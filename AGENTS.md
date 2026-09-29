@@ -53,30 +53,12 @@ tests, and project documentation.
 In Markdown, leave a blank line before lists and after headings. Put CLI commands, paths,
 environment variables, and configuration keys in backticks.
 
-## Changes before v1.0.0
-
-- Before Cordial v1.0.0, do not add migrations, compatibility layers, legacy fallbacks, or
-  deprecation paths to accommodate project changes.
-- Remove replaced functionality entirely, including its tests, documentation, comments, and other
-  references. Do not add tests or explanations about the replaced functionality or its removal; the
-  project should read as though it never existed.
-- At v1.0.0, prompt the maintainer to remove this section. Remove it only after explicit
-  confirmation.
-- At v1.0.0 and later, this section's restrictions no longer apply, even if the section remains,
-  unless the maintainer explicitly asks for them to be enforced.
-- If this section remains at v1.0.0 or later, remind the maintainer to remove it whenever they ask
-  for implementation work, unless they have asked not to be reminded. Silencing reminders does not
-  authorize removal or reinstate the restrictions.
-
 ## Protocol and compatibility versions
 
 - Any protocol, compatibility, or similar version whose meaning we define requires explicit user
   approval before it is introduced, anywhere in the project. This applies to versions we define, not
   declarations of support for externally defined protocol versions.
 - Changing any such version requires explicit user approval.
-- Keep these versions at their initial values until Cordial v1. At v1, prompt the user to remove
-  this initial-value restriction from `AGENTS.md`, and remove it only after explicit confirmation.
-  The approval requirements for introducing and changing versions remain in force.
 
 ## Issues
 
