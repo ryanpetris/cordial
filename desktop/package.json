@@ -8,22 +8,21 @@
   "main": "out/main/index.js",
   "author": "Ryan Petris <ryan@petris.net>",
   "license": "MIT",
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
+  },
   "scripts": {
     "generate": "node scripts/generate-wire.mjs",
     "check:generated": "node scripts/generate-wire.mjs --check",
     "icons": "node scripts/icons.mjs",
     "typecheck": "tsc -p .",
     "test": "vitest run",
-    "build": "node scripts/build.mjs",
-    "build:web": "node scripts/build-web.mjs",
-    "start": "node scripts/build.mjs && electron .",
-    "simulate": "node scripts/build.mjs && CORDIAL_DESKTOP_SIMULATE=2 electron .",
+    "build": "vite build --config vite.main.config.mjs && vite build --config vite.preload.config.mjs && vite build --config vite.renderer.config.mjs",
+    "build:web": "vite build --config vite.web.config.mjs",
+    "start": "npm run build && electron .",
+    "simulate": "npm run build && CORDIAL_DESKTOP_SIMULATE=2 electron .",
     "serve": "node scripts/serve.mjs",
-    "check": "npm run check:generated && npm run typecheck && npm test",
-    "dist": "node scripts/package.mjs",
-    "package:deb": "node scripts/package.mjs --deb",
-    "package:arch": "node scripts/package.mjs --arch",
-    "dist:web": "node scripts/package-web.mjs"
+    "check": "npm run check:generated && npm run typecheck && npm test"
   },
   "dependencies": {
     "ajv": "8.20.0",

@@ -1,9 +1,9 @@
 /build*/
-/.tools/
 /.cache/
 /dist/
 /target/
 __pycache__/
+.embuild/
 /rust/platforms/*/target/
 
 /rust/target/

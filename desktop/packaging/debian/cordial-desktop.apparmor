@@ -1,0 +1,7 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+profile cordial-desktop /opt/cordial-desktop/cordial-desktop flags=(unconfined) {
+  userns,
+  include if exists <local/cordial-desktop>
+}

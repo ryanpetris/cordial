@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Cordial
+Exec=cordial-desktop %U
+Icon=cordial-desktop
+Terminal=false
+Categories=Utility;
+StartupWMClass=cordial-desktop
+Keywords=bluetooth;keyboard;mouse;battery;

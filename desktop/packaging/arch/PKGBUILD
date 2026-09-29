@@ -1,0 +1,25 @@
+pkgname=cordial-desktop
+pkgver=${CORDIAL_VERSION:-0.0.0}
+pkgrel=1
+pkgdesc='Desktop manager for Cordial Bluetooth adapters'
+arch=(x86_64)
+url=${CORDIAL_HOMEPAGE:-https://github.com/ryanpetris/cordial}
+license=(MIT)
+depends=(alsa-lib at-spi2-core cairo dbus expat glib2 glibc gtk3 hicolor-icon-theme
+         libcups libgcc libnotify libstdc++ libx11 libxcb libxcomposite libxdamage
+         libxext libxfixes libxkbcommon libxrandr mesa nspr nss pango systemd systemd-libs)
+options=(!strip !debug)
+source=("cordial-desktop-$pkgver-x64.tar.gz")
+noextract=("${source[@]}")
+sha256sums=("${CORDIAL_ARCHIVE_SHA256:?Supply the release archive checksum}")
+
+package() {
+  local root="$pkgdir/opt/cordial-desktop"
+  install -d "$root" "$pkgdir/usr/bin"
+  tar --no-same-owner --strip-components=1 -C "$root" -xzf "$srcdir/${source[0]}"
+  ln -s /opt/cordial-desktop/cordial-desktop "$pkgdir/usr/bin/cordial-desktop"
+  install -Dm644 "$root/cordial-desktop.desktop" "$pkgdir/usr/share/applications/cordial-desktop.desktop"
+  install -Dm644 "$root/cordial-desktop.png" "$pkgdir/usr/share/icons/hicolor/512x512/apps/cordial-desktop.png"
+  install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/cordial-desktop/LICENSE"
+  chmod 4755 "$root/chrome-sandbox"
+}

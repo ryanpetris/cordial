@@ -8,9 +8,20 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import build_firmware as build
+from dependency_notices import newlib_notice
 
 
 class Packaging(unittest.TestCase):
+    def test_newlib_notice_layouts(self):
+        for relative in ('share/licenses/arm-none-eabi-newlib/COPYING.NEWLIB',
+                         'share/doc/libnewlib-arm-none-eabi/copyright', 'license.txt'):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                notice = root / relative
+                notice.parent.mkdir(parents=True, exist_ok=True)
+                notice.write_text('newlib license')
+                self.assertEqual(newlib_notice(root / 'bin/arm-none-eabi-gcc'), notice)
+
     def test_failed_package_keeps_previous_and_success_replaces_whole_package(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp, "board")

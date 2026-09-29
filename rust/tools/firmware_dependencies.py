@@ -73,7 +73,10 @@ def prepare():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--radio", choices=("embassy-cyw43", "pico-sdk-cyw43"), required=True)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--radio", choices=("embassy-cyw43", "pico-sdk-cyw43"))
+    selection.add_argument("--btstack", action="store_true")
     args = parser.parse_args()
-    for path in (prepare_sdk() if args.radio == "pico-sdk-cyw43" else prepare()):
+    paths = [prepare_btstack()] if args.btstack else (prepare_sdk() if args.radio == "pico-sdk-cyw43" else prepare())
+    for path in paths:
         print(path)

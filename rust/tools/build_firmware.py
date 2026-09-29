@@ -17,25 +17,21 @@ import firmware_dependencies
 import dependency_notices
 
 ROOT = Path(__file__).resolve().parents[1]
-SDK_TOOLS = ROOT.parent / "target/esp32s3/.embuild/espressif"
 
 
 def command(argv, env):
     subprocess.run(list(map(str, argv)), cwd=ROOT, env=env, check=True)
 
 
-def tool(name, candidates):
+def tool(name):
     found = shutil.which(name)
     if found:
         return Path(found).resolve()
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate.resolve()
     raise ValueError(f"Missing {name}; install the firmware toolchain described in docs/building.md")
 
 
 def release_docs(staged):
-    """Include the license and current wire contract with firmware and host releases."""
+    """Include the license and current wire contract with firmware releases."""
     shutil.copy2(ROOT.parent / "LICENSE", staged / "LICENSE")
     shutil.copytree(ROOT.parent / "docs", staged / "docs")
     shutil.copytree(ROOT.parent / "schema", staged / "schema")
@@ -118,7 +114,7 @@ def package(config, built, elf, output, name, gcc, env):
         partitions = sdk / "partition_table/partition-table.bin"
         esp_image_header(bootloader.read_bytes(), settings, revisions)
         esp_partitions(partitions.read_bytes(), config)
-        python = next(SDK_TOOLS.glob("python_env/idf6.1_*/bin/python"))
+        python = Path(env["IDF_PYTHON_ENV_PATH"]) / "bin/python"
         command([python, "-m", "esptool", "--chip", "esp32s3", "elf2image",
                  "--flash-mode", settings["flash_mode"], "--flash-freq", settings["flash_freq"],
                  "--flash-size", settings["flash_size"], "--elf-sha256-offset", "0xb0",
@@ -138,8 +134,8 @@ def package(config, built, elf, output, name, gcc, env):
     destination.with_suffix(".json").write_text(json.dumps(actual, indent=2) + "\n")
 
 
-def build(config_path, profile, output, clippy=False, release=False):
-    version = artifact.resolve(release=release)
+def build(config_path, profile, output, clippy=False):
+    version = artifact.resolve()
     config = firmware_config.load(config_path, profile)
     # All board values and the profile affect this directory, including settings
     # that don't affect physical wiring identity (backend and storage layout).
@@ -153,6 +149,7 @@ def build(config_path, profile, output, clippy=False, release=False):
     firmware_config.generate(config, generated)
     (generated / "board.json").write_text(json.dumps(raw, sort_keys=True))
     env = dict(os.environ, CORDIAL_PYTHON=sys.executable)
+    env["CORDIAL_VERSION"] = version
     temporary = ROOT.parent / "target/tmp"
     temporary.mkdir(parents=True, exist_ok=True)
     env.update(TMPDIR=str(temporary), CORDIAL_CONFIG=str(generated / "board.json"),
@@ -162,25 +159,22 @@ def build(config_path, profile, output, clippy=False, release=False):
         firmware_dependencies.prepare_btstack()
     if config["chip"] == "esp32s3":
         platform = "esp32s3"
-        gcc = tool("xtensa-esp32s3-elf-gcc", [SDK_TOOLS / "tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc"])
-        rust = Path(subprocess.check_output(["rustc", "+cordial-esp", "--print", "sysroot"], text=True).strip())
-        clang = list(rust.glob("xtensa-esp32-elf-clang/*/esp-clang/lib/libclang.so*"))
-        if not clang:
-            raise ValueError("Missing Xtensa libclang; install espup's pinned toolchain")
-        linker = tool("ldproxy", [ROOT.parent / ".tools/esp/bin/ldproxy"])
-        env.update(LIBCLANG_PATH=str(clang[0].parent), MCU="esp32s3",
+        if not all(env.get(name) for name in ("IDF_PATH", "IDF_PYTHON_ENV_PATH", "LIBCLANG_PATH")):
+            raise ValueError("Activate the espup and ESP-IDF environments described in docs/building.md")
+        gcc = tool("xtensa-esp32s3-elf-gcc")
+        linker = tool("ldproxy")
+        env.update(MCU="esp32s3",
                    CARGO_WORKSPACE_DIR=str(ROOT / "platforms/esp32s3"),
-                   ESP_IDF_TOOLS_INSTALL_DIR=f"custom:{SDK_TOOLS}",
                    ESP_IDF_SDKCONFIG=str(generated / "sdkconfig"),
                    ESP_IDF_SDKCONFIG_DEFAULTS=str(generated / "sdkconfig.defaults"),
                    CARGO_TARGET_XTENSA_ESP32S3_ESPIDF_LINKER=str(linker),
                    CARGO_TARGET_XTENSA_ESP32S3_ESPIDF_RUSTFLAGS="--cfg espidf_time64")
         features = [config["bluetooth_backend"], profile, "firmware"]
-        cargo = ["cargo", "+cordial-esp"]
+        cargo = ["cargo", "+esp"]
         extra = ["-Z", "build-std=std,panic_abort"]
     else:
         platform = "pico"
-        gcc = tool("arm-none-eabi-gcc", [])
+        gcc = tool("arm-none-eabi-gcc")
         features = [config["feature"], config["radio_backend"], profile, "firmware"]
         cargo, extra = ["cargo"], []
     env[f"CC_{triple.replace('-', '_').replace('.', '_')}"] = str(gcc)
@@ -197,7 +191,7 @@ def build(config_path, profile, output, clippy=False, release=False):
     def populate(staging):
         package(config, built, elf, staging, name, gcc, env)
         release_docs(staging)
-        sdk = Path(env.get("IDF_PATH", SDK_TOOLS / "esp-idf/v6.1")) if platform == "esp32s3" else None
+        sdk = Path(env["IDF_PATH"]) if platform == "esp32s3" else None
         dependency_notices.record(cargo, platform, features, triple, env, staging, sdk)
     publish(output, populate)
     print(output)
@@ -209,10 +203,8 @@ def main():
     parser.add_argument("--profile", choices=("development", "production"), default="development")
     parser.add_argument("--output", type=Path, default=ROOT.parent / "build/firmware")
     parser.add_argument("--clippy", action="store_true")
-    parser.add_argument("--release", action="store_true",
-                        help="require CORDIAL_VERSION or a clean release tag")
     args = parser.parse_args()
-    build(args.config.resolve(), args.profile, args.output, args.clippy, args.release)
+    build(args.config.resolve(), args.profile, args.output, args.clippy)
 
 
 if __name__ == "__main__":

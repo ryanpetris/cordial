@@ -19,31 +19,21 @@ separate from transient port names. Select an adapter by its reported identity.
 
 ## Build
 
-Run commands from the repository root on Arch Linux or Debian, with Python
-3.11.4+ available:
+Run commands from the repository root on Linux. Install Python 3.11.4+, Node.js
+24 with npm, Rust through [rustup](https://rustup.rs/), and native build tools.
+Cargo uses the pinned toolchain in `rust/rust-toolchain.toml`. The rustup `cargo`
+and `rustc` commands must be on `PATH`.
+
+On Debian and Ubuntu, install the native prerequisites with:
 
 ```sh
-make all
+sudo apt-get install build-essential git clang libclang-dev pkg-config python3
 ```
 
-Each target runs its ecosystem's bootstrap automatically. `desktop/bootstrap.py`
-prepares Node/npm and installs the locked npm dependencies, including build-time
-dependencies. `rust/bootstrap.py` uses rustup and the pinned Rust toolchain,
-and prepares the toolchain for the selected board. An installed rustup takes
-precedence over system Rust. If missing, rustup is installed locally without
-changing the default toolchain or shell profile.
-
-Missing system prerequisites stop the build with package names for Arch or
-Debian, or the required manual download. The bootstraps never run a system
-package manager. Automatic tool downloads support Linux x86-64 and ARM64;
-compatible installed Node and ARM compilers are reused. Project-managed tools and
-sources live in ignored `.tools/`, `.cache/` and `target/` directories. An existing
-rustup keeps its toolchains in its own home. Archives fetched directly by the
-bootstraps have pinned versions and SHA-256 checksums; SDK installers manage
-their own downloads. Repeated builds reuse completed installations;
-changes to the npm manifests or Node/npm version trigger `npm ci` again.
-Parallel Make targets serialize builds within each ecosystem. Running the desktop
-application releases the build lock after startup preparation.
+On Arch, install `base-devel`, `git`, `clang`, `pkgconf` and `python`.
+Desktop targets run `npm ci` when the manifests change or dependencies are
+missing, then invoke the Vite CLI. Rust targets invoke Cargo directly. Install
+the board tools below before building firmware.
 
 ```sh
 make desktop
@@ -51,8 +41,8 @@ make cli
 ```
 
 The CLI executable is `rust/target/release/cordial`. The desktop build is in
-`desktop/out/`. `python3 desktop/bootstrap.py start` starts the desktop with its
-prepared tool environment.
+`desktop/out/`. After installing desktop dependencies, `npm --prefix desktop run
+start` builds and starts the desktop application.
 
 ### Web version
 
@@ -85,8 +75,8 @@ controller stay on another machine, such as a remote development host. It is
 never built into the application or packaged.
 
 ```sh
-python3 desktop/bootstrap.py serve              # adapters on this machine
-python3 desktop/bootstrap.py serve --simulate   # two simulated adapters
+npm --prefix desktop run serve                  # adapters on this machine
+npm --prefix desktop run serve -- --simulate    # two simulated adapters
 ```
 
 The server listens on `localhost:5180` only (`--port` changes it) and reloads
@@ -105,12 +95,30 @@ adapter. Preferences last until the server stops.
 
 ### Firmware toolchains
 
-Pico builds automatically prepare ARM GCC with newlib/nano and the selected
-Rust target. ESP32-S3 builds prepare Espressif's Xtensa Rust, ldproxy, ESP-IDF
-and its C tools and Python environment. No manual environment sourcing is
-required. CMake 3.24+, Ninja and native build tools are system prerequisites.
-Pico builds and Rust checks also require Clang and libclang.
-Firmware source dependencies remain pinned and unmodified.
+All firmware builds require CMake 3.24+, Ninja and native build tools.
+Pico builds require ARM GCC with newlib/nano and its redistribution notices.
+Install `gcc-arm-none-eabi` and `libnewlib-arm-none-eabi` on Debian and Ubuntu,
+or `arm-none-eabi-gcc` and `arm-none-eabi-newlib` on Arch. Rustup installs the
+Pico Rust targets listed in `rust/rust-toolchain.toml`.
+
+ESP32-S3 uses [espup](https://github.com/esp-rs/espup) and an activated
+[ESP-IDF v6.1 environment](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/get-started/).
+Install `python3-venv` and `libusb-1.0-0` on Debian and Ubuntu, or `python` and
+`libusb` on Arch, then prepare the vendor tools:
+
+```sh
+cargo install espup --version 0.17.1 --locked
+cargo install ldproxy --version 0.3.5 --locked
+espup install --toolchain-version 1.97.0.0 --targets esp32s3 --std
+git clone --branch v6.1 --depth 1 --recursive --shallow-submodules https://github.com/espressif/esp-idf.git ../esp-idf
+../esp-idf/install.sh esp32s3
+. "$HOME/export-esp.sh"
+. ../esp-idf/export.sh
+```
+
+Source both export files in each shell that builds ESP firmware. The firmware
+builder uses the exported compiler, SDK and Python environment. Pico SDK and
+BTstack source dependencies remain pinned and unmodified in `.cache/dependencies/`.
 
 ```sh
 make firmware BOARD=pico_w
@@ -136,75 +144,100 @@ Ordinary firmware updates preserve saved bonds, identities and preferences.
 
 ### Versioning and release packages
 
-First-party manifest versions are `0.0.0`. `tools/version.py` derives the
-application version from Git when `CORDIAL_VERSION` is unset:
-
-| Source state | Application version |
-| --- | --- |
-| Clean commit with one exact `vMAJOR.MINOR.PATCH` tag | `MAJOR.MINOR.PATCH` |
-| Other commit | `0.0.0-dev+g<commit>` |
-| Commit with local changes | `0.0.0-dev+g<commit>.dirty` |
-| No Git metadata or executable | `0.0.0-dev` |
-
-Multiple release tags on the same commit are rejected. Direct Cargo and npm
-builds use the same resolver. Set `CORDIAL_PYTHON` to select a Python executable;
-otherwise the version launchers try `python3`, `python`, then `py -3`.
-
-Set `CORDIAL_VERSION=MAJOR.MINOR.PATCH` to supply the application version explicitly,
-including when building a source archive without Git metadata. The override takes
-precedence over Git state for all builds and packages. It accepts three nonnegative
-integers without leading zeroes or a `v` prefix.
+First-party manifest versions are `0.0.0`. Builds use `CORDIAL_VERSION` when
+supplied and otherwise use `0.0.0`. The value is `MAJOR.MINOR.PATCH`, without
+leading zeroes or a `v` prefix. Tracked manifests and native package recipes
+remain unchanged.
 
 ```sh
-make version
-make package-cli
-make package-desktop
-make package-web
-make package-firmware BOARD=pico_w
-CORDIAL_VERSION=1.2.3 make package-cli
+export CORDIAL_VERSION=1.2.3
+make package-desktop package-cli package-web package-firmware BOARD=pico_w
 ```
 
-Without `CORDIAL_VERSION`, release packaging requires a clean, exactly tagged commit.
-Packaging leaves tracked manifests unchanged. CLI packages go to `build/release/`;
-desktop packages go to `desktop/dist/`. The web version goes to
-`build/packages/web/cordial-web-<version>/`,
-a directory to upload as is to a static host such as GitHub Pages or Cloudflare
-Pages; it is not part of the desktop packages. The independent distribution packages are `cordial-desktop`
-and `cordial-cli`. CLI packages include protocol documentation, schemas and
-dependency notices.
-Firmware is distributed separately.
+The tag-triggered release workflow reads `GITHUB_REF_NAME`, validates
+`vMAJOR.MINOR.PATCH`, and supplies the numeric version to every build job.
+
+### Portable archives
+
+`make package-desktop` uses electron-builder for AppImage and `.tar.gz` output in
+`desktop/dist/`. `make package-desktop-tar` builds just the archive. Both formats
+bundle Electron and the application's native modules.
+
+`make package-cli` builds the static Rust executable, documentation, schemas and
+dependency notices, then creates `build/release/cordial-<version>-linux-<arch>.tar.gz`.
+`make package-cli-tar` is the same target. The CLI has no Electron dependency.
+Install its musl target once with rustup before packaging:
 
 ```sh
-CORDIAL_HOMEPAGE=https://github.com/OWNER/REPOSITORY python3 desktop/bootstrap.py dist -- --arch --deb
-make package-cli-arch
-make package-cli-deb
+(cd rust && rustup target add x86_64-unknown-linux-musl)
 ```
 
-The Debian package also supports Ubuntu. Distribution packages target x86-64.
-Desktop distribution packaging requires the project homepage in `CORDIAL_HOMEPAGE`.
-Electron Builder produces the desktop Arch and Debian packages, AppImage and tar
-archive. Arch packaging requires `bsdtar` from `libarchive-tools` on Debian/Ubuntu
-or `libarchive` on Arch. CLI packages go to `build/packages/arch/` and
-`build/packages/deb/`; their builders require `makepkg` plus `fakeroot` on Arch, and
-`build-essential`, `dpkg-dev` and `debhelper` on Debian/Ubuntu. The native recipes live in
-`rust/packaging/arch/` and `rust/packaging/debian/`.
+On ARM64 use `aarch64-unknown-linux-musl`. `CLI_TARGET` can select either target;
+the default matches the build machine.
 
-Both Make targets build the CLI release files before packaging. To package an
-existing release archive, pass `CLI_ARCHIVE=path/to/cordial-VERSION-linux-amd64.tar.gz`.
-Packaging runs under `build/packages/`; tracked recipes remain unchanged.
-For `make package-cli-arch` and `make package-cli-deb`, set `SOURCE_DATE_EPOCH`
-to the source release timestamp in Unix seconds when Git metadata is absent.
-The release workflow packages the same static CLI binary in every format.
-`python3 desktop/bootstrap.py package:arch` and `package:deb` build individual
-desktop package formats with the same homepage setting.
-The CLI uses its existing static Rust build and has no Electron dependency.
-Both applications use the repository root `LICENSE`.
-The desktop application ID is `dev.petris.cordial`.
+`make package-web` writes `build/packages/web/cordial-web-<version>/`, a directory
+ready for a static host. Firmware packages are separate from host applications.
 
-The GitHub release workflow validates `vMAJOR.MINOR.PATCH` tags and publishes
-Arch and Debian packages for each application, an AppImage, desktop and CLI tar archives, and production
-firmware archives for all four board presets. Tests, package installation checks
-and artifact checksum verification must pass before publication.
+### Native distribution packages
+
+Build each package on its target distribution. Supported native targets are
+Arch Linux x86-64, Debian 13, Ubuntu 24.04 and Ubuntu 26.04. Each native recipe
+consumes a portable archive. The Make targets build that archive when none is
+supplied:
+
+```sh
+CORDIAL_VERSION=1.2.3 make package-desktop-arch package-cli-arch
+CORDIAL_VERSION=1.2.3 make package-desktop-deb package-cli-deb
+```
+
+Use `DESKTOP_ARCHIVE` and `CLI_ARCHIVE` to package existing archives. This path
+requires Python and the native packaging tools, without Node, Cargo, firmware
+tools or Git:
+
+```sh
+export CORDIAL_VERSION=1.2.3
+make package-desktop-deb DESKTOP_ARCHIVE=cordial-desktop-1.2.3-x64.tar.gz
+make package-cli-deb CLI_ARCHIVE=cordial-1.2.3-linux-amd64.tar.gz
+```
+
+Archive versions and architectures are checked before packaging. Native desktop
+packages copy the bundled distribution to `/opt/cordial-desktop`, with a launcher
+in `/usr/bin`, desktop entry, icon and license in the standard locations. This
+follows the [Arch Electron guidelines](https://wiki.archlinux.org/title/Electron_package_guidelines)
+for applications with bundled Electron. The native packages configure Electron's
+sandbox helper; Debian and Ubuntu also install its AppArmor user namespace profile.
+
+Arch uses `makepkg` and `fakeroot`. Recipes are in `desktop/packaging/arch/` and
+`rust/packaging/arch/`; output goes to `build/packages/desktop-arch/` and
+`build/packages/cli-arch/` as `.pkg.tar.zst` files. Run `makepkg` as a regular user
+with the recipe's dependencies installed.
+
+Debian and Ubuntu use `dpkg-buildpackage`, debhelper and `dch`. Install
+`build-essential`, `debhelper`, `devscripts`, `dh-apparmor`, `equivs` and `python3`,
+then install the desktop recipe's build dependencies:
+
+```sh
+sudo mk-build-deps --install --remove --tool 'apt-get -y --no-install-recommends' desktop/packaging/debian/control
+```
+
+Recipes are in `desktop/packaging/debian/` and `rust/packaging/debian/`. Package
+output goes to `build/packages/<application>-deb/<distribution>/`. By default,
+`DEB_DISTRIBUTION` is the build system's codename and `DEB_REVISION` is
+`1~<distribution>`, producing distinct Debian and Ubuntu files. Debian's library
+tools derive dependency versions from the bundled binaries on each distribution.
+
+`CORDIAL_HOMEPAGE` can override the project homepage in native package metadata.
+`SOURCE_DATE_EPOCH` can supply the release timestamp in Unix seconds; otherwise
+native packaging uses the archive's `VERSION` timestamp. Supplied archives and
+tracked recipes remain unchanged.
+
+The GitHub release workflow resolves the tag once and supplies the same version
+to desktop, web, CLI and firmware builds. It builds the portable archives first,
+then builds each native package on its target distribution from those archives.
+Installation, native module loading, package checks and artifact checksums must
+pass before publication. Releases include the AppImage, desktop, CLI and web
+archives, both applications' Arch packages, separate Debian and Ubuntu packages,
+and production firmware archives for all four boards.
 
 Third-party license material is retained in `notices/`. Firmware and CLI packages
 include the project license, generated dependency inventories and license notices.
@@ -219,6 +252,7 @@ make schema
 `make check` runs Rust tests and Clippy, native Bluetooth regression checks,
 Python tool tests, and desktop schema/type checks and tests. `make schema`
 regenerates the shared schemas and TypeScript wire types.
+Install Clippy with `(cd rust && rustup component add clippy)` before checking.
 
 Linux CLI terminal checks additionally require `pyte` and a built CLI:
 
@@ -237,7 +271,7 @@ The allocation check runs simulated device workloads on QEMU without accessing
 hardware. To exercise the desktop with simulated adapters:
 
 ```sh
-python3 desktop/bootstrap.py simulate
+npm --prefix desktop run simulate
 ```
 
 ## Adapter names
@@ -250,7 +284,7 @@ Adapter names are stored on the adapter. Rename through adapter settings in the 
 - `desktop/`: Electron, React and TypeScript application, its web version and development server.
 - `docs/`: control protocol, storage format and HID++ references.
 - `schema/`: generated JSON wire schema and command catalog.
-- `tools/`: shared version resolver and its checks.
+- `tools/`: version validation, package checks and their tests.
 
 `make all` builds desktop, CLI and the selected firmware. `make clean` removes
 build outputs while preserving downloaded dependencies and toolchains.

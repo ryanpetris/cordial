@@ -1,8 +1,5 @@
-#[path = "../../../tools/version.rs"]
-mod version;
-
 fn main() {
-    version::configure();
+    println!("cargo:rerun-if-env-changed=CORDIAL_VERSION");
     use std::{env, path::PathBuf, process::Command};
     embuild::espidf::sysenv::output();
     println!("cargo:rustc-link-arg=-Wl,--undefined=CORDIAL_METADATA");

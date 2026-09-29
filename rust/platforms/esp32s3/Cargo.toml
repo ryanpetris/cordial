@@ -46,7 +46,6 @@ embuild = { version = "=0.33.5", features = ["espidf"] }
 
 [package.metadata.esp-idf-sys]
 esp_idf_version = "v6.1"
-esp_idf_tools_install_dir = "custom:../../../.tools/esp-idf"
 esp_idf_components = ["main", "platform", "driver", "esp_timer", "esp_driver_gpio", "esp_hw_support", "nvs_flash", "bt", "pthread"]
 
 [[package.metadata.esp-idf-sys.extra_components]]

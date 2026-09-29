@@ -1,0 +1,27 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --buildsystem=none
+
+execute_after_dh_install:
+	install -Dm644 payload/cordial-desktop.desktop debian/cordial-desktop/usr/share/applications/cordial-desktop.desktop
+	install -Dm644 payload/cordial-desktop.png debian/cordial-desktop/usr/share/icons/hicolor/512x512/apps/cordial-desktop.png
+	install -Dm644 debian/cordial-desktop.apparmor debian/cordial-desktop/etc/apparmor.d/cordial-desktop
+	dh_apparmor --profile-name=cordial-desktop
+
+# Preserve the supplied Electron and native module binaries.
+override_dh_strip:
+override_dh_dwz:
+
+override_dh_makeshlibs:
+	dh_makeshlibs -n
+
+override_dh_shlibdeps:
+	dh_shlibdeps -l$(CURDIR)/debian/cordial-desktop/opt/cordial-desktop
+
+execute_after_dh_fixperms:
+	chmod 4755 debian/cordial-desktop/opt/cordial-desktop/chrome-sandbox
+	find debian/cordial-desktop -exec touch --no-dereference --date="@$$SOURCE_DATE_EPOCH" {} +
+
+override_dh_gencontrol:
+	dh_gencontrol -- -DHomepage="$${CORDIAL_HOMEPAGE:-https://github.com/ryanpetris/cordial}"

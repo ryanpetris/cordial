@@ -73,13 +73,13 @@ command-line tool. You can install either package or both.
 **Arch Linux**
 
 ```sh
-sudo pacman -U cordial-desktop-*-x86_64.pkg.tar.xz
+sudo pacman -U cordial-desktop-*-x86_64.pkg.tar.zst
 # Optional command-line tool:
 sudo pacman -U cordial-cli-*-x86_64.pkg.tar.zst
 sudo usermod -aG uucp "$USER"
 ```
 
-**Debian 13, Ubuntu 24.04 and newer**
+**Debian 13, Ubuntu 24.04 and Ubuntu 26.04**
 
 ```sh
 sudo apt install ./cordial-desktop_*_amd64.deb
@@ -87,6 +87,9 @@ sudo apt install ./cordial-desktop_*_amd64.deb
 sudo apt install ./cordial-cli_*_amd64.deb
 sudo usermod -aG dialout "$USER"
 ```
+
+Choose the files marked `trixie` for Debian 13, `noble` for Ubuntu 24.04, or
+`resolute` for Ubuntu 26.04.
 
 **Other distributions:** download `cordial-desktop-*-x86_64.AppImage` for the desktop
 app, or `cordial-*-linux-amd64.tar.gz` for the command-line tool alone, and add

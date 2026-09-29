@@ -1,6 +1,8 @@
 """Record the selected Cargo graph and preserve supplied dependency notices."""
+import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -128,3 +130,11 @@ def record(cargo, platform, features, target, env, output, sdk=None):
         "Some published archives omit their licence texts; their declarations and upstream repositories remain in the inventory. "
         "The SDK notice collection also includes optional components and build tools; use the linker map to determine linked components. "
         "This inventory does not establish Bluetooth qualification or a commercial BTstack licence.\n")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    record(["cargo"], "host", [], args.target, os.environ, args.output)

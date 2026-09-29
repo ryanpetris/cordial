@@ -1,10 +1,7 @@
-#[path = "../../../tools/version.rs"]
-mod version;
-
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    version::configure();
+    println!("cargo:rerun-if-env-changed=CORDIAL_VERSION");
     println!("cargo:rustc-check-cfg=cfg(board_configured)");
     println!("cargo:rerun-if-env-changed=CORDIAL_CONFIG");
     let Some(config) = env::var_os("CORDIAL_CONFIG") else {

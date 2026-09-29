@@ -15,6 +15,7 @@ const profile = mkdtempSync(join(tmpdir(), "cordial-smoke-"));
 writeFileSync(join(profile, "preferences.json"), JSON.stringify({ notifyLowBattery: false, notifyConnections: false }));
 const app = await electron.launch({
   executablePath: process.env.CORDIAL_EXECUTABLE,
+  chromiumSandbox: true,
   args: [...(process.env.CORDIAL_EXECUTABLE ? [] : ["."]), `--user-data-dir=${profile}`, `--force-dark-mode=${scheme === "dark"}`],
   env: { ...process.env, CORDIAL_DESKTOP_SIMULATE: "2", ELECTRON_ENABLE_LOGGING: "1" },
 });

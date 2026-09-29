@@ -24,7 +24,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if options.args == ["--version"] {
-        println!("cordial {}", env!("CORDIAL_VERSION"));
+        println!("cordial {}", option_env!("CORDIAL_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")));
         return ExitCode::SUCCESS;
     }
     match run(options) {

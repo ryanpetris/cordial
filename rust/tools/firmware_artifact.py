@@ -10,7 +10,9 @@ MAGIC = b"CORDIAL-META-V1\n"
 FAMILIES = {"rp2040": 0xE48BFF56, "rp2350": 0xE48BFF59}
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent / "tools"))
-from version import resolve, VERSION
+from version import resolve, RELEASE
+
+VERSION = rf"(?:{RELEASE}|0\.0\.0-dev(?:\+g[0-9a-f]+(?:\.dirty)?)?)"
 
 
 def manifest(config):
