@@ -1,0 +1,11 @@
+[package]
+name = "cordial-schema"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+[dependencies]
+cordial-protocol = { workspace = true, features = ["schema"] }
+schemars = "=1.2.2"
+serde_json = { workspace = true, features = ["std"] }
+jsonschema = { version = "=0.58.1", default-features = false }

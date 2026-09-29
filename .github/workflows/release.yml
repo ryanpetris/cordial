@@ -1,0 +1,232 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          test "$(python3 tools/version.py --release)" = "${RELEASE_TAG#v}"
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git clang libclang-dev pkg-config
+      - name: Check Rust and desktop
+        run: |
+          python3 rust/bootstrap.py check
+          python3 desktop/bootstrap.py check
+      - name: Check larger output queue
+        working-directory: rust
+        env:
+          CORDIAL_CONFIG: ${{ github.workspace }}/rust/boards/xiao_esp32s3.json
+        run: ../.tools/rust-bin/cargo test --locked -p cordial-core --all-features
+      - name: Check build tools and board presets
+        run: make check-tools
+  linux:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CORDIAL_HOMEPAGE: https://github.com/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install packaging prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git pkg-config libarchive-tools dpkg-dev debhelper lintian xvfb dbus-x11
+      - name: Build desktop release formats and CLI Debian package
+        run: |
+          python3 desktop/bootstrap.py dist -- --arch --deb
+          make package-cli-deb
+      - name: Check installed application
+        run: |
+          sudo apt-get install -y ./desktop/dist/cordial-desktop_*_amd64.deb
+          python3 tools/check_linux_package.py cordial-desktop --debian
+          sudo apt-get install -y ./build/packages/deb/cordial-cli_*_amd64.deb
+          python3 tools/check_linux_package.py cordial-cli --debian
+          CORDIAL_EXECUTABLE=/opt/Cordial/cordial-desktop xvfb-run -a dbus-run-session -- node desktop/scripts/smoke.mjs desktop/out/package-smoke
+          # Electron's vendor binaries live in /opt and retain their shipped permissions and symbols.
+          lintian --suppress-tags dir-or-file-in-opt,embedded-library,shared-library-is-executable,unstripped-binary-or-object desktop/dist/cordial-desktop_*_amd64.deb
+          lintian --suppress-tags unstripped-binary-or-object build/packages/deb/cordial-cli_*_amd64.deb
+      - name: Prepare release archives
+        run: |
+          version=$(python3 tools/version.py --release)
+          mkdir -p release
+          tar -C build/release -czf "release/cordial-${version}-linux-amd64.tar.gz" "cordial-${version}-linux-amd64"
+          cp desktop/dist/*.AppImage desktop/dist/*.deb desktop/dist/*.pkg.tar.xz desktop/dist/*.tar.gz build/packages/deb/*.deb release/
+          cd release
+          sha256sum ./* > SHA256SUMS-linux
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-linux
+          path: release/
+          compression-level: 0
+          if-no-files-found: error
+  arch:
+    needs: linux
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    env:
+      CORDIAL_HOMEPAGE: https://github.com/${{ github.repository }}
+    timeout-minutes: 20
+    steps:
+      - name: Install packaging tools
+        run: |
+          pacman -Syu --noconfirm git pkgconf namcap python
+          # The container skips documentation by default; package checks need the full install.
+          sed -i '/^NoExtract.*usr\/share\/doc/d' /etc/pacman.conf
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages-linux
+          path: build/desktop-release
+      - name: Build CLI package and check independent installations
+        run: |
+          useradd -m builder
+          version=$(python tools/version.py --release)
+          chown -R builder .
+          runuser -u builder -- make package-cli-arch CLI_ARCHIVE="build/desktop-release/cordial-${version}-linux-amd64.tar.gz"
+          pacman -U --noconfirm build/packages/arch/cordial-cli-*.pkg.tar.zst
+          python tools/check_linux_package.py cordial-cli
+          test ! -e /usr/bin/cordial-desktop
+          pacman -U --noconfirm build/desktop-release/cordial-desktop-*.pkg.tar.xz
+          python tools/check_linux_package.py cordial-desktop
+          # Electron uses /opt; fpm records numeric owner names. The checker verifies UID/GID 0.
+          desktop_rules=$(python -c 'from Namcap.rules import all_rules; print(",".join(name for name, rule in all_rules.items() if rule.enable and name not in {"elfpaths", "fileownership"}))')
+          namcap -r "$desktop_rules" build/desktop-release/cordial-desktop-*.pkg.tar.xz > namcap.log
+          namcap build/packages/arch/cordial-cli-*.pkg.tar.zst >> namcap.log
+          cat namcap.log
+          if grep -q ' E:' namcap.log; then exit 1; fi
+          pacman -U --noconfirm build/desktop-release/cordial-desktop-*.pkg.tar.xz build/packages/arch/cordial-cli-*.pkg.tar.zst
+          pacman -R --noconfirm cordial-cli
+          test ! -e /usr/bin/cordial
+          python tools/check_linux_package.py cordial-desktop
+          pacman -R --noconfirm cordial-desktop
+          test ! -e /usr/bin/cordial-desktop
+          mkdir release
+          cp build/packages/arch/cordial-cli-*.pkg.tar.zst release/
+          cd release
+          sha256sum ./*.pkg.tar.zst > SHA256SUMS-arch
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-arch
+          path: release/
+          compression-level: 0
+          if-no-files-found: error
+  debian:
+    needs: linux
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:13', 'ubuntu:24.04', 'ubuntu:26.04']
+    container: ${{ matrix.image }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages-linux
+          path: release
+      - name: Check independent installations, reinstall and removal
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          # Ubuntu's container excludes documentation unless explicitly included.
+          echo 'path-include=/usr/share/doc/cordial-*' > /etc/dpkg/dpkg.cfg.d/zz-cordial-check
+          apt-get install -y --no-install-recommends ./release/cordial-cli_*_amd64.deb binutils dpkg-dev python3
+          python3 tools/check_linux_package.py cordial-cli --debian
+          test ! -e /usr/bin/cordial-desktop
+          apt-get install -y --no-install-recommends ./release/cordial-desktop_*_amd64.deb
+          python3 tools/check_linux_package.py cordial-desktop --debian
+          apt-get install -y --reinstall ./release/cordial-cli_*_amd64.deb ./release/cordial-desktop_*_amd64.deb
+          apt-get purge -y cordial-cli
+          test ! -e /usr/bin/cordial
+          python3 tools/check_linux_package.py cordial-desktop --debian
+          apt-get purge -y cordial-desktop
+          test ! -e /usr/bin/cordial-desktop
+  firmware:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [pico_w, pico2_w, waveshare_rp2350b_plus_w, xiao_esp32s3]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install firmware build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git cmake ninja-build clang libclang-dev pkg-config python3-venv libusb-1.0-0
+      - name: Build production firmware
+        run: python3 rust/bootstrap.py package-firmware --board '${{ matrix.board }}' --profile production
+      - name: Archive complete firmware package
+        env:
+          BOARD: ${{ matrix.board }}
+        run: |
+          version=$(python3 tools/version.py --release)
+          mkdir release
+          tar -C "build/firmware/$version" -czf "release/cordial-firmware-${version}-${BOARD}-production.tar.gz" .
+          cd release
+          sha256sum ./*.tar.gz > "SHA256SUMS-firmware-$BOARD"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-firmware-${{ matrix.board }}
+          path: release/
+          compression-level: 0
+          if-no-files-found: error
+  publish:
+    needs: [linux, arch, debian, firmware]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: release
+      - name: Verify release assets
+        working-directory: release
+        run: |
+          cat SHA256SUMS-* > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 11
+          sha256sum -c SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes release/*.AppImage release/*.pkg.tar.* release/*.deb release/*.tar.gz release/SHA256SUMS
+          gh release edit "$RELEASE_TAG" --draft=false

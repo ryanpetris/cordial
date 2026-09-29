@@ -1,0 +1,5 @@
+menu "Cordial"
+config CORDIAL_DEVELOPMENT
+    bool "Enable development ROM bootloader entry"
+    default n
+endmenu

@@ -1,0 +1,22 @@
+[package]
+name = "cordial-record-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+delog = { version = "=0.1.8", default-features = false, features = ["portable-atomic"] }
+cordial-core.workspace = true
+embedded-storage-async = "=0.4.2"
+littlefs2 = { version = "=0.8.1", default-features = false }
+embassy-futures = "=0.1.2"
+
+[dev-dependencies]
+cordial-protocol.workspace = true
+serde_json.workspace = true
+
+[[test]]
+name = "esp_storage"
+path = "../../tests/esp_storage.rs"

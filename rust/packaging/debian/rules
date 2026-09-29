@@ -1,0 +1,21 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --buildsystem=none
+
+# Keep the published static CLI binary intact.
+override_dh_strip:
+override_dh_dwz:
+override_dh_shlibdeps:
+
+override_dh_compress:
+	dh_compress -Xdocs -Xschema -Xnotices -Xdependencies.json -XDEPENDENCIES.md
+
+execute_after_dh_fixperms:
+	find debian/cordial-cli -exec touch --no-dereference --date="@$$SOURCE_DATE_EPOCH" {} +
+
+override_dh_gencontrol:
+	dh_gencontrol -- -DHomepage="$${CORDIAL_HOMEPAGE:-https://github.com/ryanpetris/cordial}"
+
+override_dh_builddeb:
+	dh_builddeb -- -Zxz

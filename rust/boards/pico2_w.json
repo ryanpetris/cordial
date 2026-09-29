@@ -1,0 +1,25 @@
+{
+  "name": "pico2_w",
+  "default_adapter_name": "Pico 2 W",
+  "chip": "rp2350",
+  "package": "a",
+  "flash_bytes": 4194304,
+  "xosc_hz": 12000000,
+  "radio": {
+    "power": 23,
+    "data": 24,
+    "clock": 29,
+    "cs": 25,
+    "led": {
+      "pin": 0,
+      "active_low": false
+    }
+  },
+  "mcu_led": null,
+  "bluetooth_backend": "btstack",
+  "usb_backend": "embassy",
+  "storage_backend": "littlefs",
+  "radio_backend": "pico-sdk-cyw43",
+  "firmware_bytes": 1048576,
+  "output_frames": 16
+}

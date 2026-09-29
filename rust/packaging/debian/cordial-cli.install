@@ -1,0 +1,6 @@
+cordial usr/bin
+docs usr/share/doc/cordial-cli
+schema usr/share/doc/cordial-cli
+notices usr/share/doc/cordial-cli
+dependencies.json usr/share/doc/cordial-cli
+DEPENDENCIES.md usr/share/doc/cordial-cli

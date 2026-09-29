@@ -1,0 +1,7104 @@
+{
+  "$defs": {
+    "AdapterName": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "An explicit null clears the override; the field is required.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "AdapterSettings": {
+      "additionalProperties": false,
+      "properties": {
+        "host_platform": {
+          "$ref": "#/$defs/HostPlatform"
+        },
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "name",
+        "host_platform"
+      ],
+      "type": "object"
+    },
+    "AuthenticationFailure": {
+      "description": "Last native authentication failure, retained in RAM for development diagnostics.",
+      "oneOf": [
+        {
+          "properties": {
+            "attempt": {
+              "format": "uint32",
+              "maximum": 4294967295,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "backend": {
+              "const": "nimble",
+              "type": "string"
+            },
+            "bonded": {
+              "type": "boolean"
+            },
+            "encrypted": {
+              "type": "boolean"
+            },
+            "stage": {
+              "$ref": "#/$defs/NimbleAuthenticationStage"
+            },
+            "status": {
+              "format": "int32",
+              "maximum": 2147483647,
+              "minimum": -2147483648,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "backend",
+            "attempt",
+            "stage",
+            "status",
+            "encrypted",
+            "bonded"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BareError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": "object"
+    },
+    "BootloaderMode": {
+      "enum": [
+        "bootsel",
+        "download"
+      ],
+      "type": "string"
+    },
+    "BootloaderResult": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/BootloaderMode"
+        },
+        "rebooting": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "rebooting",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "BuildProfile": {
+      "enum": [
+        "development",
+        "production"
+      ],
+      "type": "string"
+    },
+    "CancelResult": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "requested": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "request_id",
+        "requested"
+      ],
+      "type": "object"
+    },
+    "Candidate": {
+      "properties": {
+        "candidate_id": {
+          "$ref": "#/$defs/CandidateId"
+        },
+        "kind": {
+          "$ref": "#/$defs/DeviceKind"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rssi": {
+          "format": "int16",
+          "maximum": 32767,
+          "minimum": -32768,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "kind",
+        "name",
+        "transport",
+        "rssi"
+      ],
+      "type": "object"
+    },
+    "CandidateId": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "Capabilities": {
+      "items": {
+        "$ref": "#/$defs/Capability"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "Capability": {
+      "enum": [
+        "classic",
+        "ble",
+        "debug",
+        "storage_management"
+      ],
+      "type": "string"
+    },
+    "Capacity": {
+      "properties": {
+        "enabled": {
+          "items": {
+            "$ref": "#/$defs/EnabledCapacity"
+          },
+          "type": "array"
+        },
+        "pairing": {
+          "items": {
+            "$ref": "#/$defs/PairingCapacity"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "enabled",
+        "pairing"
+      ],
+      "type": "object"
+    },
+    "CapacityDetails": {
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/CapacityReason"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
+    "CapacityError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "const": "capacity"
+        },
+        "details": {
+          "$ref": "#/$defs/CapacityDetails"
+        }
+      },
+      "required": [
+        "code",
+        "details"
+      ],
+      "type": "object"
+    },
+    "CapacityReason": {
+      "description": "`details.reason` of a `capacity` error.",
+      "enum": [
+        "enabled_full",
+        "storage_full",
+        "setup_capacity",
+        "connections_full"
+      ],
+      "type": "string"
+    },
+    "Connect": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "timeout_ms": {
+          "default": 30000,
+          "maximum": 60000,
+          "minimum": 1000,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "device_id"
+      ],
+      "type": "object"
+    },
+    "ConnectionSecurity": {
+      "description": "Observed properties of the current Bluetooth link, never requested policy.\nNone means the backend cannot report that property. Key size is in bytes.",
+      "properties": {
+        "authenticated": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "bonded": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "encrypted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "key_size": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "secure_connections": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "encrypted",
+        "authenticated",
+        "secure_connections",
+        "key_size",
+        "bonded"
+      ],
+      "type": "object"
+    },
+    "ConnectionState": {
+      "enum": [
+        "disconnected",
+        "connecting",
+        "connected",
+        "disconnecting"
+      ],
+      "type": "string"
+    },
+    "Counts": {
+      "properties": {
+        "connected": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "enabled": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "paired": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "preferred_enabled": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "saved": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "saved",
+        "paired",
+        "preferred_enabled",
+        "enabled",
+        "connected"
+      ],
+      "type": "object"
+    },
+    "Device": {
+      "properties": {
+        "blocked": {
+          "type": "boolean"
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "effective_enabled": {
+          "description": "Runtime admission; `enabled_reason` explains why it is false.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "Persisted Bluetooth enablement preference, independent of `hidpp_enabled`.",
+          "type": "boolean"
+        },
+        "enabled_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DisabledReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hidpp_enabled": {
+          "type": "boolean"
+        },
+        "last_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WireError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "normalization_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "normalization_state": {
+          "$ref": "#/$defs/NormalizationState"
+        },
+        "pairing_state": {
+          "$ref": "#/$defs/PairingState"
+        },
+        "reconnect": {
+          "$ref": "#/$defs/Reconnect"
+        },
+        "roles": {
+          "items": {
+            "$ref": "#/$defs/Role"
+          },
+          "type": "array"
+        },
+        "security": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConnectionSecurity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "settings_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "settings_revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settings_state": {
+          "$ref": "#/$defs/SettingsState"
+        },
+        "state": {
+          "$ref": "#/$defs/ConnectionState"
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        },
+        "transport_supported": {
+          "description": "Derived from the current backend's transports; never persisted.",
+          "type": "boolean"
+        },
+        "trusted": {
+          "type": "boolean"
+        },
+        "validation_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ValidationError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "warnings": {
+          "items": {
+            "$ref": "#/$defs/WarningCode"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "device_id",
+        "pairing_state",
+        "name",
+        "transport",
+        "roles",
+        "state",
+        "security",
+        "enabled",
+        "effective_enabled",
+        "enabled_reason",
+        "transport_supported",
+        "validation_error",
+        "trusted",
+        "blocked",
+        "reconnect",
+        "last_error",
+        "hidpp_enabled",
+        "normalization_state",
+        "normalization_error",
+        "settings_state",
+        "settings_error",
+        "settings_revision"
+      ],
+      "type": "object"
+    },
+    "DeviceBlocked": {
+      "additionalProperties": false,
+      "properties": {
+        "blocked": {
+          "type": "boolean"
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        }
+      },
+      "required": [
+        "device_id",
+        "blocked"
+      ],
+      "type": "object"
+    },
+    "DeviceDisconnected": {
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "$ref": "#/$defs/Device"
+        },
+        "reason": {
+          "$ref": "#/$defs/DisconnectReason"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "device",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "DeviceEnabled": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "device_id",
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "DeviceFilter": {
+      "additionalProperties": false,
+      "properties": {
+        "filter": {
+          "$ref": "#/$defs/Filter",
+          "default": "saved"
+        }
+      },
+      "type": "object"
+    },
+    "DeviceId": {
+      "pattern": "^[!-~]{1,64}$",
+      "type": "string"
+    },
+    "DeviceInfo": {
+      "additionalProperties": false,
+      "description": "Full snapshot for responses; only changed fields for device.info.changed.",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "fields": {
+          "items": {
+            "$ref": "#/$defs/InfoField"
+          },
+          "maxItems": 28,
+          "type": "array"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "device_id",
+        "fields"
+      ],
+      "type": "object"
+    },
+    "DeviceKind": {
+      "description": "Discovery hint from advertised BLE Appearance or Classic Class of Device.\nUnknown includes devices whose advertised metadata does not identify an input type.",
+      "enum": [
+        "unknown",
+        "keyboard",
+        "mouse",
+        "keyboard_mouse"
+      ],
+      "type": "string"
+    },
+    "DeviceListEnd": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "DeviceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        }
+      },
+      "required": [
+        "device_id"
+      ],
+      "type": "object"
+    },
+    "DeviceRemoved": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "removed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "device_id",
+        "removed"
+      ],
+      "type": "object"
+    },
+    "DeviceResult": {
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "$ref": "#/$defs/Device"
+        }
+      },
+      "required": [
+        "device"
+      ],
+      "type": "object"
+    },
+    "DeviceSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "$ref": "#/$defs/Device"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "device"
+      ],
+      "type": "object"
+    },
+    "DeviceTrusted": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "trusted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "device_id",
+        "trusted"
+      ],
+      "type": "object"
+    },
+    "DeviceUnpaired": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "device_id"
+      ],
+      "type": "object"
+    },
+    "DisabledReason": {
+      "description": "Why a saved device is not effectively enabled, in precedence order.",
+      "enum": [
+        "unsupported_transport",
+        "invalid",
+        "blocked",
+        "disabled",
+        "capacity"
+      ],
+      "type": "string"
+    },
+    "DisconnectReason": {
+      "enum": [
+        "requested",
+        "remote",
+        "link_loss",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "Empty": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "Enabled": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "EnabledCapacity": {
+      "description": "One native constraint on ordinarily enabled bonds. `limit` excludes the\nentry reserved for temporary pairing.",
+      "properties": {
+        "enabled": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "limit": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transports": {
+          "items": {
+            "$ref": "#/$defs/Transport"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "transports",
+        "limit",
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "Machine codes only. Human explanations belong to the host application.",
+      "enum": [
+        "invalid_request",
+        "invalid_json",
+        "message_too_large",
+        "unsupported_version",
+        "unknown_command",
+        "invalid_args",
+        "busy",
+        "not_found",
+        "blocked",
+        "heartbeat_required",
+        "client_timeout",
+        "candidate_expired",
+        "disabled",
+        "pairing_required",
+        "capacity",
+        "unsupported_hid",
+        "unsupported_transport",
+        "authentication_failed",
+        "authentication_rejected",
+        "stale_prompt",
+        "connection_failed",
+        "radio_unavailable",
+        "input_overflow",
+        "storage_failed",
+        "storage_changed",
+        "storage_full",
+        "timeout",
+        "cancelled",
+        "not_pending",
+        "not_cancellable",
+        "session_fault",
+        "internal_error",
+        "not_connected",
+        "read_only",
+        "hidpp_disabled",
+        "settings_unavailable",
+        "unsupported_setting",
+        "settings_limit",
+        "settings_apply_failed",
+        "settings_refresh_failed",
+        "feature_set_unavailable",
+        "readback_mismatch",
+        "backlight_mode_selection_required",
+        "backlight_permanent_manual_required",
+        "native_routing_required",
+        "native_standard_resolution_required",
+        "hidpp_reports_unavailable",
+        "hidpp_protocol_unsupported",
+        "hidpp_reset_unavailable",
+        "hidpp_controls_unavailable",
+        "hidpp_timeout",
+        "hidpp_transport_error",
+        "hidpp_device_error",
+        "hidpp_invalid_response"
+      ],
+      "type": "string"
+    },
+    "ErrorDetails": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MutationDetails"
+        },
+        {
+          "$ref": "#/$defs/CapacityDetails"
+        },
+        {
+          "$ref": "#/$defs/ExistingDeviceDetails"
+        },
+        {
+          "$ref": "#/$defs/SettingsSummary"
+        }
+      ]
+    },
+    "Event": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/adapter.changed.event"
+        },
+        {
+          "$ref": "#/$defs/device.info.changed.event"
+        },
+        {
+          "$ref": "#/$defs/device.changed.event"
+        },
+        {
+          "$ref": "#/$defs/device.paired.event"
+        },
+        {
+          "$ref": "#/$defs/device.connected.event"
+        },
+        {
+          "$ref": "#/$defs/device.disconnected.event"
+        },
+        {
+          "$ref": "#/$defs/device.unpaired.event"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.changed.event"
+        },
+        {
+          "$ref": "#/$defs/discovery.result.event"
+        },
+        {
+          "$ref": "#/$defs/pairing.prompt.event"
+        },
+        {
+          "$ref": "#/$defs/pairing.display.event"
+        },
+        {
+          "$ref": "#/$defs/events.lost.event"
+        },
+        {
+          "$ref": "#/$defs/protocol.error.event"
+        }
+      ]
+    },
+    "ExistingDeviceDetails": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        }
+      },
+      "required": [
+        "device_id"
+      ],
+      "type": "object"
+    },
+    "ExistingDeviceError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "details": {
+          "$ref": "#/$defs/ExistingDeviceDetails"
+        }
+      },
+      "required": [
+        "code",
+        "details"
+      ],
+      "type": "object"
+    },
+    "Feature": {
+      "properties": {
+        "flags": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "id": {
+          "$ref": "#/$defs/FeatureId"
+        },
+        "index": {
+          "$ref": "#/$defs/FeatureIndex"
+        },
+        "supported": {
+          "description": "The firmware has a usable handler; not a device-provided flag.",
+          "type": "boolean"
+        },
+        "version": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "index",
+        "id",
+        "version",
+        "flags",
+        "supported"
+      ],
+      "type": "object"
+    },
+    "FeatureChunk": {
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "feature": {
+          "$ref": "#/$defs/Feature"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "device_id",
+        "feature"
+      ],
+      "type": "object"
+    },
+    "FeatureId": {
+      "description": "Stable protocol feature number, independent of each device's feature table.",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "FeatureIndex": {
+      "description": "Index assigned by the connected peripheral, not a feature number.",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "FileEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "$ref": "#/$defs/FileType"
+        }
+      },
+      "required": [
+        "name",
+        "type",
+        "size"
+      ],
+      "type": "object"
+    },
+    "FileType": {
+      "enum": [
+        "file",
+        "directory"
+      ],
+      "type": "string"
+    },
+    "Filter": {
+      "enum": [
+        "saved",
+        "paired",
+        "connected"
+      ],
+      "type": "string"
+    },
+    "GattWriteDiagnostic": {
+      "description": "Development-only recent GATT writes for up to four tokens; no report payloads.",
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "completed_ms": {
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "handle": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "queued_ms": {
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "request": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "response": {
+          "type": "boolean"
+        },
+        "started_ms": {
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "format": "int32",
+          "maximum": 2147483647,
+          "minimum": -2147483648,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "token": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "token",
+        "request",
+        "handle",
+        "response",
+        "accepted",
+        "queued_ms",
+        "started_ms",
+        "completed_ms",
+        "status"
+      ],
+      "type": "object"
+    },
+    "Heartbeat": {
+      "properties": {
+        "interval_ms": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_ms": {
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "interval_ms",
+        "timeout_ms",
+        "remaining_ms"
+      ],
+      "type": "object"
+    },
+    "HeartbeatResult": {
+      "additionalProperties": false,
+      "properties": {
+        "monitor": {
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "timeout_ms",
+        "monitor"
+      ],
+      "type": "object"
+    },
+    "HostPlatform": {
+      "enum": [
+        "linux",
+        "windows",
+        "mac"
+      ],
+      "type": "string"
+    },
+    "InfoField": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "name"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "description": "At most 64 UTF-8 bytes; no control characters.",
+                    "maxLength": 64,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "kind"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "enum": [
+                      "keyboard",
+                      "mouse",
+                      "keyboard_mouse",
+                      "other"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "manufacturer"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "description": "At most 64 UTF-8 bytes; no control characters.",
+                    "maxLength": 64,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "model"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "description": "At most 64 UTF-8 bytes; no control characters.",
+                    "maxLength": 64,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "serial"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "description": "At most 64 UTF-8 bytes; no control characters.",
+                    "maxLength": 64,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 1
+                },
+                "key": {
+                  "const": "firmware"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "description": "At most 64 UTF-8 bytes; no control characters.",
+                    "maxLength": 64,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "hardware"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "description": "At most 64 UTF-8 bytes; no control characters.",
+                    "maxLength": 64,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "software"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "description": "At most 64 UTF-8 bytes; no control characters.",
+                    "maxLength": 64,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "vendor_id_namespace"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "enum": [
+                      "usb",
+                      "bluetooth"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "vendor_id"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "maximum": 65535,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "product_id"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "maximum": 65535,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "product_version"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "maximum": 65535,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "battery_percent"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "maximum": 100,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                }
+              }
+            },
+            {
+              "else": {
+                "properties": {
+                  "fresh": {
+                    "const": false
+                  },
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "if": {
+                "properties": {
+                  "available": {
+                    "const": true
+                  }
+                }
+              },
+              "properties": {
+                "instance": {
+                  "maximum": 0
+                },
+                "key": {
+                  "const": "battery_charging"
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "fresh": {
+          "type": "boolean"
+        },
+        "instance": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "key": {
+          "$ref": "#/$defs/InfoKey"
+        },
+        "value": {
+          "$ref": "#/$defs/SettingValue"
+        }
+      },
+      "required": [
+        "key",
+        "instance",
+        "value",
+        "available",
+        "fresh"
+      ],
+      "type": "object"
+    },
+    "InfoKey": {
+      "enum": [
+        "name",
+        "kind",
+        "manufacturer",
+        "model",
+        "serial",
+        "firmware",
+        "hardware",
+        "software",
+        "vendor_id_namespace",
+        "vendor_id",
+        "product_id",
+        "product_version",
+        "battery_percent",
+        "battery_charging"
+      ],
+      "type": "string"
+    },
+    "Limits": {
+      "properties": {
+        "active_connections": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hidpp_features": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hidpp_firmware_entities": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hidpp_saved_settings": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hidpp_sensors": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hidpp_setting_choices": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hidpp_settings": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_line_bytes": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_pending_requests": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "saved_devices": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scan_candidates": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_line_bytes",
+        "max_pending_requests",
+        "saved_devices",
+        "active_connections",
+        "scan_candidates",
+        "hidpp_settings",
+        "hidpp_saved_settings",
+        "hidpp_sensors",
+        "hidpp_firmware_entities",
+        "hidpp_setting_choices",
+        "hidpp_features"
+      ],
+      "type": "object"
+    },
+    "LostEvents": {
+      "additionalProperties": false,
+      "properties": {
+        "dropped": {
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dropped",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "MonitorResult": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "enabled",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "MutationDetails": {
+      "additionalProperties": false,
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/StorageOutcome"
+        }
+      },
+      "required": [
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "NimbleAuthenticationStage": {
+      "enum": [
+        "initiate",
+        "encryption",
+        "security_state",
+        "prompt",
+        "inject",
+        "reply"
+      ],
+      "type": "string"
+    },
+    "NormalizationState": {
+      "enum": [
+        "off",
+        "pending",
+        "probing",
+        "resetting",
+        "configuring",
+        "active",
+        "unsupported",
+        "error"
+      ],
+      "type": "string"
+    },
+    "ObservationSource": {
+      "enum": [
+        "read",
+        "event"
+      ],
+      "type": "string"
+    },
+    "Pair": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_id": {
+          "$ref": "#/$defs/CandidateId"
+        },
+        "timeout_ms": {
+          "default": 120000,
+          "maximum": 180000,
+          "minimum": 1000,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "candidate_id"
+      ],
+      "type": "object"
+    },
+    "PairAction": {
+      "enum": [
+        "accept",
+        "reject"
+      ],
+      "type": "string"
+    },
+    "PairReply": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/PairAction"
+        },
+        "prompt_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "value": {
+          "maxLength": 16,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "request_id",
+        "prompt_id",
+        "action"
+      ],
+      "type": "object"
+    },
+    "PairReplyResult": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "type": "object"
+    },
+    "PairUnavailable": {
+      "description": "Why status reports Pair unavailable for a transport.",
+      "enum": [
+        "storage_full",
+        "setup_capacity",
+        "connections_full",
+        "pairing_active",
+        "radio_unavailable",
+        "storage_unavailable"
+      ],
+      "type": "string"
+    },
+    "PairingCapacity": {
+      "description": "Advisory per-transport pairing admission. Estimates share resources and\nmust not be added together.",
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "estimated_additional": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PairUnavailable"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        }
+      },
+      "required": [
+        "transport",
+        "available",
+        "reason",
+        "estimated_additional"
+      ],
+      "type": "object"
+    },
+    "PairingState": {
+      "enum": [
+        "paired",
+        "needs_pairing"
+      ],
+      "type": "string"
+    },
+    "PendingRequest": {
+      "properties": {
+        "candidate_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CandidateId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cmd": {
+          "type": "string"
+        },
+        "device_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "required": [
+        "id",
+        "cmd"
+      ],
+      "type": "object"
+    },
+    "Platform": {
+      "additionalProperties": false,
+      "properties": {
+        "platform": {
+          "$ref": "#/$defs/HostPlatform"
+        }
+      },
+      "required": [
+        "platform"
+      ],
+      "type": "object"
+    },
+    "Prompt": {
+      "properties": {
+        "candidate_id": {
+          "$ref": "#/$defs/CandidateId"
+        },
+        "expires_in_ms": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "method": {
+          "$ref": "#/$defs/PromptMethod"
+        },
+        "prompt_id": {
+          "pattern": "^[!-~]{1,64}$",
+          "type": "string"
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "candidate_id",
+        "prompt_id",
+        "method",
+        "expires_in_ms"
+      ],
+      "type": "object"
+    },
+    "PromptMethod": {
+      "enum": [
+        "confirm_passkey",
+        "enter_passkey",
+        "enter_pin",
+        "passkey",
+        "pin"
+      ],
+      "type": "string"
+    },
+    "ProtocolError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "supplied_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": "object"
+    },
+    "ReadyResult": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "initializing",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "ready",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/Status"
+            }
+          },
+          "required": [
+            "state",
+            "status"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Reconnect": {
+      "enum": [
+        "auto",
+        "paused"
+      ],
+      "type": "string"
+    },
+    "Request": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/adapter.status.request"
+        },
+        {
+          "$ref": "#/$defs/adapter.capabilities.request"
+        },
+        {
+          "$ref": "#/$defs/adapter.wait_ready.request"
+        },
+        {
+          "$ref": "#/$defs/session.heartbeat.request"
+        },
+        {
+          "$ref": "#/$defs/adapter.bootloader.enter.request"
+        },
+        {
+          "$ref": "#/$defs/storage.list.request"
+        },
+        {
+          "$ref": "#/$defs/storage.read.request"
+        },
+        {
+          "$ref": "#/$defs/session.monitor.set.request"
+        },
+        {
+          "$ref": "#/$defs/device.list.request"
+        },
+        {
+          "$ref": "#/$defs/device.get.request"
+        },
+        {
+          "$ref": "#/$defs/device.info.request"
+        },
+        {
+          "$ref": "#/$defs/device.info.refresh.request"
+        },
+        {
+          "$ref": "#/$defs/discovery.scan.request"
+        },
+        {
+          "$ref": "#/$defs/pairing.start.request"
+        },
+        {
+          "$ref": "#/$defs/pairing.reply.request"
+        },
+        {
+          "$ref": "#/$defs/device.connect.request"
+        },
+        {
+          "$ref": "#/$defs/device.disconnect.request"
+        },
+        {
+          "$ref": "#/$defs/device.unpair.request"
+        },
+        {
+          "$ref": "#/$defs/device.hidpp.set.request"
+        },
+        {
+          "$ref": "#/$defs/device.enabled.set.request"
+        },
+        {
+          "$ref": "#/$defs/device.trusted.set.request"
+        },
+        {
+          "$ref": "#/$defs/device.blocked.set.request"
+        },
+        {
+          "$ref": "#/$defs/adapter.platform.set.request"
+        },
+        {
+          "$ref": "#/$defs/adapter.name.set.request"
+        },
+        {
+          "$ref": "#/$defs/hidpp.feature.list.request"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.list.request"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.get.request"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.set.request"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.forget.request"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.refresh.request"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.apply.request"
+        },
+        {
+          "$ref": "#/$defs/request.cancel.request"
+        }
+      ]
+    },
+    "RequestId": {
+      "maximum": 2147483647,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "RequestRef": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        }
+      },
+      "required": [
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "Response": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/adapter.status.response"
+        },
+        {
+          "$ref": "#/$defs/adapter.capabilities.response"
+        },
+        {
+          "$ref": "#/$defs/adapter.wait_ready.response"
+        },
+        {
+          "$ref": "#/$defs/session.heartbeat.response"
+        },
+        {
+          "$ref": "#/$defs/adapter.bootloader.enter.response"
+        },
+        {
+          "$ref": "#/$defs/storage.list.response"
+        },
+        {
+          "$ref": "#/$defs/storage.read.response"
+        },
+        {
+          "$ref": "#/$defs/session.monitor.set.response"
+        },
+        {
+          "$ref": "#/$defs/device.list.response"
+        },
+        {
+          "$ref": "#/$defs/device.get.response"
+        },
+        {
+          "$ref": "#/$defs/device.info.response"
+        },
+        {
+          "$ref": "#/$defs/device.info.refresh.response"
+        },
+        {
+          "$ref": "#/$defs/discovery.scan.response"
+        },
+        {
+          "$ref": "#/$defs/pairing.start.response"
+        },
+        {
+          "$ref": "#/$defs/pairing.reply.response"
+        },
+        {
+          "$ref": "#/$defs/device.connect.response"
+        },
+        {
+          "$ref": "#/$defs/device.disconnect.response"
+        },
+        {
+          "$ref": "#/$defs/device.unpair.response"
+        },
+        {
+          "$ref": "#/$defs/device.hidpp.set.response"
+        },
+        {
+          "$ref": "#/$defs/device.enabled.set.response"
+        },
+        {
+          "$ref": "#/$defs/device.trusted.set.response"
+        },
+        {
+          "$ref": "#/$defs/device.blocked.set.response"
+        },
+        {
+          "$ref": "#/$defs/adapter.platform.set.response"
+        },
+        {
+          "$ref": "#/$defs/adapter.name.set.response"
+        },
+        {
+          "$ref": "#/$defs/hidpp.feature.list.response"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.list.response"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.get.response"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.set.response"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.forget.response"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.refresh.response"
+        },
+        {
+          "$ref": "#/$defs/hidpp.setting.apply.response"
+        },
+        {
+          "$ref": "#/$defs/request.cancel.response"
+        }
+      ]
+    },
+    "Role": {
+      "enum": [
+        "keyboard",
+        "mouse",
+        "consumer_control"
+      ],
+      "type": "string"
+    },
+    "Scan": {
+      "additionalProperties": false,
+      "properties": {
+        "duration_ms": {
+          "anyOf": [
+            {
+              "const": 0
+            },
+            {
+              "maximum": 60000,
+              "minimum": 1000,
+              "type": "integer"
+            }
+          ],
+          "default": 10000
+        },
+        "transport": {
+          "$ref": "#/$defs/ScanTransport",
+          "default": "both"
+        }
+      },
+      "type": "object"
+    },
+    "ScanEnd": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "count",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "ScanTransport": {
+      "enum": [
+        "both",
+        "classic",
+        "ble"
+      ],
+      "type": "string"
+    },
+    "Setting": {
+      "properties": {
+        "choices": {
+          "items": {
+            "$ref": "#/$defs/SettingValue"
+          },
+          "type": "array"
+        },
+        "desired": {
+          "$ref": "#/$defs/SettingValue"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "feature": {
+          "$ref": "#/$defs/FeatureId"
+        },
+        "feature_version": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fresh": {
+          "type": "boolean"
+        },
+        "key": {
+          "$ref": "#/$defs/SettingKey"
+        },
+        "managed": {
+          "type": "boolean"
+        },
+        "max": {
+          "format": "int64",
+          "maximum": 9223372036854775807,
+          "minimum": -9223372036854775808,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min": {
+          "format": "int64",
+          "maximum": 9223372036854775807,
+          "minimum": -9223372036854775808,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "observation_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ObservationSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observed": {
+          "$ref": "#/$defs/SettingValue"
+        },
+        "observed_at_ms": {
+          "format": "uint64",
+          "maximum": 18446744073709551615,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scope": {
+          "$ref": "#/$defs/SettingScope"
+        },
+        "state": {
+          "$ref": "#/$defs/SettingState"
+        },
+        "step": {
+          "format": "int64",
+          "maximum": 9223372036854775807,
+          "minimum": -9223372036854775808,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/SettingType"
+        },
+        "writable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key",
+        "type",
+        "writable",
+        "feature",
+        "feature_version",
+        "scope",
+        "choices",
+        "min",
+        "max",
+        "step",
+        "managed",
+        "desired",
+        "observed",
+        "fresh",
+        "observed_at_ms",
+        "observation_source",
+        "state",
+        "error"
+      ],
+      "type": "object"
+    },
+    "SettingChunk": {
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "setting": {
+          "$ref": "#/$defs/Setting"
+        }
+      },
+      "required": [
+        "revision",
+        "device_id",
+        "setting"
+      ],
+      "type": "object"
+    },
+    "SettingKey": {
+      "description": "Explicit codes: persisted setting-record keys use them, so never renumber.",
+      "enum": [
+        "fn.row_default",
+        "backlight.enabled",
+        "backlight.mode",
+        "backlight.level",
+        "backlight.delay.hands_out",
+        "backlight.delay.hands_in",
+        "backlight.delay.powered",
+        "pointer.dpi.0",
+        "pointer.dpi.1",
+        "wheel.mode",
+        "wheel.threshold",
+        "wheel.invert",
+        "thumbwheel.invert",
+        "backlight.power_on",
+        "backlight.crown",
+        "backlight.power_save",
+        "backlight.effect",
+        "backlight.current_level",
+        "backlight.status",
+        "wheel.info"
+      ],
+      "type": "string"
+    },
+    "SettingOutcome": {
+      "enum": [
+        "read",
+        "applied",
+        "unchanged",
+        "unsupported",
+        "failed",
+        "uncertain"
+      ],
+      "type": "string"
+    },
+    "SettingOutcomeChunk": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "outcome": {
+          "$ref": "#/$defs/SettingOutcome"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "setting": {
+          "$ref": "#/$defs/Setting"
+        }
+      },
+      "required": [
+        "revision",
+        "device_id",
+        "setting",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "SettingRef": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "key": {
+          "pattern": "^[a-z0-9._-]{1,64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_id",
+        "key"
+      ],
+      "type": "object"
+    },
+    "SettingScope": {
+      "enum": [
+        "device",
+        "current_host"
+      ],
+      "type": "string"
+    },
+    "SettingSet": {
+      "additionalProperties": false,
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "key": {
+          "pattern": "^[a-z0-9._-]{1,64}$",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            }
+          ]
+        }
+      },
+      "required": [
+        "device_id",
+        "key",
+        "value"
+      ],
+      "type": "object"
+    },
+    "SettingState": {
+      "enum": [
+        "unmanaged",
+        "pending",
+        "applying",
+        "applied",
+        "changed_on_device",
+        "unsupported",
+        "error",
+        "uncertain"
+      ],
+      "type": "string"
+    },
+    "SettingType": {
+      "enum": [
+        "bool",
+        "integer",
+        "enum",
+        "text"
+      ],
+      "type": "string"
+    },
+    "SettingValue": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        }
+      ]
+    },
+    "SettingsApplyError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "settings_apply_failed",
+            "not_connected"
+          ]
+        },
+        "details": {
+          "$ref": "#/$defs/SettingsSummary"
+        }
+      },
+      "required": [
+        "code",
+        "details"
+      ],
+      "type": "object"
+    },
+    "SettingsListEnd": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "settings_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorCode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "settings_state": {
+          "$ref": "#/$defs/SettingsState"
+        }
+      },
+      "required": [
+        "revision",
+        "device_id",
+        "count",
+        "settings_state",
+        "settings_error"
+      ],
+      "type": "object"
+    },
+    "SettingsRefreshError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "settings_refresh_failed",
+            "not_connected"
+          ]
+        },
+        "details": {
+          "$ref": "#/$defs/SettingsSummary"
+        }
+      },
+      "required": [
+        "code",
+        "details"
+      ],
+      "type": "object"
+    },
+    "SettingsState": {
+      "enum": [
+        "off",
+        "pending",
+        "discovering",
+        "ready",
+        "applying",
+        "unsupported",
+        "error"
+      ],
+      "type": "string"
+    },
+    "SettingsSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "applied": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "failed": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "read": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "uncertain": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unchanged": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unsupported": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "device_id",
+        "count",
+        "read",
+        "applied",
+        "unchanged",
+        "unsupported",
+        "failed",
+        "uncertain"
+      ],
+      "type": "object"
+    },
+    "Status": {
+      "properties": {
+        "adapter_id": {
+          "type": "string"
+        },
+        "authentication_failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthenticationFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "boot_id": {
+          "type": "string"
+        },
+        "build_profile": {
+          "$ref": "#/$defs/BuildProfile"
+        },
+        "capacity": {
+          "$ref": "#/$defs/Capacity"
+        },
+        "counts": {
+          "$ref": "#/$defs/Counts"
+        },
+        "firmware_version": {
+          "type": "string"
+        },
+        "gatt_writes": {
+          "items": {
+            "$ref": "#/$defs/GattWriteDiagnostic"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "hardware_config": {
+          "type": "string"
+        },
+        "hardware_digest": {
+          "type": "string"
+        },
+        "heartbeat": {
+          "$ref": "#/$defs/Heartbeat"
+        },
+        "host_platform": {
+          "$ref": "#/$defs/HostPlatform"
+        },
+        "limits": {
+          "$ref": "#/$defs/Limits"
+        },
+        "monitor": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "pending": {
+          "items": {
+            "$ref": "#/$defs/PendingRequest"
+          },
+          "type": "array"
+        },
+        "protocol": {
+          "const": 1
+        },
+        "radio_backend": {
+          "type": "string"
+        },
+        "radio_ready": {
+          "type": "boolean"
+        },
+        "revision": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "storage_ready": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "protocol",
+        "firmware_version",
+        "hardware_config",
+        "name",
+        "hardware_digest",
+        "radio_backend",
+        "adapter_id",
+        "build_profile",
+        "boot_id",
+        "session_id",
+        "limits",
+        "counts",
+        "capacity",
+        "revision",
+        "host_platform",
+        "monitor",
+        "radio_ready",
+        "storage_ready",
+        "heartbeat",
+        "pending"
+      ],
+      "type": "object"
+    },
+    "StorageChunk": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "if": {
+            "minLength": 684
+          },
+          "maxLength": 684,
+          "minLength": 4,
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/][AQgw]==|[A-Za-z0-9+/]{2}[AEIMQUYcgkosw048]=)?$",
+          "then": {
+            "pattern": "=$"
+          },
+          "type": "string"
+        },
+        "offset": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "offset",
+        "data"
+      ],
+      "type": "object"
+    },
+    "StorageListEnd": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count"
+      ],
+      "type": "object"
+    },
+    "StorageMutationError": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "storage_failed",
+            "storage_full"
+          ]
+        },
+        "details": {
+          "$ref": "#/$defs/MutationDetails"
+        }
+      },
+      "required": [
+        "code",
+        "details"
+      ],
+      "type": "object"
+    },
+    "StorageOutcome": {
+      "description": "`details.outcome` of a `storage_failed` error; absent means not saved.",
+      "enum": [
+        "not_saved",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "StoragePath": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "maxLength": 255,
+          "pattern": "^(?!.*(?:^|/)\\.{1,2}(?:/|$))/[ -~]*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "StorageReadEnd": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "Transport": {
+      "enum": [
+        "classic",
+        "ble"
+      ],
+      "type": "string"
+    },
+    "ValidationError": {
+      "description": "Structured stored-record validation problem for a saved device.",
+      "enum": [
+        "bond_missing",
+        "bond_corrupt",
+        "bond_mismatch",
+        "device_corrupt",
+        "read_failed"
+      ],
+      "type": "string"
+    },
+    "WarningCode": {
+      "enum": [
+        "led_output_unavailable",
+        "unsupported_fields"
+      ],
+      "type": "string"
+    },
+    "WireError": {
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "details": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorDetails"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "type": "object"
+    },
+    "adapter.bootloader.enter.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "adapter.bootloader.enter.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/Empty"
+        },
+        "cmd": {
+          "const": "adapter.bootloader.enter"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "adapter.bootloader.enter.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/BootloaderResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/adapter.bootloader.enter.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "adapter.capabilities.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "adapter.capabilities.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/Empty"
+        },
+        "cmd": {
+          "const": "adapter.capabilities"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "adapter.capabilities.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/Capabilities"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/adapter.capabilities.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "adapter.changed.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/AdapterSettings"
+        },
+        "event": {
+          "const": "adapter.changed"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "adapter.name.set.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "adapter.name.set.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/AdapterName"
+        },
+        "cmd": {
+          "const": "adapter.name.set"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "adapter.name.set.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/AdapterSettings"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/adapter.name.set.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "adapter.platform.set.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "adapter.platform.set.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/Platform"
+        },
+        "cmd": {
+          "const": "adapter.platform.set"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "adapter.platform.set.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/AdapterSettings"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/adapter.platform.set.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "adapter.status.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "adapter.status.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/Empty"
+        },
+        "cmd": {
+          "const": "adapter.status"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "adapter.status.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/Status"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/adapter.status.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "adapter.wait_ready.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "adapter.wait_ready.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/Empty"
+        },
+        "cmd": {
+          "const": "adapter.wait_ready"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "adapter.wait_ready.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/ReadyResult"
+                },
+                {
+                  "properties": {
+                    "state": {
+                      "const": "ready"
+                    }
+                  }
+                }
+              ]
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/adapter.wait_ready.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": false
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "additionalProperties": false,
+              "properties": {
+                "state": {
+                  "const": "initializing"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "type": "object"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.blocked.set.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        },
+        {
+          "$ref": "#/$defs/CapacityError"
+        }
+      ]
+    },
+    "device.blocked.set.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceBlocked"
+        },
+        "cmd": {
+          "const": "device.blocked.set"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.blocked.set.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.blocked.set.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.changed.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/DeviceSnapshot"
+        },
+        "event": {
+          "const": "device.changed"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "device.connect.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        },
+        {
+          "$ref": "#/$defs/CapacityError"
+        }
+      ]
+    },
+    "device.connect.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/Connect"
+        },
+        "cmd": {
+          "const": "device.connect"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.connect.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.connect.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.connected.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/DeviceSnapshot"
+        },
+        "event": {
+          "const": "device.connected"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "device.disconnect.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "device.disconnect.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceRef"
+        },
+        "cmd": {
+          "const": "device.disconnect"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.disconnect.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.disconnect.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.disconnected.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/DeviceDisconnected"
+        },
+        "event": {
+          "const": "device.disconnected"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "device.enabled.set.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        },
+        {
+          "$ref": "#/$defs/CapacityError"
+        }
+      ]
+    },
+    "device.enabled.set.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceEnabled"
+        },
+        "cmd": {
+          "const": "device.enabled.set"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.enabled.set.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.enabled.set.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.get.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "device.get.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceRef"
+        },
+        "cmd": {
+          "const": "device.get"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.get.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceSnapshot"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.get.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.hidpp.set.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "device.hidpp.set.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceEnabled"
+        },
+        "cmd": {
+          "const": "device.hidpp.set"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.hidpp.set.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.hidpp.set.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.info.changed.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/DeviceInfo"
+        },
+        "event": {
+          "const": "device.info.changed"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "device.info.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "device.info.refresh.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "device.info.refresh.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceRef"
+        },
+        "cmd": {
+          "const": "device.info.refresh"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.info.refresh.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceInfo"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.info.refresh.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.info.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceRef"
+        },
+        "cmd": {
+          "const": "device.info"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.info.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceInfo"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.info.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.list.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "device.list.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceFilter"
+        },
+        "cmd": {
+          "const": "device.list"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.list.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceListEnd"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.list.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": false
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceSnapshot"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.paired.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/DeviceSnapshot"
+        },
+        "event": {
+          "const": "device.paired"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "device.trusted.set.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "device.trusted.set.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceTrusted"
+        },
+        "cmd": {
+          "const": "device.trusted.set"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.trusted.set.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.trusted.set.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.unpair.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "device.unpair.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceRef"
+        },
+        "cmd": {
+          "const": "device.unpair"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "device.unpair.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceRemoved"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/device.unpair.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "device.unpaired.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/DeviceUnpaired"
+        },
+        "event": {
+          "const": "device.unpaired"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "discovery.result.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/Candidate"
+        },
+        "event": {
+          "const": "discovery.result"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "discovery.scan.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "discovery.scan.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/Scan"
+        },
+        "cmd": {
+          "const": "discovery.scan"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "discovery.scan.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/ScanEnd"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/discovery.scan.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "events.lost.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/LostEvents"
+        },
+        "event": {
+          "const": "events.lost"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "hidpp.feature.list.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "hidpp.feature.list.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceRef"
+        },
+        "cmd": {
+          "const": "hidpp.feature.list"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "hidpp.feature.list.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/SettingsListEnd"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/hidpp.feature.list.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": false
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/FeatureChunk"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "hidpp.setting.apply.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        },
+        {
+          "$ref": "#/$defs/SettingsApplyError"
+        }
+      ]
+    },
+    "hidpp.setting.apply.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceRef"
+        },
+        "cmd": {
+          "const": "hidpp.setting.apply"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "hidpp.setting.apply.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/SettingsSummary"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/hidpp.setting.apply.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": false
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/SettingOutcomeChunk"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "hidpp.setting.changed.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/SettingChunk"
+        },
+        "event": {
+          "const": "hidpp.setting.changed"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "hidpp.setting.forget.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "hidpp.setting.forget.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/SettingRef"
+        },
+        "cmd": {
+          "const": "hidpp.setting.forget"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "hidpp.setting.forget.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/SettingChunk"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/hidpp.setting.forget.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "hidpp.setting.get.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "hidpp.setting.get.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/SettingRef"
+        },
+        "cmd": {
+          "const": "hidpp.setting.get"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "hidpp.setting.get.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/SettingChunk"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/hidpp.setting.get.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "hidpp.setting.list.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "hidpp.setting.list.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceRef"
+        },
+        "cmd": {
+          "const": "hidpp.setting.list"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "hidpp.setting.list.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/SettingsListEnd"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/hidpp.setting.list.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": false
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/SettingChunk"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "hidpp.setting.refresh.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        },
+        {
+          "$ref": "#/$defs/SettingsRefreshError"
+        }
+      ]
+    },
+    "hidpp.setting.refresh.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/DeviceRef"
+        },
+        "cmd": {
+          "const": "hidpp.setting.refresh"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "hidpp.setting.refresh.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/SettingsSummary"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/hidpp.setting.refresh.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": false
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/SettingOutcomeChunk"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "hidpp.setting.set.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "hidpp.setting.set.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/SettingSet"
+        },
+        "cmd": {
+          "const": "hidpp.setting.set"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "hidpp.setting.set.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/SettingChunk"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/hidpp.setting.set.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "pairing.display.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/Prompt"
+        },
+        "event": {
+          "const": "pairing.display"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "pairing.prompt.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/Prompt"
+        },
+        "event": {
+          "const": "pairing.prompt"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "pairing.reply.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "pairing.reply.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/PairReply"
+        },
+        "cmd": {
+          "const": "pairing.reply"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "pairing.reply.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/PairReplyResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/pairing.reply.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "pairing.start.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        },
+        {
+          "$ref": "#/$defs/CapacityError"
+        },
+        {
+          "$ref": "#/$defs/ExistingDeviceError"
+        }
+      ]
+    },
+    "pairing.start.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/Pair"
+        },
+        "cmd": {
+          "const": "pairing.start"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "pairing.start.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/DeviceResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/pairing.start.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "protocol.error.event": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/ProtocolError"
+        },
+        "event": {
+          "const": "protocol.error"
+        },
+        "request_id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "type": {
+          "const": "event"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "type",
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "request.cancel.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "request.cancel.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/RequestRef"
+        },
+        "cmd": {
+          "const": "request.cancel"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "request.cancel.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/CancelResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/request.cancel.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "session.heartbeat.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "session.heartbeat.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/Empty"
+        },
+        "cmd": {
+          "const": "session.heartbeat"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "session.heartbeat.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/HeartbeatResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/session.heartbeat.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "session.monitor.set.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "session.monitor.set.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/Enabled"
+        },
+        "cmd": {
+          "const": "session.monitor.set"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "session.monitor.set.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/MonitorResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/session.monitor.set.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "storage.list.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "storage.list.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/StoragePath"
+        },
+        "cmd": {
+          "const": "storage.list"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "storage.list.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/StorageListEnd"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/storage.list.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": false
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/FileEntry"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "storage.read.error": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BareError"
+        },
+        {
+          "$ref": "#/$defs/StorageMutationError"
+        }
+      ]
+    },
+    "storage.read.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "$ref": "#/$defs/StoragePath"
+        },
+        "cmd": {
+          "const": "storage.read"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 1
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd",
+        "args"
+      ],
+      "type": "object"
+    },
+    "storage.read.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/StorageReadEnd"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "error": {
+              "$ref": "#/$defs/storage.read.error"
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": false
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": false
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/StorageChunk"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 1
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$id": "urn:cordial:wire:1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Request"
+    },
+    {
+      "$ref": "#/$defs/Response"
+    },
+    {
+      "$ref": "#/$defs/Event"
+    }
+  ],
+  "title": "Cordial serial protocol"
+}

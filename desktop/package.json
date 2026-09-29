@@ -1,0 +1,54 @@
+{
+  "name": "cordial-desktop",
+  "productName": "Cordial",
+  "version": "0.0.0",
+  "description": "Desktop manager for Cordial Bluetooth adapters",
+  "private": true,
+  "type": "module",
+  "main": "out/main/index.js",
+  "author": "Ryan Petris <ryan@petris.net>",
+  "license": "MIT",
+  "scripts": {
+    "generate": "node scripts/generate-wire.mjs",
+    "check:generated": "node scripts/generate-wire.mjs --check",
+    "icons": "node scripts/icons.mjs",
+    "typecheck": "tsc -p .",
+    "test": "vitest run",
+    "build": "node scripts/build.mjs",
+    "build:web": "node scripts/build-web.mjs",
+    "start": "node scripts/build.mjs && electron .",
+    "simulate": "node scripts/build.mjs && CORDIAL_DESKTOP_SIMULATE=2 electron .",
+    "serve": "node scripts/serve.mjs",
+    "check": "npm run check:generated && npm run typecheck && npm test",
+    "dist": "node scripts/package.mjs",
+    "package:deb": "node scripts/package.mjs --deb",
+    "package:arch": "node scripts/package.mjs --arch",
+    "dist:web": "node scripts/package-web.mjs"
+  },
+  "dependencies": {
+    "ajv": "8.20.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "serialport": "13.0.0",
+    "usb": "3.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.3",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "electron": "44.4.5",
+    "electron-builder": "26.15.3",
+    "json-schema-to-typescript": "16.0.0",
+    "playwright": "1.63.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.1",
+    "vitest": "5.0.2"
+  },
+  "desktopName": "cordial-desktop.desktop",
+  "allowScripts": {
+    "@serialport/bindings-cpp": true,
+    "electron-winstaller": true,
+    "fsevents": true
+  }
+}

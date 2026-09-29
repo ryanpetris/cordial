@@ -1,0 +1,20 @@
+pkgname=cordial-cli
+pkgver=${CORDIAL_VERSION:?Supply the release version}
+pkgrel=1
+pkgdesc='Command-line and terminal manager for Cordial Bluetooth adapters'
+arch=(x86_64)
+url=${CORDIAL_HOMEPAGE:-https://github.com/ryanpetris/cordial}
+license=(MIT)
+options=(!strip !debug)
+source=("cordial-$pkgver-linux-amd64.tar.gz")
+sha256sums=("${CORDIAL_ARCHIVE_SHA256:?Supply the release archive checksum}")
+
+package() {
+  local root="$srcdir/cordial-$pkgver-linux-amd64"
+  install -Dm755 "$root/cordial" "$pkgdir/usr/bin/cordial"
+  install -d "$pkgdir/usr/share/doc/cordial-cli"
+  cp -a "$root/docs" "$root/schema" "$root/notices" "$root/dependencies.json" "$root/DEPENDENCIES.md" "$pkgdir/usr/share/doc/cordial-cli/"
+  find "$pkgdir/usr/share/doc/cordial-cli" -type d -exec chmod 755 {} +
+  find "$pkgdir/usr/share/doc/cordial-cli" -type f -exec chmod 644 {} +
+  install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/cordial-cli/LICENSE"
+}

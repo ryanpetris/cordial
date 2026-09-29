@@ -1,0 +1,28 @@
+{
+  "name": "waveshare_rp2350b_plus_w",
+  "default_adapter_name": "RP2350B-Plus-W",
+  "chip": "rp2350",
+  "package": "b",
+  "flash_bytes": 16777216,
+  "xosc_hz": 12000000,
+  "radio": {
+    "power": 36,
+    "data": 37,
+    "clock": 39,
+    "cs": 38,
+    "led": {
+      "pin": 0,
+      "active_low": false
+    }
+  },
+  "mcu_led": {
+    "pin": 23,
+    "active_low": false
+  },
+  "bluetooth_backend": "btstack",
+  "usb_backend": "embassy",
+  "storage_backend": "littlefs",
+  "radio_backend": "pico-sdk-cyw43",
+  "firmware_bytes": 1048576,
+  "output_frames": 16
+}

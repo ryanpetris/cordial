@@ -1,0 +1,10 @@
+/build*/
+/.tools/
+/.cache/
+/dist/
+/target/
+__pycache__/
+/rust/platforms/*/target/
+
+/rust/target/
+/rust/tests/memory-arm/target/

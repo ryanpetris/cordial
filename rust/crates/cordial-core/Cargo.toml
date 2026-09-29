@@ -1,0 +1,26 @@
+[package]
+name = "cordial-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[features]
+development = []
+
+[dependencies]
+base64 = { version = "=0.22.1", default-features = false, features = ["alloc"] }
+serde-json-core = { version = "=0.6.0", default-features = false }
+aes = { version = "=0.8.4", default-features = false }
+cordial-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+heapless = { version = "=0.9.3", default-features = false }
+
+[build-dependencies]
+serde_json = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+cordial-schema = { path = "../cordial-schema" }
+embassy-futures = "=0.1.2"

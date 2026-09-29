@@ -1,0 +1,54 @@
+[package]
+name = "cordial-pico"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+license = "MIT"
+
+[workspace]
+resolver = "3"
+
+[features]
+default = ["development"]
+rp2040 = ["embassy-rp/rp2040"]
+rp235xa = ["embassy-rp/rp235xa"]
+rp235xb = ["embassy-rp/rp235xb"]
+development = ["cordial-core/development"]
+production = []
+pico-sdk-cyw43 = []
+embassy-cyw43 = ["dep:cyw43", "dep:cyw43-pio", "dep:bt-hci", "dep:embedded-io", "dep:embedded-io-async"]
+firmware = ["cordial-btstack/ffi", "cordial-btstack/classic", "embassy-rp/executor-thread", "dep:embassy-executor", "dep:cortex-m-rt"]
+
+[[bin]]
+name = "cordial-pico"
+path = "src/main.rs"
+required-features = ["firmware"]
+
+[dependencies]
+cordial-core = { path = "../../crates/cordial-core" }
+cordial-protocol = { path = "../../crates/cordial-protocol" }
+cordial-usb = { path = "../../adapters/usb" }
+cordial-record-storage = { path = "../../adapters/record-storage" }
+cordial-btstack = { path = "../../adapters/btstack" }
+embassy-rp = { version = "=0.10.0", default-features = false, features = ["rt", "time-driver", "critical-section-impl", "unstable-pac"] }
+embassy-time = "=0.5.1"
+embassy-sync = "=0.8.0"
+embassy-usb-driver = "=0.2.2"
+embassy-futures = "=0.1.2"
+cyw43 = { version = "=0.7.0", optional = true, features = ["bluetooth"] }
+cyw43-pio = { version = "=0.10.0", optional = true }
+bt-hci = { version = "=0.8.0", optional = true, default-features = false }
+embedded-io = { version = "=0.7.1", optional = true }
+embedded-io-async = { version = "=0.7.0", optional = true }
+talc = { version = "=5.1.1", features = ["counters"] }
+embassy-executor = { version = "=0.10.0", optional = true }
+cortex-m-rt = { version = "=0.7.7", optional = true }
+static_cell = "=2.1.1"
+portable-atomic = { version = "=1.15.0", features = ["critical-section"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = "s"

@@ -1,0 +1,25 @@
+{
+  "name": "pico_w",
+  "default_adapter_name": "Pico W",
+  "chip": "rp2040",
+  "package": "rp2040",
+  "flash_bytes": 2097152,
+  "xosc_hz": 12000000,
+  "radio": {
+    "power": 23,
+    "data": 24,
+    "clock": 29,
+    "cs": 25,
+    "led": {
+      "pin": 0,
+      "active_low": false
+    }
+  },
+  "mcu_led": null,
+  "bluetooth_backend": "btstack",
+  "usb_backend": "embassy",
+  "storage_backend": "littlefs",
+  "radio_backend": "pico-sdk-cyw43",
+  "firmware_bytes": 1048576,
+  "output_frames": 4
+}
