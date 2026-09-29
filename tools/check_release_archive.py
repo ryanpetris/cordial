@@ -6,7 +6,7 @@ import tarfile
 
 
 def check(path, application, version):
-    prefix = (f"cordial-{version}-linux-amd64/" if application == "cli"
+    prefix = (f"cordial-cli-{version}-linux-amd64/" if application == "cli"
               else f"cordial-desktop-{version}-x64/")
     executable = "cordial" if application == "cli" else "cordial-desktop"
     with tarfile.open(path, "r:gz") as archive:

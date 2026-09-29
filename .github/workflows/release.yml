@@ -122,7 +122,7 @@ jobs:
           pacman -S --needed --noconfirm "${depends[@]}"
           useradd -m builder
           chown -R builder .
-          runuser -u builder -- make package-desktop-arch package-cli-arch DESKTOP_ARCHIVE="build/portable/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" CLI_ARCHIVE="build/portable/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz"
+          runuser -u builder -- make package-desktop-arch package-cli-arch DESKTOP_ARCHIVE="build/portable/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" CLI_ARCHIVE="build/portable/cordial-cli-$CORDIAL_VERSION-linux-amd64.tar.gz"
       - name: Check independent installations, reinstall and removal
         run: |
           pacman -U --noconfirm build/packages/cli-arch/cordial-cli-*.pkg.tar.zst
@@ -190,7 +190,7 @@ jobs:
           cd build/portable
           sha256sum -c SHA256SUMS-linux
           cd ../..
-          make package-desktop-deb package-cli-deb DESKTOP_ARCHIVE="build/portable/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" CLI_ARCHIVE="build/portable/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz"
+          make package-desktop-deb package-cli-deb DESKTOP_ARCHIVE="build/portable/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" CLI_ARCHIVE="build/portable/cordial-cli-$CORDIAL_VERSION-linux-amd64.tar.gz"
       - name: Check independent installations, reinstall and removal
         run: |
           echo 'path-include=/usr/share/doc/cordial-*' > /etc/dpkg/dpkg.cfg.d/zz-cordial-check
@@ -316,7 +316,7 @@ jobs:
           sha256sum -c SHA256SUMS
           test -f "cordial-desktop-$CORDIAL_VERSION-x86_64.AppImage"
           test -f "cordial-desktop-$CORDIAL_VERSION-x64.tar.gz"
-          test -f "cordial-$CORDIAL_VERSION-linux-amd64.tar.gz"
+          test -f "cordial-cli-$CORDIAL_VERSION-linux-amd64.tar.gz"
           test -f "cordial-web-$CORDIAL_VERSION.tar.gz"
           for application in cordial-desktop cordial-cli; do
             test -f "$application-$CORDIAL_VERSION-1-x86_64.pkg.tar.zst"

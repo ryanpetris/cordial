@@ -60,7 +60,7 @@ package-cli-tar:
 	  *) echo 'CLI_TARGET must be x86_64-unknown-linux-musl or aarch64-unknown-linux-musl' >&2; exit 1 ;;
 	esac
 	(cd rust && cargo build --locked --release -p cordial-client --bin cordial --target $(CLI_TARGET))
-	name="cordial-$$version-linux-$$arch"
+	name="cordial-cli-$$version-linux-$$arch"
 	mkdir -p build/release
 	temporary=$$(mktemp -d "$$PWD/build/release/.cordial-XXXXXX")
 	trap 'rm -r "$$temporary"' EXIT

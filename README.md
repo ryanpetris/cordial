@@ -92,7 +92,7 @@ Choose the files marked `trixie` for Debian 13, `noble` for Ubuntu 24.04, or
 `resolute` for Ubuntu 26.04.
 
 **Other distributions:** download `cordial-desktop-*-x86_64.AppImage` for the desktop
-app, or `cordial-*-linux-amd64.tar.gz` for the command-line tool alone, and add
+app, or `cordial-cli-*-linux-amd64.tar.gz` for the command-line tool alone, and add
 yourself to the group that owns `/dev/ttyACM*`. Make the AppImage executable with
 `chmod +x` before running it. A desktop tar archive is also available as
 `cordial-desktop-*-x64.tar.gz`; extract it and run the included `cordial-desktop`.

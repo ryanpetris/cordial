@@ -22,7 +22,7 @@ if test -z "$$archive"; then
     if test '$(APP)' = desktop; then
         archive="desktop/dist/cordial-desktop-$$version-x64.tar.gz"
     else
-        archive="build/release/cordial-$$version-linux-amd64.tar.gz"
+        archive="build/release/cordial-cli-$$version-linux-amd64.tar.gz"
     fi
 fi
 epoch=$$("$(PYTHON)" tools/check_release_archive.py "$$archive" '$(APP)' "$$version")
@@ -37,7 +37,7 @@ arch:
 	command -v fakeroot >/dev/null
 	$(prepare)
 	cp "$(RECIPE)/arch/PKGBUILD" "$$output/"
-	if test '$(APP)' = desktop; then filename="cordial-desktop-$$version-x64.tar.gz"; else filename="cordial-$$version-linux-amd64.tar.gz"; fi
+	if test '$(APP)' = desktop; then filename="cordial-desktop-$$version-x64.tar.gz"; else filename="cordial-cli-$$version-linux-amd64.tar.gz"; fi
 	test "$$archive" -ef "$$output/$$filename" || cp -- "$$archive" "$$output/$$filename"
 	export CORDIAL_ARCHIVE_SHA256=$$(sha256sum "$$output/$$filename" | cut -d' ' -f1)
 	cd "$$output"

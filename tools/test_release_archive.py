@@ -15,7 +15,7 @@ class ReleaseArchives(unittest.TestCase):
             path = Path(directory) / "release.tar.gz"
             for application, root, binary in (
                 ("desktop", "cordial-desktop-1.2.3-x64", "cordial-desktop"),
-                ("cli", "cordial-1.2.3-linux-amd64", "cordial"),
+                ("cli", "cordial-cli-1.2.3-linux-amd64", "cordial"),
             ):
                 for failure in (None, "version", "architecture", "executable", "escape", "duplicate", "link", "permissions"):
                     with self.subTest(application=application, failure=failure):

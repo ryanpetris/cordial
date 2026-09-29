@@ -164,7 +164,7 @@ The tag-triggered release workflow reads `GITHUB_REF_NAME`, validates
 bundle Electron and the application's native modules.
 
 `make package-cli` builds the static Rust executable, documentation, schemas and
-dependency notices, then creates `build/release/cordial-<version>-linux-<arch>.tar.gz`.
+dependency notices, then creates `build/release/cordial-cli-<version>-linux-<arch>.tar.gz`.
 `make package-cli-tar` is the same target. The CLI has no Electron dependency.
 Install its musl target once with rustup before packaging:
 
@@ -197,7 +197,7 @@ tools or Git:
 ```sh
 export CORDIAL_VERSION=1.2.3
 make package-desktop-deb DESKTOP_ARCHIVE=cordial-desktop-1.2.3-x64.tar.gz
-make package-cli-deb CLI_ARCHIVE=cordial-1.2.3-linux-amd64.tar.gz
+make package-cli-deb CLI_ARCHIVE=cordial-cli-1.2.3-linux-amd64.tar.gz
 ```
 
 Archive versions and architectures are checked before packaging. Native desktop
