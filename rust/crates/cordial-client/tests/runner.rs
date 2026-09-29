@@ -302,3 +302,30 @@ fn storage_get_writes_exact_bytes_and_never_replaces_a_local_file() {
     );
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+#[test]
+fn storage_get_disconnect_before_completion_publishes_nothing() {
+    use base64::Engine;
+    let root =
+        std::env::temp_dir().join(format!("cordial-runner-incomplete-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let local = root.join("copy.json");
+    let (result, out) = script(
+        &["storage", "get", "/device.json", local.to_str().unwrap()],
+        b"",
+        |firmware| {
+            let request = firmware.receive();
+            assert!(matches!(request.command, Command::StorageRead(_)));
+            firmware.send(&cordial_protocol::messages::Message::<Value, ()>::success(
+                request.id,
+                json!({"offset":0,"data":base64::engine::general_purpose::STANDARD.encode(b"partial")}),
+                false,
+            ));
+        },
+    );
+    assert!(result.unwrap_err().message.contains("disconnected"));
+    assert!(!out.contains("Saved"), "{out}");
+    assert!(!local.exists());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    std::fs::remove_dir_all(root).unwrap();
+}

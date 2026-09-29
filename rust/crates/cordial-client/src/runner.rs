@@ -260,12 +260,6 @@ impl Script {
             if operation_deadline.is_some_and(|d| Instant::now() >= d) {
                 return Err(Error::new("operation timed out"));
             }
-            if prepared
-                && foreground.is_none()
-                && let Some(error) = lost.take()
-            {
-                return Err(error);
-            }
             if prepared && next.is_none() {
                 let auth = controller
                     .state()
@@ -308,6 +302,11 @@ impl Script {
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
                 }
+            }
+            if foreground.is_none()
+                && let Some(error) = lost.take()
+            {
+                return Err(error);
             }
             if prepared && let Some(line) = next.take() {
                 let (line, filter) = match line {
@@ -366,15 +365,9 @@ impl Script {
                     Phase::Ready => prepared = true,
                     Phase::Failed { error, .. } => return Err(error),
                     Phase::Lost(error) => {
-                        // A reboot acknowledgment can already be queued before the USB port closes.
-                        if pending
-                            .values()
-                            .any(|(c, _)| matches!(c, Command::Bootloader))
-                        {
-                            lost = Some(error);
-                        } else {
-                            return Err(error);
-                        }
+                        // The command worker drains received acknowledgments and
+                        // finishes local work before reporting its outcome.
+                        lost = Some(error);
                     }
                     Phase::Waiting => write_line(
                         if self.options.json { diagnostics } else { out },
