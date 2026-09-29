@@ -8,6 +8,7 @@ pub fn configure() {
         root.join("target/always-recompute-version").display()
     );
     println!("cargo:rerun-if-env-changed=CORDIAL_PYTHON");
+    println!("cargo:rerun-if-env-changed=CORDIAL_VERSION");
     let override_python = std::env::var_os("CORDIAL_PYTHON");
     let candidates: Vec<_> = override_python.map_or_else(
         || vec!["python3".into(), "python".into(), "py".into()],

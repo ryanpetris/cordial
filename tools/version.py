@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Resolve Cordial's application version without changing tracked manifests."""
 import argparse
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -12,6 +13,12 @@ VERSION = rf"(?:{RELEASE}|0\.0\.0-dev(?:\+g[0-9a-f]+(?:\.dirty)?)?)"
 
 
 def resolve(root=ROOT, release=False):
+    override = os.environ.get("CORDIAL_VERSION")
+    if override is not None:
+        if not re.fullmatch(RELEASE, override):
+            raise ValueError("CORDIAL_VERSION must be MAJOR.MINOR.PATCH without a v prefix")
+        return override
+
     def git(*args):
         return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True)
 

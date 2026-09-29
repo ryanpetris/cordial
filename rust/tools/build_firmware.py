@@ -209,7 +209,8 @@ def main():
     parser.add_argument("--profile", choices=("development", "production"), default="development")
     parser.add_argument("--output", type=Path, default=ROOT.parent / "build/firmware")
     parser.add_argument("--clippy", action="store_true")
-    parser.add_argument("--release", action="store_true", help="require a clean release tag")
+    parser.add_argument("--release", action="store_true",
+                        help="require CORDIAL_VERSION or a clean release tag")
     args = parser.parse_args()
     build(args.config.resolve(), args.profile, args.output, args.clippy, args.release)
 

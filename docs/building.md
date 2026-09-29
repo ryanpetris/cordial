@@ -137,7 +137,7 @@ Ordinary firmware updates preserve saved bonds, identities and preferences.
 ### Versioning and release packages
 
 First-party manifest versions are `0.0.0`. `tools/version.py` derives the
-application version from Git:
+application version from Git when `CORDIAL_VERSION` is unset:
 
 | Source state | Application version |
 | --- | --- |
@@ -150,17 +150,24 @@ Multiple release tags on the same commit are rejected. Direct Cargo and npm
 builds use the same resolver. Set `CORDIAL_PYTHON` to select a Python executable;
 otherwise the version launchers try `python3`, `python`, then `py -3`.
 
+Set `CORDIAL_VERSION=MAJOR.MINOR.PATCH` to supply the application version explicitly,
+including when building a source archive without Git metadata. The override takes
+precedence over Git state for all builds and packages. It accepts three nonnegative
+integers without leading zeroes or a `v` prefix.
+
 ```sh
 make version
 make package-cli
 make package-desktop
 make package-web
 make package-firmware BOARD=pico_w
+CORDIAL_VERSION=1.2.3 make package-cli
 ```
 
-Release packaging requires a clean, exactly tagged commit and leaves tracked
-manifests unchanged. CLI packages go to `build/release/`; desktop packages go to
-`desktop/dist/`. The web version goes to `build/packages/web/cordial-web-<version>/`,
+Without `CORDIAL_VERSION`, release packaging requires a clean, exactly tagged commit.
+Packaging leaves tracked manifests unchanged. CLI packages go to `build/release/`;
+desktop packages go to `desktop/dist/`. The web version goes to
+`build/packages/web/cordial-web-<version>/`,
 a directory to upload as is to a static host such as GitHub Pages or Cloudflare
 Pages; it is not part of the desktop packages. The independent distribution packages are `cordial-desktop`
 and `cordial-cli`. CLI packages include protocol documentation, schemas and
@@ -185,6 +192,8 @@ or `libarchive` on Arch. CLI packages go to `build/packages/arch/` and
 Both Make targets build the CLI release files before packaging. To package an
 existing release archive, pass `CLI_ARCHIVE=path/to/cordial-VERSION-linux-amd64.tar.gz`.
 Packaging runs under `build/packages/`; tracked recipes remain unchanged.
+For `make package-cli-arch` and `make package-cli-deb`, set `SOURCE_DATE_EPOCH`
+to the source release timestamp in Unix seconds when Git metadata is absent.
 The release workflow packages the same static CLI binary in every format.
 `python3 desktop/bootstrap.py package:arch` and `package:deb` build individual
 desktop package formats with the same homepage setting.

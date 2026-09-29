@@ -1,4 +1,5 @@
 """Version policy checks in disposable Git repositories."""
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -9,6 +10,24 @@ from version import resolve
 
 
 class Versions(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.dict(os.environ))
+        os.environ.pop("CORDIAL_VERSION", None)
+
+    def test_override_supports_source_archives_without_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("version.subprocess.run", side_effect=AssertionError("Git is not needed")):
+                for release in (False, True):
+                    for value in ("0.0.0", "1.2.3"):
+                        with self.subTest(release=release, value=value):
+                            os.environ["CORDIAL_VERSION"] = value
+                            self.assertEqual(resolve(Path(directory), release=release), value)
+                    for value in ("", "v1.2.3", "01.2.3", "1.2", "1.2.3\n", "../1.2.3", "1.2.3-rc1"):
+                        with self.subTest(release=release, value=value):
+                            os.environ["CORDIAL_VERSION"] = value
+                            with self.assertRaisesRegex(ValueError, "CORDIAL_VERSION"):
+                                resolve(Path(directory), release=release)
+
     def test_missing_git(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -41,6 +60,8 @@ class Versions(unittest.TestCase):
             git("tag", "v1.2.3")
             self.assertEqual(resolve(root, release=True), "1.2.3")
             (root / "untracked").write_text("dirty")
+            with patch.dict(os.environ, CORDIAL_VERSION="4.5.6"):
+                self.assertEqual(resolve(root, release=True), "4.5.6")
             self.assertEqual(resolve(root), development + ".dirty")
             with self.assertRaises(ValueError):
                 resolve(root, release=True)

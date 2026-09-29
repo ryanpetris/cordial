@@ -26,7 +26,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", action="append", choices=TARGETS,
                         help="repeat for multiple targets; defaults to this OS and CPU")
-    parser.add_argument("--release", action="store_true", help="require a clean release tag")
+    parser.add_argument("--release", action="store_true",
+                        help="require CORDIAL_VERSION or a clean release tag")
     parser.add_argument("--output", type=Path, default=ROOT.parent / "build" / "release")
     args = parser.parse_args()
     host_os = platform.system().lower()
