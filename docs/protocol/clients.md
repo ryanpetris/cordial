@@ -125,9 +125,9 @@ protocol.
   hotplug events (with short retries while udev finishes setting up a new
   node) or an explicit refresh. Ports must match the
   [USB discovery descriptors](transport.md). A matching port is only a candidate; an
-  adapter is shown after capabilities and a `protocol:1` status with an
-  `adapter_id` have been received on a new session, and only when the port's
-  USB serial number equals that `adapter_id`. The web version can read neither
+  adapter is shown after discovery reports protocol `1` and the client receives
+  capabilities and a status with an `adapter_id` on the new session. The port's
+  USB serial number must equal that `adapter_id`. The web version can read neither
   the serial number nor the manufacturer string: it lists the ports the user has
   granted by USB vendor and product ID and relies on the handshake alone. Ports that fail are logged and
   stay hidden. A removed adapter, including one whose port fails,

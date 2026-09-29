@@ -21,6 +21,8 @@ pub struct Request {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "cmd", content = "args", rename_all = "snake_case")]
 pub enum Command {
+    #[serde(rename = "adapter.protocol")]
+    Protocol(Empty),
     #[serde(rename = "adapter.status")]
     Status(Empty),
     #[serde(rename = "adapter.capabilities")]
@@ -234,6 +236,13 @@ pub struct SettingSet {
     #[cfg_attr(feature = "schema", schemars(regex(pattern = "^[a-z0-9._-]{1,64}$")))]
     pub key: String,
     pub value: SettingValue,
+}
+
+/// The discovery result accepts additional fields from future firmware.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProtocolResult {
+    pub protocol: u8,
 }
 
 impl Command {
@@ -636,7 +645,7 @@ macro_rules! command_ids {
             }
             /// Required session operations are available even with no optional capabilities.
             pub const fn session(self) -> bool {
-                matches!(self, Self::Status | Self::Capabilities | Self::Ready | Self::Heartbeat)
+                matches!(self, Self::Protocol | Self::Status | Self::Capabilities | Self::Ready | Self::Heartbeat)
             }
         }
         pub const COMMANDS: &[CommandId] = &[$(CommandId::$variant,)*];
@@ -648,7 +657,17 @@ macro_rules! command_ids {
         }
     };
 }
+impl CommandId {
+    /// Protocol discovery always uses version zero, independent of the advertised protocol.
+    pub const fn wire_version(self) -> u8 {
+        match self {
+            Self::Protocol => 0,
+            _ => crate::PROTOCOL_VERSION,
+        }
+    }
+}
 command_ids! {
+    Protocol => "adapter.protocol",
     Status => "adapter.status",
     Capabilities => "adapter.capabilities",
     Ready => "adapter.wait_ready",

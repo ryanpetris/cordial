@@ -125,6 +125,7 @@ fn initial_sync_reads_info_after_the_device_list_and_keeps_newer_changes() {
     assert_eq!(
         log,
         [
+            "adapter.protocol",
             "adapter.capabilities",
             "adapter.status",
             "adapter.wait_ready",

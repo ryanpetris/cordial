@@ -102,7 +102,7 @@ export class AdapterSession {
 
   /**
    * Opens a control session and confirms the adapter: separator, then
-   * capabilities and a matching status. Rejects if the port isn't a working
+   * protocol discovery, capabilities and a matching status. Rejects if the port isn't a working
    * Cordial adapter; the transport is closed in that case.
    */
   static async open(transport: Transport, hooks: SessionHooks): Promise<AdapterSession> {
@@ -121,6 +121,8 @@ export class AdapterSession {
     // Opening the port raised DTR and discarded most earlier input. A packet
     // from the previous session can still arrive, so input that doesn't
     // answer these requests is ignored until the first valid response.
+    const { protocol } = await this.request("adapter.protocol", {}, { timeoutMs: HANDSHAKE_MS });
+    if (protocol !== 1) throw new Error(`unsupported adapter protocol: ${protocol}`);
     const capabilities = await this.request("adapter.capabilities", {}, { timeoutMs: HANDSHAKE_MS });
     const status = await this.request("adapter.status", {}, { timeoutMs: HANDSHAKE_MS });
     const problem = statusProblem(status, capabilities);
@@ -213,7 +215,7 @@ export class AdapterSession {
       return { id: 0, result: Promise.reject(new SessionClosedError()) };
     }
     const id = this.#nextId++;
-    const message = { v: 1, id, cmd: command, args };
+    const message = { v: command === "adapter.protocol" ? 0 : 1, id, cmd: command, args };
     const problem = requestProblem(command, message);
     if (problem) return { id, result: Promise.reject(new Error(`invalid ${command} request: ${problem}`)) };
     const result = new Promise<ResultOf<C>>((resolve, reject) => {

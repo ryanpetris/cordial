@@ -1,7 +1,7 @@
 use crate::{
     MAX_LINE_BYTES, PROTOCOL_VERSION,
     identifiers::RequestId,
-    messages::{Command, Request},
+    messages::{Command, Empty, Request},
 };
 use alloc::{borrow::Cow, vec::Vec};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -24,7 +24,7 @@ struct Envelope<'a> {
     #[serde(borrow)]
     cmd: Cow<'a, str>,
     #[serde(borrow)]
-    args: &'a serde_json::value::RawValue,
+    args: Option<&'a serde_json::value::RawValue>,
 }
 
 pub fn decode_request(bytes: &[u8]) -> Result<Request, DecodeError> {
@@ -53,7 +53,26 @@ pub fn decode_request(bytes: &[u8]) -> Result<Request, DecodeError> {
         return Err(DecodeError::InvalidRequest { supplied: None });
     }
     let id = envelope.id;
-    if !envelope.args.get().starts_with('{') {
+    if envelope.cmd == "adapter.protocol" {
+        if envelope
+            .args
+            .is_some_and(|args| !args.get().starts_with('{'))
+        {
+            return Err(DecodeError::InvalidRequest { supplied: Some(id) });
+        }
+        if envelope.v != 0 {
+            return Err(DecodeError::Version { id });
+        }
+        return Ok(Request {
+            v: 0,
+            id,
+            command: Command::Protocol(Empty {}),
+        });
+    }
+    let args = envelope
+        .args
+        .ok_or(DecodeError::InvalidRequest { supplied: Some(id) })?;
+    if !args.get().starts_with('{') {
         return Err(DecodeError::InvalidRequest { supplied: Some(id) });
     }
     if envelope.v != u64::from(PROTOCOL_VERSION) {
@@ -62,7 +81,7 @@ pub fn decode_request(bytes: &[u8]) -> Result<Request, DecodeError> {
     macro_rules! command {
         ($($name:literal => $variant:ident),+ $(,)?) => {
             match envelope.cmd.as_ref() {
-                $($name => Command::$variant(serde_json::from_str(envelope.args.get()).map_err(|_| DecodeError::Arguments { id })?),)+
+                $($name => Command::$variant(serde_json::from_str(args.get()).map_err(|_| DecodeError::Arguments { id })?),)+
                 _ => return Err(DecodeError::UnknownCommand { id }),
             }
         };

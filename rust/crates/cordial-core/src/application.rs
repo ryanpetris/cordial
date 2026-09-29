@@ -517,6 +517,7 @@ impl<'a> Application<'a> {
             return self.serial.error(id, Error::UnknownCommand, now);
         }
         match &request.command {
+            Command::Protocol(_) => return self.serial.protocol(id, now),
             Command::Capabilities(_) => {
                 return self
                     .serial

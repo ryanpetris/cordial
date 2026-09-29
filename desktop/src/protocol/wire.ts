@@ -3,6 +3,7 @@
 
 export type CordialSerialProtocol = Request | Response | Event;
 export type Request =
+  | AdapterProtocolRequest
   | AdapterStatusRequest
   | AdapterCapabilitiesRequest
   | AdapterWaitReadyRequest
@@ -41,6 +42,7 @@ export type CandidateId = string;
 export type PairAction = "accept" | "reject";
 export type HostPlatform = "linux" | "windows" | "mac";
 export type Response =
+  | AdapterProtocolResponse
   | AdapterStatusResponse
   | AdapterCapabilitiesResponse
   | AdapterWaitReadyResponse
@@ -73,6 +75,14 @@ export type Response =
   | HidppSettingRefreshResponse
   | HidppSettingApplyResponse
   | RequestCancelResponse;
+export type AdapterProtocolResponse = {
+  done: true;
+  id: RequestId;
+  ok: true;
+  result: ProtocolResult;
+  type: "response";
+  v: 0;
+};
 export type AdapterStatusResponse =
   | {
       done: true;
@@ -912,6 +922,14 @@ export type DisconnectReason = "requested" | "remote" | "link_loss" | "unknown";
 export type DeviceKind = "unknown" | "keyboard" | "mouse" | "keyboard_mouse";
 export type PromptMethod = "confirm_passkey" | "enter_passkey" | "enter_pin" | "passkey" | "pin";
 
+export interface AdapterProtocolRequest {
+  args?: {
+    [k: string]: unknown | undefined;
+  } | null;
+  cmd: "adapter.protocol";
+  id: RequestId;
+  v: 0;
+}
 export interface AdapterStatusRequest {
   args: Empty;
   cmd: "adapter.status";
@@ -1167,6 +1185,13 @@ export interface RequestCancelRequest {
 }
 export interface RequestRef {
   request_id: RequestId;
+}
+/**
+ * The discovery result accepts additional fields from future firmware.
+ */
+export interface ProtocolResult {
+  protocol: number;
+  [k: string]: unknown | undefined;
 }
 export interface Status {
   adapter_id: string;
@@ -1610,6 +1635,7 @@ export interface ResponseMap {
   "adapter.capabilities": AdapterCapabilitiesResponse;
   "adapter.name.set": AdapterNameSetResponse;
   "adapter.platform.set": AdapterPlatformSetResponse;
+  "adapter.protocol": AdapterProtocolResponse;
   "adapter.status": AdapterStatusResponse;
   "adapter.wait_ready": AdapterWaitReadyResponse;
   "device.blocked.set": DeviceBlockedSetResponse;

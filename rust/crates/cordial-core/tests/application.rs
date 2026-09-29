@@ -114,7 +114,7 @@ impl<'a> Test<'a> {
     fn command(&mut self, id: u32, cmd: &str, args: Value) -> Vec<Value> {
         self.commands.insert(id, cmd.into());
         self.now += 1;
-        let mut bytes = serde_json::to_vec(&json!({"v":1,"id":id,"cmd":cmd,"args":args})).unwrap();
+        let mut bytes = serde_json::to_vec(&json!({"v":if cmd == "adapter.protocol" { 0 } else { 1 },"id":id,"cmd":cmd,"args":args})).unwrap();
         bytes.push(b'\n');
         let (n, request) = self.app.serial.feed(&bytes, self.now);
         assert_eq!(n, bytes.len());
@@ -1957,7 +1957,11 @@ fn adapter_names_are_persisted_before_publication_and_survive_reload() {
     assert_eq!(t.app.status(&t.radio, t.now).name, "Test adapter");
     t.command(1, "session.monitor.set", json!({"enabled":true}));
     let revision = t.app.manager.revision;
-    let rows = t.command(2, "adapter.name.set", json!({"name":"  Office \u{10400}  "}));
+    let rows = t.command(
+        2,
+        "adapter.name.set",
+        json!({"name":"  Office \u{10400}  "}),
+    );
     let event = rows
         .iter()
         .find(|r| r["event"] == "adapter.changed")
@@ -2066,4 +2070,46 @@ fn null_name_clears_the_override_without_losing_platform() {
     t.command(6, "adapter.name.set", json!({"name":null}));
     assert_eq!(t.store.generation, generation);
     assert_eq!(t.app.manager.revision, revision);
+}
+
+#[test]
+fn protocol_discovery_works_before_readiness_and_shares_request_ids() {
+    let mut input = [0; MAX_LINE_BYTES - 1];
+    let mut t = Test::new(&mut input, false);
+    t.app.manager.storage_ready = false;
+    t.app.manager.radio_ready = false;
+    for (i, args) in [
+        Value::Null,
+        json!({}),
+        json!({"future":{"values":[1,true,null]}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = i as u32 + 1;
+        let replies = t.command(id, "adapter.protocol", args);
+        assert_eq!(
+            replies,
+            vec![
+                json!({"v":0,"type":"response","id":id,"ok":true,"done":true,"result":{"protocol":1}})
+            ]
+        );
+    }
+    let (_, request) = t
+        .app
+        .serial
+        .feed(b"{\"v\":0,\"id\":4,\"cmd\":\"adapter.protocol\"}\n", t.now);
+    block_on(
+        t.app
+            .dispatch(&request.unwrap(), &mut t.store, &mut t.radio, t.now),
+    )
+    .unwrap();
+    assert_eq!(t.drain()[0]["v"], 0);
+    let (_, request) = t.app.serial.feed(
+        b"{\"v\":1,\"id\":4,\"cmd\":\"adapter.status\",\"args\":{}}\n",
+        t.now,
+    );
+    assert!(request.is_none());
+    assert_eq!(t.drain()[0]["data"]["code"], "invalid_request");
+    assert_eq!(t.command(5, "adapter.status", json!({}))[0]["v"], 1);
 }

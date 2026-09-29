@@ -115,7 +115,7 @@ impl Envelope {
                 ..
             } => {
                 // Only adapter.capabilities returns a list; see Inner::receive.
-                if *v != PROTOCOL_VERSION
+                if (*v != PROTOCOL_VERSION && *v != 0)
                     || (*ok
                         && (!result
                             .as_ref()
@@ -243,7 +243,8 @@ pub struct Client {
 fn reserved(command: &str) -> bool {
     matches!(
         command,
-        "adapter.status"
+        "adapter.protocol"
+            | "adapter.status"
             | "adapter.capabilities"
             | "session.heartbeat"
             | "adapter.wait_ready"
@@ -332,7 +333,7 @@ impl Inner {
         let id = RequestId::try_from(state.next_id + 1)
             .map_err(|_| Error::new("request IDs exhausted; reopen adapter"))?;
         let bytes = codec::encode(&WireRequest {
-            v: PROTOCOL_VERSION,
+            v: command.id().wire_version(),
             id,
             command,
         })
@@ -479,12 +480,20 @@ impl Inner {
         unreachable!()
     }
     fn receive(&self, mut envelope: Envelope) -> Result<()> {
-        if let Message::Response { id, done, .. } = &envelope.message {
+        if let Message::Response { v, id, done, .. } = &envelope.message {
             let mut state = self.state.lock().unwrap();
             let pending = state
                 .pending
                 .get_mut(id)
                 .ok_or_else(|| Error::new("unexpected response ID"))?;
+            let expected_version = if pending.command == "adapter.protocol" {
+                0
+            } else {
+                PROTOCOL_VERSION
+            };
+            if *v != expected_version {
+                return Err(Error::new("invalid response version"));
+            }
             let list = matches!(&envelope.message, Message::Response { result: Some(r), .. } if r.is_array());
             let ok = matches!(&envelope.message, Message::Response { ok: true, .. });
             if list != (pending.command == "adapter.capabilities" && ok) {
@@ -622,6 +631,17 @@ impl Client {
             ),
             cancellation: wait.cancellation.clone(),
         };
+        let protocol: cordial_protocol::messages::ProtocolResult = client
+            .call(Command::Protocol(Empty {}), true, &handshake)?
+            .last()
+            .unwrap()
+            .decode()?;
+        if protocol.protocol != PROTOCOL_VERSION {
+            return Err(Error::new(format!(
+                "unsupported adapter protocol: {}",
+                protocol.protocol
+            )));
+        }
         // Capabilities are per connection and precede status validation.
         let capabilities: Capabilities = client
             .call(Command::Capabilities(Empty {}), true, &handshake)?

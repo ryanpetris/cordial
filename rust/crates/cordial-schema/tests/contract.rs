@@ -34,7 +34,7 @@ fn args(name: &str) -> Value {
     }
 }
 fn request(name: &str, args: Value) -> Value {
-    json!({"v":1,"id":1,"cmd":name,"args":args})
+    json!({"v":if name == "adapter.protocol" { 0 } else { 1 },"id":1,"cmd":name,"args":args})
 }
 fn response(result: Value, done: bool) -> Value {
     json!({"v":1,"type":"response","id":1,"ok":true,"done":done,"result":result})
@@ -68,6 +68,7 @@ fn list_end() -> Value {
 }
 fn terminal(name: &str) -> Value {
     match name {
+        "adapter.protocol" => json!({"protocol":1}),
         "adapter.status" => status(),
         "adapter.capabilities" => json!(["classic", "ble", "debug", "storage_management"]),
         "adapter.wait_ready" => json!({"state":"ready","status":status()}),
@@ -128,7 +129,9 @@ fn every_command_has_codec_checked_requests_and_both_stream_phases() {
             &format!("{name}.request"),
             &serde_json::to_value(decoded).unwrap(),
         );
-        assert_valid(&format!("{name}.response"), &response(terminal(name), true));
+        let mut reply = response(terminal(name), true);
+        reply["v"] = json!(command.wire_version());
+        assert_valid(&format!("{name}.response"), &reply);
         assert_eq!(
             artifacts.catalog["commands"][name]["streaming"],
             chunk(name).is_some()
@@ -136,8 +139,16 @@ fn every_command_has_codec_checked_requests_and_both_stream_phases() {
         if let Some(chunk) = chunk(name) {
             assert_valid(&format!("{name}.response"), &response(chunk, false));
         }
-        let failure = json!({"v":1,"type":"response","id":1,"ok":false,"done":true,"error":{"code":"invalid_args"}});
-        assert_valid(&format!("{name}.response"), &failure);
+        let failure = json!({"v":command.wire_version(),"type":"response","id":1,"ok":false,"done":true,"error":{"code":"invalid_args"}});
+        if name == "adapter.protocol" {
+            assert!(!validator(&format!("{name}.response")).is_valid(&failure));
+            assert_eq!(
+                artifacts.catalog["commands"][name]["error_definitions"],
+                json!([])
+            );
+        } else {
+            assert_valid(&format!("{name}.response"), &failure);
+        }
     }
 }
 
@@ -331,4 +342,49 @@ fn resetting_an_adapter_name_requires_an_explicit_null() {
     let missing = serde_json::json!({"v":1,"id":1,"cmd":"adapter.name.set","args":{}});
     assert!(codec::decode_request(&serde_json::to_vec(&missing).unwrap()).is_err());
     assert!(!validator("adapter.name.set.request").is_valid(&missing));
+}
+
+#[test]
+fn discovery_accepts_extensible_arguments_and_results() {
+    let schema = validator("adapter.protocol.request");
+    for args in [
+        None,
+        Some(Value::Null),
+        Some(json!({})),
+        Some(json!({"future":{"values":[1,true,null]}})),
+    ] {
+        let mut query = json!({"v":0,"id":1,"cmd":"adapter.protocol"});
+        if let Some(args) = args {
+            query["args"] = args;
+        }
+        assert!(schema.is_valid(&query), "{query}");
+        assert!(codec::decode_request(&serde_json::to_vec(&query).unwrap()).is_ok());
+    }
+    for args in [json!(1), json!(false), json!(""), json!([])] {
+        let query = request("adapter.protocol", args);
+        assert!(!schema.is_valid(&query));
+        assert!(codec::decode_request(&serde_json::to_vec(&query).unwrap()).is_err());
+    }
+    let schema = validator("adapter.protocol.response");
+    let mut reply = response(
+        json!({"protocol":2,"future":{"values":[1,true,null]}}),
+        true,
+    );
+    reply["v"] = json!(0);
+    assert!(schema.is_valid(&reply));
+    let decoded: cordial_protocol::messages::ProtocolResult =
+        serde_json::from_value(reply["result"].clone()).unwrap();
+    assert_eq!(decoded.protocol, 2);
+    for protocol in [json!(null), json!("1"), json!(-1), json!(1.5), json!(256)] {
+        reply["result"]["protocol"] = protocol;
+        assert!(!schema.is_valid(&reply));
+    }
+    reply["result"] = json!({"extra":1});
+    assert!(!schema.is_valid(&reply));
+    for (name, version) in [("adapter.protocol", 1), ("adapter.status", 0)] {
+        let mut query = request(name, json!({}));
+        query["v"] = json!(version);
+        assert!(!validator("Request").is_valid(&query));
+        assert!(codec::decode_request(&serde_json::to_vec(&query).unwrap()).is_err());
+    }
 }

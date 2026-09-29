@@ -4,6 +4,30 @@
 
 The examples below are wire messages. Each object occupies one line; formatted multi-line objects elsewhere in the protocol documentation describe data shapes only.
 
+## Protocol discovery
+
+On connect, query the protocol before sending versioned management commands:
+
+```json
+{"v":0,"id":1,"cmd":"adapter.protocol","args":{}}
+{"v":0,"type":"response","id":1,"ok":true,"done":true,"result":{"protocol":1}}
+```
+
+The discovery request and successful response always use `v:0`. Their envelope
+format and version remain fixed across firmware releases. `result.protocol` reports the
+USB control protocol version, currently `1`. Clients ignore additional fields in
+this result and stop the connection if they do not support the reported protocol.
+
+Discovery accepts `args` as any JSON object, `null`, or an omitted field. Object
+contents are ignored. Other argument types are invalid envelopes. The usual
+message size limits and request ID rules apply, and discovery consumes its ID.
+Discovery is available before Bluetooth and storage are ready. A valid discovery
+request always succeeds. Unsupported versions and malformed envelopes use
+`protocol.error` events in the adapter's current control protocol, outside the
+fixed discovery exchange.
+
+## Management messages
+
 Request:
 
 ```json

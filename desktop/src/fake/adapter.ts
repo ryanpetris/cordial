@@ -417,6 +417,8 @@ export class FakeAdapter implements Transport {
     const id = m.id as number;
     if (id <= this.#lastId) return;
     this.#lastId = id;
+    if (m.cmd === "adapter.protocol")
+      return this.#line({ v: 0, type: "response", id, ok: true, done: true, result: { protocol: 1 } });
     const args = m.args as Json;
     const target = typeof args.device_id === "string" ? this.devices.find((d) => d.device.device_id === args.device_id) : undefined;
     const failure = this.failures[m.cmd as string]?.shift();

@@ -88,8 +88,9 @@ fn capabilities_precede_status_on_every_connection() {
     for _ in 0..2 {
         let (client, firmware) = common::connect();
         assert_eq!(
-            firmware.log.lock().unwrap()[..3],
+            firmware.log.lock().unwrap()[..4],
             [
+                "adapter.protocol",
                 "adapter.capabilities",
                 "adapter.status",
                 "session.heartbeat"

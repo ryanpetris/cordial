@@ -50,6 +50,15 @@
       "streaming": false,
       "transport_capability": false
     },
+    "adapter.protocol": {
+      "error": "wire.schema.json#/$defs/adapter.protocol.error",
+      "error_definitions": [],
+      "request": "wire.schema.json#/$defs/adapter.protocol.request",
+      "required_capabilities": [],
+      "response": "wire.schema.json#/$defs/adapter.protocol.response",
+      "streaming": false,
+      "transport_capability": false
+    },
     "adapter.status": {
       "error": "wire.schema.json#/$defs/adapter.status.error",
       "error_definitions": [

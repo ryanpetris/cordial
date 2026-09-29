@@ -224,6 +224,23 @@ impl<'a> Session<'a> {
         }
         self.enqueue(&Message::<T, ()>::success(id, result, done), false, now)
     }
+    /// Discovery has a fixed version-zero envelope, even when the control protocol changes.
+    pub fn protocol(&mut self, id: RequestId, now: u64) -> Result<(), EmitError> {
+        self.enqueue(
+            &Message::<_, ()>::Response {
+                v: 0,
+                id,
+                ok: true,
+                done: true,
+                result: Some(cordial_protocol::messages::ProtocolResult {
+                    protocol: cordial_protocol::PROTOCOL_VERSION,
+                }),
+                error: None,
+            },
+            false,
+            now,
+        )
+    }
     pub fn error(&mut self, id: RequestId, code: ErrorCode, now: u64) -> Result<(), EmitError> {
         self.enqueue(
             &Message::<(), ()>::failure(

@@ -206,6 +206,9 @@ fn connect_with_info(
                 .unwrap()
                 .push(request.command.name().to_owned());
             let result = match &request.command {
+                Command::Protocol(_) => {
+                    json!({"protocol":advertised.protocol,"future":{"values":[1,true,null]}})
+                }
                 Command::Capabilities(_) => capabilities.clone(),
                 Command::Status(_) => serde_json::to_value(&advertised).unwrap(),
                 Command::Heartbeat(_) => json!({"timeout_ms":15000,"monitor":false}),
@@ -224,7 +227,10 @@ fn connect_with_info(
                     continue;
                 }
             };
-            let message = Message::<Value, ()>::success(request.id, result, true);
+            let mut message = Message::<Value, ()>::success(request.id, result, true);
+            if let Message::Response { v, .. } = &mut message {
+                *v = request.command.id().wire_version();
+            }
             if output
                 .lock()
                 .unwrap()

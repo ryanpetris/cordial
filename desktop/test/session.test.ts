@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { FakeAdapter } from "../src/fake/adapter.ts";
+import { requestProblem, responseProblem } from "../src/protocol/validate.ts";
 import { AdapterSession } from "../src/core/session.ts";
 import type { Transport } from "../src/core/transport.ts";
 import { openSession, until } from "./helpers.ts";
@@ -15,12 +17,14 @@ describe("AdapterSession", () => {
     const battery = session.view.info("d_2")!.find((f) => f.key === "battery_percent");
     expect(battery?.value).toBe(12);
     // The handshake order from docs/protocol/transport.md.
-    expect(fake.received.slice(0, 4).map((m) => m.cmd)).toEqual([
+    expect(fake.received.slice(0, 5).map((m) => m.cmd)).toEqual([
+      "adapter.protocol",
       "adapter.capabilities",
       "adapter.status",
       "session.heartbeat",
       "adapter.wait_ready",
     ]);
+    expect(fake.received[0]).toEqual({ v: 0, id: 1, cmd: "adapter.protocol", args: {} });
     await session.close();
     expect(fake.monitor).toBe(false);
   });
@@ -88,4 +92,57 @@ describe("AdapterSession", () => {
     expect(session.closed).toBe(false);
     await session.close();
   });
+});
+
+function discoveryTransport(protocol: number) {
+  const fake = new FakeAdapter();
+  fake.open();
+  const close = vi.fn(() => fake.close());
+  const transport: Transport = {
+    onData(listener) {
+      fake.onData((chunk) => {
+        const lines = new TextDecoder().decode(chunk).split("\n").filter(Boolean).map((line) => {
+          const message = JSON.parse(line);
+          if (message.v === 0) message.result = { protocol, future: { values: [1, true, null] } };
+          return JSON.stringify(message);
+        });
+        listener(new TextEncoder().encode(`${lines.join("\n")}\n`));
+      });
+    },
+    onClose: (listener) => fake.onClose(listener),
+    write: (text) => fake.write(text),
+    close,
+  };
+  return { fake, close, transport };
+}
+
+it("ignores additional discovery result fields and rejects unsupported protocols before management", async () => {
+  const hooks = { changed: vi.fn(), closed: vi.fn(), log: vi.fn() };
+  const supported = discoveryTransport(1);
+  const session = await AdapterSession.open(supported.transport, hooks);
+  expect(session.status.protocol).toBe(1);
+  await session.close();
+  const unsupported = discoveryTransport(2);
+  await expect(AdapterSession.open(unsupported.transport, hooks)).rejects.toThrow("unsupported adapter protocol: 2");
+  expect(unsupported.fake.received.map((m) => m.cmd)).toEqual(["adapter.protocol"]);
+  expect(unsupported.close).toHaveBeenCalled();
+});
+
+it("validates the fixed discovery envelope and extensible arguments and result", () => {
+  const query = { v: 0, id: 1, cmd: "adapter.protocol" };
+  for (const args of [undefined, null, {}, { future: { values: [1, true, null] } }])
+    expect(requestProblem("adapter.protocol", args === undefined ? query : { ...query, args })).toBeNull();
+  for (const args of [1, false, "", []])
+    expect(requestProblem("adapter.protocol", { ...query, args })).not.toBeNull();
+  expect(requestProblem("adapter.protocol", { ...query, v: 1 })).not.toBeNull();
+  expect(requestProblem("adapter.status", { ...query, cmd: "adapter.status", args: {} })).not.toBeNull();
+  const reply = { v: 0, type: "response", id: 1, ok: true, done: true, result: { protocol: 1, future: [1] } };
+  expect(responseProblem("adapter.protocol", reply)).toBeNull();
+  expect(responseProblem("adapter.protocol", { ...reply, v: 1 })).not.toBeNull();
+  expect(responseProblem("adapter.protocol", { ...reply, done: false })).not.toBeNull();
+  expect(responseProblem("adapter.protocol", {
+    v: 0, type: "response", id: 1, ok: false, done: true, error: { code: "invalid_args" },
+  })).not.toBeNull();
+  for (const result of [{}, { protocol: "1" }, { protocol: null }, { protocol: -1 }, { protocol: 1.5 }])
+    expect(responseProblem("adapter.protocol", { ...reply, result })).not.toBeNull();
 });

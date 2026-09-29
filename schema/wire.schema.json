@@ -2143,6 +2143,22 @@
       ],
       "type": "object"
     },
+    "ProtocolResult": {
+      "additionalProperties": true,
+      "description": "The discovery result accepts additional fields from future firmware.",
+      "properties": {
+        "protocol": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocol"
+      ],
+      "type": "object"
+    },
     "ReadyResult": {
       "oneOf": [
         {
@@ -2186,6 +2202,9 @@
     },
     "Request": {
       "oneOf": [
+        {
+          "$ref": "#/$defs/adapter.protocol.request"
+        },
         {
           "$ref": "#/$defs/adapter.status.request"
         },
@@ -2303,6 +2322,9 @@
     },
     "Response": {
       "anyOf": [
+        {
+          "$ref": "#/$defs/adapter.protocol.response"
+        },
         {
           "$ref": "#/$defs/adapter.status.response"
         },
@@ -3601,6 +3623,70 @@
             "ok",
             "done",
             "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "adapter.protocol.error": false,
+    "adapter.protocol.request": {
+      "additionalProperties": false,
+      "properties": {
+        "args": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "cmd": {
+          "const": "adapter.protocol"
+        },
+        "id": {
+          "$ref": "#/$defs/RequestId"
+        },
+        "v": {
+          "const": 0
+        }
+      },
+      "required": [
+        "v",
+        "id",
+        "cmd"
+      ],
+      "type": "object"
+    },
+    "adapter.protocol.response": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "const": true
+            },
+            "id": {
+              "$ref": "#/$defs/RequestId"
+            },
+            "ok": {
+              "const": true
+            },
+            "result": {
+              "$ref": "#/$defs/ProtocolResult"
+            },
+            "type": {
+              "const": "response"
+            },
+            "v": {
+              "const": 0
+            }
+          },
+          "required": [
+            "v",
+            "type",
+            "id",
+            "ok",
+            "done",
+            "result"
           ],
           "type": "object"
         }

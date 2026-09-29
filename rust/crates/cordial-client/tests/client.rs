@@ -199,3 +199,23 @@ fn devices_retries_a_changed_snapshot_and_discards_partial_rows() {
     assert_eq!(rows[0].data().unwrap()["revision"], 2);
     client.shutdown();
 }
+
+#[test]
+fn protocol_discovery_precedes_versioned_requests_and_accepts_extra_result_fields() {
+    let (client, firmware) = common::connect();
+    assert_eq!(
+        &firmware.log.lock().unwrap()[..3],
+        &["adapter.protocol", "adapter.capabilities", "adapter.status"]
+    );
+    drop(client);
+    let mut status = common::status();
+    status.protocol = 2;
+    let error = common::try_connect(status, serde_json::json!(common::capabilities()))
+        .err()
+        .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported adapter protocol: 2")
+    );
+}

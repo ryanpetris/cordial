@@ -9,9 +9,9 @@ fn shape<T: JsonSchema>(generator: &mut SchemaGenerator) -> Value {
 fn object(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object", "properties":properties, "required":required, "additionalProperties":false})
 }
-fn response(result: Value, done: bool, id: &Value) -> Value {
+fn response(result: Value, done: bool, id: &Value, version: u8) -> Value {
     object(
-        json!({"v":{"const":PROTOCOL_VERSION},"type":{"const":"response"},"id":id,
+        json!({"v":{"const":version},"type":{"const":"response"},"id":id,
         "ok":{"const":true},"done":{"const":done},"result":result}),
         &["v", "type", "id", "ok", "done", "result"],
     )
@@ -99,7 +99,13 @@ pub fn generate() -> Artifacts {
     for &command in COMMANDS {
         use CommandId as C;
         // Exhaustive match: a new command cannot omit its contract definition.
+        let version = command.wire_version();
         let (args, terminal, chunks) = match command {
+            C::Protocol => (
+                json!({"type":["object","null"],"additionalProperties":true}),
+                shape::<ProtocolResult>(&mut generator),
+                None,
+            ),
             C::Status => (
                 shape::<Empty>(&mut generator),
                 shape::<Status>(&mut output),
@@ -245,13 +251,21 @@ pub fn generate() -> Artifacts {
         };
         let name = command.as_str();
         let request = object(
-            json!({"v":{"const":PROTOCOL_VERSION},"id":id,"cmd":{"const":name},"args":args}),
-            &["v", "id", "cmd", "args"],
+            json!({"v":{"const":version},"id":id,"cmd":{"const":name},"args":args}),
+            if command == C::Protocol {
+                &["v", "id", "cmd"]
+            } else {
+                &["v", "id", "cmd", "args"]
+            },
         );
         let request_key = format!("{name}.request");
         definitions.insert(request_key.clone(), request);
         requests.push(json!({"$ref":format!("#/$defs/{request_key}")}));
-        let mut errors = vec!["BareError", "StorageMutationError"];
+        let mut errors = if command == C::Protocol {
+            vec![]
+        } else {
+            vec!["BareError", "StorageMutationError"]
+        };
         if matches!(
             command,
             C::Pair | C::Connect | C::DeviceEnabled | C::DeviceBlocked
@@ -269,15 +283,25 @@ pub fn generate() -> Artifacts {
             .iter()
             .map(|name| json!({"$ref":format!("#/$defs/{name}")}))
             .collect();
-        definitions.insert(error_key.clone(), json!({"oneOf":error_refs}));
+        definitions.insert(
+            error_key.clone(),
+            if errors.is_empty() {
+                json!(false)
+            } else {
+                json!({"oneOf":error_refs})
+            },
+        );
         let failure = object(
-            json!({"v":{"const":PROTOCOL_VERSION},"type":{"const":"response"},"id":id,
+            json!({"v":{"const":version},"type":{"const":"response"},"id":id,
             "ok":{"const":false},"done":{"const":true},"error":{"$ref":format!("#/$defs/{error_key}")}}),
             &["v", "type", "id", "ok", "done", "error"],
         );
-        let mut variants = vec![response(terminal, true, &id), failure];
+        let mut variants = vec![response(terminal, true, &id, version)];
+        if command != C::Protocol {
+            variants.push(failure);
+        }
         if let Some(chunk) = chunks.as_ref() {
-            variants.push(response(chunk.clone(), false, &id));
+            variants.push(response(chunk.clone(), false, &id, version));
         }
         let response_key = format!("{name}.response");
         definitions.insert(response_key.clone(), json!({"anyOf":variants}));
@@ -375,6 +399,7 @@ pub fn generate() -> Artifacts {
             }
         }
     }
+    definitions["ProtocolResult"]["additionalProperties"] = json!(true);
     definitions["Status"]["properties"]["protocol"] = json!({"const":PROTOCOL_VERSION});
     definitions["SettingValue"] = json!({"anyOf":[{"type":"null"},{"type":"boolean"},{"type":"string"},
         {"type":"integer","minimum":-(cordial_protocol::MAX_REVISION as i64),"maximum":cordial_protocol::MAX_REVISION}]});

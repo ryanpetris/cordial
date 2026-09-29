@@ -2,10 +2,11 @@
 
 [Protocol index](README.md)
 
-All arguments shown as optional have the defaults listed below. An omitted optional argument and its default have the same meaning. `args` itself is always present.
+All arguments shown as optional have the defaults listed below. An omitted optional argument and its default have the same meaning. `args` itself is always present except for `adapter.protocol`.
 
 | Wire command | Arguments | Terminal success result |
 | --- | --- | --- |
+| `adapter.protocol` | Any object, `null`, or omitted; object contents are ignored. Uses `v:0` permanently. | `{ "protocol": 1 }`; clients ignore additional result fields. |
 | `adapter.status` | `{}` | Adapter identity, readiness, limits, counts, revision, monitor setting, and outstanding operations. |
 | `adapter.wait_ready` | `{}` | Optional `initializing` progress, then `{ "state": "ready", "status": STATUS }`, or an initialization error. |
 | `session.heartbeat` | `{}` | `{ "timeout_ms": 15000, "monitor": BOOL }`; renews client presence without enabling monitoring. |
