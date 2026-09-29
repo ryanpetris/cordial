@@ -22,10 +22,15 @@ def newlib_notice(compiler):
 
 
 def record(cargo, platform, features, target, env, output, sdk=None):
+    feature_flags = ["--features", ",".join(features)]
+    if platform != "host":
+        feature_flags.append("--no-default-features")
+    # Metadata may need sources for workspace members and targets not compiled
+    # by the build. Cargo fetches those sources using the committed lockfile.
     metadata = json.loads(subprocess.check_output(
-        cargo + ["metadata", "--locked", "--offline", "--format-version", "1", "--manifest-path",
+        cargo + ["metadata", "--locked", "--format-version", "1", "--manifest-path",
                  str(deps.ROOT / ("crates/cordial-client/Cargo.toml" if platform == "host" else f"platforms/{platform}/Cargo.toml")), "--filter-platform", target,
-                 "--no-default-features", "--features", ",".join(features)], env=env, cwd=deps.ROOT))
+                 *feature_flags], env=env, cwd=deps.ROOT))
     nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
     pending, selected = [metadata["resolve"]["root"]], set()
     while pending:
@@ -110,8 +115,10 @@ def record(cargo, platform, features, target, env, output, sdk=None):
             ["git", "-C", str(sdk), "rev-parse", "HEAD"], text=True).strip(),
             "notices": [copy(p, "esp-idf/" + str(p.relative_to(sdk))) for p in paths]})
     rustc = ["rustc"] + ([cargo[1]] if len(cargo) > 1 else [])
-    toolchain = subprocess.check_output(rustc + ["--version", "--verbose"], text=True).strip()
-    root = Path(subprocess.check_output(rustc + ["--print", "sysroot"], text=True).strip())
+    toolchain = subprocess.check_output(rustc + ["--version", "--verbose"],
+                                        env=env, cwd=deps.ROOT, text=True).strip()
+    root = Path(subprocess.check_output(rustc + ["--print", "sysroot"],
+                                        env=env, cwd=deps.ROOT, text=True).strip())
     for file in ("COPYRIGHT-library.html", "COPYRIGHT.html"):
         path = root / "share/doc/rust" / file
         if path.exists():
