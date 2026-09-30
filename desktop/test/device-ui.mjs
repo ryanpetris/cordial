@@ -1,0 +1,192 @@
+// Exercises the built desktop renderer with simulated state and controlled replies.
+// Run from desktop: xvfb-run -a node test/device-ui.mjs
+import { _electron } from "playwright";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import assert from "node:assert/strict";
+
+const profile = await mkdtemp(join(tmpdir(), "cordial-device-ui-"));
+await writeFile(join(profile, "preferences.json"), JSON.stringify({ notifyLowBattery: false, notifyConnections: false }));
+const env = { ...process.env, CORDIAL_DESKTOP_SIMULATE: "1" };
+delete env.ELECTRON_RUN_AS_NODE;
+const app = await _electron.launch({ args: ["--no-sandbox", ".", `--user-data-dir=${profile}`], env });
+const page = await app.firstWindow();
+const errors = [];
+page.on("pageerror", (error) => errors.push(String(error)));
+try {
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1100, 900));
+  await page.getByRole("button", { name: /Example Keys/ }).first().click();
+  await page.getByRole("group", { name: "Backlight", exact: true }).waitFor();
+  const state = await page.evaluate(() => window.cordial.state());
+  const entry = state.devices.find((d) => d.name === "Example Keys Wireless");
+  assert.ok(entry?.settings?.current);
+  const cachedSettings = entry.settings;
+  const enabled = entry.settings.settings.find((s) => s.key === "backlight.enabled");
+  Object.assign(enabled, { managed: false, desired: null, observed: null, state: "unmanaged" });
+  await app.evaluate(({ ipcMain }, state) => {
+    globalThis.uiState = state;
+    globalThis.uiActions = [];
+    ipcMain.removeHandler("state");
+    ipcMain.handle("state", () => globalThis.uiState);
+    ipcMain.removeHandler("act");
+    ipcMain.handle("act", (_event, action) => {
+      globalThis.uiActions.push(action);
+      if (globalThis.uiHold === action.type)
+        return new Promise((resolve) => { globalThis.uiReply = resolve; });
+      if (globalThis.uiFail === action.type) return { ok: false, message: "Couldn't save this value." };
+      return { ok: true };
+    });
+  }, state);
+  const publish = async () => app.evaluate(({ BrowserWindow }, state) => {
+    globalThis.uiState = state;
+    BrowserWindow.getAllWindows()[0].webContents.send("state", state);
+  }, state);
+  const actions = () => app.evaluate(() => globalThis.uiActions);
+  await publish();
+
+  const backlight = page.getByRole("group", { name: "Backlight", exact: true });
+  assert.equal(await backlight.locator('[aria-pressed="true"]').count(), 0);
+  await backlight.getByRole("button", { name: "Off", exact: true }).click();
+  assert.equal((await actions()).filter((a) => a.type === "setting.set").length, 0);
+  assert.equal(await page.getByRole("spinbutton", { name: "Timeout With Hands Away" }).inputValue(), "30");
+  await page.getByRole("tab", { name: "Details" }).click();
+  await page.getByRole("tab", { name: "Settings" }).click();
+  await page.getByRole("button", { name: /Example Mouse/ }).first().click();
+  await page.getByRole("button", { name: /Example Keys/ }).first().click();
+  assert.equal(await backlight.getByRole("button", { name: "Off", exact: true }).getAttribute("aria-pressed"), "true");
+
+  await app.evaluate(() => { globalThis.uiFail = "setting.set"; });
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByText("Couldn't save this value.", { exact: true }).waitFor();
+  assert.equal(await page.locator(".toast").count(), 0);
+  assert.equal(await page.getByRole("button", { name: "Save", exact: true }).count(), 1);
+
+  assert.equal((await actions()).find((a) => a.type === "setting.set").value, false);
+  await app.evaluate(() => { globalThis.uiFail = null; globalThis.uiHold = "setting.set"; });
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  entry.pending = [{ id: 99, command: "hidpp.setting.set" }];
+  await publish();
+  await backlight.getByRole("button", { name: "On", exact: true }).click();
+  assert.equal(await page.getByRole("button", { name: "Read Again", exact: true }).isDisabled(), true);
+  assert.equal(await page.getByRole("button", { name: "Forget saved Timeout With Hands Away" }).isDisabled(), true);
+  await app.evaluate(() => { globalThis.uiReply({ ok: true }); globalThis.uiHold = null; });
+  Object.assign(enabled, { managed: true, desired: false, observed: false, state: "applied" });
+  entry.pending = [];
+  await publish();
+  assert.equal(await backlight.getByRole("button", { name: "On", exact: true }).getAttribute("aria-pressed"), "true");
+  assert.equal(await page.getByRole("button", { name: "Save", exact: true }).count(), 1);
+
+  await app.evaluate(() => { globalThis.uiHold = "setting.set"; });
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  entry.pending = [{ id: 101, command: "hidpp.setting.set" }];
+  await publish();
+  await backlight.getByRole("button", { name: "Off", exact: true }).click();
+  await app.evaluate(() => { globalThis.uiReply({ ok: true }); globalThis.uiHold = null; });
+  Object.assign(enabled, { desired: true, observed: true });
+  entry.pending = [];
+  await publish();
+  assert.equal(await backlight.getByRole("button", { name: "Off", exact: true }).getAttribute("aria-pressed"), "true");
+  assert.equal(await page.getByRole("button", { name: "Save", exact: true }).count(), 1);
+  Object.assign(enabled, { managed: false, desired: null, observed: false, state: "unmanaged" });
+  await publish();
+  await backlight.getByRole("button", { name: "On", exact: true }).click();
+  await backlight.getByRole("button", { name: "Off", exact: true }).click();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByText("Saved", { exact: true }).waitFor();
+  await backlight.getByRole("button", { name: "Off", exact: true }).click();
+  assert.equal(await page.getByRole("button", { name: "Save", exact: true }).count(), 1);
+  entry.device.hidpp_enabled = false;
+  entry.device.normalization_state = "off";
+  await publish();
+  assert.equal(await page.getByRole("button", { name: "Save", exact: true }).isDisabled(), false);
+  assert.equal(await page.getByRole("button", { name: "Read Again", exact: true }).isDisabled(), false);
+  assert.equal(await page.getByRole("button", { name: "Apply Saved Settings", exact: true }).count(), 0);
+  Object.assign(enabled, { managed: true, desired: true, observed: true, state: "applied" });
+
+  entry.device.state = "disconnected";
+  entry.device.normalization_state = "pending";
+  entry.settings.current = false;
+  await publish();
+  assert.equal(await page.getByRole("tab", { name: "Settings" }).isDisabled(), false);
+  assert.equal(await page.getByRole("button", { name: "Forget saved Backlight", exact: true }).isDisabled(), false);
+  assert.equal(await page.getByRole("button", { name: "Save", exact: true }).isDisabled(), true);
+  entry.device.state = "connecting";
+  entry.pending = [{ id: 100, command: "device.connect" }];
+  await publish();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.ok((await actions()).some((a) => a.type === "device.connect.cancel" && a.key === entry.key));
+
+  await page.clock.install({ time: new Date("2030-01-01T00:00:00Z") });
+  await page.clock.pauseAt(new Date("2030-01-01T00:00:01Z"));
+  entry.pending = [];
+  entry.device.state = "connected";
+  entry.device.settings_state = "pending";
+  entry.settings = { settings: [], current: false, state: "pending", error: null, loadError: "The adapter hasn't read these settings yet.", result: null };
+  await publish();
+  await page.getByText("Reading the device's settings…", { exact: true }).waitFor();
+  assert.equal(await page.getByText("Couldn't read the device's settings.", { exact: true }).count(), 0);
+  await page.clock.runFor(9999);
+  assert.equal(await page.getByRole("button", { name: "Retry", exact: true }).count(), 0);
+  await page.clock.runFor(1);
+  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  assert.ok((await actions()).some((a) => a.type === "settings.reload"));
+  assert.equal(await page.locator(".toast").count(), 0);
+  await page.getByText("Reading the device's settings…", { exact: true }).waitFor();
+  entry.device.settings_state = "discovering";
+  await publish();
+  await page.clock.runFor(10_000);
+  assert.equal(await page.getByRole("button", { name: "Retry", exact: true }).count(), 0);
+  entry.device.settings_state = "ready";
+  await publish();
+  assert.equal(await page.getByRole("button", { name: "Retry", exact: true }).count(), 0);
+  await page.clock.runFor(10_000);
+  await page.getByRole("button", { name: "Retry", exact: true }).waitFor();
+  entry.device.settings_state = "discovering";
+  await publish();
+  await page.clock.runFor(90_000);
+  await page.getByRole("button", { name: "Retry", exact: true }).waitFor();
+  entry.device.settings_state = "ready";
+  entry.settings = { ...cachedSettings, current: false, loadError: "Cached list unavailable", result: {
+    kind: "apply", error: "Some saved values couldn't be applied.", counts: {
+      device_id: entry.device.device_id, revision: 1, count: 6, applied: 5, failed: 1, read: 0, unchanged: 0, unsupported: 0, uncertain: 0,
+    },
+  } };
+  await publish();
+  await page.clock.runFor(10_000);
+  await page.getByText("Some saved values couldn't be applied. (5 applied, 1 failed)", { exact: true }).waitFor();
+  await page.getByText("Couldn't read the device's settings.", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Retry", exact: true }).waitFor();
+  entry.settings.result = { kind: "refresh", error: null, counts: { ...entry.settings.result.counts, read: 6, applied: 0, failed: 0 } };
+  await publish();
+  await page.getByText("6 read", { exact: true }).waitFor();
+  await page.getByText("Couldn't read the device's settings.", { exact: true }).waitFor();
+  entry.settings.result = null;
+  entry.device.settings_error = "settings_unavailable";
+  await publish();
+  await page.getByRole("button", { name: "Retry", exact: true }).waitFor();
+  assert.equal(await page.locator(".toast").count(), 0);
+
+  entry.info = null;
+  entry.infoCurrent = false;
+  entry.infoError = "device.info got no response";
+  await publish();
+  await page.getByRole("tab", { name: "Details" }).click();
+  await page.getByText("Reading information…", { exact: true }).waitFor();
+  assert.equal(await page.getByText("Couldn't read information", { exact: true }).count(), 0);
+  await page.clock.runFor(10_000);
+  await page.getByText("Couldn't read information", { exact: true }).waitFor();
+  assert.equal(await page.getByText("device.info got no response", { exact: true }).count(), 0);
+  await app.evaluate(() => { globalThis.uiFail = "device.info.refresh"; });
+  await page.getByRole("button", { name: "Update", exact: true }).click();
+  await page.getByText("Couldn't save this value.", { exact: true }).waitFor();
+  assert.equal(await page.locator(".toast").count(), 0);
+  assert.deepEqual(errors, []);
+  console.log("Device UI: drafts, saved values, unknown Off, inline failures, busy controls, offline settings, cancellation and bounded loading passed");
+} catch (error) {
+  console.error(await page.locator("body").innerText());
+  throw error;
+} finally {
+  await app.close();
+  await rm(profile, { recursive: true, force: true });
+}

@@ -32,11 +32,18 @@ function useCountdown(expiresAt: number | undefined) {
 
 function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
   const [value, setValue] = useState("");
-  const [busy, run] = useAction();
+  const [busy, run] = useAction(true);
+  const [error, setError] = useState<string | null>(null);
   const seconds = useCountdown(prompt.expiresAt);
   const p = prompt.prompt;
   const code = (p.value ?? "").split("").join(" ");
-  const reply = (accept: boolean) => void run({ type: "pair.reply", accept, value: accept ? value : undefined });
+  // A prompt that is no longer waiting goes away with its view; other failures stay here.
+  const reply = async (accept: boolean) => {
+    setError(null);
+    const result = await run({ type: "pair.reply", accept, value: accept ? value : undefined });
+    if (!result.ok) setError(result.message);
+  };
+  const problem = error ? <p className="error-text">{error}</p> : null;
   if (prompt.kind === "display")
     return (
       <div className="prompt">
@@ -51,11 +58,12 @@ function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
         <p>Does {name} show this code?</p>
         <div className="code">{code}</div>
         <p className="muted">{seconds} seconds left</p>
+        {problem}
         <div className="actions center">
-          <button disabled={busy} onClick={() => reply(false)}>
+          <button disabled={busy} onClick={() => void reply(false)}>
             No, It's Different
           </button>
-          <button className="suggested" disabled={busy} onClick={() => reply(true)}>
+          <button className="suggested" disabled={busy} onClick={() => void reply(true)}>
             Yes, It Matches
           </button>
         </div>
@@ -68,7 +76,7 @@ function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
       className="prompt"
       onSubmit={(e) => {
         e.preventDefault();
-        if (valid) reply(true);
+        if (valid && !busy) void reply(true);
       }}
     >
       <p>{passkey ? `Enter the 6-digit passkey shown by ${name}:` : `Enter the PIN for ${name}:`}</p>
@@ -82,8 +90,9 @@ function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
         onChange={(e) => setValue(e.target.value)}
       />
       <p className="muted">{seconds} seconds left</p>
+      {problem}
       <div className="actions center">
-        <button type="button" disabled={busy} onClick={() => reply(false)}>
+        <button type="button" disabled={busy} onClick={() => void reply(false)}>
           Reject
         </button>
         <button type="submit" className="suggested" disabled={busy || !valid}>
@@ -111,6 +120,13 @@ export function AddDevice({
   const chosen = ready.find((a) => a.id === adapterId) ?? ready.find((a) => a.status?.capacity.pairing.some((p) => p.available)) ?? ready[0];
   const scan = state.scan;
   const pairing = state.pairing;
+  // Why starting a search or pairing failed; cleared by the next attempt.
+  const [problem, setProblem] = useState<string | null>(null);
+  const attempt = async (action: Parameters<typeof act>[0]) => {
+    setProblem(null);
+    const result = await act(action, true);
+    if (!result.ok) setProblem(result.message);
+  };
 
   // Keep the adapter chosen on opening, so status changes don't switch it.
   useEffect(() => {
@@ -122,7 +138,7 @@ export function AddDevice({
   useEffect(() => {
     if (!open || !chosen || pairing) return;
     if (scan?.adapterId === chosen.id) return;
-    void act({ type: "scan.start", adapterId: chosen.id });
+    void attempt({ type: "scan.start", adapterId: chosen.id });
   }, [open, chosen?.id, pairing === null]);
 
   useEffect(() => {
@@ -130,15 +146,20 @@ export function AddDevice({
   }, [open, chosen]);
 
   const close = () => {
-    if (pairing?.phase === "pairing") void act({ type: "pair.cancel" });
-    void act({ type: "scan.stop" });
-    void act({ type: "pair.dismiss" });
+    if (pairing?.phase === "pairing") void act({ type: "pair.cancel" }, true);
+    void act({ type: "scan.stop" }, true);
+    void act({ type: "pair.dismiss" }, true);
+    setProblem(null);
     onClose();
   };
 
   const again = () => {
-    void act({ type: "pair.dismiss" });
-    if (chosen) void act({ type: "scan.start", adapterId: chosen.id });
+    void act({ type: "pair.dismiss" }, true);
+    if (chosen) void attempt({ type: "scan.start", adapterId: chosen.id });
+  };
+
+  const cancelPairing = () => {
+    void act({ type: "pair.cancel" }, true);
   };
 
   const candidates = (scan?.adapterId === chosen?.id ? (scan?.candidates ?? []) : []).filter((c) => unnamed || clean(c.name ?? "") || c.kind !== "unknown");
@@ -176,7 +197,11 @@ export function AddDevice({
             <p className="muted">{pairing.message}</p>
           </div>
         ) : null}
-        {pairing.phase === "failed" ? (
+        {pairing.phase === "cancelled" ? (
+          <div className="result">
+            <p className="muted">{pairing.message}</p>
+          </div>
+        ) : pairing.phase === "failed" ? (
           <div className="result bad">
             <WarningIcon size={40} />
             <p>Couldn't add {name}.</p>
@@ -184,8 +209,8 @@ export function AddDevice({
           </div>
         ) : null}
         <footer className="dialog-footer">
-          {pairing.phase === "pairing" ? <button onClick={() => void act({ type: "pair.cancel" })}>Cancel Pairing</button> : null}
-          {pairing.phase === "failed" ? <button onClick={again}>Try Again</button> : null}
+          {pairing.phase === "pairing" ? <button onClick={cancelPairing}>Cancel Pairing</button> : null}
+          {pairing.phase === "failed" || pairing.phase === "cancelled" ? <button onClick={again}>Try Again</button> : null}
           {pairing.phase === "connected" || pairing.phase === "saved" ? (
             <>
               <button onClick={again}>Add Another</button>
@@ -200,7 +225,7 @@ export function AddDevice({
               </button>
             </>
           ) : null}
-          {pairing.phase === "failed" ? (
+          {pairing.phase === "failed" || pairing.phase === "cancelled" ? (
             <button className="suggested" onClick={close}>
               Close
             </button>
@@ -228,9 +253,9 @@ export function AddDevice({
             <>
               <Spinner /> Searching…
             </>
-          ) : scan?.error ? (
+          ) : (problem ?? scan?.error) ? (
             <Banner kind="error" action={<button onClick={again}>Search Again</button>}>
-              {scan.error}
+              {problem ?? scan?.error}
             </Banner>
           ) : (
             <button onClick={again}>Search Again</button>
@@ -250,7 +275,7 @@ export function AddDevice({
                 {a && !a.available ? (
                   <span className="muted small">{a.reason ? PAIR_UNAVAILABLE[a.reason] : "Can't add now"}</span>
                 ) : (
-                  <button className="suggested" onClick={() => chosen && void act({ type: "pair.start", adapterId: chosen.id, candidateId: c.candidate_id })}>
+                  <button className="suggested" onClick={() => chosen && void attempt({ type: "pair.start", adapterId: chosen.id, candidateId: c.candidate_id })}>
                     Pair
                   </button>
                 )}

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { AppState, Preferences as Prefs } from "../../shared/state.ts";
 import { act, api } from "../api.ts";
 import { Card, Dialog, SwitchRow } from "./common.tsx";
@@ -5,6 +6,9 @@ import { Card, Dialog, SwitchRow } from "./common.tsx";
 export function Preferences({ state, open, onClose }: { state: AppState; open: boolean; onClose: () => void }) {
   const p = state.preferences;
   const set = (preferences: Partial<Prefs>) => void act({ type: "preferences", preferences });
+  // The level as typed; it saves once it is a valid level and reverts on blur.
+  const [level, setLevel] = useState<string | null>(null);
+  const levelValid = (n: number) => Number.isInteger(n) && n >= 5 && n <= 50;
   return (
     <Dialog open={open} title="Preferences" onClose={onClose} className="preferences">
       <div className="dialog-scroll">
@@ -28,11 +32,14 @@ export function Preferences({ state, open, onClose }: { state: AppState; open: b
                 min={5}
                 max={50}
                 step={5}
-                value={p.lowBatteryPercent}
+                value={level ?? p.lowBatteryPercent}
+                aria-invalid={level !== null && !levelValid(Number(level))}
                 onChange={(e) => {
+                  setLevel(e.target.value);
                   const n = Number(e.target.value);
-                  if (Number.isInteger(n) && n >= 5 && n <= 50) set({ lowBatteryPercent: n });
+                  if (e.target.value !== "" && levelValid(n)) set({ lowBatteryPercent: n });
                 }}
+                onBlur={() => setLevel(null)}
               />
               <span className="unit">%</span>
             </div>

@@ -3,16 +3,17 @@ import type { HostPlatform } from "../../protocol/types.ts";
 import { isLow } from "../../shared/battery.ts";
 import { adapterName } from "../../shared/adapter-name.ts";
 import type { AdapterEntry, AppState } from "../../shared/state.ts";
-import { PAIR_UNAVAILABLE, PLATFORMS, TRANSPORTS, adapterStatus, deviceStatus } from "../../shared/text.ts";
+import { PAIR_UNAVAILABLE, PLATFORMS, TRANSPORTS, adapterStatus, batteryStale, deviceStatus } from "../../shared/text.ts";
 import { useAction } from "../api.ts";
 import type { Selection } from "../App.tsx";
 import { Banner, Card, Dialog, Fact, Facts, Meter, Page, Pill, Segmented, Spinner } from "./common.tsx";
 import { AdapterIcon, ChevronIcon, DeviceIcon } from "./icons.tsx";
 
 /** The rename dialog's contents; mounted each time it opens, so it starts from the current name. */
-function Rename({ adapter, busy, onRename, onDone }: {
+function Rename({ adapter, busy, error, onRename, onDone }: {
   adapter: AdapterEntry;
   busy: boolean;
+  error: string | null;
   onRename: (name: string | null) => Promise<void>;
   onDone: () => void;
 }) {
@@ -30,6 +31,7 @@ function Rename({ adapter, busy, onRename, onDone }: {
       }}
     >
       <input ref={input} className="name-input" aria-label="Adapter name" value={name} disabled={busy} maxLength={64} onChange={(e) => setName(e.target.value)} />
+      {error ? <p className="dialog-body error-text">{error}</p> : null}
       <footer className="dialog-footer">
         <button type="button" disabled={busy || !available} onClick={() => void onRename(null)}>
           Reset to default
@@ -59,18 +61,27 @@ export function AdapterPage({
   onSelect: (s: Selection) => void;
 }) {
   const [busy, run] = useAction();
+  const [quietBusy, runQuiet] = useAction(true);
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [platformError, setPlatformError] = useState<string | null>(null);
+  const [connectError, setConnectError] = useState<string | null>(null);
   const [editing, setEditing] = useState(renaming);
   useEffect(() => setEditing(renaming), [renaming]);
   const s = adapter.status;
   const connected = adapter.connection === "connected";
   const closeRename = () => {
     setEditing(false);
+    setRenameError(null);
     onRenamed();
   };
-  const done = () => { if (!busy) closeRename(); };
+  const done = () => { if (!quietBusy) closeRename(); };
   const status = adapterStatus(adapter);
   const platform = adapter.platform;
-  const setPlatform = (p: HostPlatform) => void run({ type: "adapter.platform", adapterId: adapter.id, platform: p });
+  const setPlatform = async (p: HostPlatform) => {
+    setPlatformError(null);
+    const result = await runQuiet({ type: "adapter.platform", adapterId: adapter.id, platform: p });
+    if (!result.ok) setPlatformError(result.message);
+  };
   const devices = state.devices.filter((d) => d.adapterId === adapter.id);
   const threshold = state.preferences.lowBatteryPercent;
 
@@ -86,7 +97,7 @@ export function AdapterPage({
       }
       actions={
         <>
-          {busy ? <Spinner /> : null}
+          {busy || quietBusy ? <Spinner /> : null}
           <button disabled={!connected || !s?.storage_ready} onClick={() => setEditing(true)}>Rename…</button>
           {connected ? (
             <button disabled={busy} onClick={() => void run({ type: "adapter.disconnect", adapterId: adapter.id })}>
@@ -97,12 +108,14 @@ export function AdapterPage({
       }
     >
       <Dialog open={editing} title="Rename Adapter" onClose={done}>
-        <Rename adapter={adapter} busy={busy} onDone={done} onRename={async (name) => {
-          const result = await run({ type: "adapter.name", adapterId: adapter.id, name });
+        <Rename adapter={adapter} busy={quietBusy} error={renameError} onDone={done} onRename={async (name) => {
+          setRenameError(null);
+          const result = await runQuiet({ type: "adapter.name", adapterId: adapter.id, name });
           if (result.ok) closeRename();
+          else setRenameError(result.message);
         }} />
       </Dialog>
-      {adapter.connectError ? <Banner kind="error">{adapter.connectError}</Banner> : null}
+      {!connected && (adapter.connectError ?? connectError) ? <Banner kind="error">{adapter.connectError ?? connectError}</Banner> : null}
       {!connected ? (
         <div className="page-empty">
           <AdapterIcon size={64} />
@@ -110,7 +123,15 @@ export function AdapterPage({
           {adapter.connection === "connecting" ? (
             <Spinner />
           ) : (
-            <button className="suggested" disabled={busy} onClick={() => void run({ type: "adapter.connect", adapterId: adapter.id })}>
+            <button
+              className="suggested"
+              disabled={quietBusy}
+              onClick={async () => {
+                setConnectError(null);
+                const result = await runQuiet({ type: "adapter.connect", adapterId: adapter.id });
+                if (!result.ok) setConnectError(result.message);
+              }}
+            >
               Connect
             </button>
           )}
@@ -127,19 +148,20 @@ export function AdapterPage({
           <div className="row">
             <div className="row-text">
               <div className="row-title">Platform</div>
+              {platformError ? <div className="row-subtitle">{platformError}</div> : null}
             </div>
             <div className="row-end">
               <Segmented
                 label="Platform"
                 options={Object.entries(PLATFORMS) as [HostPlatform, string][]}
                 value={platform}
-                disabled={busy}
-                onChange={setPlatform}
+                disabled={quietBusy || !s?.storage_ready}
+                onChange={(p) => void setPlatform(p)}
               />
             </div>
           </div>
           {platform !== state.hostPlatform ? (
-            <Banner action={<button onClick={() => setPlatform(state.hostPlatform)}>Switch to {PLATFORMS[state.hostPlatform]}</button>}>
+            <Banner action={<button disabled={quietBusy || !s?.storage_ready} onClick={() => void setPlatform(state.hostPlatform)}>Switch to {PLATFORMS[state.hostPlatform]}</button>}>
               This computer runs {PLATFORMS[state.hostPlatform]}.
             </Banner>
           ) : null}
@@ -160,7 +182,7 @@ export function AdapterPage({
                   <span className="row-title strong">{d.name}</span>
                   <span className={needs ? "row-subtitle warn" : "row-subtitle"}>{deviceStatus(d.device)}</span>
                 </span>
-                {d.battery?.percent != null ? <span className={low ? "value low" : "value"}>{d.battery.percent}%</span> : null}
+                {d.battery?.percent != null ? <span className={`value${low ? " low" : ""}${batteryStale(d.battery) ? " dim" : ""}`}>{d.battery.percent}%</span> : null}
                 <ChevronIcon />
               </button>
             );

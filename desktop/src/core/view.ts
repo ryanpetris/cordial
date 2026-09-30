@@ -27,8 +27,11 @@ class Cache<T> {
   complete = false;
   /** Epoch of the last read started. */
   epoch = -1;
-  /** Epoch whose read failed; not retried until the next epoch. */
+  /** Epoch whose read failed. */
   failedEpoch = -1;
+  /** View revision when the read started, and when its failure was recorded. */
+  readRevision = -1;
+  failedRevision = -1;
   /** Highest revision of a change that invalidated this cache. */
   staleRevision = 0;
 
@@ -70,6 +73,7 @@ type Change =
   | { kind: "setting"; revision: number; id: string; setting: Setting };
 
 const infoKey = (f: InfoField) => `${f.key}/${f.instance}`;
+const HISTORY_LIMIT = 256;
 
 export class AdapterView {
   devices = new Map<string, Device>();
@@ -170,7 +174,10 @@ export class AdapterView {
       default:
         return false;
     }
-    if (this.#buffer) this.#buffer.push(change);
+    if (this.#buffer) {
+      this.#buffer.push(change);
+      if (this.#buffer.length > HISTORY_LIMIT) this.lose(this.#buffer.shift()!.revision);
+    }
     else this.#apply(change);
     return true;
   }
@@ -206,6 +213,14 @@ export class AdapterView {
           ) {
             settings.complete = false;
             settings.staleRevision = Math.max(settings.staleRevision, change.revision);
+          }
+          if (change.device.state !== "connected" || change.device.normalization_state === "resetting") {
+            for (const [key, row] of settings.rows) {
+              if (row.revision >= change.revision) continue;
+              const value = { ...row.value, fresh: false };
+              if (value.managed && ["applied", "applying", "changed_on_device"].includes(value.state)) value.state = "pending";
+              settings.put(key, change.revision, value);
+            }
           }
         }
         break;
@@ -249,6 +264,7 @@ export class AdapterView {
   beginInfo(id: string): number {
     let cache = this.#infos.get(id);
     if (!cache) this.#infos.set(id, (cache = new Cache()));
+    if (cache.epoch !== this.#epoch) cache.complete = false;
     cache.epoch = this.#epoch;
     return this.#epoch;
   }
@@ -266,8 +282,10 @@ export class AdapterView {
       info.revision,
       info.fields.map((f) => [infoKey(f), f]),
     );
-    if (epoch === this.#epoch && cache.epoch === epoch) cache.complete = true;
-    this.#infoErrors.delete(info.device_id);
+    if (epoch === this.#epoch && cache.epoch === epoch) {
+      cache.complete = true;
+      this.#infoErrors.delete(info.device_id);
+    }
   }
 
   /** Records a failed read; it is retried in the next epoch. */
@@ -287,6 +305,11 @@ export class AdapterView {
     return cache && (cache.complete || cache.rows.size) ? [...cache.rows.values()].map((r) => r.value) : null;
   }
 
+  infoCurrent(id: string): boolean {
+    const cache = this.#infos.get(id);
+    return this.valid && !!cache?.complete && cache.epoch === this.#epoch;
+  }
+
   /** The last valid name the device reported, even if only last known. */
   reportedName(id: string): string | null {
     return this.#names.get(id)?.value ?? null;
@@ -297,7 +320,21 @@ export class AdapterView {
   /** Watched devices whose cached settings list must be read again. */
   settingsNeeded(watched: Iterable<string>): string[] {
     if (!this.valid) return [];
-    return [...watched].filter((id) => this.devices.has(id) && (this.#settings.get(id)?.needed(this.#epoch) ?? true));
+    return [...watched].filter((id) => {
+      if (!this.devices.has(id)) return false;
+      const cache = this.#settings.get(id);
+      return !cache || cache.needed(this.#epoch) || (!cache.complete && cache.failedRevision !== this.revision);
+    });
+  }
+
+  /** Allows a cached-list retry without refreshing the peripheral. */
+  retrySettings(id: string, force = true) {
+    const cache = this.#settings.get(id);
+    if (cache) {
+      if (force) cache.complete = false;
+      cache.failedEpoch = -1;
+      cache.failedRevision = -1;
+    }
   }
 
   beginSettings(id: string): number {
@@ -305,6 +342,7 @@ export class AdapterView {
     if (!cache) this.#settings.set(id, (cache = new Cache()));
     cache.epoch = this.#epoch;
     cache.complete = false;
+    cache.readRevision = this.revision;
     return this.#epoch;
   }
 
@@ -334,13 +372,17 @@ export class AdapterView {
     const cache = this.#settings.get(id);
     if (!cache || cache.epoch !== epoch) return;
     cache.failedEpoch = epoch;
+    cache.failedRevision = cache.readRevision;
     const meta = this.#settingsMeta.get(id);
     this.#settingsMeta.set(id, { state: meta?.state ?? null, error: meta?.error ?? null, loadError: reason });
   }
 
   /** Applies a setting record returned by a command at its revision. */
   putSetting(id: string, revision: number, setting: Setting) {
-    this.#settings.get(id)?.put(setting.key, revision, setting);
+    if (!this.devices.has(id)) return;
+    let cache = this.#settings.get(id);
+    if (!cache) this.#settings.set(id, (cache = new Cache()));
+    cache.put(setting.key, revision, setting);
   }
 
   settings(id: string): SettingsView | null {
@@ -351,7 +393,7 @@ export class AdapterView {
       settings: [...cache.rows.values()].map((r) => r.value),
       state: meta?.state ?? null,
       error: meta?.error ?? null,
-      current: cache.complete && cache.epoch === this.#epoch,
+      current: this.valid && cache.complete && cache.epoch === this.#epoch,
       loadError: meta?.loadError ?? null,
     };
   }

@@ -3,7 +3,7 @@ import type { Navigation } from "../shared/state.ts";
 import { act, api, setReporter, useAppState } from "./api.ts";
 import { AddDevice } from "./components/AddDevice.tsx";
 import { AdapterPage } from "./components/AdapterPage.tsx";
-import { DevicePage } from "./components/DevicePage.tsx";
+import { DevicePage, type Draft, type Drafts } from "./components/DevicePage.tsx";
 import { HomePage } from "./components/HomePage.tsx";
 import { Preferences } from "./components/Preferences.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
@@ -19,6 +19,8 @@ export function App() {
   const [adding, setAdding] = useState(false);
   const [preferences, setPreferences] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  // Unsaved setting edits by device and setting, kept across tabs and pages.
+  const [drafts, setDrafts] = useState<Record<string, Draft>>({});
 
   useEffect(() => {
     setReporter(setToast);
@@ -64,10 +66,23 @@ export function App() {
   }, [current, shownId]);
 
   useEffect(() => {
-    void act({ type: "settings.watch", key: watched });
+    void act({ type: "settings.watch", key: watched }, true);
   }, [watched]);
 
   if (!state) return <div className="loading" />;
+
+  const draftsFor = (key: string): Drafts => ({
+    get: (setting) => drafts[`${key} ${setting}`],
+    set: (setting, value, expected) =>
+      setDrafts((all) => {
+        const id = `${key} ${setting}`;
+        if (expected !== undefined && all[id] !== expected) return all;
+        const next = { ...all };
+        if (value === undefined) delete next[id];
+        else next[id] = value;
+        return next;
+      }),
+  });
 
   return (
     <div className="app">
@@ -84,7 +99,13 @@ export function App() {
       />
       <main className="content">
         {shown.page === "device" ? (
-          <DevicePage key={shown.key} state={state} entry={devices.find((d) => d.key === shown.key)!} onAdd={() => setAdding(true)} />
+          <DevicePage
+            key={shown.key}
+            state={state}
+            entry={devices.find((d) => d.key === shown.key)!}
+            drafts={draftsFor(shown.key)}
+            onAdd={() => setAdding(true)}
+          />
         ) : shown.page === "adapter" ? (
           <AdapterPage
             key={shown.id}

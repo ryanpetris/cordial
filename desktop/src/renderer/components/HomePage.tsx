@@ -1,21 +1,28 @@
+import { useState } from "react";
 import { isLow } from "../../shared/battery.ts";
 import type { AppState } from "../../shared/state.ts";
-import { adapterStatus } from "../../shared/text.ts";
-import { act, api } from "../api.ts";
+import { adapterStatus, batteryStale } from "../../shared/text.ts";
+import { act, api, chooseAdapter } from "../api.ts";
 import type { Selection } from "../App.tsx";
 import { Card, Meter, Page, Summary } from "./common.tsx";
 import { AdapterIcon, BatteryGlyph, ChevronIcon, DeviceIcon, HomeIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
 
 export function HomePage({ state, onSelect, onAdd }: { state: AppState; onSelect: (s: Selection) => void; onAdd: () => void }) {
+  const [chooseError, setChooseError] = useState<string | null>(null);
   if (state.adapters.length === 0) {
     const choose = api.host.choosePort;
+    const pick = async () => {
+      setChooseError(null);
+      const result = await chooseAdapter();
+      if (!result.ok) setChooseError(result.message);
+    };
     return (
       <Page icon={<HomeIcon size={20} />} title="Overview">
         <div className="page-empty">
           <AdapterIcon size={64} />
           <h2>No Adapter Found</h2>
           {choose ? (
-            <button className="suggested" onClick={() => void choose()}>
+            <button className="suggested" onClick={() => void pick()}>
               <PlusIcon /> Choose Adapter…
             </button>
           ) : (
@@ -23,6 +30,7 @@ export function HomePage({ state, onSelect, onAdd }: { state: AppState; onSelect
               <RefreshIcon /> Look Again
             </button>
           )}
+          {chooseError ? <p className="error-text">{chooseError}</p> : null}
         </div>
       </Page>
     );
@@ -92,7 +100,9 @@ export function HomePage({ state, onSelect, onAdd }: { state: AppState; onSelect
                   <span className="tile-text">
                     <span className="tile-line">
                       <span className="row-title strong">{d.name}</span>
-                      {percent != null ? <span className={dim ? "tile-percent low" : "tile-percent"}>{percent}%</span> : null}
+                      {percent != null ? (
+                        <span className={`tile-percent${dim ? " low" : ""}${batteryStale(d.battery!) ? " dim" : ""}`}>{percent}%</span>
+                      ) : null}
                     </span>
                     {percent != null ? <Meter fraction={percent / 100} low={dim} /> : null}
                     {several ? <span className="row-subtitle">{adapterName(d.adapterId)}</span> : null}

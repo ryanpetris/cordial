@@ -5,6 +5,7 @@ type Kind = "string" | "boolean" | "number" | "value" | "string?" | "nullable";
 const key = { key: "string" } as const;
 const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "device.connect": key,
+  "device.connect.cancel": key,
   "device.disconnect": key,
   "device.unpair": key,
   "device.info.refresh": key,
@@ -15,6 +16,7 @@ const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "setting.set": { key: "string", setting: "string", value: "value" },
   "setting.forget": { key: "string", setting: "string" },
   "settings.refresh": key,
+  "settings.reload": key,
   "settings.apply": key,
   "settings.watch": { key: "nullable" },
   "adapter.name": { adapterId: "string", name: "nullable" },

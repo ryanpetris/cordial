@@ -20,7 +20,7 @@ import type {
   WarningCode,
   WireError,
 } from "../protocol/types.ts";
-import type { AdapterEntry, Battery, DeviceEntry } from "./state.ts";
+import type { AdapterEntry, Battery, DeviceEntry, SettingsResult } from "./state.ts";
 
 const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
@@ -298,6 +298,31 @@ export function batteryText(b: Battery | null): string | null {
   if (b.percent != null) parts.push(`${b.percent}%`);
   if (b.charging) parts.push("Charging");
   return parts.length ? parts.join(" · ") : null;
+}
+
+/** Whether the shown battery reading is only last known. */
+export const batteryStale = (b: Battery) => (b.percent != null && !b.percentFresh) || (b.charging != null && !b.chargingFresh);
+
+/** A Read Again or Apply outcome: the counts that occurred, and always the main one. */
+export function settingsResultText(r: SettingsResult): string {
+  const c = r.counts;
+  if (!c) return r.error ?? "";
+  const apply = r.kind === "apply";
+  const counts: [string, number][] = [
+    ["read", c.read],
+    ["applied", c.applied],
+    ["unchanged", c.unchanged],
+    ["unsupported", c.unsupported],
+    ["failed", c.failed],
+    ["uncertain", c.uncertain],
+  ];
+  const summary = sentence(
+    counts
+      .filter(([o, n]) => n > 0 || (o === "applied" && apply) || (o === "read" && !apply))
+      .map(([o, n]) => `${n} ${o}`)
+      .join(", "),
+  );
+  return r.error ? `${r.error} (${summary})` : summary;
 }
 
 /** The device's state in a few words, as lists show it. */

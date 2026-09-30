@@ -23,24 +23,42 @@ export function useAppState(): AppState | null {
 type Report = (message: string) => void;
 let report: Report = () => {};
 export const setReporter = (r: Report) => (report = r);
+export const reportError = (message: string) => report(message);
 
-/** Runs an action, reporting a failure; resolves with the result. */
-export async function act(action: Action): Promise<ActionResult> {
-  const result = await api.act(action);
-  if (!result.ok) report(result.message);
+/** Opens the adapter chooser; dismissing it is a successful no-op. */
+export async function chooseAdapter(): Promise<ActionResult> {
+  try {
+    await api.host.choosePort?.();
+    return { ok: true };
+  } catch (error) {
+    return error instanceof DOMException && error.name === "NotFoundError"
+      ? { ok: true } : { ok: false, message: (error as Error).message };
+  }
+}
+
+/** Runs an action, reporting a failure unless it is quiet or shown inline; resolves with the result. */
+export async function act(action: Action, quiet = false): Promise<ActionResult> {
+  let result: ActionResult;
+  try { result = await api.act(action); }
+  catch { result = { ok: false, message: "Couldn't confirm that action." }; }
+  if (!result.ok && !result.inline && !quiet) report(result.message);
   return result;
 }
 
-/** An action runner that tracks whether its action is in progress. */
-export function useAction(): [boolean, (action: Action) => Promise<ActionResult>] {
+/** An action runner that tracks whether its action is in progress. A quiet
+ * runner leaves failures to its caller. */
+export function useAction(quiet = false): [boolean, (action: Action) => Promise<ActionResult>] {
   const [busy, setBusy] = useState(false);
-  const run = useCallback(async (action: Action) => {
-    setBusy(true);
-    try {
-      return await act(action);
-    } finally {
-      setBusy(false);
-    }
-  }, []);
+  const run = useCallback(
+    async (action: Action) => {
+      setBusy(true);
+      try {
+        return await act(action, quiet);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [quiet],
+  );
   return [busy, run];
 }

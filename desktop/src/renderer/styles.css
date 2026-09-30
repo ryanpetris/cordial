@@ -902,6 +902,38 @@ button.row {
   color: var(--dim);
 }
 
+/* A settings panel's only content while it has no rows: progress or a problem. */
+.panel-state {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 32px 0;
+}
+
+/* Concise feedback about a failed action, next to where it ran. */
+.error-text {
+  color: var(--destructive-fg);
+}
+
+.actions-note {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Last known battery readings. */
+.pill.dim,
+.side-battery.dim,
+.tile-percent.dim,
+.value.dim {
+  opacity: 0.6;
+}
+
 .small {
   font-size: 12.5px;
 }

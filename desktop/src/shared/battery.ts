@@ -9,8 +9,8 @@ export type Level = "ok" | "low" | "critical";
 /** The battery's level, or null when the readings don't decide it. */
 export function batteryLevel(b: Battery | null, threshold: number): Level | null {
   if (!b) return null;
-  if (b.charging === true) return "ok";
-  if (b.percent == null) return null;
+  if (b.chargingFresh && b.charging === true) return "ok";
+  if (!b.percentFresh || b.percent == null) return null;
   if (b.percent <= CRITICAL_PERCENT) return "critical";
   return b.percent <= threshold ? "low" : "ok";
 }

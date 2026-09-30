@@ -3,6 +3,7 @@
 import type {
   Candidate,
   Capability,
+  CommandName,
   Device,
   ErrorCode,
   HostPlatform,
@@ -11,6 +12,7 @@ import type {
   Setting,
   SettingKey,
   SettingsState,
+  SettingsSummary,
   Status,
 } from "../protocol/types.ts";
 
@@ -19,6 +21,14 @@ export interface Battery {
   percent: number | null;
   /** Null while unknown; unknown never means "not charging". */
   charging: boolean | null;
+  percentFresh: boolean;
+  chargingFresh: boolean;
+}
+
+export interface SettingsResult {
+  kind: "refresh" | "apply";
+  counts: SettingsSummary | null;
+  error: string | null;
 }
 
 export interface AdapterEntry {
@@ -43,6 +53,7 @@ export interface SettingsEntry {
   current: boolean;
   /** Why the last read of the list failed, in words. */
   loadError: string | null;
+  result: SettingsResult | null;
 }
 
 export interface DeviceEntry {
@@ -53,10 +64,12 @@ export interface DeviceEntry {
   /** Reported name, else the saved pairing name. */
   name: string;
   kind: "keyboard" | "mouse" | "keyboard_mouse" | "other";
-  /** Current readings only; null when neither is known. */
+  /** Last known readings with their freshness; null when neither is known. */
   battery: Battery | null;
   /** Null until the first information snapshot. */
   info: InfoField[] | null;
+  infoCurrent: boolean;
+  pending: { id: number; command: CommandName }[];
   /** Why the last information read failed, in words. */
   infoError: string | null;
   /** Present only while the window shows this device. */
@@ -82,7 +95,7 @@ export interface PairingState {
   adapterId: string;
   candidateId: string;
   name: string;
-  phase: "pairing" | "connecting" | "connected" | "saved" | "failed";
+  phase: "pairing" | "connecting" | "connected" | "saved" | "failed" | "cancelled";
   prompt: PairingPrompt | null;
   deviceKey: string | null;
   /** Explanation for the saved-but-not-connected and failed phases. */
@@ -123,11 +136,11 @@ export interface AppState {
 }
 
 export type Action =
-  | { type: "device.connect" | "device.disconnect" | "device.unpair" | "device.info.refresh"; key: string }
+  | { type: "device.connect" | "device.connect.cancel" | "device.disconnect" | "device.unpair" | "device.info.refresh"; key: string }
   | { type: "device.enabled" | "device.trusted" | "device.blocked" | "device.hidpp"; key: string; value: boolean }
   | { type: "setting.set"; key: string; setting: SettingKey; value: boolean | number | string }
   | { type: "setting.forget"; key: string; setting: SettingKey }
-  | { type: "settings.refresh" | "settings.apply"; key: string }
+  | { type: "settings.refresh" | "settings.apply" | "settings.reload"; key: string }
   | { type: "settings.watch"; key: string | null }
   | { type: "adapter.name"; adapterId: string; name: string | null }
   | { type: "adapter.platform"; adapterId: string; platform: HostPlatform }
@@ -142,7 +155,7 @@ export type Action =
   | { type: "pair.cancel" | "pair.dismiss" }
   | { type: "preferences"; preferences: Partial<Preferences> };
 
-export type ActionResult = { ok: true } | { ok: false; message: string };
+export type ActionResult = { ok: true } | { ok: false; message: string; inline?: boolean };
 
 /** Where the main process asks the window to go. */
 export type Navigation =

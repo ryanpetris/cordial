@@ -81,11 +81,7 @@ export async function startWebBackend(simulate: number): Promise<DesktopApi> {
       choosePort:
         serial && !simulate
           ? async () => {
-              try {
-                await serial.requestPort({ filters: PORT_FILTERS });
-              } catch {
-                return; // The user closed the chooser.
-              }
+              await serial.requestPort({ filters: PORT_FILTERS });
               if (notifying(controller.preferences)) allowNotifications();
               await controller.manager.rescan();
             }

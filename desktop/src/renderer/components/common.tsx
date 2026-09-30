@@ -39,9 +39,9 @@ export function Page({
 export type Tone = "ok" | "warn" | "low" | "neutral";
 
 /** A short status in a rounded label; `dot` marks a state rather than a reading. */
-export function Pill({ tone = "neutral", dot, children }: { tone?: Tone; dot?: boolean; children: ReactNode }) {
+export function Pill({ tone = "neutral", dot, dim, children }: { tone?: Tone; dot?: boolean; dim?: boolean; children: ReactNode }) {
   return (
-    <span className={`pill ${tone}`}>
+    <span className={dim ? `pill ${tone} dim` : `pill ${tone}`}>
       {dot ? <span className="pill-dot" /> : null}
       {children}
     </span>
@@ -54,18 +54,20 @@ export function Segmented<T extends string | number | boolean>({
   options,
   value,
   disabled,
+  selectCurrent = false,
   onChange,
 }: {
   label: string;
   options: [T, string][];
   value: T | null;
   disabled?: boolean;
+  selectCurrent?: boolean;
   onChange: (value: T) => void;
 }) {
   return (
     <span className="segmented" role="group" aria-label={label}>
       {options.map(([v, text]) => (
-        <button key={String(v)} aria-pressed={v === value} disabled={disabled} onClick={() => v !== value && onChange(v)}>
+        <button key={String(v)} aria-pressed={v === value} disabled={disabled} onClick={() => (selectCurrent || v !== value) && onChange(v)}>
           {text}
         </button>
       ))}

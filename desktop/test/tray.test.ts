@@ -25,6 +25,8 @@ const entry = (adapterId: string, id: string, patch: Partial<DeviceEntry> = {}, 
   kind: "keyboard",
   battery: null,
   info: [],
+  infoCurrent: true,
+  pending: [],
   infoError: null,
   settings: null,
   ...patch,
@@ -52,7 +54,7 @@ describe("trayModel", () => {
     const low = trayModel(
       app(
         [adapter("A", { attention: ["1 device needs pairing again"] })],
-        [entry("A", "d_1", { battery: { percent: 20, charging: false } }, "connected")],
+        [entry("A", "d_1", { battery: { percent: 20, charging: false, percentFresh: true, chargingFresh: true } }, "connected")],
       ),
     );
     expect([low.base, low.badge]).toEqual(["connected", "low"]);
@@ -74,16 +76,16 @@ describe("trayModel", () => {
 describe("battery", () => {
   it("treats unknown as undecided and charging as not low", () => {
     expect(batteryLevel(null, 20)).toBeNull();
-    expect(batteryLevel({ percent: null, charging: false }, 20)).toBeNull();
-    expect(batteryLevel({ percent: 3, charging: true }, 20)).toBe("ok");
-    expect(batteryLevel({ percent: 20, charging: null }, 20)).toBe("low");
-    expect(batteryLevel({ percent: 5, charging: false }, 20)).toBe("critical");
+    expect(batteryLevel({ percent: null, charging: false, percentFresh: true, chargingFresh: true }, 20)).toBeNull();
+    expect(batteryLevel({ percent: 3, charging: true, percentFresh: true, chargingFresh: true }, 20)).toBe("ok");
+    expect(batteryLevel({ percent: 20, charging: null, percentFresh: true, chargingFresh: false }, 20)).toBe("low");
+    expect(batteryLevel({ percent: 5, charging: false, percentFresh: true, chargingFresh: true }, 20)).toBe("critical");
   });
 
   it("alerts on entering low and critical once", () => {
     const alerts = new BatteryAlerts();
     const d = (percent: number | null, charging: boolean | null = false) => [
-      entry("A", "d_1", { battery: percent == null && charging == null ? null : { percent, charging } }),
+      entry("A", "d_1", { battery: percent == null && charging == null ? null : { percent, charging, percentFresh: percent !== null, chargingFresh: charging !== null } }),
     ];
     expect(alerts.update(d(50), 20)).toEqual([]);
     expect(alerts.update(d(20), 20).map((a) => a.level)).toEqual(["low"]);

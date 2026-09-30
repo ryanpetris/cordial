@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { AdapterEntry, AppState, DeviceEntry } from "../../shared/state.ts";
-import { adapterStatus, batteryText, deviceStatus } from "../../shared/text.ts";
-import { act, api } from "../api.ts";
+import { adapterStatus, batteryStale, batteryText, deviceStatus } from "../../shared/text.ts";
+import { act, api, chooseAdapter, reportError } from "../api.ts";
 import type { Selection } from "../App.tsx";
 import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, MenuIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
 import { isLow } from "../../shared/battery.ts";
@@ -19,7 +19,7 @@ function DeviceRow({ d, selected, threshold, onSelect }: { d: DeviceEntry; selec
         <span className={needs ? "side-subtitle warn" : "side-subtitle"}>{deviceStatus(d.device)}</span>
       </span>
       {d.battery ? (
-        <span className={low ? "side-battery low" : "side-battery"} title={`Battery ${batteryText(d.battery) ?? "unknown"}`}>
+        <span className={`side-battery${low ? " low" : ""}${batteryStale(d.battery) ? " dim" : ""}`} title={`Battery ${batteryText(d.battery) ?? "unknown"}`}>
           {d.battery.percent != null ? `${d.battery.percent}%` : null}
           <BatteryGlyph percent={d.battery.percent} charging={d.battery.charging} low={low} />
         </span>
@@ -148,7 +148,7 @@ export function Sidebar({
           Adapters
           <span>
             {choose ? (
-              <button className="icon-button" title="Choose adapter" aria-label="Choose adapter" onClick={() => void choose()}>
+              <button className="icon-button" title="Choose adapter" aria-label="Choose adapter" onClick={() => void chooseAdapter().then((result) => { if (!result.ok) reportError(result.message); })}>
                 <PlusIcon />
               </button>
             ) : null}

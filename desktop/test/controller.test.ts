@@ -26,7 +26,7 @@ describe("Controller", () => {
     const mouse = s.devices.find((d) => d.key === "AAAA0001/d_2")!;
     expect(mouse.name).toBe("Example Mouse");
     expect(mouse.kind).toBe("mouse");
-    expect(mouse.battery).toEqual({ percent: 12, charging: false });
+    expect(mouse.battery).toEqual({ percent: 12, charging: false, percentFresh: true, chargingFresh: true });
     await c.stop();
   });
 
@@ -168,6 +168,26 @@ describe("Controller", () => {
     await until(() => state()!.pairing?.phase === "failed");
     expect(state()!.pairing!.message).toMatch(/rejected/);
     await c.stop();
+  });
+
+  it("distinguishes cancelled pairing from a later failed pairing", async () => {
+    const fake = new FakeAdapter();
+    const { c, state } = controller({ "/fake": fake });
+    try {
+      await c.manager.rescan();
+      await until(() => loaded(state(), 4));
+      await c.act({ type: "scan.start", adapterId: fake.id });
+      await until(() => !!state()?.scan?.candidates.length);
+      await c.act({ type: "pair.start", adapterId: fake.id, candidateId: "c_1" });
+      await until(() => !!state()?.pairing?.prompt);
+      await c.act({ type: "pair.cancel" });
+      await until(() => state()?.pairing?.phase === "cancelled");
+      await c.act({ type: "pair.dismiss" });
+      await c.act({ type: "pair.start", adapterId: fake.id, candidateId: "c_2" });
+      await until(() => !!state()?.pairing?.prompt);
+      await c.act({ type: "pair.reply", accept: false });
+      await until(() => state()?.pairing?.phase === "failed");
+    } finally { await c.stop(); }
   });
 });
 
