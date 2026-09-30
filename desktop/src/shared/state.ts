@@ -133,6 +133,8 @@ export type Action =
   | { type: "adapter.platform"; adapterId: string; platform: HostPlatform }
   | { type: "adapter.connect" | "adapter.disconnect" | "adapter.menu"; adapterId: string }
   | { type: "adapters.refresh" }
+  /** Opens the window's app menu at a point in CSS pixels from the window's top left. */
+  | { type: "app.menu"; x: number; y: number }
   | { type: "scan.start"; adapterId: string }
   | { type: "scan.stop" }
   | { type: "pair.start"; adapterId: string; candidateId: string }

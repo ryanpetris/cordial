@@ -133,6 +133,8 @@ describe("adapter session and controller behavior", () => {
     expect(isAction({ type: "preferences", preferences: { lowBatteryPercent: 30 } })).toBe(true);
     expect(isAction({ type: "preferences", preferences: { unknown: true } })).toBe(false);
     expect(isAction({ type: "setting.set", key: "k", setting: "wheel.mode", value: 1.5 })).toBe(false);
+    expect(isAction({ type: "app.menu", x: 10, y: 20.5 })).toBe(true);
+    expect(isAction({ type: "app.menu", x: Infinity, y: 0 })).toBe(false);
     const status = new FakeAdapter().status();
     expect(statusProblem(status, ["classic", "ble"])).toBeNull();
     expect(statusProblem(status, ["ble"])).toMatch(/capacity/);

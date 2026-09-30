@@ -354,6 +354,7 @@ export class Controller {
           return { ok: true };
         }
         case "adapter.menu":
+        case "app.menu":
           return { ok: true };
       }
     } catch (error) {

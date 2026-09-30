@@ -3,7 +3,7 @@ import type { AdapterEntry, AppState, DeviceEntry } from "../../shared/state.ts"
 import { adapterStatus, batteryText, deviceStatus } from "../../shared/text.ts";
 import { act, api } from "../api.ts";
 import type { Selection } from "../App.tsx";
-import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
+import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, MenuIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
 import { isLow } from "../../shared/battery.ts";
 
 function DeviceRow({ d, selected, threshold, onSelect }: { d: DeviceEntry; selected: boolean; threshold: number; onSelect: () => void }) {
@@ -107,9 +107,24 @@ export function Sidebar({
         <span className="app-title">
           <AppIcon /> Cordial
         </span>
-        <button className="icon-button" title="Preferences" aria-label="Preferences" onClick={onPreferences}>
-          <GearIcon />
-        </button>
+        {api.host.desktop ? (
+          <button
+            className="icon-button"
+            title="Main Menu"
+            aria-label="Main Menu"
+            aria-haspopup="menu"
+            onClick={(e) => {
+              const r = e.currentTarget.getBoundingClientRect();
+              void act({ type: "app.menu", x: r.left, y: r.bottom });
+            }}
+          >
+            <MenuIcon />
+          </button>
+        ) : (
+          <button className="icon-button" title="Preferences" aria-label="Preferences" onClick={onPreferences}>
+            <GearIcon />
+          </button>
+        )}
       </header>
       <div className="sidebar-scroll">
         <button className={selection.page === "home" ? "side-row compact selected" : "side-row compact"} aria-current={selection.page === "home"} onClick={() => onSelect({ page: "home" })}>

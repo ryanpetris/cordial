@@ -279,6 +279,14 @@ function adapterMenu(adapterId: string) {
   ]).popup({ window });
 }
 
+function appMenu(x: number, y: number) {
+  if (!window) return;
+  Menu.buildFromTemplate([
+    { label: "Preferences…", accelerator: "CmdOrCtrl+,", registerAccelerator: false, click: () => showWindow({ page: "preferences" }) },
+    { label: "Quit", accelerator: "CmdOrCtrl+Q", registerAccelerator: false, click: () => void quit() },
+  ]).popup({ window, x: Math.round(x), y: Math.round(y) });
+}
+
 // ---- Lifecycle -------------------------------------------------------------
 
 async function quit() {
@@ -340,6 +348,10 @@ void app.whenReady().then(async () => {
     if (action.type === "settings.watch") windowWatch = action.key;
     if (action.type === "adapter.menu") {
       adapterMenu(action.adapterId);
+      return { ok: true };
+    }
+    if (action.type === "app.menu") {
+      appMenu(action.x, action.y);
       return { ok: true };
     }
     return act(action);

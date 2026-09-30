@@ -1,7 +1,7 @@
 // Run-time validation of actions arriving over IPC from the window.
 import type { Action } from "../shared/state.ts";
 
-type Kind = "string" | "boolean" | "value" | "string?" | "nullable";
+type Kind = "string" | "boolean" | "number" | "value" | "string?" | "nullable";
 const key = { key: "string" } as const;
 const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "device.connect": key,
@@ -23,6 +23,7 @@ const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "adapter.disconnect": { adapterId: "string" },
   "adapter.menu": { adapterId: "string" },
   "adapters.refresh": {},
+  "app.menu": { x: "number", y: "number" },
   "scan.start": { adapterId: "string" },
   "scan.stop": {},
   "pair.start": { adapterId: "string", candidateId: "string" },
@@ -46,6 +47,8 @@ function fits(value: unknown, kind: Kind): boolean {
       return typeof value === "string" && value.length <= 256;
     case "boolean":
       return typeof value === "boolean";
+    case "number":
+      return typeof value === "number" && Number.isFinite(value);
     case "value":
       return typeof value === "boolean" || typeof value === "string" || Number.isSafeInteger(value);
     case "string?":
