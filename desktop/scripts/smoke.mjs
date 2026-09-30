@@ -54,7 +54,19 @@ await page.getByRole("button", { name: "Yes, It Matches" }).click();
 await page.getByText("is paired and connected").waitFor();
 await shot("paired");
 await page.getByRole("button", { name: "Done" }).click();
-await page.getByRole("button", { name: "Preferences" }).click();
+// Native menus are outside the page: keep the app menu instead of showing
+// it, then choose its item from the main process.
+await app.evaluate(({ Menu }) => {
+  Menu.prototype.popup = function () {
+    globalThis.smokeMenu = this;
+  };
+});
+await page.getByRole("button", { name: "Main Menu" }).click();
+await app.evaluate(async () => {
+  while (!globalThis.smokeMenu) await new Promise((r) => setTimeout(r, 50));
+  globalThis.smokeMenu.items.find((item) => item.label === "Preferences…").click();
+});
+await page.getByRole("dialog", { name: "Preferences" }).waitFor();
 await shot("preferences");
 await page.keyboard.press("Escape");
 const state = await page.evaluate(() => window.cordial.state());
