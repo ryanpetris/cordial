@@ -27,7 +27,7 @@ export function HomePage({ state, onSelect, onAdd }: { state: AppState; onSelect
             </button>
           ) : (
             <button onClick={() => void act({ type: "adapters.refresh" })}>
-              <RefreshIcon /> Look Again
+              <RefreshIcon /> Refresh
             </button>
           )}
           {chooseError ? <p className="error-text">{chooseError}</p> : null}

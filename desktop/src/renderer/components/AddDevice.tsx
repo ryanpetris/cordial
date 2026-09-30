@@ -122,9 +122,11 @@ export function AddDevice({
   const pairing = state.pairing;
   // Why starting a search or pairing failed; cleared by the next attempt.
   const [problem, setProblem] = useState<string | null>(null);
+  const [searchFailed, setSearchFailed] = useState(false);
   const attempt = async (action: Parameters<typeof act>[0]) => {
     setProblem(null);
     const result = await act(action, true);
+    if (action.type === "scan.start") setSearchFailed(!result.ok);
     if (!result.ok) setProblem(result.message);
   };
 
@@ -150,6 +152,7 @@ export function AddDevice({
     void act({ type: "scan.stop" }, true);
     void act({ type: "pair.dismiss" }, true);
     setProblem(null);
+    setSearchFailed(false);
     onClose();
   };
 
@@ -210,7 +213,7 @@ export function AddDevice({
         ) : null}
         <footer className="dialog-footer">
           {pairing.phase === "pairing" ? <button onClick={cancelPairing}>Cancel Pairing</button> : null}
-          {pairing.phase === "failed" || pairing.phase === "cancelled" ? <button onClick={again}>Try Again</button> : null}
+          {pairing.phase === "failed" || pairing.phase === "cancelled" ? <button onClick={again}>{pairing.phase === "failed" ? "Retry" : "Refresh"}</button> : null}
           {pairing.phase === "connected" || pairing.phase === "saved" ? (
             <>
               <button onClick={again}>Add Another</button>
@@ -254,11 +257,11 @@ export function AddDevice({
               <Spinner /> Searching…
             </>
           ) : (problem ?? scan?.error) ? (
-            <Banner kind="error" action={<button onClick={again}>Search Again</button>}>
+            <Banner kind="error" action={<button onClick={again}>{searchFailed || scan?.error ? "Retry" : "Refresh"}</button>}>
               {problem ?? scan?.error}
             </Banner>
           ) : (
-            <button onClick={again}>Search Again</button>
+            <button onClick={again}>Refresh</button>
           )}
         </div>
         <ul className="candidates" aria-label="Nearby devices">

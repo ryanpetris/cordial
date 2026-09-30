@@ -308,7 +308,14 @@ function useWaited(waiting: boolean, restart: number | string): (ms: number) => 
   return (ms) => waiting && clock !== null && clock.restart === restart && Date.now() - clock.since >= ms;
 }
 
-function Settings({ entry, drafts, waited, onRetry }: { entry: DeviceEntry; drafts: Drafts; waited: (ms: number) => boolean; onRetry: () => void }) {
+function Settings({ entry, drafts, waited, onRetry, refreshFailed, onRefreshed }: {
+  entry: DeviceEntry;
+  drafts: Drafts;
+  waited: (ms: number) => boolean;
+  onRetry: () => void;
+  refreshFailed: boolean | null;
+  onRefreshed: (ok: boolean) => void;
+}) {
   const [busy, run] = useAction();
   const d = entry.device;
   const view = entry.settings;
@@ -361,9 +368,14 @@ function Settings({ entry, drafts, waited, onRetry }: { entry: DeviceEntry; draf
       <div className="actions">
         {note || loadFailed ? <span className="actions-note">{note}{loadFailed ? problem : null}</span> : null}
         {busy || d.settings_state === "applying" || d.settings_state === "discovering" ? <Spinner /> : null}
-        <button disabled={blocked} onClick={() => void run({ type: "settings.refresh", key: entry.key })}>
-          <RefreshIcon /> Read Again
-        </button>
+        {!loadFailed ? (
+          <button disabled={blocked} onClick={async () => {
+            const result = await run({ type: "settings.refresh", key: entry.key });
+            onRefreshed(result.ok);
+          }}>
+            <RefreshIcon /> {(refreshFailed ?? (view?.result?.kind === "refresh" && !!view.result.error)) ? "Retry" : "Refresh"}
+          </button>
+        ) : null}
         {managed && d.hidpp_enabled ? (
           <button disabled={blocked} onClick={() => void run({ type: "settings.apply", key: entry.key })}>
             Apply Saved Settings
@@ -381,6 +393,8 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
   const cancelled = useRef(false);
   const [attempt, setAttempt] = useState(0);
   const [infoBusy, runInfo] = useAction(true);
+  const [refreshFailed, setRefreshFailed] = useState<boolean | null>(null);
+  const [infoRefreshFailed, setInfoRefreshFailed] = useState(false);
   // The last failed action on this page, shown next to the control that ran it.
   const [failure, setFailure] = useState<{ at: string; message: string } | null>(null);
   const [forgetting, setForgetting] = useState(false);
@@ -391,7 +405,11 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
   const settings = hasSettings(entry);
   const settingsWaited = useWaited(connected && !entry.settings?.current, `${attempt}/${d.settings_state === "discovering"}`);
   const infoWaited = useWaited(!entry.infoCurrent, 0);
-  useEffect(() => setFailure(null), [d.state]);
+  useEffect(() => {
+    setFailure(null);
+    setRefreshFailed(null);
+    setInfoRefreshFailed(false);
+  }, [d.state]);
   const perform = async (at: string, runner: typeof run, action: Parameters<typeof run>[0]) => {
     setFailure(null);
     const result = await runner(action);
@@ -491,6 +509,8 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
             entry={entry}
             drafts={drafts}
             waited={settingsWaited}
+            refreshFailed={refreshFailed}
+            onRefreshed={(ok) => setRefreshFailed(!ok)}
             onRetry={() => {
               setAttempt((n) => n + 1);
               void act({ type: "settings.reload", key: entry.key });
@@ -568,8 +588,11 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
               {connected ? (
                 <div className="card-actions">
                   {infoBusy ? <Spinner /> : null}
-                  <button disabled={infoBusy} onClick={() => void perform("info", runInfo, { type: "device.info.refresh", key: entry.key })}>
-                    <RefreshIcon /> Update
+                  <button disabled={infoBusy} onClick={async () => {
+                    const result = await perform("info", runInfo, { type: "device.info.refresh", key: entry.key });
+                    setInfoRefreshFailed(!result.ok);
+                  }}>
+                    <RefreshIcon /> {infoRefreshFailed || (infoWaited(GRACE_MS) && (entry.info === null || entry.infoError)) ? "Retry" : "Refresh"}
                   </button>
                 </div>
               ) : null}

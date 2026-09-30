@@ -303,7 +303,7 @@ export function batteryText(b: Battery | null): string | null {
 /** Whether the shown battery reading is only last known. */
 export const batteryStale = (b: Battery) => (b.percent != null && !b.percentFresh) || (b.charging != null && !b.chargingFresh);
 
-/** A Read Again or Apply outcome: the counts that occurred, and always the main one. */
+/** A Refresh or Apply outcome: the counts that occurred, and always the main one. */
 export function settingsResultText(r: SettingsResult): string {
   const c = r.counts;
   if (!c) return r.error ?? "";
