@@ -249,6 +249,20 @@ impl Link {
     pub fn enabled(&self) -> bool {
         self.enabled
     }
+    /// Whether the device answered the protocol probe as HID++ 2.0 or later
+    /// and has usable long reports, once that is known. HID++ 1.0 and a device
+    /// without usable HID++ reports answer false; an error reply, timeout or
+    /// transport failure leaves it unknown.
+    pub fn hidpp_found(&self) -> Option<bool> {
+        let client = &self.client;
+        if client.protocol[0] >= 2 {
+            Some(true)
+        } else if client.protocol[0] == 1 || client.error == Some(crate::hidpp::Error::NoReports) {
+            Some(false)
+        } else {
+            None
+        }
+    }
     pub fn busy(&self) -> bool {
         self.configure_pending || self.activate_pending || self.settings.busy()
     }

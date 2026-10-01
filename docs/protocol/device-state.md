@@ -62,7 +62,7 @@ Device record:
 | `reconnect` | `auto` or `paused`. A user-requested disconnect pauses reconnect for the remainder of this adapter boot, until `device.connect` is issued. |
 | `last_error` | `null` or an object containing `code` for the most recent connection/profile failure. Clear it on a successful connection. |
 | `warnings` | Optional array of HID limitations, currently `unsupported_fields` or `led_output_unavailable`. The latter means recognized lock-indicator output cannot be safely encoded. Vendor/HID++ output alone and devices without indicator reports do not trigger it. Input can remain connected. |
-| `hidpp_enabled` | Persisted Boolean permitting HID++ normalization and setting application for this saved device; read-only discovery remains available when false; true for every new pairing. This is independent of whether the peripheral supports HID++. |
+| `hidpp_enabled` | Persisted Boolean permitting HID++ normalization and setting application for this saved device; read-only discovery remains available when false. False for a new pairing until the device's first connection detects HID++ 2.0 or newer with usable long reports and turns it on. Otherwise independent of whether the peripheral supports HID++. |
 | `normalization_state` | Runtime state: `off`, `pending`, `probing`, `resetting`, `configuring`, `active`, `unsupported`, or `error`; see the [HID++ lifecycle](commands.md#hid-settings-and-lifecycle). |
 | `normalization_error` | `null` or a diagnostic string for the current normalization failure. Separate from `last_error`, which concerns the ordinary HID connection. |
 | `settings_state` | `off`, `pending`, `discovering`, `ready`, `applying`, `unsupported`, or `error`. Independent of normalization support. |

@@ -2,7 +2,7 @@
 //! vendor procedures; this module owns admission, persistence and HID forwarding.
 use crate::{
     bluetooth::{Bluetooth, ConnectionSecurity, Descriptor, ReportType},
-    devices::{ACTIVE_CONNECTIONS, AdapterPreference, Device, Peer, Policies, Policy},
+    devices::{ACTIVE_CONNECTIONS, AdapterPreference, Device, Peer, Policies, Policy, Setup},
     forward::Forwarder,
     link::{Link, LinkId, Profile},
     storage::{Preferences, RecordStore},
@@ -26,6 +26,8 @@ pub struct Connection {
     pub closing: bool,
     pub error: Option<Error>,
     pub deadline: u64,
+    /// A setup save failed; setup resumes on the device's next connection.
+    pub setup_failed: bool,
 }
 
 pub struct Manager {
@@ -334,6 +336,7 @@ impl Manager {
             closing: false,
             error: None,
             deadline,
+            setup_failed: false,
         });
         Ok(id)
     }
@@ -918,6 +921,37 @@ impl Manager {
             changed = true;
         }
         Ok(changed.then_some(slot))
+    }
+    /// The next first-connection setup progress to save: the connection and
+    /// device slot of a connected device with `setup_pending`, the policy
+    /// recording its newly settled steps, and the settled steps to keep once
+    /// that policy is saved.
+    pub fn setup(&self) -> Option<(usize, usize, Policy, Setup)> {
+        self.connections.iter().enumerate().find_map(|(index, c)| {
+            let c = c.as_ref()?;
+            let link = c.runtime.as_ref()?;
+            let slot = c.device?;
+            let d = self.devices[slot].as_ref()?;
+            // A requested settings job finishes before setup reconfigures the link.
+            if c.closing || c.setup_failed || !d.policy.setup_pending || link.settings.explicit() {
+                return None;
+            }
+            let mut setup = d.setup;
+            let mut hidpp = false;
+            if !setup.hidpp
+                && let Some(found) = link.hidpp_found()
+            {
+                setup.hidpp = true;
+                hidpp = found;
+            }
+            if setup == d.setup {
+                return None;
+            }
+            let mut policy = d.policy.clone();
+            policy.hidpp_enabled |= hidpp;
+            policy.setup_pending = !setup.complete();
+            Some((index, slot, policy, setup))
+        })
     }
     pub async fn policy<S: RecordStore>(
         &mut self,

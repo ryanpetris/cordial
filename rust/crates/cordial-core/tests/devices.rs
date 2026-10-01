@@ -73,7 +73,7 @@ fn policies_have_independent_records_and_unpair_clears_only_the_owner() {
             .unwrap();
         for slot in 0..8 {
             let p = Policy::paired(slot as u64 + 1, peer(slot as u8), &[b'"'; 128]);
-            assert!(p.trusted && p.hidpp_enabled && !p.blocked);
+            assert!(p.trusted && !p.hidpp_enabled && p.setup_pending && !p.blocked);
             assert!(p.valid());
             let bond = cordial_core::bonds::Bond {
                 owner: p.id,
@@ -196,4 +196,50 @@ fn reconnect_policy_and_names_survive_normal_runtime_transitions() {
     assert!(!d.reconnect_due(60_000));
     d.explicit_connect().unwrap();
     assert!(d.reconnect_due(60_000));
+}
+#[test]
+fn setup_pending_is_saved_only_while_set() {
+    let mut p = Policy::paired(10, peer(1), b"Keyboard");
+    let bond = cordial_core::bonds::Bond {
+        owner: p.id,
+        identity: p.peer,
+        complete: true,
+        keys: cordial_core::bonds::Keys::Ble {
+            local: cordial_core::bonds::Security {
+                flags: 1,
+                key_size: 16,
+                ..Default::default()
+            },
+            peer: Default::default(),
+        },
+    };
+    let save = |p: &Policy| {
+        cordial_core::storage::json(&cordial_core::bonds::DeviceRecord {
+            policy: p.clone(),
+            bond: bond.clone(),
+        })
+        .unwrap()
+    };
+    let pending = save(&p);
+    assert!(
+        std::str::from_utf8(&pending)
+            .unwrap()
+            .contains("\"setup_pending\":true")
+    );
+    assert!(
+        cordial_core::codec::read_policy(10, &pending)
+            .unwrap()
+            .setup_pending
+    );
+    p.setup_pending = false;
+    let done = save(&p);
+    assert!(
+        !std::str::from_utf8(&done)
+            .unwrap()
+            .contains("setup_pending")
+    );
+    assert_eq!(
+        cordial_core::codec::read_policy(10, &done).unwrap(),
+        Policy { bond: 10, ..p }
+    );
 }

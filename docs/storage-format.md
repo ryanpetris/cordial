@@ -43,7 +43,9 @@ storage unavailable. None of these failures triggers an automatic erase.
 The adapter name override is a trimmed string of 1..64 UTF-8 bytes without control characters. A null or absent `name` uses the board default baked into the image. `adapter.name.set` with `name: null` clears the override. Name and platform updates preserve each other and commit before runtime state changes.
 
 A device policy contains its ID, peer address/type/transport, name, trusted,
-blocked, HID++ and preferred-enabled flags. Connection state, effective
+blocked, HID++ and preferred-enabled flags. A new device's policy also
+contains `setup_pending: true` until its first-connection setup completes;
+the field is omitted afterwards, and a policy without it has completed setup. Connection state, effective
 enablement, discovery, battery readings and transient errors are not persisted.
 The bond holds the canonical native-independent identity and security keys.
 Classic stores link key and key type. BLE stores local and peer security

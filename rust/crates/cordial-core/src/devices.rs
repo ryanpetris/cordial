@@ -33,6 +33,10 @@ pub struct Policy {
     pub blocked: bool,
     pub hidpp_enabled: bool,
     pub enabled: bool,
+    /// Set from pairing until the device's first-connection setup completes;
+    /// saved only while set.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub setup_pending: bool,
     #[serde(skip)]
     pub bond: u64,
     #[serde(skip)]
@@ -46,8 +50,9 @@ impl Policy {
             name: display_name(name),
             trusted: true,
             blocked: false,
-            hidpp_enabled: true,
+            hidpp_enabled: false,
             enabled: true,
+            setup_pending: true,
             bond: 0,
             deleting: false,
         }
@@ -82,6 +87,21 @@ pub fn display_name(bytes: &[u8]) -> Box<str> {
     name.into_boxed_str()
 }
 
+/// The first-connection setup steps a device has settled since the adapter
+/// started. Its saved `setup_pending` clears once every step is settled; until
+/// then, each connection resumes the steps that are not.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Setup {
+    /// HID++ detection, which turns HID++ on for a device that answers as HID++
+    /// 2.0, or a user choice of HID++ made first.
+    pub hidpp: bool,
+}
+impl Setup {
+    pub fn complete(self) -> bool {
+        self.hidpp
+    }
+}
+
 pub struct Device {
     pub pairing_state: PairingState,
     pub effective_enabled: bool,
@@ -95,6 +115,7 @@ pub struct Device {
     pub paused: bool,
     pub error: Option<ErrorCode>,
     pub settings_revision: u64,
+    pub setup: Setup,
     retry_at: u64,
     last_failure: u64,
     retry_delay: u32,
@@ -117,6 +138,7 @@ impl Device {
             paused: false,
             error: None,
             settings_revision: 0,
+            setup: Setup::default(),
             retry_at: 0,
             last_failure: 0,
             retry_delay: 0,

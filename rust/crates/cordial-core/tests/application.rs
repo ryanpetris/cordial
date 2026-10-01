@@ -186,7 +186,7 @@ fn pairing_prompts_preserve_request_order_and_forwarding_survives_cli_exit() {
     t.poll();
     let paired = t.drain();
     let paired = paired.iter().find(|r| r["id"] == 3).unwrap();
-    assert_eq!(paired["result"]["device"]["hidpp_enabled"], true);
+    assert_eq!(paired["result"]["device"]["hidpp_enabled"], false);
     t.event(Event::Connected {
         link,
         descriptors: descriptor(),
@@ -1150,7 +1150,7 @@ fn bonded_link_gets_a_fresh_setup_deadline_and_initial_states_are_pending() {
     );
     assert_eq!(
         record.normalization_state,
-        cordial_protocol::identifiers::NormalizationState::Pending
+        cordial_protocol::identifiers::NormalizationState::Off
     );
     assert_eq!(
         record.settings_state,
@@ -2112,4 +2112,270 @@ fn protocol_discovery_works_before_readiness_and_shares_request_ids() {
     assert!(request.is_none());
     assert_eq!(t.drain()[0]["data"]["code"], "invalid_request");
     assert_eq!(t.command(5, "adapter.status", json!({}))[0]["v"], 1);
+}
+
+/// The saved keyboard as it is between pairing and its first completed setup.
+fn pending_setup(t: &mut Test<'_>) {
+    let policy = &mut t.app.manager.devices[0].as_mut().unwrap().policy;
+    policy.hidpp_enabled = false;
+    policy.setup_pending = true;
+}
+/// A keyboard descriptor with HID++ short and long reports.
+fn hidpp_descriptor() -> Vec<cordial_core::bluetooth::Descriptor> {
+    vec![cordial_core::bluetooth::Descriptor {
+        service: ServiceId(7),
+        bytes: vec![
+            5, 1, 9, 6, 0xa1, 1, 0x85, 1, 5, 7, 0x19, 4, 0x29, 11, 0x15, 0, 0x25, 1, 0x75, 1, 0x95,
+            8, 0x81, 2, 0xc0, 0x06, 0x00, 0xff, 0x09, 1, 0xa1, 1, 0x85, 0x10, 0x75, 8, 0x95, 6,
+            0x15, 0, 0x26, 0xff, 0, 0x09, 1, 0x81, 0, 0x09, 1, 0x91, 0, 0x85, 0x11, 0x95, 19, 0x09,
+            2, 0x81, 0, 0x09, 2, 0x91, 0, 0xc0,
+        ]
+        .into_boxed_slice(),
+    }]
+}
+/// Connects the saved keyboard through automatic reconnection.
+fn connect_saved(
+    t: &mut Test<'_>,
+    descriptors: Vec<cordial_core::bluetooth::Descriptor>,
+) -> cordial_core::link::LinkId {
+    t.poll();
+    let link = t.radio.connects.last().unwrap().0;
+    t.event(Event::Connected {
+        link,
+        descriptors,
+        max_output: 255,
+    });
+    link
+}
+/// An answer to the HID++ protocol request.
+enum Protocol {
+    Version(u8),
+    /// The HID++ 1.0 error for an unknown request.
+    Hidpp10,
+    /// A HID++ 2.0 error reply, which settles nothing.
+    Error,
+}
+/// Completes the HID++ protocol request the adapter sent last and answers it.
+/// Returns the messages sent meanwhile.
+fn answer_protocol(
+    t: &mut Test<'_>,
+    link: cordial_core::link::LinkId,
+    answer: Protocol,
+) -> Vec<Value> {
+    let (id, request) = t.radio.writes.last().cloned().unwrap();
+    assert_eq!(
+        request[5], 0xa5,
+        "expected the protocol request, got {request:?}"
+    );
+    t.event(Event::Written { id, result: Ok(()) });
+    let mut sent = t.drain();
+    let mut reply = request.clone();
+    match answer {
+        Protocol::Version(major) => (reply[3], reply[4]) = (major, 0),
+        Protocol::Hidpp10 => reply[1..5].copy_from_slice(&[0x8f, request[1], request[2], 1]),
+        Protocol::Error => reply[1..5].copy_from_slice(&[0xff, request[1], request[2], 2]),
+    }
+    t.event(Event::Input(
+        InputReport::new(link, ServiceId(7), 0x11, &reply).unwrap(),
+    ));
+    sent.extend(t.drain());
+    t.poll();
+    sent.extend(t.drain());
+    sent
+}
+fn saved_record(t: &Test<'_>) -> Value {
+    serde_json::from_slice(&t.store.records[&cordial_core::storage::record_key(2, 77)]).unwrap()
+}
+fn saved_policy<'a>(t: &'a Test<'_>) -> &'a Policy {
+    &t.app.manager.devices[0].as_ref().unwrap().policy
+}
+
+#[test]
+fn first_connection_setup_turns_hidpp_on_for_a_hidpp_2_device() {
+    let mut input = [0; MAX_LINE_BYTES - 1];
+    let mut t = Test::new(&mut input, true);
+    pending_setup(&mut t);
+    t.command(1, "session.monitor.set", json!({"enabled":true}));
+    let link = connect_saved(&mut t, hidpp_descriptor());
+    t.poll();
+    t.drain();
+    // The setup event and the start of normalization land in one poll; the
+    // test reads output only between steps, so the later record may stand in.
+    let mut events = answer_protocol(&mut t, link, Protocol::Version(4));
+    for _ in 0..4 {
+        t.poll();
+        events.extend(t.drain());
+    }
+    assert!(saved_policy(&t).hidpp_enabled && !saved_policy(&t).setup_pending);
+    let record = saved_record(&t);
+    assert_eq!(record["policy"]["hidpp_enabled"], true);
+    assert!(record["policy"].get("setup_pending").is_none());
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == "device.changed" && e["data"]["device"]["hidpp_enabled"] == true),
+        "expected a device.changed with HID++ on, got {events:?}"
+    );
+    // Turning HID++ on starts normalization on the live connection.
+    t.poll();
+    let (_, request) = t.radio.writes.last().unwrap();
+    assert_eq!(request[5], 0xa5);
+    assert_eq!(
+        t.app.manager.record(0).unwrap().normalization_state,
+        cordial_protocol::identifiers::NormalizationState::Probing
+    );
+}
+
+#[test]
+fn first_connection_setup_leaves_hidpp_off_without_hidpp_2() {
+    for hidpp in [false, true] {
+        let mut input = [0; MAX_LINE_BYTES - 1];
+        let mut t = Test::new(&mut input, true);
+        pending_setup(&mut t);
+        let link = connect_saved(
+            &mut t,
+            if hidpp {
+                hidpp_descriptor()
+            } else {
+                descriptor()
+            },
+        );
+        t.poll();
+        if hidpp {
+            answer_protocol(&mut t, link, Protocol::Hidpp10);
+        }
+        assert!(!saved_policy(&t).hidpp_enabled && !saved_policy(&t).setup_pending);
+        assert!(saved_record(&t)["policy"].get("setup_pending").is_none());
+        if !hidpp {
+            assert!(t.radio.writes.is_empty());
+        }
+    }
+}
+
+#[test]
+fn unanswered_setup_resumes_on_the_next_connection() {
+    for error in [false, true] {
+        let mut input = [0; MAX_LINE_BYTES - 1];
+        let mut t = Test::new(&mut input, true);
+        pending_setup(&mut t);
+        let link = connect_saved(&mut t, hidpp_descriptor());
+        t.poll();
+        if error {
+            answer_protocol(&mut t, link, Protocol::Error);
+        } else {
+            let (id, _) = t.radio.writes.last().cloned().unwrap();
+            t.event(Event::Written { id, result: Ok(()) });
+            t.now += cordial_core::hidpp::TIMEOUT_MS + 1;
+            t.poll();
+        }
+        t.poll();
+        assert!(!saved_policy(&t).hidpp_enabled && saved_policy(&t).setup_pending);
+        reconnect_and_detect(&mut t, link);
+    }
+}
+/// Reconnects the saved keyboard, answers as HID++ 2.0 and checks setup turned HID++ on.
+fn reconnect_and_detect(t: &mut Test<'_>, link: cordial_core::link::LinkId) {
+    t.event(Event::Disconnected { link, error: None });
+    t.now += 60_000;
+    let link = connect_saved(t, hidpp_descriptor());
+    t.poll();
+    answer_protocol(t, link, Protocol::Version(4));
+    assert!(saved_policy(t).hidpp_enabled && !saved_policy(t).setup_pending);
+}
+
+#[test]
+fn a_requested_settings_refresh_finishes_before_setup_turns_hidpp_on() {
+    let mut input = [0; MAX_LINE_BYTES - 1];
+    let mut t = Test::new(&mut input, true);
+    pending_setup(&mut t);
+    let link = connect_saved(&mut t, hidpp_descriptor());
+    t.poll();
+    let (id, _) = t.radio.writes.last().cloned().unwrap();
+    t.event(Event::Written { id, result: Ok(()) });
+    t.now += cordial_core::hidpp::TIMEOUT_MS + 1;
+    for _ in 0..4 {
+        t.poll();
+    }
+    t.drain();
+    // A manual refresh retries the protocol probe as part of its job.
+    t.command(
+        1,
+        "hidpp.setting.refresh",
+        json!({"device_id":"d_000000000000004d"}),
+    );
+    let mut sent = answer_protocol(&mut t, link, Protocol::Version(4));
+    assert!(!saved_policy(&t).hidpp_enabled && saved_policy(&t).setup_pending);
+    // The test leaves feature discovery unanswered, so the refresh ends in
+    // timeouts; setup waits for its response.
+    for _ in 0..40 {
+        t.now += cordial_core::hidpp::TIMEOUT_MS;
+        t.poll();
+        sent.extend(t.drain());
+        if saved_policy(&t).hidpp_enabled {
+            break;
+        }
+    }
+    assert!(saved_policy(&t).hidpp_enabled && !saved_policy(&t).setup_pending);
+    let done = sent
+        .iter()
+        .position(|m| m["id"] == 1 && m["done"] == true)
+        .expect("the refresh finishes");
+    assert_eq!(sent[done]["error"]["code"], "settings_refresh_failed");
+    assert_ne!(sent[done]["error"]["details"]["revision"], Value::Null);
+    let on = sent.iter().position(|m| {
+        m["event"] == "device.changed" && m["data"]["device"]["hidpp_enabled"] == true
+    });
+    assert!(
+        on.is_none_or(|on| done < on),
+        "setup ran before the refresh finished: {sent:?}"
+    );
+}
+
+#[test]
+fn a_hidpp_choice_during_setup_settles_detection() {
+    for enabled in [false, true] {
+        let mut input = [0; MAX_LINE_BYTES - 1];
+        let mut t = Test::new(&mut input, true);
+        pending_setup(&mut t);
+        let link = connect_saved(&mut t, hidpp_descriptor());
+        t.poll();
+        let reply = t.command(
+            1,
+            "device.hidpp.set",
+            json!({"device_id":"d_000000000000004d","enabled":enabled}),
+        );
+        assert_eq!(
+            reply.last().unwrap()["result"]["device"]["hidpp_enabled"],
+            enabled
+        );
+        assert_eq!(saved_policy(&t).hidpp_enabled, enabled);
+        assert!(!saved_policy(&t).setup_pending);
+        assert!(saved_record(&t)["policy"].get("setup_pending").is_none());
+        if !enabled {
+            // The probe still answers, and detection does not override the choice.
+            answer_protocol(&mut t, link, Protocol::Version(4));
+            assert!(!saved_policy(&t).hidpp_enabled);
+        }
+    }
+}
+
+#[test]
+fn a_failed_setup_save_waits_for_the_next_connection() {
+    let mut input = [0; MAX_LINE_BYTES - 1];
+    let mut t = Test::new(&mut input, true);
+    pending_setup(&mut t);
+    let link = connect_saved(&mut t, hidpp_descriptor());
+    t.poll();
+    let key = cordial_core::storage::record_key(2, 77);
+    t.store.fail_save = Some((key, false));
+    answer_protocol(&mut t, link, Protocol::Version(4));
+    assert!(!saved_policy(&t).hidpp_enabled && saved_policy(&t).setup_pending);
+    t.store.fail_save = None;
+    t.poll();
+    assert!(saved_policy(&t).setup_pending);
+    assert_eq!(
+        t.app.manager.record(0).unwrap().state,
+        cordial_protocol::identifiers::ConnectionState::Connected
+    );
+    reconnect_and_detect(&mut t, link);
 }

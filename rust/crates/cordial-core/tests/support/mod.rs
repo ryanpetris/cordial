@@ -269,7 +269,10 @@ pub fn descriptor() -> Vec<Descriptor> {
 pub fn setup() -> (Manager, Store, Radio) {
     let mut store = Store::default();
     block_on(storage::open(&mut store)).unwrap();
+    // A saved device that finished setup with HID++ on.
     let mut policy = Policy::paired(77, peer(1), b"Keyboard");
+    policy.hidpp_enabled = true;
+    policy.setup_pending = false;
     policy.bond = 77;
     block_on(cordial_core::bonds::commit(
         &mut store,

@@ -323,6 +323,26 @@ impl<'a> Application<'a> {
                 .collect(),
         }
     }
+    /// Saves first-connection setup progress for connected devices. A failed
+    /// save leaves the remaining steps to the device's next connection.
+    /// `write_uncertain` describes the last requested write, so these
+    /// background saves leave it as they found it.
+    async fn setup<S: RecordStore>(&mut self, store: &mut S, now: u64) {
+        if !self.manager.storage_ready {
+            return;
+        }
+        while let Some((index, slot, policy, setup)) = self.manager.setup() {
+            let uncertain = self.manager.write_uncertain;
+            let saved = self.manager.policy(slot, policy, store).await;
+            self.manager.write_uncertain = uncertain;
+            if saved.is_ok() {
+                self.manager.devices[slot].as_mut().unwrap().setup = setup;
+                self.changed(slot, "device.changed", now);
+            } else if let Some(c) = &mut self.manager.connections[index] {
+                c.setup_failed = true;
+            }
+        }
+    }
     fn changed(&mut self, slot: usize, event: &str, now: u64) {
         let mut revision = self.manager.changed();
         let catalog_changed = self.manager.devices[slot].as_mut().is_some_and(|d| {
@@ -1014,12 +1034,19 @@ impl Application<'_> {
             | Command::DeviceTrusted(_)
             | Command::DeviceBlocked(_)
             | Command::Hidpp(_) => {
-                let mut policy = self.manager.devices[slot].as_ref().unwrap().policy.clone();
+                let d = self.manager.devices[slot].as_ref().unwrap();
+                let mut policy = d.policy.clone();
+                let mut setup = d.setup;
                 match command {
                     Command::DeviceEnabled(a) => policy.enabled = a.enabled,
                     Command::DeviceTrusted(a) => policy.trusted = a.trusted,
                     Command::DeviceBlocked(a) => policy.blocked = a.blocked,
-                    Command::Hidpp(a) => policy.hidpp_enabled = a.enabled,
+                    Command::Hidpp(a) => {
+                        // A user choice settles setup's HID++ detection.
+                        policy.hidpp_enabled = a.enabled;
+                        setup.hidpp = true;
+                        policy.setup_pending &= !setup.complete();
+                    }
                     _ => unreachable!(),
                 }
                 self.manager
@@ -1048,6 +1075,7 @@ impl Application<'_> {
                             mutation_failure(code, self.manager.write_uncertain)
                         }
                     })?;
+                self.manager.devices[slot].as_mut().unwrap().setup = setup;
                 self.changed(slot, "device.changed", now);
                 if matches!(
                     command,
@@ -2445,6 +2473,7 @@ impl Application<'_> {
             }
         }
         self.information_changes(now);
+        self.setup(store, now).await;
         let mut i = 0;
         while i < self.operations.len() {
             let expired = match self.operations[i].work {

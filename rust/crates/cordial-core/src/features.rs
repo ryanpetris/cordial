@@ -233,6 +233,10 @@ impl Engine {
     pub fn done(&self) -> bool {
         self.explicit && self.completed
     }
+    /// Whether a requested job owns the engine until its results are released.
+    pub fn explicit(&self) -> bool {
+        self.explicit
+    }
     pub fn results(&self) -> &[JobResult] {
         &self.results
     }
