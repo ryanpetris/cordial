@@ -123,9 +123,10 @@ export function AddDevice({
   // Why starting a search or pairing failed; cleared by the next attempt.
   const [problem, setProblem] = useState<string | null>(null);
   const [searchFailed, setSearchFailed] = useState(false);
+  const [starting, start] = useAction(true);
   const attempt = async (action: Parameters<typeof act>[0]) => {
     setProblem(null);
-    const result = await act(action, true);
+    const result = await start(action);
     if (action.type === "scan.start") setSearchFailed(!result.ok);
     if (!result.ok) setProblem(result.message);
   };
@@ -257,11 +258,11 @@ export function AddDevice({
               <Spinner /> Searching…
             </>
           ) : (problem ?? scan?.error) ? (
-            <Banner kind="error" action={<button onClick={again}>{searchFailed || scan?.error ? "Retry" : "Refresh"}</button>}>
+            <Banner kind="error" action={<button disabled={starting} onClick={again}>{searchFailed || scan?.error ? "Retry" : "Refresh"}</button>}>
               {problem ?? scan?.error}
             </Banner>
           ) : (
-            <button onClick={again}>Refresh</button>
+            <button disabled={starting} onClick={again}>Refresh</button>
           )}
         </div>
         <ul className="candidates" aria-label="Nearby devices">
@@ -278,7 +279,7 @@ export function AddDevice({
                 {a && !a.available ? (
                   <span className="muted small">{a.reason ? PAIR_UNAVAILABLE[a.reason] : "Can't Add Now"}</span>
                 ) : (
-                  <button className="suggested" onClick={() => chosen && void attempt({ type: "pair.start", adapterId: chosen.id, candidateId: c.candidate_id })}>
+                  <button className="suggested" disabled={starting} onClick={() => chosen && void attempt({ type: "pair.start", adapterId: chosen.id, candidateId: c.candidate_id })}>
                     Pair
                   </button>
                 )}

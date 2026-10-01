@@ -1,11 +1,224 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FakeAdapter } from "../src/fake/adapter.ts";
+import { AdapterManager } from "../src/core/manager.ts";
 import { controller, until } from "./helpers.ts";
 
 const loaded = (s: ReturnType<ReturnType<typeof controller>["state"]>, devices: number) =>
   !!s && s.devices.length === devices && s.devices.every((d) => d.info);
 
 describe("Controller", () => {
+  it("cancels every scan when starts overlap", async () => {
+    const fake = new FakeAdapter({ adapterId: "AAAA0001" });
+    const { c, state } = controller({ "/a": fake });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 4));
+    const start = () => c.act({ type: "scan.start", adapterId: fake.id });
+    await start();
+    expect(await Promise.all([start(), start()])).toEqual([{ ok: true }, { ok: true }]);
+    await until(() => !!c.state().scan?.running && !!c.state().scan?.candidates.length);
+    await c.act({ type: "scan.stop" });
+    const scans = fake.received.filter((m) => m.cmd === "discovery.scan");
+    const cancelled = fake.received.filter((m) => m.cmd === "request.cancel").map((m) => (m.args as { request_id: number }).request_id);
+    expect(scans).toHaveLength(3);
+    expect(cancelled).toEqual(scans.map((m) => m.id));
+    expect(c.state().scan).toBeNull();
+    await c.stop();
+  });
+
+  it("keeps the first pairing tracked when two starts await scan cancellation", async () => {
+    const fake = new FakeAdapter({ adapterId: "AAAA0001" });
+    const { c, state } = controller({ "/a": fake });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 4));
+    await c.act({ type: "scan.start", adapterId: fake.id });
+    await until(() => !!c.state().scan?.candidates.length);
+    const cancelled = Promise.withResolvers<void>();
+    const write = fake.write.bind(fake);
+    let cancelling = false;
+    fake.write = async (text) => {
+      if (JSON.parse(text).cmd === "request.cancel") {
+        cancelling = true;
+        await cancelled.promise;
+      }
+      await write(text);
+    };
+    const first = c.act({ type: "pair.start", adapterId: fake.id, candidateId: "c_1" });
+    await until(() => cancelling);
+    const second = c.act({ type: "pair.start", adapterId: fake.id, candidateId: "c_2" });
+    cancelled.resolve();
+    expect(await first).toEqual({ ok: true });
+    expect(await second).toEqual({ ok: false, message: "Another device is being added." });
+    await until(() => !!c.state().pairing?.prompt);
+    expect(fake.received.filter((m) => m.cmd === "pairing.start")).toHaveLength(1);
+    expect(c.state().pairing?.candidateId).toBe("c_1");
+    await c.act({ type: "pair.cancel" });
+    await until(() => c.state().pairing?.phase === "cancelled");
+    await c.stop();
+  });
+
+  it.each(["scan.start", "pair.start"] as const)("cancels a pending %s when the dialog closes", async (type) => {
+    const fake = new FakeAdapter({ adapterId: "AAAA0001" });
+    const { c, state } = controller({ "/a": fake });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 4));
+    await c.act({ type: "scan.start", adapterId: fake.id });
+    await until(() => !!c.state().scan?.candidates.length);
+    const cancelled = Promise.withResolvers<void>();
+    const write = fake.write.bind(fake);
+    let cancelling = false;
+    fake.write = async (text) => {
+      if (JSON.parse(text).cmd === "request.cancel") {
+        cancelling = true;
+        await cancelled.promise;
+      }
+      await write(text);
+    };
+    const start = c.act(type === "scan.start"
+      ? { type, adapterId: fake.id }
+      : { type, adapterId: fake.id, candidateId: "c_1" });
+    await until(() => cancelling);
+    const stop = c.act({ type: "scan.stop" });
+    const dismiss = c.act({ type: "pair.dismiss" });
+    cancelled.resolve();
+    await Promise.all([start, stop, dismiss]);
+    expect(fake.received.filter((m) => m.cmd === "discovery.scan")).toHaveLength(1);
+    expect(fake.received.filter((m) => m.cmd === "pairing.start")).toHaveLength(0);
+    expect(c.state().scan).toBeNull();
+    expect(c.state().pairing).toBeNull();
+    await c.stop();
+  });
+
+  it("stops scanning while a dismissed pairing is still tearing down", async () => {
+    const a = new FakeAdapter({ adapterId: "AAAA0001" });
+    const b = new FakeAdapter({ adapterId: "BBBB0002" });
+    const held = Promise.withResolvers<() => void>();
+    let pairingId: number | undefined;
+    const onData = a.onData.bind(a);
+    a.onData = (listener) => onData((chunk) => {
+      const messages = new TextDecoder().decode(chunk).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      if (messages.some((m) => m.type === "response" && m.id === pairingId && m.done)) {
+        held.resolve(() => listener(chunk));
+        return;
+      }
+      listener(chunk);
+    });
+    const { c, state } = controller({ "/a": a, "/b": b });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 8));
+    await c.act({ type: "scan.start", adapterId: a.id });
+    await until(() => !!c.state().scan?.candidates.length);
+    await c.act({ type: "pair.start", adapterId: a.id, candidateId: "c_1" });
+    await until(() => !!c.state().pairing?.prompt);
+    pairingId = Number(a.received.find((m) => m.cmd === "pairing.start")!.id);
+    await c.act({ type: "pair.cancel" });
+    const release = await held.promise;
+    await c.act({ type: "pair.dismiss" });
+    await c.act({ type: "scan.start", adapterId: b.id });
+    await until(() => !!c.state().scan?.candidates.length);
+    const pairing = c.act({ type: "pair.start", adapterId: b.id, candidateId: "c_1" });
+    await Promise.resolve();
+    const stop = c.act({ type: "scan.stop" });
+    try {
+      await until(() => b.received.some((m) => m.cmd === "request.cancel"), 1000);
+      expect(await stop).toEqual({ ok: true });
+      expect(await pairing).toEqual({ ok: true });
+      expect(c.state().scan).toBeNull();
+      expect(b.received.filter((m) => m.cmd === "pairing.start")).toHaveLength(0);
+    } finally {
+      release();
+      await Promise.all([pairing, stop]);
+      await c.stop();
+    }
+  });
+
+  it.each(["scan.stop", "pair.cancel", "pair.start"] as const)("unblocks discovery when %s loses its cancellation acknowledgement", async (type) => {
+    const fake = new FakeAdapter({ adapterId: "AAAA0001" });
+    let dropCancel = false;
+    const onData = fake.onData.bind(fake);
+    fake.onData = (listener) => onData((chunk) => {
+      const messages = new TextDecoder().decode(chunk).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      if (dropCancel && messages.some((m) => m.type === "response"
+        && fake.received.some((r) => r.id === m.id && r.cmd === "request.cancel"))) return;
+      listener(chunk);
+    });
+    const { c, state } = controller({ "/a": fake });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 4));
+    await c.act({ type: "scan.start", adapterId: fake.id });
+    await until(() => !!c.state().scan?.candidates.length);
+    if (type === "pair.cancel") {
+      await c.act({ type: "pair.start", adapterId: fake.id, candidateId: "c_1" });
+      await until(() => !!c.state().pairing?.prompt);
+    }
+    const session = c.manager.connected.get(fake.id)!.session;
+    dropCancel = true;
+    vi.useFakeTimers();
+    try {
+      const action = c.act(type === "pair.start"
+        ? { type, adapterId: fake.id, candidateId: "c_1" }
+        : { type });
+      await vi.advanceTimersByTimeAsync(1);
+      const heartbeat = session.request("session.heartbeat", {});
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(heartbeat).resolves.toHaveProperty("monitor");
+      const next = c.act({ type: "scan.stop" });
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(session.closed).toBe(true);
+      await action;
+      expect(await next).toEqual({ ok: true });
+      expect(c.state().scan).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      await c.stop();
+    }
+  });
+
+  it("closes a reconnect that finishes opening after shutdown", async () => {
+    const fake = new FakeAdapter({ adapterId: "AAAA0001" });
+    const open = vi.fn(async () => fake.open());
+    const manager = new AdapterManager({
+      listPorts: async () => [{ path: "/a", serial: fake.id }],
+      openTransport: open,
+      changed: vi.fn(),
+      log: vi.fn(),
+    });
+    await manager.rescan();
+    await until(() => manager.connected.get(fake.id)!.session.view.valid);
+    await manager.disconnect(fake.id);
+    const opening = Promise.withResolvers<void>();
+    const close = vi.spyOn(fake, "close");
+    let started = false;
+    open.mockImplementationOnce(async () => {
+      started = true;
+      await opening.promise;
+      return fake.open();
+    });
+    const reconnect = manager.connect(fake.id);
+    await until(() => started);
+    await manager.stop();
+    opening.resolve();
+    expect(await reconnect).toBe("That adapter is no longer available.");
+    expect(manager.connected.size).toBe(0);
+    expect(close).toHaveBeenCalledOnce();
+    expect(await manager.connect(fake.id)).toBe("That adapter is no longer available.");
+  });
+
+  it.skipIf(!global.gc)("releases manually disconnected sessions for garbage collection", async () => {
+    const fake = new FakeAdapter({ adapterId: "AAAA0001" });
+    const { c, state } = controller({ "/a": fake });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 4));
+    const reference = new WeakRef(c.manager.connected.get(fake.id)!.session);
+    await c.manager.disconnect(fake.id);
+    await new Promise((r) => setTimeout(r, 1100));
+    for (let i = 0; i < 5; i++) {
+      global.gc!();
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(reference.deref()).toBeUndefined();
+    await c.stop();
+  });
+
   it("combines confirmed adapters and hides a port that isn't one", async () => {
     const a = new FakeAdapter({ adapterId: "AAAA0001" });
     const b = new FakeAdapter({ adapterId: "BBBB0002", board: "xiao_esp32s3" });

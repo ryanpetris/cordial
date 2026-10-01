@@ -3,7 +3,6 @@ declare const __CORDIAL_VERSION__: string;
 import {
   BrowserWindow,
   Menu,
-  Notification,
   Tray,
   app,
   ipcMain,
@@ -21,6 +20,7 @@ import { Controller } from "../core/controller.ts";
 import { candidatePorts, hostPlatform, openSerial, watchHotplug } from "../node/serial.ts";
 import { preferencesFrom, type Action, type AppState, type Navigation, type Preferences } from "../shared/state.ts";
 import { trayModel, type TrayModel } from "./tray-model.ts";
+import { closeNotifications, showNotification } from "./notifications.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const icons = join(root, "assets", "icons");
@@ -36,6 +36,7 @@ let tray: Tray | null = null;
 let trayKey = "";
 let quitting = false;
 let controller: Controller;
+let stopHotplug: (() => Promise<void>) | null = null;
 let pendingNavigation: Navigation | null = null;
 /** The device whose settings the window shows, kept while it is hidden. */
 let windowWatch: string | null = null;
@@ -249,10 +250,10 @@ const plain = (s: string) =>
   process.platform === "linux" ? s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : s;
 
 function notify(title: string, body: string, to?: Navigation) {
-  if (!Notification.isSupported()) return;
-  const n = new Notification({ title, body: plain(body), icon: nativeImage.createFromPath(join(icons, "app.png")) });
-  if (to) n.on("click", () => showWindow(to));
-  n.show();
+  showNotification(
+    { title, body: plain(body), icon: nativeImage.createFromPath(join(icons, "app.png")) },
+    to ? () => showWindow(to) : undefined,
+  );
 }
 
 // ---- Actions ---------------------------------------------------------------
@@ -292,7 +293,8 @@ function appMenu(x: number, y: number) {
 async function quit() {
   if (quitting) return;
   quitting = true;
-  await Promise.race([controller.stop(), new Promise((r) => setTimeout(r, 1500))]);
+  closeNotifications();
+  await Promise.race([Promise.all([stopHotplug?.(), controller.stop()]), new Promise((r) => setTimeout(r, 1500))]);
   tray?.destroy();
   app.exit(0);
 }
@@ -363,7 +365,7 @@ void app.whenReady().then(async () => {
   });
 
   Menu.setApplicationMenu(null);
-  if (!fake) await watchHotplug(() => controller.manager.burst(), log);
+  if (!fake) stopHotplug = await watchHotplug(() => controller.manager.burst(), log);
   controller.changed();
   await controller.manager.rescan();
   if (!hidden) showWindow();

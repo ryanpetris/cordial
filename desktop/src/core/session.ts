@@ -243,10 +243,12 @@ export class AdapterSession {
         resolve: resolve as (r: unknown) => void,
         reject,
       };
-      if (options.timeoutMs)
+      // Cancellation acknowledges before teardown; silence uses the link deadline.
+      const timeoutMs = options.timeoutMs ?? (command === "request.cancel" ? HEARTBEAT_TIMEOUT_MS : undefined);
+      if (timeoutMs)
         pending.timer = setTimeout(
           () => this.#fail(new Error(`${command} got no response`)),
-          options.timeoutMs,
+          timeoutMs,
         );
       else if (options.waitMs)
         pending.timer = setTimeout(() => {
@@ -298,6 +300,10 @@ export class AdapterSession {
   }
 
   #dispatch(message: unknown) {
+    if (message === null || typeof message !== "object" || Array.isArray(message)) {
+      if (!this.#confirmed) return this.#hooks.log("ignoring input left from an earlier session");
+      return this.#fail(new Error("adapter sent a non-object message"));
+    }
     const m = message as { type?: unknown; id?: unknown };
     if (m.type === "response") {
       const pending = typeof m.id === "number" ? this.#pending.get(m.id) : undefined;

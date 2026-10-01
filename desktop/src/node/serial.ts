@@ -80,19 +80,26 @@ export function openSerial(path: string): Promise<Transport> {
 }
 
 /**
- * Calls `changed` whenever a USB device is attached or detached. Resolves
- * false when hotplug events are unavailable.
+ * Calls `changed` whenever a USB device is attached or detached.
+ * Returns cleanup that owns the watcher, or null when events are unavailable.
  */
-export async function watchHotplug(changed: () => void, log: (message: string) => void): Promise<boolean> {
+export async function watchHotplug(changed: () => void, log: (message: string) => void): Promise<(() => Promise<void>) | null> {
+  let emitter: import("usb/index.js").Emitter | undefined;
+  const stop = async () => {
+    const current = emitter;
+    emitter = undefined;
+    if (current) await Promise.allSettled([current.removeAttach(), current.removeDetach()]);
+  };
   try {
     const { Emitter } = (await import("usb/index.js")) as typeof import("usb/index.js");
-    const emitter = new Emitter();
+    emitter = new Emitter();
     await emitter.addAttach(changed);
     await emitter.addDetach(changed);
-    return true;
+    return stop;
   } catch (error) {
+    await stop().catch(() => {});
     log(`USB hotplug events unavailable; use the Adapters refresh button: ${(error as Error).message}`);
-    return false;
+    return null;
   }
 }
 

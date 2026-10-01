@@ -64,7 +64,7 @@ export async function startBackend(simulate = 0): Promise<Backend> {
     lowBattery: (alert) => log(`notification: ${alert.name} battery ${alert.level}, ${alert.percent}%`),
     connection: (name, connected) => log(`notification: ${name} ${connected ? "connected" : "disconnected"}`),
   });
-  if (!simulate) await watchHotplug(() => controller.manager.burst(), log);
+  const stopHotplug = !simulate ? await watchHotplug(() => controller.manager.burst(), log) : null;
   controller.changed();
   await controller.manager.rescan();
 
@@ -110,6 +110,6 @@ export async function startBackend(simulate = 0): Promise<Backend> {
       else reply(res, 404, { error: "not found" });
       return true;
     },
-    stop: () => controller.stop(),
+    stop: async () => { await Promise.all([stopHotplug?.(), controller.stop()]); },
   };
 }

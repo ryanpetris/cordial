@@ -92,6 +92,8 @@ export class Controller {
   #timer: ReturnType<typeof setTimeout> | undefined;
   readonly #alerts = new BatteryAlerts();
   #states = new Map<string, Device["state"]>();
+  #discoveryActions: Promise<void> = Promise.resolve();
+  #discoveryAbort = new AbortController();
 
   constructor(deps: ControllerDeps) {
     this.#deps = deps;
@@ -411,7 +413,21 @@ export class Controller {
       : { ok: true, settingsSave: save };
   }
 
-  async act(action: Action): Promise<ActionResult> {
+  act(action: Action): Promise<ActionResult> {
+    if (!["scan.start", "scan.stop", "pair.start", "pair.cancel", "pair.dismiss"].includes(action.type))
+      return this.#act(action);
+    // Stops invalidate starts that are waiting for a hardware job to end.
+    if (action.type === "scan.stop" || action.type === "pair.cancel" || action.type === "pair.dismiss") {
+      this.#discoveryAbort.abort();
+      this.#discoveryAbort = new AbortController();
+    }
+    const signal = this.#discoveryAbort.signal;
+    const result = this.#discoveryActions.then(() => this.#act(action, signal));
+    this.#discoveryActions = result.then(() => {}, () => {});
+    return result;
+  }
+
+  async #act(action: Action, signal = this.#discoveryAbort.signal): Promise<ActionResult> {
     const gone: ActionResult = { ok: false, message: "That device or adapter is no longer available." };
     try {
       switch (action.type) {
@@ -558,12 +574,12 @@ export class Controller {
           this.manager.burst();
           return { ok: true };
         case "scan.start":
-          return this.#startScan(action.adapterId);
+          return this.#startScan(action.adapterId, signal);
         case "scan.stop":
           await this.#stopScan();
           return { ok: true };
         case "pair.start":
-          return this.#pair(action.adapterId, action.candidateId);
+          return this.#pair(action.adapterId, action.candidateId, signal);
         case "pair.reply":
           return this.#reply(action.accept, action.value);
         case "pair.cancel":
@@ -602,8 +618,10 @@ export class Controller {
 
   // ---- Discovery and pairing ----------------------------------------------
 
-  async #startScan(adapterId: string): Promise<ActionResult> {
+  async #startScan(adapterId: string, signal: AbortSignal): Promise<ActionResult> {
+    if (signal.aborted) return { ok: true };
     await this.#stopScan();
+    if (signal.aborted) return { ok: true };
     const session = this.#session(adapterId);
     if (!session) return { ok: false, message: "That adapter is no longer available." };
     const classic = session.capabilities.includes("classic");
@@ -652,13 +670,30 @@ export class Controller {
     await Promise.race([scan.done, new Promise((r) => setTimeout(r, 2000))]);
   }
 
-  async #pair(adapterId: string, candidateId: string): Promise<ActionResult> {
+  async #pair(adapterId: string, candidateId: string, signal: AbortSignal): Promise<ActionResult> {
+    if (signal.aborted) return { ok: true };
     const session = this.#session(adapterId);
     if (!session) return { ok: false, message: "That adapter is no longer available." };
     if (this.#pairing && !this.#pairing.dismissed && (this.#pairing.phase === "pairing" || this.#pairing.phase === "connecting"))
       return { ok: false, message: "Another device is being added." };
     // A dismissed pairing may still be tearing down (up to 15 seconds).
-    if (this.#pairing?.dismissed && this.#pairing.phase === "pairing") await Promise.race([this.#pairing.done, new Promise((r) => setTimeout(r, 16000))]);
+    if (this.#pairing?.dismissed && this.#pairing.phase === "pairing") {
+      const interrupted = Promise.withResolvers<void>();
+      const interrupt = () => interrupted.resolve();
+      signal.addEventListener("abort", interrupt, { once: true });
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          this.#pairing.done,
+          new Promise<void>((resolve) => { timeout = setTimeout(resolve, 16000); }),
+          interrupted.promise,
+        ]);
+      } finally {
+        clearTimeout(timeout);
+        signal.removeEventListener("abort", interrupt);
+      }
+    }
+    if (signal.aborted) return { ok: true };
     const candidate = this.#scan?.candidates.find((c) => c.candidate_id === candidateId);
     const name = clean(candidate?.name ?? "") || "the device";
     // Candidates stay usable after their scan is cancelled.
@@ -667,6 +702,7 @@ export class Controller {
       await scan.session.request("request.cancel", { request_id: scan.requestId }).catch(() => {});
       await Promise.race([scan.done, new Promise((r) => setTimeout(r, 2000))]);
     }
+    if (signal.aborted) return { ok: true };
     const started = session.start(
       "pairing.start",
       { candidate_id: candidateId },
@@ -765,6 +801,8 @@ export class Controller {
   }
 
   async stop() {
+    this.#discoveryAbort.abort();
+    this.#discoveryAbort = new AbortController();
     await this.manager.stop();
   }
 }

@@ -6,6 +6,35 @@ import type { Transport } from "../src/core/transport.ts";
 import { openSession, until } from "./helpers.ts";
 
 describe("AdapterSession", () => {
+  it.each(["null", "42", "true", '"text"', "[]"])("ignores stale %s before confirmation", async (input) => {
+    const fake = new FakeAdapter();
+    fake.staleInput = `${input}\n`;
+    const hooks = { changed: vi.fn(), closed: vi.fn(), log: vi.fn() };
+    const session = await AdapterSession.open(fake.open(), hooks);
+    expect(session.closed).toBe(false);
+    expect(hooks.log).toHaveBeenCalledWith("ignoring input left from an earlier session");
+    await session.close();
+  });
+
+  it.each(["null", "42", "true", '"text"', "[]"])("fails cleanly on %s after confirmation", async (input) => {
+    const fake = new FakeAdapter();
+    let receive!: (chunk: Uint8Array) => void;
+    const hooks = { changed: vi.fn(), closed: vi.fn(), log: vi.fn() };
+    const transport: Transport = {
+      onData(listener) { receive = listener; fake.onData(listener); },
+      onClose: (listener) => fake.onClose(listener),
+      write: (text) => fake.write(text),
+      close: () => fake.close(),
+    };
+    fake.open();
+    const session = await AdapterSession.open(transport, hooks);
+    expect(() => receive(new TextEncoder().encode(`${input}\n`))).not.toThrow();
+    expect(session.closed).toBe(true);
+    expect(hooks.closed).toHaveBeenCalledOnce();
+    expect(hooks.closed.mock.calls[0]![0].message).toBe("adapter sent a non-object message");
+    await session.close();
+  });
+
   it("confirms the adapter, waits for readiness and builds the device view", async () => {
     const { fake, session } = await openSession();
     expect(session.adapterId).toBe(fake.id);

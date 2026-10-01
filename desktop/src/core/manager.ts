@@ -41,7 +41,7 @@ export class AdapterManager {
   readonly disconnected = new Map<string, Disconnected>();
   readonly #deps: ManagerDeps;
   readonly #probing = new Set<string>();
-  readonly #opened = new Map<AdapterSession, number>();
+  readonly #opened = new WeakMap<AdapterSession, number>();
   /** Closes still releasing their ports, by adapter ID. */
   readonly #closing = new Map<string, Promise<void>>();
   #timers: ReturnType<typeof setTimeout>[] = [];
@@ -199,6 +199,7 @@ export class AdapterManager {
 
   /** Opens a disconnected adapter again. Resolves with an error message. */
   async connect(id: string): Promise<string | null> {
+    if (this.#stopped) return "That adapter is no longer available.";
     const d = this.disconnected.get(id);
     if (!d || d.connecting) return null;
     if (!d.path) return "The adapter isn't plugged in.";
@@ -207,11 +208,19 @@ export class AdapterManager {
     this.#deps.changed();
     // The previous session must release the port first.
     await this.#closing.get(id);
+    if (this.#stopped) {
+      d.connecting = false;
+      return "That adapter is no longer available.";
+    }
     const path = d.path;
     this.#probing.add(path);
     try {
       const session = await this.#open(path);
       d.connecting = false;
+      if (this.#stopped) {
+        await session?.close();
+        return "That adapter is no longer available.";
+      }
       if (!session || session.adapterId !== id) {
         await session?.close();
         d.error = "Couldn't connect. Is another program using it?";
@@ -232,6 +241,6 @@ export class AdapterManager {
     for (const t of this.#timers) clearTimeout(t);
     const sessions = [...this.connected.values()].map((c) => c.session);
     this.connected.clear();
-    await Promise.all(sessions.map((s) => s.close().catch(() => {})));
+    await Promise.all([...this.#closing.values(), ...sessions.map((s) => s.close().catch(() => {}))]);
   }
 }

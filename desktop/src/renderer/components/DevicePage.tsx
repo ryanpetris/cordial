@@ -168,9 +168,11 @@ function MarkerMenu({ label, x, y, options, onClose }: {
     menu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
     const outside = (e: PointerEvent) => !menu.contains(e.target as Node) && !(e.target as Element).closest?.("[aria-expanded=true]") && onClose(false);
     document.addEventListener("pointerdown", outside);
-    window.addEventListener("blur", () => onClose(false), { once: true });
+    const blur = () => onClose(false);
+    window.addEventListener("blur", blur, { once: true });
     return () => {
       document.removeEventListener("pointerdown", outside);
+      window.removeEventListener("blur", blur);
       menu.hidePopover();
     };
   }, []);
