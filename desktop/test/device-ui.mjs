@@ -144,13 +144,14 @@ try {
 
   // A connected device opens on Settings, whose buttons sit in the page bar;
   // any other opens on Details, where the bar holds Forget Device and the
-  // connection button. The header holds no buttons.
+  // connection button. A device with no settings to show has no tabs. The
+  // header holds no buttons.
   const bar = page.locator(".page-bar");
   assert.equal(await page.getByRole("tab", { name: "Settings" }).getAttribute("aria-selected"), "true");
   assert.equal(await bar.getByRole("button", { name: "Save", exact: true }).count(), 1);
   assert.equal(await page.locator(".page-header button").count(), 0);
   await page.getByRole("button", { name: /Travel Keyboard/ }).first().click();
-  assert.equal(await page.getByRole("tab", { name: "Details" }).getAttribute("aria-selected"), "true");
+  await page.getByRole("tablist").waitFor({ state: "detached" });
   await bar.getByRole("button", { name: "Forget Device", exact: true }).waitFor();
   await bar.getByRole("button", { name: "Connect", exact: true }).waitFor();
   assert.equal(await page.locator(".page-header button").count(), 0);
@@ -393,6 +394,35 @@ try {
   await app.evaluate(() => { globalThis.uiFail = null; });
   await page.getByRole("button", { name: "Retry", exact: true }).click();
   await page.getByRole("button", { name: "Refresh", exact: true }).waitFor();
+
+  // A device without HID++ settings shows its details without tabs, and the
+  // tab chosen earlier returns with them. A focused control keeps its focus.
+  await page.getByRole("tab", { name: "Settings" }).click();
+  const supported = { settings: entry.settings, state: entry.device.settings_state, error: entry.device.settings_error };
+  entry.settings = { ...supported.settings, settings: [], current: true };
+  entry.device.settings_state = "unsupported";
+  entry.device.settings_error = "hidpp_protocol_unsupported";
+  await publish();
+  await page.getByRole("tablist").waitFor({ state: "detached" });
+  assert.equal(await page.getByRole("tabpanel").count(), 0);
+  const automatic = page.getByRole("switch", { name: "Automatic Connections", exact: true });
+  await automatic.focus();
+  entry.device.settings_state = "pending";
+  await publish();
+  await page.getByRole("tab", { name: "Settings", selected: true }).waitFor();
+  await page.getByRole("tab", { name: "Details" }).click();
+  await automatic.focus();
+  entry.device.settings_state = "unsupported";
+  await publish();
+  await page.getByRole("tablist").waitFor({ state: "detached" });
+  assert.equal(await automatic.evaluate((e) => e === document.activeElement), true);
+  entry.settings = supported.settings;
+  entry.device.settings_state = supported.state;
+  entry.device.settings_error = supported.error;
+  await publish();
+  await page.getByRole("tab", { name: "Details", selected: true }).waitFor();
+  assert.equal(await automatic.evaluate((e) => e === document.activeElement), true);
+  await page.getByRole("tab", { name: "Settings" }).click();
 
   state.scan = { adapterId: entry.adapterId, running: false, candidates: [], error: null };
   await publish();

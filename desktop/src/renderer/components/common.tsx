@@ -171,7 +171,7 @@ export function SwitchRow(props: {
 }
 
 /** A row of tabs over one TabPanel with the same `id`; the arrow keys move
- * between the enabled tabs. */
+ * between the tabs. */
 export function TabBar<T extends string>({
   id,
   label,
@@ -181,14 +181,14 @@ export function TabBar<T extends string>({
 }: {
   id: string;
   label: string;
-  tabs: [T, string, boolean?][];
+  tabs: [T, string][];
   value: T;
   onChange: (value: T) => void;
 }) {
   const list = useRef<HTMLDivElement>(null);
-  const enabled = tabs.filter(([, , disabled]) => !disabled).map(([v]) => v);
+  const values = tabs.map(([v]) => v);
   const move = (step: number) => {
-    const next = enabled[(enabled.indexOf(value) + step + enabled.length) % enabled.length];
+    const next = values[(values.indexOf(value) + step + values.length) % values.length];
     if (next === undefined || next === value) return;
     onChange(next);
     list.current?.querySelector<HTMLElement>(`[data-tab="${next}"]`)?.focus();
@@ -207,7 +207,7 @@ export function TabBar<T extends string>({
           }
         }}
       >
-        {tabs.map(([v, text, disabled]) => (
+        {tabs.map(([v, text]) => (
           <button
             key={v}
             type="button"
@@ -218,7 +218,6 @@ export function TabBar<T extends string>({
             aria-selected={v === value}
             aria-controls={`${id}-panel`}
             tabIndex={v === value ? 0 : -1}
-            disabled={disabled}
             onClick={() => onChange(v)}
           >
             {text}
@@ -229,9 +228,13 @@ export function TabBar<T extends string>({
   );
 }
 
-/** The panel a TabBar with the same `id` switches; `value` is the shown tab. */
-export function TabPanel({ id, value, children }: { id: string; value: string; children: ReactNode }) {
-  return (
+/** The panel a TabBar with the same `id` switches; `value` is the shown tab,
+ * or null while no TabBar is shown. The panel stays mounted either way, so
+ * its contents keep focus as the TabBar comes and goes. */
+export function TabPanel({ id, value, children }: { id: string; value: string | null; children: ReactNode }) {
+  return value === null ? (
+    <div>{children}</div>
+  ) : (
     <div id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-${value}`}>
       {children}
     </div>

@@ -461,12 +461,12 @@ function WheelInfo({ entry, s }: { entry: DeviceEntry; s: Setting }) {
   );
 }
 
-/** Whether the settings tab has anything to show; saved settings stay visible while disconnected. */
+/** Whether the device page has a settings tab; saved settings stay visible while disconnected. */
 function hasSettings(entry: DeviceEntry) {
   const d = entry.device;
   const view = entry.settings;
   if (view?.settings.length) return true;
-  if (d.state !== "connected") return false;
+  if (d.state !== "connected" || d.settings_state === "unsupported") return false;
   return !view || view.loadError !== null || d.settings_error !== null || reading(entry);
 }
 
@@ -592,7 +592,7 @@ function Settings({ entry, adapter, drafts, bar, waited, onRetry }: {
   );
 
   if (!settings.length)
-    return d.settings_state === "unsupported" || d.settings_state === "error" ? (
+    return d.settings_state === "error" ? (
       <p className="muted">Settings unavailable{d.settings_error ? `: ${codeText(d.settings_error)}.` : "."}</p>
     ) : failing ? (
       <div className="panel-state">{loadProblem}</div>
@@ -761,16 +761,18 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
         </>
       }
       nav={
-        <TabBar
-          id={tabs}
-          label="Device"
-          tabs={[
-            ["settings", "Settings", !settings],
-            ["details", "Details"],
-          ]}
-          value={tab}
-          onChange={setTab}
-        />
+        settings ? (
+          <TabBar
+            id={tabs}
+            label="Device"
+            tabs={[
+              ["settings", "Settings"],
+              ["details", "Details"],
+            ]}
+            value={tab}
+            onChange={setTab}
+          />
+        ) : undefined
       }
       bar={
         tab === "settings" ? (
@@ -821,7 +823,7 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
         <Banner key={w}>{WARNINGS[w]}</Banner>
       ))}
 
-      <TabPanel id={tabs} value={tab}>
+      <TabPanel id={tabs} value={settings ? tab : null}>
         {tab === "settings" ? (
           <Settings
             entry={entry}
