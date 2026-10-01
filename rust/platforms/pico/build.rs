@@ -67,8 +67,7 @@ fn main() {
             String::from_utf8_lossy(&prepared.stderr)
         );
         let paths = String::from_utf8(prepared.stdout).expect("dependency paths");
-        // Both radio compositions use LittleFS's C string helpers. Nano's
-        // byte-copy implementation is also safe for RP2350 USB DPRAM.
+        // Both radio compositions use LittleFS's C string helpers.
         let target = env::var("TARGET").unwrap().replace(['-', '.'], "_");
         let compiler = env::var(format!("CC_{target}")).expect("ARM compiler");
         let flags: &[&str] = if env::var_os("CARGO_FEATURE_RP2040").is_some() {
@@ -94,6 +93,9 @@ fn main() {
             libc.parent().unwrap().display()
         );
         println!("cargo:rustc-link-lib=static=c_nano");
+        if env::var_os("CARGO_FEATURE_RP2040").is_none() {
+            println!("cargo:rustc-link-arg=--wrap=memcpy");
+        }
         if env::var_os("CARGO_FEATURE_PICO_SDK_CYW43").is_some() {
             let paths: Vec<_> = paths.lines().collect();
             let native = root.join("tools/pico_radio.py");
