@@ -876,7 +876,7 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
                 <Fact label="HID++ Protocol">{hidppProtocolText(d.hidpp_protocol)}</Fact>
                 <Fact label="Special-Key Translation">
                   {NORMALIZATION[d.normalization_state]}
-                  {d.normalization_error ? `: ${codeText(d.normalization_error)}` : ""}
+                  {d.normalization_state !== "unsupported" && d.normalization_error ? `: ${codeText(d.normalization_error)}` : ""}
                 </Fact>
                 <Fact label="Device Settings">
                   {SETTINGS_STATUS[d.settings_state]}

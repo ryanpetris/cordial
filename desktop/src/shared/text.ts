@@ -140,7 +140,7 @@ export const NORMALIZATION: Record<NormalizationState, string> = {
   resetting: "Resetting",
   configuring: "Setting Up",
   active: "Active",
-  unsupported: "Unavailable",
+  unsupported: "Unsupported",
   error: "Failed",
 };
 
