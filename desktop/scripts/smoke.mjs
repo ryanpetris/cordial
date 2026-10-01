@@ -50,7 +50,7 @@ await shot("add-device");
 await page.getByRole("listitem").filter({ hasText: "Example Keys Mini" }).getByRole("button", { name: "Pair" }).click();
 await page.getByText("Does Example Keys Mini show this code?").waitFor();
 await shot("pair-confirm");
-await page.getByRole("button", { name: "Yes, It Matches" }).click();
+await page.getByRole("button", { name: "Codes Match" }).click();
 await page.getByText("is paired and connected").waitFor();
 await shot("paired");
 await page.getByRole("button", { name: "Done" }).click();
