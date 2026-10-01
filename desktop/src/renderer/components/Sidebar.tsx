@@ -3,7 +3,7 @@ import type { AdapterEntry, AppState, DeviceEntry } from "../../shared/state.ts"
 import { adapterStatus, batteryStale, batteryText, deviceStatus } from "../../shared/text.ts";
 import { act, api, chooseAdapter, reportError } from "../api.ts";
 import type { Selection } from "../App.tsx";
-import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, MenuIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
+import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, MenuIcon, PlusIcon, WarningIcon } from "./icons.tsx";
 import { isLow } from "../../shared/battery.ts";
 
 function DeviceRow({ d, selected, threshold, onSelect }: { d: DeviceEntry; selected: boolean; threshold: number; onSelect: () => void }) {
@@ -74,7 +74,7 @@ function AdapterMenu({ adapter, x, y, onRename, onClose }: { adapter: AdapterEnt
         </button>
       )}
       <button role="menuitem" disabled={!connected || !adapter.status?.storage_ready} onClick={run(onRename)}>
-        Rename…
+        Rename
       </button>
     </div>
   );
@@ -121,7 +121,7 @@ export function Sidebar({
             <MenuIcon />
           </button>
         ) : (
-          <button className="icon-button" title="Preferences" aria-label="Preferences" onClick={onPreferences}>
+          <button className="icon-button" title="Settings" aria-label="Settings" onClick={onPreferences}>
             <GearIcon />
           </button>
         )}
@@ -144,23 +144,13 @@ export function Sidebar({
           />
         ))}
         {state.devices.length === 0 ? <p className="side-empty">{connected.length ? "No Saved Devices" : "No Adapter Connected"}</p> : null}
-        <h3 className="side-heading with-button">
+        <h3 className="side-heading">
           Adapters
-          <span>
-            {choose ? (
-              <button className="icon-button" title="Choose Adapter" aria-label="Choose Adapter" onClick={() => void chooseAdapter().then((result) => { if (!result.ok) reportError(result.message); })}>
-                <PlusIcon />
-              </button>
-            ) : null}
-            <button
-              className="icon-button"
-              title={api.host.desktop ? "Refresh Adapters (F5)" : "Refresh Adapters"}
-              aria-label="Refresh Adapters"
-              onClick={() => void act({ type: "adapters.refresh" })}
-            >
-              <RefreshIcon />
+          {choose ? (
+            <button className="icon-button" title="Choose Adapter" aria-label="Choose Adapter" onClick={() => void chooseAdapter().then((result) => { if (!result.ok) reportError(result.message); })}>
+              <PlusIcon />
             </button>
-          </span>
+          ) : null}
         </h3>
         {state.adapters.map((a) => {
           const selected = selection.page === "adapter" && selection.id === a.id;

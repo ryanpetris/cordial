@@ -57,11 +57,11 @@ make web
 The build is in `desktop/out/web/`, a static site with relative URLs that works
 under any path. Serve it locally with, for example,
 `python3 -m http.server 8000 --bind 127.0.0.1 --directory desktop/out/web`.
-The page asks for access to an adapter with **Choose Adapter…**; the browser then
+The page asks for access to an adapter with **Choose Adapter**; the browser then
 remembers it. Only one tab manages adapters at a time. Add `?simulate=2` to the
 URL for a demo with two simulated adapters, which needs no Web Serial. The
 browser has no tray, notifications appear only while the page is open, and
-preferences are kept in the browser.
+settings are kept in the browser.
 
 Web Serial can't read USB serial numbers, so the page identifies adapters by the
 protocol handshake alone. A disconnected adapter is remembered by its port.
@@ -91,7 +91,7 @@ It refuses requests with another host name or origin, and actions that aren't
 JSON, so other web pages can't use it. It has no other authentication; anyone
 who can reach the port on the development host can manage its adapters. Quit the
 desktop application on that host first, since only one program can open an
-adapter. Preferences last until the server stops.
+adapter. Changes in Settings last until the server stops.
 
 ### Firmware toolchains
 

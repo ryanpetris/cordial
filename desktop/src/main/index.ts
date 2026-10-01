@@ -203,7 +203,7 @@ function trayMenu(model: TrayModel, state: AppState): Menu {
           d.connected
             ? { label: "Disconnect", click: () => void act({ type: "device.disconnect", key: d.key }) }
             : { label: "Connect", enabled: d.canConnect, click: () => void act({ type: "device.connect", key: d.key }) },
-          { label: "Open…", click: () => showWindow({ page: "device", key: d.key }) },
+          { label: "Open", click: () => showWindow({ page: "device", key: d.key }) },
         ],
       });
   }
@@ -211,13 +211,13 @@ function trayMenu(model: TrayModel, state: AppState): Menu {
   items.push(
     { type: "separator" },
     {
-      label: "Add Device…",
+      label: "Add Device",
       enabled: state.adapters.some((a) => a.connection === "connected" && a.readiness === "ready"),
       click: () => showWindow({ page: "add-device" }),
     },
     { label: "Open Cordial", click: () => showWindow() },
     { type: "separator" },
-    { label: "Preferences…", click: () => showWindow({ page: "preferences" }) },
+    { label: "Settings", click: () => showWindow({ page: "preferences" }) },
     { label: "Quit", click: () => quit() },
   );
   return Menu.buildFromTemplate(items);
@@ -276,14 +276,16 @@ function adapterMenu(adapterId: string) {
           enabled: adapter.connection === "disconnected",
           click: () => void act({ type: "adapter.connect", adapterId }),
         },
-    { label: "Rename…", enabled: connected && !!adapter.status?.storage_ready, click: () => showWindow({ page: "adapter", id: adapterId, rename: true }) },
+    { label: "Rename", enabled: connected && !!adapter.status?.storage_ready, click: () => showWindow({ page: "adapter", id: adapterId, rename: true }) },
   ]).popup({ window });
 }
 
 function appMenu(x: number, y: number) {
   if (!window) return;
   Menu.buildFromTemplate([
-    { label: "Preferences…", accelerator: "CmdOrCtrl+,", registerAccelerator: false, click: () => showWindow({ page: "preferences" }) },
+    { label: "Refresh Adapters", accelerator: "F5", registerAccelerator: false, click: () => void act({ type: "adapters.refresh" }) },
+    { type: "separator" },
+    { label: "Settings", accelerator: "CmdOrCtrl+,", registerAccelerator: false, click: () => showWindow({ page: "preferences" }) },
     { label: "Quit", accelerator: "CmdOrCtrl+Q", registerAccelerator: false, click: () => void quit() },
   ]).popup({ window, x: Math.round(x), y: Math.round(y) });
 }

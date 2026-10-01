@@ -62,11 +62,13 @@ await app.evaluate(({ Menu }) => {
   };
 });
 await page.getByRole("button", { name: "Main Menu" }).click();
-await app.evaluate(async () => {
+const menuLabels = await app.evaluate(async () => {
   while (!globalThis.smokeMenu) await new Promise((r) => setTimeout(r, 50));
-  globalThis.smokeMenu.items.find((item) => item.label === "Preferences…").click();
+  globalThis.smokeMenu.items.find((item) => item.label === "Settings").click();
+  return globalThis.smokeMenu.items.map((item) => item.label).filter(Boolean);
 });
-await page.getByRole("dialog", { name: "Preferences" }).waitFor();
+if (menuLabels.join() !== "Refresh Adapters,Settings,Quit") throw new Error(`unexpected app menu: ${menuLabels}`);
+await page.getByRole("dialog", { name: "Settings" }).waitFor();
 await shot("preferences");
 await page.keyboard.press("Escape");
 const state = await page.evaluate(() => window.cordial.state());

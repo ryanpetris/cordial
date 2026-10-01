@@ -11,7 +11,7 @@ export function Preferences({ state, open, onClose }: { state: AppState; open: b
   const [level, setLevel] = useState<string | null>(null);
   const levelValid = (n: number) => Number.isInteger(n) && n >= 5 && n <= 50;
   return (
-    <Dialog open={open} title="Preferences" onClose={onClose} className="preferences">
+    <Dialog open={open} title="Settings" onClose={onClose} className="preferences">
       <div className="dialog-scroll">
         {api.host.desktop ? (
           <Card title="General">
