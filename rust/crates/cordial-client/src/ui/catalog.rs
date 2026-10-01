@@ -34,8 +34,8 @@ pub struct Info {
     pub key: SettingKey,
     pub label: &'static str,
     pub category: &'static str,
-    /// Shown with the setting's details.
-    pub note: &'static str,
+    /// The unit integer values are in, or "".
+    pub unit: &'static str,
     /// Wording of enum tokens that plain capitalization would garble.
     choices: &'static [(&'static str, &'static str)],
     /// Reads a text value the adapter sends as reply bytes in lowercase hex.
@@ -47,7 +47,7 @@ const fn info(key: SettingKey, label: &'static str, category: &'static str) -> I
         key,
         label,
         category,
-        note: "",
+        unit: "",
         choices: &[],
         decode: None,
     }
@@ -60,17 +60,14 @@ static CATALOG: [Info; 20] = {
     [
         Info {
             choices: &[
-                ("function_keys", "Function keys (F1–F12)"),
-                ("special_actions", "Special actions"),
+                ("function_keys", "F1-F12"),
+                ("special_actions", "Shortcuts"),
             ],
-            ..info(FnRowDefault, "Function Row Default", "Keyboard")
+            ..info(FnRowDefault, "Function Row", "Keyboard")
         },
-        info(BacklightEnabled, "Backlight Enabled", "Backlight"),
+        info(BacklightEnabled, "Backlight", "Backlight"),
         info(BacklightMode, "Backlight Mode", "Backlight"),
-        Info {
-            note: "The level used in permanent manual mode.",
-            ..info(BacklightLevel, "Manual Backlight Level", "Backlight")
-        },
+        info(BacklightLevel, "Manual Backlight Level", "Backlight"),
         info(
             BacklightCurrentLevel,
             "Current Backlight Level",
@@ -78,37 +75,49 @@ static CATALOG: [Info; 20] = {
         ),
         Info {
             choices: &[
-                ("battery", "Off (battery)"),
-                ("saturated", "Automatic (saturated)"),
+                ("battery", "Off (Battery)"),
+                ("saturated", "Automatic (Saturated)"),
             ],
             ..info(BacklightStatus, "Backlight Status", "Backlight")
         },
         info(BacklightEffect, "Backlight Effect", "Backlight"),
-        info(
-            BacklightDelayHandsOut,
-            "Delay With Hands Away (Seconds)",
-            "Backlight",
-        ),
-        info(
-            BacklightDelayHandsIn,
-            "Delay With Hands Nearby (Seconds)",
-            "Backlight",
-        ),
-        info(
-            BacklightDelayPowered,
-            "Delay While Powered (Seconds)",
-            "Backlight",
-        ),
+        Info {
+            unit: "s",
+            ..info(
+                BacklightDelayHandsOut,
+                "Timeout With Hands Away",
+                "Backlight",
+            )
+        },
+        Info {
+            unit: "s",
+            ..info(
+                BacklightDelayHandsIn,
+                "Timeout With Hands Nearby",
+                "Backlight",
+            )
+        },
+        Info {
+            unit: "s",
+            ..info(
+                BacklightDelayPowered,
+                "Timeout While Plugged In",
+                "Backlight",
+            )
+        },
         info(BacklightPowerOn, "Backlight at Power-On", "Backlight"),
         info(BacklightCrown, "Crown Backlight", "Backlight"),
         info(BacklightPowerSave, "Backlight Power Saving", "Backlight"),
-        info(PointerDpi0, "Pointer DPI (Sensor 1)", "Pointer"),
-        info(PointerDpi1, "Pointer DPI (Sensor 2)", "Pointer"),
-        info(WheelMode, "Wheel Mode", "Wheel"),
         Info {
-            note: "255 turns automatic switching to ratchet mode off.",
-            ..info(WheelThreshold, "SmartShift Threshold", "Wheel")
+            unit: "DPI",
+            ..info(PointerDpi0, "Pointer Speed", "Pointer")
         },
+        Info {
+            unit: "DPI",
+            ..info(PointerDpi1, "Second Sensor Speed", "Pointer")
+        },
+        info(WheelMode, "Wheel Mode", "Wheel"),
+        info(WheelThreshold, "SmartShift", "Wheel"),
         info(WheelInvert, "Reverse Vertical Scrolling", "Wheel"),
         Info {
             decode: Some(wheel_facts),
@@ -149,18 +158,26 @@ pub fn categories(settings: &[Setting]) -> Vec<&'static str> {
     out
 }
 
-/// Words an enum token: the catalog's wording, else the token capitalized
+/// Words an enum token: the catalog's wording, else the token in title case
 /// with spaces for separators.
 pub fn choice_words(key: SettingKey, token: &str) -> String {
     if let Some((_, words)) = info_for(key).0.choices.iter().find(|(t, _)| *t == token) {
         return (*words).into();
     }
-    let t = token.replace(['_', '-'], " ");
-    let mut chars = t.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_lowercase() => c.to_ascii_uppercase().to_string() + chars.as_str(),
-        _ => t,
-    }
+    token
+        .replace(['_', '-'], " ")
+        .split(' ')
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(c) if c.is_ascii_lowercase() => {
+                    c.to_ascii_uppercase().to_string() + chars.as_str()
+                }
+                _ => w.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A value as the shell accepts it: on/off, the integer, or the text itself.
@@ -478,9 +495,6 @@ pub fn setting_detail(d: &Device, s: &Setting) -> String {
     } else {
         field("Values", "read-only information");
     }
-    if !info.note.is_empty() {
-        field("Note", info.note);
-    }
     field(
         "Last Observed on Device",
         &format!("{} ({})", value_text(s, &s.observed), freshness(s)),
@@ -624,6 +638,20 @@ pub fn job_text(
     lines.join("\n")
 }
 
+/// Refresh or Apply failure counts: only those that occurred.
+pub fn failure_summary(c: &crate::controller::JobCounts) -> String {
+    [
+        ("failed", c.failed),
+        ("unsupported", c.unsupported),
+        ("uncertain", c.uncertain),
+    ]
+    .iter()
+    .filter(|(_, n)| *n > 0)
+    .map(|(o, n)| format!("{n} {o}"))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
 /// Refresh or Apply counts: those that occurred, and always the main one.
 pub fn job_summary(command: &Command, c: &crate::controller::JobCounts) -> String {
     let apply = matches!(command, Command::SettingsApply(_));
@@ -682,11 +710,11 @@ pub(crate) mod tests {
         assert_eq!(choice_words(SettingKey::WheelMode, "freespin"), "Freespin");
         assert_eq!(
             choice_words(SettingKey::BacklightMode, "permanent_manual"),
-            "Permanent manual"
+            "Permanent Manual"
         );
         assert_eq!(
             choice_words(SettingKey::FnRowDefault, "function_keys"),
-            "Function keys (F1–F12)"
+            "F1-F12"
         );
     }
 

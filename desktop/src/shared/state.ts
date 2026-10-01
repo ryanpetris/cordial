@@ -31,6 +31,23 @@ export interface SettingsResult {
   error: string | null;
 }
 
+/** A value or policy change staged for the device's settings form. */
+export type SettingsChange =
+  | { type: "set"; setting: SettingKey; value: boolean | number | string }
+  | { type: "forget"; setting: SettingKey };
+
+export interface SettingsSaveItem {
+  change: SettingsChange;
+  status: "pending" | "saving" | "saved" | "applied" | "not_saved" | "not_applied" | "not_sent";
+  error: string | null;
+}
+
+/** Outcomes belong only to the changes in this submission. */
+export interface SettingsSave {
+  running: boolean;
+  items: SettingsSaveItem[];
+}
+
 export interface AdapterEntry {
   id: string;
   /** Name reported by the adapter. */
@@ -74,6 +91,8 @@ export interface DeviceEntry {
   infoError: string | null;
   /** Present only while the window shows this device. */
   settings: SettingsEntry | null;
+  /** The current or most recent settings submission in this adapter session. */
+  settingsSave?: SettingsSave | null;
 }
 
 export interface ScanState {
@@ -140,6 +159,7 @@ export type Action =
   | { type: "device.enabled" | "device.trusted" | "device.blocked" | "device.hidpp"; key: string; value: boolean }
   | { type: "setting.set"; key: string; setting: SettingKey; value: boolean | number | string }
   | { type: "setting.forget"; key: string; setting: SettingKey }
+  | { type: "settings.save"; key: string; changes: SettingsChange[] }
   | { type: "settings.refresh" | "settings.apply" | "settings.reload"; key: string }
   | { type: "settings.watch"; key: string | null }
   | { type: "adapter.name"; adapterId: string; name: string | null }
@@ -155,7 +175,7 @@ export type Action =
   | { type: "pair.cancel" | "pair.dismiss" }
   | { type: "preferences"; preferences: Partial<Preferences> };
 
-export type ActionResult = { ok: true } | { ok: false; message: string; inline?: boolean };
+export type ActionResult = ({ ok: true } | { ok: false; message: string; inline?: boolean }) & { settingsSave?: SettingsSave };
 
 /** Where the main process asks the window to go. */
 export type Navigation =

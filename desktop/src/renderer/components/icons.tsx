@@ -95,7 +95,24 @@ export const PlusIcon = ({ size = 16 }: Props) => svg(size, <path d="M12 5v14M5 
 export const CheckIcon = ({ size = 16 }: Props) => svg(size, <path d="M5 12.5l4.5 4.5L19 7.5" />);
 export const WarningIcon = ({ size = 16 }: Props) =>
   svg(size, <path d="M12 3.5l9.5 16.5h-19zM12 10v4.5M12 17.2h.01" />);
-export const ResetIcon = ({ size = 14 }: Props) => svg(size, <path d="M4 12a8 8 0 1 0 2.3-5.6M4 4v4.5h4.5" />);
+
+/** A setting's state marker. Each state has its own shape, so none depends on color alone. */
+export type MarkShape = "outline" | "filled" | "differs" | "draft" | "problem";
+
+export function StateMark({ shape, size = 14 }: { shape: MarkShape; size?: number }) {
+  switch (shape) {
+    case "outline":
+      return svg(size, <circle cx="12" cy="12" r="6" />);
+    case "filled":
+      return svg(size, <circle cx="12" cy="12" r="6" fill="currentColor" />);
+    case "differs":
+      return svg(size, <path d="M12 5l7 7-7 7-7-7z" fill="currentColor" />);
+    case "draft":
+      return svg(size, <path d="M5 19l1-4L16 5l3 3L9 18zM14 7l3 3" />);
+    case "problem":
+      return svg(size, <path d="M12 4l9 15.5H3zM12 10v4M12 16.8h.01" />);
+  }
+}
 
 export function DeviceIcon({ kind, size = 24 }: { kind: DeviceEntry["kind"]; size?: number }) {
   switch (kind) {

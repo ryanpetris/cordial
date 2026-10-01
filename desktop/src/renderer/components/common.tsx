@@ -48,30 +48,117 @@ export function Pill({ tone = "neutral", dot, dim, children }: { tone?: Tone; do
   );
 }
 
-/** A choice among a few options as joined buttons. */
+/** A choice among a few options as joined buttons, one radio group: Tab
+ * reaches the chosen option and the arrow keys move and choose. */
 export function Segmented<T extends string | number | boolean>({
   label,
   options,
   value,
   disabled,
-  selectCurrent = false,
   onChange,
 }: {
   label: string;
   options: [T, string][];
   value: T | null;
   disabled?: boolean;
-  selectCurrent?: boolean;
   onChange: (value: T) => void;
 }) {
+  const group = useRef<HTMLSpanElement>(null);
+  const chosen = options.findIndex(([v]) => v === value);
+  const choose = (i: number) => {
+    const option = options[(i + options.length) % options.length];
+    if (!option) return;
+    group.current?.querySelectorAll<HTMLButtonElement>("button")[options.indexOf(option)]?.focus();
+    if (option[0] !== value) onChange(option[0]);
+  };
   return (
-    <span className="segmented" role="group" aria-label={label}>
-      {options.map(([v, text]) => (
-        <button key={String(v)} aria-pressed={v === value} disabled={disabled} onClick={() => (selectCurrent || v !== value) && onChange(v)}>
+    <span
+      ref={group}
+      className="segmented"
+      role="radiogroup"
+      aria-label={label}
+      aria-disabled={disabled || undefined}
+      onKeyDown={(e) => {
+        if (disabled) return;
+        const at = options.findIndex((_, i) => group.current?.querySelectorAll("button")[i] === document.activeElement);
+        const step = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 0;
+        if (step) choose((at < 0 ? Math.max(chosen, 0) : at) + step);
+        else if (e.key === "Home") choose(0);
+        else if (e.key === "End") choose(options.length - 1);
+        else return;
+        e.preventDefault();
+      }}
+    >
+      {options.map(([v, text], i) => (
+        <button
+          key={String(v)}
+          type="button"
+          role="radio"
+          aria-checked={v === value}
+          tabIndex={i === (chosen < 0 ? 0 : chosen) ? 0 : -1}
+          disabled={disabled}
+          onClick={() => v !== value && onChange(v)}
+        >
           {text}
         </button>
       ))}
     </span>
+  );
+}
+
+/** An On/Off toggle. An unknown value shows as a mixed checkbox, since a
+ * switch can't be mixed; choosing it turns it on. */
+export function Switch({
+  id,
+  checked,
+  disabled,
+  label,
+  onChange,
+}: {
+  id?: string;
+  checked: boolean | null;
+  disabled?: boolean;
+  label?: string;
+  onChange: (value: boolean) => void;
+}) {
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (input.current) input.current.indeterminate = checked === null;
+  }, [checked]);
+  return (
+    <input
+      ref={input}
+      id={id}
+      type="checkbox"
+      role={checked === null ? undefined : "switch"}
+      className="switch"
+      aria-label={label}
+      checked={checked === true}
+      disabled={disabled}
+      onChange={(e) => onChange(e.target.checked)}
+    />
+  );
+}
+
+/** A labelled toggle row that takes effect at once; the whole row toggles. */
+export function SwitchRow(props: {
+  title: string;
+  subtitle?: ReactNode;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  const id = useId();
+  return (
+    <label className={props.disabled ? "row clickable disabled" : "row clickable"} htmlFor={id}>
+      <div className="row-text">
+        <div className="row-title">{props.title}</div>
+        {props.subtitle ? <div className="row-subtitle">{props.subtitle}</div> : null}
+      </div>
+      <div className="row-end">
+        <Switch id={id} checked={props.checked} disabled={props.disabled} onChange={props.onChange} />
+      </div>
+    </label>
   );
 }
 
@@ -115,6 +202,7 @@ export function Tabs<T extends string>({
         {tabs.map(([v, text, disabled]) => (
           <button
             key={v}
+            type="button"
             id={`${id}-${v}`}
             data-tab={v}
             role="tab"
@@ -172,60 +260,6 @@ export function Row({
       </div>
       {children ? <div className="row-end">{children}</div> : null}
     </div>
-  );
-}
-
-export function Switch({
-  checked,
-  disabled,
-  label,
-  onChange,
-}: {
-  checked: boolean;
-  disabled?: boolean;
-  label: string;
-  onChange: (value: boolean) => void;
-}) {
-  return (
-    <input
-      type="checkbox"
-      role="switch"
-      className="switch"
-      aria-label={label}
-      checked={checked}
-      disabled={disabled}
-      onChange={(e) => onChange(e.target.checked)}
-    />
-  );
-}
-
-/** A labelled switch row; the whole row toggles. */
-export function SwitchRow(props: {
-  title: string;
-  subtitle?: ReactNode;
-  checked: boolean;
-  disabled?: boolean;
-  onChange: (value: boolean) => void;
-}) {
-  const id = useId();
-  return (
-    <label className={props.disabled ? "row clickable disabled" : "row clickable"} htmlFor={id}>
-      <div className="row-text">
-        <div className="row-title">{props.title}</div>
-        {props.subtitle ? <div className="row-subtitle">{props.subtitle}</div> : null}
-      </div>
-      <div className="row-end">
-        <input
-          id={id}
-          type="checkbox"
-          role="switch"
-          className="switch"
-          checked={props.checked}
-          disabled={props.disabled}
-          onChange={(e) => props.onChange(e.target.checked)}
-        />
-      </div>
-    </label>
   );
 }
 

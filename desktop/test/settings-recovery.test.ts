@@ -6,7 +6,7 @@ import type { Event } from "../src/protocol/types.ts";
 import { responseProblem } from "../src/protocol/validate.ts";
 import { batteryOf } from "../src/core/controller.ts";
 import { batteryLevel } from "../src/shared/battery.ts";
-import { batteryStale, settingsResultText } from "../src/shared/text.ts";
+import { batteryStale } from "../src/shared/text.ts";
 import { controller, openSession, until } from "./helpers.ts";
 
 type Message = Record<string, any>;
@@ -224,7 +224,9 @@ describe("settings actions", () => {
       { type: "setting.set", key, setting: "backlight.enabled", value: false },
       { type: "setting.forget", key, setting: "backlight.enabled" },
       { type: "settings.refresh", key }, { type: "settings.apply", key },
+      { type: "device.hidpp", key, value: false },
     ] as const) expect(await c.act(action)).toMatchObject({ ok: false });
+    fake.changeDevice("d_1", { normalization_state: "active" });
     expect(await c.act({ type: "device.hidpp", key, value: false })).toEqual({ ok: true });
     fake.changeDevice("d_1", { state: "disconnected", normalization_state: "pending", settings_state: "pending" });
     expect(await c.act({ type: "setting.forget", key, setting: "backlight.enabled" })).toEqual({ ok: true });
@@ -315,8 +317,5 @@ describe("protocol and battery parity", () => {
     expect(batteryLevel(batteryOf(info({ battery_percent: 4 }), false), 20)).toBeNull();
     expect(batteryLevel(batteryOf(info({ battery_percent: 4 })), 20)).toBe("critical");
     expect(batteryStale({ percent: 72, charging: true, percentFresh: true, chargingFresh: false })).toBe(true);
-    expect(settingsResultText({ kind: "apply", error: "The device disconnected.", counts: {
-      device_id: "d_1", revision: 1, count: 0, read: 0, applied: 0, unchanged: 0, failed: 0, uncertain: 0, unsupported: 0,
-    } })).toContain("The device disconnected.");
   });
 });

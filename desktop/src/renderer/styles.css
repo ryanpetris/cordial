@@ -636,8 +636,8 @@ button.row {
   background: var(--hover);
 }
 
-.segmented button[aria-pressed="true"],
-.segmented button[aria-pressed="true"]:hover {
+.segmented button[aria-checked="true"],
+.segmented button[aria-checked="true"]:hover {
   background: var(--card);
   color: var(--fg);
   box-shadow: 0 1px 2px rgba(0, 0, 6, 0.18);
@@ -881,6 +881,119 @@ button.row {
   color: var(--destructive-fg);
 }
 
+/* Settings form: each row is label, control with unit, and a state marker
+   whose slot keeps its width in every state. Narrow cards put the control on
+   its own line under the label and marker. */
+.settings-form .card {
+  container-type: inline-size;
+}
+
+.setting-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 32px;
+  grid-template-areas: "label control marker";
+  align-items: center;
+  gap: 4px 12px;
+  min-height: 54px;
+  padding: 8px 8px 8px 14px;
+}
+
+.card > * + .setting-row,
+.setting-row + * {
+  border-top: 1px solid var(--border);
+}
+
+.setting-label {
+  grid-area: label;
+  min-width: 0;
+}
+
+.setting-control {
+  grid-area: control;
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.setting-marker {
+  grid-area: marker;
+  display: flex;
+  justify-content: center;
+}
+
+@container (max-width: 480px) {
+  .setting-row {
+    grid-template-columns: minmax(0, 1fr) 32px;
+    grid-template-areas: "label marker" "control control";
+  }
+
+  .setting-control {
+    justify-content: flex-start;
+  }
+}
+
+.setting-row.stale .setting-control {
+  opacity: 0.6;
+}
+
+.settings-form.busy .setting-control,
+.setting-control:disabled {
+  opacity: 0.6;
+}
+
+.marker {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  color: var(--dim);
+}
+
+.marker.filled {
+  color: var(--success-fg);
+}
+
+.marker.differs,
+.marker.problem {
+  color: var(--warning-fg);
+}
+
+.marker.draft {
+  color: var(--accent-fg);
+}
+
+.settings-footer {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  margin: 14px 0 0;
+  padding: 10px 0;
+  background: var(--window);
+}
+
+button[aria-disabled="true"] {
+  opacity: 0.5;
+  cursor: default;
+}
+
+button[aria-disabled="true"]:hover {
+  background: var(--button);
+}
+
+button.suggested[aria-disabled="true"]:hover {
+  background: var(--accent);
+}
+
 .slider {
   display: flex;
   align-items: center;
@@ -938,8 +1051,6 @@ button.row {
   font-size: 12.5px;
 }
 
-/* Switch */
-
 .switch {
   appearance: none;
   position: relative;
@@ -971,6 +1082,11 @@ button.row {
 
 .switch:checked::after {
   transform: translateX(20px);
+}
+
+/* An unknown reading sits between Off and On. */
+.switch:indeterminate::after {
+  transform: translateX(10px);
 }
 
 .switch:disabled {
@@ -1145,12 +1261,9 @@ button.row {
 .check {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
   margin: 12px 22px 0;
-}
-
-.check input {
-  accent-color: var(--accent);
 }
 
 .signal {

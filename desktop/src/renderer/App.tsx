@@ -19,7 +19,7 @@ export function App() {
   const [adding, setAdding] = useState(false);
   const [preferences, setPreferences] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
-  // Unsaved setting edits by device and setting, kept across tabs and pages.
+  // Staged setting changes by device and setting, kept across tabs and pages.
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
 
   useEffect(() => {
@@ -73,15 +73,16 @@ export function App() {
 
   const draftsFor = (key: string): Drafts => ({
     get: (setting) => drafts[`${key} ${setting}`],
-    set: (setting, value, expected) =>
+    set: (setting, draft, expected) =>
       setDrafts((all) => {
         const id = `${key} ${setting}`;
         if (expected !== undefined && all[id] !== expected) return all;
         const next = { ...all };
-        if (value === undefined) delete next[id];
-        else next[id] = value;
+        if (draft === undefined) delete next[id];
+        else next[id] = draft;
         return next;
       }),
+    clear: () => setDrafts((all) => Object.fromEntries(Object.entries(all).filter(([id]) => !id.startsWith(`${key} `)))),
   });
 
   return (

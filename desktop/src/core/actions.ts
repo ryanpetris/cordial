@@ -1,7 +1,7 @@
 // Run-time validation of actions arriving over IPC from the window.
 import type { Action } from "../shared/state.ts";
 
-type Kind = "string" | "boolean" | "number" | "value" | "string?" | "nullable";
+type Kind = "string" | "boolean" | "number" | "value" | "string?" | "nullable" | "changes";
 const key = { key: "string" } as const;
 const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "device.connect": key,
@@ -15,6 +15,7 @@ const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "device.hidpp": { key: "string", value: "boolean" },
   "setting.set": { key: "string", setting: "string", value: "value" },
   "setting.forget": { key: "string", setting: "string" },
+  "settings.save": { key: "string", changes: "changes" },
   "settings.refresh": key,
   "settings.reload": key,
   "settings.apply": key,
@@ -57,6 +58,15 @@ function fits(value: unknown, kind: Kind): boolean {
       return value === undefined || (typeof value === "string" && value.length <= 256);
     case "nullable":
       return value === null || (typeof value === "string" && value.length <= 256);
+    case "changes":
+      return Array.isArray(value) && value.length > 0 && value.every((change: unknown) => {
+        if (!change || typeof change !== "object") return false;
+        const c = change as Record<string, unknown>;
+        const fields = c.type === "set" ? ["type", "setting", "value"] : ["type", "setting"];
+        return (c.type === "set" || c.type === "forget")
+          && Object.keys(c).every((k) => fields.includes(k))
+          && fits(c.setting, "string") && (c.type === "forget" || fits(c.value, "value"));
+      });
   }
 }
 

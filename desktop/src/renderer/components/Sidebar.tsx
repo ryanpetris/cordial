@@ -143,19 +143,19 @@ export function Sidebar({
             onSelect={() => onSelect({ page: "device", key: d.key })}
           />
         ))}
-        {state.devices.length === 0 ? <p className="side-empty">{connected.length ? "No saved devices" : "No adapter connected"}</p> : null}
+        {state.devices.length === 0 ? <p className="side-empty">{connected.length ? "No Saved Devices" : "No Adapter Connected"}</p> : null}
         <h3 className="side-heading with-button">
           Adapters
           <span>
             {choose ? (
-              <button className="icon-button" title="Choose adapter" aria-label="Choose adapter" onClick={() => void chooseAdapter().then((result) => { if (!result.ok) reportError(result.message); })}>
+              <button className="icon-button" title="Choose Adapter" aria-label="Choose Adapter" onClick={() => void chooseAdapter().then((result) => { if (!result.ok) reportError(result.message); })}>
                 <PlusIcon />
               </button>
             ) : null}
             <button
               className="icon-button"
-              title={api.host.desktop ? "Refresh adapters (F5)" : "Refresh adapters"}
-              aria-label="Refresh adapters"
+              title={api.host.desktop ? "Refresh Adapters (F5)" : "Refresh Adapters"}
+              aria-label="Refresh Adapters"
               onClick={() => void act({ type: "adapters.refresh" })}
             >
               <RefreshIcon />
@@ -187,7 +187,7 @@ export function Sidebar({
             </button>
           );
         })}
-        {state.adapters.length === 0 ? <p className="side-empty">None found</p> : null}
+        {state.adapters.length === 0 ? <p className="side-empty">None Found</p> : null}
         {menuAdapter ? (
           <AdapterMenu key={menu.id} adapter={menuAdapter} x={menu.x} y={menu.y} onRename={() => onRename(menu.id)} onClose={() => setMenu(null)} />
         ) : null}

@@ -100,8 +100,8 @@ pub enum Action {
     Unblock,
     Remove,
     Hide,
-    /// Toggles listing nearby devices with neither a name nor a known kind.
-    ShowUnnamed,
+    /// Lists nearby devices with neither a name nor a known kind, or not.
+    ShowUnnamed(bool),
     Hidpp(bool),
     Platform(HostPlatform),
     Rename,
@@ -111,18 +111,25 @@ pub enum Action {
     SettingsBack,
     SettingsReload,
     SettingsRefresh,
-    SettingsApply,
-    SettingsHidppOn,
     Category(&'static str),
     Setting(SettingKey),
     Draft(SettingKey, SettingValue),
-    /// SmartShift's automatic switching, separate from Min and Max, which
-    /// can set the same values, so each control has one highlight.
+    /// SmartShift On or Off, separate from Min and Max, which can set the
+    /// same values, so each control has one highlight.
     Switch(SettingKey, SettingValue),
     Step(SettingKey, i64),
-    CancelDraft(SettingKey),
-    Save(SettingKey),
-    Default(SettingKey),
+    /// Drops the setting's staged change.
+    Undo(SettingKey),
+    /// Stages saving the value the device reports.
+    Keep(SettingKey),
+    /// Stages forgetting the saved value.
+    Forget(SettingKey),
+    /// Sends every staged change of the page's device, one at a time.
+    SaveAll,
+    /// Drops every staged change of the page's device.
+    Discard,
+    /// Sends again the values of the latest Save that were saved but didn't apply.
+    RetrySave,
     FilesOpen,
     FilesClose,
     FilesUp,
@@ -154,8 +161,8 @@ pub(super) struct Job {
     command: Command,
     /// A pairing answer; its error belongs in the prompt.
     answer: bool,
-    /// A settings page Save or Default: the draft it sent, Null for none.
-    sent: Option<SettingValue>,
+    /// One change sent by the settings page's Save queue.
+    save: bool,
     /// Loads the settings page's snapshot.
     load: bool,
 }
@@ -164,7 +171,7 @@ impl Job {
         Self {
             command,
             answer: false,
-            sent: None,
+            save: false,
             load: false,
         }
     }
@@ -333,7 +340,7 @@ impl<B: Backend> Model<B> {
     }
 
     /// Deselects a nearby device the unnamed filter now hides, such as after
-    /// unchecking Show unnamed devices or once its pairing ends, so no
+    /// turning Show Unnamed Devices off or once its pairing ends, so no
     /// details or actions stay for it.
     pub(super) fn drop_hidden_selection(&mut self) {
         let (Some(all), Some(st)) = (self.full_state(), self.state()) else {
@@ -531,12 +538,14 @@ impl<B: Backend> Model<B> {
             }
         }
         self.sync_settings();
+        self.sync_saves();
     }
 
-    /// A timer tick: prompts expire and spinners advance.
+    /// A timer tick: prompts expire, spinners advance and Save waits time out.
     pub(crate) fn tick(&mut self) {
         self.sync_auth();
         self.sync_settings();
+        self.sync_saves();
     }
 
     fn ports_listed(&mut self, result: Result<Vec<PortInfo>, String>) {
@@ -667,11 +676,11 @@ impl<B: Backend> Model<B> {
             return;
         }
         if job.load {
-            self.page.loading = false;
-            if let Command::Settings(id) = &job.command
-                && *id == self.page.device
-            {
-                self.page.load_err = result.err().map(|f| f.error);
+            if let Command::Settings(id) = &job.command {
+                self.page.loading.remove(id);
+                if *id == self.page.device {
+                    self.page.load_err = result.err().map(|f| f.error);
+                }
             }
             return;
         }
@@ -944,8 +953,9 @@ impl<B: Backend> Model<B> {
                 let (Some(d), _) = Self::find(&st, &self.selected) else {
                     return;
                 };
-                // Nothing is sent for the saved value or while a change is pending.
-                if pending_for(&st, "device.hidpp.set", &d.device_id.0).is_some()
+                // Nothing is sent for the saved value, or while a change is
+                // pending or the device's settings work runs.
+                if !settings::settings_busy(&st, d, self.saving(&d.device_id.0)).is_empty()
                     || st.current && d.hidpp_enabled == on
                 {
                     return;
@@ -1007,8 +1017,8 @@ impl<B: Backend> Model<B> {
             | Action::Unblock
             | Action::Remove
             | Action::Hide => self.device_command(action, st.as_ref()),
-            Action::ShowUnnamed => {
-                self.show_unnamed = !self.show_unnamed;
+            Action::ShowUnnamed(on) => {
+                self.show_unnamed = on;
                 self.drop_hidden_selection();
                 // The checkbox keeps the highlight across the selection change.
                 self.focus_ctx = self.focus_context();
@@ -1156,15 +1166,23 @@ impl<B: Backend> Model<B> {
             Action::Bootloader => Command::Bootloader,
             Action::SettingsReload => Command::Settings(page()),
             Action::SettingsRefresh => Command::SettingsRefresh(page()),
-            Action::SettingsApply => Command::SettingsApply(page()),
-            Action::SettingsHidppOn => Command::Hidpp(page(), true),
             Action::Draft(key, _)
             | Action::Switch(key, _)
             | Action::Step(key, _)
-            | Action::Save(key) => {
+            | Action::Keep(key) => {
                 Command::SettingSet(page(), *key, SettingInput::Value(SettingValue::Null))
             }
-            Action::Default(key) => Command::SettingForget(page(), *key),
+            Action::Forget(key) => Command::SettingForget(page(), *key),
+            // Save sends sets and forgets; either is enough for what is staged.
+            Action::SaveAll | Action::RetrySave => {
+                return Command::SettingSet(
+                    page(),
+                    SettingKey::WheelMode,
+                    SettingInput::Value(SettingValue::Null),
+                )
+                .supported(st)
+                    || Command::SettingForget(page(), SettingKey::WheelMode).supported(st);
+            }
             Action::FilesOpen | Action::FilesUp | Action::FilesRefresh | Action::FilesEntry(_) => {
                 Command::StorageList("/".into())
             }

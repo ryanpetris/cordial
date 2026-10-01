@@ -34,7 +34,7 @@ function Rename({ adapter, busy, error, onRename, onDone }: {
       {error ? <p className="dialog-body error-text">{error}</p> : null}
       <footer className="dialog-footer">
         <button type="button" disabled={busy || !available} onClick={() => void onRename(null)}>
-          Reset to default
+          Reset to Default
         </button>
         <button type="button" disabled={busy} onClick={onDone}>
           Cancel
@@ -190,12 +190,12 @@ export function AdapterPage({
         </Card>
       ) : null}
 
-      {connected && s && (s.capacity.enabled.length || s.capacity.pairing.length) ? (
-        <Card title="Capacity">
+      {connected && s && s.capacity.enabled.length ? (
+        <Card title="Active Devices">
           {s.capacity.enabled.map((c) => (
             <div key={c.transports.join()} className="row meter-row">
               <div className="meter-line">
-                <span>Active {c.transports.map((t) => TRANSPORTS[t]).join(" + ")}</span>
+                <span>Bluetooth</span>
                 <span className="value">
                   {c.enabled} of {c.limit}
                 </span>
@@ -203,15 +203,18 @@ export function AdapterPage({
               <Meter fraction={c.limit ? c.enabled / c.limit : 0} />
             </div>
           ))}
-          {s.capacity.pairing.length ? (
-            <Facts>
-              {s.capacity.pairing.map((p) => (
-                <Fact key={p.transport} label={`Room for ${TRANSPORTS[p.transport]}`}>
-                  {p.available ? `About ${p.estimated_additional} more` : p.reason ? PAIR_UNAVAILABLE[p.reason] : "Unavailable"}
-                </Fact>
-              ))}
-            </Facts>
-          ) : null}
+        </Card>
+      ) : null}
+
+      {connected && s && s.capacity.pairing.length ? (
+        <Card title="New Pairings">
+          <Facts>
+            {s.capacity.pairing.map((p) => (
+              <Fact key={p.transport} label={TRANSPORTS[p.transport]}>
+                {!p.available ? (p.reason ? PAIR_UNAVAILABLE[p.reason] : "Unavailable") : p.estimated_additional > 0 ? `About ${p.estimated_additional} More` : "Available"}
+              </Fact>
+            ))}
+          </Facts>
         </Card>
       ) : null}
 
@@ -223,8 +226,8 @@ export function AdapterPage({
             </Fact>
             <Fact label="Board">{s.hardware_config}</Fact>
             <Fact label="Adapter ID">{s.adapter_id}</Fact>
-            <Fact label="Bluetooth">{s.radio_ready ? "Ready" : "Not ready"}</Fact>
-            <Fact label="Storage">{s.storage_ready ? "Ready" : "Not ready"}</Fact>
+            <Fact label="Bluetooth">{s.radio_ready ? "Ready" : "Not Ready"}</Fact>
+            <Fact label="Storage">{s.storage_ready ? "Ready" : "Not Ready"}</Fact>
           </Facts>
         </Card>
       ) : null}

@@ -9,6 +9,7 @@ import {
   type HostPlatform,
   type InfoField,
   type Prompt,
+  type Setting,
   type SettingsSummary,
 } from "../protocol/types.ts";
 import {
@@ -23,8 +24,10 @@ import {
   type Preferences,
   type ScanState,
   type SettingsResult,
+  type SettingsChange,
+  type SettingsSave,
 } from "../shared/state.ts";
-import { hidppBusy, settingsBusy, settingsLive } from "../shared/settings.ts";
+import { settingsBusy, settingsLive } from "../shared/settings.ts";
 import { DISABLED, clean, codeText, errorText } from "../shared/text.ts";
 import { BatteryAlerts, CRITICAL_PERCENT, type Alert } from "./battery.ts";
 import { AdapterManager, type ManagerDeps } from "./manager.ts";
@@ -41,6 +44,8 @@ export interface ControllerDeps extends Omit<ManagerDeps, "changed"> {
 }
 
 const PUBLISH_MS = 30;
+// A hardware job has 90 seconds, followed by the session's heartbeat allowance.
+const SETTINGS_WAIT_MS = 105_000;
 
 const message = (error: unknown) =>
   error instanceof AdapterError
@@ -79,6 +84,7 @@ export class Controller {
   readonly #deps: ControllerDeps;
   #preferences: Preferences;
   readonly #settingsResults = new Map<string, { result: SettingsResult; session: AdapterSession; state: Device["state"] }>();
+  readonly #settingsSaves = new Map<string, { save: SettingsSave; session: AdapterSession }>();
   #scan: (ScanState & { requestId: number; session: AdapterSession; done: Promise<void> }) | null = null;
   #pairing: (PairingState & { requestId: number; session: AdapterSession; dismissed: boolean; done: Promise<void> }) | null =
     null;
@@ -175,6 +181,8 @@ export class Controller {
     devices.sort((a, b) => a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
     const keys = new Set(devices.map((d) => d.key));
     for (const key of this.#settingsResults.keys()) if (!keys.has(key)) this.#settingsResults.delete(key);
+    for (const [key, saved] of this.#settingsSaves)
+      if (!keys.has(key) || this.#target(key)?.session !== saved.session) this.#settingsSaves.delete(key);
     // Discovery and pairing end with their adapter's session.
     const live = (s: AdapterSession) => [...this.manager.connected.values()].some((c) => c.session === s);
     if (this.#scan && !live(this.#scan.session)) this.#scan = null;
@@ -223,6 +231,7 @@ export class Controller {
       pending: session.pendingFor(device.device_id),
       infoError: session.view.infoError(device.device_id),
       settings: settings ? { ...settings, result: this.#settingsResults.get(key)?.result ?? null } : null,
+      settingsSave: this.#settingsSaves.get(key)?.session === session ? this.#settingsSaves.get(key)!.save : null,
     };
   }
 
@@ -237,6 +246,169 @@ export class Controller {
     const session = this.#session(key.slice(0, slash));
     const id = key.slice(slash + 1);
     return session && session.view.devices.has(id) ? { session, id } : null;
+  }
+
+  /** Keeps an active submission observable when the window changes pages. */
+  #watchSettings() {
+    for (const { id, session } of this.manager.connected.values()) {
+      const watched = new Set<string>();
+      if (this.#watched?.startsWith(`${id}/`)) watched.add(this.#watched.slice(id.length + 1));
+      for (const [key, submission] of this.#settingsSaves)
+        if (submission.session === session && submission.save.running) watched.add(key.slice(id.length + 1));
+      session.watchSettings(watched);
+    }
+  }
+
+  /** Waits for this session's hardware work and, when supplied, a saved key's outcome. */
+  async #settleSettings(key: string, session: AdapterSession, id: string, change?: Extract<SettingsChange, { type: "set" }>): Promise<Setting | null> {
+    const deadline = Date.now() + SETTINGS_WAIT_MS;
+    for (;;) {
+      if (session.closed || this.#target(key)?.session !== session)
+        throw new Error("The adapter disconnected before the settings finished.");
+      const device = session.view.devices.get(id)!;
+      if (change && device.state !== "connected") throw new Error("The device disconnected before the setting applied.");
+      if (change && !device.hidpp_enabled) throw new Error("Logitech Features were turned off before the setting applied.");
+      if (session.view.valid && !settingsBusy({ device, pending: session.pendingFor(id) })) {
+        if (!change) return null;
+        const settings = session.view.settings(id);
+        if (settings?.loadError) throw new Error(settings.loadError);
+        if (settings?.current) {
+          const setting = settings.settings.find((s) => s.key === change.setting);
+          if (!setting || !setting.managed || setting.desired !== change.value)
+            throw new Error("The saved preference changed before its application was confirmed.");
+          if (!["pending", "applying"].includes(setting.state)) return setting;
+        }
+      }
+      if (Date.now() >= deadline) {
+        session.resync();
+        session.reloadSettings(id);
+        throw new Error("The device did not confirm the setting in time.");
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  async #saveSettings(key: string, changes: SettingsChange[]): Promise<ActionResult> {
+    const target = this.#target(key);
+    if (!target) return { ok: false, message: "That device or adapter is no longer available." };
+    const { session, id } = target;
+    const startedConnected = session.view.devices.get(id)!.state === "connected";
+    if (settingsBusy(this.#device(session.adapterId, session, session.view.devices.get(id)!)))
+      return { ok: false, message: codeText("busy") };
+    if (!changes.length || new Set(changes.map((c) => c.setting)).size !== changes.length)
+      return { ok: false, message: "There are no distinct settings changes to save." };
+    if (changes.length > session.status.limits.hidpp_settings)
+      return { ok: false, message: "There are too many settings changes to save." };
+    const ordered = [...changes];
+    const modeIndex = ordered.findIndex((c) => c.setting === "backlight.mode");
+    const levelIndex = ordered.findIndex((c) => c.setting === "backlight.level");
+    if (modeIndex >= 0 && levelIndex >= 0 && levelIndex < modeIndex) {
+      const [level] = ordered.splice(levelIndex, 1);
+      ordered.splice(ordered.findIndex((c) => c.setting === "backlight.mode") + 1, 0, level!);
+    }
+    const items: SettingsSave["items"] = ordered.map((change) => ({ change, status: "pending", error: null }));
+    const previous = this.#settingsSaves.get(key);
+    const settings = session.view.settings(id);
+    const retained = previous?.session === session ? previous.save.items.filter((item) => {
+      if (item.status !== "not_applied" || item.change.type !== "set" || ordered.some((c) => c.setting === item.change.setting)) return false;
+      const setting = settings?.settings.find((s) => s.key === item.change.setting);
+      if (!settings?.current || !setting) return true;
+      return setting.managed && setting.desired === item.change.value
+        && !(setting.state === "applied" && setting.fresh && setting.observed === item.change.value);
+    }) : [];
+    const save: SettingsSave = { running: true, items: [...items, ...retained] };
+    this.#settingsResults.delete(key);
+    this.#settingsSaves.set(key, { save, session });
+    this.#watchSettings();
+    this.#publish();
+    let stopped: string | null = null;
+    try {
+      saving: for (const item of items) {
+        const { change } = item;
+        const device = session.view.devices.get(id);
+        if (session.closed || this.#target(key)?.session !== session || !device) {
+          stopped = "The adapter disconnected before the settings finished.";
+          break;
+        }
+        if (device.state !== "connected" && (startedConnected || change.type === "set")) {
+          item.status = "not_sent";
+          item.error = codeText("not_connected");
+          if (startedConnected) {
+            stopped = item.error;
+            break;
+          }
+          continue;
+        }
+        item.status = "saving";
+        this.#publish();
+        let stored = false;
+        try {
+          let row;
+          for (let attempt = 0; ; attempt++) {
+            await this.#settleSettings(key, session, id);
+            const current = session.view.devices.get(id)!;
+            if (startedConnected && current.state !== "connected") {
+              item.status = "not_sent";
+              item.error = stopped = codeText("not_connected");
+              break saving;
+            }
+            if (change.type === "set" && change.setting === "backlight.level" && current.hidpp_enabled) {
+              const mode = session.view.settings(id)?.settings.find((s) => s.key === "backlight.mode");
+              const modeChange = items.find((i) => i.change.setting === "backlight.mode");
+              if ((modeChange?.change.type === "set" && ["not_saved", "not_applied", "not_sent"].includes(modeChange.status))
+                || (mode && (!mode.fresh || mode.observed !== "permanent_manual"))) {
+                item.status = "not_sent";
+                item.error = codeText("backlight_permanent_manual_required");
+                continue saving;
+              }
+            }
+            try {
+              row = change.type === "set"
+                ? await session.request("hidpp.setting.set", { device_id: id, key: change.setting, value: change.value }, { timeoutMs: SETTINGS_WAIT_MS })
+                : await session.request("hidpp.setting.forget", { device_id: id, key: change.setting }, { timeoutMs: SETTINGS_WAIT_MS });
+              break;
+            } catch (error) {
+              if (attempt || !(error instanceof AdapterError) || error.wire.code !== "busy") throw error;
+            }
+          }
+          stored = true;
+          session.view.putSetting(id, row.revision, row.setting);
+          item.status = "saved";
+          this.#publish();
+          if (change.type === "set" && session.view.devices.get(id)?.hidpp_enabled) {
+            session.reloadSettings(id);
+            const setting = await this.#settleSettings(key, session, id, change);
+            if (setting?.state === "applied" && setting.fresh && setting.observed === change.value) item.status = "applied";
+            else {
+              item.status = "not_applied";
+              item.error = setting?.error ? codeText(setting.error) : "The device did not confirm the saved value.";
+            }
+          }
+        } catch (error) {
+          item.status = stored ? "not_applied" : "not_saved";
+          item.error = error instanceof AdapterError ? message(error) : (error as Error).message;
+          const current = session.view.devices.get(id);
+          if (stored || session.closed || this.#target(key)?.session !== session || !current || current.state !== "connected"
+            || !session.view.valid || session.view.settings(id)?.loadError
+            || settingsBusy({ device: current, pending: session.pendingFor(id) })) {
+            stopped = item.error;
+            break;
+          }
+        }
+        this.changed();
+      }
+      if (stopped)
+        for (const item of save.items) if (item.status === "pending") { item.status = "not_sent"; item.error = stopped; }
+    } finally {
+      save.running = false;
+      this.#watchSettings();
+      session.mutated();
+      this.#publish();
+    }
+    const incomplete = save.items.find((i) => ["not_saved", "not_applied", "not_sent"].includes(i.status));
+    return incomplete
+      ? { ok: false, message: incomplete.error ?? "Some settings did not finish.", inline: true, settingsSave: save }
+      : { ok: true, settingsSave: save };
   }
 
   async act(action: Action): Promise<ActionResult> {
@@ -316,7 +488,8 @@ export class Controller {
         case "device.hidpp": {
           const t = this.#target(action.key);
           if (!t) return gone;
-          if (action.type === "device.hidpp" && hidppBusy(this.#device(t.session.adapterId, t.session, t.session.view.devices.get(t.id)!)))
+          if (action.type === "device.hidpp"
+            && settingsBusy(this.#device(t.session.adapterId, t.session, t.session.view.devices.get(t.id)!)))
             return { ok: false, message: codeText("busy") };
           if (action.type === "device.enabled")
             await t.session.request("device.enabled.set", { device_id: t.id, enabled: action.value });
@@ -343,12 +516,11 @@ export class Controller {
           this.#publish();
           return { ok: true };
         }
+        case "settings.save":
+          return await this.#saveSettings(action.key, action.changes);
         case "settings.watch": {
           this.#watched = action.key;
-          for (const { id, session } of this.manager.connected.values()) {
-            const t = action.key?.startsWith(`${id}/`) ? action.key.slice(id.length + 1) : null;
-            session.watchSettings(t ? [t] : []);
-          }
+          this.#watchSettings();
           this.changed();
           return { ok: true };
         }

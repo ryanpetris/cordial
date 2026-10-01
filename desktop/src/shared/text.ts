@@ -20,7 +20,7 @@ import type {
   WarningCode,
   WireError,
 } from "../protocol/types.ts";
-import type { AdapterEntry, Battery, DeviceEntry, SettingsResult } from "./state.ts";
+import type { AdapterEntry, Battery, DeviceEntry } from "./state.ts";
 
 const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
@@ -102,12 +102,12 @@ export function errorText(error: WireError): string {
 export const codeText = (code: ErrorCode) => sentence(ERRORS[code]);
 
 export const PAIR_UNAVAILABLE: Record<PairUnavailable, string> = {
-  storage_full: "Adapter storage is full — forget an unused device to add more.",
-  setup_capacity: "The adapter's Bluetooth stack has no pairing place available.",
-  connections_full: "Every connection is in use — disconnect a device first.",
-  pairing_active: "Another pairing is in progress.",
-  radio_unavailable: "Bluetooth on the adapter isn't ready.",
-  storage_unavailable: "Adapter storage isn't ready.",
+  storage_full: "Storage Full",
+  setup_capacity: "No Pairing Slot",
+  connections_full: "All Connections in Use",
+  pairing_active: "Pairing in Progress",
+  radio_unavailable: "Bluetooth Not Ready",
+  storage_unavailable: "Storage Not Ready",
 };
 
 export const DISABLED: Record<DisabledReason, string> = {
@@ -133,29 +133,30 @@ export const WARNINGS: Record<WarningCode, string> = {
 
 export const NORMALIZATION: Record<NormalizationState, string> = {
   off: "Off",
-  pending: "Waiting for the device to connect",
-  probing: "Checking the device",
+  pending: "Waiting to Connect",
+  probing: "Checking",
   resetting: "Resetting",
-  configuring: "Setting up",
+  configuring: "Setting Up",
   active: "Active",
-  unsupported: "Not supported by this device",
+  unsupported: "Unsupported",
   error: "Failed",
 };
 
+/** A saved setting's state as its marker names it. */
 export const SETTING_STATES: Record<SettingState, string> = {
-  unmanaged: "Default",
-  pending: "Waiting to apply",
-  applying: "Applying…",
-  applied: "Applied",
-  changed_on_device: "Changed on device",
-  unsupported: "Unsupported now",
+  unmanaged: "Not Saved",
+  pending: "Saved",
+  applying: "Saved",
+  applied: "Saved",
+  changed_on_device: "Changed on Device",
+  unsupported: "Can't Apply Now",
   error: "Failed",
   uncertain: "Unconfirmed",
 };
 
 export const PLATFORMS: Record<HostPlatform, string> = { linux: "Linux", windows: "Windows", mac: "Mac" };
 export const TRANSPORTS: Record<Transport, string> = { ble: "Bluetooth LE", classic: "Bluetooth Classic" };
-export const ROLES: Record<Role, string> = { keyboard: "Keyboard", mouse: "Mouse", consumer_control: "Media keys" };
+export const ROLES: Record<Role, string> = { keyboard: "Keyboard", mouse: "Mouse", consumer_control: "Media Keys" };
 
 export const INFO_LABELS: Record<InfoKey, string> = {
   name: "Reported Name",
@@ -177,7 +178,7 @@ export const INFO_LABELS: Record<InfoKey, string> = {
 const KINDS: Record<DeviceEntry["kind"], string> = {
   keyboard: "Keyboard",
   mouse: "Mouse",
-  keyboard_mouse: "Keyboard and mouse",
+  keyboard_mouse: "Keyboard and Mouse",
   other: "Other",
 };
 
@@ -210,7 +211,6 @@ export function infoValue(f: InfoField): string | null {
 export interface SettingInfo {
   label: string;
   category: string;
-  note?: string;
   unit?: string;
   choices?: Record<string, string>;
 }
@@ -218,9 +218,9 @@ export interface SettingInfo {
 /** Recognized settings in display order; categories follow first use. */
 export const SETTINGS: Record<SettingKey, SettingInfo> = {
   "fn.row_default": {
-    label: "Function Row Default",
+    label: "Function Row",
     category: "Keyboard",
-    choices: { function_keys: "Function keys (F1–F12)", special_actions: "Special actions" },
+    choices: { function_keys: "F1-F12", special_actions: "Shortcuts" },
   },
   "backlight.enabled": { label: "Backlight", category: "Backlight" },
   "backlight.mode": { label: "Backlight Mode", category: "Backlight" },
@@ -229,23 +229,19 @@ export const SETTINGS: Record<SettingKey, SettingInfo> = {
   "backlight.status": {
     label: "Backlight Status",
     category: "Backlight",
-    choices: { battery: "Off (battery)", saturated: "Automatic (saturated)" },
+    choices: { battery: "Off (Battery)", saturated: "Automatic (Saturated)" },
   },
   "backlight.effect": { label: "Backlight Effect", category: "Backlight" },
   "backlight.delay.hands_out": { label: "Timeout With Hands Away", category: "Backlight", unit: "s" },
   "backlight.delay.hands_in": { label: "Timeout With Hands Nearby", category: "Backlight", unit: "s" },
-  "backlight.delay.powered": { label: "Timeout While Charging", category: "Backlight", unit: "s" },
+  "backlight.delay.powered": { label: "Timeout While Plugged In", category: "Backlight", unit: "s" },
   "backlight.power_on": { label: "Backlight at Power-On", category: "Backlight" },
   "backlight.crown": { label: "Crown Backlight", category: "Backlight" },
   "backlight.power_save": { label: "Backlight Power Saving", category: "Backlight" },
   "pointer.dpi.0": { label: "Pointer Speed", category: "Pointer", unit: "DPI" },
   "pointer.dpi.1": { label: "Second Sensor Speed", category: "Pointer", unit: "DPI" },
   "wheel.mode": { label: "Wheel Mode", category: "Wheel" },
-  "wheel.threshold": {
-    label: "SmartShift Threshold",
-    category: "Wheel",
-    note: "255 turns automatic switching to ratchet mode off.",
-  },
+  "wheel.threshold": { label: "SmartShift", category: "Wheel" },
   "wheel.invert": { label: "Reverse Vertical Scrolling", category: "Wheel" },
   "wheel.info": { label: "Wheel Capabilities", category: "Wheel" },
   "thumbwheel.invert": { label: "Reverse Horizontal Scrolling", category: "Wheel" },
@@ -254,9 +250,12 @@ export const SETTINGS: Record<SettingKey, SettingInfo> = {
 const ORDER = Object.keys(SETTINGS) as SettingKey[];
 export const settingOrder = (key: SettingKey) => ORDER.indexOf(key);
 
-/** An enum token in words: the catalog's wording, else the capitalized token. */
+/** Capitalizes each word: "permanent manual" becomes "Permanent Manual". */
+const titleCase = (s: string) => s.replace(/(^|\s)(\p{Ll})/gu, (_, space: string, c: string) => space + c.toUpperCase());
+
+/** An enum token in words: the catalog's wording, else the token in title case. */
 export function choiceText(key: SettingKey, token: string): string {
-  return SETTINGS[key].choices?.[token] ?? sentence(token.replace(/[_-]/g, " "));
+  return SETTINGS[key].choices?.[token] ?? titleCase(token.replace(/[_-]/g, " "));
 }
 
 /** Decodes the lowercase-hex `wheel.info` readout into labelled facts; null when undocumented. */
@@ -281,12 +280,12 @@ export function wheelInfo(value: SettingValue, featureVersion: number): [string,
 }
 
 export function securityFacts(s: ConnectionSecurity): [string, string][] {
-  const flag = (v: boolean | null | undefined) => (v == null ? "Not reported" : v ? "Yes" : "No");
+  const flag = (v: boolean | null | undefined) => (v == null ? "Not Reported" : v ? "Yes" : "No");
   return [
     ["Encrypted", flag(s.encrypted)],
     ["Authenticated Pairing", flag(s.authenticated)],
     ["Secure Connections", flag(s.secure_connections)],
-    ["Encryption Key", s.key_size == null ? "Not reported" : `${s.key_size * 8}-bit`],
+    ["Encryption Key", s.key_size == null ? "Not Reported" : `${s.key_size * 8}-bit`],
     ["Saved Pairing", flag(s.bonded)],
   ];
 }
@@ -303,31 +302,9 @@ export function batteryText(b: Battery | null): string | null {
 /** Whether the shown battery reading is only last known. */
 export const batteryStale = (b: Battery) => (b.percent != null && !b.percentFresh) || (b.charging != null && !b.chargingFresh);
 
-/** A Refresh or Apply outcome: the counts that occurred, and always the main one. */
-export function settingsResultText(r: SettingsResult): string {
-  const c = r.counts;
-  if (!c) return r.error ?? "";
-  const apply = r.kind === "apply";
-  const counts: [string, number][] = [
-    ["read", c.read],
-    ["applied", c.applied],
-    ["unchanged", c.unchanged],
-    ["unsupported", c.unsupported],
-    ["failed", c.failed],
-    ["uncertain", c.uncertain],
-  ];
-  const summary = sentence(
-    counts
-      .filter(([o, n]) => n > 0 || (o === "applied" && apply) || (o === "read" && !apply))
-      .map(([o, n]) => `${n} ${o}`)
-      .join(", "),
-  );
-  return r.error ? `${r.error} (${summary})` : summary;
-}
-
 /** The device's state in a few words, as lists show it. */
 export function deviceStatus(d: DeviceEntry["device"]): string {
-  if (d.pairing_state === "needs_pairing") return "Needs pairing";
+  if (d.pairing_state === "needs_pairing") return "Needs Pairing";
   if (d.blocked) return "Blocked";
   switch (d.state) {
     case "connected":
@@ -337,7 +314,7 @@ export function deviceStatus(d: DeviceEntry["device"]): string {
     case "disconnecting":
       return "Disconnecting…";
     default:
-      return d.effective_enabled ? "Not connected" : d.enabled ? "Inactive" : "Turned off";
+      return d.effective_enabled ? "Disconnected" : d.enabled ? "Inactive" : "Disabled";
   }
 }
 
@@ -345,9 +322,9 @@ export function deviceStatus(d: DeviceEntry["device"]): string {
 export function adapterStatus(a: AdapterEntry): { text: string; warn: boolean } {
   if (a.connection === "disconnected") return { text: "Disconnected", warn: false };
   if (a.connection === "connecting") return { text: "Connecting…", warn: false };
-  if (a.readiness === "failed") return { text: "Not ready", warn: true };
+  if (a.readiness === "failed") return { text: "Not Ready", warn: true };
   if (a.readiness === "waiting") return { text: "Starting…", warn: false };
-  return a.attention.length ? { text: "Needs attention", warn: true } : { text: "Ready", warn: false };
+  return a.attention.length ? { text: "Needs Attention", warn: true } : { text: "Ready", warn: false };
 }
 
 /** Removes control and format characters (including bidirectional

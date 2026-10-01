@@ -3,7 +3,7 @@ import type { Candidate } from "../../protocol/types.ts";
 import type { AppState, PairingPrompt } from "../../shared/state.ts";
 import { PAIR_UNAVAILABLE, TRANSPORTS, clean } from "../../shared/text.ts";
 import { act, useAction } from "../api.ts";
-import { Banner, Dialog, Spinner } from "./common.tsx";
+import { Banner, Dialog, Spinner, Switch } from "./common.tsx";
 import { CheckIcon, DeviceIcon, WarningIcon } from "./icons.tsx";
 
 const kindOf = (c: Candidate) => (c.kind === "unknown" ? "other" : c.kind);
@@ -61,10 +61,10 @@ function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
         {problem}
         <div className="actions center">
           <button disabled={busy} onClick={() => void reply(false)}>
-            No, It's Different
+            Codes Differ
           </button>
           <button className="suggested" disabled={busy} onClick={() => void reply(true)}>
-            Yes, It Matches
+            Codes Match
           </button>
         </div>
       </div>
@@ -271,12 +271,12 @@ export function AddDevice({
               <li key={c.candidate_id} className="candidate">
                 <DeviceIcon kind={kindOf(c)} />
                 <span className="side-text">
-                  <span className="side-title">{clean(c.name ?? "") || "Unnamed device"}</span>
+                  <span className="side-title">{clean(c.name ?? "") || "Unnamed Device"}</span>
                   <span className="side-subtitle">{TRANSPORTS[c.transport]}</span>
                 </span>
                 <Signal rssi={c.rssi} />
                 {a && !a.available ? (
-                  <span className="muted small">{a.reason ? PAIR_UNAVAILABLE[a.reason] : "Can't add now"}</span>
+                  <span className="muted small">{a.reason ? PAIR_UNAVAILABLE[a.reason] : "Can't Add Now"}</span>
                 ) : (
                   <button className="suggested" onClick={() => chosen && void attempt({ type: "pair.start", adapterId: chosen.id, candidateId: c.candidate_id })}>
                     Pair
@@ -287,14 +287,17 @@ export function AddDevice({
           })}
           {candidates.length === 0 ? (
             <li className="candidate empty-row">
-              {scan?.running ? "Looking for devices in pairing mode…" : "No devices found"}
+              {scan?.running ? "Looking for devices in pairing mode…" : "No Devices Found"}
             </li>
           ) : null}
         </ul>
-        <label className="check">
-          <input type="checkbox" checked={unnamed} onChange={(e) => setUnnamed(e.target.checked)} /> Show unnamed devices
-          {hiddenCount > 0 && !unnamed ? <span className="muted"> ({hiddenCount} hidden)</span> : null}
-        </label>
+        <div className="check">
+          <span>
+            Show Unnamed Devices
+            {hiddenCount > 0 && !unnamed ? <span className="muted"> ({hiddenCount} hidden)</span> : null}
+          </span>
+          <Switch label="Show Unnamed Devices" checked={unnamed} onChange={setUnnamed} />
+        </div>
         <footer className="dialog-footer">
           <button onClick={close}>Cancel</button>
         </footer>

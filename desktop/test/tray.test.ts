@@ -65,6 +65,7 @@ describe("trayModel", () => {
   it("groups devices by adapter only with several adapters", () => {
     const one = trayModel(app([adapter("A")], [entry("A", "d_1")]));
     expect(one.groups.map((g) => g.title)).toEqual([null]);
+    expect(one.groups[0]!.devices[0]!.label).toBe("d_1 — Disconnected");
     const two = trayModel(app([adapter("A"), adapter("B")], [entry("A", "d_1"), entry("B", "d_1")]));
     expect(two.groups.map((g) => [g.title, g.devices.length])).toEqual([
       ["Adapter A", 1],

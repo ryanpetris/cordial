@@ -4,6 +4,7 @@ import { adapterName } from "../shared/adapter-name.ts";
 import type {
   Candidate,
   Device,
+  ErrorCode,
   HostPlatform,
   InfoField,
   InfoKey,
@@ -33,6 +34,8 @@ export interface FakeOptions {
   readyError?: string;
   /** Milliseconds before each reply. */
   latency?: number;
+  /** Milliseconds between saving a setting and finishing its hardware job. */
+  settingJobMs?: number;
 }
 
 export function device(id: string, patch: Partial<Device> = {}): Device {
@@ -234,10 +237,13 @@ export class FakeAdapter implements Transport {
   received: Json[] = [];
   /** Error codes to answer the next requests of a command with, in order. */
   failures: Record<string, string[]> = {};
+  /** Hardware failures after a setting has already been saved. */
+  settingFailures: Partial<Record<Setting["key"], ErrorCode>> = {};
   /** Input from an earlier session delivered right after the next open. */
   staleInput: string | null = null;
   readonly #readyError: string | undefined;
   readonly #latency: number;
+  readonly #settingJobMs: number;
   #data: ((chunk: Uint8Array) => void)[] = [];
   #close: ((error: Error | null) => void)[] = [];
   #session = 0;
@@ -258,6 +264,7 @@ export class FakeAdapter implements Transport {
     this.capabilities = options.capabilities ?? ["classic", "ble"];
     this.#readyError = options.readyError;
     this.#latency = options.latency ?? 0;
+    this.#settingJobMs = options.settingJobMs ?? 0;
   }
 
   // ---- Transport ----------------------------------------------------------
@@ -470,13 +477,31 @@ export class FakeAdapter implements Transport {
         if (i === -1) return this.#error(id, "not_found");
         const s = d.settings[i]!;
         if (!s.writable) return this.#error(id, "read_only");
+        if (d.device.settings_state === "applying") return this.#error(id, "busy");
+        if (m.cmd === "hidpp.setting.set" && d.device.state !== "connected") return this.#error(id, "not_connected");
+        const apply = m.cmd === "hidpp.setting.set" && d.device.hidpp_enabled;
         const next =
           m.cmd === "hidpp.setting.set"
-            ? { ...s, managed: true, desired: args.value as SettingValue, observed: args.value as SettingValue, state: "applied" as const }
+            ? { ...s, managed: true, desired: args.value as SettingValue, error: null,
+                ...(apply && !this.#settingJobMs ? { observed: args.value as SettingValue, state: "applied" as const } : { state: "pending" as const }) }
             : { ...s, managed: false, desired: null, state: "unmanaged" as const };
         d.settings[i] = next;
+        if (apply && this.#settingJobMs) this.changeDevice(d.device.device_id, { settings_state: "applying" });
         const revision = this.#bump();
         this.#ok(id, { revision, device_id: d.device.device_id, setting: next });
+        if (apply && this.#settingJobMs) {
+          const session = this.#session;
+          setTimeout(() => {
+            if (!this.#open || this.#session !== session || d.device.state !== "connected") return;
+            const error = this.settingFailures[next.key];
+            const applied = { ...next, error: error ?? null, state: error ? "error" as const : "applied" as const,
+              observed: error ? s.observed : next.desired, fresh: !error };
+            d.settings[i] = applied;
+            const revision = this.#bump();
+            if (this.monitor) this.#event("hidpp.setting.changed", { revision, device_id: d.device.device_id, setting: applied });
+            this.changeDevice(d.device.device_id, { settings_state: "ready", settings_revision: revision });
+          }, this.#settingJobMs);
+        }
         return;
       }
       case "hidpp.setting.refresh":

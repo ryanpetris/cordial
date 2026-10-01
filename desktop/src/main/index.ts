@@ -206,7 +206,7 @@ function trayMenu(model: TrayModel, state: AppState): Menu {
         ],
       });
   }
-  if (!anyDevices) items.push({ label: state.adapters.length ? "No saved devices" : "No adapter connected", enabled: false });
+  if (!anyDevices) items.push({ label: state.adapters.length ? "No Saved Devices" : "No Adapter Connected", enabled: false });
   items.push(
     { type: "separator" },
     {

@@ -333,14 +333,22 @@ impl Layout {
     /// A field whose value is picked by clicking one of its options. The
     /// chosen option is marked; options wrap under the first when narrow.
     pub fn choice(&mut self, key: &str, kw: usize, options: Vec<Choice>) {
+        self.choice_if(key, kw, options, true);
+    }
+    /// A choice drawn in place but dim and without click targets while it
+    /// is unavailable, so nothing moves when it becomes available again.
+    pub fn choice_if(&mut self, key: &str, kw: usize, options: Vec<Choice>, enabled: bool) {
         self.line(styled(pad_str(key, kw), dim()));
         let (mut y, mut x) = (self.lines.len() - 1, kw);
         for (i, o) in options.into_iter().enumerate() {
-            let (text, tone) = if o.chosen {
-                (format!("[● {}]", o.label), Tone::Chosen)
+            let (text, mut look) = if o.chosen {
+                (format!("[● {}]", o.label), Tone::Chosen.style())
             } else {
-                (format!("[○ {}]", o.label), Tone::Normal)
+                (format!("[○ {}]", o.label), Tone::Normal.style())
             };
+            if !enabled {
+                look = dim();
+            }
             let text = truncate_str(&text, self.width.saturating_sub(kw));
             let w = width(&text);
             if i > 0 && x + 1 + w > self.width {
@@ -351,14 +359,52 @@ impl Layout {
                 self.lines[y].spans.push(Span::raw(" "));
                 x += 1;
             }
-            self.lines[y].spans.push(span(text, tone.style()));
+            self.lines[y].spans.push(span(text, look));
+            if enabled {
+                self.hits.push(Hit {
+                    x,
+                    y,
+                    w,
+                    action: o.action,
+                });
+            }
+            x += w;
+        }
+    }
+    /// An On/Off toggle: one target that turns it over. An unknown value
+    /// shows as such, and the action turns it On.
+    pub fn toggle(&mut self, key: &str, kw: usize, on: Option<bool>, action: Action) {
+        self.toggle_if(key, kw, on, action, true);
+    }
+    /// A toggle drawn in place but dim and without a click target while it
+    /// is unavailable, like `choice_if`.
+    pub fn toggle_if(
+        &mut self,
+        key: &str,
+        kw: usize,
+        on: Option<bool>,
+        action: Action,
+        enabled: bool,
+    ) {
+        self.line(styled(pad_str(key, kw), dim()));
+        let (text, mut look) = match on {
+            Some(true) => ("[■ On]", Tone::Chosen.style()),
+            Some(false) => ("[□ Off]", Tone::Normal.style()),
+            None => ("[□ Unknown]", Tone::Normal.style()),
+        };
+        if !enabled {
+            look = dim();
+        }
+        let text = truncate_str(text, self.width.saturating_sub(kw));
+        let (y, w) = (self.lines.len() - 1, width(&text));
+        self.lines[y].spans.push(span(text, look));
+        if enabled {
             self.hits.push(Hit {
-                x,
+                x: kw,
                 y,
                 w,
-                action: o.action,
+                action,
             });
-            x += w;
         }
     }
     /// Indents every line and hit by one cell.

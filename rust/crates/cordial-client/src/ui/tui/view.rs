@@ -7,6 +7,7 @@ use super::{
         line_width, ok, pad, pad_str, span, spread, strip, styled, title, truncate, warn,
     },
     pending_for, scan_choices, scan_name,
+    settings::settings_busy,
 };
 use crate::{
     controller::{Auth, DeviceInfoView, State},
@@ -14,7 +15,7 @@ use crate::{
         Backend,
         text::{
             self, display, display_candidate_name, display_name, hidpp_error_text, platform_name,
-            role_names, transport_long, transport_name, warning_text, yes_no,
+            role_names, transport_long, transport_name, warning_text,
         },
     },
 };
@@ -47,12 +48,11 @@ pub(super) fn device_status(d: &Device) -> (&'static str, Style) {
         _ if d.state == ConnectionState::Connected => ("● Connected", ok()),
         _ if d.state == ConnectionState::Connecting => ("◌ Connecting", warn()),
         _ if d.state == ConnectionState::Disconnecting => ("◌ Disconnecting", warn()),
-        _ if d.pairing_state == PairingState::NeedsPairing => ("! Needs pairing", warn()),
-        _ if d.validation_error.is_some() => ("! Record error", err()),
+        _ if d.pairing_state == PairingState::NeedsPairing => ("! Needs Pairing", warn()),
+        _ if d.validation_error.is_some() => ("! Record Error", err()),
         _ if !d.transport_supported => ("! Unsupported", warn()),
         _ if !d.enabled => ("○ Disabled", dim()),
-        _ if !d.effective_enabled => ("! No free place", warn()),
-        _ if d.last_error.is_some() => ("✕ Failed", err()),
+        _ if !d.effective_enabled => ("! Inactive", warn()),
         _ => ("○ Disconnected", dim()),
     }
 }
@@ -67,20 +67,19 @@ struct Column {
 }
 
 impl Column {
-    const LABELS: [&str; 14] = [
+    const LABELS: [&str; 13] = [
         "Status",
         "Pairing",
         "Connect",
-        "Bluetooth",
         "Saved Record",
         "Security",
         "Type",
-        "Trusted",
-        "Blocked",
+        "Use This Device",
+        "Automatic Connections",
+        "Block Connections",
         "Reconnect",
-        "HID++",
+        "Logitech Features",
         "Warning",
-        "Last Error",
         "ID",
     ];
 
@@ -115,24 +114,36 @@ impl Column {
         }
         b.hang(prefix, value, look);
     }
-    fn choice(self, b: &mut Layout, label: &str, options: Vec<Choice>) {
+    /// An On/Off toggle that takes effect at once; `action` turns it over.
+    /// Drawn as a plain value when the adapter doesn't offer changing it.
+    fn toggle(self, b: &mut Layout, label: &str, on: bool, action: Option<Action>) {
+        self.toggle_if(b, label, on, action, true);
+    }
+    /// A toggle that stays in place, dim and without a target, while
+    /// `enabled` is false.
+    fn toggle_if(
+        self,
+        b: &mut Layout,
+        label: &str,
+        on: bool,
+        action: Option<Action>,
+        enabled: bool,
+    ) {
+        let Some(action) = action else {
+            self.field(b, label, if on { "On" } else { "Off" }, layout::plain());
+            return;
+        };
         if self.stacked {
             b.line(styled(label.to_string(), dim()));
-            b.choice("", 2, options);
+            b.toggle_if("", 2, Some(on), action, enabled);
         } else {
-            b.choice(label, self.kw, options);
+            b.toggle_if(label, self.kw, Some(on), action, enabled);
         }
     }
 }
 
-/// A saved device's Bluetooth enablement and why it is inactive.
+/// Why a saved device is inactive, and problems with its saved record.
 fn enablement_section(b: &mut Layout, c: Column, d: &Device) {
-    // An active device needs no field; its status already says so.
-    match (d.enabled, d.effective_enabled) {
-        (true, true) => {}
-        (true, false) => c.field(b, "Bluetooth", "Enabled, not active", warn()),
-        (false, _) => c.field(b, "Bluetooth", "Disabled", dim()),
-    }
     if let Some(reason) = d
         .enabled_reason
         .filter(|r| *r != cordial_protocol::errors::DisabledReason::Disabled)
@@ -158,42 +169,37 @@ fn enablement_section(b: &mut Layout, c: Column, d: &Device) {
     }
 }
 
-/// Saved counts, enabled places and advisory pairing room.
+/// Active-device places for each native constraint, and advisory room for
+/// new pairings on each transport. Constraints overlap and estimates share
+/// resources, so neither is ever summed.
 fn capacity_section(b: &mut Layout, st: &State) {
-    let c = &st.status.counts;
-    b.row();
-    b.line(styled("Devices", title()));
-    b.field(
-        "Saved",
-        &format!("{} saved, {} paired", c.saved, c.paired),
-        layout::plain(),
-    );
-    b.field(
-        "Enabled",
-        &format!("{} active of {} enabled", c.enabled, c.preferred_enabled),
-        layout::plain(),
-    );
-    for e in &st.status.capacity.enabled {
-        let names: Vec<&str> = e.transports.iter().map(|t| transport_name(*t)).collect();
-        let free = e.limit.saturating_sub(e.enabled);
-        b.field(
-            &format!("Places {}", names.join("+")),
-            &format!("{} of {} in use, {free} free", e.enabled, e.limit),
-            if free == 0 { warn() } else { layout::plain() },
-        );
+    let enabled = &st.status.capacity.enabled;
+    if !enabled.is_empty() {
+        b.row();
+        b.line(styled("Active Devices", title()));
+        for e in enabled {
+            b.hang(
+                styled("Bluetooth  ", dim()),
+                &format!("{} of {}", e.enabled, e.limit),
+                if e.enabled >= e.limit {
+                    warn()
+                } else {
+                    layout::plain()
+                },
+            );
+        }
     }
-    for p in &st.status.capacity.pairing {
-        b.field(
-            &format!("Pair {}", transport_name(p.transport)),
-            &text::capitalized(&text::pairing_capacity_words(p)),
-            if p.available { layout::plain() } else { warn() },
-        );
-    }
-    if st.status.capacity.pairing.len() > 1 {
-        b.para(
-            "Pairing estimates share the adapter's storage; don't add them.",
-            dim(),
-        );
+    let pairing = &st.status.capacity.pairing;
+    if !pairing.is_empty() {
+        b.row();
+        b.line(styled("New Pairings", title()));
+        for p in pairing {
+            b.hang(
+                styled(format!("{}  ", transport_long(p.transport)), dim()),
+                &text::pairing_room_label(p),
+                if p.available { layout::plain() } else { warn() },
+            );
+        }
     }
 }
 
@@ -267,7 +273,7 @@ fn security_section(b: &mut Layout, c: Column, d: &Device) {
     };
     let summary = match s {
         Some(_) => text::capitalized(text::security_summary(s)),
-        None => "Not reported".into(),
+        None => "Not Reported".into(),
     };
     c.field(b, "Security", &summary, look);
     for f in s.map(text::security_facts).into_iter().flatten() {
@@ -310,16 +316,16 @@ fn signal(rssi: Option<i16>, base: Style) -> Vec<ratatui::text::Span<'static>> {
 fn normalization_status(d: &Device) -> Option<(String, Style)> {
     use NormalizationState::*;
     Some(match d.normalization_state {
-        Active => ("● Special keys active".into(), ok()),
-        Pending if connected(d) => ("◌ Starting special keys…".into(), warn()),
-        Pending => ("○ Special keys start when connected".into(), dim()),
-        Probing | Configuring => ("◌ Setting up special keys…".into(), warn()),
-        Resetting if d.hidpp_enabled => ("◌ Setting up special keys…".into(), warn()),
-        Resetting => ("◌ Turning off…".into(), warn()),
-        Unsupported => ("○ Special keys not supported by this device".into(), dim()),
+        Active => ("● Special Keys Active".into(), ok()),
+        Pending if connected(d) => ("◌ Starting Special Keys…".into(), warn()),
+        Pending => ("○ Waiting to Connect".into(), dim()),
+        Probing | Configuring => ("◌ Setting Up Special Keys…".into(), warn()),
+        Resetting if d.hidpp_enabled => ("◌ Setting Up Special Keys…".into(), warn()),
+        Resetting => ("◌ Turning Off…".into(), warn()),
+        Unsupported => ("○ Special Keys Unsupported".into(), dim()),
         Error => (
             format!(
-                "✕ Special keys failed: {}",
+                "✕ Special Keys Failed: {}",
                 hidpp_error_text(d.normalization_error)
             ),
             err(),
@@ -332,52 +338,27 @@ fn normalization_status(d: &Device) -> Option<(String, Style)> {
 pub(super) fn settings_status(d: &Device) -> Option<(String, Style)> {
     use SettingsState::*;
     Some(match d.settings_state {
-        Pending if connected(d) => ("◌ Device settings wait for setup…".into(), warn()),
-        Pending => ("○ Device settings apply when connected".into(), dim()),
-        Discovering => ("◌ Reading device settings…".into(), warn()),
-        Ready if !d.hidpp_enabled => (
-            "● Device settings readable · saved values not applied (HID++ off)".into(),
-            ok(),
-        ),
-        Ready => ("● Device settings ready".into(), ok()),
-        Applying => ("◌ Applying saved device settings…".into(), warn()),
-        Unsupported => ("○ No device settings supported".into(), dim()),
+        Pending if connected(d) => ("◌ Settings Waiting for Setup…".into(), warn()),
+        Pending => ("○ Waiting to Connect".into(), dim()),
+        Discovering => ("◌ Reading Settings…".into(), warn()),
+        Ready => ("● Settings Ready".into(), ok()),
+        Applying => ("◌ Applying Settings…".into(), warn()),
+        Unsupported => ("○ Settings Unsupported".into(), dim()),
         Error => (
-            format!(
-                "✕ Device settings failed: {}",
-                hidpp_error_text(d.settings_error)
-            ),
+            format!("✕ Settings Failed: {}", hidpp_error_text(d.settings_error)),
             err(),
         ),
         Off => return None,
     })
 }
 
-/// The master HID++ preference and the status of what it permits: special
-/// keys and device settings. The preference is saved per device, so it stays
-/// changeable while the device is disconnected.
-fn hidpp_section(b: &mut Layout, c: Column, st: &State, d: &Device, changeable: bool) {
-    let on = d.hidpp_enabled;
-    if !changeable {
-        c.field(b, "HID++", if on { "On" } else { "Off" }, layout::plain());
-    } else {
-        c.choice(
-            b,
-            "HID++",
-            vec![
-                Choice {
-                    label: "On".into(),
-                    action: Action::Hidpp(true),
-                    chosen: on,
-                },
-                Choice {
-                    label: "Off".into(),
-                    action: Action::Hidpp(false),
-                    chosen: !on,
-                },
-            ],
-        );
-    }
+/// The Logitech Features preference and the status of what it permits:
+/// special keys and device settings. The preference is saved per device, so
+/// it stays changeable while the device is disconnected. The toggle is dim
+/// and has no target while `idle` is false.
+fn hidpp_section(b: &mut Layout, c: Column, st: &State, d: &Device, offered: bool, idle: bool) {
+    let action = offered.then_some(Action::Hidpp(!d.hidpp_enabled));
+    c.toggle_if(b, "Logitech Features", d.hidpp_enabled, action, idle);
     if pending_for(st, "device.hidpp.set", &d.device_id.0).is_some() {
         c.more(b, None, &format!("{} Saving…", spinner()), warn());
         return;
@@ -386,7 +367,7 @@ fn hidpp_section(b: &mut Layout, c: Column, st: &State, d: &Device, changeable: 
         && d.normalization_state == NormalizationState::Pending
         && d.settings_state == SettingsState::Pending
     {
-        c.more(b, None, "○ Starts when connected", dim());
+        c.more(b, None, "○ Waiting to Connect", dim());
         return;
     }
     for (text, look) in [normalization_status(d), settings_status(d)]
@@ -395,6 +376,19 @@ fn hidpp_section(b: &mut Layout, c: Column, st: &State, d: &Device, changeable: 
     {
         c.more(b, None, &text, look);
     }
+}
+
+/// Actions drawn as the details card's toggles rather than buttons.
+fn policy_toggle(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Enable
+            | Action::Disable
+            | Action::Trust
+            | Action::Untrust
+            | Action::Block
+            | Action::Unblock
+    )
 }
 
 pub(super) struct Control {
@@ -460,12 +454,12 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "Saved with its bond and settings, but not used for connections. Enable it to connect again. Enabling needs a free enabled-device place; the adapter never disables another device to make one.",
             ),
             (
-                "Needs pairing",
+                "Needs Pairing",
                 "Saved, with its settings kept, but its saved bond is missing or damaged, so it can't connect until it pairs again. Put it in pairing mode, Scan, and choose Pair on it under Nearby. Remove forgets it.",
             ),
             (
                 "Nearby",
-                "Found by the current scan. Every listed nearby device offers Pair; the adapter recognizes a saved device only once pairing identifies it. Unnamed devices are listed by kind, such as Unnamed keyboard; Show unnamed devices also lists those of unknown kind until this app closes.",
+                "Found by the current scan. Every listed nearby device offers Pair; the adapter recognizes a saved device only once pairing identifies it. Unnamed devices are listed by kind, such as Unnamed Keyboard; Show Unnamed Devices also lists those of unknown kind until this app closes.",
             ),
             (
                 "Battery",
@@ -485,11 +479,11 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "Pair a nearby device, save it on the adapter and connect it. Pairing a saved device again renews its bond and keeps its settings. When every enabled-device place is in use, the device is saved disabled instead. Pair is unavailable when the adapter has no room for another paired device.",
             ),
             (
-                "Enable",
+                "Use This Device: On",
                 "Use a saved device for connections again, if an enabled-device place is free.",
             ),
             (
-                "Disable",
+                "Use This Device: Off",
                 "Disconnect the device and stop using it for connections. Its bond and settings are kept.",
             ),
             (
@@ -500,16 +494,22 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "Disconnect",
                 "Disconnect and pause automatic reconnection until the device is connected again or the adapter restarts.",
             ),
-            ("Trust", "Let the device reconnect without being asked."),
             (
-                "Untrust",
+                "Automatic Connections: On",
+                "Let the device reconnect without being asked.",
+            ),
+            (
+                "Automatic Connections: Off",
                 "Stop future automatic connections; the current one is kept.",
             ),
             (
-                "Block",
+                "Block Connections: On",
                 "Refuse every connection from the device until it is unblocked. The bond is kept.",
             ),
-            ("Unblock", "Allow connections from the device again."),
+            (
+                "Block Connections: Off",
+                "Allow connections from the device again.",
+            ),
             (
                 "Remove",
                 "Disconnect and delete the saved bond. The device may also need its old pairing cleared before it is used again.",
@@ -519,11 +519,11 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "Drop a nearby device from the list until it is found again.",
             ),
             (
-                "HID++",
+                "Logitech Features",
                 "On lets the adapter use Logitech HID++ for special keys and to apply saved device settings while the device is connected. Off resets the adapter's temporary HID++ reporting and key diversions; it does not restore device settings. The adapter still reads a connected device's settings and features, and you can save values on the dongle, but nothing is written to the device until HID++ is on again. Saved for each device, and can be changed while it is disconnected.",
             ),
             (
-                "Refresh info",
+                "Refresh Info",
                 "Ask a connected device for its current battery charge, model, firmware and other information. The adapter keeps this information only in memory; it is never saved.",
             ),
             (
@@ -545,31 +545,27 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         &[
             (
                 "Current",
-                "Current Value: the value last read from the device, including with HID++ off. It is marked stale while the device is disconnected or has not been read again.",
+                "Current: the value last read from the device, including with Logitech Features off. It is marked Last Known while the device is disconnected or has not been read again.",
             ),
             (
                 "Saved",
-                "\"Saved on Dongle: Yes\" means the adapter reapplies the saved value when the device reconnects with HID++ on, when HID++ is turned on, and after an adapter platform change, overriding changes made on the device or from another computer meanwhile. With HID++ off the saved value waits: \"Not applied\".",
+                "\"Saved\" means the adapter reapplies the saved value when the device reconnects with Logitech Features on, when Logitech Features are turned on, and after an adapter platform change, overriding changes made on the device or from another computer meanwhile. With Logitech Features off the saved value waits.",
             ),
             (
                 "Save",
-                "Choose a new value with the controls, then Save stores it on the dongle and applies it. With HID++ off, Save only stores it; it is applied when HID++ is turned on. Nothing is sent until you click Save; Cancel discards the change.",
+                "Choose a new value with the controls, then Save stores it on the dongle and applies it. With Logitech Features off, Save only stores it; it is applied when Logitech Features are turned on. Nothing is sent until you click Save; Discard discards the change.",
             ),
             (
-                "Default",
-                "Forget saved value; leave device unchanged. The adapter stops applying a value and the device keeps its current one.",
+                "Forget Saved Value",
+                "The adapter stops applying a value and the device keeps its current one.",
             ),
             (
                 "Refresh",
                 "Read current values from the connected device. Nothing is changed.",
             ),
             (
-                "Apply",
-                "Apply saved values: reread the device and write saved values that differ, showing each result. Needs HID++ on.",
-            ),
-            (
-                "Differs",
-                "\"Current value differs from saved\" means the device was changed, for example with its own controls. Such changes are shown but never saved or corrected until saved values are applied again.",
+                "Changed on Device",
+                "\"Changed on Device\" means the device was changed, for example with its own controls. Such changes are shown but never saved or corrected until saved values are applied again.",
             ),
             (
                 "Applies To",
@@ -612,7 +608,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("r", "Refresh the device list."),
             (
                 "Tab",
-                "Move between controls; Shift+Tab moves back. Enter activates the highlighted control, and Enter or Space toggles a highlighted checkbox such as Show unnamed devices.",
+                "Move between controls; Shift+Tab moves back. Enter activates the highlighted control, and Enter or Space toggles a highlighted checkbox such as Show Unnamed Devices.",
             ),
             ("y n", "Answer confirmations and code comparisons."),
             ("PgUp PgDn", "Scroll the activity log."),
@@ -668,19 +664,19 @@ fn help_text(st: &State, section: &str, key: &str, text: &str) -> Option<String>
             };
         }
         ("Devices", "Nearby") | ("Actions", "Hide") | (_, "h") => hide,
-        ("Devices", "Needs pairing") | ("Actions", "Pair") | (_, "p") => pair,
+        ("Devices", "Needs Pairing") | ("Actions", "Pair") | (_, "p") => pair,
         ("Devices", "Disabled") => ok(Command::Enabled(none(), true)),
-        ("Actions", "Enable") => ok(Command::Enabled(none(), true)),
-        ("Actions", "Disable") => ok(Command::Enabled(none(), false)),
+        ("Actions", "Use This Device: On") => ok(Command::Enabled(none(), true)),
+        ("Actions", "Use This Device: Off") => ok(Command::Enabled(none(), false)),
         ("Actions", "Connect") | (_, "c") => connect,
         ("Actions", "Disconnect") | (_, "d") => ok(Command::Disconnect(none())),
-        ("Actions", "Trust") => ok(Command::Trusted(none(), true)),
-        ("Actions", "Untrust") => ok(Command::Trusted(none(), false)),
-        ("Actions", "Block") => ok(Command::Blocked(none(), true)),
-        ("Actions", "Unblock") => ok(Command::Blocked(none(), false)),
+        ("Actions", "Automatic Connections: On") => ok(Command::Trusted(none(), true)),
+        ("Actions", "Automatic Connections: Off") => ok(Command::Trusted(none(), false)),
+        ("Actions", "Block Connections: On") => ok(Command::Blocked(none(), true)),
+        ("Actions", "Block Connections: Off") => ok(Command::Blocked(none(), false)),
         ("Actions", "Remove") | (_, "x") => ok(Command::Remove(none())),
-        ("Actions", "HID++") => ok(Command::Hidpp(none(), true)),
-        ("Actions", "Refresh info") => ok(Command::DeviceInfoRefresh(none())),
+        ("Actions", "Logitech Features") => ok(Command::Hidpp(none(), true)),
+        ("Actions", "Refresh Info") => ok(Command::DeviceInfoRefresh(none())),
         ("Actions", "Settings…") | ("Device Settings", _) | (_, "o") if !settings => false,
         ("Actions", "Platform") => ok(Command::Platform(st.status.host_platform)),
         ("Actions", "Files") => ok(Command::StorageList("/".into())),
@@ -689,12 +685,11 @@ fn help_text(st: &State, section: &str, key: &str, text: &str) -> Option<String>
             cordial_protocol::settings::SettingKey::WheelMode,
             SettingInput::Text(none()),
         )),
-        ("Device Settings", "Default") => ok(Command::SettingForget(
+        ("Device Settings", "Forget Saved Value") => ok(Command::SettingForget(
             none(),
             cordial_protocol::settings::SettingKey::WheelMode,
         )),
         ("Device Settings", "Refresh") => ok(Command::SettingsRefresh(none())),
-        ("Device Settings", "Apply") => ok(Command::SettingsApply(none())),
         (_, "Enter") => {
             return match (pair, connect) {
                 (true, true) => Some(text.to_owned()),
@@ -1117,7 +1112,7 @@ impl<B: Backend> Model<B> {
             Some(st) if prepared && !st.available => bar.row(),
             Some(st) if prepared && pending_for(st, "discovery.scan", "").is_some() => {
                 if self.offers(st, &Action::ScanOff) {
-                    bar.button("Stop scan", Action::ScanOff, Tone::Normal);
+                    bar.button("Stop Scan", Action::ScanOff, Tone::Normal);
                 }
                 let label = format!("Scanning {}", self.scan_label);
                 let room = bar
@@ -1153,15 +1148,15 @@ impl<B: Backend> Model<B> {
             return styled("◌ Connecting…", warn());
         }
         let Some(st) = st else {
-            return styled("No adapter", dim());
+            return styled("No Adapter", dim());
         };
         let s = match () {
             _ if !st.available => styled("✕ Disconnected", err()),
             _ if !st.current => styled("◌ Refreshing", warn()),
-            _ if self.unready.is_some() => styled("! Not ready", warn()),
-            _ if !st.status.radio_ready => styled("! Radio not ready", warn()),
-            _ if !st.status.storage_ready => styled("! Storage not ready", warn()),
-            _ if !st.monitor => styled("‖ Live updates off", warn()),
+            _ if self.unready.is_some() => styled("! Not Ready", warn()),
+            _ if !st.status.radio_ready => styled("! Bluetooth Not Ready", warn()),
+            _ if !st.status.storage_ready => styled("! Storage Not Ready", warn()),
+            _ if !st.monitor => styled("‖ Live Updates Off", warn()),
             _ => styled("● Ready", ok()),
         };
         let count = format!(
@@ -1412,13 +1407,13 @@ impl<B: Backend> Model<B> {
         b.line(styled("NEARBY", dim()));
         let hidden = self.unnamed_hidden();
         if !scan_choices(st).is_empty() || !st.candidates.is_empty() || hidden > 0 {
-            let (mark, tone) = if self.show_unnamed {
-                ("■", Tone::Chosen)
-            } else {
-                ("□", Tone::Normal)
-            };
-            let label = format!("{mark} Show unnamed devices");
-            b.button_right(&label, Action::ShowUnnamed, tone);
+            let on = self.show_unnamed;
+            b.toggle(
+                "Show Unnamed Devices ",
+                21,
+                Some(on),
+                Action::ShowUnnamed(!on),
+            );
         }
         let mut nearby = 0;
         // Every listed candidate stays here and offers Pair.
@@ -1446,7 +1441,7 @@ impl<B: Backend> Model<B> {
             let text = if pending_for(st, "discovery.scan", "").is_some() {
                 "  Looking for devices…"
             } else if scan_choices(st).is_empty() {
-                "  No nearby devices"
+                "  No Nearby Devices"
             } else {
                 "  Use Scan to find nearby devices"
             };
@@ -1529,8 +1524,8 @@ impl<B: Backend> Model<B> {
                 // entry, keeps the saved settings.
                 let needs = d.pairing_state == PairingState::NeedsPairing;
                 if needs {
-                    c.field(&mut b, "Pairing", "Needs pairing", warn());
-                    c.field(&mut b, "Connect", "Unavailable until paired again", warn());
+                    c.field(&mut b, "Pairing", "Needs Pairing Again", warn());
+                    c.field(&mut b, "Connect", "Unavailable Until Paired Again", warn());
                 }
                 enablement_section(&mut b, c, d);
                 if needs && d.blocked {
@@ -1548,30 +1543,48 @@ impl<B: Backend> Model<B> {
                     kind = format!("{roles} · {kind}");
                 }
                 c.field(&mut b, "Type", &kind, layout::plain());
-                c.field(&mut b, "Trusted", yes_no(d.trusted), layout::plain());
-                if d.blocked {
-                    c.field(&mut b, "Blocked", "Yes", err());
-                } else {
-                    c.field(&mut b, "Blocked", "No", layout::plain());
-                }
+                // A toggle offers turning it over, so its action follows the value.
+                let policy = |value: bool, on: Action, off: Action| {
+                    (self.offers(st, &on) && self.offers(st, &off)).then_some(if value {
+                        off
+                    } else {
+                        on
+                    })
+                };
+                c.toggle(
+                    &mut b,
+                    "Use This Device",
+                    d.enabled,
+                    policy(d.enabled, Action::Enable, Action::Disable),
+                );
+                c.toggle(
+                    &mut b,
+                    "Automatic Connections",
+                    d.trusted,
+                    policy(d.trusted, Action::Trust, Action::Untrust),
+                );
+                c.toggle(
+                    &mut b,
+                    "Block Connections",
+                    d.blocked,
+                    policy(d.blocked, Action::Block, Action::Unblock),
+                );
                 if needs {
-                    c.field(&mut b, "Reconnect", "Not until paired again", warn());
+                    c.field(&mut b, "Reconnect", "Not Until Paired Again", warn());
                 } else if !d.effective_enabled {
-                    c.field(&mut b, "Reconnect", "Not while inactive", dim());
+                    c.field(&mut b, "Reconnect", "Not While Inactive", dim());
                 } else if d.reconnect == Reconnect::Paused {
-                    c.field(&mut b, "Reconnect", "Paused until Connect", warn());
+                    c.field(&mut b, "Reconnect", "Paused Until Connect", warn());
                 } else {
                     c.field(&mut b, "Reconnect", "Automatic", layout::plain());
                 }
-                let changeable = self.offers(st, &Action::Hidpp(!d.hidpp_enabled));
-                hidpp_section(&mut b, c, st, d, changeable);
+                // Logitech Features wait while the device's settings work runs.
+                let offered = self.offers(st, &Action::Hidpp(!d.hidpp_enabled));
+                let idle = settings_busy(st, d, self.saving(&d.device_id.0)).is_empty();
+                hidpp_section(&mut b, c, st, d, offered, idle);
                 info_section(&mut b, c, st, d, rows);
                 for w in &d.warnings {
                     c.field(&mut b, "Warning", warning_text(*w), warn());
-                }
-                if let Some(e) = &d.last_error {
-                    let e = display(&text::wire_text(e, None));
-                    c.field(&mut b, "Last Error", &e, err());
                 }
                 c.field(&mut b, "ID", &display(&d.device_id.0), dim());
             }
@@ -1579,8 +1592,13 @@ impl<B: Backend> Model<B> {
                 heading = display_candidate_name(c);
                 b.field("Status", "Nearby", layout::plain());
                 if pending_for(st, "pairing.start", &c.candidate_id.0).is_none() {
-                    if let Some(why) = text::pair_blocked(&st.status, c.transport) {
-                        b.field("Pair", &format!("Unavailable: {why}"), warn());
+                    if let Some(why) = st
+                        .status
+                        .pairing(c.transport)
+                        .filter(|p| !p.available)
+                        .map(text::pairing_room_label)
+                    {
+                        b.field("Pair", &why, warn());
                     } else {
                         b.para(
                             "Pair saves it. If it is already saved, pairing renews its bond and keeps its settings.",
@@ -1600,7 +1618,13 @@ impl<B: Backend> Model<B> {
             }
             _ => b.para("Select a device to see its details and actions.", dim()),
         }
-        for a in self.device_actions(st) {
+        // Policy toggles are drawn as toggles in the card; their
+        // shortcuts still use these actions.
+        for a in self
+            .device_actions(st)
+            .into_iter()
+            .filter(|a| !policy_toggle(&a.action))
+        {
             if a.right {
                 actions.button_right(a.label, a.action, a.tone);
             } else {
@@ -1630,7 +1654,7 @@ impl<B: Backend> Model<B> {
             (Some(d), _) => {
                 let id = &d.device_id.0;
                 match pending_for(st, "device.connect", id) {
-                    Some(p) => add("Cancel connect", Action::Cancel(p.id), Tone::Normal, false),
+                    Some(p) => add("Cancel Connect", Action::Cancel(p.id), Tone::Normal, false),
                     _ if matches!(
                         d.state,
                         ConnectionState::Connected | ConnectionState::Connecting
@@ -1660,14 +1684,14 @@ impl<B: Backend> Model<B> {
                     add("Block", Action::Block, Tone::Normal, false);
                 }
                 if connected(d) {
-                    add("Refresh info", Action::RefreshInfo, Tone::Normal, false);
+                    add("Refresh Info", Action::RefreshInfo, Tone::Normal, false);
                 }
                 add("Settings…", Action::DeviceSettings, Tone::Normal, false);
                 add("Remove", Action::Remove, Tone::Danger, true);
             }
             (_, Some(c)) => {
                 match pending_for(st, "pairing.start", &c.candidate_id.0) {
-                    Some(p) => add("Cancel pairing", Action::Cancel(p.id), Tone::Normal, false),
+                    Some(p) => add("Cancel Pairing", Action::Cancel(p.id), Tone::Normal, false),
                     // Status says why Pair is unavailable; the details card shows it.
                     None if text::pair_blocked(&st.status, c.transport).is_some() => {}
                     None => add("Pair", Action::Pair, Tone::Primary, false),
@@ -1792,7 +1816,7 @@ impl<B: Backend> Model<B> {
                 );
                 code(&mut body);
                 if cancel {
-                    pinned.button("Cancel pairing", Action::CancelDialog, Tone::Normal);
+                    pinned.button("Cancel Pairing", Action::CancelDialog, Tone::Normal);
                 }
             } else if !reply {
                 body.para(
@@ -1851,7 +1875,13 @@ impl<B: Backend> Model<B> {
                         }
                         body.line(styled(*section, title()));
                         for (key, text) in rows {
-                            body.hang(styled(pad_str(key, 12), bold()), &text, layout::plain());
+                            // A key too long for the column gets a line of its own.
+                            if text::width(key) > 10 {
+                                body.line(styled(key.to_string(), bold()));
+                                body.hang(styled(pad_str("", 12), bold()), &text, layout::plain());
+                            } else {
+                                body.hang(styled(pad_str(key, 12), bold()), &text, layout::plain());
+                            }
                         }
                     }
                     pinned.button("Close", Action::CancelDialog, Tone::Normal);

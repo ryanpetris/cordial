@@ -159,10 +159,10 @@ pub fn named(c: &Candidate) -> bool {
 /// What an unnamed nearby device is called, by the kind it advertised.
 pub fn unnamed(kind: DeviceKind) -> &'static str {
     match kind {
-        DeviceKind::Keyboard => "Unnamed keyboard",
-        DeviceKind::Mouse => "Unnamed mouse",
-        DeviceKind::KeyboardMouse => "Unnamed keyboard/mouse",
-        DeviceKind::Unknown => "Unnamed device",
+        DeviceKind::Keyboard => "Unnamed Keyboard",
+        DeviceKind::Mouse => "Unnamed Mouse",
+        DeviceKind::KeyboardMouse => "Unnamed Keyboard/Mouse",
+        DeviceKind::Unknown => "Unnamed Device",
     }
 }
 
@@ -498,6 +498,31 @@ pub fn pair_unavailable_words(reason: PairUnavailable) -> &'static str {
     }
 }
 
+/// Why Pair is unavailable for a transport, as a short label.
+pub fn pair_unavailable_label(reason: PairUnavailable) -> &'static str {
+    match reason {
+        PairUnavailable::StorageFull => "Storage Full",
+        PairUnavailable::SetupCapacity => "No Pairing Slot",
+        PairUnavailable::ConnectionsFull => "All Connections in Use",
+        PairUnavailable::PairingActive => "Pairing in Progress",
+        PairUnavailable::RadioUnavailable => "Bluetooth Not Ready",
+        PairUnavailable::StorageUnavailable => "Storage Not Ready",
+    }
+}
+
+/// One transport's room for new pairings as a short label. Estimates are
+/// advisory and never combined across transports.
+pub fn pairing_room_label(p: &cordial_protocol::messages::PairingCapacity) -> String {
+    match (p.available, p.reason) {
+        (true, _) if p.estimated_additional > 0 => {
+            format!("About {} More", p.estimated_additional)
+        }
+        (true, _) => "Available".into(),
+        (false, Some(reason)) => pair_unavailable_label(reason).into(),
+        (false, None) => "Unavailable".into(),
+    }
+}
+
 /// Why a saved device is not active for connections.
 pub fn disabled_words(reason: DisabledReason) -> &'static str {
     match reason {
@@ -644,14 +669,14 @@ pub fn link_security(d: &Device) -> Option<Option<&ConnectionSecurity>> {
 /// and no combination is called simply secure.
 pub fn security_summary(s: Option<&ConnectionSecurity>) -> &'static str {
     let Some(s) = s else {
-        return "security not reported";
+        return "Security Not Reported";
     };
     match (s.encrypted, s.authenticated) {
-        (Some(false), _) => "not encrypted",
-        (None, _) => "encryption not reported",
-        (Some(true), Some(true)) => "encrypted, authenticated",
-        (Some(true), Some(false)) => "encrypted, unauthenticated",
-        (Some(true), None) => "encrypted",
+        (Some(false), _) => "Not Encrypted",
+        (None, _) => "Encryption Not Reported",
+        (Some(true), Some(true)) => "Encrypted, Authenticated",
+        (Some(true), Some(false)) => "Encrypted, Unauthenticated",
+        (Some(true), None) => "Encrypted",
     }
 }
 
@@ -678,7 +703,7 @@ pub fn security_facts(s: &ConnectionSecurity) -> [SecurityFact; 5] {
     let flag = |label, v: Option<bool>| SecurityFact {
         label,
         value: v
-            .map_or("not reported", |b| if b { "yes" } else { "no" })
+            .map_or("Not Reported", |b| if b { "Yes" } else { "No" })
             .into(),
         reading: match v {
             Some(true) => Reading::Yes,
@@ -692,7 +717,7 @@ pub fn security_facts(s: &ConnectionSecurity) -> [SecurityFact; 5] {
         flag("Secure Connections", s.secure_connections),
         SecurityFact {
             label: "Encryption Key",
-            value: s.key_size.map_or("not reported".into(), |b| {
+            value: s.key_size.map_or("Not Reported".into(), |b| {
                 format!("{} bits", u16::from(b) * 8)
             }),
             reading: s.key_size.map_or(Reading::NotReported, |_| Reading::Value),
@@ -740,7 +765,10 @@ pub fn device_line(d: &Device) -> String {
     }
     if let Some(s) = link_security(d) {
         let words = match s {
-            Some(_) => security_summary(s).replace(", ", ",").replace(' ', "-"),
+            Some(_) => security_summary(s)
+                .to_lowercase()
+                .replace(", ", ",")
+                .replace(' ', "-"),
             None => "not-reported".into(),
         };
         let _ = write!(line, " security={words}");
@@ -1794,10 +1822,10 @@ mod tests {
         use crate::ui::command::tests::{candidate, state};
         let mut st = state();
         let kinds = [
-            (DeviceKind::Keyboard, "Unnamed keyboard"),
-            (DeviceKind::Mouse, "Unnamed mouse"),
-            (DeviceKind::KeyboardMouse, "Unnamed keyboard/mouse"),
-            (DeviceKind::Unknown, "Unnamed device"),
+            (DeviceKind::Keyboard, "Unnamed Keyboard"),
+            (DeviceKind::Mouse, "Unnamed Mouse"),
+            (DeviceKind::KeyboardMouse, "Unnamed Keyboard/Mouse"),
+            (DeviceKind::Unknown, "Unnamed Device"),
         ];
         for (i, (kind, label)) in kinds.into_iter().enumerate() {
             let mut c = candidate(&format!("c_u{i}"), "");
@@ -1816,11 +1844,11 @@ mod tests {
         // The shell lists every candidate, including unknown unnamed ones.
         let list = devices(&st, Filter::All);
         assert!(
-            list.contains("c_u3  Unnamed device  ble  candidate"),
+            list.contains("c_u3  Unnamed Device  ble  candidate"),
             "{list}"
         );
         assert!(
-            list.contains("c_u2  Unnamed keyboard/mouse  ble  candidate"),
+            list.contains("c_u2  Unnamed Keyboard/Mouse  ble  candidate"),
             "{list}"
         );
     }
@@ -1832,12 +1860,12 @@ mod tests {
         assert!(device_line(&full).contains(" security=encrypted,unauthenticated "));
         let info = device_info(&full);
         for line in [
-            "  Link Security: encrypted, unauthenticated",
-            "    Encryption: yes",
-            "    Authenticated Pairing (MITM Protection): no",
-            "    Secure Connections: yes",
+            "  Link Security: Encrypted, Unauthenticated",
+            "    Encryption: Yes",
+            "    Authenticated Pairing (MITM Protection): No",
+            "    Secure Connections: Yes",
             "    Encryption Key: 128 bits",
-            "    Saved Bond: yes",
+            "    Saved Bond: Yes",
             "  Trusted: yes",
         ] {
             assert!(info.contains(line), "{line}:\n{info}");
@@ -1853,10 +1881,10 @@ mod tests {
         assert!(device_line(&d).contains(" security=encrypted,authenticated "));
         let info = device_info(&d);
         for line in [
-            "    Authenticated Pairing (MITM Protection): yes",
-            "    Secure Connections: not reported",
-            "    Encryption Key: not reported",
-            "    Saved Bond: no",
+            "    Authenticated Pairing (MITM Protection): Yes",
+            "    Secure Connections: Not Reported",
+            "    Encryption Key: Not Reported",
+            "    Saved Bond: No",
         ] {
             assert!(info.contains(line), "{line}:\n{info}");
         }
@@ -1866,7 +1894,7 @@ mod tests {
 
         let s = d.security.as_mut().unwrap();
         s.authenticated = None;
-        assert_eq!(security_summary(d.security.as_ref()), "encrypted");
+        assert_eq!(security_summary(d.security.as_ref()), "Encrypted");
         d.security.as_mut().unwrap().encrypted = None;
         assert!(device_line(&d).contains(" security=encryption-not-reported "));
         d.security.as_mut().unwrap().encrypted = Some(false);
@@ -1876,7 +1904,7 @@ mod tests {
         assert!(device_line(&d).contains(" security=not-reported "));
         assert!(
             device_info(&d).contains(
-                "  Link Security: security not reported\n  Bluetooth: enabled\n  Trusted"
+                "  Link Security: Security Not Reported\n  Bluetooth: enabled\n  Trusted"
             )
         );
 

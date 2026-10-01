@@ -4,7 +4,7 @@
 //! control under it, or none, until a key is pressed.
 use super::{Action, Dialog, Hit, MIN_HEIGHT, MIN_WIDTH, Menu, Model, pending_for, scan_choices};
 use crate::{controller::State, ui::Backend};
-use cordial_protocol::messages::PromptMethod;
+use cordial_protocol::{messages::PromptMethod, settings::SettingValue};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A key as the handlers name it, such as `ctrl+c`, `shift+tab` or `q`.
@@ -35,10 +35,30 @@ pub fn name(k: &KeyEvent) -> String {
     base.to_owned()
 }
 
+/// Whether two actions are the same toggle, before and after it flips, so
+/// the highlight stays on it.
+fn same_toggle(a: &Action, b: &Action) -> bool {
+    use Action::*;
+    match (a, b) {
+        (Enable | Disable, Enable | Disable)
+        | (Trust | Untrust, Trust | Untrust)
+        | (Block | Unblock, Block | Unblock)
+        | (Hidpp(_), Hidpp(_))
+        | (ShowUnnamed(_), ShowUnnamed(_)) => true,
+        (Draft(j, SettingValue::Bool(_)), Draft(k, SettingValue::Bool(_))) => j == k,
+        (Switch(j, _), Switch(k, _)) => j == k,
+        _ => false,
+    }
+}
+
 impl<B: Backend> Model<B> {
     pub(super) fn focus_hit(&self) -> Option<Hit> {
         let focus = self.focus.as_ref()?;
-        self.hits.iter().find(|h| h.action == *focus).cloned()
+        self.hits
+            .iter()
+            .find(|h| h.action == *focus)
+            .or_else(|| self.hits.iter().find(|h| same_toggle(&h.action, focus)))
+            .cloned()
     }
 
     fn move_focus(&mut self, delta: isize) {
@@ -52,11 +72,10 @@ impl<B: Backend> Model<B> {
             return;
         }
         let n = controls.len() as isize;
-        let i = match self
-            .focus
-            .as_ref()
-            .and_then(|f| controls.iter().position(|a| *a == f))
-        {
+        let i = match self.focus.as_ref().and_then(|f| {
+            (controls.iter().position(|a| *a == f))
+                .or_else(|| controls.iter().position(|a| same_toggle(a, f)))
+        }) {
             Some(i) => i as isize,
             None if delta < 0 => 0,
             None => -1,
@@ -198,11 +217,11 @@ impl<B: Backend> Model<B> {
             }
             _ => {}
         }
-        // Space also toggles a focused checkbox, outside text entry.
+        // Space also chooses a focused option, outside text entry.
         let check = key == " "
             && !self.form_focused
             && !self.files.editing
-            && self.focus == Some(Action::ShowUnnamed);
+            && self.focus.as_ref().is_some_and(|f| same_toggle(f, f));
         if (key == "enter" || check)
             && let Some(h) = self.focus_hit()
         {
@@ -317,16 +336,23 @@ impl<B: Backend> Model<B> {
             return true;
         }
         if self.settings_open(&st) {
+            // Left and Right move between buttons once one is highlighted;
+            // otherwise they edit the selected setting.
+            let button = self.focus.is_some();
             match key {
                 _ if up || down => self.move_setting(step),
-                "left" => self.move_focus(-1),
-                "right" => self.move_focus(1),
+                "left" if button => self.move_focus(-1),
+                "right" if button => self.move_focus(1),
+                "left" | "right" => self.edit_selected(if key == "left" { -1 } else { 1 }, false),
+                " " => self.edit_selected(0, true),
+                "backspace" => self.undo_selected(),
                 "home" | "end" => {
                     self.page.key = None;
                     self.move_setting(if key == "home" { 1 } else { -1 });
                 }
                 "pgup" => self.event_scroll += 5,
                 "pgdown" => self.event_scroll = self.event_scroll.saturating_sub(5),
+                "s" => self.action(Action::SaveAll),
                 "r" => self.action(Action::SettingsRefresh),
                 "a" => self.action(Action::Menu(Menu::Adapter)),
                 _ => {}
@@ -432,7 +458,12 @@ impl<B: Backend> Model<B> {
             } else {
                 ""
             };
-            return format!("↑↓ select setting · tab move · {enter}{refresh}esc back");
+            let save = if self.offers(st, &Action::SaveAll) {
+                "s save · ⌫ undo · "
+            } else {
+                ""
+            };
+            return format!("↑↓ select · ←→ change · {enter}{save}{refresh}esc back");
         }
         let primary = if !enter.is_empty() {
             " · ⏎ press highlighted"

@@ -32,7 +32,7 @@ try {
   await page.getByRole('button', { name: 'Cancel', exact: true }).click();
   await page.getByRole('heading', { name: 'Desk \u{10400}', exact: true }).waitFor({ state: 'attached' });
   await rename.click();
-  await page.getByRole('button', { name: 'Reset to default', exact: true }).click();
+  await page.getByRole('button', { name: 'Reset to Default', exact: true }).click();
   await input.waitFor({ state: 'hidden' });
   await page.getByRole('heading', { name: 'Pico W', exact: true }).waitFor({ state: 'attached' });
   // Give both adapters the same name and verify the displayed and editable values.

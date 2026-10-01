@@ -62,7 +62,7 @@ export function HomePage({ state, onSelect, onAdd }: { state: AppState; onSelect
               <div className="row-text">
                 <div className="row-title strong">{d.name}</div>
                 <div className="row-subtitle">
-                  Needs pairing again{several ? ` · ${adapterName(d.adapterId)}` : null}
+                  Needs Pairing Again{several ? ` · ${adapterName(d.adapterId)}` : null}
                 </div>
               </div>
               <div className="row-end">

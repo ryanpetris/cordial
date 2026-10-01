@@ -34,6 +34,22 @@ pub use term::Tui;
 /// How long an interface waits to open an adapter and complete its handshake.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// How long an interface waits for the reply to saving or forgetting one
+/// setting: the adapter's settings job deadline and time to settle.
+const SETTING_TIMEOUT: Duration = Duration::from_secs(90 + 15);
+
+/// How an interface runs a command: a setting save or forget ends with a
+/// timeout instead of waiting without limit; other commands are unchanged.
+fn run_options(command: &Command) -> RunOptions {
+    match command {
+        Command::SettingSet(..) | Command::SettingForget(..) => RunOptions {
+            wait: Wait::timeout(SETTING_TIMEOUT),
+            ..RunOptions::default()
+        },
+        _ => RunOptions::default(),
+    }
+}
+
 pub struct UiOptions {
     /// An explicit serial port, opened instead of choosing an adapter.
     pub port: Option<String>,
@@ -129,7 +145,8 @@ impl Backend for Live {
         self.controller.close();
     }
     fn run(&self, command: Command) -> Ticket {
-        self.controller.run(command, RunOptions::default())
+        let options = run_options(&command);
+        self.controller.run(command, options)
     }
     fn run_cancellable(&self, command: Command, cancel: Cancellation) -> Ticket {
         let wait = Wait {
@@ -161,4 +178,31 @@ impl Backend for Live {
 /// The full-screen TUI and a handle that interrupts it.
 pub fn tui(options: UiOptions) -> (Tui, Interrupter) {
     Tui::new(options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cordial_protocol::settings::SettingKey;
+
+    #[test]
+    fn only_setting_saves_and_forgets_have_a_deadline() {
+        let key = SettingKey::WheelMode;
+        let set = Command::SettingSet(
+            "d_1".into(),
+            key,
+            crate::controller::SettingInput::Text("ratchet".into()),
+        );
+        for command in [set, Command::SettingForget("d_1".into(), key)] {
+            let deadline = run_options(&command).wait.deadline.expect("deadline");
+            assert!(deadline > std::time::Instant::now() + Duration::from_secs(100));
+        }
+        for command in [
+            Command::Status,
+            Command::SettingsRefresh("d_1".into()),
+            Command::Connect("d_1".into()),
+        ] {
+            assert!(run_options(&command).wait.deadline.is_none(), "{command:?}");
+        }
+    }
 }

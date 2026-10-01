@@ -58,10 +58,7 @@ pub(super) fn state_words(d: &Device) -> String {
         ConnectionState::Connected => "connected".into(),
         ConnectionState::Connecting => "connecting…".into(),
         ConnectionState::Disconnecting => "disconnecting…".into(),
-        ConnectionState::Disconnected => match &d.last_error {
-            Some(e) => format!("disconnected: {}", text::display(&text::wire_text(e, None))),
-            None => "disconnected".into(),
-        },
+        ConnectionState::Disconnected => "disconnected".into(),
     }
 }
 
@@ -75,15 +72,9 @@ fn device_changes(old: &Device, d: &Device) -> Vec<(Kind, String)> {
     if old.state != d.state {
         let kind = match d.state {
             ConnectionState::Connected => Kind::Good,
-            ConnectionState::Disconnected if d.last_error.is_some() => Kind::Bad,
             _ => Kind::Info,
         };
         out.push((kind, format!("{name} {}", state_words(d))));
-    } else if let Some(e) = &d.last_error
-        && old.last_error.as_ref() != Some(e)
-    {
-        let words = text::display(&text::wire_text(e, None));
-        out.push((Kind::Bad, format!("{name}: {words}")));
     }
     if old.enabled != d.enabled {
         out.push(if d.enabled {
@@ -142,7 +133,10 @@ fn device_changes(old: &Device, d: &Device) -> Vec<(Kind, String)> {
     if old.hidpp_enabled != d.hidpp_enabled {
         out.push((
             Kind::Info,
-            format!("HID++ turned {} for {name}", text::on_off(d.hidpp_enabled)),
+            format!(
+                "Logitech Features turned {} for {name}",
+                text::on_off(d.hidpp_enabled)
+            ),
         ));
     }
     // Other status changes follow every connection; the details show them.
@@ -414,7 +408,7 @@ impl<B: Backend> Model<B> {
             }
             SettingState::ChangedOnDevice if self.hidpp_off(&e.device_id.0) => self.note(
                 Kind::Warn,
-                format!("{label} on {name} differs from its saved value, which isn't applied while HID++ is off"),
+                format!("{label} on {name} differs from its saved value, which isn't applied while Logitech Features are off"),
             ),
             SettingState::ChangedOnDevice => self.note(
                 Kind::Warn,
@@ -429,7 +423,7 @@ impl<B: Backend> Model<B> {
             }
             SettingState::Uncertain => self.note(
                 Kind::Warn,
-                format!("{label} on {name} may not have been applied; Apply rereads it first"),
+                format!("{label} on {name} may not have been applied"),
             ),
             SettingState::Unsupported if s.managed => self.note(
                 Kind::Warn,
@@ -548,7 +542,7 @@ impl<B: Backend> Model<B> {
             Devices => "refresh devices".into(),
             Bootloader => "enter the bootloader".into(),
             Cancel(_) => "cancel the request".into(),
-            Hidpp(_, on) => format!("turn HID++ {} for {target}", text::on_off(*on)),
+            Hidpp(_, on) => format!("turn Logitech Features {} for {target}", text::on_off(*on)),
             Platform(_) => "set the platform".into(),
             Name(_) => "rename the adapter".into(),
             DeviceInfoRefresh(_) => format!("refresh the information of {target}"),
@@ -613,74 +607,43 @@ impl<B: Backend> Model<B> {
             Blocked(_, true) => format!("Blocked {target}"),
             Blocked(_, false) => format!("Unblocked {target}"),
             Remove(_) => format!("Removed {target}"),
-            Hidpp(_, on) => format!("HID++ turned {} for {target}", text::on_off(*on)),
+            Hidpp(_, on) => format!(
+                "Logitech Features turned {} for {target}",
+                text::on_off(*on)
+            ),
             Platform(p) => format!("Platform set to {}", text::platform_name(*p)),
             _ => return,
         };
         self.note(Kind::Good, done);
     }
 
-    /// Reports settings commands started from the TUI.
+    /// Reports Refresh and Apply started from the TUI. Only failures are
+    /// noted, with the counts of what failed; the settings page's Save queue
+    /// reports its own outcomes.
     fn settings_command_activity(&mut self, command: &Command, result: &Result<Outcome, Failure>) {
         use Command::*;
-        let (device, key) = match command {
-            SettingSet(d, k, _) | SettingForget(d, k) => (d, Some(*k)),
-            SettingsRefresh(d) | SettingsApply(d) => (d, None),
-            _ => return,
+        let (SettingsRefresh(device) | SettingsApply(device)) = command else {
+            return;
+        };
+        let Err(f) = result else {
+            return;
         };
         let name = self.label(device);
-        let label = key
-            .map(|k| text::display(catalog::label(k)))
-            .unwrap_or_default();
-        let job = match result {
-            Ok(o) => Some(o),
-            Err(f) => f.partial.as_deref(),
-        };
-        let summary = match job {
+        let summary = match f.partial.as_deref() {
             Some(Outcome::Job {
                 counts: Some(c), ..
-            }) => catalog::job_summary(command, c),
+            }) => catalog::failure_summary(c),
             _ => String::new(),
         };
-        match (command, result) {
-            (_, Err(f)) => {
-                let mut what = match command {
-                    SettingSet(..) => format!("save {label} for {name}"),
-                    SettingForget(..) => format!("forget the saved {label} for {name}"),
-                    SettingsRefresh(_) => format!("read the settings of {name}"),
-                    _ => format!("apply every saved value on {name}"),
-                };
-                if !summary.is_empty() && key.is_none() {
-                    what = format!("{what} ({summary})");
-                }
-                let words = text::error_words(&f.error);
-                self.note(Kind::Bad, format!("Couldn't {what}: {words}"));
-            }
-            (SettingSet(..), _) if self.hidpp_off(device) => self.note(
-                Kind::Info,
-                format!("Saved {label} on the dongle for {name}; not applied while HID++ is off"),
-            ),
-            (SettingSet(..), _) => {
-                self.note(
-                    Kind::Good,
-                    format!("Saved {label} on the dongle for {name}"),
-                );
-            }
-            (SettingForget(..), _) => self.note(
-                Kind::Info,
-                format!("{label} for {name} is Default; the device was left unchanged"),
-            ),
-            (SettingsRefresh(_), _) => {
-                self.note(
-                    Kind::Info,
-                    format!("Read the settings of {name}: {summary}"),
-                );
-            }
-            _ => self.note(
-                Kind::Good,
-                format!("Applied saved values on {name}: {summary}"),
-            ),
+        let mut what = match command {
+            SettingsRefresh(_) => format!("read the settings of {name}"),
+            _ => format!("apply every saved value on {name}"),
+        };
+        if !summary.is_empty() {
+            what = format!("{what} ({summary})");
         }
+        let words = text::error_words(&f.error);
+        self.note(Kind::Bad, format!("Couldn't {what}: {words}"));
     }
 }
 
