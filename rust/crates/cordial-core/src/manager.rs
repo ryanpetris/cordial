@@ -1,21 +1,17 @@
 //! Application-owned policy and live links. Bluetooth adapters own security and
 //! vendor procedures; this module owns admission, persistence and HID forwarding.
+use crate::model::{
+    errors::ErrorCode as Error,
+    identifiers::{ConnectionState as State, DeviceId, HostPlatform, Transport},
+};
 use crate::{
-    bluetooth::{Bluetooth, ConnectionSecurity, Descriptor, ReportType},
+    bluetooth::{Bluetooth, ConnectionSecurity, Descriptor},
     devices::{ACTIVE_CONNECTIONS, AdapterPreference, Device, Peer, Policies, Policy, Setup},
     forward::Forwarder,
     link::{Link, LinkId, Profile},
     storage::{Preferences, RecordStore},
 };
-use alloc::{boxed::Box, string::ToString, vec::Vec};
-use cordial_protocol::{
-    errors::{ErrorCode as Error, WarningCode},
-    identifiers::{
-        ConnectionState as State, DeviceId, HostPlatform, NormalizationState, PairingState,
-        Reconnect, Role, SettingsState, Transport,
-    },
-    messages::{self, WireError},
-};
+use alloc::{boxed::Box, vec::Vec};
 
 pub struct Connection {
     pub id: LinkId,
@@ -35,7 +31,6 @@ pub struct Manager {
     pub connections: [Option<Connection>; ACTIVE_CONNECTIONS],
     pub forward: Forwarder,
     pub preference: AdapterPreference,
-    pub revision: u64,
     pub storage_ready: bool,
     pub write_uncertain: bool,
     pub radio_ready: bool,
@@ -44,6 +39,8 @@ pub struct Manager {
     pub available_bytes: usize,
     native_limits: [usize; 2],
     pending_device: Option<u64>,
+    /// Devices deleted because their saved record was lost, not yet reported.
+    pub removed: Vec<DeviceId>,
 }
 impl Default for Manager {
     fn default() -> Self {
@@ -52,7 +49,6 @@ impl Default for Manager {
             connections: core::array::from_fn(|_| None),
             forward: Forwarder::default(),
             preference: AdapterPreference::default(),
-            revision: 0,
             storage_ready: false,
             write_uncertain: false,
             radio_ready: false,
@@ -65,12 +61,15 @@ impl Default for Manager {
             available_bytes: 0,
             native_limits: [0; 2],
             pending_device: None,
+            removed: Vec::new(),
         }
     }
 }
 impl Manager {
     /// Load complete records before publishing readiness or admitting a peer.
-    /// Load each document separately; never format a failed store here.
+    /// Load each document separately; never format a failed store here. A
+    /// device whose record is missing, undecodable or does not match its bond
+    /// is deleted; a read error fails the load and deletes nothing.
     pub async fn load<S: RecordStore, B: Bluetooth>(
         &mut self,
         store: &mut S,
@@ -91,9 +90,11 @@ impl Manager {
         let mut devices: Vec<Option<Device>> = Vec::new();
         self.caps = radio.capabilities();
         self.native_limits = [
-            radio.bond_capacity(cordial_protocol::identifiers::Transport::Classic),
-            radio.bond_capacity(cordial_protocol::identifiers::Transport::Ble),
+            radio.bond_capacity(Transport::Classic),
+            radio.bond_capacity(Transport::Ble),
         ];
+        let mut lost = Vec::new();
+        let mut stale_preferences = Vec::new();
         let mut previous = None;
         while let Some(key) = store
             .next_key(previous)
@@ -101,61 +102,63 @@ impl Manager {
             .map_err(|_| Error::StorageFailed)?
         {
             previous = Some(key);
+            let id = u64::from_be_bytes(key[1..].try_into().unwrap());
+            // Keys come in order, so every device record is read before any preferences.
+            // Preferences whose device is gone are what an interrupted delete left.
+            if key[0] == 4
+                && !lost.contains(&id)
+                && !devices.iter().flatten().any(|d| d.policy.id == id)
+            {
+                stale_preferences.push(id);
+            }
             if key[0] != 2 {
                 continue;
             }
-            let (policy, record_error) = Policies { store }.load_record(key).await;
-            use cordial_protocol::errors::ValidationError;
-            let mut validation =
-                record_error.or(match crate::bonds::load(store, policy.bond).await {
-                    Ok(Some(bond)) if !bond.valid() => Some(ValidationError::BondCorrupt),
-                    Ok(Some(bond)) if bond.owner != policy.id || bond.identity != policy.peer => {
-                        Some(ValidationError::BondMismatch)
-                    }
-                    Ok(Some(_)) => None,
-                    Ok(None) => Some(ValidationError::BondMissing),
-                    Err(crate::storage::Error::Corrupt) => Some(ValidationError::BondCorrupt),
-                    Err(_) => Some(ValidationError::ReadFailed),
-                });
-            let preferences = match (Preferences {
-                store,
-                device: policy.id,
-            })
-            .load_all()
-            .await
+            let Some(bytes) = store
+                .load_owned(key)
+                .await
+                .map_err(|_| Error::StorageFailed)?
+            else {
+                continue;
+            };
+            let Some(policy) = crate::bonds::decode(id, &bytes) else {
+                lost.push(id);
+                continue;
+            };
+            // Records load in ID order; a later record for the same peer is the
+            // corrupt one.
+            if devices
+                .iter()
+                .flatten()
+                .any(|d| d.policy.peer == policy.peer)
             {
+                lost.push(id);
+                continue;
+            }
+            let preferences = match (Preferences { store, device: id }).load_all().await {
                 Ok(p) => p,
-                Err(_) => {
-                    validation = Some(ValidationError::ReadFailed);
+                Err(crate::storage::Error::Corrupt) => {
+                    stale_preferences.push(id);
                     Vec::new()
                 }
+                Err(_) => return Err(Error::StorageFailed),
             };
             let mut device = Device::new(policy);
-            device.validation_error = validation;
-            device.pairing_state = if matches!(
-                validation,
-                Some(
-                    ValidationError::BondMissing
-                        | ValidationError::BondCorrupt
-                        | ValidationError::BondMismatch
-                )
-            ) {
-                PairingState::NeedsPairing
-            } else {
-                PairingState::Paired
-            };
-            device
-                .catalog
-                .restore_preferences(preferences)
-                .map_err(|_| Error::StorageFailed)?;
-            devices.try_reserve(1).map_err(|_| Error::Capacity)?;
-            for other in devices.iter_mut().flatten() {
-                if other.policy.peer == device.policy.peer {
-                    other.validation_error = Some(ValidationError::DeviceCorrupt);
-                    device.validation_error = Some(ValidationError::DeviceCorrupt);
-                }
+            if device.catalog.restore_preferences(preferences).is_err() {
+                stale_preferences.push(id);
             }
+            devices.try_reserve(1).map_err(|_| Error::Capacity)?;
             devices.push(Some(device));
+        }
+        for id in lost {
+            Policies { store }
+                .remove(0, id)
+                .await
+                .map_err(|_| Error::StorageFailed)?;
+        }
+        // Stale preferences are ignored, so a failed removal is retried at the next start.
+        for id in stale_preferences {
+            let _ = store.remove(crate::storage::record_key(4, id)).await;
         }
         self.devices = devices;
         self.refresh_enabled();
@@ -172,16 +175,13 @@ impl Manager {
                 && d.policy.enabled
                 && !d.policy.blocked
                 && !d.policy.deleting
-                && d.validation_error.is_none()
-                && d.pairing_state == PairingState::Paired
         };
         // Keep current selections; repairing another preferred record must not
         // evict a working device. Startup records are sorted by stable ID.
         let mut used = [0usize; 2];
         for d in self.devices.iter_mut().flatten() {
-            let kind = usize::from(
-                d.policy.peer.transport == cordial_protocol::identifiers::Transport::Ble,
-            );
+            let kind =
+                usize::from(d.policy.peer.transport == crate::model::identifiers::Transport::Ble);
             d.transport_supported = self.caps.supports(d.policy.peer.transport);
             d.effective_enabled = d.effective_enabled
                 && eligible(d)
@@ -198,11 +198,9 @@ impl Manager {
                     !d.effective_enabled
                         && eligible(d)
                         && used[usize::from(
-                            d.policy.peer.transport
-                                == cordial_protocol::identifiers::Transport::Ble,
+                            d.policy.peer.transport == crate::model::identifiers::Transport::Ble,
                         )] < self.native_limits[usize::from(
-                            d.policy.peer.transport
-                                == cordial_protocol::identifiers::Transport::Ble,
+                            d.policy.peer.transport == crate::model::identifiers::Transport::Ble,
                         )]
                         .saturating_sub(1)
                 })
@@ -214,69 +212,18 @@ impl Manager {
             let d = self.devices[slot].as_mut().unwrap();
             d.effective_enabled = true;
             used[usize::from(
-                d.policy.peer.transport == cordial_protocol::identifiers::Transport::Ble,
+                d.policy.peer.transport == crate::model::identifiers::Transport::Ble,
             )] += 1;
         }
     }
-    pub fn capacity(&self, caps: crate::bluetooth::Capabilities) -> messages::Capacity {
-        use cordial_protocol::{errors::PairUnavailable, identifiers::Transport};
-        let mut enabled = Vec::new();
-        let mut pairing = Vec::new();
-        for transport in [Transport::Classic, Transport::Ble]
-            .into_iter()
-            .filter(|t| caps.supports(*t))
-        {
-            enabled.push(messages::EnabledCapacity {
-                transports: alloc::vec![transport],
-                limit: self.native_limits[usize::from(transport == Transport::Ble)]
-                    .saturating_sub(1),
-                enabled: self
-                    .devices
-                    .iter()
-                    .flatten()
-                    .filter(|d| d.effective_enabled && d.policy.peer.transport == transport)
-                    .count(),
-            });
-            let reason = if !self.storage_ready {
-                Some(PairUnavailable::StorageUnavailable)
-            } else if self.native_limits[usize::from(transport == Transport::Ble)] == 0 {
-                Some(PairUnavailable::SetupCapacity)
-            } else if !self.radio_ready {
-                Some(PairUnavailable::RadioUnavailable)
-            } else if self.available_bytes
-                < crate::bonds::MAINTENANCE_BYTES + crate::bonds::PAIR_BYTES
-            {
-                Some(PairUnavailable::StorageFull)
-            } else if self
-                .connections
-                .iter()
-                .flatten()
-                .any(|c| c.device.is_none())
-            {
-                Some(PairUnavailable::PairingActive)
-            } else if self.connections.iter().all(Option::is_some) {
-                Some(PairUnavailable::ConnectionsFull)
-            } else {
-                None
-            };
-            pairing.push(messages::PairingCapacity {
-                transport,
-                available: reason.is_none(),
-                reason,
-                estimated_additional: (self
-                    .available_bytes
-                    .saturating_sub(crate::bonds::MAINTENANCE_BYTES)
-                    / crate::bonds::PAIR_BYTES),
-            });
-        }
-        messages::Capacity { enabled, pairing }
+    /// How many devices of `transport` can be enabled at once: the native bond
+    /// table less the entry kept free for pairing.
+    pub fn max_enabled(&self, transport: Transport) -> usize {
+        self.native_limits[usize::from(transport == Transport::Ble)].saturating_sub(1)
     }
-    pub fn changed(&mut self) -> u64 {
-        self.revision = self
-            .revision
-            .saturating_add(1)
-            .min(cordial_protocol::MAX_REVISION);
-        self.revision
+    /// No room to save another device.
+    pub fn storage_full(&self) -> bool {
+        self.available_bytes < crate::bonds::MAINTENANCE_BYTES + crate::bonds::PAIR_BYTES
     }
     pub fn find(&self, id: &DeviceId) -> Result<usize, Error> {
         self.devices
@@ -361,27 +308,17 @@ impl Manager {
         if !radio.capabilities().supports(d.policy.peer.transport) {
             return Err(Error::UnsupportedTransport);
         }
-        if d.validation_error.is_some() {
-            return Err(if d.pairing_state == PairingState::NeedsPairing {
-                Error::PairingRequired
-            } else {
-                Error::StorageFailed
-            });
-        }
         if !d.policy.enabled {
             return Err(Error::Disabled);
+        }
+        if d.policy.blocked {
+            return Err(Error::Blocked);
         }
         if !d.effective_enabled {
             return Err(Error::Capacity);
         }
-        if d.pairing_state == PairingState::NeedsPairing {
-            return Err(Error::PairingRequired);
-        }
         if explicit {
             d.explicit_connect()?;
-        }
-        if d.policy.blocked {
-            return Err(Error::Blocked);
         }
         if d.state == State::Connected {
             return Ok(None);
@@ -417,12 +354,12 @@ impl Manager {
             return Err(Error::UnsupportedTransport);
         }
         if self.native_limits
-            [usize::from(peer.transport == cordial_protocol::identifiers::Transport::Ble)]
+            [usize::from(peer.transport == crate::model::identifiers::Transport::Ble)]
             == 0
         {
-            return Err(Error::Capacity);
+            return Err(Error::UnsupportedTransport);
         }
-        if self.available_bytes < crate::bonds::MAINTENANCE_BYTES + crate::bonds::PAIR_BYTES {
+        if self.storage_full() {
             return Err(Error::StorageFull);
         }
         if self.devices.iter().all(Option::is_some) {
@@ -434,15 +371,6 @@ impl Manager {
             if d.policy.blocked {
                 return Err(Error::Blocked);
             }
-        }
-        if self.devices.iter().all(Option::is_some)
-            && !self
-                .devices
-                .iter()
-                .flatten()
-                .any(|d| d.pairing_state == PairingState::NeedsPairing && !d.policy.blocked)
-        {
-            return Err(Error::Capacity);
         }
         if self
             .connections
@@ -461,8 +389,9 @@ impl Manager {
     }
     /// Rebuild the native active view from committed records. Import existing
     /// entries in place so unrelated live connections keep their database index.
+    /// A device whose record turns out to be lost is deleted.
     pub async fn sync_bonds<S: RecordStore, B: Bluetooth>(
-        &self,
+        &mut self,
         store: &mut S,
         radio: &mut B,
     ) -> Result<(), Error> {
@@ -477,19 +406,63 @@ impl Manager {
                 radio.forget(peer).await?;
             }
         }
-        for d in self
-            .devices
-            .iter()
-            .flatten()
-            .filter(|d| d.effective_enabled)
-        {
-            let bond = crate::bonds::load(store, d.policy.bond)
-                .await
-                .map_err(|_| Error::StorageFailed)?
-                .ok_or(Error::StorageFailed)?;
-            radio.import_bond(&bond).await?;
+        let mut slot = 0;
+        while slot < self.devices.len() {
+            let Some(d) = self.devices[slot].as_ref().filter(|d| d.effective_enabled) else {
+                slot += 1;
+                continue;
+            };
+            let id = d.policy.id;
+            match crate::bonds::load(store, d.policy.bond).await {
+                Ok(Some(bond))
+                    if bond.valid() && bond.owner == id && bond.identity == d.policy.peer =>
+                {
+                    radio.import_bond(&bond).await?;
+                }
+                Ok(_) | Err(crate::storage::Error::Corrupt) => {
+                    self.lose(slot, store, radio).await?;
+                    // Losing a device can promote one at an earlier slot; import it too.
+                    slot = 0;
+                    continue;
+                }
+                Err(_) => return Err(Error::StorageFailed),
+            }
+            slot += 1;
         }
         Ok(())
+    }
+    /// Deletes a device whose saved record was lost, as an unpair would, and
+    /// queues its removal for the client.
+    pub async fn lose<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        slot: usize,
+        store: &mut S,
+        radio: &mut B,
+    ) -> Result<(), Error> {
+        let Some(d) = self.devices[slot].take() else {
+            return Ok(());
+        };
+        if let Some(id) = self.link_for(slot) {
+            self.forward.remove(id.slot as usize);
+            radio.disconnect(id);
+            if let Some(c) = self.connection_mut(id) {
+                c.device = None;
+                c.closing = true;
+            }
+        }
+        // The device leaves the model whether or not cleanup succeeds; a record left on flash is
+        // deleted again at the next startup.
+        let removal = Policies { store }.remove(slot, d.policy.id).await;
+        let result = match removal {
+            Err(_) => Err(Error::StorageFailed),
+            Ok(()) if radio.capabilities().supports(d.policy.peer.transport) => {
+                radio.forget(d.policy.peer).await
+            }
+            Ok(()) => Ok(()),
+        };
+        self.removed.push(d.policy.device_id());
+        self.refresh_enabled();
+        result
     }
     pub async fn prepare_pair<S: RecordStore, B: Bluetooth>(
         &mut self,
@@ -499,7 +472,7 @@ impl Manager {
         radio: &mut B,
     ) -> Result<(), Error> {
         if self.native_limits
-            [usize::from(peer.transport == cordial_protocol::identifiers::Transport::Ble)]
+            [usize::from(peer.transport == crate::model::identifiers::Transport::Ble)]
             == 0
         {
             return Err(Error::Capacity);
@@ -636,7 +609,7 @@ impl Manager {
             return Err(Error::NotPending);
         }
         if identity.transport != c.peer.transport
-            || (identity.transport == cordial_protocol::identifiers::Transport::Classic
+            || (identity.transport == crate::model::identifiers::Transport::Classic
                 && identity != c.peer)
         {
             return Err(Error::AuthenticationFailed);
@@ -646,19 +619,10 @@ impl Manager {
         if retained.is_some_and(|slot| self.devices[slot].as_ref().unwrap().policy.blocked) {
             return Err(Error::Blocked);
         }
-        if let Some(slot) = retained {
-            if self.link_for(slot).is_some_and(|other| other != id) {
-                return Err(Error::Busy);
-            }
-            if matches!(
-                self.devices[slot].as_ref().unwrap().validation_error,
-                Some(
-                    cordial_protocol::errors::ValidationError::DeviceCorrupt
-                        | cordial_protocol::errors::ValidationError::ReadFailed
-                )
-            ) {
-                return Err(Error::StorageFailed);
-            }
+        if let Some(slot) = retained
+            && self.link_for(slot).is_some_and(|other| other != id)
+        {
+            return Err(Error::Busy);
         }
         let slot = retained
             .or_else(|| self.devices.iter().position(Option::is_none))
@@ -674,9 +638,8 @@ impl Manager {
                 .filter(|d| d.effective_enabled && d.policy.peer.transport == identity.transport)
                 .count();
             policy.enabled = used
-                < self.native_limits[usize::from(
-                    identity.transport == cordial_protocol::identifiers::Transport::Ble,
-                )]
+                < self.native_limits
+                    [usize::from(identity.transport == crate::model::identifiers::Transport::Ble)]
                 .saturating_sub(1);
             policy
         };
@@ -704,8 +667,6 @@ impl Manager {
         }
         let d = self.devices[slot].as_mut().unwrap();
         d.policy = policy;
-        d.validation_error = None;
-        d.pairing_state = PairingState::Paired;
         d.paused = false;
         d.error = None;
         d.state = State::Connecting;
@@ -750,14 +711,11 @@ impl Manager {
         let slot = c.device.ok_or(Error::AuthenticationFailed)?;
         let profiles = descriptors
             .into_iter()
-            .map(|d| Profile::compile(d.service, &d.bytes))
+            .map(|d| Profile::from_map(d.service, d.map))
             .collect::<Result<Vec<_>, _>>()?;
         let d = self.devices[slot].as_mut().ok_or(Error::NotFound)?;
         if !d.effective_enabled {
             return Err(Error::Disabled);
-        }
-        if d.pairing_state != PairingState::Paired {
-            return Err(Error::PairingRequired);
         }
         let runtime = Link::new(
             id,
@@ -773,13 +731,13 @@ impl Manager {
                 d.roles & crate::hid::KEYBOARD != 0,
                 d.roles & crate::hid::MOUSE != 0,
             ) {
-                (true, true) => messages::DeviceKind::KeyboardMouse,
-                (true, false) => messages::DeviceKind::Keyboard,
-                (false, true) => messages::DeviceKind::Mouse,
-                _ => messages::DeviceKind::Unknown,
+                (true, true) => crate::model::link::DeviceKind::KeyboardMouse,
+                (true, false) => crate::model::link::DeviceKind::Keyboard,
+                (false, true) => crate::model::link::DeviceKind::Mouse,
+                _ => crate::model::link::DeviceKind::Unknown,
             },
         );
-        d.warnings = runtime.warnings;
+        d.update_warnings(&runtime.warnings)?;
         d.connection(State::Connected, None, now);
         let c = self.connections[id.slot as usize].as_mut().unwrap();
         c.runtime = Some(Box::new(runtime));
@@ -868,36 +826,24 @@ impl Manager {
             && let Some(out) = link.output(leds, now)?
         {
             let id = out.id;
-            if radio
-                .write(
-                    id,
-                    out.service,
-                    ReportType::Output,
-                    out.report_id,
-                    out.payload,
-                )
-                .is_err()
-            {
+            if let Err(error) = radio.write(id, out.service, out.kind, out.report_id, out.payload) {
                 changed |=
-                    link.output_complete(id, false, &mut d.catalog, &mut self.forward, now)?;
+                    link.output_complete(id, Err(error), &mut d.catalog, &mut self.forward, now)?;
             }
         }
         if radio.can_write(c.id)
-            && let Some(read) = link.battery_read(&d.catalog, now)
+            && let Some(read) = link.report_read(&d.catalog, now)
             && let Err(e) = radio.read(read.id, read.service, read.kind, read.report_id)
         {
-            link.battery_read_complete(read.id, read.kind, Err(e), &mut d.catalog);
+            link.report_read_complete(read.id, read.kind, Err(e), &mut d.catalog, now);
         }
-        if d.warnings != link.warnings {
-            d.warnings = link.warnings;
-            changed = true;
-        }
+        changed |= d.update_warnings(&link.warnings)?;
         Ok(changed.then_some(slot))
     }
     pub fn written(
         &mut self,
         id: crate::link::WriteId,
-        success: bool,
+        result: Result<(), Error>,
         now: u64,
     ) -> Result<Option<usize>, Error> {
         let Some(c) = self.connection(id.link) else {
@@ -915,11 +861,8 @@ impl Manager {
         };
         let d = self.devices[slot].as_mut().unwrap();
         let mut changed =
-            link.output_complete(id, success, &mut d.catalog, &mut self.forward, now)?;
-        if d.warnings != link.warnings {
-            d.warnings = link.warnings;
-            changed = true;
-        }
+            link.output_complete(id, result, &mut d.catalog, &mut self.forward, now)?;
+        changed |= d.update_warnings(&link.warnings)?;
         Ok(changed.then_some(slot))
     }
     /// The next first-connection setup progress to save: the connection and
@@ -972,8 +915,6 @@ impl Manager {
             && policy.enabled
             && !policy.blocked
             && self.caps.supports(policy.peer.transport)
-            && current.validation_error.is_none()
-            && current.pairing_state == PairingState::Paired
         {
             let used = self
                 .devices
@@ -983,7 +924,7 @@ impl Manager {
                 .count();
             if used
                 >= self.native_limits[usize::from(
-                    policy.peer.transport == cordial_protocol::identifiers::Transport::Ble,
+                    policy.peer.transport == crate::model::identifiers::Transport::Ble,
                 )]
                 .saturating_sub(1)
             {
@@ -993,15 +934,6 @@ impl Manager {
         let d = self.devices[slot].as_mut().unwrap();
         if d.policy.deleting {
             return Err(Error::Busy);
-        }
-        if matches!(
-            d.validation_error,
-            Some(
-                cordial_protocol::errors::ValidationError::DeviceCorrupt
-                    | cordial_protocol::errors::ValidationError::ReadFailed
-            )
-        ) {
-            return Err(Error::StorageFailed);
         }
         if policy.id != d.policy.id || policy.peer != d.policy.peer || policy.name != d.policy.name
         {
@@ -1018,10 +950,11 @@ impl Manager {
                 if self.write_uncertain {
                     self.storage_ready = false;
                 }
-                if error == crate::storage::Error::Full {
-                    Error::StorageFull
-                } else {
-                    Error::StorageFailed
+                match error {
+                    crate::storage::Error::Full => Error::StorageFull,
+                    // The saved record is missing, undecodable or holds another device's bond.
+                    crate::storage::Error::Missing => Error::NotFound,
+                    _ => Error::StorageFailed,
                 }
             })?;
         let was_vendor = d.catalog.info.battery.vendor();
@@ -1047,6 +980,42 @@ impl Manager {
             );
         }
         self.refresh_enabled();
+        Ok(())
+    }
+    /// Saves the adapter name and host platform together. On a platform change, every ready
+    /// HID++-enabled connection reconfigures for the new platform.
+    pub async fn adapter<S: RecordStore>(
+        &mut self,
+        name: Option<alloc::string::String>,
+        platform: HostPlatform,
+        store: &mut S,
+    ) -> Result<(), Error> {
+        self.write_uncertain = false;
+        if !self.storage_ready {
+            return Err(Error::StorageFailed);
+        }
+        let changed = self.preference.host_platform != platform;
+        self.save_preference(
+            AdapterPreference {
+                name,
+                host_platform: platform,
+            },
+            store,
+        )
+        .await?;
+        if changed {
+            for c in self.connections.iter_mut().flatten().filter(|c| !c.closing) {
+                let Some(slot) = c.device else {
+                    continue;
+                };
+                let d = self.devices[slot].as_mut().unwrap();
+                if d.policy.hidpp_enabled
+                    && let Some(link) = &mut c.runtime
+                {
+                    link.reconfigure(true, platform, &mut d.catalog);
+                }
+            }
+        }
         Ok(())
     }
     pub async fn name<S: RecordStore>(
@@ -1146,7 +1115,11 @@ impl Manager {
         if radio.capabilities().supports(policy.peer.transport)
             && let Err(error) = radio.forget(policy.peer).await
         {
-            self.storage_ready = false;
+            // Nothing was saved; the device stays as it was, and its bond is loaded again if the
+            // stack lost it.
+            self.devices[slot].as_mut().unwrap().policy = previous_policy;
+            self.refresh_enabled();
+            let _ = self.sync_bonds(store, radio).await;
             return Err(error);
         }
         if let Err(error) = (Policies { store }).remove(slot, policy.id).await {
@@ -1178,89 +1151,5 @@ impl Manager {
             }
         }
         Ok(())
-    }
-    pub fn record(&self, slot: usize) -> Option<messages::Device> {
-        let d = self.devices.get(slot)?.as_ref()?;
-        let runtime = self
-            .connections
-            .iter()
-            .flatten()
-            .find(|c| c.device == Some(slot) && !c.closing)
-            .and_then(|c| c.runtime.as_deref());
-        let pending = if d.policy.hidpp_enabled {
-            NormalizationState::Pending
-        } else {
-            NormalizationState::Off
-        };
-        let mut warnings = Vec::new();
-        if d.warnings & 1 != 0 {
-            warnings.push(WarningCode::UnsupportedFields);
-        }
-        if d.warnings & 2 != 0 {
-            warnings.push(WarningCode::LedOutputUnavailable);
-        }
-        Some(messages::Device {
-            device_id: d.policy.device_id(),
-            pairing_state: d.pairing_state,
-            enabled: d.policy.enabled,
-            effective_enabled: d.effective_enabled,
-            enabled_reason: if !d.transport_supported {
-                Some(cordial_protocol::errors::DisabledReason::UnsupportedTransport)
-            } else if d.validation_error.is_some() {
-                Some(cordial_protocol::errors::DisabledReason::Invalid)
-            } else if d.policy.blocked {
-                Some(cordial_protocol::errors::DisabledReason::Blocked)
-            } else if !d.policy.enabled {
-                Some(cordial_protocol::errors::DisabledReason::Disabled)
-            } else if !d.effective_enabled {
-                Some(cordial_protocol::errors::DisabledReason::Capacity)
-            } else {
-                None
-            },
-            transport_supported: d.transport_supported,
-            validation_error: d.validation_error,
-
-            name: (!d.policy.name.is_empty()).then(|| d.policy.name.to_string()),
-            transport: d.policy.peer.transport,
-            roles: [Role::Keyboard, Role::Mouse, Role::ConsumerControl]
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, r)| (d.roles & (1 << i) != 0).then_some(r))
-                .collect(),
-            state: d.state,
-            security: self
-                .link_for(slot)
-                .and_then(|id| self.connection(id))
-                .filter(|c| !c.closing && d.state == State::Connected)
-                .and_then(|c| c.security),
-            trusted: d.policy.trusted,
-            blocked: d.policy.blocked,
-            reconnect: if d.paused {
-                Reconnect::Paused
-            } else {
-                Reconnect::Auto
-            },
-            last_error: d.error.map(|code| WireError {
-                code,
-                details: None,
-            }),
-            warnings,
-            hidpp_enabled: d.policy.hidpp_enabled,
-            hidpp_protocol: runtime.map_or(Default::default(), |r| r.client.protocol),
-            normalization_state: runtime.map_or(pending, |r| r.client.status),
-            normalization_error: runtime
-                .filter(|r| r.client.status != NormalizationState::Off)
-                .and_then(|r| r.client.error.map(|e| e.code())),
-            settings_state: runtime.map_or(
-                if d.policy.hidpp_enabled {
-                    SettingsState::Pending
-                } else {
-                    SettingsState::Off
-                },
-                |r| r.settings.state,
-            ),
-            settings_error: runtime.and_then(|r| r.settings.error),
-            settings_revision: d.settings_revision,
-        })
     }
 }

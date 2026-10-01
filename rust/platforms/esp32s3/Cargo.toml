@@ -26,7 +26,6 @@ required-features = ["firmware"]
 cordial-record-storage = { path = "../../adapters/record-storage" }
 embedded-storage-async = "=0.4.2"
 cordial-core = { path = "../../crates/cordial-core" }
-cordial-protocol = { path = "../../crates/cordial-protocol" }
 esp-idf-sys = { version = "=0.38.1", features = ["native"] }
 critical-section = "=1.2.0"
 embassy-executor = "=0.10.0"

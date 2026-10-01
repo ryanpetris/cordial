@@ -1,7 +1,7 @@
 use crate::{Store, now};
 use cordial_ble_hid::Backend;
 use cordial_esp32s3::native::Native;
-use cordial_protocol::errors::ErrorCode as Error;
+use cordial_core::model::errors::ErrorCode as Error;
 
 pub type Radio = Backend<Native>;
 pub type Records = Store;

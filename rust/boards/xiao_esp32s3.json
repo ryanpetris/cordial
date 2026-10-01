@@ -14,6 +14,5 @@
   "usb_backend": "embassy",
   "storage_backend": "littlefs",
   "radio_backend": "esp-idf",
-  "firmware_bytes": 2097152,
-  "output_frames": 16
+  "firmware_bytes": 2097152
 }

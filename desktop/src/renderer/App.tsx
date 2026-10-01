@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { Navigation } from "../shared/state.ts";
-import { act, api, setReporter, useAppState } from "./api.ts";
+import { api, setReporter, useAppState } from "./api.ts";
 import { AddDevice } from "./components/AddDevice.tsx";
 import { AdapterPage } from "./components/AdapterPage.tsx";
 import { DevicePage, type Draft, type Drafts } from "./components/DevicePage.tsx";
@@ -56,7 +56,6 @@ export function App() {
         ? adapters.find((a) => a.id === selection.id)
         : true;
   const shown = current ? selection : HOME;
-  const watched = shown.page === "device" ? shown.key : null;
   const shownId = selection.page === "device" ? selection.key : selection.page === "adapter" ? selection.id : null;
   const seen = useRef<string | null>(null);
 
@@ -64,10 +63,6 @@ export function App() {
     if (current) seen.current = shownId;
     else if (seen.current === shownId) setSelection(HOME);
   }, [current, shownId]);
-
-  useEffect(() => {
-    void act({ type: "settings.watch", key: watched }, true);
-  }, [watched]);
 
   if (!state) return <div className="loading" />;
 
@@ -105,7 +100,6 @@ export function App() {
             state={state}
             entry={devices.find((d) => d.key === shown.key)!}
             drafts={draftsFor(shown.key)}
-            onAdd={() => setAdding(true)}
           />
         ) : shown.page === "adapter" ? (
           <AdapterPage
@@ -117,7 +111,7 @@ export function App() {
             onSelect={setSelection}
           />
         ) : (
-          <HomePage state={state} onSelect={setSelection} onAdd={() => setAdding(true)} />
+          <HomePage state={state} onSelect={setSelection} />
         )}
       </main>
       <AddDevice state={state} open={adding} onClose={() => setAdding(false)} onOpenDevice={(key) => setSelection({ page: "device", key })} />

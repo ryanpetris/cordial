@@ -159,7 +159,7 @@ fn bounded_descriptors_and_qualified_vendor_reports() {
     ));
     let mut absolute = MOUSE.to_vec();
     absolute[41] = 2;
-    assert!(matches!(Map::compile(&absolute), Err(Error::Unsupported)));
+    assert!(Map::compile(&absolute).is_ok());
     let mut descriptor = NKRO_MEDIA.to_vec();
     let vendor = [
         0x06, 0x00, 0xff, 0x09, 1, 0xa1, 1, 0x85, 0x10, 0x75, 8, 0x95, 6, 0x15, 0, 0x26, 0xff, 0,
@@ -288,3 +288,781 @@ const NKRO_MEDIA: &[u8] = &[
     0x96, 0, 1, 0x81, 2, 0xa4, 0x85, 2, 0x05, 12, 0x19, 0, 0x2a, 0xff, 3, 0x15, 0, 0x26, 0xff, 3,
     0x75, 16, 0x95, 2, 0x81, 0, 0xb4, 0x85, 3, 0x19, 0, 0x2a, 0xff, 0, 0x81, 2, 0xc0,
 ];
+
+fn consumer_field(usage: u16, size: u8, minimum: i16, maximum: u16, flags: u8) -> Vec<u8> {
+    let [min_lo, min_hi] = minimum.to_le_bytes();
+    let [max_lo, max_hi] = maximum.to_le_bytes();
+    let [usage_lo, usage_hi] = usage.to_le_bytes();
+    vec![
+        5, 12, 9, 1, 0xa1, 1, 0x0a, usage_lo, usage_hi, 0x16, min_lo, min_hi, 0x26, max_lo, max_hi,
+        0x75, size, 0x95, 1, 0x81, flags, 0xc0,
+    ]
+}
+
+#[test]
+fn consumer_counts_keep_order_and_retry_bytes_until_completion() {
+    let map = Map::compile(&consumer_field(0xe0, 16, i16::MIN, i16::MAX as u16, 6)).unwrap();
+    let mut state = map.state().unwrap();
+    let mut forward = Forwarder::default();
+    drain(&mut forward);
+    let axis = CONSUMER_AXES.iter().position(|&u| u == 0xe0).unwrap();
+    for value in [i16::MAX, -3] {
+        let input = map.decode(&mut state, 0, &value.to_le_bytes()).unwrap();
+        assert_eq!(input.consumer_motion[axis], i64::from(value));
+        assert_eq!(input.held, Held::default());
+        forward.input(0, input).unwrap();
+    }
+    let first = forward.packet().unwrap().clone();
+    assert_eq!(first.id, REPORT_CONSUMER_MOTION);
+    assert_eq!(first.bytes(), forward.packet().unwrap().bytes());
+    assert_eq!(
+        i32::from_le_bytes(first.bytes()[axis * 4..axis * 4 + 4].try_into().unwrap()),
+        i32::from(i16::MAX)
+    );
+    forward.complete();
+    let second = forward.packet().unwrap().clone();
+    assert_eq!(
+        i32::from_le_bytes(second.bytes()[axis * 4..axis * 4 + 4].try_into().unwrap()),
+        -3
+    );
+    forward.complete();
+    assert!(forward.packet().is_none());
+    let mut large = Input::default();
+    large.consumer_motion[axis] = MOTION_LIMIT;
+    forward.input(0, large).unwrap();
+    let sum: i64 = drain(&mut forward)
+        .iter()
+        .map(|p| {
+            i64::from(i32::from_le_bytes(
+                p.bytes()[axis * 4..axis * 4 + 4].try_into().unwrap(),
+            ))
+        })
+        .sum();
+    assert_eq!(sum, MOTION_LIMIT);
+    forward.enable(false);
+    forward.input(0, large).unwrap();
+    forward.enable(true);
+    assert!(
+        drain(&mut forward)
+            .iter()
+            .all(|p| p.id != REPORT_CONSUMER_MOTION)
+    );
+}
+
+#[test]
+fn preferred_linear_buttons_emit_only_edges() {
+    let map = Map::compile(&consumer_field(0xe0, 2, -1, 1, 6)).unwrap();
+    let mut state = map.state().unwrap();
+    let axis = CONSUMER_AXES.iter().position(|&u| u == 0xe0).unwrap();
+    for (raw, expected) in [(1, 1), (1, 0), (0, 0), (3, -1), (3, 0)] {
+        assert_eq!(
+            map.decode(&mut state, 0, &[raw]).unwrap().consumer_motion[axis],
+            expected
+        );
+    }
+    state.clear();
+    assert_eq!(
+        map.decode(&mut state, 0, &[1]).unwrap().consumer_motion[axis],
+        1
+    );
+}
+
+#[test]
+fn relative_on_off_controls_use_distinct_reports_and_rearm_after_completion() {
+    let mut forward = Forwarder::default();
+    drain(&mut forward);
+    for (minimum, size, report, value) in [
+        (0, 1, REPORT_CONSUMER_TOGGLE, 1),
+        (-1, 2, REPORT_CONSUMER_ON_OFF, 3),
+    ] {
+        let map = Map::compile(&consumer_field(
+            0xe2,
+            size,
+            minimum,
+            1,
+            if minimum == 0 { 6 } else { 0x26 },
+        ))
+        .unwrap();
+        let mut state = map.state().unwrap();
+        let switch = CONSUMER_SWITCHES.iter().position(|&u| u == 0xe2).unwrap();
+        for raw in [value, value, 0, value] {
+            let input = map.decode(&mut state, 0, &[raw]).unwrap();
+            assert_eq!(input.held, Held::default());
+            forward.input(0, input).unwrap();
+        }
+        let packets = drain(&mut forward);
+        assert_eq!(packets.len(), 4);
+        assert!(packets.iter().all(|p| p.id == report));
+        let width = if size == 1 { 1 } else { 2 };
+        let bit = switch * width;
+        for pair in packets.as_chunks::<2>().0 {
+            assert_eq!(
+                (pair[0].bytes()[bit / 8] >> (bit % 8)) & ((1 << width) - 1),
+                value
+            );
+            assert!(pair[1].bytes().iter().all(|&v| v == 0));
+        }
+    }
+}
+
+#[test]
+fn one_shot_release_precedes_bulk_motion_and_keeps_other_sources_held() {
+    let map = Map::compile(&consumer_field(0xcd, 1, 0, 1, 6)).unwrap();
+    let mut state = map.state().unwrap();
+    let mut input = map.decode(&mut state, 0, &[1]).unwrap();
+    input.motion[0] = MOTION_LIMIT;
+    let mut forward = Forwarder::default();
+    drain(&mut forward);
+    let mut other = Input::default();
+    other.held.consumer(0xe9).unwrap();
+    forward.input(1, other).unwrap();
+    drain(&mut forward);
+    forward.input(0, input).unwrap();
+    let packets = drain(&mut forward);
+    assert_eq!(packets[0].id, REPORT_CONSUMER);
+    assert_eq!(packets[0].bytes()[..4], [0xcd, 0, 0xe9, 0]);
+    assert_eq!(packets[1].id, REPORT_CONSUMER);
+    assert_eq!(packets[1].bytes()[..4], [0xe9, 0, 0, 0]);
+    assert!(packets[2..].iter().all(|p| p.id == REPORT_MOUSE));
+    assert_eq!(
+        map.decode(&mut state, 0, &[1]).unwrap().pulses,
+        Held::default()
+    );
+}
+
+#[test]
+fn rejected_reports_do_not_change_relative_keyboard_latches() {
+    let descriptor = [
+        5, 1, 9, 6, 0xa1, 1, 5, 7, 9, 4, 0x15, 0xff, 0x25, 1, 0x75, 2, 0x95, 1, 0x81, 6, 0x19, 0,
+        0x29, 0x65, 0x15, 0, 0x25, 0x65, 0x75, 8, 0x81, 0, 0xc0,
+    ];
+    let map = Map::compile(&descriptor).unwrap();
+    let mut state = map.state().unwrap();
+    assert_eq!(map.decode(&mut state, 0, &[5, 0]), Err(Error::Rollover));
+    assert!(!key(&map.decode(&mut state, 0, &[0, 0]).unwrap().held, 4));
+    assert!(key(&map.decode(&mut state, 0, &[1, 0]).unwrap().held, 4));
+    assert!(key(&map.decode(&mut state, 0, &[0, 0]).unwrap().held, 4));
+    assert!(!key(&map.decode(&mut state, 0, &[3, 0]).unwrap().held, 4));
+}
+
+#[test]
+fn indicator_ranges_arrays_and_unrelated_values_are_preserved() {
+    let mut descriptor = KEYBOARD.to_vec();
+    let end = descriptor.pop().unwrap();
+    assert_eq!(end, 0xc0);
+    descriptor.extend_from_slice(&[
+        5, 8, 9, 2, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x91, 2, 0x06, 0, 0xff, 9, 1, 0x91, 2,
+        0xc0,
+    ]);
+    let map = Map::compile(&descriptor).unwrap();
+    let mut bytes = [0; 3];
+    assert_eq!(
+        encode_indicators(&map, 0, 2, None, None, false, &mut bytes),
+        Err(IndicatorError::ReadRequired)
+    );
+    assert_eq!(
+        encode_indicators(&map, 0, 2, None, Some(&[0xff, 7, 42]), false, &mut bytes),
+        Ok(Some(3))
+    );
+    assert_eq!(bytes, [0xe2, 1, 42]);
+    let mut descriptor = KEYBOARD.to_vec();
+    descriptor.pop();
+    descriptor.extend_from_slice(&[
+        5, 8, 0x19, 0, 0x29, 5, 0x15, 0, 0x25, 5, 0x75, 8, 0x95, 3, 0x91, 0, 0xc0,
+    ]);
+    let map = Map::compile(&descriptor).unwrap();
+    let mut bytes = [0; 4];
+    assert_eq!(
+        encode_indicators(&map, 0, 0x15, None, None, false, &mut bytes),
+        Ok(Some(4))
+    );
+    assert_eq!(bytes, [0x15, 1, 3, 5]);
+    assert_eq!(
+        encode_indicators(&map, 0, 31, None, None, false, &mut bytes),
+        Err(IndicatorError::ArrayCapacity)
+    );
+}
+
+#[test]
+fn mixed_volatile_and_relative_output_values_use_neutral_encodings() {
+    let mut descriptor = KEYBOARD.to_vec();
+    descriptor.pop();
+    descriptor.extend_from_slice(&[
+        0x06, 0, 0xff, 9, 1, 0x15, 0, 0x25, 100, 0x75, 8, 0x95, 1, 0x91, 0xc2, 9, 2, 0x15, 0xff,
+        0x25, 1, 0x91, 6, 0xc0,
+    ]);
+    let map = Map::compile(&descriptor).unwrap();
+    let mut bytes = [0; 3];
+    assert_eq!(
+        encode_indicators(&map, 0, 2, None, None, false, &mut bytes),
+        Ok(Some(3))
+    );
+    assert_eq!(bytes, [2, 101, 0]);
+}
+
+#[test]
+fn absolute_values_preserve_zero_and_resume_the_latest_state() {
+    let map = Map::compile(&consumer_field(0xe0, 8, 0, 100, 2)).unwrap();
+    let mut state = map.state().unwrap();
+    let axis = CONSUMER_AXES.iter().position(|&u| u == 0xe0).unwrap();
+    let mut forward = Forwarder::default();
+    drain(&mut forward);
+    forward
+        .input(0, map.decode(&mut state, 0, &[0]).unwrap())
+        .unwrap();
+    let packets = drain(&mut forward);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].id, REPORT_CONSUMER_VALUES);
+    assert_eq!(&packets[0].bytes()[2 * axis..2 * axis + 2], &[0, 0]);
+    forward.enable(false);
+    let mut latest = map.decode(&mut state, 0, &[100]).unwrap();
+    latest.position = [Some(1_000), Some(2_000), None];
+    latest.motion = [99; 4];
+    forward.input(0, latest).unwrap();
+    forward.enable(true);
+    let packets = drain(&mut forward);
+    let absolute = packets
+        .iter()
+        .find(|p| p.id == REPORT_CONSUMER_VALUES)
+        .unwrap();
+    assert_eq!(
+        &absolute.bytes()[2 * axis..2 * axis + 2],
+        &65_534u16.to_le_bytes()
+    );
+    let pointer = packets
+        .iter()
+        .find(|p| p.id == REPORT_POINTER_POSITION)
+        .unwrap();
+    assert_eq!(pointer.bytes(), &[0xe8, 3, 0xd0, 7, 0xff, 0xff]);
+    assert!(
+        packets
+            .iter()
+            .filter(|p| p.id == REPORT_MOUSE)
+            .all(|p| p.bytes()[2..].iter().all(|&v| v == 0))
+    );
+    forward.remove(0);
+    forward.resync();
+    assert!(
+        drain(&mut forward)
+            .iter()
+            .all(|p| ![REPORT_POINTER_POSITION, REPORT_CONSUMER_VALUES].contains(&p.id))
+    );
+}
+
+#[test]
+fn removing_or_suspending_a_source_rearms_relative_switch_reports() {
+    for suspend in [false, true] {
+        let mut forward = Forwarder::default();
+        drain(&mut forward);
+        let mut input = Input::default();
+        input.consumer_switches[0] = 1;
+        forward.input(0, input).unwrap();
+        assert_eq!(forward.packet().unwrap().id, REPORT_CONSUMER_TOGGLE);
+        if suspend {
+            forward.enable(false);
+            forward.enable(true);
+        } else {
+            forward.remove(0);
+            forward.complete();
+        }
+        forward.input(1, input).unwrap();
+        let packets: Vec<_> = drain(&mut forward)
+            .into_iter()
+            .filter(|p| p.id == REPORT_CONSUMER_TOGGLE)
+            .collect();
+        assert_eq!(packets.len(), 3);
+        assert_eq!(packets[0].bytes(), &[0; 5]);
+        assert_eq!(packets[1].bytes(), &[1, 0, 0, 0, 0]);
+        assert_eq!(packets[2].bytes(), &[0; 5]);
+    }
+}
+
+#[test]
+fn null_samples_keep_the_previous_valid_edge_state() {
+    let map = Map::compile(&consumer_field(0xe2, 2, 0, 1, 0x46)).unwrap();
+    let mut state = map.state().unwrap();
+    let index = CONSUMER_SWITCHES.iter().position(|&u| u == 0xe2).unwrap();
+    for (raw, expected) in [(0, 0), (2, 0), (1, 1), (2, 0), (1, 0), (0, 0), (1, 1)] {
+        assert_eq!(
+            map.decode(&mut state, 0, &[raw]).unwrap().consumer_switches[index],
+            expected
+        );
+    }
+}
+
+#[test]
+fn selector_empty_and_volatile_unchanged_values_do_not_require_null_state() {
+    let mut descriptor = KEYBOARD.to_vec();
+    descriptor.pop();
+    descriptor.extend_from_slice(&[
+        5, 8, 0x19, 1, 0x29, 5, 0x15, 1, 0x25, 5, 0x75, 8, 0x95, 5, 0x91, 0, 0x06, 0, 0xff, 9, 1,
+        0x15, 0, 0x25, 10, 0x95, 1, 0x91, 0x82, 0xc0,
+    ]);
+    let map = Map::compile(&descriptor).unwrap();
+    let mut bytes = [0xff; 7];
+    assert_eq!(
+        encode_indicators(&map, 0, 0, None, None, false, &mut bytes),
+        Ok(Some(7))
+    );
+    assert_eq!(bytes, [0, 0, 0, 0, 0, 0, 11]);
+}
+
+fn encode_indicators(
+    map: &Map,
+    report: usize,
+    leds: u8,
+    confirmed: Option<u8>,
+    baseline: Option<&[u8]>,
+    rearm: bool,
+    payload: &mut [u8],
+) -> Result<Option<usize>, IndicatorError> {
+    map.indicator_report(
+        report,
+        leds,
+        cordial_core::hid::IndicatorValue {
+            bits: confirmed.unwrap_or(0),
+            known: confirmed.map_or(0, |_| 31),
+        },
+        baseline,
+        rearm,
+        payload,
+    )
+    .map(|r| r.map(|r| r.length))
+    .map_err(|e| e.reason)
+}
+
+#[test]
+fn null_samples_retain_absolute_and_relative_key_holds() {
+    for (minimum, flags, release) in [(0, 0x42, 0), (-1, 0x46, 3)] {
+        let descriptor = [
+            5,
+            1,
+            9,
+            6,
+            0xa1,
+            1,
+            5,
+            7,
+            9,
+            4,
+            0x15,
+            minimum as u8,
+            0x25,
+            1,
+            0x75,
+            2,
+            0x95,
+            1,
+            0x81,
+            flags,
+            0xc0,
+        ];
+        let map = Map::compile(&descriptor).unwrap();
+        let mut state = map.state().unwrap();
+        for (raw, held) in [
+            (1, true),
+            (2, true),
+            (1, true),
+            (release, false),
+            (2, false),
+        ] {
+            assert_eq!(
+                key(&map.decode(&mut state, 0, &[raw]).unwrap().held, 4),
+                held
+            );
+        }
+    }
+}
+
+#[test]
+fn padded_signed_values_and_indicator_bits_use_the_declared_field_width() {
+    let descriptor = consumer_field(0xe0, 64, -1, 1, 6);
+    let map = Map::compile(&descriptor).unwrap();
+    let mut state = map.state().unwrap();
+    let axis = CONSUMER_AXES.iter().position(|&u| u == 0xe0).unwrap();
+    assert_eq!(
+        map.decode(&mut state, 0, &(-1i64).to_le_bytes())
+            .unwrap()
+            .consumer_motion[axis],
+        -1
+    );
+    let mut descriptor = KEYBOARD.to_vec();
+    descriptor.pop();
+    descriptor.extend_from_slice(&[
+        5, 8, 9, 2, 0x15, 0xff, 0x25, 1, 0x75, 64, 0x95, 1, 0x91, 6, 0xc0,
+    ]);
+    let map = Map::compile(&descriptor).unwrap();
+    let mut bytes = [0; 9];
+    encode_indicators(&map, 0, 0, None, None, false, &mut bytes).unwrap();
+    assert_eq!(bytes, [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+}
+
+#[test]
+fn one_shot_represses_a_usage_held_by_another_source() {
+    let mut forward = Forwarder::default();
+    drain(&mut forward);
+    let mut held = Input::default();
+    held.held.consumer(0xcd).unwrap();
+    held.held.consumer(0xe9).unwrap();
+    forward.input(1, held).unwrap();
+    drain(&mut forward);
+    let mut pulse = Input::default();
+    pulse.pulses.consumer(0xcd).unwrap();
+    forward.input(0, pulse).unwrap();
+    let release = forward.packet().unwrap().clone();
+    assert_eq!(release.id, REPORT_CONSUMER);
+    assert_eq!(&release.bytes()[..4], &[0xe9, 0, 0, 0]);
+    assert_eq!(forward.packet().unwrap().bytes(), release.bytes());
+    forward.complete();
+    let packets = drain(&mut forward);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(&packets[0].bytes()[..4], &[0xcd, 0, 0xe9, 0]);
+    forward.remove(0);
+    assert!(drain(&mut forward).is_empty());
+    forward.remove(1);
+    assert_eq!(drain(&mut forward)[0].bytes(), &[0; 16]);
+}
+
+#[test]
+fn custom_input_bytes_leave_standard_keys_available_with_a_field_diagnostic() {
+    let mut descriptor = KEYBOARD.to_vec();
+    descriptor.pop();
+    descriptor.extend_from_slice(&[
+        5, 7, 9, 4, 0x15, 0, 0x25, 1, 0x75, 8, 0x95, 1, 0x82, 2, 1, 0xc0,
+    ]);
+    let map = Map::compile(&descriptor).unwrap();
+    assert_eq!(map.limitations().len(), 1);
+    assert_eq!(
+        map.limitations()[0].code,
+        cordial_core::model::errors::WarningCode::BufferedInputUnsupported
+    );
+    assert_eq!(map.limitations()[0].usage_page, 7);
+    let mut bytes = [0; 9];
+    bytes[2] = 5;
+    assert!(key(
+        &map.decode(&mut map.state().unwrap(), 0, &bytes)
+            .unwrap()
+            .held,
+        5
+    ));
+}
+
+#[test]
+fn an_unknown_toggle_does_not_block_independent_known_lights() {
+    let mut descriptor = KEYBOARD.to_vec();
+    descriptor.pop();
+    descriptor.extend_from_slice(&[
+        5, 8, 9, 2, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x91, 6, 9, 3, 0x91, 6, 0xc0,
+    ]);
+    let map = Map::compile(&descriptor).unwrap();
+    let mut bytes = [0; 2];
+    let encoded = map
+        .indicator_report(
+            0,
+            6,
+            IndicatorValue { bits: 0, known: 2 },
+            None,
+            false,
+            &mut bytes,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(bytes, [6, 1]);
+    assert_eq!(encoded.unknown, 4);
+    assert_eq!(
+        map.indicator_locations(0, encoded.unknown)
+            .collect::<Vec<_>>(),
+        vec![(2, 0x80003), (9, 0x80003)]
+    );
+}
+
+#[test]
+fn the_last_history_bit_is_distinct_from_a_field_without_history() {
+    let mut descriptor = vec![5, 1, 9, 6, 0xa1, 1, 5, 7, 9, 4, 0x15, 0, 0x25, 1, 0x75, 1];
+    for report in 1..=16 {
+        descriptor.extend_from_slice(&[
+            0x85, report, 0x96, 0xff, 0x0f, 9, 4, 0x81, 6, 0x95, 1, 9, 4, 0x81, 6,
+        ]);
+    }
+    descriptor.push(0xc0);
+    let map = Map::compile(&descriptor).unwrap();
+    let mut state = map.state().unwrap();
+    let mut bytes = [0; REPORT_BYTES];
+    bytes[511] = 0x80;
+    assert!(key(&map.decode(&mut state, 16, &bytes).unwrap().pulses, 4));
+    assert_eq!(
+        map.decode(&mut state, 16, &bytes).unwrap().pulses,
+        Held::default()
+    );
+    bytes[511] = 0;
+    map.decode(&mut state, 16, &bytes).unwrap();
+    bytes[511] = 0x80;
+    assert!(key(&map.decode(&mut state, 16, &bytes).unwrap().pulses, 4));
+}
+
+#[test]
+fn input_array_high_flags_do_not_change_selector_semantics() {
+    let descriptor = [
+        5, 1, 9, 6, 0xa1, 1, 5, 7, 0x19, 0, 0x29, 0x65, 0x15, 0, 0x25, 0x65, 0x75, 8, 0x95, 1,
+        0x82, 0, 1, 0xc0,
+    ];
+    let map = Map::compile(&descriptor).unwrap();
+    assert!(map.limitations().is_empty());
+    assert!(key(
+        &map.decode(&mut map.state().unwrap(), 0, &[4]).unwrap().held,
+        4
+    ));
+}
+
+#[test]
+fn relative_selector_items_emit_independent_pulses_and_rearm_when_cleared() {
+    // Two independent selector fields include the same key. An ordinary held
+    // key and another selector's previous sample do not suppress a new pulse.
+    let descriptor = [
+        5, 1, 9, 6, 0xa1, 1, 5, 7, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 9, 4, 0x81, 2, 0x75, 7,
+        0x81, 1, 0x75, 8, 9, 0, 9, 4, 0x81, 4, 9, 0, 9, 4, 0x81, 4, 0xc0,
+    ];
+    let map = Map::compile(&descriptor).unwrap();
+    assert!(map.limitations().is_empty());
+    let mut state = map.state().unwrap();
+    let first = map.decode(&mut state, 0, &[1, 1, 0]).unwrap();
+    assert!(key(&first.held, 4) && key(&first.pulses, 4));
+    assert!(!key(
+        &map.decode(&mut state, 0, &[1, 1, 0]).unwrap().pulses,
+        4
+    ));
+    assert!(key(
+        &map.decode(&mut state, 0, &[1, 1, 1]).unwrap().pulses,
+        4
+    ));
+    assert!(!key(
+        &map.decode(&mut state, 0, &[1, 0, 1]).unwrap().pulses,
+        4
+    ));
+    assert!(key(
+        &map.decode(&mut state, 0, &[1, 1, 1]).unwrap().pulses,
+        4
+    ));
+    state.clear();
+    assert!(key(
+        &map.decode(&mut state, 0, &[0, 1, 0]).unwrap().pulses,
+        4
+    ));
+}
+
+#[test]
+fn unsupported_numeric_array_selectors_do_not_fill_held_control_history() {
+    let mut descriptor = vec![
+        5, 12, 9, 1, 0xa1, 1, 0x15, 0, 0x25, 10, 0x75, 8, 0x95, 10, 9, 0,
+    ];
+    for usage in cordial_core::hid::CONSUMER_AXES.into_iter().take(9) {
+        descriptor.extend_from_slice(&[0x0a, usage as u8, (usage >> 8) as u8]);
+    }
+    descriptor.extend_from_slice(&[9, 0xcd, 0x81, 4, 0xc0]);
+    let map = Map::compile(&descriptor).unwrap();
+    let mut state = map.state().unwrap();
+    let payload = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    assert_eq!(
+        map.decode(&mut state, 0, &payload)
+            .unwrap()
+            .pulses
+            .consumers[0],
+        0xcd
+    );
+    assert_eq!(
+        map.decode(&mut state, 0, &payload).unwrap().pulses,
+        Held::default()
+    );
+}
+
+#[test]
+fn absolute_numeric_selectors_are_diagnosed_without_losing_ordinary_controls() {
+    let bytes = [
+        5, 12, 9, 1, 0xa1, 1, 9, 0, 9, 0xe0, 9, 0xcd, 0x15, 0, 0x25, 2, 0x75, 8, 0x95, 2, 0x81, 0,
+        0xc0,
+    ];
+    let map = Map::compile(&bytes).unwrap();
+    assert_eq!(
+        map.limitations()[0].code,
+        cordial_core::model::errors::WarningCode::NumericSelectorUnsupported
+    );
+    assert_eq!(map.limitations()[0].usage, 0xe0);
+    let input = map.decode(&mut map.state().unwrap(), 0, &[1, 2]).unwrap();
+    assert_eq!(input.held.consumers[0], 0xcd);
+}
+
+#[test]
+fn contact_controls_forward_as_held_keys_and_standard_relative_switches() {
+    for usage in [0x500, 0x501, 0x502, 0x514] {
+        let map = Map::compile(&consumer_field(usage, 1, 0, 1, 2)).unwrap();
+        assert_eq!(
+            map.decode(&mut map.state().unwrap(), 0, &[1])
+                .unwrap()
+                .held
+                .consumers[0],
+            usage
+        );
+    }
+    for usage in [0x500, 0x501, 0x502] {
+        for (minimum, size, raw) in [(0, 1, 1), (-1, 2, 3)] {
+            let map = Map::compile(&consumer_field(usage, size, minimum, 1, 6)).unwrap();
+            let index = CONSUMER_SWITCHES.iter().position(|&u| u == usage).unwrap();
+            let mut forward = Forwarder::default();
+            drain(&mut forward);
+            forward
+                .input(0, map.decode(&mut map.state().unwrap(), 0, &[raw]).unwrap())
+                .unwrap();
+            let packets = drain(&mut forward);
+            assert_eq!(packets.len(), 2);
+            let bits = if minimum == 0 { 1 } else { 2 };
+            assert_eq!(
+                packets[0].id,
+                if minimum == 0 {
+                    REPORT_CONSUMER_TOGGLE
+                } else {
+                    REPORT_CONSUMER_ON_OFF
+                }
+            );
+            assert_eq!(
+                (packets[0].bytes()[index * bits / 8] >> (index * bits % 8)) & ((1 << bits) - 1),
+                raw
+            );
+            assert_eq!(
+                packets[0].bytes().len(),
+                (CONSUMER_SWITCHES.len() * bits).div_ceil(8)
+            );
+        }
+    }
+}
+
+#[test]
+fn repeated_on_off_controls_compose_in_field_order() {
+    let mute = CONSUMER_SWITCHES.iter().position(|&u| u == 0xe2).unwrap();
+    for (signed_first, expected) in [(true, -1), (false, 1)] {
+        let mut bytes = vec![5, 12, 9, 1, 0xa1, 1, 0x75, 2, 0x95, 1];
+        for signed in [signed_first, !signed_first] {
+            bytes.extend_from_slice(&[
+                9,
+                0xe2,
+                0x15,
+                if signed { 0xff } else { 0 },
+                0x25,
+                1,
+                0x81,
+                6,
+            ]);
+        }
+        bytes.push(0xc0);
+        let map = Map::compile(&bytes).unwrap();
+        let input = map.decode(&mut map.state().unwrap(), 0, &[5]).unwrap();
+        assert_eq!(input.consumer_switches[mute], expected);
+        assert_ne!(input.explicit_switches & (1 << mute), 0);
+    }
+    let bytes = [
+        5, 12, 9, 1, 0xa1, 1, 0x75, 1, 0x95, 2, 9, 0xe2, 9, 0xe2, 0x15, 0, 0x25, 1, 0x81, 6, 0xc0,
+    ];
+    let map = Map::compile(&bytes).unwrap();
+    assert_eq!(
+        map.decode(&mut map.state().unwrap(), 0, &[3])
+            .unwrap()
+            .consumer_switches[mute],
+        0
+    );
+    let bytes = [
+        5, 12, 9, 1, 0xa1, 1, 0x75, 8, 0x95, 2, 9, 0, 9, 0xe2, 0x15, 0, 0x25, 1, 0x81, 4, 0xc0,
+    ];
+    let map = Map::compile(&bytes).unwrap();
+    assert_eq!(
+        map.decode(&mut map.state().unwrap(), 0, &[1, 1])
+            .unwrap()
+            .consumer_switches[mute],
+        1
+    );
+}
+
+#[test]
+fn repeated_ordered_usage_sequences_share_storage_and_keep_selector_order() {
+    let mut bytes = vec![
+        5, 1, 9, 6, 0xa1, 1, 5, 7, 0x75, 8, 0x95, 1, 0x15, 0, 0x25, 2,
+    ];
+    for field in 0..96 {
+        bytes.extend_from_slice(&[
+            9,
+            0,
+            9,
+            if field % 2 == 0 { 5 } else { 4 },
+            9,
+            if field % 2 == 0 { 4 } else { 5 },
+            0x81,
+            0,
+        ]);
+    }
+    bytes.push(0xc0);
+    let map = Map::compile(&bytes).unwrap();
+    let mut payload = [0; 96];
+    payload[0] = 1;
+    let input = map.decode(&mut map.state().unwrap(), 0, &payload).unwrap();
+    assert!(key(&input.held, 5) && !key(&input.held, 4));
+    payload[0] = 0;
+    payload[1] = 1;
+    let input = map.decode(&mut map.state().unwrap(), 0, &payload).unwrap();
+    assert!(key(&input.held, 4) && !key(&input.held, 5));
+}
+
+#[test]
+fn repeated_one_shot_fields_forward_each_edge_with_bounded_queue_admission() {
+    let mut bytes = vec![5, 12, 9, 1, 0xa1, 1, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1];
+    for _ in 0..3 {
+        bytes.extend_from_slice(&[9, 0xb5, 0x81, 6]);
+    }
+    bytes.push(0xc0);
+    let map = Map::compile(&bytes).unwrap();
+    let mut state = map.state().unwrap();
+    let input = map.decode(&mut state, 0, &[7]).unwrap();
+    let mut forward = Forwarder::default();
+    drain(&mut forward);
+    forward.input(0, input).unwrap();
+    let packets = drain(&mut forward);
+    assert_eq!(packets.len(), 6);
+    for pair in packets.as_chunks::<2>().0 {
+        assert_eq!(pair[0].id, REPORT_CONSUMER);
+        assert_eq!(&pair[0].bytes()[..2], &0xb5u16.to_le_bytes());
+        assert_eq!(pair[1].bytes(), &[0; 16]);
+    }
+    assert_eq!(
+        map.decode(&mut state, 0, &[7])
+            .unwrap()
+            .pulse_repetition_count,
+        0
+    );
+    for n in 0..QUEUE - 1 {
+        forward
+            .input(
+                1 + n % 2,
+                Input {
+                    motion: [1, 0, 0, 0],
+                    ..Input::default()
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        forward.input(0, input),
+        Err(cordial_core::hid::Error::Overflow)
+    );
+}
+
+#[test]
+fn a_consumer_range_spanning_a_numeric_control_is_not_diagnosed() {
+    // A keyboard's Consumer array covering usages 1 through 0x29c, which includes AC Pan.
+    let bytes = [
+        5, 12, 9, 1, 0xa1, 1, 0x15, 1, 0x26, 0x9c, 2, 0x19, 1, 0x2a, 0x9c, 2, 0x75, 16, 0x95, 1,
+        0x81, 0, 0xc0,
+    ];
+    let map = Map::compile(&bytes).unwrap();
+    assert!(map.limitations().is_empty());
+    let input = map
+        .decode(&mut map.state().unwrap(), 0, &[0xcd, 0])
+        .unwrap();
+    assert_eq!(input.held.consumers[0], 0xcd);
+}

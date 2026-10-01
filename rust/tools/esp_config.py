@@ -80,10 +80,8 @@ cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_byte
     defaults = f"# Project native sources: {digest.hexdigest()}\n"
     defaults += "".join(f"CONFIG_{key}={encode(value)}\n" for key, value in values.items())
     (out / "sdkconfig.defaults").write_text(defaults)
-    (out / "board.rs").write_text(f"""pub const RADIO_BACKEND: &str = "esp-idf";
-pub const DEFAULT_ADAPTER_NAME: &str = {json.dumps(config["default_adapter_name"], ensure_ascii=False)};
+    (out / "board.rs").write_text(f"""pub const DEFAULT_ADAPTER_NAME: &str = {json.dumps(config["default_adapter_name"], ensure_ascii=False)};
 pub const HARDWARE: &str = {json.dumps(config['name'])};
-pub const HARDWARE_DIGEST: &str = {json.dumps(config['hardware_digest'])};
 pub const STORAGE_START: u32 = {config['storage_offset']};
 pub const STORAGE_END: u32 = {config['flash_bytes']};
 pub const NATIVE_STORAGE_START: u32 = 0x9000;

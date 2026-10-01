@@ -126,7 +126,7 @@ int main(void) {
         link.reports[0].type=cases[i].type;link.reports[0].id=9;
         link.reports[0].characteristic.properties=cases[i].properties;
         write_mode=write_done=0;write_ready=NULL;
-        assert(cordial_gatt_write(&link)==(cases[i].mode ? CORDIAL_OK:CORDIAL_UNSUPPORTED));
+        assert(cordial_gatt_write(&link)==(cases[i].mode ? CORDIAL_OK:CORDIAL_REPORT_SIZE));
         assert(write_mode==cases[i].mode && !write_done);
         if(write_mode==3) { assert(write_ready);write_ready->callback(write_ready->context);assert(write_mode==4 && write_done==1); }
         else if(write_mode) { complete(0);assert(write_done==1); }

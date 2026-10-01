@@ -1,12 +1,10 @@
+use cordial_core::model::{errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod};
 use cordial_core::{
     bluetooth::{Bluetooth, Capabilities, Descriptor, ReportType},
     devices::{Peer, Policies, Policy},
     link::{LinkId, ServiceId, WriteId},
     manager::Manager,
     storage::{self, RecordKey, RecordStore},
-};
-use cordial_protocol::{
-    errors::ErrorCode as Error, identifiers::Transport, messages::PromptMethod,
 };
 use embassy_futures::block_on;
 use std::{collections::BTreeMap, string::String};
@@ -119,8 +117,6 @@ pub struct Radio {
     pub reconnect: Vec<Peer>,
     pub info_refreshes: Vec<LinkId>,
     pub reject_info_refresh: bool,
-    pub gatt_writes: Option<Vec<cordial_protocol::messages::GattWriteDiagnostic>>,
-    pub authentication_failure: Option<cordial_protocol::messages::AuthenticationFailure>,
     pub scans: Vec<(u64, bool, bool)>,
     pub bonds: Vec<Peer>,
     pub connects: Vec<(LinkId, bool)>,
@@ -142,12 +138,6 @@ impl Bluetooth for Radio {
         }
         self.info_refreshes.push(link);
         Ok(())
-    }
-    fn gatt_writes(&self) -> Option<Vec<cordial_protocol::messages::GattWriteDiagnostic>> {
-        self.gatt_writes.clone()
-    }
-    fn authentication_failure(&self) -> Option<cordial_protocol::messages::AuthenticationFailure> {
-        self.authentication_failure
     }
     fn bond_capacity(&self, t: Transport) -> usize {
         if self.capabilities().supports(t) {
@@ -257,14 +247,16 @@ pub fn peer(n: u8) -> Peer {
     }
 }
 pub fn descriptor() -> Vec<Descriptor> {
-    vec![Descriptor {
-        service: ServiceId(7),
-        bytes: vec![
-            5, 1, 9, 6, 0xa1, 1, 5, 7, 0x19, 4, 0x29, 11, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8, 0x81,
-            2, 0xc0,
-        ]
-        .into_boxed_slice(),
-    }]
+    vec![
+        Descriptor::from_slice(
+            ServiceId(7),
+            &[
+                5, 1, 9, 6, 0xa1, 1, 5, 7, 0x19, 4, 0x29, 11, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8,
+                0x81, 2, 0xc0,
+            ],
+        )
+        .unwrap(),
+    ]
 }
 pub fn setup() -> (Manager, Store, Radio) {
     let mut store = Store::default();

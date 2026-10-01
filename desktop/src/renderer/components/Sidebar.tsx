@@ -3,12 +3,11 @@ import type { AdapterEntry, AppState, DeviceEntry } from "../../shared/state.ts"
 import { adapterStatus, batteryStale, batteryText, deviceStatus } from "../../shared/text.ts";
 import { act, api, chooseAdapter, reportError } from "../api.ts";
 import type { Selection } from "../App.tsx";
-import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, MenuIcon, PlugIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
+import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, MenuIcon, PlugIcon, PlusIcon, RefreshIcon } from "./icons.tsx";
 import { isLow } from "../../shared/battery.ts";
 
 function DeviceRow({ d, selected, threshold, onSelect }: { d: DeviceEntry; selected: boolean; threshold: number; onSelect: () => void }) {
   const low = isLow(d.battery, threshold);
-  const needs = d.device.pairing_state === "needs_pairing";
   return (
     <button className={selected ? "side-row selected" : "side-row"} aria-current={selected} onClick={onSelect}>
       <span className={d.device.state === "connected" ? "side-icon on" : "side-icon"}>
@@ -16,15 +15,13 @@ function DeviceRow({ d, selected, threshold, onSelect }: { d: DeviceEntry; selec
       </span>
       <span className="side-text">
         <span className="side-title">{d.name}</span>
-        <span className={needs ? "side-subtitle warn" : "side-subtitle"}>{deviceStatus(d.device)}</span>
+        <span className="side-subtitle">{deviceStatus(d.device)}</span>
       </span>
       {d.battery ? (
         <span className={`side-battery${low ? " low" : ""}${batteryStale(d.battery) ? " dim" : ""}`} title={`Battery ${batteryText(d.battery) ?? "unknown"}`}>
           {d.battery.percent != null ? `${d.battery.percent}%` : null}
           <BatteryGlyph percent={d.battery.percent} charging={d.battery.charging} low={low} />
         </span>
-      ) : needs ? (
-        <WarningIcon />
       ) : null}
     </button>
   );
@@ -83,7 +80,7 @@ function AdapterMenu({ adapter, x, y, onRename, onClose }: { adapter: AdapterEnt
           Connect
         </button>
       )}
-      <button role="menuitem" disabled={!connected || !adapter.status?.storage_ready} onClick={run(onRename)}>
+      <button role="menuitem" disabled={!connected || !adapter.status?.ready} onClick={run(onRename)}>
         Rename
       </button>
     </div>

@@ -7,8 +7,6 @@
 #include "soc/usb_dwc_struct.h"
 #include "esp_system.h"
 #include "soc/rtc_cntl_reg.h"
-#include "bootloader_random.h"
-#include "esp_random.h"
 #if CONFIG_CORDIAL_DEVELOPMENT
 #include "esp_private/periph_ctrl.h"
 #include "hal/usb_wrap_ll.h"
@@ -30,13 +28,6 @@ void cordial_esp_wake(void *task) {
     }
 }
 void cordial_esp_wait(void) { (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY); }
-uint64_t cordial_esp_boot_random(void) {
-    // Before Bluetooth starts, enable the supported temporary entropy source.
-    bootloader_random_enable();
-    uint64_t value = ((uint64_t)esp_random() << 32) | esp_random();
-    bootloader_random_disable();
-    return value;
-}
 
 esp_err_t cordial_esp_usb_phy(void) {
     static usb_phy_handle_t phy;

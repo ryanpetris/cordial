@@ -78,7 +78,7 @@ int main(void) {
 
     def test_accept_list_waits_for_any_peer_and_serializes_scan_and_manual_connect(self):
         source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
-        resume = source[source.index("static void resume_radio(void) {"):source.index("static void auth_diagnostic(")]
+        resume = source[source.index("static void resume_radio(void) {"):source.index("static void security_ready(")]
         connect = source[source.index("        if(!arg) {", source.index("    case BLE_GAP_EVENT_CONNECT:")):source.index("        if (!l) { if(!event->connect.status)")]
         wrapper = source[source.index("static int auto_gap(struct ble_gap_event *event"):source.index("static int gap(struct ble_gap_event *event")]
         expired = source[source.index("static void reject_incoming(void)"):source.index("// Start HID links")]
@@ -470,63 +470,39 @@ int main(void) {
 
 
 
-    def test_native_authentication_preserves_failure_status_without_changing_admission(self):
+    def test_native_authentication_failure_keeps_link_insecure(self):
         source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
-        helper = source[source.index("static void auth_diagnostic("):source.index("static void security_ready(")]
         encryption = source[source.index("    case BLE_GAP_EVENT_ENC_CHANGE: {"):source.index("    case BLE_GAP_EVENT_PASSKEY_ACTION: {")]
         encryption = encryption[encryption.index("{")+1:encryption.rindex("}")]
-        for development in (0, 1):
-            run_c(f"#define CONFIG_CORDIAL_DEVELOPMENT {development}\n" + r'''
+        run_c(r'''
 #include <assert.h>
 #include <stdbool.h>
 #include "ble.h"
-#define BLE_HS_CONN_HANDLE_NONE 65535
 struct ble_gap_conn_desc { struct {bool encrypted,bonded;} sec_state; };
 struct ble_gap_event {struct {uint16_t conn_handle;int status;} enc_change;};
 typedef struct {uint32_t token;uint16_t connection;bool closing,secure;} link;
 static link current={.token=42,.connection=1};
 static struct ble_gap_conn_desc state;
-static int lookup_error, failures, successes, reports;
-static cordial_ble_event last;
+static int lookup_error, failures, successes;
 static link *by_handle(uint16_t h) {return h==current.connection ? &current:0;}
 static int ble_gap_conn_find(uint16_t h,struct ble_gap_conn_desc *out) {
     assert(h==1);*out=state;return lookup_error;
 }
-#if CONFIG_CORDIAL_DEVELOPMENT
-static void emit(const cordial_ble_event *e) {last=*e;reports++;}
-#endif
 static void fail(link *l,uint8_t code) {assert(l==&current && code==CORDIAL_BLE_AUTH);failures++;}
 static void security_ready(link *l) {assert(l==&current);successes++;}
-''' + helper + r'''
 static int encryption_changed(struct ble_gap_event *event) {link *l;
 ''' + encryption + r'''
 }
 int main(void) {
     struct ble_gap_event e={.enc_change={.conn_handle=1,.status=0x40b}};
     assert(!encryption_changed(&e) && failures==1 && successes==0);
-#if CONFIG_CORDIAL_DEVELOPMENT
-    assert(reports==1 && last.kind==CORDIAL_BLE_AUTH_FAILURE && last.token==42);
-    assert(last.code==CORDIAL_AUTH_ENCRYPTION && last.number==0x40b && !last.encrypted && !last.bonded);
-    auth_fail(&current,CORDIAL_AUTH_INITIATE,6);
-    assert(last.code==CORDIAL_AUTH_INITIATE && last.number==6);
-    auth_diagnostic(&current,CORDIAL_AUTH_CLEAR,0);
-    assert(last.code==CORDIAL_AUTH_CLEAR && last.number==0);
-#else
-    assert(!reports && !last.kind);
-#endif
-    int before=failures;
     e.enc_change.status=0;state.sec_state.encrypted=true;
-    assert(!encryption_changed(&e) && failures==before+1 && successes==0);
-#if CONFIG_CORDIAL_DEVELOPMENT
-    assert(last.code==CORDIAL_AUTH_STATE && last.number==0 && last.encrypted && !last.bonded);
-#endif
+    assert(!encryption_changed(&e) && failures==2 && successes==0 && !current.secure);
     state.sec_state.bonded=true;
-    assert(!encryption_changed(&e) && failures==before+1 && successes==1 && current.secure);
+    assert(!encryption_changed(&e) && failures==2 && successes==1 && current.secure);
     lookup_error=7;
-    assert(!encryption_changed(&e) && failures==before+2 && successes==1);
-#if CONFIG_CORDIAL_DEVELOPMENT
-    assert(last.code==CORDIAL_AUTH_STATE && last.number==7);
-#endif
+    assert(!encryption_changed(&e) && failures==3 && successes==1);
+    return 0;
 }
 ''')
 

@@ -35,13 +35,13 @@ const shot = async (name) => {
 await page.getByRole("button", { name: /Example Keys/ }).first().waitFor();
 await shot("home");
 await page.getByRole("button", { name: /Example Keys/ }).first().click();
-await shot("device");
-await page.getByRole("tab", { name: "Details" }).click();
 await shot("device-details");
+await page.getByRole("tab", { name: "Settings" }).click();
+await shot("device");
 await page.getByRole("button", { name: /Example Mouse/ }).first().click();
 await shot("mouse");
 await page.getByRole("button", { name: /Old Mouse/ }).first().click();
-await shot("needs-pairing");
+await shot("disabled");
 await page.getByRole("button", { name: /Pico W/ }).first().click();
 await shot("adapter");
 await page.getByRole("button", { name: "Add Device" }).click();

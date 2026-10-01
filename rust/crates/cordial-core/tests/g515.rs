@@ -1,15 +1,15 @@
+use cordial_core::model::{
+    hidpp::{FeatureId, ProtocolState},
+    identifiers::{HostPlatform, NormalizationState, SettingsState, Transport},
+    info::InfoKey,
+    settings::SettingValue,
+};
 use cordial_core::{
     forward::Forwarder,
     hid::Map,
     hidpp::Error,
     link::{Link, LinkId, Profile, ServiceId},
     settings::Catalog,
-};
-use cordial_protocol::{
-    hidpp::{FeatureId, ProtocolState},
-    identifiers::{HostPlatform, NormalizationState, SettingsState, Transport},
-    info::InfoKey,
-    settings::SettingValue,
 };
 
 // Bluetooth GET captures: feature IDs, revisions, flags, protocol and battery.
@@ -121,7 +121,7 @@ fn pump(
             let id = output.id;
             let report = output.report_id;
             let payload = output.payload.to_vec();
-            link.output_complete(id, true, catalog, forward, *now)
+            link.output_complete(id, Ok(()), catalog, forward, *now)
                 .unwrap();
             if report == Some(0x11) {
                 requests.push((payload[1], payload[2] >> 4));

@@ -32,56 +32,55 @@ fn management_and_development_recovery_work_before_controller_start() {
     ));
     let mut radio = unsafe { Backend::new(state, None) };
     let mut store = storage.handle();
-    let mut input = [0; 4096];
-    let mut app = Application::new(
-        &mut input,
-        Build {
-            profile: cordial_protocol::messages::BuildProfile::Development,
-            version: "test",
-            hardware: "test",
-            default_adapter_name: "Test adapter",
-            radio_backend: "pico-sdk-cyw43",
-            digest: "test",
-            adapter_id: "adapter".into(),
-            boot_id: "boot".into(),
-            bootloader: Some(Bootloader {
-                mode: "bootsel",
-                enter: || std::panic::panic_any("entered bootloader"),
-            }),
-        },
-    );
-    app.session(true, &mut radio, 0);
-    for (command, expected) in [
-        (
-            b"{\"v\":1,\"id\":1,\"cmd\":\"adapter.status\",\"args\":{}}\n".as_slice(),
-            "\"radio_ready\":false",
-        ),
-        (
-            b"{\"v\":1,\"id\":2,\"cmd\":\"adapter.wait_ready\",\"args\":{}}\n".as_slice(),
-            "\"state\":\"initializing\"",
-        ),
-        (
-            b"{\"v\":1,\"id\":3,\"cmd\":\"session.heartbeat\",\"args\":{}}\n".as_slice(),
-            "\"ok\":true",
-        ),
-        (
-            b"{\"v\":1,\"id\":4,\"cmd\":\"adapter.capabilities\",\"args\":{}}\n".as_slice(),
-            "\"result\":[\"classic\",\"ble\",\"debug\",\"storage_management\"]",
-        ),
-        (
-            b"{\"v\":1,\"id\":5,\"cmd\":\"adapter.bootloader.enter\",\"args\":{}}\n".as_slice(),
-            "\"rebooting\":true",
-        ),
+    let mut app = Application::new(Build {
+        development: true,
+        version: "test",
+        board: "test",
+        default_adapter_name: "Test adapter",
+        adapter_id: "adapter".into(),
+        bootloader: Some(Bootloader {
+            enter: || std::panic::panic_any("entered bootloader"),
+        }),
+    });
+    app.session(true, &mut radio);
+    use cordial_protocol::{self as p, request::Command, response::Result as R};
+    use prost::Message;
+    for command in [
+        Command::GetStatus(p::GetStatus {}),
+        Command::EnterBootloader(p::EnterBootloader {}),
     ] {
-        let (_, request) = app.serial.feed(command, 1);
-        block_on(app.dispatch(&request.unwrap(), &mut store, &mut radio, 1)).unwrap();
+        let mut frame = Vec::new();
+        p::frame::encode(
+            &p::Request {
+                command: Some(command),
+            },
+            &mut frame,
+        );
+        let (_, request) = app.serial.feed(&frame);
+        block_on(app.dispatch(request.unwrap(), &mut store, &mut radio, 1));
         let mut output = Vec::new();
-        while let Some((token, bytes)) = app.serial.output(64, 1) {
+        while let Some((token, bytes)) = app.serial.output(64) {
             output.extend_from_slice(bytes);
             let length = bytes.len();
             app.serial.output_complete(token, length);
         }
-        assert!(std::str::from_utf8(&output).unwrap().contains(expected));
+        let mut decoder = p::frame::Decoder::new(None);
+        let message = output
+            .iter()
+            .find_map(|&b| {
+                decoder
+                    .push(b)
+                    .map(|f| p::Message::decode(f.unwrap()).unwrap())
+            })
+            .unwrap();
+        let Some(p::message::Kind::Response(response)) = message.kind else {
+            panic!("expected a response");
+        };
+        match response.result {
+            Some(R::Status(status)) => assert!(!status.ready),
+            None => {}
+            other => panic!("{other:?}"),
+        }
         radio.poll();
         assert!(radio.next_event().is_none());
         assert!(

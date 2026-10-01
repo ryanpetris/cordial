@@ -13,7 +13,7 @@ enum cordial_kind {
 };
 enum cordial_error {
     CORDIAL_OK, CORDIAL_BUSY, CORDIAL_CAPACITY, CORDIAL_CONNECTION, CORDIAL_AUTHENTICATION,
-    CORDIAL_UNSUPPORTED, CORDIAL_STORAGE, CORDIAL_OVERFLOW, CORDIAL_TIMEOUT, CORDIAL_RADIO
+    CORDIAL_UNSUPPORTED, CORDIAL_STORAGE, CORDIAL_OVERFLOW, CORDIAL_TIMEOUT, CORDIAL_RADIO, CORDIAL_REPORT_SIZE
 };
 enum cordial_prompt { CORDIAL_CONFIRM, CORDIAL_ENTER_PASSKEY, CORDIAL_ENTER_PIN, CORDIAL_DISPLAY_PASSKEY };
 typedef struct {
@@ -28,6 +28,7 @@ typedef struct {
     uint8_t kind, code, report_id, report_type;
     const uint8_t *data;
 } cordial_event;
+// Positive accepts the event; zero indicates pressure; negative is a cordial_error.
 typedef int (*cordial_emit)(void *, const cordial_event *);
 
 void cordial_profiles_init(void *context, cordial_emit emit);

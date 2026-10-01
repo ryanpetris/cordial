@@ -5,7 +5,7 @@ use cordial_btstack::{
     transport::Io,
 };
 use cordial_esp32s3::controller;
-use cordial_protocol::errors::ErrorCode as Error;
+use cordial_core::model::errors::ErrorCode as Error;
 
 static IO: Io = Io::new();
 pub type Radio = Backend<Store>;

@@ -1,11 +1,11 @@
 //! RAM-only battery normalization. A transport pins the provider; failed reads
 //! never select another provider. No serialization or storage path exists here.
-use alloc::vec::Vec;
-use cordial_protocol::{
+use crate::model::{
     identifiers::Transport,
     info::{InfoField, InfoKey as K},
     settings::SettingValue as V,
 };
+use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Default)]
 struct Reading {

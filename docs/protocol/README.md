@@ -1,31 +1,47 @@
-# USB control protocol, version 1
+# Serial API
 
-These documents define the current USB control contract. All examples use synthetic device identifiers and values.
+The Dongle's USB CDC port carries a protobuf API. A client sends one request and gets one response
+back, in order; the Dongle also sends an event whenever something changes. There are no request
+IDs, no subscriptions, no heartbeats and no revisions. The separate USB HID interfaces carry the
+keyboard and mouse.
 
-The USB CDC interface carries management commands and live notifications alongside the separate USB HID interfaces. One host process owns the CDC port. Multiple requests and notifications share that connection; independent host processes do not open the port concurrently. The Rust host executable provides a command shell, one-shot CLI commands, and a full-screen TUI through the same protocol client. References to the CLI's session, heartbeat, monitoring, and cleanup responsibilities apply equally to the TUI. The desktop application in `desktop/` is a separate host process with the same responsibilities; while it runs it keeps one session open to every adapter it has confirmed. There are no system services or background brokers, and host processes do not coordinate: quit the desktop application, or disconnect that adapter in it, before using the CLI or TUI with an adapter. The dongle stores its own bonds and connection policy and operates without any host tool after setup.
+One host process owns the port at a time. The Dongle stores its bonds, connection policy and
+settings itself and works without any host software once set up; the host only configures it and
+reports what it says, such as battery levels.
 
 ## Documents
 
-- [USB discovery, framing, sessions, heartbeat and exit](transport.md)
-- [Message envelopes and request IDs](messages.md)
-- [Identity, device records and revisions](device-state.md)
-- [Command reference](commands.md)
-- [Notifications, snapshots and multiplexing](monitoring.md)
-- [Resource limits and errors](limits-and-errors.md)
+- [USB discovery, framing and sessions](transport.md)
+- [Compatibility rules](compatibility.md)
+- [Commands](commands.md)
+- [Records: status, devices, integrations, information, settings and warnings](records.md)
+- [Information and settings keys](keys.md)
+- [Limits and errors](limits-and-errors.md)
 - [CLI, TUI and desktop behavior](clients.md)
-- [Development commands and diagnostics](development.md)
+- [Development commands](development.md)
 - [HID decoding, forwarding limits and suspend behavior](hid-forwarding.md)
 
-## Machine-readable schemas
+## Definitions
 
-[Schema documentation](../../schema/README.md) covers the checked-in Draft 2020-12 wire
-schema and generated command catalog. The shared Serde types also derive Schemars
-schemas behind a host-only feature. Regenerate with `(cd rust && cargo run -p cordial-schema)`;
-check without writing with `(cd rust && cargo run -p cordial-schema -- --check)`.
+- [`proto/cordial.proto`](../../proto/cordial.proto) defines every message. Its comments say what
+  each field means, which fields are required, and what a missing field means.
+- [`proto/keys.toml`](../../proto/keys.toml) lists every information and setting key, with its type,
+  unit and enum values.
 
-Use the initiating command's response definition and the response's `done` phase.
-Responses do not repeat the command name, so the union of all response types cannot
-check correlation. Schemas describe individual messages. The protocol documentation and the
-client enforce ordering, capability requirements, heartbeat deadlines,
-cancellation, revisions and mutation detection. Codec tests enforce the 4096-byte
-frame limit, duplicate keys and byte limits that JSON Schema cannot express.
+Both are checked: `tools/check_keys.py` validates the key catalog and compares it with an earlier
+version, and `buf breaking` compares the schema with the last release (see
+[Compatibility rules](compatibility.md)).
+
+## Libraries
+
+The protocol and the connection are libraries that the apps build on, so other projects can use
+them too:
+
+| | Rust | TypeScript |
+| --- | --- | --- |
+| Messages, framing, key constants | `cordial-protocol` | `@cordial/protocol` |
+| Port discovery and connection | `cordial-client` | `@cordial/client` (`/node`, `/web`) |
+
+The protocol libraries do no I/O; the Rust one is `no_std` and shared with the firmware. The client
+libraries carry no user-facing text and keep no state beyond the open connection. All examples in
+these documents use synthetic identifiers and values.

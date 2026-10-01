@@ -1,5 +1,5 @@
 use crate::hid::{HIDPP_LONG, HIDPP_SHORT, Held};
-use cordial_protocol::{
+use crate::model::{
     hidpp::ProtocolState,
     identifiers::{HostPlatform, NormalizationState},
     translation::control,
@@ -20,8 +20,8 @@ pub enum Error {
     InvalidResponse,
 }
 impl Error {
-    pub fn code(self) -> cordial_protocol::errors::ErrorCode {
-        use cordial_protocol::errors::ErrorCode as C;
+    pub fn code(self) -> crate::model::errors::ErrorCode {
+        use crate::model::errors::ErrorCode as C;
         match self {
             Self::NoReports => C::HidppReportsUnavailable,
             Self::ProtocolUnsupported => C::HidppProtocolUnsupported,
@@ -225,8 +225,8 @@ impl Client {
         self.response.take()
     }
     /// Feature exchanges require a negotiated modern protocol and long reports.
-    pub fn feature_error(&self) -> Option<cordial_protocol::errors::ErrorCode> {
-        use cordial_protocol::errors::ErrorCode as C;
+    pub fn feature_error(&self) -> Option<crate::model::errors::ErrorCode> {
+        use crate::model::errors::ErrorCode as C;
         match self.protocol {
             ProtocolState::Error { code } => Some(code),
             ProtocolState::Unavailable => Some(C::HidppReportsUnavailable),

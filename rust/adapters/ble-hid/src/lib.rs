@@ -4,14 +4,12 @@ extern crate alloc;
 mod information;
 pub mod native;
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
+use cordial_core::model::{errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod};
 use cordial_core::{
     bluetooth::{Bluetooth, Capabilities, Descriptor, Event, InputReport, ReportType},
     devices::Peer,
     hid,
     link::{LinkId, ServiceId, WriteId},
-};
-use cordial_protocol::{
-    errors::ErrorCode as Error, identifiers::Transport, messages::PromptMethod,
 };
 use native::{Event as NativeEvent, Host};
 
@@ -472,9 +470,13 @@ impl<H: Host> Backend<H> {
             NativeEvent::Data { offset, data, .. } => {
                 let pending = link.pending.as_mut().unwrap();
                 let bytes = data.bytes();
-                // ATT values, including a Report Map, are at most 512 bytes.
-                // The shared parser's larger limit also serves Classic HID.
-                let limit = hid::REPORT_BYTES;
+                let limit = if matches!(pending.operation, Operation::Setup)
+                    && matches!(link.stage, Stage::Map)
+                {
+                    hid::DESCRIPTOR_BYTES
+                } else {
+                    hid::REPORT_BYTES
+                };
                 if usize::from(offset) != pending.data.len()
                     || pending.data.len() + bytes.len() > limit
                 {
@@ -608,10 +610,7 @@ impl<H: Host> Backend<H> {
                 }
                 push(
                     &mut link.descriptors,
-                    Descriptor {
-                        service: ServiceId(link.service as u16),
-                        bytes: data.into_boxed_slice(),
-                    },
+                    Descriptor::from_owned(ServiceId(link.service as u16), data)?,
                     SERVICES,
                 )?;
                 if link.characteristics.iter().any(|c| c.uuid == 0x2a4e) {
@@ -726,12 +725,6 @@ impl<H: Host> Bluetooth for Backend<H> {
             .is_some_and(|s| self.links[s].as_ref().unwrap().info.busy())
     }
 
-    fn gatt_writes(&self) -> Option<Vec<cordial_protocol::messages::GattWriteDiagnostic>> {
-        self.host.gatt_writes()
-    }
-    fn authentication_failure(&self) -> Option<cordial_protocol::messages::AuthenticationFailure> {
-        self.host.authentication_failure()
-    }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             classic: false,
@@ -852,7 +845,7 @@ impl<H: Host> Bluetooth for Backend<H> {
         let request = self.sequence()?;
         let link = self.links[slot].as_mut().unwrap();
         if report.properties & 0x08 == 0 && payload.len() > link.max_output {
-            return Err(Error::UnsupportedHid);
+            return Err(Error::HidReportTooLarge);
         }
         self.host.write(
             link.token,

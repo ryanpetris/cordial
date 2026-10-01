@@ -15,5 +15,6 @@ export default defineConfig(({ mode }) => ({
       output: { format: "es", entryFileNames: "index.js" },
     },
   },
-  ssr: { noExternal: ["ajv"] },
+  // The workspace packages ship TypeScript sources, bundled with the app.
+  ssr: { noExternal: [/^@cordial\//, /^@bufbuild\//] },
 }));

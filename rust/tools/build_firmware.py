@@ -31,10 +31,10 @@ def tool(name):
 
 
 def release_docs(staged):
-    """Include the license and current wire contract with firmware releases."""
+    """Include the license, documentation and protocol definitions with firmware releases."""
     shutil.copy2(ROOT.parent / "LICENSE", staged / "LICENSE")
     shutil.copytree(ROOT.parent / "docs", staged / "docs")
-    shutil.copytree(ROOT.parent / "schema", staged / "schema")
+    shutil.copytree(ROOT.parent / "proto", staged / "proto")
 
 
 def publish(output, populate):

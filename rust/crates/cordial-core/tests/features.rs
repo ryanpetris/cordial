@@ -1,17 +1,17 @@
-use cordial_core::{
-    compact::{Preference, Record},
-    features::Engine,
-    hid::HIDPP_LONG,
-    hidpp::{Client, TIMEOUT_MS},
-    settings::{Catalog, Error as StoreError, PreferenceStore, Saved},
-};
-use cordial_protocol::{
+use cordial_core::model::{
     errors::ErrorCode,
     hidpp::FeatureId,
     identifiers::SettingsState,
     settings::{
         ObservationSource, SettingKey as K, SettingOutcome, SettingState, SettingValue as V,
     },
+};
+use cordial_core::{
+    compact::{Preference, Record},
+    features::Engine,
+    hid::HIDPP_LONG,
+    hidpp::{Client, TIMEOUT_MS},
+    settings::{Catalog, Error as StoreError, PreferenceStore, Saved},
 };
 use embassy_futures::block_on;
 
@@ -21,6 +21,10 @@ struct Store {
     writes: usize,
 }
 impl PreferenceStore for Store {
+    async fn replace(&mut self, values: &[Preference]) -> Result<(), StoreError> {
+        self.saved = values.to_vec();
+        Ok(())
+    }
     async fn save(&mut self, p: &Preference) -> Result<(), StoreError> {
         self.writes += 1;
         self.saved.retain(|v| v.metadata.key != p.metadata.key);
@@ -251,12 +255,13 @@ impl Device {
         catalog
             .info
             .battery
-            .configure(cordial_protocol::identifiers::Transport::Classic, true);
+            .configure(cordial_core::model::identifiers::Transport::Classic, true);
         catalog.connection(true, enabled);
         let mut engine = Engine::default();
         engine.activate(&mut catalog, 100).unwrap();
         let mut client = Client::new(HIDPP_LONG);
-        client.protocol = cordial_protocol::hidpp::ProtocolState::Detected { major: 2, minor: 0 };
+        client.protocol =
+            cordial_core::model::hidpp::ProtocolState::Detected { major: 2, minor: 0 };
         Self {
             catalog,
             engine,
@@ -290,7 +295,10 @@ impl Device {
         assert!(self.client.next_output(self.now).is_none());
         self.client.tx_complete(true, self.now);
     }
-    fn info(&self, key: cordial_protocol::info::InfoKey) -> cordial_protocol::info::InfoField {
+    fn info(
+        &self,
+        key: cordial_core::model::info::InfoKey,
+    ) -> cordial_core::model::info::InfoField {
         self.catalog
             .info
             .snapshot()
@@ -373,9 +381,9 @@ fn discovery_uses_advertised_features_revisions_and_capabilities() {
         d.run();
         assert_eq!(d.engine.state, SettingsState::Ready);
         assert!(d.peer.writes.is_empty());
-        assert!(!d.info(cordial_protocol::info::InfoKey::Name).available);
+        assert!(!d.info(cordial_core::model::info::InfoKey::Name).available);
         assert!(
-            !d.info(cordial_protocol::info::InfoKey::BatteryPercent)
+            !d.info(cordial_core::model::info::InfoKey::BatteryPercent)
                 .available
         );
         assert_eq!(d.catalog.features().len(), 13);
@@ -393,7 +401,7 @@ fn discovery_uses_advertised_features_revisions_and_capabilities() {
                 .any(|r| r.metadata.key == K::BacklightMode),
             version >= 3
         );
-        assert!(!d.info(cordial_protocol::info::InfoKey::Serial).available);
+        assert!(!d.info(cordial_core::model::info::InfoKey::Serial).available);
         assert_eq!(d.get(K::PointerDpi1).wire().observed, V::Integer(1600));
         d.set(K::FnRowDefault, V::Text("special_actions".into()));
         assert!(!d.engine.busy());
@@ -672,21 +680,21 @@ fn background_cancellation_keeps_completed_reads_and_disconnect_is_not_a_setting
             } // Earlier name, battery and Fn reads completed.
             d.respond(p);
         }
-        assert!(d.info(cordial_protocol::info::InfoKey::Name).fresh);
+        assert!(d.info(cordial_core::model::info::InfoKey::Name).fresh);
         if disconnect {
             d.engine.disconnected(&mut d.catalog, &d.client);
             assert_eq!(d.engine.error, None);
             assert_eq!(d.engine.state, SettingsState::Pending);
-            assert!(!d.info(cordial_protocol::info::InfoKey::Name).fresh);
+            assert!(!d.info(cordial_core::model::info::InfoKey::Name).fresh);
         } else {
             d.now += 90_000;
             d.client.tx_complete(true, d.now);
             d.client.tick(d.now);
             d.engine.poll(&mut d.catalog, &mut d.client, d.now);
             assert_eq!(d.engine.error, Some(ErrorCode::Timeout));
-            assert!(d.info(cordial_protocol::info::InfoKey::Name).fresh);
+            assert!(d.info(cordial_core::model::info::InfoKey::Name).fresh);
             assert!(
-                d.info(cordial_protocol::info::InfoKey::BatteryPercent)
+                d.info(cordial_core::model::info::InfoKey::BatteryPercent)
                     .fresh
             );
         }
@@ -732,7 +740,7 @@ fn backlight_level_unsupported_diagnostic_recovers_with_current_capabilities() {
 
 #[test]
 fn information_refresh_preserves_settings_and_hardware_entity_type() {
-    use cordial_protocol::info::InfoKey as I;
+    use cordial_core::model::info::InfoKey as I;
     let mut d = Device::new(
         Peer {
             hardware_entity: true,
@@ -763,7 +771,7 @@ fn information_refresh_preserves_settings_and_hardware_entity_type() {
     d.catalog
         .info
         .battery
-        .configure(cordial_protocol::identifiers::Transport::Classic, true);
+        .configure(cordial_core::model::identifiers::Transport::Classic, true);
     d.catalog.restore_preferences(saved).unwrap();
     d.catalog.connection(true, true);
     let before = d.get(K::WheelInvert).wire();
@@ -774,7 +782,7 @@ fn information_refresh_preserves_settings_and_hardware_entity_type() {
 
 #[test]
 fn battery_interfaces_on_classic_and_ble() {
-    use cordial_protocol::{identifiers::Transport, info::InfoKey as I};
+    use cordial_core::model::{identifiers::Transport, info::InfoKey as I};
     for (feature, percentage, charging) in [
         (0x1004, V::Integer(51), V::Bool(true)),
         (0x1001, V::Integer(100), V::Bool(false)),
@@ -803,7 +811,7 @@ fn battery_interfaces_on_classic_and_ble() {
 
 #[test]
 fn battery_events_preserve_capabilities_and_supersede_pending_status() {
-    use cordial_protocol::info::InfoKey as I;
+    use cordial_core::model::info::InfoKey as I;
     for fail in [false, true] {
         let mut peer = Peer::default();
         peer.features[3].0 = 0x1004;
@@ -841,7 +849,7 @@ fn battery_events_preserve_capabilities_and_supersede_pending_status() {
 
 #[test]
 fn battery_status_capability_bands_and_zero_unknown() {
-    use cordial_protocol::info::InfoKey as I;
+    use cordial_core::model::info::InfoKey as I;
     for (battery, expected) in [
         ([100, 2, 0], V::Null),
         ([100, 2, 50], V::Integer(50)),

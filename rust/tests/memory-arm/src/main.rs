@@ -19,10 +19,12 @@ use cordial_core::{
     manager::Connection,
     storage::{self, Preferences, RecordKey, RecordStore},
 };
-use cordial_protocol::{
-    errors::ErrorCode as Error, hidpp::*, identifiers::Transport, messages::PromptMethod,
+use cordial_core::model::{
+    errors::ErrorCode as Error, hidpp::*, identifiers::Transport, link::PromptMethod,
     settings::*,
 };
+use cordial_protocol::{frame, request::Command};
+use prost::Message;
 use talc::{TalcCell, source::Manual};
 struct Heap {
     talc: TalcCell<Manual>,
@@ -315,7 +317,7 @@ fn features(maximum: bool) -> Vec<Feature> {
         })
         .collect()
 }
-fn populate(app: &mut Application<'_>, devices: usize, saved: usize, maximum: bool) {
+fn populate(app: &mut Application, devices: usize, saved: usize, maximum: bool) {
     for n in 0..devices {
         let peer = Peer {
             address: [n as u8; 6],
@@ -365,7 +367,7 @@ fn populate(app: &mut Application<'_>, devices: usize, saved: usize, maximum: bo
         app.manager.devices[n] = Some(d);
     }
 }
-fn refresh(app: &mut Application<'_>, maximum: bool) {
+fn refresh(app: &mut Application, maximum: bool) {
     for d in app.manager.devices.iter_mut().flatten() {
         if maximum {
             discovery::run(&mut d.catalog);
@@ -376,14 +378,14 @@ fn refresh(app: &mut Application<'_>, maximum: bool) {
         }
     }
 }
-fn observations(app: &mut Application<'_>, maximum: bool) {
+fn observations(app: &mut Application, maximum: bool) {
     // Real read/event handlers mutate individual rows in the live catalog.
     // They do not rebuild every disconnected device's inventory at once.
     for d in app.manager.devices.iter_mut().take(4).flatten() {
         d.catalog.invalidate();
         if maximum {
-            use cordial_protocol::info::InfoKey as I;
-            d.catalog.info.battery.configure(cordial_protocol::identifiers::Transport::Ble, false);
+            use cordial_core::model::info::InfoKey as I;
+            d.catalog.info.battery.configure(cordial_core::model::identifiers::Transport::Ble, false);
             for instance in 0..4 {
                 d.catalog.info.battery.gatt(0x2a19, instance, &[50]);
                 d.catalog.info.battery.gatt(0x2bed, instance, &[0,0x21,0]);
@@ -455,7 +457,7 @@ fn descriptor(maximum: bool, reports: usize) -> Vec<u8> {
     descriptor.push(0xc0);
     descriptor
 }
-fn reports(app: &mut Application<'_>, count: usize, maximum: bool) {
+fn reports(app: &mut Application, count: usize, maximum: bool) {
     for n in 0..count {
         let id = LinkId {
             slot: n as u8,
@@ -474,13 +476,16 @@ fn reports(app: &mut Application<'_>, count: usize, maximum: bool) {
             device: Some(n),
             runtime: None,
             closing: false,
+            setup_failed: false,
             error: None,
             deadline: 0,
         });
         let raw = descriptor(maximum, 16);
-        let descriptors = (0..if maximum { 3 } else { 1 })
-            .map(|service| Descriptor::from_slice(ServiceId(service), &raw).unwrap())
-            .collect();
+        let mut parsed: [Option<Descriptor>; 3] = core::array::from_fn(|_| None);
+        for (service, entry) in parsed.iter_mut().enumerate().take(if maximum { 3 } else { 1 }) {
+            *entry = Some(Descriptor::from_slice(ServiceId(service as u16), &raw).unwrap());
+        }
+        let descriptors = parsed.into_iter().flatten().collect();
         drop(raw);
         app.manager.connected(id, descriptors, 512, 0).unwrap();
     }
@@ -491,45 +496,51 @@ fn reports(app: &mut Application<'_>, count: usize, maximum: bool) {
         block_on(app.poll(&mut Store, &mut Radio, 0, 0));
     }
 }
-fn send(app: &mut Application<'_>, bytes: &str) {
-    let (_, request) = app.serial.feed(bytes.as_bytes(), 1);
-    block_on(app.dispatch(&request.unwrap(), &mut Store, &mut Radio, 1)).unwrap();
+fn send(app: &mut Application, command: Command) {
+    let mut bytes = alloc::vec::Vec::new();
+    frame::encode(
+        &cordial_protocol::Request {
+            command: Some(command),
+        },
+        &mut bytes,
+    );
+    let (_, request) = app.serial.feed(&bytes);
+    block_on(app.dispatch(request.unwrap(), &mut Store, &mut Radio, 1));
 }
-fn drain(app: &mut Application<'_>) -> usize {
-    let mut line = [0; 4096];
-    let mut used = 0;
+/// Writes out everything queued, returning the number of scan candidates reported.
+fn drain(app: &mut Application) -> usize {
+    let mut decoder = frame::Decoder::new(None);
     let mut candidates = 0;
-    while let Some((token, bytes)) = app.serial.output(64, 2) {
+    while let Some((token, bytes)) = app.serial.output(64) {
         let len = bytes.len();
-        line[used..used + len].copy_from_slice(bytes);
-        used += len;
-        if bytes.last() == Some(&b'\n') {
-            candidates += usize::from(
-                line[..used]
-                    .windows(b"\"event\":\"discovery.result\"".len())
-                    .any(|v| v == b"\"event\":\"discovery.result\""),
-            );
-            used = 0;
+        for &b in bytes {
+            if let Some(frame) = decoder.push(b) {
+                let message = cordial_protocol::Message::decode(frame.unwrap()).unwrap();
+                candidates += usize::from(matches!(
+                    message.kind,
+                    Some(cordial_protocol::message::Kind::Event(cordial_protocol::Event {
+                        kind: Some(cordial_protocol::event::Kind::ScanFound(_))
+                    }))
+                ));
+            }
         }
         app.serial.output_complete(token, len);
     }
-    assert_eq!(used, 0);
     candidates
 }
-fn candidates(app: &mut Application<'_>, scan: u64) {
+fn candidates(app: &mut Application, scan: u64) {
     send(
         app,
-        "{\"v\":1,\"id\":100,\"cmd\":\"session.heartbeat\",\"args\":{}}\n",
+        Command::StartScan(cordial_protocol::StartScan {
+            transports: alloc::vec![cordial_protocol::Transport::Ble as i32],
+            seconds: 60,
+        }),
     );
     drain(app);
-    send(
-        app,
-        "{\"v\":1,\"id\":101,\"cmd\":\"discovery.scan\",\"args\":{\"duration_ms\":0}}\n",
-    );
     for n in 0..32 {
         block_on(app.event(
             Event::Found {
-            kind: cordial_protocol::messages::DeviceKind::Unknown,
+                kind: cordial_core::model::link::DeviceKind::Unknown,
                 connectable: true,
                 scan,
                 address: Some(Peer {
@@ -550,19 +561,18 @@ fn candidates(app: &mut Application<'_>, scan: u64) {
             1,
         ));
     }
-    send(
-        app,
-        "{\"v\":1,\"id\":102,\"cmd\":\"request.cancel\",\"args\":{\"request_id\":101}}\n",
-    );
+    // One event goes out per poll, and saved devices may still have events waiting.
     let mut found = 0;
-    for _ in 0..40 {
+    for _ in 0..96 {
         block_on(app.poll(&mut Store, &mut Radio, 0, 2));
         found += drain(app);
     }
     assert_eq!(found, 32);
+    send(app, Command::StopScan(cordial_protocol::StopScan {}));
+    drain(app);
 }
 
-fn reconnect(app: &mut Application<'_>, maximum: bool, slot: usize) {
+fn reconnect(app: &mut Application, maximum: bool, slot: usize) {
     if !maximum {
         return;
     }
@@ -586,15 +596,18 @@ fn reconnect(app: &mut Application<'_>, maximum: bool, slot: usize) {
         device: Some(slot),
         runtime: None,
         closing: false,
+            setup_failed: false,
         error: None,
         deadline: 0,
     });
-    let descriptors = (0..3)
-        .map(|service| Descriptor::from_slice(ServiceId(service), raw).unwrap())
-        .collect();
+    // The callback retains maps inline before forming the Connected event.
+    let parsed: [Descriptor; 3] = core::array::from_fn(|service| {
+        Descriptor::from_slice(ServiceId(service as u16), raw).unwrap()
+    });
+    let descriptors = parsed.into_iter().collect();
     app.manager.connected(id, descriptors, 512, 0).unwrap();
 }
-fn commands(app: &mut Application<'_>, devices: usize, maximum: bool, scan: u64) {
+fn commands(app: &mut Application, devices: usize, maximum: bool, scan: u64) {
     reconnect(app, maximum, scan as usize % 4);
     if maximum {
         for _ in 0..8 {
@@ -602,65 +615,28 @@ fn commands(app: &mut Application<'_>, devices: usize, maximum: bool, scan: u64)
         }
         refresh(app, maximum);
     }
-    app.session(true, &mut Radio, 0);
-    let id = cordial_protocol::identifiers::RequestId::try_from(1).unwrap();
-    unsafe {
-        (*HEAP.0.get()).reject_after = 1;
-    }
-    assert_eq!(
-        app.serial.heartbeat(id, 1),
-        Err(cordial_core::control::EmitError::Full)
-    );
-    assert_eq!(app.serial.queued(), 0);
-    assert_eq!(app.serial.remaining_ms(1), 14999);
-    app.serial.heartbeat(id, 1).unwrap();
-    assert_eq!(app.serial.remaining_ms(1), 15000);
+    app.session(true, &mut Radio);
+    send(app, Command::GetStatus(cordial_protocol::GetStatus {}));
     drain(app);
-    // Decoder errors also retain their response when the exact output copy fails.
-    unsafe {
-        (*HEAP.0.get()).reject_after = 1;
-    }
-    let invalid = b"{\"v\":1,\"id\":2,\"cmd\":\"unknown\",\"args\":{}}\n";
-    assert_eq!(app.serial.feed(invalid, 1).0, invalid.len());
-    assert_eq!(app.serial.queued(), 0);
-    app.serial.tick(1);
-    assert_eq!(app.serial.queued(), 1);
-    drain(app);
-    app.serial.monitor(id, true, 1).unwrap();
-    drain(app);
-    // Allow the owned event name, but refuse its serialized output copy.
-    unsafe {
-        (*HEAP.0.get()).reject_after = 2;
-    }
-    app.serial
-        .event("device.changed", None, 0u8, true, 1)
-        .unwrap();
-    assert_eq!(app.serial.queued(), 0);
-    app.serial.tick(1);
-    let (token, bytes) = app.serial.output(4096, 1).unwrap();
-    assert!(bytes.windows(11).any(|b| b == b"events.lost"));
-    assert!(bytes.windows(11).any(|b| b == b"\"dropped\":1"));
-    let len = bytes.len();
-    app.serial.output_complete(token, len);
-    app.serial.monitor(id, false, 1).unwrap();
+    // A frame that is not a request is answered without reaching the application.
+    let invalid = [3, 0xff, 0xff, 0];
+    assert_eq!(app.serial.feed(&invalid), (invalid.len(), None));
     drain(app);
     if maximum {
         candidates(app, scan);
     }
     for n in 0..devices.min(4) {
-        let bytes = alloc::format!(
-            "{{\"v\":1,\"id\":{},\"cmd\":\"hidpp.setting.list\",\"args\":{{\"device_id\":\"d_{:016x}\"}}}}\n",
-            n + 103,
-            n + 1
-        );
-        let (_, request) = app.serial.feed(bytes.as_bytes(), 1);
-        block_on(app.dispatch(&request.unwrap(), &mut Store, &mut Radio, 1)).unwrap();
-    }
-    for id in 107..110 {
         send(
             app,
-            &alloc::format!("{{\"v\":1,\"id\":{id},\"cmd\":\"adapter.status\",\"args\":{{}}}}\n"),
+            Command::ListSettings(cordial_protocol::ListSettings {
+                device: alloc::format!("d_{:016x}", n + 1),
+            }),
         );
+        drain(app);
+    }
+    for _ in 0..3 {
+        send(app, Command::GetStatus(cordial_protocol::GetStatus {}));
+        drain(app);
     }
     observations(app, maximum);
     // Retain a full output queue while observations change live records.
@@ -670,7 +646,7 @@ fn commands(app: &mut Application<'_>, devices: usize, maximum: bool, scan: u64)
         (*HEAP.0.get()).reject_after = 1;
     }
     assert!(matches!(
-        Descriptor::from_slice(ServiceId(0), &[0; 2048]),
+        Descriptor::from_slice(ServiceId(0), unsafe { &*core::ptr::addr_of!(MAX_DESCRIPTOR) }),
         Err(Error::Capacity)
     ));
     reconnect(app, maximum, (scan as usize + 1) % 4);
@@ -678,9 +654,8 @@ fn commands(app: &mut Application<'_>, devices: usize, maximum: bool, scan: u64)
         block_on(app.poll(&mut Store, &mut Radio, 0, 2));
         drain(app);
     }
-    assert!(app.status(&Radio, 3).pending.is_empty());
-    assert!(Descriptor::from_slice(ServiceId(0), &[0; 2048]).is_ok());
-    app.session(false, &mut Radio, 3);
+    assert!(Descriptor::from_slice(ServiceId(0), unsafe { &*core::ptr::addr_of!(MAX_DESCRIPTOR) }).is_ok());
+    app.session(false, &mut Radio);
 }
 static mut MAX_DESCRIPTOR: [u8; 2048] = [0; 2048];
 #[cortex_m_rt::entry]
@@ -708,7 +683,7 @@ fn main() -> ! {
         size_of::<cordial_core::compact::FeatureEntry>(),
         size_of::<Profile>(),
         size_of::<Link>(),
-        size_of::<Application<'_>>(),
+        size_of::<Application>(),
         size_of::<Device>(),
         size_of::<Policy>()
     )
@@ -723,21 +698,14 @@ fn main() -> ! {
     let platform_storage = Box::new([0u8; 2048]);
     core::hint::black_box(&platform_storage);
     stats("backend and platform reserve");
-    let mut input = [0; 4096];
-    let mut app = Application::new(
-        &mut input,
-        Build {
-            profile: cordial_protocol::messages::BuildProfile::Development,
-            version: "0.0.0",
-            hardware: "pico_w",
-            default_adapter_name: "Test adapter",
-            radio_backend: "pico-sdk-cyw43",
-            digest: "22410797341ffa56e16b6cc87598d2c23820dacd176b988d38dc8b73f4583d30",
-            adapter_id: "E6613008E35A4733".into(),
-            boot_id: "0123456789abcdef".into(),
-            bootloader: None,
-        },
-    );
+    let mut app = Application::new(Build {
+        development: true,
+        version: "0.0.0",
+        board: "pico_w",
+        default_adapter_name: "Test adapter",
+        adapter_id: "E6613008E35A4733".into(),
+        bootloader: None,
+    });
     block_on(app.event(Event::Ready, &mut Store, &mut Radio, 0));
     stats("empty core");
     for (label, devices, saved, maximum) in [

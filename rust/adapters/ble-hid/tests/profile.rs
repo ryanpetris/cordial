@@ -2,13 +2,11 @@ use cordial_ble_hid::{
     Backend,
     native::{Data, Event as Raw, Host},
 };
+use cordial_core::model::{errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod};
 use cordial_core::{
     bluetooth::{Bluetooth, ConnectionSecurity, Event, ReportType},
     devices::Peer,
     link::{LinkId, ServiceId, WriteId},
-};
-use cordial_protocol::{
-    errors::ErrorCode as Error, identifiers::Transport, messages::PromptMethod,
 };
 use embassy_futures::block_on;
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
@@ -306,7 +304,10 @@ fn connected(backend: &mut Backend<Mock>) {
             assert_eq!(descriptors.len(), 2);
             for (i, d) in descriptors.iter().enumerate() {
                 assert_eq!(d.service, ServiceId(i as u16));
-                assert_eq!(&*d.bytes, MAP);
+                assert_eq!(
+                    d.map.reports()[0].bits[0],
+                    cordial_core::hid::Map::compile(MAP).unwrap().reports()[0].bits[0]
+                );
             }
         }
         _ => panic!("expected complete HID setup"),
@@ -452,8 +453,8 @@ fn host_restart_cancels_a_connect_still_in_the_native_queue() {
     connected(&mut b);
 }
 #[test]
-fn att_map_limit_applies_to_the_whole_fragmented_value() {
-    for size in [512, 513] {
+fn descriptor_limit_applies_to_the_whole_fragmented_map() {
+    for size in [512, 600, 2048, 2049] {
         let (mut b, state) = setup(true);
         state.borrow_mut().map_size = size;
         b.connect(LINK, PEER, false).unwrap();
@@ -465,7 +466,7 @@ fn att_map_limit_applies_to_the_whole_fragmented_value() {
                 ..
             })
         ));
-        if size == 512 {
+        if size <= 2048 {
             assert!(matches!(
                 b.next_profile_event(),
                 Some(Event::Connected { .. })
@@ -627,7 +628,7 @@ fn pairing_security_waits_for_room_for_both_events() {
     let (mut b, state) = setup(false);
     for _ in 0..7 {
         state.borrow_mut().events.push_back(Raw::Found {
-            kind: cordial_protocol::messages::DeviceKind::Unknown,
+            kind: cordial_core::model::link::DeviceKind::Unknown,
             address: PEER,
             connectable: true,
             scan: 1,
@@ -723,7 +724,7 @@ fn output_prefers_advertised_write_commands_and_falls_back_to_requests() {
             &vec![2; length],
         );
         let Some(response) = response else {
-            assert_eq!(result, Err(Error::UnsupportedHid));
+            assert_eq!(result, Err(Error::HidReportTooLarge));
             assert!(state.borrow().responses.is_empty());
             assert!(b.can_write(LINK));
             continue;

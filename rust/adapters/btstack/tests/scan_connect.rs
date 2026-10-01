@@ -6,11 +6,11 @@ use cordial_btstack::{
     storage::Storage,
     transport::Io,
 };
+use cordial_core::model::identifiers::Transport;
 use cordial_core::{
     bluetooth::{Bluetooth, Event},
     devices::Peer,
 };
-use cordial_protocol::identifiers::Transport;
 #[allow(dead_code)]
 mod support {
     use std::vec::Vec;

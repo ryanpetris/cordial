@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cordial-schema", "crates/cordial-protocol", "crates/cordial-core", "crates/cordial-client", "adapters/record-storage", "adapters/usb", "adapters/btstack", "adapters/ble-hid"]
+members = ["crates/cordial-protocol", "crates/cordial-core", "crates/cordial-client", "crates/cordial-cli", "adapters/record-storage", "adapters/usb", "adapters/btstack", "adapters/ble-hid"]
 exclude = ["platforms/pico", "platforms/esp32s3"]
 
 [workspace.package]
@@ -13,6 +13,7 @@ license = "MIT"
 [workspace.dependencies]
 cordial-protocol = { path = "crates/cordial-protocol" }
 cordial-core = { path = "crates/cordial-core" }
+cordial-client = { path = "crates/cordial-client", default-features = false }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "=1.0.151", default-features = false, features = ["alloc", "raw_value"] }
 

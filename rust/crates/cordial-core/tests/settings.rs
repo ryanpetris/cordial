@@ -1,9 +1,9 @@
 use cordial_core::compact::{Preference, Record};
-use cordial_core::settings::*;
-use cordial_protocol::{
+use cordial_core::model::{
     hidpp::{FeatureId, FeatureRevision},
     settings::*,
 };
+use cordial_core::settings::*;
 
 #[derive(Default)]
 struct Store {
@@ -12,6 +12,10 @@ struct Store {
     fail: bool,
 }
 impl PreferenceStore for Store {
+    async fn replace(&mut self, values: &[Preference]) -> Result<(), Error> {
+        self.saved = values.to_vec();
+        Ok(())
+    }
     async fn remove_all(&mut self) -> Result<(), Error> {
         if self.fail {
             return Err(Error::Storage);

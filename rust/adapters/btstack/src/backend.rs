@@ -1,6 +1,7 @@
 //! BTstack callbacks own their bytes before returning to the vendor stack.
 use crate::{ffi, storage::Storage, transport::Io};
 use alloc::{collections::VecDeque, format, vec::Vec};
+use cordial_core::model::{errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod};
 use cordial_core::{
     bluetooth::{
         Bluetooth, Capabilities, ConnectionSecurity, Descriptor, Event, InputReport, ReportType,
@@ -9,9 +10,6 @@ use cordial_core::{
     hid,
     link::{LinkId, ServiceId, WriteId},
     storage::RecordStore,
-};
-use cordial_protocol::{
-    errors::ErrorCode as Error, identifiers::Transport, messages::PromptMethod,
 };
 use core::{
     cell::{Cell, RefCell},
@@ -22,7 +20,7 @@ use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 const EVENTS: usize = 8;
 struct Pending {
     events: VecDeque<Event>,
-    descriptors: [Vec<Descriptor>; 4],
+    descriptors: [heapless::Vec<Descriptor, 3>; 4],
     generations: [u64; 4],
 }
 /// Only the application owner calls C. The controller task exchanges packets
@@ -63,7 +61,7 @@ impl<S: RecordStore + 'static> State<S> {
             pairing: Cell::new(None),
             pending: RefCell::new(Pending {
                 events,
-                descriptors: core::array::from_fn(|_| Vec::new()),
+                descriptors: core::array::from_fn(|_| heapless::Vec::new()),
                 generations: [0; 4],
             }),
         })
@@ -75,7 +73,7 @@ impl<S: RecordStore + 'static> State<S> {
         let mut pending = self.pending.borrow_mut();
         let slot = usize::from(link.slot);
         pending.generations[slot] = link.generation;
-        pending.descriptors[slot] = Vec::new();
+        pending.descriptors[slot].clear();
     }
     unsafe extern "C" fn time(context: *mut c_void) -> u32 {
         let state = unsafe { &*context.cast::<Self>() };
@@ -108,11 +106,11 @@ impl<S: RecordStore + 'static> State<S> {
         } else {
             unsafe { core::slice::from_raw_parts(raw.data, raw.length.into()) }
         };
-        i32::from(state.copy_event(raw, data))
+        state.copy_event(raw, data)
     }
-    fn copy_event(&self, raw: &ffi::Event, bytes: &[u8]) -> bool {
+    fn copy_event(&self, raw: &ffi::Event, bytes: &[u8]) -> c_int {
         if self.stopping.get() {
-            return true;
+            return 1;
         }
         let link = LinkId {
             slot: raw.link.slot,
@@ -122,12 +120,12 @@ impl<S: RecordStore + 'static> State<S> {
         let mut pending = self.pending.borrow_mut();
         if matches!(raw.kind, 5..=12 | 14 | 15) {
             if slot >= 4 || link.generation == 0 {
-                return false;
+                return 0;
             }
             if pending.generations[slot] != link.generation {
                 // Only an accepted owner operation can replace a generation.
                 // Late callbacks cannot erase a new connection's descriptors.
-                return true;
+                return 1;
             }
         }
         if raw.kind == 7 {
@@ -137,21 +135,22 @@ impl<S: RecordStore + 'static> State<S> {
                 || descriptors.len() >= 3
                 || descriptors.iter().any(|d| d.service.0 == raw.service)
             {
-                return false;
+                return 0;
             }
-            if descriptors.try_reserve(1).is_err() {
-                return false;
-            }
-            let Ok(descriptor) = Descriptor::from_slice(ServiceId(raw.service), bytes) else {
-                return false;
+            let descriptor = match Descriptor::from_slice(ServiceId(raw.service), bytes) {
+                Ok(descriptor) => descriptor,
+                Err(Error::Capacity) => return -2,
+                Err(_) => return -5,
             };
-            descriptors.push(descriptor);
-            return true;
+            if descriptors.push(descriptor).is_err() {
+                return -2;
+            }
+            return 1;
         }
         // C retries security observations after pressure subsides. Keep room
         // for the Connected event that follows the initial observation.
         if raw.kind == 14 && pending.events.len() >= EVENTS - 1 {
-            return false;
+            return 0;
         }
         if pending.events.len() == EVENTS {
             // Discovery updates are optional. Link callbacks return failure to
@@ -159,7 +158,7 @@ impl<S: RecordStore + 'static> State<S> {
             if matches!(raw.kind, 1 | 2 | 13) {
                 self.fault.set(Some(Error::Capacity));
             }
-            return matches!(raw.kind, 1..=3 | 13);
+            return i32::from(matches!(raw.kind, 1..=3 | 13));
         }
         let id = WriteId {
             link,
@@ -214,7 +213,7 @@ impl<S: RecordStore + 'static> State<S> {
                     1 => PromptMethod::EnterPasskey,
                     2 => PromptMethod::EnterPin,
                     3 => PromptMethod::DisplayPasskey,
-                    _ => return false,
+                    _ => return 0,
                 };
                 Event::Prompt {
                     link,
@@ -229,16 +228,24 @@ impl<S: RecordStore + 'static> State<S> {
             },
             8 => {
                 if pending.descriptors[slot].is_empty() {
-                    return false;
+                    return 0;
                 }
+                let mut descriptors = Vec::new();
+                if descriptors
+                    .try_reserve_exact(pending.descriptors[slot].len())
+                    .is_err()
+                {
+                    return -2;
+                }
+                descriptors.extend(core::mem::take(&mut pending.descriptors[slot]));
                 Event::Connected {
                     link,
-                    descriptors: core::mem::take(&mut pending.descriptors[slot]),
+                    descriptors,
                     max_output: raw.number as usize,
                 }
             }
             9 => {
-                pending.descriptors[slot] = Vec::new();
+                pending.descriptors[slot].clear();
                 Event::Disconnected {
                     link,
                     error: (raw.code != 0).then(|| error(raw.code)),
@@ -246,7 +253,7 @@ impl<S: RecordStore + 'static> State<S> {
             }
             10 => match report() {
                 Ok(report) => Event::Input(report),
-                Err(_) => return false,
+                Err(_) => return 0,
             },
             11 => Event::Written {
                 id,
@@ -262,13 +269,13 @@ impl<S: RecordStore + 'static> State<S> {
                         Err(error(raw.code))
                     },
                 },
-                _ => return false,
+                _ => return 0,
             },
-            _ => return false,
+            _ => return 0,
         };
         pending.events.push_back(event);
         self.wake.signal(());
-        true
+        1
     }
 }
 impl<S: RecordStore + 'static> Backend<S> {
@@ -422,6 +429,7 @@ fn error(code: u8) -> Error {
         6 => Error::StorageFailed,
         7 => Error::InputOverflow,
         8 => Error::Timeout,
+        10 => Error::HidReportTooLarge,
         _ => Error::RadioUnavailable,
     }
 }
@@ -699,7 +707,7 @@ mod tests {
             event.peer.address = [1; 6];
             event.address.transport = address_transport;
             event.address.address = [2; 6];
-            assert!(state.copy_event(&event, &[]));
+            assert_eq!(state.copy_event(&event, &[]), 1);
             let Event::Found {
                 peer,
                 address,
@@ -737,7 +745,7 @@ mod tests {
         });
         let mut event = raw(14, 2);
         event.number = 1 | 4 | 8 | (16 << 8) | (15 << 16); // Encrypted SC Just Works bond.
-        assert!(state.copy_event(&event, &[]));
+        assert_eq!(state.copy_event(&event, &[]), 1);
         match state.pending.borrow_mut().events.pop_front().unwrap() {
             Event::Security { security, .. } => {
                 assert_eq!(security.encrypted, Some(true));
@@ -749,11 +757,11 @@ mod tests {
             _ => panic!("missing security"),
         }
         event.link.generation = 1;
-        assert!(state.copy_event(&event, &[]));
+        assert_eq!(state.copy_event(&event, &[]), 1);
         assert!(state.pending.borrow_mut().events.pop_front().is_none());
         event.link.generation = 2;
         event.number = 0;
-        assert!(state.copy_event(&event, &[]));
+        assert_eq!(state.copy_event(&event, &[]), 1);
         assert!(
             matches!(state.pending.borrow_mut().events.pop_front(), Some(Event::Security { security, .. })
             if security == ConnectionSecurity::default())
@@ -768,11 +776,29 @@ mod tests {
             slot: 0,
             generation: 1,
         });
-        assert!(state.copy_event(&raw(7, 1), &[0xa1, 1, 0xc0]));
-        assert!(!state.copy_event(&raw(7, 1), &[0xa1, 1, 0xc0])); // Duplicate service.
+        assert_eq!(
+            state.copy_event(
+                &raw(7, 1),
+                &[
+                    5, 1, 9, 6, 0xa1, 1, 5, 7, 9, 4, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2,
+                    0xc0
+                ]
+            ),
+            1
+        );
+        assert_eq!(
+            state.copy_event(
+                &raw(7, 1),
+                &[
+                    5, 1, 9, 6, 0xa1, 1, 5, 7, 9, 4, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2,
+                    0xc0
+                ]
+            ),
+            0
+        ); // Duplicate service.
         let mut connected = raw(8, 1);
         connected.number = 512;
-        assert!(state.copy_event(&connected, &[]));
+        assert_eq!(state.copy_event(&connected, &[]), 1);
         match state.pending.borrow_mut().events.pop_front().unwrap() {
             Event::Connected {
                 descriptors,
@@ -781,18 +807,18 @@ mod tests {
             } => {
                 assert_eq!(max_output, 512);
                 assert_eq!(descriptors[0].service, ServiceId(2));
-                assert_eq!(&*descriptors[0].bytes, &[0xa1, 1, 0xc0]);
+                assert_eq!(descriptors[0].map.roles, hid::KEYBOARD);
             }
             _ => panic!("missing Connected"),
         }
         let mut input = [0xff, 3, 0x10];
         for _ in 0..EVENTS {
-            assert!(state.copy_event(&raw(10, 1), &input));
+            assert_eq!(state.copy_event(&raw(10, 1), &input), 1);
         }
         input.fill(0);
-        assert!(!state.copy_event(&raw(10, 1), &input));
-        assert!(!state.copy_event(&raw(9, 1), &[]));
-        assert!(!state.copy_event(&raw(14, 1), &[]));
+        assert_eq!(state.copy_event(&raw(10, 1), &input), 0);
+        assert_eq!(state.copy_event(&raw(9, 1), &[]), 0);
+        assert_eq!(state.copy_event(&raw(14, 1), &[]), 0);
         match state.pending.borrow_mut().events.pop_front().unwrap() {
             Event::Input(report) => {
                 assert_eq!(report.service, ServiceId(2));
@@ -801,8 +827,8 @@ mod tests {
             }
             _ => panic!("missing owned Input"),
         }
-        assert!(!state.copy_event(&raw(14, 1), &[])); // Reserve the last slot.
-        assert!(state.copy_event(&raw(9, 1), &[]));
+        assert_eq!(state.copy_event(&raw(14, 1), &[]), 0); // Reserve the last slot.
+        assert_eq!(state.copy_event(&raw(9, 1), &[]), 1);
         assert!(matches!(
             state.pending.borrow_mut().events.pop_back(),
             Some(Event::Disconnected { .. })
@@ -813,13 +839,22 @@ mod tests {
             slot: 0,
             generation: 2,
         });
-        assert!(state.copy_event(&raw(7, 2), &[0xa1, 2, 0xc0]));
-        assert!(state.copy_event(&raw(9, 1), &[]));
+        assert_eq!(
+            state.copy_event(
+                &raw(7, 2),
+                &[
+                    5, 1, 9, 6, 0xa1, 1, 5, 7, 9, 5, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2,
+                    0xc0
+                ]
+            ),
+            1
+        );
+        assert_eq!(state.copy_event(&raw(9, 1), &[]), 1);
         assert_eq!(state.pending.borrow().descriptors[0].len(), 1);
-        assert!(state.copy_event(&raw(8, 2), &[]));
+        assert_eq!(state.copy_event(&raw(8, 2), &[]), 1);
         let mut read = raw(12, 2);
         read.code = 3;
-        assert!(state.copy_event(&read, &[]));
+        assert_eq!(state.copy_event(&read, &[]), 1);
         assert!(matches!(
             state.pending.borrow_mut().events.pop_back(),
             Some(Event::Read {

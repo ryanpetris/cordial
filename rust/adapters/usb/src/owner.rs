@@ -1,9 +1,7 @@
 //! Application-side packet pump. Only this owner touches application state.
 use crate::{HidTx, Io, SerialRx, SerialTx, Status};
-use cordial_core::{
-    application::Application, bluetooth::Bluetooth, control::EmitError, storage::RecordStore,
-};
-use cordial_protocol::messages::Request;
+use cordial_core::{application::Application, bluetooth::Bluetooth, storage::RecordStore};
+use cordial_protocol::{Request, frame::DELIMITER};
 
 pub struct Owner<'a> {
     io: &'a Io,
@@ -30,10 +28,10 @@ impl<'a> Owner<'a> {
             request: None,
         }
     }
-    fn sync<B: Bluetooth>(&mut self, app: &mut Application<'_>, radio: &mut B, now: u64) -> Status {
+    fn sync<B: Bluetooth>(&mut self, app: &mut Application, radio: &mut B) -> Status {
         let status = self.io.status();
         if status.session != self.seen.session {
-            app.session(status.serial_open(), radio, now);
+            app.session(status.serial_open(), radio);
             self.input = None;
             self.request = None;
             self.offset = 0;
@@ -54,12 +52,12 @@ impl<'a> Owner<'a> {
 
     pub async fn poll<S: RecordStore, B: Bluetooth>(
         &mut self,
-        app: &mut Application<'_>,
+        app: &mut Application,
         store: &mut S,
         radio: &mut B,
         now: u64,
     ) {
-        let status = self.sync(app, radio, now);
+        let status = self.sync(app, radio);
 
         while let Ok(done) = self.io.hid_done.try_receive() {
             if self.hid_pending == Some((done.generation, done.sequence)) {
@@ -90,28 +88,19 @@ impl<'a> Owner<'a> {
             self.offset = 0;
         }
         loop {
-            if let Some(request) = &self.request {
-                let result = app.dispatch(request, store, radio, now).await;
-                let blocked = matches!(result, Err(EmitError::Full));
-                if !blocked {
-                    self.request = None;
-                }
+            if let Some(request) = self.request.take() {
+                app.dispatch(request, store, radio, now).await;
                 // Flash can yield while USB closes/reopens the port. Finish the
                 // already accepted command, then discard that session's tail.
                 if self.io.status() != status {
-                    self.sync(app, radio, now);
+                    self.sync(app, radio);
                     return;
-                }
-                if blocked {
-                    break;
                 }
             }
             let Some(packet) = &self.input else {
                 break;
             };
-            let (read, request) = app
-                .serial
-                .feed(&packet.bytes[self.offset..packet.length], now);
+            let (read, request) = app.serial.feed(&packet.bytes[self.offset..packet.length]);
             self.offset += read;
             self.request = request;
             if self.offset == packet.length {
@@ -132,7 +121,7 @@ impl<'a> Owner<'a> {
             let mut tx = HidTx {
                 generation: status.generation,
                 sequence: self.hid_sequence,
-                bytes: [0; 33],
+                bytes: [0; 69],
                 length: 1 + packet.bytes().len(),
             };
             tx.bytes[0] = packet.id;
@@ -149,9 +138,9 @@ impl<'a> Owner<'a> {
                 length: 0,
             };
             if self.separator {
-                tx.bytes[0] = b'\n';
+                tx.bytes[0] = DELIMITER;
                 tx.length = 1;
-            } else if let Some((token, bytes)) = app.serial.output(63, now) {
+            } else if let Some((token, bytes)) = app.serial.output(63) {
                 tx.token = Some(token);
                 tx.length = bytes.len();
                 tx.bytes[..tx.length].copy_from_slice(bytes);

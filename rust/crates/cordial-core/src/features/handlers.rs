@@ -1,5 +1,5 @@
 use super::*;
-use cordial_protocol::{info::InfoKey as I, settings::SettingValue as V};
+use crate::model::{info::InfoKey as I, settings::SettingValue as V};
 
 fn be(p: &[u8]) -> u16 {
     u16::from_be_bytes([p[0], p[1]])

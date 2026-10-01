@@ -1,596 +1,239 @@
-// One adapter's control session: the docs/protocol/transport.md handshake, heartbeat,
-// readiness, monitoring and snapshot synchronization over a Transport.
-import { LineDecoder } from "../protocol/framing.ts";
-import {
-  AdapterError,
-  HEARTBEAT_INTERVAL_MS,
-  MAX_REQUEST_ID,
-  SessionClosedError,
-  type ArgsOf,
-  type Capability,
-  type ChunkOf,
-  type CommandName,
-  type Event,
-  type ResultOf,
-  type Status,
-  type WireError,
-} from "../protocol/types.ts";
-import { statusProblem } from "../protocol/status.ts";
-import { codeText } from "../shared/text.ts";
-import { eventProblem, requestProblem, responseProblem } from "../protocol/validate.ts";
-import type { Transport } from "./transport.ts";
-import { AdapterView } from "./view.ts";
-
-const HANDSHAKE_MS = 4000;
-const HEARTBEAT_TIMEOUT_MS = 4000;
-const CLEANUP_MS = 1000;
-const STATUS_DELAY_MS = 250;
-const READ_MS = 5000;
-const RESERVED = new Set<CommandName>([
-  "adapter.protocol", "adapter.status", "adapter.capabilities", "session.heartbeat",
-  "adapter.wait_ready", "session.monitor.set", "pairing.reply", "request.cancel",
-]);
+// One adapter's session: a Connection and the adapter's state, kept current
+// from responses and events in the order the adapter sent them. Each device
+// record, settings list and warning list arrives whole, so the latest one
+// wins. Opening lists the devices, then each device's warnings and settings.
+import { Connection, ConnectionClosedError, CordialError, type ByteStream } from "@cordial/client";
+import type { Event, Request, Response } from "@cordial/protocol";
+import type { AdapterStatus, DeviceRecord, DeviceWarning, Setting } from "../shared/state.ts";
+import { errorText } from "../shared/text.ts";
+import * as convert from "./convert.ts";
 
 export interface SessionHooks {
   /** Some adapter state visible to the user changed. */
   changed(): void;
   /** The session ended by itself: unplugged, failed or protocol violation. */
   closed(error: Error): void;
+  /** A scan or pairing event, which the controller tracks. */
+  event(event: Event): void;
+  /** The adapter answered a request; events after this follow its result. */
+  answered?(request: Request, response: Response): void;
   log(message: string): void;
 }
 
-export interface RequestOptions<C extends CommandName> {
-  onChunk?: (chunk: ChunkOf<C>) => void;
-  /** Events carrying this request's ID, such as discovery results. */
-  onEvent?: (event: Event) => void;
-  /** A timeout fails the whole session; used where silence means a dead link. */
-  timeoutMs?: number;
-  /** Bounds a read's wait while heartbeats continue checking the link. */
-  waitMs?: number;
-}
-
-export interface Started<C extends CommandName> {
-  id: number;
-  result: Promise<ResultOf<C>>;
-}
-
-interface Pending {
-  command: CommandName;
-  deviceId?: string;
-  chunks: number;
-  abandoned: boolean;
-  onChunk?: (chunk: never) => void;
-  onEvent?: (event: Event) => void;
-  resolve(result: unknown): void;
-  reject(error: Error): void;
-  timer?: ReturnType<typeof setTimeout>;
-}
-
-export type Readiness = { state: "waiting" } | { state: "ready" } | { state: "failed"; error: WireError };
-
-/** A settings list whose chunks disagree; retried like `busy`. */
-class InconsistentList extends AdapterError {
-  constructor() {
-    super("hidpp.setting.list", { code: "busy" });
-  }
-}
-
-const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** Why a failed request failed, in words. */
+export const failure = (error: unknown) =>
+  error instanceof CordialError ? errorText(convert.wireError(error))
+    : error instanceof ConnectionClosedError ? "The adapter disconnected."
+      : (error as Error).message;
 
 export class AdapterSession {
-  readonly view = new AdapterView();
-  status!: Status;
-  capabilities: Capability[] = [];
-  readiness: Readiness = { state: "waiting" };
-  closed = false;
+  status: AdapterStatus;
+  readonly devices = new Map<string, DeviceRecord>();
+  readonly settings = new Map<string, Setting[]>();
+  readonly settingsErrors = new Map<string, string>();
+  readonly warnings = new Map<string, DeviceWarning[]>();
+  readonly warningsErrors = new Map<string, string>();
+  /** The device list has been read. */
+  listed = false;
 
-  readonly #transport: Transport;
   readonly #hooks: SessionHooks;
-  readonly #decoder = new LineDecoder();
-  readonly #pending = new Map<number, Pending>();
-  #nextId = 1;
-  #writes: Promise<void> = Promise.resolve();
-  #heartbeat: ReturnType<typeof setInterval> | undefined;
-  #statusTimer: ReturnType<typeof setTimeout> | undefined;
-  #syncing = false;
+  #connection!: Connection;
+  /** Commands in flight, per device. */
+  readonly #pending = new Map<string, string[]>();
+  #syncing: Promise<void> | null = null;
   #syncAgain = false;
-  #fetching = false;
-  #monitoring = false;
-  /** Orderly shutdown has started. */
-  #closing = false;
-  /** A valid response arrived; earlier stray input is ignored, later is fatal. */
-  #confirmed = false;
-  readonly #settled = new Map<number, Promise<void>>();
-  readonly #watched = new Set<string>();
 
-  private constructor(transport: Transport, hooks: SessionHooks) {
-    this.#transport = transport;
+  private constructor(hooks: SessionHooks) {
     this.#hooks = hooks;
-    transport.onData((chunk) => this.#receive(chunk));
-    transport.onClose((error) => this.#fail(error ?? new Error("serial port closed")));
+    this.status = null as unknown as AdapterStatus;
   }
 
-  /**
-   * Opens a control session and confirms the adapter: separator, then
-   * protocol discovery, capabilities and a matching status. Rejects if the port isn't a working
-   * Cordial adapter; the transport is closed in that case.
-   */
-  static async open(transport: Transport, hooks: SessionHooks): Promise<AdapterSession> {
-    const session = new AdapterSession(transport, hooks);
-    try {
-      await session.#handshake();
-    } catch (error) {
-      await session.#shutdownTransport();
-      session.#fail(error as Error, false);
-      throw error;
-    }
+  /** Starts a session and reads the adapter's status; rejects if the port isn't a working adapter. */
+  static async open(stream: ByteStream, hooks: SessionHooks): Promise<AdapterSession> {
+    const session = new AdapterSession(hooks);
+    session.#connection = await Connection.open(stream, {
+      onEvent: (event) => session.#event(event),
+      onResponse: (request, response) => session.#response(request, response),
+      onClose: (error) => hooks.closed(error),
+      log: hooks.log,
+    });
+    // Callbacks during the handshake have already applied the status and any later adapter event.
+    session.status ??= convert.status(session.#connection.status);
     return session;
   }
 
-  async #handshake() {
-    // Opening the port raised DTR and discarded most earlier input. A packet
-    // from the previous session can still arrive, so input that doesn't
-    // answer these requests is ignored until the first valid response.
-    const { protocol } = await this.request("adapter.protocol", {}, { timeoutMs: HANDSHAKE_MS });
-    if (protocol !== 1) throw new Error(`unsupported adapter protocol: ${protocol}`);
-    const capabilities = await this.request("adapter.capabilities", {}, { timeoutMs: HANDSHAKE_MS });
-    const status = await this.request("adapter.status", {}, { timeoutMs: HANDSHAKE_MS });
-    const problem = statusProblem(status, capabilities);
-    if (problem) throw new Error(`not a usable version 1 adapter: ${problem}`);
-    this.capabilities = capabilities;
-    this.status = status;
-    this.view.setAdapter(status.revision, status.host_platform, status.name);
-    await this.request("session.heartbeat", {}, { timeoutMs: HANDSHAKE_MS });
-    this.#heartbeat = setInterval(() => void this.#beat(), HEARTBEAT_INTERVAL_MS);
-  }
-
-
   get adapterId(): string {
-    return this.status.adapter_id;
+    return this.status.id;
   }
 
-  /** Waits for readiness, then builds and maintains the device view. */
+  get closed(): boolean {
+    return this.#connection.closed;
+  }
+
+  get connection(): Connection {
+    return this.#connection;
+  }
+
+  /** Reads the devices and keeps them current. */
   run() {
-    void this.#waitReady();
+    this.#sync();
   }
 
-  async #waitReady() {
+  /** Sends a command for a device, tracking it as pending while it runs. */
+  async perform<T>(device: string, command: string, run: (c: Connection) => Promise<T>): Promise<T> {
+    const list = this.#pending.get(device) ?? [];
+    list.push(command);
+    this.#pending.set(device, list);
+    this.#hooks.changed();
     try {
-      // The adapter answers within 30 seconds and the heartbeat covers a dead
-      // link. A timeout means it is still starting, so wait again.
-      let ready;
-      for (;;) {
-        try {
-          ready = await this.request("adapter.wait_ready", {});
-          break;
-        } catch (error) {
-          if (!(error instanceof AdapterError && error.wire.code === "timeout") || this.closed) throw error;
-          this.#hooks.log("adapter still starting; waiting again");
-        }
-      }
-      const status = ready.status;
-      if (
-        status.boot_id !== this.status.boot_id ||
-        status.session_id !== this.status.session_id ||
-        status.adapter_id !== this.status.adapter_id ||
-        !status.radio_ready ||
-        !status.storage_ready
-      ) {
-        throw new Error("readiness reported a different adapter session");
-      }
-      if (!this.#installStatus(status)) return;
-      this.readiness = { state: "ready" };
+      return await run(this.#connection);
+    } finally {
+      list.splice(list.indexOf(command), 1);
+      if (!list.length) this.#pending.delete(device);
       this.#hooks.changed();
-      this.resync();
-    } catch (error) {
-      if (this.closed) return;
-      if (error instanceof AdapterError) {
-        this.readiness = { state: "failed", error: error.wire };
-        this.#hooks.changed();
-      } else {
-        this.#fail(error as Error);
-      }
     }
   }
 
-  /** Installs a status of this session; anything else ends the session. */
-  #installStatus(status: Status): boolean {
-    const problem =
-      status.adapter_id !== this.status.adapter_id ||
-      status.boot_id !== this.status.boot_id ||
-      status.session_id !== this.status.session_id
-        ? "status reported a different adapter session"
-        : statusProblem(status, this.capabilities);
-    if (problem) {
-      this.#fail(new Error(problem));
-      return false;
-    }
-    this.status = status;
-    this.view.setAdapter(status.revision, status.host_platform, status.name);
-    return true;
+  pendingFor(id: string): string[] {
+    return [...(this.#pending.get(id) ?? [])];
   }
 
-  // ---- Requests ----------------------------------------------------------
-
-  /** Sends a command and resolves with its terminal result. */
-  request<C extends CommandName>(command: C, args: ArgsOf<C>, options: RequestOptions<C> = {}) {
-    return this.start(command, args, options).result;
-  }
-
-  /** Sends a command, exposing its request ID for replies and cancellation. */
-  start<C extends CommandName>(command: C, args: ArgsOf<C>, options: RequestOptions<C> = {}): Started<C> {
-    if (this.closed) return { id: 0, result: Promise.reject(new SessionClosedError()) };
-    const limit = this.status?.limits.max_pending_requests ?? 4;
-    const ordinary = [...this.#pending.values()].filter((p) => !RESERVED.has(p.command)).length;
-    if (this.#pending.size >= limit + 8 || (!RESERVED.has(command) && ordinary >= limit))
-      return { id: 0, result: Promise.reject(new Error("Too many pending adapter requests")) };
-    if (this.#nextId > MAX_REQUEST_ID) {
-      this.#fail(new Error("request IDs exhausted"));
-      return { id: 0, result: Promise.reject(new SessionClosedError()) };
-    }
-    const id = this.#nextId++;
-    const message = { v: command === "adapter.protocol" ? 0 : 1, id, cmd: command, args };
-    const problem = requestProblem(command, message);
-    if (problem) return { id, result: Promise.reject(new Error(`invalid ${command} request: ${problem}`)) };
-    const result = new Promise<ResultOf<C>>((resolve, reject) => {
-      const pending: Pending = {
-        command,
-        deviceId: args && "device_id" in args ? String(args.device_id) : undefined,
-        chunks: 0,
-        abandoned: false,
-        onChunk: options.onChunk as Pending["onChunk"],
-        onEvent: options.onEvent,
-        resolve: resolve as (r: unknown) => void,
-        reject,
-      };
-      // Cancellation acknowledges before teardown; silence uses the link deadline.
-      const timeoutMs = options.timeoutMs ?? (command === "request.cancel" ? HEARTBEAT_TIMEOUT_MS : undefined);
-      if (timeoutMs)
-        pending.timer = setTimeout(
-          () => this.#fail(new Error(`${command} got no response`)),
-          timeoutMs,
-        );
-      else if (options.waitMs)
-        pending.timer = setTimeout(() => {
-          pending.abandoned = true;
-          pending.onChunk = undefined;
-          pending.onEvent = undefined;
-          reject(new Error(`${command} got no response`));
-          const ordinary = [...this.#pending.values()].filter((p) => !RESERVED.has(p.command));
-          if (ordinary.length >= limit && ordinary.every((p) => p.abandoned))
-            this.#fail(new Error("adapter reads stopped responding"));
-        }, options.waitMs);
-      this.#pending.set(id, pending);
-    });
-    this.#hooks.changed();
-    const settled = result.then(
-      () => {},
-      () => {},
-    );
-    this.#settled.set(id, settled);
-    void settled.then(() => this.#settled.delete(id));
-    const line = `${JSON.stringify(message)}\n`;
-    this.#writes = this.#writes
-      .then(() => (this.closed ? undefined : this.#transport.write(line)))
-      .catch((error: Error) => this.#fail(new Error(`serial write failed: ${error.message}`)));
-    return { id, result };
-  }
-
-  pendingFor(id: string) {
-    return [...this.#pending].filter(([, p]) => p.deviceId === id).map(([requestId, p]) => ({ id: requestId, command: p.command }));
-  }
-
-  #receive(chunk: Uint8Array) {
-    for (const line of this.#decoder.push(chunk)) {
-      if (this.closed) return;
-      let message: unknown;
-      try {
-        if ("error" in line) throw new Error(`adapter sent an ${line.error} line`);
-        message = JSON.parse(line.text);
-      } catch (error) {
-        if (!this.#confirmed) {
-          this.#hooks.log("ignoring input left from an earlier session");
-          continue;
-        }
-        this.#fail(error instanceof SyntaxError ? new Error("adapter sent invalid JSON") : (error as Error));
-        return;
-      }
-      this.#dispatch(message);
-    }
-  }
-
-  #dispatch(message: unknown) {
-    if (message === null || typeof message !== "object" || Array.isArray(message)) {
-      if (!this.#confirmed) return this.#hooks.log("ignoring input left from an earlier session");
-      return this.#fail(new Error("adapter sent a non-object message"));
-    }
-    const m = message as { type?: unknown; id?: unknown };
-    if (m.type === "response") {
-      const pending = typeof m.id === "number" ? this.#pending.get(m.id) : undefined;
-      if (!pending) {
-        this.#hooks.log(`ignoring response to unknown request ${String(m.id)}`);
-        return;
-      }
-      const problem = responseProblem(pending.command, message, this.status?.limits);
-      if (problem && !this.#confirmed) return this.#hooks.log("ignoring input left from an earlier session");
-      if (problem) return this.#fail(new Error(`invalid ${pending.command} response: ${problem}`));
-      this.#confirmed = true;
-      const r = message as { id: number; done: boolean; ok: boolean; result?: unknown; error?: WireError };
-      if (!r.done) {
-        const limit = pending.command === "device.list" ? this.status.limits.saved_devices
-          : pending.command.startsWith("hidpp.setting.") ? this.status.limits.hidpp_settings : Infinity;
-        if (++pending.chunks > limit) return this.#fail(new Error(`oversized ${pending.command} response`));
-        pending.onChunk?.(r.result as never);
-        return;
-      }
-      this.#pending.delete(r.id);
-      clearTimeout(pending.timer);
-      this.#hooks.changed();
-      if (r.ok) pending.resolve(r.result);
-      else pending.reject(new AdapterError(pending.command, r.error!));
-      return;
-    }
-    // Events can't belong to this session before its first response.
-    if (!this.#confirmed) return this.#hooks.log("ignoring input left from an earlier session");
-    const problem = eventProblem(message, this.status?.limits);
-    if (problem) return this.#fail(new Error(`invalid event: ${problem}`));
-    const event = message as Event;
-    if (event.event === "protocol.error") {
-      this.#fail(new Error(`adapter reported protocol error ${event.data.code}`));
-      return;
-    }
-    if (event.request_id !== undefined) {
-      this.#pending.get(event.request_id)?.onEvent?.(event);
-      return;
-    }
-    if (!this.view.event(event)) return;
-    if (event.event.startsWith("device.") && event.event !== "device.info.changed") this.#refreshStatusSoon();
-    this.#afterChange();
-  }
-
-  // ---- Synchronization ---------------------------------------------------
-
-  /** Follows up on view changes: lost events, new devices, stale settings. */
-  #afterChange() {
-    this.#hooks.changed();
-    if (this.readiness.state !== "ready") return;
-    if (!this.view.valid) this.resync();
-    else this.#fetchSoon();
-  }
-
-  /** Rebuilds the device view from a fresh snapshot (single flight). */
-  resync() {
-    if (this.#closing) return;
+  /** Lists the devices, then reads each device's warnings and settings (single flight). */
+  #sync() {
     if (this.#syncing) {
       this.#syncAgain = true;
       return;
     }
-    this.#syncing = true;
-    void (async () => {
-      let attempt = 0;
+    this.#syncing = (async () => {
       do {
         this.#syncAgain = false;
         try {
-          await this.#snapshot();
-          attempt = 0;
+          await this.#connection.listDevices();
+          this.listed = true;
+          this.#hooks.changed();
+          for (const id of [...this.devices.keys()]) await this.#readLists(id);
         } catch (error) {
-          this.view.abortSnapshot();
           if (this.closed) break;
-          // A list interrupted by a revision change reports busy; retry.
-          const busy = error instanceof AdapterError && error.wire.code === "busy";
-          this.#hooks.log(`device snapshot failed: ${(error as Error).message}`);
-          await sleep(busy ? 100 : Math.min(30000, 1000 * 2 ** attempt++));
-          this.#syncAgain = true;
+          this.#hooks.log(`listing devices failed: ${failure(error)}`);
         }
-      } while (this.#syncAgain && !this.closed && !this.#closing);
-      this.#syncing = false;
-      if (!this.closed) this.#fetchSoon();
+      } while (this.#syncAgain && !this.closed);
+      this.#syncing = null;
     })();
   }
 
-  async #snapshot() {
-    if (this.#closing) return;
-    this.view.beginSnapshot();
-    await this.request("session.monitor.set", { enabled: true }, { waitMs: READ_MS });
-    if (this.#closing) return;
-    this.#monitoring = true;
-    const rows: ChunkOf<"device.list">[] = [];
-    const end = await this.request("device.list", { filter: "saved" }, { onChunk: (row) => rows.push(row), waitMs: READ_MS });
-    const ids = new Set(rows.map((r) => r.device.device_id));
-    if (rows.some((r) => r.revision !== end.revision) || ids.size !== rows.length || rows.length !== end.count)
-      throw new Error("inconsistent device snapshot");
-    this.view.installSnapshot(
-      rows.map((r) => r.device),
-      end.revision,
+  async #readLists(id: string) {
+    if (!this.devices.has(id) || this.closed) return;
+    await this.#connection.listWarnings(id).then(
+      () => this.warningsErrors.delete(id),
+      (error: unknown) => this.#readFailed(id, this.warningsErrors, "warnings", error),
     );
-    if (!this.#installStatus(await this.request("adapter.status", {}, { waitMs: READ_MS }))) return;
-    if (!this.view.valid) this.#syncAgain = true;
+    if (!this.devices.has(id) || this.closed) return;
+    await this.#connection.listSettings(id).then(
+      () => this.settingsErrors.delete(id),
+      (error: unknown) => this.#readFailed(id, this.settingsErrors, "settings", error),
+    );
     this.#hooks.changed();
   }
 
-  #fetchSoon() {
-    this.#fetch().catch((error: Error) => {
-      if (!this.closed) this.#hooks.log(`reading device details failed: ${error.message}`);
-    });
+  #readFailed(id: string, errors: Map<string, string>, what: string, error: unknown) {
+    if (this.closed || !this.devices.has(id)) return;
+    const reason = failure(error);
+    this.#hooks.log(`${what} of ${id} unavailable: ${reason}`);
+    errors.set(id, reason);
   }
 
-  /** Reads missing device information and watched settings lists. */
-  async #fetch() {
-    if (this.#fetching || this.closed || !this.view.valid) return;
-    this.#fetching = true;
-    try {
-      for (;;) {
-        const info = this.view.infoNeeded()[0];
-        const settings = info === undefined ? this.view.settingsNeeded(this.#watched)[0] : undefined;
-        if (info !== undefined) await this.#readInfo(info);
-        else if (settings !== undefined) await this.#readSettings(settings);
-        else break;
-        this.#hooks.changed();
-        if (this.closed || !this.view.valid) break;
+  /** Reads a device's warning and settings lists again, as after a failed read. */
+  reload(id: string) {
+    void this.#readLists(id);
+  }
+
+  // ---- State --------------------------------------------------------------
+
+  #response(request: Request, response: Response) {
+    const result = response.result;
+    this.#hooks.answered?.(request, response);
+    switch (result.case) {
+      case "status":
+        this.#setStatus(result.value);
+        break;
+      case "devices": {
+        const listed = new Map(result.value.devices.map((d) => [d.id, convert.device(d)]));
+        for (const id of this.devices.keys()) if (!listed.has(id)) this.#remove(id);
+        for (const [id, d] of listed) this.devices.set(id, d);
+        break;
       }
-    } finally {
-      this.#fetching = false;
+      case "device":
+        this.#putDevice(convert.device(result.value), false);
+        break;
+      case "settings":
+        if (this.devices.has(result.value.device)) this.settings.set(result.value.device, convert.settings(result.value.settings));
+        break;
+      case "warnings":
+        if (this.devices.has(result.value.device)) this.warnings.set(result.value.device, result.value.warnings.map(convert.warning));
+        break;
     }
-  }
-
-  /** Runs a read, retrying while the adapter reports busy. */
-  async #retryBusy<T>(read: () => Promise<T>): Promise<T> {
-    for (let attempt = 1; ; attempt++) {
-      try {
-        return await read();
-      } catch (error) {
-        if (!(error instanceof AdapterError && error.wire.code === "busy") || attempt === 4 || this.closed) throw error;
-        await sleep(250 * attempt);
-      }
-    }
-  }
-
-  async #readInfo(id: string) {
-    const epoch = this.view.beginInfo(id);
-    try {
-      const info = await this.#retryBusy(() => this.request("device.info", { device_id: id }, { waitMs: READ_MS }));
-      if (info.device_id !== id) throw new Error(`device.info answered for ${info.device_id}`);
-      this.view.installInfo(info, epoch);
-    } catch (error) {
-      const reason = error instanceof AdapterError ? codeText(error.wire.code) : (error as Error).message;
-      this.#hooks.log(`information of ${id} unavailable: ${reason}`);
-      this.view.infoFailed(id, epoch, reason);
-    }
-  }
-
-  /** Reads a device's information again and installs the snapshot. */
-  async refreshInfo(id: string) {
-    const epoch = this.view.beginInfo(id);
-    const info = await this.request("device.info.refresh", { device_id: id });
-    if (info.device_id !== id) throw new Error("the adapter answered for a different device");
-    this.view.installInfo(info, epoch);
     this.#hooks.changed();
   }
 
-  async #readSettings(id: string) {
-    const epoch = this.view.beginSettings(id);
-    try {
-      const { end, rows } = await this.#retryBusy(async () => {
-        const rows: ChunkOf<"hidpp.setting.list">[] = [];
-        const end = await this.request("hidpp.setting.list", { device_id: id }, { onChunk: (row) => rows.push(row), waitMs: READ_MS });
-        // All chunks and the summary share the captured revision.
-        const keys = new Set(rows.map((r) => r.setting.key));
-        const consistent =
-          end.device_id === id &&
-          rows.length === end.count &&
-          keys.size === rows.length &&
-          rows.every((r) => r.revision === end.revision && r.device_id === id);
-        // An inconsistent list is read again, like a busy one.
-        if (!consistent) throw new InconsistentList();
-        return { end, rows };
-      });
-      this.view.installSettings(
-        id,
-        end.revision,
-        rows.map((r) => r.setting),
-        end.settings_state,
-        end.settings_error,
-        epoch,
-      );
-    } catch (error) {
-      const reason =
-        error instanceof InconsistentList ? "The adapter returned an inconsistent settings list."
-          : error instanceof AdapterError ? codeText(error.wire.code) : (error as Error).message;
-      this.#hooks.log(`settings of ${id} unavailable: ${reason}`);
-      this.view.settingsFailed(id, epoch, reason);
-    }
-  }
-
-  /** Keeps a device's settings list loaded while the UI shows it. */
-  watchSettings(ids: Iterable<string>) {
-    const next = [...ids];
-    for (const id of next) if (!this.#watched.has(id)) this.view.retrySettings(id, false);
-    this.#watched.clear();
-    for (const id of next) this.#watched.add(id);
-    this.#fetchSoon();
-  }
-
-  reloadSettings(id: string) {
-    this.view.retrySettings(id);
-    this.#fetchSoon();
-  }
-
-  /** Reads status again soon; capacity changes have no event of their own. */
-  #refreshStatusSoon() {
-    if (this.#statusTimer || this.readiness.state !== "ready") return;
-    this.#statusTimer = setTimeout(() => {
-      this.#statusTimer = undefined;
-      this.request("adapter.status", {}, { waitMs: READ_MS })
-        .then((status) => {
-          if (this.#installStatus(status)) this.#hooks.changed();
-        })
-        .catch(() => {});
-    }, STATUS_DELAY_MS);
-  }
-
-  /** Call after a mutation so counts and capacity follow it. */
-  mutated() {
-    this.#refreshStatusSoon();
-  }
-
-  async #beat() {
-    if (this.#closing) return;
-    try {
-      const result = await this.request("session.heartbeat", {}, { timeoutMs: HEARTBEAT_TIMEOUT_MS });
-      // After a missed deadline (for example across suspend) the adapter
-      // turned monitoring off; turn it on again and resynchronize.
-      if (!result.monitor && this.#monitoring && !this.#closing) {
-        this.#monitoring = false;
-        this.view.lose();
-        this.resync();
+  #event(event: Event) {
+    const kind = event.kind;
+    switch (kind.case) {
+      case "adapter": {
+        const wasReady = this.status?.ready;
+        this.#setStatus(kind.value);
+        // Devices listed before the adapter was ready may be incomplete. Before open() returns,
+        // run() lists them anyway.
+        if (wasReady === false && this.status.ready && this.#connection) this.#sync();
+        break;
       }
-    } catch (error) {
-      if (!this.closed && !this.#closing) this.#fail(new Error(`heartbeat failed: ${(error as Error).message}`));
+      case "device":
+        this.#putDevice(convert.device(kind.value), true);
+        break;
+      case "deviceRemoved":
+        this.#remove(kind.value.id);
+        break;
+      case "settings":
+        if (this.devices.has(kind.value.device)) {
+          this.settings.set(kind.value.device, convert.settings(kind.value.settings));
+          this.settingsErrors.delete(kind.value.device);
+        }
+        break;
+      case "warnings":
+        if (this.devices.has(kind.value.device)) {
+          this.warnings.set(kind.value.device, kind.value.warnings.map(convert.warning));
+          this.warningsErrors.delete(kind.value.device);
+        }
+        break;
+      default:
+        this.#hooks.event(event);
+        return;
     }
+    this.#hooks.changed();
   }
 
-  // ---- Shutdown ----------------------------------------------------------
+  #setStatus(status: Parameters<typeof convert.status>[0]) {
+    const next = convert.status(status);
+    // Another adapter can't answer on this session; keep the identity it opened with.
+    if (!this.status || next.id === this.status.id) this.status = next;
+  }
 
-  /** Orderly close: stop monitoring and cancel scans and pairing, then release. */
+  #putDevice(device: DeviceRecord, event: boolean) {
+    const known = this.devices.has(device.id);
+    this.devices.set(device.id, device);
+    // A newly paired device's lists are read once; events keep them current.
+    if (!known && event && this.listed) void this.#readLists(device.id);
+  }
+
+  #remove(id: string) {
+    this.devices.delete(id);
+    this.settings.delete(id);
+    this.settingsErrors.delete(id);
+    this.warnings.delete(id);
+    this.warningsErrors.delete(id);
+  }
+
+  /** Ends the session; the adapter stops any scan and unsaved pairing. */
   async close() {
-    if (this.closed || this.#closing) return;
-    this.#closing = true;
-    this.#monitoring = false;
-    clearInterval(this.#heartbeat);
-    const cancellable = [...this.#pending]
-      .filter(([, p]) => p.command === "discovery.scan" || p.command === "pairing.start")
-      .map(([id]) => id);
-    // Wait for the cancelled requests' own responses too, so none is still
-    // in flight when the port closes.
-    const cleanup = [
-      this.request("session.monitor.set", { enabled: false }),
-      ...cancellable.map((id) => this.request("request.cancel", { request_id: id })),
-      ...cancellable.map((id) => this.#settled.get(id) ?? Promise.resolve()),
-    ].map((p) => p.catch(() => {}));
-    await Promise.race([Promise.all(cleanup), sleep(CLEANUP_MS)]);
-    this.#stop(new SessionClosedError());
-    await this.#shutdownTransport();
-  }
-
-  async #shutdownTransport() {
-    await this.#transport.close().catch(() => {});
-  }
-
-  #stop(error: Error) {
-    this.closed = true;
-    clearInterval(this.#heartbeat);
-    clearTimeout(this.#statusTimer);
-    for (const pending of this.#pending.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(error instanceof SessionClosedError ? error : new SessionClosedError(error.message));
-    }
-    this.#pending.clear();
-  }
-
-  #fail(error: Error, notify = true) {
-    if (this.closed) return;
-    this.#stop(error);
-    void this.#transport.close();
-    if (notify) this.#hooks.closed(error);
+    await this.#connection.close();
   }
 }

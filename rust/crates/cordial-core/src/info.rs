@@ -1,12 +1,12 @@
 //! Volatile observations only. This module deliberately has no storage API or
 //! serialization implementation; battery information must NEVER reach flash.
+use crate::model::{
+    info::{InfoField, InfoKey as K, MAX_TEXT},
+    settings::SettingValue as V,
+};
 use alloc::{
     string::{String, ToString},
     vec::Vec,
-};
-use cordial_protocol::{
-    info::{InfoField, InfoKey as K, MAX_TEXT},
-    settings::SettingValue as V,
 };
 
 #[derive(Default)]
@@ -38,11 +38,11 @@ impl Information {
         self.connected = connected;
         self.enabled = enabled;
     }
-    pub fn kind_hint(&mut self, kind: cordial_protocol::messages::DeviceKind) {
+    pub fn kind_hint(&mut self, kind: crate::model::link::DeviceKind) {
         let hint = match kind {
-            cordial_protocol::messages::DeviceKind::Keyboard => Some("keyboard"),
-            cordial_protocol::messages::DeviceKind::Mouse => Some("mouse"),
-            cordial_protocol::messages::DeviceKind::KeyboardMouse => Some("keyboard_mouse"),
+            crate::model::link::DeviceKind::Keyboard => Some("keyboard"),
+            crate::model::link::DeviceKind::Mouse => Some("mouse"),
+            crate::model::link::DeviceKind::KeyboardMouse => Some("keyboard_mouse"),
             _ => None,
         };
         self.dirty |= self.kind_hint != hint;

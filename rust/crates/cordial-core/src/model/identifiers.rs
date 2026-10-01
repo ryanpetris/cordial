@@ -1,0 +1,60 @@
+//! Identifiers and states shared across the firmware.
+use alloc::string::String;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DeviceId(pub String);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostPlatform {
+    #[default]
+    Linux,
+    Windows,
+    Mac,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    Classic,
+    Ble,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionState {
+    #[default]
+    Disconnected,
+    Connecting,
+    Connected,
+    Disconnecting,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsState {
+    #[default]
+    Off,
+    Pending,
+    Discovering,
+    Ready,
+    Applying,
+    Unsupported,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NormalizationState {
+    #[default]
+    Off,
+    Pending,
+    Probing,
+    Resetting,
+    Configuring,
+    Active,
+    Unsupported,
+    Error,
+}

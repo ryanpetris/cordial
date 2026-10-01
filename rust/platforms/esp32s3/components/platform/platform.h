@@ -9,7 +9,6 @@ void cordial_esp_critical_exit(void);
 void *cordial_esp_current_task(void);
 void cordial_esp_wake(void *task);
 void cordial_esp_wait(void);
-uint64_t cordial_esp_boot_random(void);
 esp_err_t cordial_esp_usb_phy(void);
 void *cordial_esp_usb_registers(void);
 esp_err_t cordial_esp_usb_interrupt(void (*handler)(void *), void *context);

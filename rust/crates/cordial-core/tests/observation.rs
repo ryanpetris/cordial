@@ -1,11 +1,11 @@
-use cordial_core::{
-    compact::{Metadata, Observed, Preference, Record},
-    settings::Catalog,
-};
-use cordial_protocol::{
+use cordial_core::model::{
     errors::ErrorCode,
     hidpp::{FeatureId, FeatureRevision},
     settings::*,
+};
+use cordial_core::{
+    compact::{Metadata, Observed, Preference, Record},
+    settings::Catalog,
 };
 
 #[test]

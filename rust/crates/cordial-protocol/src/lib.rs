@@ -1,30 +1,29 @@
-#![no_std]
+//! The Cordial serial API: protobuf messages generated from `proto/cordial.proto`, the frame
+//! encoding used on the USB serial port, and the information and setting keys from
+//! `proto/keys.toml`.
+//!
+//! A client sends [`Request`] frames and receives [`Message`] frames, each holding a
+//! [`Response`] or an [`Event`]. [`frame`] turns messages into frames and back.
+#![cfg_attr(not(feature = "json"), no_std)]
 
 extern crate alloc;
 
-pub mod codec;
-pub mod errors;
-pub mod hidpp;
-pub mod identifiers;
-pub mod info;
-pub mod messages;
-pub mod payloads;
-pub mod settings;
-pub mod translation;
-
-pub const PROTOCOL_VERSION: u8 = 1;
-/// Includes the terminating LF.
-pub const MAX_LINE_BYTES: usize = 4096;
-pub const MAX_REQUEST_ID: u32 = 2_147_483_647;
-pub const MAX_REVISION: u64 = 9_007_199_254_740_991;
-pub const HEARTBEAT_INTERVAL_MS: u32 = 5_000;
-pub const HEARTBEAT_TIMEOUT_MS: u32 = 15_000;
-
-/// Canonical adapter names contain 1..64 UTF-8 bytes and no control characters.
-pub fn adapter_name(value: &str) -> Option<&str> {
-    if value.chars().any(char::is_control) {
-        return None;
-    }
-    let name = value.trim();
-    (!name.is_empty() && name.len() <= 64).then_some(name)
+#[allow(clippy::all, clippy::pedantic, missing_docs)]
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/cordial.rs"));
+    #[cfg(feature = "json")]
+    include!(concat!(env!("OUT_DIR"), "/cordial.serde.rs"));
 }
+pub use generated::*;
+
+pub mod frame;
+pub mod keys;
+
+/// USB vendor ID of every Dongle (pid.codes).
+pub const USB_VENDOR_ID: u16 = 0x1209;
+/// USB product ID of every Dongle.
+pub const USB_PRODUCT_ID: u16 = 0xc0d1;
+/// USB manufacturer string of every Dongle.
+pub const USB_MANUFACTURER: &str = "Cordial";
+/// The longest request a Dongle accepts, before frame encoding.
+pub const MAX_REQUEST_BYTES: usize = 1024;

@@ -8,7 +8,6 @@ license.workspace = true
 
 [dependencies]
 cordial-core.workspace = true
-cordial-protocol.workspace = true
 
 [dev-dependencies]
 embassy-futures = "=0.1.2"

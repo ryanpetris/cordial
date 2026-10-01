@@ -5,7 +5,8 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { isAction } from "../core/actions.ts";
 import { Controller } from "../core/controller.ts";
-import { candidatePorts, hostPlatform, openSerial, watchHotplug } from "../node/serial.ts";
+import { listPorts, openSerial } from "@cordial/client/node";
+import { hostPlatform, watchHotplug } from "../node/host.ts";
 import { preferencesFrom, type AppState } from "../shared/state.ts";
 
 const log = (message: string) => console.log(`[cordial] ${new Date().toISOString()} ${message}`);
@@ -50,7 +51,7 @@ export interface Backend {
 export async function startBackend(simulate = 0): Promise<Backend> {
   const clients = new Set<ServerResponse>();
   const send = (res: ServerResponse, state: AppState) => res.write(`data: ${JSON.stringify(state)}\n\n`);
-  const ports = simulate > 0 ? (await import("../fake/ports.ts")).simulatedPorts(simulate) : { listPorts: candidatePorts, openTransport: openSerial };
+  const ports = simulate > 0 ? (await import("../fake/ports.ts")).simulatedPorts(simulate) : { listPorts, openTransport: openSerial };
   const controller = new Controller({
     ...ports,
     log,
@@ -70,7 +71,6 @@ export async function startBackend(simulate = 0): Promise<Backend> {
 
   /** Like hiding the desktop window: nothing runs without a page to show it. */
   function lastClientGone() {
-    void controller.act({ type: "settings.watch", key: null });
     void controller.act({ type: "pair.cancel" });
     void controller.act({ type: "pair.dismiss" });
     void controller.act({ type: "scan.stop" });

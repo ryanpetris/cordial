@@ -1,14 +1,14 @@
+use cordial_core::model::{
+    errors::ErrorCode,
+    hidpp::{FeatureId, FeatureRevision},
+    identifiers::{ConnectionState, HostPlatform, Transport},
+    settings::{SettingKey, SettingScope},
+};
 use cordial_core::{
     compact::{Metadata, Preference},
     devices::*,
     settings::PreferenceStore,
     storage::{Error, Preferences, RecordKey, RecordStore},
-};
-use cordial_protocol::{
-    errors::ErrorCode,
-    hidpp::{FeatureId, FeatureRevision},
-    identifiers::{ConnectionState, HostPlatform, Transport},
-    settings::{SettingKey, SettingScope},
 };
 use embassy_futures::block_on;
 use std::collections::BTreeMap;

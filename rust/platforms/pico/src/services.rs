@@ -25,7 +25,6 @@ pub fn random_u64() -> u64 {
 pub struct Identity {
     pub unique: [u8; 8],
     pub adapter: String,
-    pub boot: String,
 }
 pub fn identity<T: Instance, M: Mode, const N: usize>(
     flash: &mut Flash<'_, T, M, N>,
@@ -42,12 +41,7 @@ pub fn identity<T: Instance, M: Mode, const N: usize>(
             .to_be_bytes()
     };
     let adapter = format!("{:016X}", u64::from_be_bytes(unique));
-    let boot = format!("{:016x}", random_u64());
-    Ok(Identity {
-        unique,
-        adapter,
-        boot,
-    })
+    Ok(Identity { unique, adapter })
 }
 
 /// The controller address follows the Wi-Fi OTP MAC plus one. If OTP is unset,

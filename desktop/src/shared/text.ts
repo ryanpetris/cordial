@@ -1,200 +1,181 @@
 // The host's words for adapter codes and records. The adapter sends machine
-// codes only. Records keyed by the generated enums are exhaustive, so a
-// schema change fails type checking until its wording is added here.
+// codes and catalog keys only. Records keyed by the protocol's enums are
+// exhaustive, so a protocol change fails type checking until its wording is
+// added here; keys missing from the catalog tables here are not shown.
 import type {
-  CapacityReason,
-  ConnectionSecurity,
-  DisabledReason,
-  ErrorCode,
+  AdapterEntry,
+  AdapterStatus,
+  Battery,
+  Code,
+  DeviceEntry,
+  DeviceRecord,
+  DeviceWarning,
   HostPlatform,
-  InfoField,
-  InfoKey,
-  NormalizationState,
-  ProtocolState,
-  PairUnavailable,
-  Role,
-  SettingKey,
-  SettingState,
-  SettingValue,
-  SettingsState,
-  Transport,
-  ValidationError,
-  WarningCode,
+  InfoEntry,
+  Inactive,
+  IntegrationStateName,
+  Integration,
+  ReportTypeName,
+  RoleName,
+  Scalar,
+  Security,
+  SettingStateName,
+  TransportName,
+  WarningName,
   WireError,
-} from "../protocol/types.ts";
-import type { AdapterEntry, Battery, DeviceEntry } from "./state.ts";
+} from "./state.ts";
 
 const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
-const ERRORS: Record<ErrorCode, string> = {
-  invalid_request: "the adapter rejected a malformed request",
-  invalid_json: "the adapter couldn't parse a request",
-  message_too_large: "a request exceeded the adapter's line limit",
-  unsupported_version: "the adapter doesn't support this protocol version",
+const ERRORS: Record<Code, string> = {
+  unknown: "the adapter hit an unexpected failure",
+  bad_request: "the adapter rejected a malformed request",
   unknown_command: "this adapter's firmware doesn't support that command",
-  invalid_args: "the adapter rejected the command's arguments",
+  bad_args: "the adapter rejected the command's arguments",
+  too_long: "a request exceeded the adapter's size limit",
+  not_ready: "the adapter's Bluetooth or storage isn't ready",
+  not_found: "the adapter couldn't find that device or setting",
+  not_connected: "the device isn't connected; connect it first",
   busy: "the adapter is busy with a conflicting operation; try again when it finishes",
-  not_found: "the adapter has no saved device with that ID",
-  blocked: "the device is blocked; unblock it before connecting",
-  heartbeat_required: "the adapter stopped hearing from this app; try again",
-  client_timeout: "stopped because the adapter stopped hearing from this app",
-  candidate_expired: "that nearby device is no longer available; search again",
   disabled: "the device is turned off in Cordial; turn on “Use This Device” first",
-  pairing_required: "the device needs pairing again; put it in pairing mode and add it again",
-  capacity: "the adapter has no room for that right now",
-  unsupported_hid: "the device's HID format isn't supported",
-  unsupported_transport: "this adapter doesn't support the device's Bluetooth type",
-  authentication_failed: "Bluetooth authentication failed",
-  authentication_rejected: "authentication was rejected by you or the device",
-  stale_prompt: "that pairing prompt is no longer waiting for an answer",
-  connection_failed: "the Bluetooth link or HID setup failed",
-  radio_unavailable: "the adapter's Bluetooth controller isn't ready",
-  input_overflow: "input was dropped because the computer didn't read it in time",
+  blocked: "the device is blocked; unblock it before connecting",
+  unsupported: "this adapter or device doesn't support that",
+  no_capacity: "the adapter has no room for that right now",
+  no_prompt: "that pairing prompt is no longer waiting for an answer",
   storage_failed: "the adapter couldn't save the change; what it had saved is unchanged",
-  storage_changed: "the adapter's saved data changed during the operation; try again",
-  storage_full:
-    "the adapter's storage is full, so the change wasn't saved; remove unused devices or set saved settings back to default",
+  internal: "the adapter hit an unexpected failure",
+  candidate_expired: "that nearby device is no longer available; search again",
+  auth_failed: "Bluetooth authentication failed",
+  rejected: "authentication was rejected by you or the device",
   timeout: "the operation took too long",
   cancelled: "the operation was cancelled",
-  not_pending: "that request has already finished",
-  not_cancellable: "that operation can't be cancelled",
-  session_fault: "the adapter stopped this session because its output stalled",
-  internal_error: "the adapter hit an unexpected failure",
-  not_connected: "the device isn't connected; connect it first",
-  read_only: "that setting is read-only information from the device",
-  hidpp_disabled: "Logitech features are off for this device; turn them on to apply saved settings",
-  settings_unavailable: "the adapter hasn't read this device's settings yet; it reads them when the device connects",
-  unsupported_setting: "the device doesn't support that setting or value now",
-  settings_limit: "the adapter can't save more settings for this device; set another one back to default first",
-  settings_apply_failed: "some saved values couldn't be applied or confirmed",
-  settings_refresh_failed: "some settings couldn't be read",
-  feature_set_unavailable: "the device's feature list couldn't be read",
+  connection_failed: "the Bluetooth link or HID setup failed",
+  unsupported_hid: "the device's HID format isn't supported",
+  protocol_unsupported: "not supported",
+  feature_unavailable: "a needed feature is unavailable",
+  transport_error: "couldn't send",
+  device_error: "device error",
+  invalid_response: "unexpected reply",
   readback_mismatch: "the device reported a different value after the change",
-  backlight_mode_selection_required: "the backlight is in temporary manual mode; choose a backlight mode first",
-  backlight_permanent_manual_required: "the level only applies in permanent manual backlight mode",
-  native_routing_required: "the thumbwheel isn't in its native mode",
-  native_standard_resolution_required: "the wheel isn't in its native standard-resolution mode",
-  hidpp_reports_unavailable: "not supported",
-  hidpp_protocol_unsupported: "not supported",
-  hidpp_reset_unavailable: "special keys unavailable",
-  hidpp_controls_unavailable: "special keys unavailable",
-  hidpp_timeout: "no response",
-  hidpp_transport_error: "couldn't send",
-  hidpp_device_error: "device error",
-  hidpp_invalid_response: "unexpected reply",
 };
 
-const CAPACITY: Record<CapacityReason, string> = {
-  enabled_full: "every enabled-device place is in use; turn off another device first",
-  storage_full: "the adapter's storage has no room for another device; remove unused devices or saved settings",
-  setup_capacity: "the adapter's Bluetooth stack has no pairing place available",
-  connections_full: "every connection is in use; disconnect a device first",
+const CAPACITY: Record<NonNullable<WireError["reason"]>, string> = {
+  unknown: ERRORS.no_capacity,
+  enabled: "every enabled-device place is in use; turn off another device first",
+  storage: "the adapter's storage has no room; remove unused devices or saved settings",
+  connections: "every connection is in use; disconnect a device first",
 };
 
 /** An adapter error as a sentence for the window or a notification. */
 export function errorText(error: WireError): string {
-  if (error.code === "capacity" && error.details && "reason" in error.details)
-    return sentence(CAPACITY[error.details.reason as CapacityReason] ?? ERRORS.capacity);
-  if (error.code === "storage_failed" && error.details && "outcome" in error.details)
-    if (error.details.outcome === "unknown")
-      return "The adapter may or may not have saved the change; check the device and try again.";
+  if (error.code === "no_capacity") return sentence(CAPACITY[error.reason ?? "unknown"]);
+  if (error.code === "storage_failed" && error.outcomeUnknown)
+    return "The adapter may or may not have saved the change; check the device and try again.";
   return sentence(ERRORS[error.code]);
 }
 
-export const codeText = (code: ErrorCode) => sentence(ERRORS[code]);
+export const codeText = (code: Code) => sentence(ERRORS[code]);
 
-export const PAIR_UNAVAILABLE: Record<PairUnavailable, string> = {
-  storage_full: "Storage Full",
-  setup_capacity: "No Pairing Slot",
-  connections_full: "All Connections in Use",
-  pairing_active: "Pairing in Progress",
-  radio_unavailable: "Bluetooth Not Ready",
-  storage_unavailable: "Storage Not Ready",
-};
-
-export const DISABLED: Record<DisabledReason, string> = {
+/** Why a device the adapter doesn't use is inactive. */
+export const INACTIVE: Record<Inactive, string> = {
+  unknown: "The adapter isn't using it.",
   unsupported_transport: "This adapter doesn't support its Bluetooth type.",
-  invalid: "Its saved record is invalid.",
   blocked: "It is blocked.",
   disabled: "It is turned off.",
   capacity: "Every enabled-device place is in use; turn off another device to make room.",
 };
 
-export const VALIDATION: Record<ValidationError, string> = {
-  bond_missing: "Its saved pairing is missing.",
-  bond_corrupt: "Its saved pairing is damaged.",
-  bond_mismatch: "Its saved pairing belongs to a different device.",
-  device_corrupt: "Its saved device record is damaged.",
-  read_failed: "The adapter couldn't read its saved record.",
+export const WARNINGS: Record<WarningName, string> = {
+  unknown: "The adapter can't use part of this device.",
+  numeric_selector_unsupported: "The adapter can't derive a value from this numeric selector field.",
+  pointer_selector_unsupported: "The adapter can't forward pointer coordinates from a selector field.",
+  buffered_input_unsupported: "The adapter can't interpret this input field's custom byte format.",
+  indicator_report_too_large: "The indicator report is larger than the Bluetooth connection allows.",
+  indicator_read_unsupported: "The device doesn't support reading this indicator report.",
+  indicator_write_unsupported: "The device doesn't support writing this indicator report.",
+  buffered_indicator_unsupported: "The adapter can't interpret this indicator field's custom byte format.",
+  indicator_state_unknown: "The device doesn't report the indicator state needed for this update.",
+  indicator_read_failed: "The adapter couldn't read the indicator report.",
+  indicator_write_failed: "The adapter couldn't update the indicator lights.",
+  indicator_array_full: "The indicator report has no room for all active lights.",
+  indicator_relative_selector_unsupported: "The adapter can't forward this relative indicator selector.",
+  indicator_mode_unsupported: "The indicator doesn't provide a usable on/off control.",
+  indicator_nonlinear_unsupported: "The adapter can't convert this indicator's nonlinear values.",
+  indicator_scale_unsupported: "The indicator's units don't provide a usable value conversion.",
+  indicator_range_unsupported: "The indicator's value range can't represent both states.",
 };
 
-export const WARNINGS: Record<WarningCode, string> = {
-  unsupported_fields: "Some input fields are unsupported.",
-  led_output_unavailable: "Lock indicator lights are unsupported.",
+const REPORT_TYPES: Record<ReportTypeName, string> = {
+  input: "Input Report",
+  output: "Output Report",
+  feature: "Feature Report",
 };
 
-export const NORMALIZATION: Record<NormalizationState, string> = {
-  off: "Off",
-  pending: "Waiting to Connect",
-  probing: "Checking",
-  resetting: "Resetting",
-  configuring: "Setting Up",
-  active: "Active",
-  unsupported: "Unsupported",
-  error: "Failed",
-};
+const hex = (n: number) => n.toString(16).toUpperCase().padStart(4, "0");
 
-export const SETTINGS_STATUS: Record<SettingsState, string> = {
-  off: "Off",
-  pending: "Waiting to Connect",
-  discovering: "Reading",
-  ready: "Ready",
-  applying: "Applying",
-  unsupported: "Unavailable",
-  error: "Failed",
-};
+export const WARNINGS_READ_FAILED = "The adapter couldn't read the device's warnings.";
 
-export function hidppProtocolText(protocol?: ProtocolState): string {
-  switch (protocol?.state) {
-    case "detected": return `${protocol.major}.${protocol.minor}`;
-    case "probing": return "Checking";
-    case "unavailable": return "Unavailable";
-    case "error": return `Failed: ${codeText(protocol.code)}`;
-    default: return "Unknown";
-  }
+const INPUT_WARNINGS: WarningName[] = ["numeric_selector_unsupported", "pointer_selector_unsupported", "buffered_input_unsupported"];
+
+/** A device warning as an Information fact: what it concerns, the problem,
+ * and the HID service, report and field it was found in. */
+export function warningFact(w: DeviceWarning): { label: string; text: string; context: string } {
+  const context = [`Service ${w.service}`];
+  const kind = w.reportType ? REPORT_TYPES[w.reportType] : null;
+  if (kind) context.push(w.reportId !== null ? `${kind} ${w.reportId}` : kind);
+  else if (w.reportId !== null) context.push(`Report ${w.reportId}`);
+  if (w.bitOffset !== null) context.push(`Bit ${w.bitOffset}`);
+  if (w.usagePage !== null) context.push(`Usage ${hex(w.usagePage)}${w.usage !== null ? `:${hex(w.usage)}` : ""}`);
+  return {
+    label: INPUT_WARNINGS.includes(w.code) ? "Input Field" : "Lock Indicators",
+    text: WARNINGS[w.code],
+    context: context.join(", "),
+  };
 }
 
-/** A saved setting's state as its marker names it. */
-export const SETTING_STATES: Record<SettingState, string> = {
+/** Whether HID++ is up on the device, in a few words. */
+export const INTEGRATION_STATES: Record<IntegrationStateName, string> = {
+  off: "Off",
+  disconnected: "Waiting to Connect",
+  starting: "Setting Up",
+  active: "Active",
+  unsupported: "Unsupported",
+};
+
+export function integrationText(i: Integration): string {
+  return i.state ? INTEGRATION_STATES[i.state] : `Failed: ${codeText(i.error ?? "unknown")}`;
+}
+
+/** The detected HID++ version, as "4.5". */
+export const versionText = (i: Integration) => (i.version ? `${i.version.major}.${i.version.minor}` : "Unknown");
+
+/** A saved setting's state as its marker names it; `unmanaged` is a setting with no saved value. */
+export const SETTING_STATES: Record<SettingStateName | "unmanaged" | "error", string> = {
   unmanaged: "Not Saved",
   pending: "Saved",
-  applying: "Saved",
   applied: "Saved",
   changed_on_device: "Changed on Device",
   unsupported: "Can't Apply Now",
   error: "Failed",
-  uncertain: "Unconfirmed",
 };
 
 export const PLATFORMS: Record<HostPlatform, string> = { linux: "Linux", windows: "Windows", mac: "Mac" };
-export const TRANSPORTS: Record<Transport, string> = { ble: "Bluetooth LE", classic: "Bluetooth Classic" };
-export const ROLES: Record<Role, string> = { keyboard: "Keyboard", mouse: "Mouse", consumer_control: "Media Keys" };
+export const TRANSPORTS: Record<TransportName, string> = { ble: "Bluetooth LE", classic: "Bluetooth Classic" };
+export const ROLES: Record<RoleName, string> = { keyboard: "Keyboard", mouse: "Mouse", consumer_control: "Media Keys", system_control: "System Keys" };
 
-export const INFO_LABELS: Record<InfoKey, string> = {
-  name: "Reported Name",
-  kind: "Device Type",
-  manufacturer: "Manufacturer",
-  model: "Model",
-  serial: "Serial Number",
-  firmware: "Firmware",
-  hardware: "Hardware",
-  software: "Software",
-  vendor_id_namespace: "Vendor ID Namespace",
-  vendor_id: "Vendor ID",
-  product_id: "Product ID",
-  product_version: "Product Version",
-  battery_percent: "Battery",
-  battery_charging: "Charging",
+/** Labels of the information keys the Information card shows, in display order. */
+export const INFO_LABELS: Record<string, string> = {
+  "device.manufacturer": "Manufacturer",
+  "device.model": "Model",
+  "device.serial": "Serial Number",
+  "firmware.version": "Firmware",
+  "bootloader.version": "Bootloader",
+  "hardware.revision": "Hardware",
+  "software.revision": "Software",
+  "vendor.registry": "Vendor ID Namespace",
+  "vendor.id": "Vendor ID",
+  "product.id": "Product ID",
+  "product.version": "Product Version",
 };
 
 const KINDS: Record<DeviceEntry["kind"], string> = {
@@ -204,31 +185,31 @@ const KINDS: Record<DeviceEntry["kind"], string> = {
   other: "Other",
 };
 
-export function infoLabel(f: InfoField): string {
-  if (f.key === "firmware") return f.instance === 0 ? "Firmware" : "Bootloader";
-  return f.instance === 0 ? INFO_LABELS[f.key] : `${INFO_LABELS[f.key]} ${f.instance + 1}`;
-}
+export const kindText = (kind: DeviceEntry["kind"]) => KINDS[kind];
 
-export function infoValue(f: InfoField): string | null {
-  if (!f.available) return null;
+export function infoValue(f: InfoEntry): string {
   const v = f.value;
   switch (f.key) {
-    case "kind":
-      return KINDS[v as DeviceEntry["kind"]] ?? "Other";
-    case "vendor_id":
-    case "product_id":
-    case "product_version":
-      return typeof v === "number" ? `0x${v.toString(16).toUpperCase().padStart(4, "0")}` : null;
-    case "vendor_id_namespace":
+    case "vendor.id":
+    case "product.id":
+    case "product.version":
+      return typeof v === "number" ? `0x${v.toString(16).toUpperCase().padStart(4, "0")}` : String(v);
+    case "vendor.registry":
       return v === "usb" ? "USB" : "Bluetooth";
-    case "battery_percent":
-      return `${String(v)}%`;
-    case "battery_charging":
-      return v ? "Yes" : "No";
     default:
+      if (f.type === "bool") return v ? "Yes" : "No";
+      if (f.type === "color") return `#${(v as number).toString(16).padStart(6, "0").toUpperCase()}`;
       return String(v);
   }
 }
+
+/** The text an information entry or the adapter status carries for `key`, if any. */
+export const infoOf = (list: InfoEntry[], key: string) => list.find((f) => f.key === key)?.value;
+
+/** Why a nearby device can't be added: the adapter has no room to save it. */
+export const STORAGE_FULL = "Storage Full";
+
+export const storageFull = (s: AdapterStatus | null) => infoOf(s?.info ?? [], "storage.full") === true;
 
 export interface SettingInfo {
   label: string;
@@ -237,9 +218,9 @@ export interface SettingInfo {
   choices?: Record<string, string>;
 }
 
-/** Recognized settings in display order; categories follow first use. */
-export const SETTINGS: Record<SettingKey, SettingInfo> = {
-  "fn.row_default": {
+/** Recognized settings and setting-like readings in display order; categories follow first use. */
+const SETTINGS: Record<string, SettingInfo> = {
+  "keyboard.fn_row": {
     label: "Function Row",
     category: "Keyboard",
     choices: { function_keys: "F1-F12", special_actions: "Shortcuts" },
@@ -260,55 +241,56 @@ export const SETTINGS: Record<SettingKey, SettingInfo> = {
   "backlight.power_on": { label: "Backlight at Power-On", category: "Backlight" },
   "backlight.crown": { label: "Crown Backlight", category: "Backlight" },
   "backlight.power_save": { label: "Backlight Power Saving", category: "Backlight" },
-  "pointer.dpi.0": { label: "Pointer Speed", category: "Pointer", unit: "DPI" },
-  "pointer.dpi.1": { label: "Second Sensor Speed", category: "Pointer", unit: "DPI" },
+  "pointer.sensor.{n}.dpi": { label: "Pointer Speed", category: "Pointer", unit: "DPI" },
   "wheel.mode": { label: "Wheel Mode", category: "Wheel" },
   "wheel.threshold": { label: "SmartShift", category: "Wheel" },
   "wheel.invert": { label: "Reverse Vertical Scrolling", category: "Wheel" },
-  "wheel.info": { label: "Wheel Capabilities", category: "Wheel" },
   "thumbwheel.invert": { label: "Reverse Horizontal Scrolling", category: "Wheel" },
 };
 
-const ORDER = Object.keys(SETTINGS) as SettingKey[];
-export const settingOrder = (key: SettingKey) => ORDER.indexOf(key);
+const SENSOR = /^pointer\.sensor\.([0-9]+)\.dpi$/;
+const template = (key: string) => (SENSOR.test(key) ? "pointer.sensor.{n}.dpi" : key);
+
+/** How the settings form shows `key`; null for keys this app doesn't know. */
+export function settingInfo(key: string): SettingInfo | null {
+  const info = SETTINGS[template(key)];
+  if (!info) return null;
+  const sensor = Number(SENSOR.exec(key)?.[1] ?? 0);
+  return sensor === 0 ? info : { ...info, label: sensor === 1 ? "Second Sensor Speed" : `Sensor ${sensor + 1} Speed` };
+}
+
+const ORDER = Object.keys(SETTINGS);
+/** Display order; a second sensor follows the first. */
+export const settingOrder = (key: string) => ORDER.indexOf(template(key)) + Number(SENSOR.exec(key)?.[1] ?? 0) / 100;
 
 /** Capitalizes each word: "permanent manual" becomes "Permanent Manual". */
 const titleCase = (s: string) => s.replace(/(^|\s)(\p{Ll})/gu, (_, space: string, c: string) => space + c.toUpperCase());
 
 /** An enum token in words: the catalog's wording, else the token in title case. */
-export function choiceText(key: SettingKey, token: string): string {
-  return SETTINGS[key].choices?.[token] ?? titleCase(token.replace(/[_-]/g, " "));
+export function choiceText(key: string, token: string): string {
+  return settingInfo(key)?.choices?.[token] ?? titleCase(token.replace(/[_-]/g, " "));
 }
 
-/** Decodes the lowercase-hex `wheel.info` readout into labelled facts; null when undocumented. */
-export function wheelInfo(value: SettingValue, featureVersion: number): [string, string][] | null {
-  if (typeof value !== "string" || !/^([0-9a-f]{2})+$/.test(value)) return null;
-  const b = value.match(/../g)!.map((h) => parseInt(h, 16));
-  if (b.length !== (featureVersion === 0 ? 2 : 4)) return null;
-  const names: [number, string][] = [
-    [2, "ratchet switch"],
-    [3, "inversion"],
+/** The wheel's capability readings as labelled figures. */
+export function wheelFigures(info: InfoEntry[]): [string, string][] {
+  const figures: [string, string, (v: Scalar) => string][] = [
+    ["wheel.resolution_multiplier", "Resolution Multiplier", String],
+    ["wheel.ratchets_per_rotation", "Ratchets per Rotation", String],
+    ["wheel.diameter", "Wheel Diameter", (v) => `${String(v)} mm`],
   ];
-  if (featureVersion >= 1) names.push([4, "statistics"]);
-  const caps = [];
-  for (let bit = 0; bit < 8; bit++)
-    if (b[1]! & (1 << bit)) caps.push(names.find(([n]) => n === bit)?.[1] ?? `bit ${bit}`);
-  const facts: [string, string][] = [
-    ["Resolution Multiplier", String(b[0])],
-    ["Capabilities", caps.length ? sentence(caps.join(", ")) : "None"],
-  ];
-  if (b.length === 4) facts.push(["Ratchets per Rotation", String(b[2])], ["Wheel Diameter", `${b[3]} mm`]);
-  return facts;
+  return figures.flatMap(([key, label, text]) => {
+    const v = infoOf(info, key);
+    return v === undefined ? [] : [[label, text(v)] as [string, string]];
+  });
 }
 
-export function securityFacts(s: ConnectionSecurity): [string, string][] {
-  const flag = (v: boolean | null | undefined) => (v == null ? "Not Reported" : v ? "Yes" : "No");
+export function securityFacts(s: Security): [string, string][] {
+  const flag = (v: boolean | null) => (v == null ? "Not Reported" : v ? "Yes" : "No");
   return [
     ["Encrypted", flag(s.encrypted)],
     ["Authenticated Pairing", flag(s.authenticated)],
-    ["Secure Connections", flag(s.secure_connections)],
-    ["Encryption Key", s.key_size == null ? "Not Reported" : `${s.key_size * 8}-bit`],
-    ["Saved Pairing", flag(s.bonded)],
+    ["Secure Connections", flag(s.secureConnections)],
+    ["Encryption Key", s.keySize == null ? "Not Reported" : `${s.keySize * 8}-bit`],
   ];
 }
 
@@ -325,8 +307,7 @@ export function batteryText(b: Battery | null): string | null {
 export const batteryStale = (b: Battery) => (b.percent != null && !b.percentFresh) || (b.charging != null && !b.chargingFresh);
 
 /** The device's state in a few words, as lists show it. */
-export function deviceStatus(d: DeviceEntry["device"]): string {
-  if (d.pairing_state === "needs_pairing") return "Needs Pairing";
+export function deviceStatus(d: DeviceRecord): string {
   if (d.blocked) return "Blocked";
   switch (d.state) {
     case "connected":
@@ -336,7 +317,7 @@ export function deviceStatus(d: DeviceEntry["device"]): string {
     case "disconnecting":
       return "Disconnecting…";
     default:
-      return d.effective_enabled ? "Disconnected" : d.enabled ? "Inactive" : "Disabled";
+      return d.inactive === null ? "Disconnected" : d.enabled ? "Inactive" : "Disabled";
   }
 }
 
@@ -344,7 +325,6 @@ export function deviceStatus(d: DeviceEntry["device"]): string {
 export function adapterStatus(a: AdapterEntry): { text: string; warn: boolean } {
   if (a.connection === "disconnected") return { text: "Disconnected", warn: false };
   if (a.connection === "connecting") return { text: "Connecting…", warn: false };
-  if (a.readiness === "failed") return { text: "Not Ready", warn: true };
   if (a.readiness === "waiting") return { text: "Starting…", warn: false };
   return a.attention.length ? { text: "Needs Attention", warn: true } : { text: "Ready", warn: false };
 }

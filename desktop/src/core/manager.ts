@@ -1,18 +1,21 @@
 // Finds Cordial adapters and keeps one session open to each. A USB serial
 // port with the Cordial ID is only a candidate: it becomes an adapter once
-// the protocol handshake confirms it. Removal is silent.
+// the adapter answers its first request. Removal is silent.
+import type { ByteStream, PortInfo } from "@cordial/client";
+import type { Event, Request, Response } from "@cordial/protocol";
+import type { AdapterStatus } from "../shared/state.ts";
 import { AdapterSession } from "./session.ts";
-import type { PortInfo, Transport } from "./transport.ts";
-import type { Status } from "../protocol/types.ts";
 
 export interface ManagerDeps {
   listPorts(): Promise<PortInfo[]>;
-  openTransport(path: string): Promise<Transport>;
+  openTransport(path: string): Promise<ByteStream>;
   log(message: string): void;
   /** Adapter list or any adapter's state changed. */
   changed(): void;
-  /** A session was confirmed and registered. */
-  opened?(id: string, session: AdapterSession): void;
+  /** A session's scan or pairing event. */
+  event?(session: AdapterSession, event: Event): void;
+  /** A request the session's adapter answered, in order with its events. */
+  answered?(session: AdapterSession, request: Request, response: Response): void;
 }
 
 export interface Connected {
@@ -26,7 +29,7 @@ export interface Disconnected {
   id: string;
   /** Present while plugged in. */
   path: string | null;
-  status: Status;
+  status: AdapterStatus;
   connecting: boolean;
   error: string | null;
 }
@@ -127,7 +130,7 @@ export class AdapterManager {
         }
         return;
       }
-      // The USB serial number is the adapter ID (docs/protocol/transport.md); it is how a
+      // The USB serial number is the adapter ID; it is how a
       // disconnected adapter is recognized without opening its port.
       if (port.serial !== null && port.serial !== id) {
         this.#deps.log(`${port.path}: adapter ${id} reports USB serial ${port.serial || "(none)"}; ignoring it`);
@@ -141,7 +144,7 @@ export class AdapterManager {
   }
 
   async #open(path: string): Promise<AdapterSession | null> {
-    let transport: Transport;
+    let transport: ByteStream;
     try {
       transport = await this.#deps.openTransport(path);
     } catch (error) {
@@ -153,6 +156,8 @@ export class AdapterManager {
       session = await AdapterSession.open(transport, {
         changed: () => this.#deps.changed(),
         closed: (error) => session && this.#closed(session, error),
+        event: (event) => session && this.#deps.event?.(session, event),
+        answered: (request, response) => session && this.#deps.answered?.(session, request, response),
         log: (message) => this.#deps.log(`${path}: ${message}`),
       });
       return session;
@@ -165,7 +170,6 @@ export class AdapterManager {
   #register(id: string, path: string, session: AdapterSession) {
     this.connected.set(id, { id, path, session });
     this.#opened.set(session, Date.now());
-    this.#deps.opened?.(id, session);
     session.run();
     this.#deps.changed();
   }
@@ -189,7 +193,7 @@ export class AdapterManager {
     const c = this.connected.get(id);
     if (!c) return;
     this.connected.delete(id);
-    this.disconnected.set(id, { id, path: c.path, status: { ...c.session.status, name: c.session.view.name ?? c.session.status.name }, connecting: false, error: null });
+    this.disconnected.set(id, { id, path: c.path, status: c.session.status, connecting: false, error: null });
     this.#deps.changed();
     const closing = c.session.close();
     this.#closing.set(id, closing);

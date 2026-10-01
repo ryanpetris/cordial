@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import type { HostPlatform } from "../../protocol/types.ts";
 import { isLow } from "../../shared/battery.ts";
 import { adapterName } from "../../shared/adapter-name.ts";
-import type { AdapterEntry, AppState } from "../../shared/state.ts";
-import { PAIR_UNAVAILABLE, PLATFORMS, TRANSPORTS, adapterStatus, batteryStale, deviceStatus } from "../../shared/text.ts";
+import type { AdapterEntry, AppState, HostPlatform } from "../../shared/state.ts";
+import { PLATFORMS, STORAGE_FULL, TRANSPORTS, adapterStatus, batteryStale, deviceStatus, infoOf, storageFull } from "../../shared/text.ts";
 import { useAction } from "../api.ts";
 import type { Selection } from "../App.tsx";
 import { Banner, Card, Dialog, Fact, Facts, Meter, Page, Pill, Segmented, Spinner } from "./common.tsx";
@@ -18,7 +17,7 @@ function Rename({ adapter, busy, error, onRename, onDone }: {
   onDone: () => void;
 }) {
   const [name, setName] = useState(adapter.name);
-  const available = adapter.connection === "connected" && !!adapter.status?.storage_ready;
+  const available = adapter.connection === "connected" && !!adapter.status?.ready;
   const valid = adapterName(name) !== null;
   const input = useRef<HTMLInputElement>(null);
   useEffect(() => input.current?.select(), []);
@@ -76,7 +75,7 @@ export function AdapterPage({
   };
   const done = () => { if (!quietBusy) closeRename(); };
   const status = adapterStatus(adapter);
-  const platform = adapter.platform;
+  const platform = s?.platform ?? null;
   const setPlatform = async (p: HostPlatform) => {
     setPlatformError(null);
     const result = await runQuiet({ type: "adapter.platform", adapterId: adapter.id, platform: p });
@@ -103,7 +102,7 @@ export function AdapterPage({
       bar={
         <>
           {busy || quietBusy || adapter.connection === "connecting" ? <Spinner /> : null}
-          <button disabled={!connected || !s?.storage_ready} onClick={() => setEditing(true)}>
+          <button disabled={!connected || !s?.ready} onClick={() => setEditing(true)}>
             <PencilIcon /> Rename
           </button>
           {connected ? (
@@ -151,13 +150,13 @@ export function AdapterPage({
                 label="Platform"
                 options={Object.entries(PLATFORMS) as [HostPlatform, string][]}
                 value={platform}
-                disabled={quietBusy || !s?.storage_ready}
+                disabled={quietBusy || !s?.ready}
                 onChange={(p) => void setPlatform(p)}
               />
             </div>
           </div>
           {platform !== state.hostPlatform ? (
-            <Banner action={<button disabled={quietBusy || !s?.storage_ready} onClick={() => void setPlatform(state.hostPlatform)}><SwapIcon /> Switch to {PLATFORMS[state.hostPlatform]}</button>}>
+            <Banner action={<button disabled={quietBusy || !s?.ready} onClick={() => void setPlatform(state.hostPlatform)}><SwapIcon /> Switch to {PLATFORMS[state.hostPlatform]}</button>}>
               This computer runs {PLATFORMS[state.hostPlatform]}.
             </Banner>
           ) : null}
@@ -168,7 +167,6 @@ export function AdapterPage({
         <Card title="Devices">
           {devices.map((d) => {
             const low = isLow(d.battery, threshold);
-            const needs = d.device.pairing_state === "needs_pairing";
             return (
               <button key={d.key} className="row clickable" onClick={() => onSelect({ page: "device", key: d.key })}>
                 <span className={d.device.state === "connected" ? "row-icon on" : "row-icon"}>
@@ -176,7 +174,7 @@ export function AdapterPage({
                 </span>
                 <span className="row-text">
                   <span className="row-title strong">{d.name}</span>
-                  <span className={needs ? "row-subtitle warn" : "row-subtitle"}>{deviceStatus(d.device)}</span>
+                  <span className="row-subtitle">{deviceStatus(d.device)}</span>
                 </span>
                 {d.battery?.percent != null ? <span className={`value${low ? " low" : ""}${batteryStale(d.battery) ? " dim" : ""}`}>{d.battery.percent}%</span> : null}
                 <ChevronIcon />
@@ -186,28 +184,32 @@ export function AdapterPage({
         </Card>
       ) : null}
 
-      {connected && s && s.capacity.enabled.length ? (
+      {connected && s && s.transports.some((t) => t.maxEnabled !== null) ? (
         <Card title="Active Devices">
-          {s.capacity.enabled.map((c) => (
-            <div key={c.transports.join()} className="row meter-row">
-              <div className="meter-line">
-                <span>Bluetooth</span>
-                <span className="value">
-                  {c.enabled} of {c.limit}
-                </span>
+          {s.transports.map(({ transport, maxEnabled }) => {
+            if (maxEnabled === null) return null;
+            const used = devices.filter((d) => d.device.transport === transport && d.device.inactive === null).length;
+            return (
+              <div key={transport} className="row meter-row">
+                <div className="meter-line">
+                  <span>{TRANSPORTS[transport]}</span>
+                  <span className="value">
+                    {used} of {maxEnabled}
+                  </span>
+                </div>
+                <Meter fraction={maxEnabled ? used / maxEnabled : 0} />
               </div>
-              <Meter fraction={c.limit ? c.enabled / c.limit : 0} />
-            </div>
-          ))}
+            );
+          })}
         </Card>
       ) : null}
 
-      {connected && s && s.capacity.pairing.length ? (
+      {connected && s && s.transports.length ? (
         <Card title="New Pairings">
           <Facts>
-            {s.capacity.pairing.map((p) => (
-              <Fact key={p.transport} label={TRANSPORTS[p.transport]}>
-                {!p.available ? (p.reason ? PAIR_UNAVAILABLE[p.reason] : "Unavailable") : p.estimated_additional > 0 ? `About ${p.estimated_additional} More` : "Available"}
+            {s.transports.map(({ transport }) => (
+              <Fact key={transport} label={TRANSPORTS[transport]}>
+                {storageFull(s) ? STORAGE_FULL : "Available"}
               </Fact>
             ))}
           </Facts>
@@ -218,12 +220,10 @@ export function AdapterPage({
         <Card title="About">
           <Facts>
             <Fact label="Firmware">
-              {s.firmware_version} ({s.build_profile === "development" ? "Development" : "Production"})
+              {String(infoOf(s.info, "firmware.version") ?? "Unknown")} ({infoOf(s.info, "build.development") === true ? "Development" : "Production"})
             </Fact>
-            <Fact label="Board">{s.hardware_config}</Fact>
-            <Fact label="Adapter ID">{s.adapter_id}</Fact>
-            <Fact label="Bluetooth">{s.radio_ready ? "Ready" : "Not Ready"}</Fact>
-            <Fact label="Storage">{s.storage_ready ? "Ready" : "Not Ready"}</Fact>
+            {infoOf(s.info, "board.name") !== undefined ? <Fact label="Board">{String(infoOf(s.info, "board.name"))}</Fact> : null}
+            <Fact label="Adapter ID">{s.id}</Fact>
           </Facts>
         </Card>
       ) : null}

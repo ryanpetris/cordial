@@ -34,14 +34,14 @@ fn identity_derived_key_matches_aes_vector_and_detects_corruption() {
 
 #[test]
 fn setting_commit_readback_and_maintenance_reserve() {
+    use cordial_core::model::{
+        hidpp::{FeatureId, FeatureRevision},
+        settings::{SettingKey, SettingScope},
+    };
     use cordial_core::{
         compact::{Metadata, Preference},
         settings::PreferenceStore,
         storage::{Preferences, record_key},
-    };
-    use cordial_protocol::{
-        hidpp::{FeatureId, FeatureRevision},
-        settings::{SettingKey, SettingScope},
     };
     let mut store = support::Store::default();
     let mut preference = Preference {

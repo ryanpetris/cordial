@@ -1,5 +1,5 @@
 use cordial_core::info::{Information, standard};
-use cordial_protocol::{
+use cordial_core::model::{
     info::{InfoField, InfoKey as K},
     settings::SettingValue as V,
 };
@@ -11,7 +11,7 @@ fn field(i: &Information, key: K, instance: u8) -> InfoField {
 }
 #[test]
 fn battery_source_is_pinned_and_toggle_requires_new_readings() {
-    use cordial_protocol::identifiers::Transport;
+    use cordial_core::model::identifiers::Transport;
     let mut i = Information::default();
     i.battery.configure(Transport::Classic, true);
     i.connection(true, true);
@@ -141,7 +141,7 @@ fn equivalent_providers_produce_identical_wire_snapshots() {
     a.connection(true, true);
     let mut b = Information::default();
     b.battery
-        .configure(cordial_protocol::identifiers::Transport::Classic, true);
+        .configure(cordial_core::model::identifiers::Transport::Classic, true);
     b.connection(true, true);
     standard(&mut a, 0x2a19, 0, &[50]);
     b.observe(true, K::BatteryPercent, 0, V::Integer(50));
@@ -155,11 +155,11 @@ fn equivalent_providers_produce_identical_wire_snapshots() {
 fn failed_appearance_read_uses_the_device_kind_hint() {
     let mut i = Information::default();
     i.connection(true, false);
-    i.kind_hint(cordial_protocol::messages::DeviceKind::Keyboard);
+    i.kind_hint(cordial_core::model::link::DeviceKind::Keyboard);
     standard(&mut i, 0x2a01, 0, &[0xc1, 3]);
     standard(&mut i, 0x2a01, 0, &[]);
     assert_eq!(field(&i, K::Kind, 0).value, V::Text("keyboard".into()));
-    i.kind_hint(cordial_protocol::messages::DeviceKind::Unknown);
+    i.kind_hint(cordial_core::model::link::DeviceKind::Unknown);
     assert!(!field(&i, K::Kind, 0).available);
 }
 
@@ -193,7 +193,7 @@ fn names_only_change_for_a_valid_new_name_and_read_errors_keep_values_stale() {
 }
 #[test]
 fn disconnect_keeps_preferred_kind_and_descriptor_roles_strengthen_appearance() {
-    use cordial_protocol::messages::DeviceKind;
+    use cordial_core::model::link::DeviceKind;
     let mut i = Information::default();
     i.connection(true, true);
     i.kind_hint(DeviceKind::KeyboardMouse);

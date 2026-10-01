@@ -27,7 +27,6 @@ required-features = ["firmware"]
 
 [dependencies]
 cordial-core = { path = "../../crates/cordial-core" }
-cordial-protocol = { path = "../../crates/cordial-protocol" }
 cordial-usb = { path = "../../adapters/usb" }
 cordial-record-storage = { path = "../../adapters/record-storage" }
 cordial-btstack = { path = "../../adapters/btstack" }
@@ -46,6 +45,8 @@ embassy-executor = { version = "=0.10.0", optional = true }
 cortex-m-rt = { version = "=0.7.7", optional = true }
 static_cell = "=2.1.1"
 portable-atomic = { version = "=1.15.0", features = ["critical-section"] }
+# The protocol messages use `bytes`, which needs portable-atomic for atomic CAS on RP2040.
+bytes = { version = "=1.12.1", default-features = false, features = ["extra-platforms"] }
 
 [profile.release]
 lto = true

@@ -1,17 +1,11 @@
 // Combines every adapter into the application state and performs the user's
 // actions. Electron-free so it can be tested against a simulated adapter.
+// Refusals the adapter would make that this app can predict from what it
+// knows are made here, before sending; one the adapter makes anyway is shown
+// as it is, without retrying or reading anything again.
+import { CordialError } from "@cordial/client";
+import { IntegrationKind, Platform, Transport, type Event, type Request, type Response } from "@cordial/protocol";
 import { adapterName } from "../shared/adapter-name.ts";
-import {
-  AdapterError,
-  SessionClosedError,
-  type Candidate,
-  type Device,
-  type HostPlatform,
-  type InfoField,
-  type Prompt,
-  type Setting,
-  type SettingsSummary,
-} from "../protocol/types.ts";
 import {
   DEFAULT_PREFERENCES,
   type Action,
@@ -20,20 +14,24 @@ import {
   type AppState,
   type Battery,
   type DeviceEntry,
+  type DeviceRecord,
+  type HostPlatform,
+  type InfoEntry,
   type PairingState,
   type Preferences,
   type ScanState,
-  type SettingsResult,
   type SettingsChange,
   type SettingsSave,
 } from "../shared/state.ts";
-import { settingsBusy, settingsLive } from "../shared/settings.ts";
-import { DISABLED, clean, codeText, errorText } from "../shared/text.ts";
+import { enabledFull } from "../shared/capacity.ts";
+import { settingsBusy } from "../shared/settings.ts";
+import { INACTIVE, clean, codeText, errorText, infoOf, storageFull } from "../shared/text.ts";
 import { BatteryAlerts, CRITICAL_PERCENT, type Alert } from "./battery.ts";
+import * as convert from "./convert.ts";
 import { AdapterManager, type ManagerDeps } from "./manager.ts";
-import type { AdapterSession } from "./session.ts";
+import { failure, type AdapterSession } from "./session.ts";
 
-export interface ControllerDeps extends Omit<ManagerDeps, "changed"> {
+export interface ControllerDeps extends Omit<ManagerDeps, "changed" | "event"> {
   preferences: Preferences;
   savePreferences(p: Preferences): void;
   hostPlatform: HostPlatform;
@@ -44,56 +42,47 @@ export interface ControllerDeps extends Omit<ManagerDeps, "changed"> {
 }
 
 const PUBLISH_MS = 30;
-// A hardware job has 90 seconds, followed by the session's heartbeat allowance.
-const SETTINGS_WAIT_MS = 105_000;
+/** How long a scan runs before the user searches again. */
+const SCAN_SECONDS = 30;
 
-const message = (error: unknown) =>
-  error instanceof AdapterError
-    ? errorText(error.wire)
-    : error instanceof SessionClosedError
-      ? "The adapter disconnected before the change finished."
-      : `Couldn't complete that: ${(error as Error).message}`;
-const failed = (error: unknown): ActionResult => ({ ok: false, message: message(error) });
+const failed = (error: unknown): ActionResult => ({ ok: false, message: failure(error) });
+const GONE: ActionResult = { ok: false, message: "That device or adapter is no longer available." };
 
-function field(fields: InfoField[] | null, key: InfoField["key"]): InfoField | undefined {
-  return fields?.find((f) => f.key === key && f.instance === 0 && f.available);
-}
-
-export function batteryOf(fields: InfoField[] | null, current = true): Battery | null {
-  const percent = field(fields, "battery_percent");
-  const charging = field(fields, "battery_charging");
+export function batteryOf(info: InfoEntry[], current = true): Battery | null {
+  const percent = infoOf(info, "battery.level");
+  const charging = infoOf(info, "battery.charging");
   const b: Battery = {
-    percent: percent ? (percent.value as number) : null,
-    charging: charging ? (charging.value as boolean) : null,
-    percentFresh: current && !!percent?.fresh,
-    chargingFresh: current && !!charging?.fresh,
+    percent: typeof percent === "number" ? percent : null,
+    charging: typeof charging === "boolean" ? charging : null,
+    percentFresh: current && typeof percent === "number",
+    chargingFresh: current && typeof charging === "boolean",
   };
   return b.percent == null && b.charging == null ? null : b;
 }
 
-function kindOf(fields: InfoField[] | null, device: Device): DeviceEntry["kind"] {
-  const kind = field(fields, "kind")?.value;
-  if (kind === "keyboard" || kind === "mouse" || kind === "keyboard_mouse" || kind === "other") return kind;
+function kindOf(device: DeviceRecord): DeviceEntry["kind"] {
+  if (device.kind !== "unknown") return device.kind;
   const keyboard = device.roles.includes("keyboard");
   const mouse = device.roles.includes("mouse");
   return keyboard && mouse ? "keyboard_mouse" : keyboard ? "keyboard" : mouse ? "mouse" : "other";
 }
 
+type Scan = ScanState & { session: AdapterSession };
+type Pairing = PairingState & { session: AdapterSession; dismissed: boolean };
+
 export class Controller {
   readonly manager: AdapterManager;
   readonly #deps: ControllerDeps;
   #preferences: Preferences;
-  readonly #settingsResults = new Map<string, { result: SettingsResult; session: AdapterSession; state: Device["state"] }>();
   readonly #settingsSaves = new Map<string, { save: SettingsSave; session: AdapterSession }>();
-  #scan: (ScanState & { requestId: number; session: AdapterSession; done: Promise<void> }) | null = null;
-  #pairing: (PairingState & { requestId: number; session: AdapterSession; dismissed: boolean; done: Promise<void> }) | null =
-    null;
-  #watched: string | null = null;
+  #scan: Scan | null = null;
+  /** Scans sent and not yet answered, in the order sent. Each replaces #scan when the adapter
+   * accepts it, unless it was stopped meanwhile. */
+  #starts: { scan: Scan; stopped: boolean }[] = [];
+  #pairing: Pairing | null = null;
   #timer: ReturnType<typeof setTimeout> | undefined;
   readonly #alerts = new BatteryAlerts();
-  #states = new Map<string, Device["state"]>();
-  #discoveryActions: Promise<void> = Promise.resolve();
-  #discoveryAbort = new AbortController();
+  #states = new Map<string, DeviceRecord["state"]>();
 
   constructor(deps: ControllerDeps) {
     this.#deps = deps;
@@ -101,10 +90,8 @@ export class Controller {
     this.manager = new AdapterManager({
       ...deps,
       changed: () => this.changed(),
-      opened: (id, session) => {
-        const key = this.#watched;
-        if (key?.startsWith(`${id}/`)) session.watchSettings([key.slice(id.length + 1)]);
-      },
+      event: (session, event) => this.#event(session, event),
+      answered: (session, request, response) => this.#answered(session, request, response),
     });
   }
 
@@ -142,25 +129,17 @@ export class Controller {
     const adapters: AdapterEntry[] = [];
     const devices: DeviceEntry[] = [];
     for (const { id, session } of this.manager.connected.values()) {
-      const view = session.view;
       const status = session.status;
-      const ready = session.readiness;
-      const entries = ready.state === "ready" ? [...view.devices.values()].map((d) => this.#device(id, session, d)) : [];
+      const entries = session.listed ? [...session.devices.values()].map((d) => this.#device(id, session, d)) : [];
       const attention: string[] = [];
-      if (ready.state === "failed") attention.push(`Not ready: ${errorText(ready.error)}`);
-      else if (ready.state === "ready" && !status.radio_ready) attention.push("Bluetooth isn't ready");
-      else if (ready.state === "ready" && !status.storage_ready) attention.push("Storage isn't ready");
-      const needsPairing = entries.filter((d) => d.device.pairing_state === "needs_pairing").length;
-      if (needsPairing) attention.push(`${needsPairing} ${needsPairing === 1 ? "device needs" : "devices need"} pairing again`);
+      if (status.ready && storageFull(status)) attention.push("Storage Full");
       adapters.push({
-        name: view.name ?? status.name,
+        name: status.name,
         id,
         connection: "connected",
         connectError: null,
-        readiness: ready.state,
+        readiness: status.ready ? "ready" : "waiting",
         status,
-        capabilities: session.capabilities,
-        platform: view.platform,
         attention,
       });
       devices.push(...entries);
@@ -174,21 +153,21 @@ export class Controller {
         connectError: d.error,
         readiness: "waiting",
         status: null,
-        capabilities: [],
-        platform: null,
         attention: [],
       });
     }
     adapters.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
     devices.sort((a, b) => a.name.localeCompare(b.name) || a.key.localeCompare(b.key));
     const keys = new Set(devices.map((d) => d.key));
-    for (const key of this.#settingsResults.keys()) if (!keys.has(key)) this.#settingsResults.delete(key);
     for (const [key, saved] of this.#settingsSaves)
       if (!keys.has(key) || this.#target(key)?.session !== saved.session) this.#settingsSaves.delete(key);
     // Discovery and pairing end with their adapter's session.
     const live = (s: AdapterSession) => [...this.manager.connected.values()].some((c) => c.session === s);
     if (this.#scan && !live(this.#scan.session)) this.#scan = null;
+    // A closed session never answers its pending scans.
+    this.#starts = this.#starts.filter((s) => live(s.scan.session));
     if (this.#pairing && !live(this.#pairing.session)) this.#pairing = null;
+    this.#follow();
     const pairing = this.#pairing && !this.#pairing.dismissed ? this.#pairing : null;
     return {
       adapters,
@@ -213,28 +192,43 @@ export class Controller {
     };
   }
 
-  #device(adapterId: string, session: AdapterSession, device: Device): DeviceEntry {
-    const info = session.view.info(device.device_id);
-    const key = `${adapterId}/${device.device_id}`;
-    // The last valid reported name wins; the pairing name is the fallback.
-    const name = clean(session.view.reportedName(device.device_id) ?? "") || clean(device.name ?? "") || "Unnamed device";
-    const settings = this.#watched === key ? session.view.settings(device.device_id) : null;
-    const outcome = this.#settingsResults.get(key);
-    if (outcome && (outcome.session !== session || outcome.state !== device.state)) this.#settingsResults.delete(key);
+  #device(adapterId: string, session: AdapterSession, device: DeviceRecord): DeviceEntry {
+    const key = `${adapterId}/${device.id}`;
+    const save = this.#settingsSaves.get(key);
     return {
       key,
       adapterId,
       device,
-      name,
-      kind: kindOf(info, device),
-      battery: batteryOf(info, session.view.infoCurrent(device.device_id)),
-      info,
-      infoCurrent: session.view.infoCurrent(device.device_id),
-      pending: session.pendingFor(device.device_id),
-      infoError: session.view.infoError(device.device_id),
-      settings: settings ? { ...settings, result: this.#settingsResults.get(key)?.result ?? null } : null,
-      settingsSave: this.#settingsSaves.get(key)?.session === session ? this.#settingsSaves.get(key)!.save : null,
+      name: clean(device.name) || "Unnamed device",
+      kind: kindOf(device),
+      battery: batteryOf(device.info, device.state === "connected"),
+      pending: session.pendingFor(device.id),
+      warnings: session.warnings.get(device.id) ?? null,
+      warningsError: session.warningsErrors.get(device.id) ?? null,
+      settings: session.settings.get(device.id) ?? null,
+      settingsError: session.settingsErrors.get(device.id) ?? null,
+      settingsSave: save?.session === session ? save.save : null,
     };
+  }
+
+  /** Follows a saved pairing's device until it connects or can't. */
+  #follow() {
+    const p = this.#pairing;
+    if (!p || p.phase !== "connecting" || !p.deviceKey) return;
+    const d = p.session.devices.get(p.deviceKey.slice(p.adapterId.length + 1));
+    if (!d) return;
+    p.name = clean(d.name) || p.name;
+    if (d.state === "connected") p.phase = "connected";
+    else if (d.inactive !== null) {
+      p.phase = "saved";
+      p.message = d.inactive === "disabled"
+        ? "It was saved but is turned off; turn on “Use This Device” to connect it."
+        : `It was saved but can't connect yet. ${INACTIVE[d.inactive]}`;
+    } else if (d.state === "disconnected" && d.error) {
+      p.phase = "saved";
+      p.message = `It was saved, but connecting failed. ${codeText(d.error)}`;
+    }
+    if (p.phase !== "connecting" && p.dismissed) this.#pairing = null;
   }
 
   // ---- Actions -----------------------------------------------------------
@@ -243,259 +237,87 @@ export class Controller {
     return this.manager.connected.get(adapterId)?.session ?? null;
   }
 
-  #target(key: string): { session: AdapterSession; id: string } | null {
+  #target(key: string): { session: AdapterSession; id: string; device: DeviceRecord } | null {
     const slash = key.indexOf("/");
     const session = this.#session(key.slice(0, slash));
     const id = key.slice(slash + 1);
-    return session && session.view.devices.has(id) ? { session, id } : null;
-  }
-
-  /** Keeps an active submission observable when the window changes pages. */
-  #watchSettings() {
-    for (const { id, session } of this.manager.connected.values()) {
-      const watched = new Set<string>();
-      if (this.#watched?.startsWith(`${id}/`)) watched.add(this.#watched.slice(id.length + 1));
-      for (const [key, submission] of this.#settingsSaves)
-        if (submission.session === session && submission.save.running) watched.add(key.slice(id.length + 1));
-      session.watchSettings(watched);
-    }
-  }
-
-  /** Waits for this session's hardware work and, when supplied, a saved key's outcome. */
-  async #settleSettings(key: string, session: AdapterSession, id: string, change?: Extract<SettingsChange, { type: "set" }>): Promise<Setting | null> {
-    const deadline = Date.now() + SETTINGS_WAIT_MS;
-    for (;;) {
-      if (session.closed || this.#target(key)?.session !== session)
-        throw new Error("The adapter disconnected before the settings finished.");
-      const device = session.view.devices.get(id)!;
-      if (change && device.state !== "connected") throw new Error("The device disconnected before the setting applied.");
-      if (change && !device.hidpp_enabled) throw new Error("Logitech Features were turned off before the setting applied.");
-      if (session.view.valid && !settingsBusy({ device, pending: session.pendingFor(id) })) {
-        if (!change) return null;
-        const settings = session.view.settings(id);
-        if (settings?.loadError) throw new Error(settings.loadError);
-        if (settings?.current) {
-          const setting = settings.settings.find((s) => s.key === change.setting);
-          if (!setting || !setting.managed || setting.desired !== change.value)
-            throw new Error("The saved preference changed before its application was confirmed.");
-          if (!["pending", "applying"].includes(setting.state)) return setting;
-        }
-      }
-      if (Date.now() >= deadline) {
-        session.resync();
-        session.reloadSettings(id);
-        throw new Error("The device did not confirm the setting in time.");
-      }
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
-    }
+    const device = session?.devices.get(id);
+    return session && device ? { session, id, device } : null;
   }
 
   async #saveSettings(key: string, changes: SettingsChange[]): Promise<ActionResult> {
     const target = this.#target(key);
-    if (!target) return { ok: false, message: "That device or adapter is no longer available." };
+    if (!target) return GONE;
     const { session, id } = target;
-    const startedConnected = session.view.devices.get(id)!.state === "connected";
-    if (settingsBusy(this.#device(session.adapterId, session, session.view.devices.get(id)!)))
-      return { ok: false, message: codeText("busy") };
+    const entry = this.#device(session.adapterId, session, target.device);
+    if (settingsBusy(entry)) return { ok: false, message: codeText("busy") };
     if (!changes.length || new Set(changes.map((c) => c.setting)).size !== changes.length)
       return { ok: false, message: "There are no distinct settings changes to save." };
-    if (changes.length > session.status.limits.hidpp_settings)
-      return { ok: false, message: "There are too many settings changes to save." };
-    const ordered = [...changes];
-    const modeIndex = ordered.findIndex((c) => c.setting === "backlight.mode");
-    const levelIndex = ordered.findIndex((c) => c.setting === "backlight.level");
-    if (modeIndex >= 0 && levelIndex >= 0 && levelIndex < modeIndex) {
-      const [level] = ordered.splice(levelIndex, 1);
-      ordered.splice(ordered.findIndex((c) => c.setting === "backlight.mode") + 1, 0, level!);
-    }
-    const items: SettingsSave["items"] = ordered.map((change) => ({ change, status: "pending", error: null }));
-    const previous = this.#settingsSaves.get(key);
-    const settings = session.view.settings(id);
-    const retained = previous?.session === session ? previous.save.items.filter((item) => {
-      if (item.status !== "not_applied" || item.change.type !== "set" || ordered.some((c) => c.setting === item.change.setting)) return false;
-      const setting = settings?.settings.find((s) => s.key === item.change.setting);
-      if (!settings?.current || !setting) return true;
-      return setting.managed && setting.desired === item.change.value
-        && !(setting.state === "applied" && setting.fresh && setting.observed === item.change.value);
-    }) : [];
-    const save: SettingsSave = { running: true, items: [...items, ...retained] };
-    this.#settingsResults.delete(key);
+    const known = new Map((entry.settings ?? []).map((s) => [s.key, s]));
+    if (changes.some((c) => !known.has(c.setting))) return { ok: false, message: codeText("not_found") };
+    const items: SettingsSave["items"] = changes.map((change) => ({ change, status: "pending", error: null }));
+    const save: SettingsSave = { running: true, items };
     this.#settingsSaves.set(key, { save, session });
-    this.#watchSettings();
     this.#publish();
+    // Values are saved in one write and forgetting in another, each all or nothing.
+    const groups = [items.filter((i) => i.change.type === "set"), items.filter((i) => i.change.type === "forget")];
     let stopped: string | null = null;
     try {
-      saving: for (const item of items) {
-        const { change } = item;
-        const device = session.view.devices.get(id);
-        if (session.closed || this.#target(key)?.session !== session || !device) {
-          stopped = "The adapter disconnected before the settings finished.";
-          break;
-        }
-        if (device.state !== "connected" && (startedConnected || change.type === "set")) {
-          item.status = "not_sent";
-          item.error = codeText("not_connected");
-          if (startedConnected) {
-            stopped = item.error;
-            break;
-          }
+      for (const group of groups) {
+        if (!group.length) continue;
+        if (stopped) {
+          for (const item of group) Object.assign(item, { status: "not_sent", error: stopped });
           continue;
         }
-        item.status = "saving";
+        for (const item of group) item.status = "saving";
         this.#publish();
-        let stored = false;
         try {
-          let row;
-          for (let attempt = 0; ; attempt++) {
-            await this.#settleSettings(key, session, id);
-            const current = session.view.devices.get(id)!;
-            if (startedConnected && current.state !== "connected") {
-              item.status = "not_sent";
-              item.error = stopped = codeText("not_connected");
-              break saving;
-            }
-            if (change.type === "set" && change.setting === "backlight.level" && current.hidpp_enabled) {
-              const mode = session.view.settings(id)?.settings.find((s) => s.key === "backlight.mode");
-              const modeChange = items.find((i) => i.change.setting === "backlight.mode");
-              if ((modeChange?.change.type === "set" && ["not_saved", "not_applied", "not_sent"].includes(modeChange.status))
-                || (mode && (!mode.fresh || mode.observed !== "permanent_manual"))) {
-                item.status = "not_sent";
-                item.error = codeText("backlight_permanent_manual_required");
-                continue saving;
-              }
-            }
-            try {
-              row = change.type === "set"
-                ? await session.request("hidpp.setting.set", { device_id: id, key: change.setting, value: change.value }, { timeoutMs: SETTINGS_WAIT_MS })
-                : await session.request("hidpp.setting.forget", { device_id: id, key: change.setting }, { timeoutMs: SETTINGS_WAIT_MS });
-              break;
-            } catch (error) {
-              if (attempt || !(error instanceof AdapterError) || error.wire.code !== "busy") throw error;
-            }
-          }
-          stored = true;
-          session.view.putSetting(id, row.revision, row.setting);
-          item.status = "saved";
-          this.#publish();
-          if (change.type === "set" && session.view.devices.get(id)?.hidpp_enabled) {
-            session.reloadSettings(id);
-            const setting = await this.#settleSettings(key, session, id, change);
-            if (setting?.state === "applied" && setting.fresh && setting.observed === change.value) item.status = "applied";
-            else {
-              item.status = "not_applied";
-              item.error = setting?.error ? codeText(setting.error) : "The device did not confirm the saved value.";
-            }
-          }
+          await session.perform(id, "settings", (c) => {
+            const refs = group.map((i) => ({ integration: known.get(i.change.setting)!.integration, key: i.change.setting }));
+            return group[0]!.change.type === "set"
+              ? c.setSettings({
+                  device: id,
+                  changes: group.map((i, n) => ({ ...refs[n]!, value: convert.value(known.get(i.change.setting)!.type, (i.change as Extract<SettingsChange, { type: "set" }>).value) })),
+                })
+              : c.forgetSettings({ device: id, settings: refs });
+          });
+          for (const item of group) item.status = "saved";
         } catch (error) {
-          item.status = stored ? "not_applied" : "not_saved";
-          item.error = error instanceof AdapterError ? message(error) : (error as Error).message;
-          const current = session.view.devices.get(id);
-          if (stored || session.closed || this.#target(key)?.session !== session || !current || current.state !== "connected"
-            || !session.view.valid || session.view.settings(id)?.loadError
-            || settingsBusy({ device: current, pending: session.pendingFor(id) })) {
-            stopped = item.error;
-            break;
-          }
+          stopped = failure(error);
+          for (const item of group) Object.assign(item, { status: "not_saved", error: stopped });
         }
-        this.changed();
       }
-      if (stopped)
-        for (const item of save.items) if (item.status === "pending") { item.status = "not_sent"; item.error = stopped; }
     } finally {
       save.running = false;
-      this.#watchSettings();
-      session.mutated();
       this.#publish();
     }
-    const incomplete = save.items.find((i) => ["not_saved", "not_applied", "not_sent"].includes(i.status));
+    const incomplete = save.items.find((i) => i.status !== "saved");
     return incomplete
-      ? { ok: false, message: incomplete.error ?? "Some settings did not finish.", inline: true, settingsSave: save }
+      ? { ok: false, message: incomplete.error ?? "Some settings were not saved.", inline: true, settingsSave: save }
       : { ok: true, settingsSave: save };
   }
 
-  act(action: Action): Promise<ActionResult> {
-    if (!["scan.start", "scan.stop", "pair.start", "pair.cancel", "pair.dismiss"].includes(action.type))
-      return this.#act(action);
-    // Stops invalidate starts that are waiting for a hardware job to end.
-    if (action.type === "scan.stop" || action.type === "pair.cancel" || action.type === "pair.dismiss") {
-      this.#discoveryAbort.abort();
-      this.#discoveryAbort = new AbortController();
-    }
-    const signal = this.#discoveryAbort.signal;
-    const result = this.#discoveryActions.then(() => this.#act(action, signal));
-    this.#discoveryActions = result.then(() => {}, () => {});
-    return result;
-  }
-
-  async #act(action: Action, signal = this.#discoveryAbort.signal): Promise<ActionResult> {
-    const gone: ActionResult = { ok: false, message: "That device or adapter is no longer available." };
+  async act(action: Action): Promise<ActionResult> {
     try {
       switch (action.type) {
-        case "device.connect.cancel": {
+        case "device.reload": {
           const t = this.#target(action.key);
-          if (!t) return gone;
-          const pending = t.session.pendingFor(t.id).find((p) => p.command === "device.connect");
-          if (pending) {
-            try { await t.session.request("request.cancel", { request_id: pending.id }); }
-            catch (error) { if (!(error instanceof AdapterError && error.wire.code === "not_pending")) throw error; }
-          }
-          return { ok: true };
-        }
-        case "settings.reload": {
-          const t = this.#target(action.key);
-          if (!t) return gone;
-          t.session.reloadSettings(t.id);
-          this.changed();
-          return { ok: true };
-        }
-        case "settings.refresh":
-        case "settings.apply": {
-          const t = this.#target(action.key);
-          if (!t) return gone;
-          const entry = this.#device(t.session.adapterId, t.session, t.session.view.devices.get(t.id)!);
-          if (settingsBusy(entry)) return { ok: false, message: codeText("busy") };
-          if (!settingsLive(entry)) return { ok: false, message: codeText("not_connected") };
-          if (action.type === "settings.apply" && !entry.device.hidpp_enabled) return { ok: false, message: codeText("hidpp_disabled") };
-          this.#settingsResults.delete(action.key);
-          const kind = action.type === "settings.refresh" ? "refresh" : "apply";
-          try {
-            const counts = await t.session.request(kind === "refresh" ? "hidpp.setting.refresh" : "hidpp.setting.apply", { device_id: t.id }, {
-              onChunk: (row) => {
-                t.session.view.putSetting(t.id, row.revision, row.setting);
-                this.changed();
-              },
-            });
-            this.#settingsResults.set(action.key, { result: { kind, counts, error: null }, session: t.session, state: t.session.view.devices.get(t.id)?.state ?? entry.device.state });
-          } catch (error) {
-            const details = error instanceof AdapterError && "details" in error.wire ? error.wire.details : null;
-            const counts = details && "count" in details ? details as SettingsSummary : null;
-            this.#settingsResults.set(action.key, { result: { kind, counts, error: message(error) }, session: t.session, state: t.session.view.devices.get(t.id)?.state ?? entry.device.state });
-            return { ok: false, message: message(error), inline: true };
-          } finally {
-            t.session.mutated();
-            this.changed();
-          }
-          return { ok: true };
-        }
-        case "device.info.refresh": {
-          const t = this.#target(action.key);
-          if (!t) return gone;
-          await t.session.refreshInfo(t.id);
+          if (!t) return GONE;
+          t.session.reload(t.id);
           return { ok: true };
         }
         case "device.connect":
         case "device.disconnect":
-        case "device.unpair": {
+        case "device.unpair":
+        case "device.refresh": {
           const t = this.#target(action.key);
-          if (!t) return gone;
-          const args = { device_id: t.id };
-          const command = {
-            "device.connect": "device.connect",
-            "device.disconnect": "device.disconnect",
-            "device.unpair": "device.unpair",
-          } as const;
-          await t.session.request(command[action.type], args);
-          t.session.mutated();
+          if (!t) return GONE;
+          const { session, id, device } = t;
+          if (action.type === "device.refresh" && device.state !== "connected") return { ok: false, message: codeText("not_connected") };
+          if (action.type === "device.connect") await session.perform(id, "connect", (c) => c.connectDevice(id));
+          else if (action.type === "device.disconnect") await session.perform(id, "disconnect", (c) => c.disconnectDevice(id));
+          else if (action.type === "device.unpair") await session.perform(id, "unpair", (c) => c.unpairDevice(id));
+          else await session.perform(id, "refresh", (c) => c.refreshDevice(id));
           return { ok: true };
         }
         case "device.enabled":
@@ -503,63 +325,34 @@ export class Controller {
         case "device.blocked":
         case "device.hidpp": {
           const t = this.#target(action.key);
-          if (!t) return gone;
-          if (action.type === "device.hidpp"
-            && settingsBusy(this.#device(t.session.adapterId, t.session, t.session.view.devices.get(t.id)!)))
+          if (!t) return GONE;
+          const { session, id, device } = t;
+          if (action.type === "device.enabled" && action.value && !device.enabled && enabledFull(session.status, [...session.devices.values()], device))
+            return { ok: false, message: errorText({ code: "no_capacity", reason: "enabled", outcomeUnknown: false }) };
+          if (action.type === "device.hidpp" && settingsBusy(this.#device(session.adapterId, session, device)))
             return { ok: false, message: codeText("busy") };
-          if (action.type === "device.enabled")
-            await t.session.request("device.enabled.set", { device_id: t.id, enabled: action.value });
-          else if (action.type === "device.trusted")
-            await t.session.request("device.trusted.set", { device_id: t.id, trusted: action.value });
-          else if (action.type === "device.blocked")
-            await t.session.request("device.blocked.set", { device_id: t.id, blocked: action.value });
-          else await t.session.request("device.hidpp.set", { device_id: t.id, enabled: action.value });
-          t.session.mutated();
-          return { ok: true };
-        }
-        case "setting.set":
-        case "setting.forget": {
-          const t = this.#target(action.key);
-          if (!t) return gone;
-          const entry = this.#device(t.session.adapterId, t.session, t.session.view.devices.get(t.id)!);
-          if (settingsBusy(entry)) return { ok: false, message: codeText("busy") };
-          if (action.type === "setting.set" && !settingsLive(entry)) return { ok: false, message: codeText("not_connected") };
-          const row =
-            action.type === "setting.set"
-              ? await t.session.request("hidpp.setting.set", { device_id: t.id, key: action.setting, value: action.value })
-              : await t.session.request("hidpp.setting.forget", { device_id: t.id, key: action.setting });
-          t.session.view.putSetting(t.id, row.revision, row.setting);
-          this.#publish();
+          const field = action.type.slice("device.".length) as "enabled" | "trusted" | "blocked" | "hidpp";
+          await session.perform(id, field, (c) =>
+            c.setDevice(
+              field === "hidpp"
+                ? { device: id, integrations: [{ kind: device.hidpp?.kind ?? IntegrationKind.HIDPP, enabled: action.value }] }
+                : { device: id, [field]: action.value },
+            ),
+          );
           return { ok: true };
         }
         case "settings.save":
           return await this.#saveSettings(action.key, action.changes);
-        case "settings.watch": {
-          this.#watched = action.key;
-          this.#watchSettings();
-          this.changed();
-          return { ok: true };
-        }
-        case "adapter.name": {
-          const session = this.#session(action.adapterId);
-          if (!session) return gone;
-          const name = action.name === null ? null : adapterName(action.name);
-          if (action.name !== null && name === null) return { ok: false, message: "Invalid adapter name" };
-          if (!session.status.storage_ready) return { ok: false, message: "Adapter storage is not ready" };
-          const result = await session.request("adapter.name.set", { name });
-          session.view.setAdapter(result.revision, result.host_platform, result.name);
-          session.mutated();
-          this.changed();
-          return { ok: true };
-        }
+        case "adapter.name":
         case "adapter.platform": {
           const session = this.#session(action.adapterId);
-          if (!session) return gone;
-          if (!session.status.storage_ready) return { ok: false, message: "Adapter storage is not ready" };
-          const result = await session.request("adapter.platform.set", { platform: action.platform });
-          session.view.setAdapter(result.revision, result.host_platform, result.name);
-          session.mutated();
-          this.changed();
+          if (!session) return GONE;
+          if (!session.status.ready) return { ok: false, message: codeText("not_ready") };
+          if (action.type === "adapter.name") {
+            const name = action.name === null ? "" : adapterName(action.name);
+            if (name === null) return { ok: false, message: "Invalid adapter name" };
+            await session.connection.setAdapter({ name });
+          } else await session.connection.setAdapter({ platform: convert.wire(Platform, action.platform) });
           return { ok: true };
         }
         case "adapter.disconnect":
@@ -574,23 +367,22 @@ export class Controller {
           this.manager.burst();
           return { ok: true };
         case "scan.start":
-          return this.#startScan(action.adapterId, signal);
+          return await this.#startScan(action.adapterId);
         case "scan.stop":
           await this.#stopScan();
           return { ok: true };
         case "pair.start":
-          return this.#pair(action.adapterId, action.candidateId, signal);
+          return await this.#pair(action.adapterId, action.candidateId);
         case "pair.reply":
-          return this.#reply(action.accept, action.value);
+          return await this.#reply(action.accept, action.value);
         case "pair.cancel":
-          if (this.#pairing?.phase === "pairing")
-            await this.#pairing.session.request("request.cancel", { request_id: this.#pairing.requestId });
+          if (this.#pairing?.phase === "pairing") await this.#pairing.session.connection.cancelPairing();
           return { ok: true };
         case "pair.dismiss":
-          // A pairing still finishing is forgotten when it ends; a connect
-          // continues in the background and shows on the device page.
+          // A pairing still finishing is forgotten when it ends; a saved
+          // device's connection continues and shows on its page.
           if (this.#pairing) {
-            if (this.#pairing.phase === "pairing" || this.#pairing.phase === "connecting") this.#pairing.dismissed = true;
+            if (this.#pairing.phase === "pairing") this.#pairing.dismissed = true;
             else this.#pairing = null;
           }
           this.changed();
@@ -618,191 +410,139 @@ export class Controller {
 
   // ---- Discovery and pairing ----------------------------------------------
 
-  async #startScan(adapterId: string, signal: AbortSignal): Promise<ActionResult> {
-    if (signal.aborted) return { ok: true };
-    await this.#stopScan();
-    if (signal.aborted) return { ok: true };
-    const session = this.#session(adapterId);
-    if (!session) return { ok: false, message: "That adapter is no longer available." };
-    const classic = session.capabilities.includes("classic");
-    const ble = session.capabilities.includes("ble");
-    if (!classic && !ble) return { ok: false, message: "This adapter can't search for devices." };
-    const candidates: Candidate[] = [];
-    const started = session.start(
-      "discovery.scan",
-      { transport: classic && ble ? "both" : classic ? "classic" : "ble", duration_ms: 0 },
-      {
-        onEvent: (event) => {
-          if (event.event !== "discovery.result") return;
-          const i = candidates.findIndex((c) => c.candidate_id === event.data.candidate_id);
-          if (i === -1) candidates.push(event.data);
-          else candidates[i] = event.data;
-          this.changed();
-        },
-      },
-    );
-    const done = started.result
-      .then(
-        () => {},
-        (error: unknown) => {
-          if (this.#scan === scan && error instanceof AdapterError && error.wire.code !== "cancelled")
-            scan.error = errorText(error.wire);
-        },
-      )
-      .finally(() => {
-        scan.running = false;
-        this.changed();
-      });
-    const scan = { adapterId, running: true, candidates, error: null as string | null, requestId: started.id, session, done };
+  #answered(session: AdapterSession, request: Request, response: Response) {
+    if (request.command.case !== "startScan") return;
+    // Each session answers its requests in order, so this is its oldest unanswered scan.
+    const i = this.#starts.findIndex((s) => s.scan.session === session);
+    if (i === -1) return;
+    const { scan, stopped } = this.#starts.splice(i, 1)[0]!;
+    if (stopped) return;
+    if (response.result.case === "error") {
+      scan.running = false;
+      scan.error = failure(new CordialError("startScan", response.result.value.code, response.result.value.reason, response.result.value.outcomeUnknown));
+    }
     this.#scan = scan;
     this.changed();
+  }
+
+  #event(session: AdapterSession, event: Event) {
+    const kind = event.kind;
+    const scan = this.#scan?.session === session ? this.#scan : null;
+    const pairing = this.#pairing?.session === session ? this.#pairing : null;
+    if (kind.case === "scanFound" && scan) {
+      const c = convert.candidate(kind.value);
+      const i = scan.candidates.findIndex((x) => x.id === c.id);
+      if (i === -1) scan.candidates.push(c);
+      else scan.candidates[i] = c;
+    } else if (kind.case === "scanDone" && scan) {
+      scan.running = false;
+    } else if (kind.case === "pairing" && pairing && kind.value.candidate === pairing.candidateId && pairing.phase === "pairing") {
+      const step = convert.pairingStep(kind.value);
+      if (step.kind === "progress") pairing.prompt = null;
+      else if (step.kind === "prompt") pairing.prompt = step.prompt;
+      else if (step.kind === "done") {
+        pairing.prompt = null;
+        pairing.deviceKey = `${pairing.adapterId}/${step.device}`;
+        pairing.phase = "connecting";
+        // A dismissed pairing that saved its device is done with.
+        if (pairing.dismissed) this.#pairing = null;
+      } else {
+        pairing.prompt = null;
+        pairing.phase = step.code === "cancelled" ? "cancelled" : "failed";
+        pairing.message = step.code === "cancelled" ? "Adding the device was cancelled." : codeText(step.code);
+        if (pairing.dismissed) this.#pairing = null;
+      }
+    } else return;
+    this.changed();
+  }
+
+  async #startScan(adapterId: string): Promise<ActionResult> {
+    const session = this.#session(adapterId);
+    if (!session) return { ok: false, message: "That adapter is no longer available." };
+    const transports = session.status.transports.map((t) => convert.wire(Transport, t.transport));
+    if (!transports.length) return { ok: false, message: "This adapter can't search for devices." };
+    if (this.#scan?.running && this.#scan.session !== session) await this.#stopScan();
+    // Events before the adapter answers the scan still belong to the earlier one; the new scan
+    // replaces it, and its candidates, at its response.
+    const scan: Scan = { adapterId, running: true, candidates: [], error: null, session };
+    this.#starts.push({ scan, stopped: false });
+    try {
+      await session.connection.startScan(transports, SCAN_SECONDS);
+    } catch (error) {
+      return { ok: false, message: failure(error) };
+    }
     return { ok: true };
   }
 
   async #stopScan() {
     const scan = this.#scan;
-    if (!scan) return;
+    const pending = this.#starts.filter((s) => !s.stopped);
+    for (const s of pending) s.stopped = true;
+    if (!scan && !pending.length) return;
     this.#scan = null;
     this.changed();
-    if (!scan.running) return;
-    await scan.session.request("request.cancel", { request_id: scan.requestId }).catch(() => {});
-    // The adapter accepts another scan only after this one has ended.
-    await Promise.race([scan.done, new Promise((r) => setTimeout(r, 2000))]);
+    // A stop sent after an unanswered start ends the scan that start begins.
+    const sessions = new Set([...(scan?.running ? [scan.session] : []), ...pending.map((s) => s.scan.session)]);
+    for (const session of sessions) await session.connection.stopScan().catch(() => {});
   }
 
-  async #pair(adapterId: string, candidateId: string, signal: AbortSignal): Promise<ActionResult> {
-    if (signal.aborted) return { ok: true };
+  async #pair(adapterId: string, candidateId: string): Promise<ActionResult> {
     const session = this.#session(adapterId);
     if (!session) return { ok: false, message: "That adapter is no longer available." };
-    if (this.#pairing && !this.#pairing.dismissed && (this.#pairing.phase === "pairing" || this.#pairing.phase === "connecting"))
-      return { ok: false, message: "Another device is being added." };
-    // A dismissed pairing may still be tearing down (up to 15 seconds).
-    if (this.#pairing?.dismissed && this.#pairing.phase === "pairing") {
-      const interrupted = Promise.withResolvers<void>();
-      const interrupt = () => interrupted.resolve();
-      signal.addEventListener("abort", interrupt, { once: true });
-      let timeout: ReturnType<typeof setTimeout> | undefined;
-      try {
-        await Promise.race([
-          this.#pairing.done,
-          new Promise<void>((resolve) => { timeout = setTimeout(resolve, 16000); }),
-          interrupted.promise,
-        ]);
-      } finally {
-        clearTimeout(timeout);
-        signal.removeEventListener("abort", interrupt);
-      }
+    if (this.#pairing?.phase === "pairing" && !this.#pairing.dismissed) return { ok: false, message: "Another device is being added." };
+    if (storageFull(session.status)) return { ok: false, message: errorText({ code: "no_capacity", reason: "storage", outcomeUnknown: false }) };
+    const candidate = this.#scan?.candidates.find((c) => c.id === candidateId);
+    // Candidates stay usable after their scan stops.
+    if (this.#scan?.running && this.#scan.session === session) {
+      this.#scan.running = false;
+      await session.connection.stopScan().catch(() => {});
     }
-    if (signal.aborted) return { ok: true };
-    const candidate = this.#scan?.candidates.find((c) => c.candidate_id === candidateId);
-    const name = clean(candidate?.name ?? "") || "the device";
-    // Candidates stay usable after their scan is cancelled.
-    const scan = this.#scan;
-    if (scan?.running) {
-      await scan.session.request("request.cancel", { request_id: scan.requestId }).catch(() => {});
-      await Promise.race([scan.done, new Promise((r) => setTimeout(r, 2000))]);
-    }
-    if (signal.aborted) return { ok: true };
-    const started = session.start(
-      "pairing.start",
-      { candidate_id: candidateId },
-      {
-        onEvent: (event) => {
-          if (!this.#pairing || this.#pairing.requestId !== started.id) return;
-          if (event.event === "pairing.prompt" || event.event === "pairing.display") {
-            const prompt: Prompt = event.data;
-            this.#pairing.prompt = {
-              kind: event.event === "pairing.prompt" ? "prompt" : "display",
-              prompt,
-              expiresAt: Date.now() + prompt.expires_in_ms,
-            };
-            this.changed();
-          }
-        },
-      },
-    );
-    const pairing = {
+    const pairing: Pairing = {
       adapterId,
       candidateId,
-      name,
-      phase: "pairing" as PairingState["phase"],
+      name: clean(candidate?.name ?? "") || "the device",
+      phase: "pairing",
       prompt: null,
-      deviceKey: null as string | null,
-      message: null as string | null,
-      requestId: started.id,
+      deviceKey: null,
+      message: null,
       session,
       dismissed: false,
-      done: Promise.resolve(),
     };
     this.#pairing = pairing;
     this.changed();
-    pairing.done = (async () => {
-      try {
-        const { device } = await started.result;
-        pairing.prompt = null;
-        pairing.deviceKey = `${adapterId}/${device.device_id}`;
-        pairing.name = clean(device.name ?? "") || name;
-        session.mutated();
-        if (!device.effective_enabled) {
-          pairing.phase = "saved";
-          pairing.message =
-            device.enabled_reason === "disabled" || !device.enabled_reason
-              ? "It was saved but is turned off; turn on “Use This Device” to connect it."
-              : `It was saved but can't connect yet. ${DISABLED[device.enabled_reason]}`;
-          return;
-        }
-        pairing.phase = "connecting";
-        this.changed();
-        try {
-          await session.request("device.connect", { device_id: device.device_id });
-          pairing.phase = "connected";
-        } catch (error) {
-          pairing.phase = "saved";
-          pairing.message = `It was saved, but connecting failed. ${message(error)}`;
-        }
-      } catch (error) {
-        pairing.prompt = null;
-        pairing.phase = error instanceof AdapterError && error.wire.code === "cancelled" ? "cancelled" : "failed";
-        pairing.message =
-          error instanceof AdapterError && error.wire.code === "cancelled"
-            ? "Adding the device was cancelled."
-            : message(error);
-      } finally {
-        if (pairing.dismissed && this.#pairing === pairing) this.#pairing = null;
+    try {
+      await session.connection.startPairing(candidateId);
+    } catch (error) {
+      if (this.#pairing === pairing) {
+        pairing.phase = "failed";
+        pairing.message = failure(error);
+        if (pairing.dismissed) this.#pairing = null;
         this.changed();
       }
-    })();
+    }
     return { ok: true };
   }
 
   async #reply(accept: boolean, value?: string): Promise<ActionResult> {
     const pairing = this.#pairing;
     const prompt = pairing?.prompt;
-    if (!pairing || !prompt || prompt.kind !== "prompt") return { ok: false, message: "No pairing prompt is waiting." };
-    const entry = prompt.prompt.method === "enter_passkey" || prompt.prompt.method === "enter_pin";
+    if (!pairing || !prompt || prompt.kind === "show") return { ok: false, message: "No pairing prompt is waiting." };
     try {
-      await pairing.session.request("pairing.reply", {
-        request_id: pairing.requestId,
-        prompt_id: prompt.prompt.prompt_id,
-        action: accept ? "accept" : "reject",
-        ...(accept && entry ? { value: value ?? "" } : {}),
-      });
+      if (accept) await pairing.session.connection.acceptPrompt(prompt.kind === "enter" ? (value ?? "") : "");
+      else await pairing.session.connection.rejectPrompt();
       if (pairing.prompt === prompt) pairing.prompt = null;
       this.changed();
       return { ok: true };
     } catch (error) {
-      if (error instanceof AdapterError && error.wire.code === "stale_prompt") {
+      if (error instanceof CordialError && convert.errorCode(error.code) === "no_prompt") {
         if (pairing.prompt === prompt) pairing.prompt = null;
         this.changed();
-        return { ok: false, message: codeText("stale_prompt") };
       }
       return failed(error);
     }
   }
 
   async stop() {
-    this.#discoveryAbort.abort();
-    this.#discoveryAbort = new AbortController();
     await this.manager.stop();
   }
 }

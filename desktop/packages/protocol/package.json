@@ -1,0 +1,25 @@
+{
+  "name": "@cordial/protocol",
+  "version": "0.0.0",
+  "description": "Cordial serial API messages, framing and key catalog",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "generate": "node scripts/generate.mjs",
+    "check:generated": "node scripts/generate.mjs --check",
+    "lint": "buf lint ../../../proto --config buf.yaml",
+    "breaking": "buf breaking ../../../proto --config buf.yaml --against-config buf.yaml --against"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.16.0"
+  },
+  "devDependencies": {
+    "@bufbuild/buf": "1.73.0",
+    "@bufbuild/protoc-gen-es": "2.16.0",
+    "smol-toml": "1.9.0"
+  }
+}

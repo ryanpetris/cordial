@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { watchHotplug } from "../src/node/serial.ts";
+import { watchHotplug } from "../src/node/host.ts";
 
 interface Watcher {
   attach?: () => void;

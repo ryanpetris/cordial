@@ -1,6 +1,6 @@
 //! Scripted public HID++ replies exercise the production discovery allocator.
 use cordial_core::{features::Engine, hid::HIDPP_LONG, hidpp::Client, settings::Catalog};
-use cordial_protocol::{identifiers::SettingsState, settings::SettingKey};
+use cordial_core::model::{identifiers::SettingsState, settings::SettingKey};
 
 const KNOWN: &[(u16, u8)] = &[
     (1, 2),
@@ -74,7 +74,7 @@ fn answer(mut packet: [u8; 19]) -> [u8; 19] {
 pub fn run(catalog: &mut Catalog) {
     let mut engine = Engine::default();
     let mut client = Client::new(HIDPP_LONG);
-    client.protocol = [2, 0];
+    client.protocol = cordial_core::model::hidpp::ProtocolState::Detected { major: 2, minor: 0 };
     catalog.connection(true, false);
     engine.activate(catalog, 100).unwrap();
     for now in 101..1101 {

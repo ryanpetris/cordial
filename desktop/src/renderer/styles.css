@@ -589,6 +589,14 @@ button.row {
   opacity: 0.6;
 }
 
+/* Where a fact applies, on its own line under the value. */
+.fact-detail {
+  display: block;
+  margin-top: 2px;
+  font-size: 12.5px;
+  color: var(--dim);
+}
+
 .facts + .row {
   border-top: 1px solid var(--border);
 }

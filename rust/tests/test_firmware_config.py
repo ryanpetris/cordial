@@ -39,7 +39,6 @@ class BoardConfigTests(unittest.TestCase):
                 identities.add((board["hardware_digest"], board["storage_identity"]))
                 out = Path(temp, backend)
                 config.generate(board, out)
-                self.assertIn(backend, (out / "board.rs").read_text())
                 if backend == "pico-sdk-cyw43":
                     header = (out / "cordial.h").read_text()
                     self.assertIn("#define PICO_RP2350A 0", header)
@@ -82,24 +81,6 @@ class BoardConfigTests(unittest.TestCase):
                 path.write_text(json.dumps(preset | change))
                 with self.assertRaises(ValueError):
                     config.load(path, "development")
-
-    def test_output_frames_presets_and_validation(self):
-        for name, frames in (("pico_w", 4), ("pico2_w", 16),
-                             ("waveshare_rp2350b_plus_w", 16), ("xiao_esp32s3", 16)):
-            preset = config.ROOT / "boards" / f"{name}.json"
-            baseline = config.load(preset, "development")
-            self.assertEqual(baseline["output_frames"], frames)
-            raw = json.loads(preset.read_text())
-            with tempfile.TemporaryDirectory() as temp:
-                path = Path(temp, "board.json")
-                path.write_text(json.dumps(raw | {"output_frames": 8}))
-                changed = config.load(path, "development")
-                for field in ("hardware_digest", "storage_identity"):
-                    self.assertEqual(baseline[field], changed[field])
-                for invalid in (None, True, "16", 4.0, -1, 0, 3, 2**32):
-                    path.write_text(json.dumps(raw | {"output_frames": invalid}))
-                    with self.assertRaisesRegex(ValueError, "output_frames"):
-                        config.load(path, "development")
 
     def test_presets_and_custom_pins(self):
         for name, feature in (("pico_w", "rp2040"), ("pico2_w", "rp235xa"),

@@ -4,12 +4,25 @@
 #include <string.h>
 
 enum { QUERY_IDLE, QUERY_SERVICES, QUERY_REPORTS, QUERY_MAP, QUERY_DESCRIPTORS, QUERY_REFERENCE, QUERY_READ, QUERY_WRITE };
+static uint8_t operation_error(uint8_t status) {
+    switch (status) {
+        case ATT_ERROR_SUCCESS: return CORDIAL_OK;
+        case ATT_ERROR_READ_NOT_PERMITTED:
+        case ATT_ERROR_WRITE_NOT_PERMITTED:
+        case ATT_ERROR_REQUEST_NOT_SUPPORTED:
+        case ATT_ERROR_ATTRIBUTE_NOT_LONG: return CORDIAL_UNSUPPORTED;
+        case ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH: return CORDIAL_REPORT_SIZE;
+        default: return CORDIAL_CONNECTION;
+    }
+}
+
 // Profile setup is serialized; Rust copies each completed map before the next
 // service uses this buffer. Other connections never move or resize it.
 static uint8_t report_map[CORDIAL_DESCRIPTOR_BYTES];
 static uint16_t map_length;
 static void callback(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void advance(cordial_connection *l);
+static cordial_report *find(cordial_connection *l);
 
 static void accepted(cordial_connection *l, uint8_t status) {
     if (status) cordial_fail(l, CORDIAL_UNSUPPORTED);
@@ -22,7 +35,7 @@ static void advance(cordial_connection *l) {
     if (l->closing) return;
     if (l->query == QUERY_REPORTS) {
         if (!l->map_handle) { cordial_fail(l, CORDIAL_UNSUPPORTED); return; }
-        map_length = 0; l->query = QUERY_MAP;
+        map_length = 0; l->query = QUERY_MAP; l->read_simple = false;
         accepted(l, gatt_client_read_long_value_of_characteristic_using_value_handle(callback, l->handle, l->map_handle));
         return;
     }
@@ -106,12 +119,15 @@ static void callback(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t s
             }
             break;
         }
+        case GATT_EVENT_CHARACTERISTIC_VALUE_QUERY_RESULT:
         case GATT_EVENT_LONG_CHARACTERISTIC_VALUE_QUERY_RESULT: {
             bool map = l->query == QUERY_MAP;
             if (!map && (l->query != QUERY_READ || !l->reading)) return;
-            uint16_t offset = gatt_event_long_characteristic_value_query_result_get_value_offset(packet);
-            uint16_t length = gatt_event_long_characteristic_value_query_result_get_value_length(packet);
-            const uint8_t *data = gatt_event_long_characteristic_value_query_result_get_value(packet);
+            bool simple = event == GATT_EVENT_CHARACTERISTIC_VALUE_QUERY_RESULT;
+            if (simple != l->read_simple) return;
+            uint16_t offset = simple ? 0 : gatt_event_long_characteristic_value_query_result_get_value_offset(packet);
+            uint16_t length = simple ? gatt_event_characteristic_value_query_result_get_value_length(packet) : gatt_event_long_characteristic_value_query_result_get_value_length(packet);
+            const uint8_t *data = simple ? gatt_event_characteristic_value_query_result_get_value(packet) : gatt_event_long_characteristic_value_query_result_get_value(packet);
             uint16_t *received = map ? &map_length : &l->length;
             uint16_t capacity = map ? sizeof report_map : sizeof l->bytes;
             if (offset != *received || offset > capacity || length > capacity - offset || data + length > packet + size) {
@@ -121,8 +137,21 @@ static void callback(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t s
         }
         case GATT_EVENT_QUERY_COMPLETE: {
             uint8_t status = gatt_event_query_complete_get_att_status(packet);
-            if (l->query == QUERY_WRITE) { l->query = QUERY_IDLE; cordial_write_done(l, status ? CORDIAL_CONNECTION : CORDIAL_OK); return; }
-            if (l->query == QUERY_READ) { l->query = QUERY_IDLE; cordial_read_done(l, status ? CORDIAL_CONNECTION : CORDIAL_OK); return; }
+            if (status == ATT_ERROR_ATTRIBUTE_NOT_LONG && (l->query == QUERY_MAP || l->query == QUERY_READ) && !l->read_simple) {
+                uint16_t received = l->query == QUERY_MAP ? map_length : l->length;
+                if (received) {
+                    // The owner validates the declared report length before use.
+                    status = ATT_ERROR_SUCCESS;
+                } else {
+                    cordial_report *report = l->query == QUERY_READ ? find(l) : NULL;
+                    uint16_t handle = report ? report->characteristic.value_handle : l->map_handle;
+                    l->read_simple = true;
+                    if (!gatt_client_read_value_of_characteristic_using_value_handle(callback, l->handle, handle)) return;
+                    status = ATT_ERROR_UNLIKELY_ERROR;
+                }
+            }
+            if (l->query == QUERY_WRITE) { l->query = QUERY_IDLE; cordial_write_done(l, operation_error(status)); return; }
+            if (l->query == QUERY_READ) { l->query = QUERY_IDLE; cordial_read_done(l, operation_error(status)); return; }
             if (status) { cordial_fail(l, CORDIAL_UNSUPPORTED); return; }
             if (l->query == QUERY_DESCRIPTORS && !l->reports[l->report_cursor].reference) { cordial_fail(l, CORDIAL_UNSUPPORTED); return; }
             if (l->query == QUERY_REFERENCE && !l->reports[l->report_cursor].type) { cordial_fail(l, CORDIAL_UNSUPPORTED); return; }
@@ -168,14 +197,14 @@ int cordial_gatt_write(cordial_connection *l) {
     } else if ((report->characteristic.properties & ATT_PROPERTY_WRITE_WITHOUT_RESPONSE) && l->length <= mtu - 3) {
         l->writable.callback = without_response; l->writable.context = l;
         result = gatt_client_request_to_write_without_response(&l->writable, l->handle);
-    } else { l->query = QUERY_IDLE; return CORDIAL_UNSUPPORTED; }
+    } else { l->query = QUERY_IDLE; return (report->characteristic.properties & ATT_PROPERTY_WRITE_WITHOUT_RESPONSE) ? CORDIAL_REPORT_SIZE : CORDIAL_UNSUPPORTED; }
     if (result) l->query = QUERY_IDLE;
     return result ? CORDIAL_CONNECTION : CORDIAL_OK;
 }
 int cordial_gatt_read(cordial_connection *l) {
     cordial_report *report = find(l);
     if (!report || !(report->characteristic.properties & ATT_PROPERTY_READ)) return CORDIAL_UNSUPPORTED;
-    l->query = QUERY_READ;
+    l->query = QUERY_READ; l->read_simple = false;
     uint8_t result = gatt_client_read_long_value_of_characteristic_using_value_handle(callback, l->handle, report->characteristic.value_handle);
     if (result) l->query = QUERY_IDLE;
     return result ? CORDIAL_CONNECTION : CORDIAL_OK;

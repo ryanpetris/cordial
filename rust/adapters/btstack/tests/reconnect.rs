@@ -8,7 +8,7 @@ use cordial_btstack::{
 };
 use cordial_core::bluetooth::{Bluetooth, Event};
 use cordial_core::devices::Peer;
-use cordial_protocol::identifiers::Transport;
+use cordial_core::model::identifiers::Transport;
 use embassy_futures::block_on;
 #[allow(dead_code)]
 mod support {

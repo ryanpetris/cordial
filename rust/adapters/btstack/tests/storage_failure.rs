@@ -5,11 +5,11 @@ use cordial_btstack::{
     storage::Storage,
     transport::Io,
 };
+use cordial_core::model::errors::ErrorCode;
 use cordial_core::{
     bluetooth::Bluetooth,
     storage::{Error, RecordKey, RecordStore},
 };
-use cordial_protocol::errors::ErrorCode;
 use embassy_futures::block_on;
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 

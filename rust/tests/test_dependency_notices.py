@@ -66,10 +66,10 @@ class DependencyNotices(unittest.TestCase):
         self.target = next(line.removeprefix("host: ") for line in self.compiler.splitlines()
                            if line.startswith("host: "))
         (self.workspace / "Cargo.toml").write_text(
-            '[workspace]\nresolver="3"\nmembers=["crates/cordial-client", "other"]\n'
+            '[workspace]\nresolver="3"\nmembers=["crates/cordial-cli", "other"]\n'
             'exclude=["platforms/esp32s3"]\n')
         self.manifest = '''[package]
-name="cordial-client"
+name="cordial-cli"
 version="0.0.0"
 edition="2021"
 [features]
@@ -86,7 +86,7 @@ dev-only="=1.0.0"
 [target.'cfg(any())'.dependencies]
 platform-only="=1.0.0"
 '''
-        self.package("crates/cordial-client", self.manifest)
+        self.package("crates/cordial-cli", self.manifest)
         self.package("other", '[package]\nname="other"\nversion="0.0.0"\nedition="2021"\n'
                      '[dependencies]\nunused="=1.0.0"\n')
 
@@ -121,9 +121,9 @@ platform-only="=1.0.0"
         return {entry["name"] for entry in entries}
 
     def test_cli_collects_notices_after_build_with_fresh_cache(self):
-        manifest = "crates/cordial-client/Cargo.toml"
+        manifest = "crates/cordial-cli/Cargo.toml"
         self.cargo("generate-lockfile")
-        self.cargo("build", "--locked", "-p", "cordial-client", "--bin", "cordial-client",
+        self.cargo("build", "--locked", "-p", "cordial-cli", "--bin", "cordial-cli",
                    "--target", self.target)
         self.assertFalse(list(self.home.glob("registry/src/*/unused-*")))
         offline = self.cargo("metadata", "--locked", "--offline", "--format-version", "1",

@@ -1,47 +1,83 @@
-# Transport and framing
+# USB discovery, framing and sessions
 
 [Protocol index](README.md)
 
-Automatic USB discovery requires VID/PID `1209:c0d1` and manufacturer `Cordial`.
-Hosts read these descriptors before opening the serial port. Explicit CLI port
-selection bypasses discovery filtering.
-CDC occupies interfaces 0 and 1; HID occupies interface 2 with report IDs 1, 2 and 3. Endpoint numbers, optional interface strings and class-descriptor revisions are supplied by the USB implementation and are not host discovery keys. The USB serial number string equals the adapter's `adapter_id`, so a host can recognize an adapter before opening its port; opening and `adapter.status` still confirm it.
+## Discovery
 
-The USB manufacturer string is `Cordial`. The product string is the firmware's
-programmed `default_adapter_name`, independent of the user's saved adapter name.
-The serial number is 16 uppercase hexadecimal digits, including leading zeros.
-Pico W uses its flash unique ID; RP2350 boards use their chip ID; ESP32-S3 uses
-bits 0..63 of its factory `OPTIONAL_UNIQUE_ID` eFuse field, read as a little-endian
-64-bit integer. USB identity is available before radio startup.
+Automatic discovery selects USB devices with VID/PID `1209:c0d1` and manufacturer `Cordial`, read
+from the descriptors before the serial port is opened. An explicitly selected port bypasses this
+filter.
 
-- Encode each message as one UTF-8 JSON object followed by LF. Accept CRLF from the host; emit LF from the adapter. Newlines inside strings use JSON escaping.
-- A message is at most 4,096 bytes, including its line terminator. Reject duplicate object keys, invalid UTF-8, and values of the wrong type.
-- USB transfers are not message boundaries. A line may arrive in pieces, and one transfer may contain multiple lines. Ignore empty lines. For an oversized line, discard through its next LF before accepting another message.
-- Serialize complete lines in each direction. Concurrent requests, responses, and events must never interleave their bytes within a line.
-- Management messages use `"v":1`; the fixed [protocol discovery exchange](messages.md#protocol-discovery) uses `"v":0`. Reject any other version for the requested command without executing it.
-- Emit no prompts, debug text, startup banners, or raw keyboard/mouse reports on this interface. Human-readable formatting belongs to the CLI. Device names are untrusted text; the CLI must escape terminal control characters.
-- Use the conventional 115200, 8-N-1 host serial settings. CDC line coding does not set the USB transfer speed or change the protocol. Opening the port or changing baud rate must not reboot the adapter.
+CDC occupies interfaces 0 and 1; HID occupies interface 2. Endpoint numbers and interface strings
+are not discovery keys. The USB serial number is the adapter ID, 16 uppercase hexadecimal digits,
+so a host can recognize an adapter before opening its port; `GetStatus` confirms it. The product
+string is the firmware's default adapter name, independent of any name the user saved.
 
-The CLI asserts DTR while it owns the port. A DTR transition from low to high starts a control session; DTR going low, USB reset, or USB disconnection ends it. Clear partial lines, queued control output, request IDs, and subscriptions at the session boundary. The host first queries `adapter.protocol` using the fixed `v:0` discovery exchange. If the reported protocol is supported, it queries `adapter.capabilities` and `adapter.status` using that version, then starts `session.heartbeat`. Before normal management commands, the host completes the [`adapter.wait_ready` handshake](commands.md#adapter-readiness). Protocol discovery, status, capability discovery, file access and development bootloader entry can bypass that wait. DTR provides an immediate teardown signal when available; the heartbeat also handles a crashed client or a serial stack that leaves DTR asserted.
+Pico W uses its flash unique ID, RP2350 boards their chip ID, and ESP32-S3 bits 0..63 of its factory
+`OPTIONAL_UNIQUE_ID` eFuse field read as a little-endian 64-bit integer. The USB identity is
+available before the radio starts.
 
-On opening the port, the CLI explicitly cycles DTR low then high and discards stale received bytes before sending its first request. This establishes a fresh request-ID namespace even if a previous process crashed with DTR high; it does not reset the dongle or its HID connections. The desktop application instead opens the port from a closed state with HUPCL: opening raises DTR (a low-to-high transition, because the kernel lowered DTR when the previous owner's descriptor closed, including after a crash) and the serial library discards the input received so far. The separator arrives as an ignored empty line if it was not discarded with that input. Because a packet of the previous session can still arrive afterwards, the application ignores lines that are not valid JSON, events, and responses that don't match its request until the first valid response; after that, invalid input ends the session. Closing the port lowers DTR. The desktop application cannot toggle DTR on an open port because its serial library always issues a break request with modem-line changes, and the adapter's CDC interface does not support break. Its web version opens the port through Web Serial, which changes DTR without a break: like the CLI, it lowers DTR, waits 60 ms and raises it, then ignores earlier-session input the same way as the desktop application. It lowers DTR before closing the port.
+The conventional 115200 8-N-1 serial settings work; line coding does not change the transfer speed
+or the protocol, and opening the port or changing the baud rate never reboots the Dongle.
 
-A USB IN packet already submitted before DTR falls may still reach the host. After DTR rises, the adapter sends an LF separator before any new-session responses. The client drains input while DTR is low, ignores empty lines, and discards any old fragment up to that separator before sending its initial `adapter.protocol`, followed by `adapter.capabilities` and `adapter.status`. It then requires a matching status response with the adapter identity and session ID. This handshake must have a bounded timeout. Do not reset USB or interrupt HID merely to reopen the control session.
+## Framing
 
-Closing a control session stops its scan and cancels pairing that has not committed a bond. An explicit connection attempt already in progress may finish. Disconnect/unpair operations already accepted finish independently of the host. Existing bonds, reconnect policy, and HID forwarding do not depend on an open CLI. Loss of the physical USB connection naturally prevents delivery to that computer.
+- Each message is protobuf-encoded, then COBS-encoded, then followed by one `0x00` byte. COBS
+  output contains no zero byte, so a zero always ends a frame and a receiver that joins mid-stream
+  resynchronizes at the next one.
+- Client to Dongle, every frame is a `Request`. Dongle to client, every frame is a `Message` holding
+  either a `Response` or an `Event`.
+- Empty frames (two delimiters in a row) are ignored.
+- A client frame is at most 1024 bytes before COBS encoding. A longer frame is discarded through
+  its delimiter and answered with `ERROR_CODE_TOO_LONG`.
+- Dongle frames have no length limit. The Dongle writes long frames incrementally and never
+  interleaves two frames.
+- USB checksums every packet, so frames carry no checksum of their own.
 
-## Client heartbeat and exit
+## Requests and responses
 
-The CLI sends `session.heartbeat` every 5,000 ms while open, including while waiting for user input or another command. Each heartbeat refreshes a 15,000 ms client-presence deadline measured by the dongle's monotonic clock. These values are fixed for version 1 and advertised by `adapter.status`. Heartbeats are normal requests with terminal responses, multiplexed with all other traffic.
+The Dongle answers every request frame with exactly one `Response`, in the order requests arrive.
+It reads the next request only after the previous response has been written, so a client may send
+requests back to back but never needs to match responses to requests.
 
-A new control session starts with a 15-second grace period. When its presence deadline expires:
+- A frame that does not decode as a `Request` gets `ERROR_CODE_BAD_REQUEST`.
+- A `Request` with no command set gets `ERROR_CODE_UNKNOWN_COMMAND`. That is also what firmware sees
+  for a command added after it was built, because protobuf decodes an unknown `oneof` variant as an
+  unset one.
+- A command with a missing required field, a value of the wrong type or a value out of range gets
+  `ERROR_CODE_BAD_ARGS`.
+- A `Response` with no result set means success with nothing to return.
 
-- Disable monitoring and discard queued optional notifications. Stop discovery and cancel any pairing that has not committed its bond; affected requests receive terminal error `client_timeout` if the control channel remains usable.
-- Keep bonds, trust/block settings, existing HID connections, and automatic reconnection operating independently. A missed heartbeat must not release held keys or disconnect a working peripheral.
-- Retain request-ID ordering for the still-open serial session. A later heartbeat restores client presence but does not restart monitoring, scanning, or pairing. The CLI explicitly re-enables the desired activity and refreshes its device snapshot.
+Every command returns promptly. A command responds once it is accepted and any saved value is
+written; Bluetooth work that takes longer, such as connecting, pairing, scanning or disconnecting,
+reports its progress through events.
 
-After expiry, new `discovery.scan`, `pairing.start`, and monitor-enable requests return `heartbeat_required` until another heartbeat arrives. Other management commands remain available. Arbitrary commands and outgoing events do not refresh this deadline.
+## Events
 
-On `quit`, `exit`, EOF, or orderly process shutdown, send `session.monitor.set` with `enabled:false` when supported, stop heartbeat scheduling, and cancel any scan or uncommitted pairing. Allow at most one second total for best-effort cleanup acknowledgements, then lower DTR and close the port. Do not send disconnect/remove commands for the user's devices. A crash or forced kill relies on DTR teardown or heartbeat expiry instead.
+An event can arrive between any two frames, including between a request and its response; a
+`Message` holding a `Response` always answers the oldest unanswered request.
 
-Monitoring and discovery are RAM-only session state. They always start off after a power cycle, firmware restart, or new control session. Never persist either state to flash. Standalone HID operation needs no heartbeat.
+Each event carries the complete current state of one thing: the adapter, a device, a device's
+settings, a device's warnings, a scan candidate, or the pairing. A client replaces what it had with
+the latest event. There are no deltas, so nothing needs ordering and there are no revisions.
+
+The Dongle keeps one pending slot per thing. When a thing changes again before its event is
+written, the event that goes out carries the newer state, so events are never lost under output
+pressure; intermediate states can be skipped. Events are written only when no response is waiting,
+and a client that stops reading holds back only the serial port, never HID forwarding.
+
+## Sessions
+
+- Opening the port (DTR rising) starts a session. The Dongle discards any partial input and unsent
+  output from the previous session and writes a `0x00` delimiter.
+- A client also writes a `0x00` before its first request, so a partial frame left by an earlier
+  client cannot merge with it, and ignores everything up to the first `Response` after its first
+  request.
+- Closing the port (DTR falling), USB reset or USB disconnection ends the session. Ending a session
+  stops a running scan and cancels a pairing that has not saved its bond; a new session starts with
+  no events waiting and no scan candidates. Saved devices, connections, automatic reconnection and
+  HID forwarding carry on without a client.
+
+The CLI cycles DTR low then high when it opens a port. The desktop application opens the port from
+closed, which raises DTR, and its web version lowers DTR, waits 60 ms and raises it, because Web
+Serial changes DTR without a break request. All of them lower DTR when they close the port.

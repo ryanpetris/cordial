@@ -1,11 +1,11 @@
-use cordial_core::{
-    hid::{HIDPP_LONG, HIDPP_SHORT, Held},
-    hidpp::*,
-};
-use cordial_protocol::{
+use cordial_core::model::{
     errors::ErrorCode,
     hidpp::ProtocolState,
     identifiers::{HostPlatform, NormalizationState},
+};
+use cordial_core::{
+    hid::{HIDPP_LONG, HIDPP_SHORT, Held},
+    hidpp::*,
 };
 
 fn respond(client: &mut Client, packet: &[u8; 19], parameters: &[u8], now: &mut u64) -> bool {

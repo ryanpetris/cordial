@@ -11,9 +11,12 @@
   "engines": {
     "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
   },
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "generate": "node scripts/generate-wire.mjs",
-    "check:generated": "node scripts/generate-wire.mjs --check",
+    "generate": "npm --workspace @cordial/protocol run generate",
+    "check:generated": "npm --workspace @cordial/protocol run check:generated",
     "icons": "node scripts/icons.mjs",
     "typecheck": "tsc -p .",
     "test": "vitest run",
@@ -25,20 +28,20 @@
     "check": "npm run check:generated && npm run typecheck && npm test"
   },
   "dependencies": {
-    "ajv": "8.20.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "serialport": "13.0.0",
     "usb": "3.1.0"
   },
   "devDependencies": {
+    "@cordial/client": "0.0.0",
+    "@cordial/protocol": "0.0.0",
     "@types/node": "26.6.3",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "6.1.1",
     "electron": "44.4.5",
     "electron-builder": "26.15.3",
-    "json-schema-to-typescript": "16.0.0",
     "playwright": "1.63.0",
     "typescript": "7.0.2",
     "vite": "8.3.1",

@@ -1,9 +1,9 @@
 import { vi } from "vitest";
+import type { PortInfo } from "@cordial/client";
 import { FakeAdapter, type FakeOptions } from "../src/fake/adapter.ts";
 import { Controller } from "../src/core/controller.ts";
 import { AdapterSession } from "../src/core/session.ts";
-import type { PortInfo } from "../src/core/transport.ts";
-import { DEFAULT_PREFERENCES, type AppState } from "../src/shared/state.ts";
+import { DEFAULT_PREFERENCES, type AppState, type DeviceRecord } from "../src/shared/state.ts";
 
 export const until = async (check: () => boolean, ms = 3000) => {
   const end = Date.now() + ms;
@@ -13,9 +13,31 @@ export const until = async (check: () => boolean, ms = 3000) => {
   }
 };
 
+/** A device record as the app keeps it. */
+export function record(id: string, patch: Partial<DeviceRecord> = {}): DeviceRecord {
+  return {
+    id,
+    transport: "ble",
+    name: id,
+    kind: "keyboard",
+    state: "disconnected",
+    enabled: true,
+    trusted: true,
+    blocked: false,
+    paused: false,
+    inactive: null,
+    error: null,
+    security: null,
+    hidpp: null,
+    info: [],
+    roles: [],
+    ...patch,
+  };
+}
+
 export async function openSession(options: FakeOptions = {}) {
   const fake = new FakeAdapter(options);
-  const hooks = { changed: vi.fn(), closed: vi.fn(), log: vi.fn() };
+  const hooks = { changed: vi.fn(), closed: vi.fn(), event: vi.fn(), log: vi.fn() };
   const session = await AdapterSession.open(fake.open(), hooks);
   session.run();
   return { fake, session, hooks };

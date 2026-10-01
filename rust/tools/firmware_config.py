@@ -40,7 +40,7 @@ def indicator(value, maximum, label):
 def load(path, profile):
     config = json.loads(Path(path).read_text(), object_pairs_hook=unique_object)
     fields = {"default_adapter_name", "name", "chip", "package", "flash_bytes", "xosc_hz", "radio", "mcu_led",
-              "bluetooth_backend", "radio_backend", "usb_backend", "storage_backend", "firmware_bytes", "output_frames"}
+              "bluetooth_backend", "radio_backend", "usb_backend", "storage_backend", "firmware_bytes"}
     if not isinstance(config, dict) or set(config) != fields:
         raise ValueError(f"Board configuration requires exactly: {', '.join(sorted(fields))}")
     if profile not in ("development", "production"):
@@ -52,8 +52,6 @@ def load(path, profile):
             or len(name.encode("utf-8")) > 64
             or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in name)):
         raise ValueError("default_adapter_name must be a trimmed name of 1..64 UTF-8 bytes without controls")
-    if type(config["output_frames"]) is not int or not 4 <= config["output_frames"] <= 0xffffffff:
-        raise ValueError("output_frames must be an integer from 4 to 4294967295")
     if config["chip"] == "esp32s3":
         from esp_config import normalize
         return normalize(config, profile)
@@ -151,10 +149,8 @@ ASSERT(_heap_end > __sheap, "Static RAM leaves no application heap");
 pub const STORAGE_START: u32 = {config['storage_offset']};
 pub const STORAGE_END: u32 = {config['storage_offset'] + config['storage_bytes']};
 pub const STORAGE_IDENTITY: [u8; 32] = {list(config['storage_identity'])!r};
-pub const RADIO_BACKEND: &str = {json.dumps(config["radio_backend"])};
 pub const DEFAULT_ADAPTER_NAME: &str = {json.dumps(config["default_adapter_name"], ensure_ascii=False)};
 pub const HARDWARE: &str = {json.dumps(config['name'])};
-pub const HARDWARE_DIGEST: &str = {json.dumps(config['hardware_digest'])};
 pub fn clocks() -> embassy_rp::clocks::ClockConfig {{
     use embassy_rp::clocks::{{ClockConfig, PllConfig}};
     let mut clocks = ClockConfig::crystal({config['xosc_hz']});

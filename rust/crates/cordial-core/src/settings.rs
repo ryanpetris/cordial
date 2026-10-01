@@ -1,8 +1,6 @@
 use crate::compact::{FeatureEntry, Observed, Preference, Record, number, scalar};
-use alloc::vec::Vec;
-use alloc::{boxed::Box, rc::Rc};
-use cordial_protocol::errors::ErrorCode;
-use cordial_protocol::{
+use crate::model::errors::ErrorCode;
+use crate::model::{
     hidpp::Feature,
     hidpp::{FeatureId, FeatureRevision},
     settings::{
@@ -10,13 +8,24 @@ use cordial_protocol::{
         SettingValue,
     },
 };
+use alloc::vec::Vec;
+use alloc::{boxed::Box, rc::Rc};
 use serde::{Deserialize, Serialize};
 
 #[allow(async_fn_in_trait)]
 pub trait PreferenceStore {
     async fn save(&mut self, value: &Preference) -> Result<(), Error>;
+    /// Replaces every saved preference of the device in one write.
+    async fn replace(&mut self, values: &[Preference]) -> Result<(), Error>;
     async fn remove(&mut self, key: SettingKey) -> Result<(), Error>;
     async fn remove_all(&mut self) -> Result<(), Error>;
+}
+
+/// One requested change to a saved setting: a new value, or `None` to forget it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Change {
+    pub key: SettingKey,
+    pub value: Option<SettingValue>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -337,6 +346,75 @@ impl Catalog {
         record.error = None;
         Ok(())
     }
+    /// Saves and forgets several settings in one storage write. Every change is validated first;
+    /// if any is invalid, nothing is saved. A value is accepted whenever the setting's metadata
+    /// accepts it, whatever the device's current state; it waits as pending until an apply writes
+    /// it. Nothing is sent to the device here.
+    pub async fn change<S: PreferenceStore>(
+        &mut self,
+        changes: &[Change],
+        store: &mut S,
+    ) -> Result<(), Error> {
+        let mut updates = Vec::new();
+        updates
+            .try_reserve_exact(changes.len())
+            .map_err(|_| Error::Resource)?;
+        for change in changes {
+            let index = self
+                .records
+                .iter()
+                .position(|r| r.metadata.key == change.key && r.writable)
+                .ok_or(Error::NotFound)?;
+            let preference = match &change.value {
+                None => None,
+                Some(value) => {
+                    let record = &self.records[index];
+                    let value = number(change.key, value)?;
+                    let candidate = Preference {
+                        metadata: record.metadata.clone(),
+                        value,
+                    };
+                    if !candidate.valid() {
+                        return Err(Error::InvalidValue);
+                    }
+                    Some(Rc::new(candidate))
+                }
+            };
+            updates.push((index, preference));
+        }
+        let unchanged = updates
+            .iter()
+            .all(|(i, p)| self.records[*i].preference.as_deref() == p.as_deref());
+        if !unchanged {
+            let mut values: Vec<Preference> = Vec::new();
+            for (i, record) in self.records.iter().enumerate() {
+                let preference = match updates.iter().find(|(j, _)| *j == i) {
+                    Some((_, p)) => p.as_deref(),
+                    None => record.preference.as_deref(),
+                };
+                if let Some(p) = preference {
+                    values.try_reserve(1).map_err(|_| Error::Resource)?;
+                    values.push(p.clone());
+                }
+            }
+            if values.len() > MAX_SAVED {
+                return Err(Error::Limit);
+            }
+            store.replace(&values).await?;
+        }
+        for (index, preference) in updates {
+            let record = &mut self.records[index];
+            record.state = if preference.is_some() {
+                SettingState::Pending
+            } else {
+                SettingState::Unmanaged
+            };
+            record.preference = preference;
+            record.error = None;
+            record.changed.set(true);
+        }
+        Ok(())
+    }
     /// Observations never update saved preferences or schedule corrective writes.
     pub fn observe(
         &mut self,
@@ -380,7 +458,7 @@ impl Catalog {
     }
 }
 
-pub const MAX_RECORDS: usize = cordial_protocol::settings::SettingKey::ALL.len();
+pub const MAX_RECORDS: usize = crate::model::settings::SettingKey::ALL.len();
 pub const MAX_SAVED: usize = MAX_RECORDS;
 pub const MAX_FEATURES: usize = 256;
 pub const MAX_CHOICES: usize = u16::MAX as usize + 1;

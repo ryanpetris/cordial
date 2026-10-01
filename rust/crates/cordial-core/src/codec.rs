@@ -1,10 +1,10 @@
 //! Native bond byte helpers and persisted JSON policy validation.
+use crate::model::identifiers::Transport;
 use crate::{
     devices::{Peer, Policy},
     storage::Error,
 };
 use alloc::vec::Vec;
-use cordial_protocol::identifiers::Transport;
 
 pub struct Reader<'a>(&'a [u8]);
 impl<'a> Reader<'a> {

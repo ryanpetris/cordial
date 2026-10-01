@@ -1,0 +1,12 @@
+version: v2
+lint:
+  use:
+    - STANDARD
+  except:
+    - ENUM_ZERO_VALUE_SUFFIX
+    - PACKAGE_VERSION_SUFFIX
+    # The schema lives in the repository's proto directory, not one named after its package.
+    - PACKAGE_DIRECTORY_MATCH
+breaking:
+  use:
+    - WIRE_JSON

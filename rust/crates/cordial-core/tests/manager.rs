@@ -1,13 +1,18 @@
 mod support;
-use cordial_core::{
-    bluetooth::InputReport, devices::AdapterPreference, link::ServiceId, manager::Manager,
-};
-use cordial_protocol::{
+use cordial_core::model::{
     errors::ErrorCode as Error,
     identifiers::{ConnectionState, HostPlatform},
 };
+use cordial_core::{
+    bluetooth::InputReport, devices::AdapterPreference, link::ServiceId, manager::Manager,
+};
+use cordial_protocol as p;
 use embassy_futures::block_on;
 use support::*;
+
+fn record(manager: &Manager, slot: usize) -> Option<p::Device> {
+    cordial_core::wire::device(manager, slot)
+}
 
 #[test]
 fn disconnect_releases_input_and_generation_blocks_late_events() {
@@ -39,7 +44,10 @@ fn disconnect_releases_input_and_generation_blocks_late_events() {
     manager.connected(new, descriptor(), 255, 3).unwrap();
     assert!(!manager.input(&input, 4).unwrap());
     assert!(manager.disconnected(old, None, 4).is_none());
-    assert_eq!(manager.record(0).unwrap().state, ConnectionState::Connected);
+    assert_eq!(
+        manager.devices[0].as_ref().unwrap().state,
+        ConnectionState::Connected
+    );
     assert!(manager.forward.packet().is_none());
 }
 #[test]
@@ -52,10 +60,10 @@ fn policies_save_before_publish_and_unpair_keeps_adapter_preferences() {
         block_on(manager.policy(0, changed.clone(), &mut store)),
         Err(Error::StorageFailed)
     );
-    assert!(manager.record(0).unwrap().hidpp_enabled);
+    assert!(manager.devices[0].as_ref().unwrap().policy.hidpp_enabled);
     store.fail_save = None;
     block_on(manager.policy(0, changed, &mut store)).unwrap();
-    assert!(!manager.record(0).unwrap().hidpp_enabled);
+    assert!(!manager.devices[0].as_ref().unwrap().policy.hidpp_enabled);
     block_on(manager.platform(HostPlatform::Mac, &mut store)).unwrap();
     let id = manager
         .connect(0, true, 30_000, &mut radio)
@@ -70,7 +78,7 @@ fn policies_save_before_publish_and_unpair_keeps_adapter_preferences() {
     manager.disconnected(id, None, 1).unwrap();
     block_on(manager.unpair(0, &mut store, &mut radio)).unwrap();
     assert!(radio.bonds.is_empty());
-    assert!(manager.record(0).is_none());
+    assert!(manager.devices[0].is_none());
     let mut reloaded = Manager::default();
     block_on(reloaded.load(&mut store, &mut radio)).unwrap();
     assert_eq!(
@@ -97,10 +105,16 @@ fn security_is_observed_per_connection_and_never_carried_across_generations() {
         key_size: Some(16),
         bonded: Some(true),
     };
+    let wire = p::Security {
+        encrypted: Some(true),
+        authenticated: Some(false),
+        secure_connections: Some(true),
+        key_size: Some(16),
+    };
     assert_eq!(manager.security(id, initial), None);
-    assert_eq!(manager.record(0).unwrap().security, None);
+    assert_eq!(record(&manager, 0).unwrap().security, None);
     manager.connected(id, descriptor(), 255, 0).unwrap();
-    assert_eq!(manager.record(0).unwrap().security, Some(initial));
+    assert_eq!(record(&manager, 0).unwrap().security, Some(wire));
     assert_eq!(manager.security(id, initial), None); // No redundant notification.
     let changed = ConnectionSecurity {
         authenticated: Some(true),
@@ -108,7 +122,7 @@ fn security_is_observed_per_connection_and_never_carried_across_generations() {
     };
     assert_eq!(manager.security(id, changed), Some(0));
     manager.disconnect(0, &mut radio).unwrap();
-    assert_eq!(manager.record(0).unwrap().security, None);
+    assert_eq!(record(&manager, 0).unwrap().security, None);
     assert_eq!(manager.security(id, initial), None);
     manager.disconnected(id, None, 1).unwrap();
     let next = manager
@@ -118,13 +132,13 @@ fn security_is_observed_per_connection_and_never_carried_across_generations() {
     assert_ne!(id, next);
     assert_eq!(manager.security(id, changed), None);
     manager.connected(next, descriptor(), 255, 2).unwrap();
-    assert_eq!(manager.record(0).unwrap().security, None);
+    assert_eq!(record(&manager, 0).unwrap().security, None);
     assert_eq!(
         manager.security(next, ConnectionSecurity::default()),
         Some(0)
     );
     assert_eq!(
-        manager.record(0).unwrap().security.unwrap().authenticated,
+        record(&manager, 0).unwrap().security.unwrap().authenticated,
         None
     );
 }
@@ -163,11 +177,8 @@ fn interrupted_pairing_leaves_the_committed_device_unchanged() {
     assert_eq!(radio.bonds, vec![peer(1)]);
 }
 #[test]
-fn missing_bond_and_unsupported_transport_preserve_device() {
-    use cordial_protocol::{
-        errors::{DisabledReason, ValidationError},
-        identifiers::Transport,
-    };
+fn unsupported_transport_keeps_the_device_and_a_lost_bond_deletes_it() {
+    use cordial_core::model::identifiers::Transport;
     let (mut manager, mut store, mut radio) = setup();
     radio.transports = Some(cordial_core::bluetooth::Capabilities {
         classic: false,
@@ -175,12 +186,16 @@ fn missing_bond_and_unsupported_transport_preserve_device() {
         ble_scan_and_connect: false,
     });
     block_on(manager.load(&mut store, &mut radio)).unwrap();
+    let d = record(&manager, 0).unwrap();
     assert_eq!(
-        manager.record(0).unwrap().enabled_reason,
-        Some(DisabledReason::UnsupportedTransport)
+        d.inactive,
+        Some(p::InactiveReason::UnsupportedTransport as i32)
     );
-    assert!(manager.record(0).unwrap().enabled);
-    assert_eq!(manager.record(0).unwrap().transport, Transport::Classic);
+    assert!(d.enabled);
+    assert_eq!(
+        manager.devices[0].as_ref().unwrap().policy.peer.transport,
+        Transport::Classic
+    );
     let key = cordial_core::storage::record_key(2, 77);
     let mut value: serde_json::Value = serde_json::from_slice(&store.records[&key]).unwrap();
     value["bond"]["complete"] = false.into();
@@ -188,11 +203,27 @@ fn missing_bond_and_unsupported_transport_preserve_device() {
         .records
         .insert(key, serde_json::to_vec(&value).unwrap());
     block_on(manager.load(&mut store, &mut radio)).unwrap();
+    assert!(manager.devices.iter().all(Option::is_none));
+    assert!(!store.records.contains_key(&key));
+}
+#[test]
+fn a_lost_record_whose_cleanup_fails_is_still_reported_removed() {
+    let (mut manager, mut store, mut radio) = setup();
+    block_on(manager.load(&mut store, &mut radio)).unwrap();
+    let id = manager.devices[0].as_ref().unwrap().policy.device_id();
+    let key = cordial_core::storage::record_key(2, 77);
+    let mut value: serde_json::Value = serde_json::from_slice(&store.records[&key]).unwrap();
+    value["bond"]["complete"] = false.into();
+    store
+        .records
+        .insert(key, serde_json::to_vec(&value).unwrap());
+    store.fail_remove = Some(key);
     assert_eq!(
-        manager.record(0).unwrap().validation_error,
-        Some(ValidationError::BondCorrupt)
+        block_on(manager.sync_bonds(&mut store, &mut radio)),
+        Err(Error::StorageFailed)
     );
-    assert_eq!(manager.devices.iter().flatten().count(), 1);
+    assert!(manager.devices.iter().all(Option::is_none));
+    assert_eq!(manager.removed, [id]);
 }
 #[test]
 fn additional_pairs_are_saved_disabled_and_enable_does_not_evict() {
@@ -203,7 +234,10 @@ fn additional_pairs_are_saved_disabled_and_enable_does_not_evict() {
         radio.bonds.push(peer(n));
         let slot =
             block_on(manager.bonded(link, peer(n), b"extra", &mut store, &mut radio)).unwrap();
-        assert_eq!(manager.record(slot).unwrap().enabled, n <= 7);
+        assert_eq!(
+            manager.devices[slot].as_ref().unwrap().policy.enabled,
+            n <= 7
+        );
         manager.disconnected(link, None, 0);
         block_on(manager.finish_pair(&mut store, &mut radio)).unwrap();
     }
@@ -215,7 +249,7 @@ fn additional_pairs_are_saved_disabled_and_enable_does_not_evict() {
         block_on(manager.policy(8, policy, &mut store)),
         Err(Error::Capacity)
     );
-    assert!(!manager.record(8).unwrap().enabled);
+    assert!(!manager.devices[8].as_ref().unwrap().policy.enabled);
 }
 
 #[test]
@@ -238,22 +272,26 @@ fn ambiguous_device_commit_is_resolved_from_storage() {
     }
 }
 #[test]
-fn malformed_device_record_is_visible_and_blocks_destructive_collection() {
+fn malformed_device_record_is_deleted() {
     let (mut manager, mut store, mut radio) = setup();
     let key = cordial_core::storage::record_key(2, 77);
     store.records.insert(key, vec![0xff]);
     block_on(manager.load(&mut store, &mut radio)).unwrap();
+    assert!(manager.devices.iter().all(Option::is_none));
+    assert!(!store.records.contains_key(&key));
+}
+#[test]
+fn a_read_error_fails_the_load_and_deletes_nothing() {
+    let (mut manager, mut store, mut radio) = setup();
+    let saved = store.records.clone();
+    store.fail = true;
     assert_eq!(
-        manager.record(0).unwrap().validation_error,
-        Some(cordial_protocol::errors::ValidationError::DeviceCorrupt)
+        block_on(manager.load(&mut store, &mut radio)),
+        Err(Error::StorageFailed)
     );
-    assert!(!manager.record(0).unwrap().effective_enabled);
-    assert!(
-        store
-            .records
-            .contains_key(&cordial_core::storage::record_key(2, 77))
-    );
-    assert_eq!(store.records[&key], vec![0xff]);
+    store.fail = false;
+    assert_eq!(store.records, saved);
+    assert!(!manager.storage_ready);
 }
 #[test]
 fn pairing_needs_new_device_budget_even_for_a_duplicate() {
@@ -267,7 +305,7 @@ fn pairing_needs_new_device_budget_even_for_a_duplicate() {
 }
 #[test]
 fn changed_final_ble_identity_does_not_replace_the_provisional_owner() {
-    use cordial_protocol::identifiers::Transport;
+    use cordial_core::model::identifiers::Transport;
     let (mut manager, mut store, mut radio) = setup();
     let mut policy = manager.devices[0].as_ref().unwrap().policy.clone();
     policy.peer.transport = Transport::Ble;
@@ -291,26 +329,6 @@ fn changed_final_ble_identity_does_not_replace_the_provisional_owner() {
     assert!(radio.bonds.contains(&policy.peer));
 }
 
-#[test]
-fn unreadable_policy_cannot_be_overwritten_or_connected() {
-    let (mut manager, mut store, mut radio) = setup();
-    let key = cordial_core::storage::record_key(2, 77);
-    store.records.insert(key, vec![0xff]);
-    block_on(manager.load(&mut store, &mut radio)).unwrap();
-    manager.radio_ready = true;
-    let mut policy = manager.devices[0].as_ref().unwrap().policy.clone();
-    policy.enabled = false;
-    assert_eq!(
-        block_on(manager.policy(0, policy, &mut store)),
-        Err(Error::StorageFailed)
-    );
-    assert_eq!(
-        manager.connect(0, true, 90_000, &mut radio),
-        Err(Error::StorageFailed)
-    );
-    assert_eq!(store.records[&key], vec![0xff]);
-    assert!(radio.connects.is_empty());
-}
 #[test]
 fn unblock_at_capacity_preserves_the_working_selection() {
     use cordial_core::devices::Policy;
@@ -340,8 +358,11 @@ fn unblock_at_capacity_preserves_the_working_selection() {
         block_on(manager.policy(0, blocked, &mut store)),
         Err(Error::Capacity)
     );
-    assert!(manager.record(7).unwrap().effective_enabled);
-    assert_eq!(manager.record(7).unwrap().state, ConnectionState::Connected);
+    assert!(manager.devices[7].as_ref().unwrap().effective_enabled);
+    assert_eq!(
+        manager.devices[7].as_ref().unwrap().state,
+        ConnectionState::Connected
+    );
 }
 #[test]
 fn failed_delete_keeps_the_previous_complete_device() {
@@ -425,7 +446,7 @@ fn deleting_highest_device_does_not_reuse_its_id() {
 fn late_identity_cannot_take_over_an_existing_live_link() {
     let (mut manager, mut store, mut radio) = setup();
     let mut policy = manager.devices[0].as_ref().unwrap().policy.clone();
-    policy.peer.transport = cordial_protocol::identifiers::Transport::Ble;
+    policy.peer.transport = cordial_core::model::identifiers::Transport::Ble;
     block_on(cordial_core::bonds::commit(
         &mut store,
         &policy,
@@ -464,7 +485,7 @@ fn device_and_bond_are_one_json_record() {
 
 #[test]
 fn disabling_ble_hidpp_requests_fresh_standard_battery() {
-    use cordial_protocol::{identifiers::Transport, info::InfoKey};
+    use cordial_core::model::{identifiers::Transport, info::InfoKey};
     let (mut manager, mut store, mut radio) = setup();
     let d = manager.devices[0].as_mut().unwrap();
     d.policy.peer.transport = Transport::Ble;
@@ -509,4 +530,14 @@ fn disabling_ble_hidpp_requests_fresh_standard_battery() {
         .poll_link(id.slot as usize, 0, 3, &mut radio)
         .unwrap();
     assert_eq!(radio.info_refreshes, vec![id]);
+}
+
+#[test]
+fn preferences_without_a_device_are_removed_at_startup() {
+    let (mut manager, mut store, mut radio) = setup();
+    let orphan = cordial_core::storage::record_key(4, 999);
+    store.records.insert(orphan, b"[]".to_vec());
+    block_on(manager.load(&mut store, &mut radio)).unwrap();
+    assert!(!store.records.contains_key(&orphan));
+    assert!(manager.devices[0].is_some());
 }

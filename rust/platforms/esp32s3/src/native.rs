@@ -2,8 +2,8 @@
 //! owner runs the common BLE HID profile; native tasks retain their own bonds.
 use cordial_ble_hid::native::{Data, Event, Host};
 use cordial_core::devices::{Peer, display_name};
-use cordial_protocol::{
-    errors::ErrorCode as Error, identifiers::Transport, messages::PromptMethod,
+use cordial_core::model::{
+    errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod,
 };
 use embassy_sync::{
     blocking_mutex::{Mutex, raw::CriticalSectionRawMutex as Raw},
@@ -16,20 +16,9 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-#[cfg(feature = "development")]
-static GATT_WRITES: Mutex<
-    Raw,
-    RefCell<[Option<cordial_protocol::messages::GattWriteDiagnostic>; 4]>,
-> = Mutex::new(RefCell::new([None; 4]));
-
 static EVENTS: Channel<Raw, Event, 40> = Channel::new();
 static FAULT: AtomicBool = AtomicBool::new(false);
 static TAKEN: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "development")]
-static AUTH_FAILURE: Mutex<
-    Raw,
-    RefCell<Option<cordial_protocol::messages::AuthenticationFailure>>,
-> = Mutex::new(RefCell::new(None));
 static BOND_RESULT: Signal<Raw, (u32, Result<Vec<u8>, Error>)> = Signal::new();
 static FORGOTTEN: Signal<Raw, (u32, Result<(), Error>)> = Signal::new();
 static CHANGED: Signal<Raw, ()> = Signal::new();
@@ -48,6 +37,7 @@ fn error(code: u8) -> Error {
         ffi::cordial_ble_error_CORDIAL_BLE_STORAGE => Error::StorageFailed,
         ffi::cordial_ble_error_CORDIAL_BLE_OVERFLOW => Error::InputOverflow,
         ffi::cordial_ble_error_CORDIAL_BLE_TIMEOUT => Error::Timeout,
+        ffi::cordial_ble_error_CORDIAL_BLE_REPORT_SIZE => Error::HidReportTooLarge,
         _ => Error::RadioUnavailable,
     }
 }
@@ -113,7 +103,7 @@ fn copy_event(e: &ffi::cordial_ble_event) -> Result<(), Error> {
         },
         ffi::cordial_ble_kind_CORDIAL_BLE_CONNECTED => Event::Connected {
             token,
-            max_output: e.number.min(255) as u16,
+            max_output: e.number.min(cordial_core::hid::REPORT_BYTES as u32) as u16,
         },
         ffi::cordial_ble_kind_CORDIAL_BLE_SECURITY => Event::Security {
             token,
@@ -191,53 +181,6 @@ fn copy_event(e: &ffi::cordial_ble_event) -> Result<(), Error> {
             BONDS.lock(|b| *b.borrow_mut() = Some((peers, bytes.len() / size)));
             return Ok(());
         }
-        #[cfg(feature = "development")]
-        ffi::cordial_ble_kind_CORDIAL_BLE_WRITE_STARTED
-        | ffi::cordial_ble_kind_CORDIAL_BLE_WRITE_COMPLETED => {
-            GATT_WRITES.lock(|writes| {
-                if let Some(w) = writes
-                    .borrow_mut()
-                    .iter_mut()
-                    .flatten()
-                    .find(|w| w.request == request)
-                {
-                    let now = embassy_time::Instant::now().as_millis();
-                    if u32::from(e.kind) == ffi::cordial_ble_kind_CORDIAL_BLE_WRITE_STARTED {
-                        w.started_ms = Some(now);
-                    } else {
-                        w.completed_ms = Some(now);
-                        w.status = Some(e.number as i32);
-                    }
-                }
-            });
-            return Ok(());
-        }
-        #[cfg(feature = "development")]
-        ffi::cordial_ble_kind_CORDIAL_BLE_AUTH_FAILURE => {
-            use cordial_protocol::messages::{
-                AuthenticationFailure, NimbleAuthenticationStage as Stage,
-            };
-            let stage = match u32::from(e.code) {
-                ffi::cordial_ble_auth_stage_CORDIAL_AUTH_CLEAR => None,
-                ffi::cordial_ble_auth_stage_CORDIAL_AUTH_INITIATE => Some(Stage::Initiate),
-                ffi::cordial_ble_auth_stage_CORDIAL_AUTH_ENCRYPTION => Some(Stage::Encryption),
-                ffi::cordial_ble_auth_stage_CORDIAL_AUTH_STATE => Some(Stage::SecurityState),
-                ffi::cordial_ble_auth_stage_CORDIAL_AUTH_PROMPT => Some(Stage::Prompt),
-                ffi::cordial_ble_auth_stage_CORDIAL_AUTH_INJECT => Some(Stage::Inject),
-                ffi::cordial_ble_auth_stage_CORDIAL_AUTH_REPLY => Some(Stage::Reply),
-                _ => return Err(Error::InternalError),
-            };
-            AUTH_FAILURE.lock(|v| {
-                *v.borrow_mut() = stage.map(|stage| AuthenticationFailure::Nimble {
-                    attempt: token,
-                    stage,
-                    status: e.number as i32,
-                    encrypted: e.encrypted != 0,
-                    bonded: e.bonded != 0,
-                })
-            });
-            return Ok(());
-        }
         ffi::cordial_ble_kind_CORDIAL_BLE_BOND_RESULT => {
             BOND_RESULT.signal((request, result(i32::from(e.code)).map(|()| bytes.to_vec())));
             return Ok(());
@@ -293,17 +236,8 @@ impl Native {
     }
 }
 impl Host for Native {
-    #[cfg(feature = "development")]
-    fn gatt_writes(&self) -> Option<Vec<cordial_protocol::messages::GattWriteDiagnostic>> {
-        let writes = GATT_WRITES.lock(|writes| *writes.borrow());
-        Some(writes.into_iter().flatten().collect())
-    }
     fn scan_and_connect(&self) -> bool {
         false
-    }
-    #[cfg(feature = "development")]
-    fn authentication_failure(&self) -> Option<cordial_protocol::messages::AuthenticationFailure> {
-        AUTH_FAILURE.lock(|v| *v.borrow())
     }
     fn bond_capacity(&self) -> usize {
         unsafe { ffi::cordial_ble_bond_capacity() as usize }
@@ -477,60 +411,7 @@ impl Host for Native {
         }
         c.length = bytes.len() as u16;
         c.data[..bytes.len()].copy_from_slice(bytes);
-        #[cfg(feature = "development")]
-        GATT_WRITES.lock(|writes| {
-            let mut writes = writes.borrow_mut();
-            let slot = writes
-                .iter()
-                .position(|w| w.is_some_and(|w| w.token == token))
-                .or_else(|| writes.iter().position(Option::is_none))
-                .unwrap_or_else(|| {
-                    writes
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, w)| {
-                            let w = w.unwrap();
-                            (
-                                if !w.accepted {
-                                    0
-                                } else if w.completed_ms.is_some() {
-                                    1
-                                } else if w.started_ms.is_none() {
-                                    2
-                                } else {
-                                    3
-                                },
-                                w.queued_ms,
-                            )
-                        })
-                        .unwrap()
-                        .0
-                });
-            writes[slot] = Some(cordial_protocol::messages::GattWriteDiagnostic {
-                token,
-                request,
-                handle,
-                response,
-                accepted: false,
-                queued_ms: embassy_time::Instant::now().as_millis(),
-                started_ms: None,
-                completed_ms: None,
-                status: None,
-            });
-        });
-        let result = Self::submit(&c);
-        #[cfg(feature = "development")]
-        GATT_WRITES.lock(|writes| {
-            if let Some(w) = writes
-                .borrow_mut()
-                .iter_mut()
-                .flatten()
-                .find(|w| w.request == request)
-            {
-                w.accepted = result.is_ok();
-            }
-        });
-        result
+        Self::submit(&c)
     }
     fn subscribe(
         &mut self,

@@ -13,7 +13,11 @@ cordial-protocol = { path = "../../crates/cordial-protocol" }
 embassy-futures = "=0.1.2"
 talc = { version = "=5.1.1", features = ["counters"] }
 cortex-m-rt = "=0.7.7"
-serde_json = { version = "=1.0.151", default-features = false, features = ["alloc"] }
+prost = { version = "=0.14.4", default-features = false }
+# The protocol messages use `bytes`, which needs portable-atomic for atomic CAS on thumbv6m.
+# The test runs on one core under QEMU.
+bytes = { version = "=1.12.1", default-features = false, features = ["extra-platforms"] }
+portable-atomic = { version = "=1.15.0", features = ["unsafe-assume-single-core"] }
 
 [profile.release]
 opt-level = "s"

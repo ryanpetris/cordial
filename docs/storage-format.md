@@ -106,9 +106,10 @@ count, but RAM can be exhausted before flash.
 
 Directory enumeration reopens and skips to an index, trading O(n²) enumeration
 for fixed iterator state. Logical document enumeration selects the next ID
-without collecting all keys. Device responses stream at one revision without a
-second full wire snapshot. File reads use one 512-byte chunk and a 684-byte
-base64 buffer. The output queue is bounded and pauses reads when full.
+without collecting all keys. Each response and event is encoded into
+one frame buffer, held until the USB endpoint has written it; requests are not
+read while a response waits. File reads use one 512-byte chunk and return the
+whole file in one response.
 
 Filesystem operations are synchronous and serialized by the application owner.
 They can stall execution while flash is busy. Remounting each operation avoids

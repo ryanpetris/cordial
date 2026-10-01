@@ -1,15 +1,13 @@
 //! Operations shared by the selected Bluetooth adapters. Vendor callbacks copy
 //! into their event queue and wake the application; they do not reenter it.
+pub use crate::model::link::{ConnectionSecurity, DeviceKind};
+use crate::model::{errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod};
 use crate::{
     devices::Peer,
     hid,
     link::{LinkId, ServiceId, WriteId},
 };
 use alloc::{boxed::Box, vec::Vec};
-pub use cordial_protocol::messages::{ConnectionSecurity, DeviceKind};
-use cordial_protocol::{
-    errors::ErrorCode as Error, identifiers::Transport, messages::PromptMethod,
-};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Capabilities {
@@ -26,30 +24,33 @@ impl Capabilities {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReportType {
-    Input,
-    Output,
-    Feature,
-}
+pub use crate::model::errors::HidReportType as ReportType;
+/// A service's parsed report map, owned from discovery through admission.
 pub struct Descriptor {
     pub service: ServiceId,
-    pub bytes: Box<[u8]>,
+    pub map: hid::Map,
 }
 impl Descriptor {
     pub fn from_slice(service: ServiceId, bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.is_empty() || bytes.len() > hid::DESCRIPTOR_BYTES {
+        let map = hid::Map::compile(bytes).map_err(|e| {
+            if e == hid::Error::Capacity {
+                Error::Capacity
+            } else {
+                Error::UnsupportedHid
+            }
+        })?;
+        Ok(Self { service, map })
+    }
+    /// Release the transport's transient read buffer before retaining the map.
+    pub fn from_owned(service: ServiceId, owned: Vec<u8>) -> Result<Self, Error> {
+        if owned.len() > hid::DESCRIPTOR_BYTES {
             return Err(Error::UnsupportedHid);
         }
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(bytes.len())
-            .map_err(|_| Error::Capacity)?;
-        owned.extend_from_slice(bytes);
-        Ok(Self {
-            service,
-            bytes: owned.into_boxed_slice(),
-        })
+        let mut scratch = [0; hid::DESCRIPTOR_BYTES];
+        let length = owned.len();
+        scratch[..length].copy_from_slice(&owned);
+        drop(owned);
+        Self::from_slice(service, &scratch[..length])
     }
 }
 /// Inline data keeps ordinary input free of allocator calls.
@@ -161,15 +162,6 @@ pub trait Bluetooth {
     }
     fn info_busy(&self, _link: LinkId) -> bool {
         false
-    }
-
-    fn gatt_writes(
-        &self,
-    ) -> Option<alloc::vec::Vec<cordial_protocol::messages::GattWriteDiagnostic>> {
-        None
-    }
-    fn authentication_failure(&self) -> Option<cordial_protocol::messages::AuthenticationFailure> {
-        None
     }
 
     fn capabilities(&self) -> Capabilities;

@@ -1,6 +1,4 @@
-use crate::settings::{Error, MAX_CHOICES, MAX_TEXT_BYTES, SettingMetadata};
-use alloc::{boxed::Box, rc::Rc, string::ToString, vec::Vec};
-use cordial_protocol::{
+use crate::model::{
     errors::ErrorCode,
     hidpp::{Feature, FeatureFlags, FeatureId, FeatureIndex, FeatureRevision},
     settings::{
@@ -8,6 +6,8 @@ use cordial_protocol::{
         SettingValue,
     },
 };
+use crate::settings::{Error, MAX_CHOICES, MAX_TEXT_BYTES, SettingMetadata};
+use alloc::{boxed::Box, rc::Rc, string::ToString, vec::Vec};
 use core::{cell::Cell, num::NonZeroU64};
 use serde::{Deserialize, Serialize};
 

@@ -1,5 +1,6 @@
 [package]
 name = "cordial-protocol"
+description = "Messages, framing and key catalog of the Cordial serial API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,10 +8,18 @@ publish.workspace = true
 license.workspace = true
 
 [features]
-schema = ["dep:schemars"]
+# Protobuf JSON mapping for logs and command-line output on hosts.
+json = ["dep:pbjson", "dep:serde", "dep:pbjson-build"]
 
 [dependencies]
-schemars = { version = "=1.2.2", optional = true }
-serde.workspace = true
-serde_json.workspace = true
-serde-json-core = { version = "=0.6.0", default-features = false }
+prost = { version = "=0.14.4", default-features = false, features = ["derive"] }
+pbjson = { version = "=0.9.0", optional = true }
+serde = { workspace = true, optional = true }
+
+[build-dependencies]
+prost = "=0.14.4"
+prost-build = "=0.14.4"
+protox = "=0.9.1"
+pbjson-build = { version = "=0.9.0", optional = true }
+toml = { version = "=1.1.6", default-features = false, features = ["parse", "serde"] }
+serde = { workspace = true, features = ["std"] }

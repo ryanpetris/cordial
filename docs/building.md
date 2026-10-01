@@ -32,8 +32,8 @@ sudo apt-get install build-essential git clang libclang-dev pkg-config python3
 
 On Arch, install `base-devel`, `git`, `clang`, `pkgconf` and `python`.
 Desktop targets run `npm ci` when the manifests change or dependencies are
-missing, then invoke the Vite CLI. Rust targets invoke Cargo directly. Install
-the board tools below before building firmware.
+missing, then invoke the Vite CLI. Rust targets invoke Cargo directly. Firmware
+builds run in Docker; see [Firmware](#firmware).
 
 ```sh
 make desktop
@@ -93,38 +93,24 @@ who can reach the port on the development host can manage its adapters. Quit the
 desktop application on that host first, since only one program can open an
 adapter. Changes in Settings last until the server stops.
 
-### Firmware toolchains
+### Firmware
 
-All firmware builds require CMake 3.24+, Ninja and native build tools.
-Pico builds require ARM GCC with newlib/nano and its redistribution notices.
-Install `gcc-arm-none-eabi` and `libnewlib-arm-none-eabi` on Debian and Ubuntu,
-or `arm-none-eabi-gcc` and `arm-none-eabi-newlib` on Arch. Rustup installs the
-Pico Rust targets listed in `rust/rust-toolchain.toml`.
-
-ESP32-S3 uses [espup](https://github.com/esp-rs/espup) and an activated
-[ESP-IDF v6.1 environment](https://docs.espressif.com/projects/esp-idf/en/v6.1/esp32s3/get-started/).
-Install `python3-venv` and `libusb-1.0-0` on Debian and Ubuntu, or `python` and
-`libusb` on Arch, then prepare the vendor tools:
+Firmware builds run in Docker, so the ARM, Xtensa and ESP-IDF toolchains need no
+local setup. Install [Docker](https://docs.docker.com/engine/install/) and allow
+your user to run it. `DOCKER=podman` uses Podman instead.
 
 ```sh
-cargo install espup --version 0.17.1 --locked
-cargo install ldproxy --version 0.3.5 --locked
-espup install --toolchain-version 1.97.0.0 --targets esp32s3 --std
-git clone --branch v6.1 --depth 1 --recursive --shallow-submodules https://github.com/espressif/esp-idf.git ../esp-idf
-../esp-idf/install.sh esp32s3
-. "$HOME/export-esp.sh"
-. ../esp-idf/export.sh
+make docker-firmware BOARD=pico_w
+make docker-firmware BOARD=xiao_esp32s3
+make docker-firmware-all
 ```
 
-Source both export files in each shell that builds ESP firmware. The firmware
-builder uses the exported compiler, SDK and Python environment. Pico SDK and
-BTstack source dependencies remain pinned and unmodified in `.cache/dependencies/`.
-
-```sh
-make firmware BOARD=pico_w
-make firmware BOARD=xiao_esp32s3
-make firmware-all
-```
+The first build of each platform creates its image from `rust/docker/`: the Pico
+image has Rust and ARM GCC, and the ESP32-S3 image adds Rust, espup and ldproxy to
+Espressif's ESP-IDF v6.1 image. Later builds reuse the image. The build runs as
+your user with the checkout mounted at its own path, and keeps the Cargo cache in
+`.cache/docker/`. Pico SDK and BTstack source dependencies remain pinned and
+unmodified in `.cache/dependencies/`.
 
 `BOARD` defaults to `pico_w`. `PROFILE` defaults to `development`, independently
 of compiler release optimization. `PROFILE=production` excludes development
@@ -151,7 +137,7 @@ remain unchanged.
 
 ```sh
 export CORDIAL_VERSION=1.2.3
-make package-desktop package-cli package-web package-firmware BOARD=pico_w
+make package-desktop package-cli package-web docker-firmware BOARD=pico_w
 ```
 
 The tag-triggered release workflow reads `GITHUB_REF_NAME`, validates
@@ -163,7 +149,7 @@ The tag-triggered release workflow reads `GITHUB_REF_NAME`, validates
 `desktop/dist/`. `make package-desktop-tar` builds just the archive. Both formats
 bundle Electron and the application's native modules.
 
-`make package-cli` builds the static Rust executable, documentation, schemas and
+`make package-cli` builds the static Rust executable, documentation, protocol definitions and
 dependency notices, then creates `build/release/cordial-cli-<version>-linux-<arch>.tar.gz`.
 `make package-cli-tar` is the same target. The CLI has no Electron dependency.
 Install its musl target once with rustup before packaging:
@@ -246,12 +232,15 @@ include the project license, generated dependency inventories and license notice
 
 ```sh
 make check
-make schema
+npm --prefix desktop/packages/protocol run generate
 ```
 
 `make check` runs Rust tests and Clippy, native Bluetooth regression checks,
-Python tool tests, and desktop schema/type checks and tests. `make schema`
-regenerates the shared schemas and TypeScript wire types.
+Python tool tests, desktop type checks and tests, and the protocol checks:
+`tools/check_keys.py`, `buf lint`, and `buf breaking` against the last release tag
+(`PROTOCOL_BASE` overrides it). Rust code is generated from `proto/` at build time;
+the second command regenerates the checked-in TypeScript messages and key constants
+after `proto/cordial.proto` or `proto/keys.toml` changes.
 Install Clippy with `(cd rust && rustup component add clippy)` before checking.
 
 Linux CLI terminal checks additionally require `pyte` and a built CLI:
@@ -261,7 +250,7 @@ CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest disco
 ```
 
 The ARM allocation check prepares Pico W development firmware and uses its linked
-heap bounds. It requires the system package `qemu-system-arm`:
+heap bounds. It runs in the Pico firmware image, which includes QEMU:
 
 ```sh
 make check-memory
@@ -276,14 +265,14 @@ npm --prefix desktop run simulate
 
 ## Adapter names
 
-Adapter names are stored on the adapter. Rename through adapter settings in the TUI or desktop app, or run `adapter name set "Desk"` in the shell. Each board configuration supplies `default_adapter_name`, baked into the firmware image and used until a custom name is saved. Use **Reset to default** in either rename dialog, or `adapter name reset` in the shell, to clear the custom name.
+Adapter names are stored on the adapter. Rename through adapter settings in the TUI or desktop app, or run `adapter set name "Desk"` in the shell. Each board configuration supplies `default_adapter_name`, baked into the firmware image and used until a custom name is saved. Use **Reset to default** in either rename dialog, or `adapter reset name` in the shell, to clear the custom name.
 
 ## Repository layout
 
 - `rust/`: firmware, CLI/TUI, shared crates, adapters, board definitions and their tools/tests.
 - `desktop/`: Electron, React and TypeScript application, its web version and development server.
 - `docs/`: control protocol, storage format and HID++ references.
-- `schema/`: generated JSON wire schema and command catalog.
+- `proto/`: serial protocol messages and the information and settings key catalog.
 - `tools/`: version validation, package checks and their tests.
 
 `make all` builds desktop, CLI and the selected firmware. `make clean` removes

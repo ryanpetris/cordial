@@ -94,11 +94,12 @@ fn main() {
     }
     if env::var_os("CARGO_FEATURE_CLASSIC").is_some() {
         build.define("ENABLE_CLASSIC", None);
-        for path in [
-            "src/classic/hid_host.c",
-            "src/classic/sdp_client.c",
-            "src/classic/sdp_util.c",
-        ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            source.join("src/classic/hid_host.c").display()
+        );
+        build.file("c/classic_output.c");
+        for path in ["src/classic/sdp_client.c", "src/classic/sdp_util.c"] {
             println!("cargo:rerun-if-changed={}", source.join(path).display());
             build.file(source.join(path));
         }

@@ -29,7 +29,7 @@ def record(cargo, platform, features, target, env, output, sdk=None):
     # by the build. Cargo fetches those sources using the committed lockfile.
     metadata = json.loads(subprocess.check_output(
         cargo + ["metadata", "--locked", "--format-version", "1", "--manifest-path",
-                 str(deps.ROOT / ("crates/cordial-client/Cargo.toml" if platform == "host" else f"platforms/{platform}/Cargo.toml")), "--filter-platform", target,
+                 str(deps.ROOT / ("crates/cordial-cli/Cargo.toml" if platform == "host" else f"platforms/{platform}/Cargo.toml")), "--filter-platform", target,
                  *feature_flags], env=env, cwd=deps.ROOT))
     nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
     pending, selected = [metadata["resolve"]["root"]], set()

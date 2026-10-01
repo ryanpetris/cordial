@@ -1,8 +1,8 @@
-use cordial_core::{forward::Forwarder, link::*, settings::Catalog};
-use cordial_protocol::{
+use cordial_core::model::{
     errors::ErrorCode,
     identifiers::{HostPlatform, SettingsState},
 };
+use cordial_core::{forward::Forwarder, link::*, settings::Catalog};
 
 const KEYBOARD: &[u8] = &[
     0x05, 1, 0x09, 6, 0xa1, 1, 0x05, 7, 0x19, 0xe0, 0x29, 0xe7, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8,
@@ -71,32 +71,43 @@ fn indicators_wait_for_completion_and_late_completion_cannot_cross_reconnect() {
     assert_eq!(out.report_id, None);
     let old = out.id;
     assert!(l.output(4, 1).unwrap().is_none());
-    l.output_complete(old, true, &mut c, &mut f, 2).unwrap();
+    l.output_complete(old, Ok(()), &mut c, &mut f, 2).unwrap();
     let out = l.output(4, 3).unwrap().unwrap();
     assert_eq!(out.payload, &[4]);
     assert_eq!(out.service, ServiceId(1));
     let next = out.id;
-    l.output_complete(old, true, &mut c, &mut f, 4).unwrap();
+    l.output_complete(old, Ok(()), &mut c, &mut f, 4).unwrap();
     assert!(l.output(4, 4).unwrap().is_none());
-    l.output_complete(next, true, &mut c, &mut f, 5).unwrap();
+    l.output_complete(next, Ok(()), &mut c, &mut f, 5).unwrap();
     let out = l.output(4, 6).unwrap().unwrap();
     assert_eq!(out.service, ServiceId(2));
     let next = out.id;
-    l.output_complete(next, true, &mut c, &mut f, 7).unwrap();
+    l.output_complete(next, Ok(()), &mut c, &mut f, 7).unwrap();
     assert!(l.output(4, 8).unwrap().is_none());
     l.disconnected(&mut c, &mut f);
     let mut l = link(&mut c, 2);
     let new = l.output(1, 9).unwrap().unwrap().id;
-    l.output_complete(old, true, &mut c, &mut f, 10).unwrap();
+    l.output_complete(old, Ok(()), &mut c, &mut f, 10).unwrap();
     assert!(l.output(1, 11).unwrap().is_none());
-    l.output_complete(new, false, &mut c, &mut f, 12).unwrap();
-    assert_eq!(l.warnings & 2, 2);
+    l.output_complete(
+        new,
+        Err(cordial_core::model::errors::ErrorCode::Timeout),
+        &mut c,
+        &mut f,
+        12,
+    )
+    .unwrap();
+    assert!(
+        l.warnings
+            .iter()
+            .any(|w| w.code == cordial_core::model::errors::WarningCode::IndicatorWriteFailed)
+    );
 }
 
 #[test]
 fn standard_battery_reports_are_scaled_queried_and_cleared_without_vendor_fallback() {
     use cordial_core::bluetooth::{InputReport, ReportType};
-    use cordial_protocol::{
+    use cordial_core::model::{
         identifiers::Transport, info::InfoKey as K, settings::SettingValue as V,
     };
     let mut descriptor = KEYBOARD.to_vec();
@@ -125,7 +136,7 @@ fn standard_battery_reports_are_scaled_queried_and_cleared_without_vendor_fallba
     for now in 0..4 {
         l.poll(&mut c, &mut f, now).unwrap();
     }
-    let read = l.battery_read(&c, 4).unwrap();
+    let read = l.report_read(&c, 4).unwrap();
     assert_eq!(read.report_id, Some(2));
     assert_eq!(read.kind, ReportType::Input);
     let reply = InputReport::new(l.id, ServiceId(0), 2, &[128]).unwrap();
@@ -134,7 +145,7 @@ fn standard_battery_reports_are_scaled_queried_and_cleared_without_vendor_fallba
         c.info.battery.field(K::BatteryPercent).value,
         V::Integer(50)
     );
-    let read = l.battery_read(&c, 5).unwrap();
+    let read = l.report_read(&c, 5).unwrap();
     assert_eq!(read.report_id, Some(3));
     assert_eq!(read.kind, ReportType::Feature);
     let reply = InputReport::new(l.id, ServiceId(0), 3, &[1]).unwrap();
@@ -145,8 +156,8 @@ fn standard_battery_reports_are_scaled_queried_and_cleared_without_vendor_fallba
     );
     l.input(ServiceId(0), 2, &[0], &mut c, &mut f, 6).unwrap();
     assert_eq!(c.info.battery.field(K::BatteryPercent).value, V::Integer(0));
-    assert!(l.battery_read(&c, 7).is_none());
-    let read = l.battery_read(&c, 60_008).unwrap();
+    assert!(l.report_read(&c, 7).is_none());
+    let read = l.report_read(&c, 60_008).unwrap();
     assert_eq!(
         read.report_id,
         Some(3),
@@ -162,8 +173,8 @@ fn standard_battery_reports_are_scaled_queried_and_cleared_without_vendor_fallba
 
 #[test]
 fn hid_charging_flags_clear_unknown_and_accept_array_status() {
+    use cordial_core::model::{info::InfoKey as K, settings::SettingValue as V};
     use cordial_core::{bluetooth::ReportType, hid::Map};
-    use cordial_protocol::{info::InfoKey as K, settings::SettingValue as V};
     for (data, flags, range) in [(vec![1, 0], 2, 1), (vec![0x45, 0x40], 0, 0x47)] {
         let mut d = KEYBOARD.to_vec();
         d.splice(0..0, [0x85, 1]);
@@ -197,10 +208,10 @@ fn hid_charging_flags_clear_unknown_and_accept_array_status() {
 
 #[test]
 fn optional_battery_collections_keep_input_and_select_lowest() {
-    use cordial_core::{battery::Battery, bluetooth::ReportType, hid::Map};
-    use cordial_protocol::{
+    use cordial_core::model::{
         identifiers::Transport, info::InfoKey as K, settings::SettingValue as V,
     };
+    use cordial_core::{battery::Battery, bluetooth::ReportType, hid::Map};
     let mut d = KEYBOARD.to_vec();
     d.splice(0..0, [0x85, 1]);
     for report in [2, 3, 4, 5] {
@@ -232,7 +243,7 @@ fn optional_battery_collections_keep_input_and_select_lowest() {
 
 #[test]
 fn legacy_battery_reads_short_reports_and_discards_reconfigured_reply() {
-    use cordial_protocol::{
+    use cordial_core::model::{
         identifiers::Transport, info::InfoKey as K, settings::SettingValue as V,
     };
     let mut descriptor = KEYBOARD.to_vec();
@@ -263,7 +274,7 @@ fn legacy_battery_reads_short_reports_and_discards_reconfigured_reply() {
             continue;
         };
         let (id, report, payload) = (out.id, out.report_id, out.payload.to_vec());
-        l.output_complete(id, true, &mut c, &mut f, now).unwrap();
+        l.output_complete(id, Ok(()), &mut c, &mut f, now).unwrap();
         if report != Some(0x10) {
             continue;
         }
@@ -304,4 +315,204 @@ fn legacy_battery_reads_short_reports_and_discards_reconfigured_reply() {
         }
     }
     assert_eq!(reads, 2);
+}
+
+#[test]
+fn a_failed_indicator_report_does_not_block_later_reports_and_retries_only_the_failure() {
+    let mut catalog = Catalog::default();
+    let mut link = link(&mut catalog, 1);
+    let mut forward = Forwarder::default();
+    let first = link.output(2, 0).unwrap().unwrap().id;
+    link.output_complete(
+        first,
+        Err(cordial_core::model::errors::ErrorCode::Timeout),
+        &mut catalog,
+        &mut forward,
+        1,
+    )
+    .unwrap();
+    let second = link.output(2, 2).unwrap().unwrap();
+    assert_eq!(second.service, ServiceId(2));
+    let id = second.id;
+    link.output_complete(id, Ok(()), &mut catalog, &mut forward, 3)
+        .unwrap();
+    assert!(link.output(2, 4).unwrap().is_none());
+    assert!(link.output(2, 1_000).unwrap().is_none());
+    let retry = link.output(2, 1_001).unwrap().unwrap();
+    assert_eq!(retry.service, ServiceId(1));
+    let id = retry.id;
+    link.output_complete(id, Ok(()), &mut catalog, &mut forward, 1_002)
+        .unwrap();
+    assert!(link.output(2, 1_003).unwrap().is_none());
+    assert!(link.warnings.is_empty());
+}
+
+#[test]
+fn mixed_indicator_reports_read_current_values_and_allow_long_writes() {
+    use cordial_core::bluetooth::{InputReport, ReportType};
+    let mut descriptor = KEYBOARD.to_vec();
+    descriptor.pop();
+    descriptor.extend_from_slice(&[
+        0x06, 0, 0xff, 9, 1, 0x15, 0, 0x26, 0xff, 0, 0x75, 8, 0x96, 0x2c, 1, 0x91, 2, 0xc0,
+    ]);
+    let id = LinkId {
+        slot: 0,
+        generation: 1,
+    };
+    let mut catalog = Catalog::default();
+    let mut link = Link::new(
+        id,
+        vec![Profile::compile(ServiceId(3), &descriptor).unwrap()],
+        20,
+        false,
+        HostPlatform::Linux,
+        &mut catalog,
+    )
+    .unwrap();
+    assert!(link.output(2, 0).unwrap().is_none());
+    let request = link.report_read(&catalog, 0).unwrap();
+    assert_eq!(request.kind, ReportType::Output);
+    let mut bytes = [0xa5; cordial_core::hid::REPORT_BYTES];
+    bytes[0] = 0;
+    let report = InputReport::new(id, ServiceId(3), 0, &bytes[..301]).unwrap();
+    link.report_read_complete(request.id, request.kind, Ok(&report), &mut catalog, 1);
+    let output = link.output(2, 2).unwrap().unwrap();
+    assert_eq!(output.payload.len(), 301);
+    assert_eq!(output.payload[0], 2);
+    assert!(output.payload[1..].iter().all(|&v| v == 0xa5));
+}
+
+#[test]
+fn an_indicator_read_failure_does_not_block_another_services_lights() {
+    let mut descriptor = KEYBOARD.to_vec();
+    descriptor.pop();
+    descriptor.extend_from_slice(&[
+        0x06, 0, 0xff, 9, 1, 0x15, 0, 0x26, 0xff, 0, 0x75, 8, 0x95, 1, 0x91, 2, 0xc0,
+    ]);
+    let mut catalog = Catalog::default();
+    let mut link = Link::new(
+        LinkId {
+            slot: 0,
+            generation: 1,
+        },
+        vec![
+            Profile::compile(ServiceId(1), &descriptor).unwrap(),
+            Profile::compile(ServiceId(2), KEYBOARD).unwrap(),
+        ],
+        20,
+        false,
+        HostPlatform::Linux,
+        &mut catalog,
+    )
+    .unwrap();
+    assert!(link.output(2, 0).unwrap().is_none());
+    let read = link.report_read(&catalog, 0).unwrap();
+    link.report_read_complete(read.id, read.kind, Err(ErrorCode::Timeout), &mut catalog, 1);
+    assert_eq!(link.output(2, 2).unwrap().unwrap().service, ServiceId(2));
+    assert_eq!(
+        link.warnings[0].code,
+        cordial_core::model::errors::WarningCode::IndicatorReadFailed
+    );
+    assert_eq!(link.warnings[0].service, 1);
+}
+
+#[test]
+fn indicator_target_reversal_updates_reports_already_written_for_an_intermediate_target() {
+    let mut catalog = Catalog::default();
+    let mut link = link(&mut catalog, 1);
+    let mut forward = Forwarder::default();
+    for now in 0..2 {
+        let id = link.output(0, now).unwrap().unwrap().id;
+        link.output_complete(id, Ok(()), &mut catalog, &mut forward, now)
+            .unwrap();
+    }
+    assert!(link.output(0, 2).unwrap().is_none());
+    let id = link.output(2, 3).unwrap().unwrap().id;
+    link.output_complete(id, Ok(()), &mut catalog, &mut forward, 4)
+        .unwrap();
+    let output = link.output(0, 5).unwrap().unwrap();
+    assert_eq!(output.service, ServiceId(1));
+    assert_eq!(output.payload, &[0]);
+}
+
+#[test]
+fn relative_indicators_use_input_feedback_and_clear_precise_unknown_state_warnings() {
+    use cordial_core::bluetooth::{InputReport, ReportType};
+    use cordial_core::model::errors::WarningCode;
+    let mut descriptor = KEYBOARD.to_vec();
+    // The first Output item carries relative toggles for the five lock lights.
+    let output = descriptor.windows(2).position(|w| w == [0x91, 2]).unwrap();
+    descriptor[output + 1] = 6;
+    descriptor.pop();
+    descriptor.extend_from_slice(&[
+        5, 8, 9, 2, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, 0xc0,
+    ]);
+    let id = LinkId {
+        slot: 0,
+        generation: 1,
+    };
+    let mut catalog = Catalog::default();
+    let mut link = Link::new(
+        id,
+        vec![Profile::compile(ServiceId(1), &descriptor).unwrap()],
+        20,
+        false,
+        HostPlatform::Linux,
+        &mut catalog,
+    )
+    .unwrap();
+    let mut forward = Forwarder::default();
+    let neutral = link.output(2, 0).unwrap().unwrap();
+    assert_eq!(neutral.payload, &[0]);
+    let write = neutral.id;
+    link.output_complete(write, Ok(()), &mut catalog, &mut forward, 1)
+        .unwrap();
+    assert!(link.output(2, 2).unwrap().is_none());
+    let read = link.report_read(&catalog, 2).unwrap();
+    assert_eq!(read.kind, ReportType::Input);
+    let report = InputReport::new(id, ServiceId(1), 0, &[0; 9]).unwrap();
+    link.report_read_complete(read.id, read.kind, Ok(&report), &mut catalog, 3);
+    assert!(link.output(2, 4).unwrap().is_none());
+    assert!(link.report_read(&catalog, 4).is_none());
+    let output = link.output(2, 6).unwrap().unwrap();
+    assert_eq!(output.payload, &[2]);
+    let write = output.id;
+    link.output_complete(write, Ok(()), &mut catalog, &mut forward, 7)
+        .unwrap();
+    assert_eq!(link.warnings.len(), 4);
+    assert!(
+        link.warnings
+            .iter()
+            .all(|w| w.code == WarningCode::IndicatorStateUnknown
+                && w.bit_offset.is_some()
+                && w.usage_page == Some(8)
+                && w.usage != Some(2))
+    );
+    assert!(link.output(2, 8).unwrap().is_none());
+}
+
+#[test]
+fn unsupported_indicator_writes_are_distinct_from_retryable_failures() {
+    use cordial_core::model::errors::WarningCode;
+    let mut catalog = Catalog::default();
+    let mut link = link(&mut catalog, 1);
+    let mut forward = Forwarder::default();
+    let id = link.output(2, 0).unwrap().unwrap().id;
+    link.output_complete(
+        id,
+        Err(ErrorCode::UnsupportedHid),
+        &mut catalog,
+        &mut forward,
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        link.warnings[0].code,
+        WarningCode::IndicatorWriteUnsupported
+    );
+    let id = link.output(2, 2).unwrap().unwrap().id;
+    link.output_complete(id, Ok(()), &mut catalog, &mut forward, 3)
+        .unwrap();
+    assert!(link.output(2, 4).unwrap().is_none());
+    assert!(link.output(2, 2_000).unwrap().is_none());
 }

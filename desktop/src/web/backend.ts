@@ -2,9 +2,8 @@
 // or simulated ones for a demo. Preferences stay in this browser.
 import icon from "../../assets/icons/app.png";
 import { Controller } from "../core/controller.ts";
-import type { HostPlatform } from "../protocol/types.ts";
-import { preferencesFrom, type AppState, type DesktopApi, type Preferences } from "../shared/state.ts";
-import { PORT_FILTERS, listPorts, openWebSerial } from "./serial.ts";
+import { PORT_FILTERS, listPorts, openWebSerial } from "@cordial/client/web";
+import { preferencesFrom, type AppState, type DesktopApi, type HostPlatform, type Preferences } from "../shared/state.ts";
 
 const PREFERENCES_KEY = "cordial.preferences";
 const log = (message: string) => console.log(`[cordial] ${message}`);
@@ -67,8 +66,9 @@ export async function startWebBackend(simulate: number): Promise<DesktopApi> {
     serial.addEventListener("connect", () => controller.manager.burst());
     serial.addEventListener("disconnect", () => controller.manager.burst());
   }
-  // Best effort: the heartbeat ends the session if the page goes without it.
-  // A page kept for back and forward navigation keeps running when shown again.
+  // Closing the port ends the adapter's session; the browser closes it anyway
+  // when the page goes. A page kept for back and forward navigation keeps
+  // running when shown again.
   window.addEventListener("pagehide", (event) => {
     if (!event.persisted) void controller.stop();
   });

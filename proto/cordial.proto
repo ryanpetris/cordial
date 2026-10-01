@@ -1,0 +1,811 @@
+// The Cordial serial API. A client sends one Request per frame and receives one Response for each,
+// in order; the Dongle also sends an Event whenever a device, its settings, its warnings, the
+// adapter, a scan or a pairing changes. Each frame is one protobuf message, COBS-encoded and
+// followed by a zero byte. docs/protocol describes framing, sessions and the compatibility rules.
+syntax = "proto3";
+
+package cordial;
+
+// ---------------------------------------------------------------------------
+// Envelopes
+// ---------------------------------------------------------------------------
+
+// Client to Dongle. Exactly one command is set.
+message Request {
+  oneof command {
+    GetStatus get_status = 1;
+    SetAdapter set_adapter = 2;
+    EnterBootloader enter_bootloader = 3;
+
+    StartScan start_scan = 10;
+    StopScan stop_scan = 11;
+    StartPairing start_pairing = 12;
+    AcceptPrompt accept_prompt = 13;
+    RejectPrompt reject_prompt = 14;
+    CancelPairing cancel_pairing = 15;
+
+    ListDevices list_devices = 20;
+    GetDevice get_device = 21;
+    SetDevice set_device = 22;
+    ConnectDevice connect_device = 23;
+    DisconnectDevice disconnect_device = 24;
+    UnpairDevice unpair_device = 25;
+    RefreshDevice refresh_device = 26;
+    ListWarnings list_warnings = 27;
+
+    ListSettings list_settings = 30;
+    SetSettings set_settings = 31;
+    ForgetSettings forget_settings = 32;
+
+    // Development firmware only.
+    ListFeatures list_features = 40;
+    ListFiles list_files = 41;
+    ReadFile read_file = 42;
+  }
+}
+
+// Dongle to client.
+message Message {
+  oneof kind {
+    Response response = 1;
+    Event event = 2;
+  }
+}
+
+// The answer to one Request. No result set means success with no result.
+message Response {
+  oneof result {
+    Error error = 1;
+    Status status = 2;
+    Device device = 3;
+    DeviceList devices = 4;
+    DeviceSettings settings = 6;
+    FeatureList features = 7;
+    FileList files = 8;
+    FileData file = 9;
+    DeviceWarnings warnings = 10;
+  }
+}
+
+message Event {
+  oneof kind {
+    // Name, platform, readiness or an adapter info value changed.
+    Status adapter = 1;
+    // Anything in a device record changed, including a newly paired device.
+    Device device = 2;
+    // A device has been unpaired.
+    DeviceRemoved device_removed = 3;
+    // Any of a device's settings changed. Carries the device's full list.
+    DeviceSettings settings = 4;
+    // A scan found a candidate, or a candidate's name or signal changed.
+    Candidate scan_found = 5;
+    // A scan ended, by timeout or StopScan.
+    ScanDone scan_done = 6;
+    // The pairing changed state.
+    Pairing pairing = 7;
+    // A device's warnings changed. Carries the device's full list.
+    DeviceWarnings warnings = 8;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Adapter
+// ---------------------------------------------------------------------------
+
+message GetStatus {}
+
+// Partial update: missing fields are left unchanged. Responds with Status once saved.
+message SetAdapter {
+  // 1..64 bytes, no control characters. "" restores the firmware default name.
+  optional string name = 1;
+  optional Platform platform = 2;
+}
+
+// Responds, then reboots into the ROM programming mode. Development firmware only.
+message EnterBootloader {}
+
+message Status {
+  // Required. Adapter ID; the same string as the USB serial number. Stable across boots.
+  string id = 1;
+  // Effective adapter name.
+  string name = 2;
+  // Saved host platform used for special-key translation.
+  Platform platform = 3;
+  // Bluetooth and storage have started. Until then, commands that need either return
+  // ERROR_CODE_NOT_READY.
+  bool ready = 4;
+  // One entry per transport this firmware supports. A transport that is not listed is not
+  // supported.
+  repeated TransportSupport transports = 5;
+  // Facts about the Dongle itself, with keys from the same catalog as Device.info.
+  repeated Info info = 6;
+}
+
+// What the Dongle supports for one transport. Per-transport limits and capabilities are added here
+// as fields, never as per-transport fields on Status.
+message TransportSupport {
+  // Required.
+  Transport transport = 1;
+  // How many devices of this transport can be enabled at once: the size of the Bluetooth stack's
+  // bond table for it, less one entry kept free for pairing. Reported by the Dongle from its stack,
+  // never assumed by a client. Missing means unknown; the client lets the Dongle decide.
+  optional uint32 max_enabled = 2;
+}
+
+enum Platform {
+  PLATFORM_LINUX = 0;
+  PLATFORM_WINDOWS = 1;
+  PLATFORM_MAC = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Discovery and pairing
+// ---------------------------------------------------------------------------
+
+// Candidates arrive as scan_found events; the scan ends with scan_done. Starting a running scan
+// restarts its timer.
+message StartScan {
+  // Required, at least one. Transports to scan, chosen from Status.transports. An empty list returns
+  // ERROR_CODE_BAD_ARGS; a transport the firmware does not support returns ERROR_CODE_UNSUPPORTED.
+  repeated Transport transports = 1;
+  // 1..60. Zero means 10.
+  uint32 seconds = 2;
+}
+
+// Ends the scan early. Candidates already found stay usable.
+message StopScan {}
+
+// Progress arrives as pairing events. Only one pairing runs at a time; another returns
+// ERROR_CODE_BUSY.
+message StartPairing {
+  // Required.
+  string candidate = 1;
+}
+
+// Answers the open prompt. Returns ERROR_CODE_NO_PROMPT when none is open.
+message AcceptPrompt {
+  // The passkey or PIN, when the step is EnterCode.
+  string value = 1;
+}
+
+// Rejects the open prompt; pairing fails with ERROR_CODE_REJECTED.
+message RejectPrompt {}
+
+// Cancels a pairing that has not saved its bond.
+message CancelPairing {}
+
+message Candidate {
+  // Required. Valid until the next scan starts or the session ends.
+  string id = 1;
+  // Required.
+  Transport transport = 2;
+  // Advertised name, or "" when none.
+  string name = 3;
+  Kind kind = 4;
+  // Signal strength in dBm.
+  optional sint32 rssi = 5;
+}
+
+message ScanDone {
+  uint32 count = 1;
+  // The candidate limit was reached.
+  bool truncated = 2;
+}
+
+message Pairing {
+  // Required.
+  string candidate = 1;
+  // Required. Where the pairing is. A client that sees no step set treats the pairing as still in
+  // progress.
+  oneof step {
+    PairingConnecting connecting = 2;
+    EnterCode enter_code = 3;
+    ConfirmCode confirm_code = 4;
+    ShowCode show_code = 5;
+    PairingDone done = 6;
+    // Pairing ended. Existing bonds are unchanged.
+    ErrorCode failed = 7;
+  }
+}
+
+// Setting up the link and security.
+message PairingConnecting {}
+
+// The user types a code. Answer with AcceptPrompt carrying it, or RejectPrompt.
+message EnterCode {
+  CodeKind kind = 1;
+}
+
+// The user checks that passkey matches the one the device shows. Answer with AcceptPrompt or
+// RejectPrompt.
+message ConfirmCode {
+  // Required. Six decimal digits.
+  string passkey = 1;
+}
+
+// The user types value on the device. No reply is needed.
+message ShowCode {
+  CodeKind kind = 1;
+  // Required.
+  string value = 2;
+}
+
+// The bond is saved. The device's connection progress follows as device events.
+message PairingDone {
+  // Required. The saved device ID.
+  string device = 1;
+}
+
+enum CodeKind {
+  CODE_KIND_UNKNOWN = 0;
+  // Six decimal digits, including leading zeros.
+  CODE_KIND_PASSKEY = 1;
+  // A legacy PIN: 1 to 16 printable ASCII characters.
+  CODE_KIND_PIN = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Devices
+// ---------------------------------------------------------------------------
+
+message ListDevices {}
+
+message DeviceList {
+  repeated Device devices = 1;
+}
+
+message GetDevice {
+  // Required.
+  string device = 1;
+}
+
+// Partial update: missing fields are left unchanged. Responds with Device once saved. Effects that
+// need the radio (disconnecting, starting an integration) follow as device events.
+message SetDevice {
+  // Required.
+  string device = 1;
+  // Whether the device is loaded into the Bluetooth stack so it can connect. False unloads and
+  // disconnects it; it stays saved. True returns ERROR_CODE_NO_CAPACITY with
+  // CAPACITY_REASON_ENABLED when the device's transport already has max_enabled devices enabled.
+  optional bool enabled = 2;
+  // Whether the device may reconnect on its own.
+  optional bool trusted = 3;
+  // Whether the device is refused all connections. True disconnects it.
+  optional bool blocked = 4;
+  // Integration preferences to change. Integrations not listed are left unchanged. A kind this
+  // firmware does not know returns ERROR_CODE_UNSUPPORTED.
+  repeated IntegrationUpdate integrations = 5;
+}
+
+// Partial update of one integration's preferences.
+message IntegrationUpdate {
+  // Required.
+  IntegrationKind kind = 1;
+  // Whether the Dongle uses this integration: applies its translation and saved settings.
+  optional bool enabled = 2;
+}
+
+// Clears a disconnect pause and starts connecting. Responds with Device. A failure shows up as
+// DEVICE_STATE_DISCONNECTED with error set.
+message ConnectDevice {
+  // Required.
+  string device = 1;
+}
+
+// Disconnects and pauses reconnection until ConnectDevice or the Dongle restarts. Responds with
+// Device.
+message DisconnectDevice {
+  // Required.
+  string device = 1;
+}
+
+// Deletes the bond and the device's settings. device_removed follows once it is gone.
+message UnpairDevice {
+  // Required.
+  string device = 1;
+}
+
+// Re-reads device information and settings from a connected device. Changes arrive as
+// device and settings events.
+message RefreshDevice {
+  // Required.
+  string device = 1;
+}
+
+message DeviceRemoved {
+  // Required.
+  string id = 1;
+}
+
+message Device {
+  // Required. Opaque saved-device ID. Stable for the life of the bond.
+  string id = 1;
+  // Required.
+  Transport transport = 2;
+  // Best known name: the device-reported name, otherwise the name seen at pairing.
+  string name = 3;
+  Kind kind = 4;
+  DeviceState state = 5;
+  // The saved preferences set with SetDevice.
+  bool enabled = 6;
+  bool trusted = 7;
+  bool blocked = 8;
+  // A DisconnectDevice is holding reconnection off.
+  bool paused = 9;
+  // Missing when the Dongle will use this device. Otherwise why not.
+  optional InactiveReason inactive = 10;
+  // The last failed connection attempt. Cleared by a successful connection.
+  optional ErrorCode error = 11;
+  // Link security while connected.
+  Security security = 13;
+  // Every integration the device has been detected with or has a saved preference for.
+  repeated Integration integrations = 14;
+  // What the device reports about itself. A key whose value is unknown is left out.
+  repeated Info info = 15;
+  // The kinds of input the device produces, learned from its HID descriptor. Empty until the
+  // descriptor has been read. A client skips roles it does not know.
+  repeated Role roles = 16;
+}
+
+enum Role {
+  // A role this client does not know.
+  ROLE_UNKNOWN = 0;
+  // Keys and modifiers.
+  ROLE_KEYBOARD = 1;
+  // Pointer movement, buttons and wheels.
+  ROLE_MOUSE = 2;
+  // Media and volume keys.
+  ROLE_CONSUMER_CONTROL = 3;
+  // Power, sleep and wake keys.
+  ROLE_SYSTEM_CONTROL = 4;
+}
+
+enum Transport {
+  TRANSPORT_UNSPECIFIED = 0;
+  TRANSPORT_CLASSIC = 1;
+  TRANSPORT_BLE = 2;
+}
+
+enum Kind {
+  KIND_UNKNOWN = 0;
+  KIND_KEYBOARD = 1;
+  KIND_MOUSE = 2;
+  KIND_KEYBOARD_MOUSE = 3;
+  KIND_OTHER = 4;
+}
+
+enum DeviceState {
+  DEVICE_STATE_DISCONNECTED = 0;
+  DEVICE_STATE_CONNECTING = 1;
+  // Input is being forwarded.
+  DEVICE_STATE_CONNECTED = 2;
+  DEVICE_STATE_DISCONNECTING = 3;
+}
+
+enum InactiveReason {
+  // Inactive for a reason this client does not know.
+  INACTIVE_REASON_UNKNOWN = 0;
+  INACTIVE_REASON_UNSUPPORTED_TRANSPORT = 1;
+  INACTIVE_REASON_BLOCKED = 2;
+  INACTIVE_REASON_DISABLED = 3;
+  // Enabled, but the stack's bond table has no room for it. Only happens when the table is
+  // smaller than the number of devices already enabled, such as after a firmware change.
+  INACTIVE_REASON_CAPACITY = 4;
+}
+
+// The device's current warnings. Responds with DeviceWarnings.
+message ListWarnings {
+  // Required.
+  string device = 1;
+}
+
+message DeviceWarnings {
+  // Required.
+  string device = 1;
+  // Empty when the device has none. A reconnect replaces the previous connection's warnings.
+  repeated DeviceWarning warnings = 2;
+}
+
+// One HID input or output the Dongle cannot translate or update. The device keeps working; only
+// the identified field is affected.
+message DeviceWarning {
+  // Required.
+  WarningCode code = 1;
+  // Which HID service on the device, counting from 0. BLE devices can have several.
+  uint32 service = 2;
+  ReportType report_type = 3;
+  optional uint32 report_id = 4;
+  // Position of the field within its report.
+  optional uint32 bit_offset = 5;
+  // The field's USB HID usage, such as the Num Lock LED or Volume Up.
+  optional uint32 usage_page = 6;
+  optional uint32 usage = 7;
+}
+
+enum ReportType {
+  REPORT_TYPE_UNKNOWN = 0;
+  REPORT_TYPE_INPUT = 1;
+  REPORT_TYPE_OUTPUT = 2;
+  REPORT_TYPE_FEATURE = 3;
+}
+
+enum WarningCode {
+  // A warning this client does not know.
+  WARNING_CODE_UNKNOWN = 0;
+
+  // Input limitations.
+  WARNING_CODE_NUMERIC_SELECTOR_UNSUPPORTED = 1;
+  WARNING_CODE_POINTER_SELECTOR_UNSUPPORTED = 2;
+  WARNING_CODE_BUFFERED_INPUT_UNSUPPORTED = 3;
+
+  // Lock indicator limitations.
+  WARNING_CODE_INDICATOR_READ_UNSUPPORTED = 20;
+  WARNING_CODE_INDICATOR_WRITE_UNSUPPORTED = 21;
+  WARNING_CODE_INDICATOR_REPORT_TOO_LARGE = 22;
+  WARNING_CODE_BUFFERED_INDICATOR_UNSUPPORTED = 23;
+  WARNING_CODE_INDICATOR_ARRAY_FULL = 24;
+  WARNING_CODE_INDICATOR_RELATIVE_SELECTOR_UNSUPPORTED = 25;
+  WARNING_CODE_INDICATOR_RANGE_UNSUPPORTED = 26;
+  WARNING_CODE_INDICATOR_MODE_UNSUPPORTED = 27;
+  WARNING_CODE_INDICATOR_NONLINEAR_UNSUPPORTED = 28;
+  WARNING_CODE_INDICATOR_SCALE_UNSUPPORTED = 29;
+
+  // Lock indicator failures. Cleared by the next successful update.
+  WARNING_CODE_INDICATOR_STATE_UNKNOWN = 40;
+  WARNING_CODE_INDICATOR_READ_FAILED = 41;
+  WARNING_CODE_INDICATOR_WRITE_FAILED = 42;
+}
+
+// Each field is missing when the Bluetooth stack does not report it.
+message Security {
+  optional bool encrypted = 1;
+  optional bool authenticated = 2;
+  optional bool secure_connections = 3;
+  optional uint32 key_size = 4;
+}
+
+// A protocol the Dongle speaks with a device on top of standard HID, providing special-key
+// translation, settings and features.
+enum IntegrationKind {
+  INTEGRATION_KIND_UNSPECIFIED = 0;
+  // Logitech HID++.
+  INTEGRATION_KIND_HIDPP = 1;
+}
+
+message Integration {
+  // Required. A client keeps a kind it does not know and passes it back unchanged.
+  IntegrationKind kind = 1;
+  // Saved preference set with SetDevice.
+  bool enabled = 2;
+  // Present when the device speaks this integration on the current link.
+  IntegrationDetection detected = 3;
+  // Required. Whether the integration is up, or why it failed. A client that sees neither set
+  // treats the integration as off.
+  oneof status {
+    IntegrationState state = 4;
+    // Connected, and starting failed.
+    ErrorCode error = 5;
+  }
+
+  // Fields 20 and up carry details specific to one kind, which a client never needs in order to
+  // show or use the integration.
+}
+
+message IntegrationDetection {
+  // The protocol version the device reported.
+  Version version = 1;
+}
+
+message Version {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// Whether an integration is up on the device. Settings never report their own availability:
+// ListSettings shows what is known, and a settings event follows whenever an integration coming up
+// or going down changes that.
+enum IntegrationState {
+  // Turned off with SetDevice. Unknown states also read as this.
+  INTEGRATION_STATE_OFF = 0;
+  // Turned on, and the device is not connected.
+  INTEGRATION_STATE_DISCONNECTED = 1;
+  // Connected; detecting the integration, reading its settings and applying saved values.
+  INTEGRATION_STATE_STARTING = 2;
+  // Up: its settings have been read and saved values are applied. Special-key translation runs
+  // wherever the device supports it and is never reported.
+  INTEGRATION_STATE_ACTIVE = 3;
+  // Connected, and the device cannot use this integration at all, such as a device without usable
+  // HID++ reports.
+  INTEGRATION_STATE_UNSUPPORTED = 4;
+}
+
+// One fact about a device or the Dongle, read-only. For a device it comes from any integration or
+// standard service and is never saved to flash.
+message Info {
+  // Required. A key from the key catalog. Appears at most once per list. A client shows only keys
+  // it knows.
+  string key = 1;
+  // Required. Its type is fixed for the key by the catalog.
+  Value value = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+// Every setting the Dongle knows for the device, across all integrations: those read from the
+// device this boot, plus every saved value. Sends nothing to the device. The list grows or changes
+// as integrations come up, and a settings event follows each change. Responds with DeviceSettings.
+message ListSettings {
+  // Required.
+  string device = 1;
+}
+
+// Saves one or more values on the Dongle in one storage write, responds with the device's full
+// DeviceSettings, then re-applies every saved setting of each integration named in the request, as
+// it does when the device connects. If any change is
+// invalid or the save fails, nothing is saved and nothing is applied. A valid value is always
+// saved, whatever the device's current state; it stays SETTING_STATE_PENDING until an apply
+// writes it.
+message SetSettings {
+  // Required.
+  string device = 1;
+  // Required, at least one. Each setting appears at most once.
+  repeated SettingChange changes = 2;
+}
+
+message SettingChange {
+  // Required. The integration and key together identify the setting.
+  IntegrationKind integration = 1;
+  // Required.
+  string key = 2;
+  // Required. Must match the setting's type: bool, integer, text for enum and text settings, or
+  // color.
+  Value value = 3;
+}
+
+// Removes one or more saved values in one storage write, responds with the device's full
+// DeviceSettings, then applies the remaining saved settings. A forgotten setting is never
+// written to the device again; the device keeps whatever value it has.
+message ForgetSettings {
+  // Required.
+  string device = 1;
+  // Required, at least one.
+  repeated SettingRef settings = 2;
+}
+
+message SettingRef {
+  // Required.
+  IntegrationKind integration = 1;
+  // Required.
+  string key = 2;
+}
+
+message DeviceSettings {
+  // Required.
+  string device = 1;
+  repeated Setting settings = 2;
+}
+
+// A value the Dongle can change on the device and save. Values the device only reports are Info.
+message Setting {
+  // Required. The integration providing this setting.
+  IntegrationKind integration = 1;
+  // Required. A key from the key catalog. A client shows only keys it knows.
+  string key = 2;
+  // How applying the saved value went. Set exactly when the setting has a saved value; missing for
+  // a setting the Dongle leaves alone.
+  oneof status {
+    SettingState state = 3;
+    // The last apply failed.
+    ErrorCode error = 4;
+  }
+
+  // Required. The setting's type, with its value, saved value and limits. In each type, value is
+  // the last value read from the device and saved is the value saved on the Dongle; saved is
+  // missing when the Dongle leaves the setting alone. A client ignores a setting whose type it does
+  // not know, which it sees as no type set.
+  //
+  // value is current while the setting's integration is INTEGRATION_STATE_ACTIVE. In any other
+  // state it is the last reading, which a client shows as possibly out of date. It is missing when
+  // the Dongle has not read the setting since it started.
+  oneof type {
+    BoolSetting bool = 10;
+    IntegerSetting integer = 11;
+    EnumSetting enum = 12;
+    TextSetting text = 13;
+    ColorSetting color = 14;
+  }
+
+  // Fields 20 and up carry details specific to one integration, which a client never needs in
+  // order to show or edit the setting.
+}
+
+message BoolSetting {
+  optional bool value = 1;
+  optional bool saved = 2;
+}
+
+message IntegerSetting {
+  optional sint64 value = 1;
+  optional sint64 saved = 2;
+  // The values the device accepts: a range, a fixed list, or neither for any integer.
+  oneof limits {
+    IntegerRange range = 3;
+    IntegerChoices choices = 4;
+  }
+}
+
+message IntegerRange {
+  sint64 min = 1;
+  sint64 max = 2;
+  // Accepted values are min, min + step, and so on up to max. Zero means 1.
+  uint64 step = 3;
+}
+
+message IntegerChoices {
+  repeated sint64 values = 1;
+}
+
+message EnumSetting {
+  optional string value = 1;
+  optional string saved = 2;
+  // The values a client may save. value can hold one outside this list, such as a mode the
+  // device reports but does not accept as a write.
+  repeated string choices = 3;
+}
+
+message TextSetting {
+  optional string value = 1;
+  optional string saved = 2;
+  // The longest value the device accepts, in UTF-8 bytes, as the device reports it. Missing means
+  // no limit beyond the request size.
+  optional uint32 max_bytes = 3;
+}
+
+// A 24-bit RGB color, 0xRRGGBB.
+message ColorSetting {
+  optional uint32 value = 1;
+  optional uint32 saved = 2;
+}
+
+// A typed value: an information value, or a value to save in SetSettings.
+message Value {
+  oneof value {
+    bool bool = 1;
+    sint64 integer = 2;
+    // Enum value or text.
+    string text = 3;
+    // A 24-bit RGB color, 0xRRGGBB.
+    uint32 color = 4;
+  }
+}
+
+enum SettingState {
+  // Saved, and waiting until the device can take it. Unknown states also read as this.
+  SETTING_STATE_PENDING = 0;
+  SETTING_STATE_APPLIED = 1;
+  // The device reports a value other than the saved one, such as after the user changed it on the
+  // device. The next apply writes the saved value back.
+  SETTING_STATE_CHANGED_ON_DEVICE = 2;
+  // The device does not support this saved setting.
+  SETTING_STATE_UNSUPPORTED = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Development only. Production firmware answers these with ERROR_CODE_UNKNOWN_COMMAND.
+// ---------------------------------------------------------------------------
+
+message ListFeatures {
+  // Required.
+  string device = 1;
+}
+
+message FeatureList {
+  repeated Feature features = 1;
+}
+
+// One entry in a device's feature table, for any integration.
+message Feature {
+  // Required.
+  IntegrationKind integration = 1;
+  // The Dongle knows how to use this feature.
+  bool supported = 2;
+  // The integration's own description of the feature. A client that does not know the variant
+  // shows the entry without details.
+  oneof detail {
+    HidppFeature hidpp = 10;
+  }
+}
+
+message HidppFeature {
+  uint32 index = 1;
+  uint32 id = 2;
+  uint32 version = 3;
+  uint32 flags = 4;
+}
+
+message ListFiles {
+  // Required. Absolute path.
+  string path = 1;
+}
+
+message FileList {
+  repeated FileEntry entries = 1;
+}
+
+message FileEntry {
+  string name = 1;
+  bool directory = 2;
+  uint64 size = 3;
+}
+
+message ReadFile {
+  // Required. Absolute path.
+  string path = 1;
+}
+
+message FileData {
+  bytes data = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+message Error {
+  ErrorCode code = 1;
+  // For ERROR_CODE_NO_CAPACITY.
+  CapacityReason reason = 2;
+  // For ERROR_CODE_STORAGE_FAILED: the Dongle cannot tell whether the save took effect.
+  bool outcome_unknown = 3;
+}
+
+enum ErrorCode {
+  // A failure this client does not know. Shown as a generic failure.
+  ERROR_CODE_UNKNOWN = 0;
+
+  // Request errors.
+  ERROR_CODE_BAD_REQUEST = 1;      // The frame is not a Request.
+  ERROR_CODE_UNKNOWN_COMMAND = 2;  // No such command in this firmware.
+  ERROR_CODE_BAD_ARGS = 3;         // Missing Required field, wrong value type, or out of range.
+  ERROR_CODE_TOO_LONG = 4;         // The frame exceeded 1024 bytes.
+  ERROR_CODE_NOT_READY = 5;        // Bluetooth or storage has not started, or failed to start.
+  ERROR_CODE_NOT_FOUND = 6;        // No device, candidate, setting or file with that ID or key.
+  ERROR_CODE_NOT_CONNECTED = 7;    // The command needs a connected device.
+  ERROR_CODE_BUSY = 8;             // A pairing is running, or the device is doing something that conflicts.
+  ERROR_CODE_DISABLED = 9;
+  ERROR_CODE_BLOCKED = 10;
+  ERROR_CODE_UNSUPPORTED = 11;     // Transport, setting or value not supported by this firmware or device.
+  ERROR_CODE_NO_CAPACITY = 12;     // See Error.reason.
+  ERROR_CODE_NO_PROMPT = 13;       // AcceptPrompt or RejectPrompt with no open prompt.
+  ERROR_CODE_STORAGE_FAILED = 14;  // Reading or writing saved data failed. See Error.outcome_unknown.
+  ERROR_CODE_INTERNAL = 15;
+
+  // Pairing and connection failures.
+  ERROR_CODE_CANDIDATE_EXPIRED = 30;
+  ERROR_CODE_AUTH_FAILED = 31;
+  ERROR_CODE_REJECTED = 32;
+  ERROR_CODE_TIMEOUT = 33;
+  ERROR_CODE_CANCELLED = 34;
+  ERROR_CODE_CONNECTION_FAILED = 35;
+  ERROR_CODE_UNSUPPORTED_HID = 36;
+
+  // Integration and setting failures, for any integration. Timeouts use ERROR_CODE_TIMEOUT.
+  ERROR_CODE_PROTOCOL_UNSUPPORTED = 50;  // The device lacks a supported protocol version or the reports it needs.
+  ERROR_CODE_FEATURE_UNAVAILABLE = 51;   // A feature the integration needs is missing.
+  ERROR_CODE_TRANSPORT_ERROR = 52;       // Exchanging messages with the device failed.
+  ERROR_CODE_DEVICE_ERROR = 53;          // The device answered with an error.
+  ERROR_CODE_INVALID_RESPONSE = 54;      // The device's answer could not be understood.
+  ERROR_CODE_READBACK_MISMATCH = 55;     // A written value did not read back.
+}
+
+enum CapacityReason {
+  CAPACITY_REASON_UNKNOWN = 0;
+  // max_enabled devices of this transport are already enabled.
+  CAPACITY_REASON_ENABLED = 1;
+  // Flash is full.
+  CAPACITY_REASON_STORAGE = 2;
+  // The connection table is full.
+  CAPACITY_REASON_CONNECTIONS = 3;
+}

@@ -15,9 +15,24 @@ pub enum Error {
     Corrupt,
     /// A failed mutation could not be resolved by reading the record back.
     Unknown,
+    /// The file or directory does not exist.
+    Missing,
 }
 
-pub use cordial_protocol::payloads::{FileEntry, FileType};
+/// Whether a development file entry is a file or a directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileType {
+    File,
+    Directory,
+}
+
+/// One entry of a development directory listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: alloc::string::String,
+    pub kind: FileType,
+    pub size: usize,
+}
 
 #[allow(async_fn_in_trait)]
 pub trait RecordStore {
@@ -199,9 +214,28 @@ impl<S: RecordStore> crate::settings::PreferenceStore for Preferences<'_, S> {
         }
         self.write(&values).await.map_err(preference_error)
     }
+    async fn replace(
+        &mut self,
+        values: &[crate::compact::Preference],
+    ) -> Result<(), crate::settings::Error> {
+        if values.iter().any(|p| !p.valid()) {
+            return Err(crate::settings::Error::InvalidValue);
+        }
+        let current = self.load_all().await.map_err(preference_error)?;
+        let added = values
+            .iter()
+            .any(|p| !current.iter().any(|c| c.metadata.key == p.metadata.key));
+        if added
+            && self.store.available().await.map_err(preference_error)?
+                < crate::bonds::MAINTENANCE_BYTES
+        {
+            return Err(crate::settings::Error::StorageFull);
+        }
+        self.write(values).await.map_err(preference_error)
+    }
     async fn remove(
         &mut self,
-        key: cordial_protocol::settings::SettingKey,
+        key: crate::model::settings::SettingKey,
     ) -> Result<(), crate::settings::Error> {
         let mut values = self.load_all().await.map_err(preference_error)?;
         values.retain(|p| p.metadata.key != key);

@@ -33,11 +33,7 @@ function trayDevice(d: DeviceEntry, threshold: number): TrayDevice {
     key: d.key,
     label: `${d.name} — ${parts.join(" · ")}`,
     connected: d.device.state === "connected",
-    canConnect:
-      d.device.state === "disconnected" &&
-      d.device.effective_enabled &&
-      !d.device.blocked &&
-      d.device.pairing_state === "paired",
+    canConnect: d.device.state === "disconnected" && d.device.inactive === null,
     low: isLow(d.battery, threshold),
   };
 }

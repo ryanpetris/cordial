@@ -1,12 +1,12 @@
 //! Portable bond records. Native adapters translate their database callbacks to
 //! these fields; committed records are selected only by a device's bond ID.
+use crate::model::identifiers::Transport;
 use crate::{
     codec::{self, Reader},
     devices::Peer,
     storage::{Error, RecordStore, record_key},
 };
 use alloc::vec::Vec;
-use cordial_protocol::identifiers::Transport;
 pub const MAINTENANCE_BYTES: usize = 32768;
 pub const PAIR_BYTES: usize = 16384;
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -139,6 +139,14 @@ impl Bond {
 pub struct DeviceRecord {
     pub policy: crate::devices::Policy,
     pub bond: Bond,
+}
+/// The policy of a saved device record, when the record decodes and holds a complete bond that
+/// belongs to it. Anything else means the record is lost.
+pub fn decode(id: u64, bytes: &[u8]) -> Option<crate::devices::Policy> {
+    let policy = crate::codec::read_policy(id, bytes).ok()?;
+    let record: DeviceRecord = serde_json::from_slice(bytes).ok()?;
+    (record.bond.valid() && record.bond.owner == id && record.bond.identity == policy.peer)
+        .then_some(policy)
 }
 pub async fn load<S: RecordStore>(store: &mut S, id: u64) -> Result<Option<Bond>, Error> {
     let Some(bytes) = store.load_owned(record_key(2, id)).await? else {

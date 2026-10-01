@@ -2,7 +2,7 @@
 //! boundary carries owned results to the common HID-over-GATT profile owner.
 use alloc::{boxed::Box, vec::Vec};
 use cordial_core::devices::Peer;
-use cordial_protocol::{errors::ErrorCode as Error, messages::PromptMethod};
+use cordial_core::model::{errors::ErrorCode as Error, link::PromptMethod};
 
 pub struct Data {
     pub length: u16,
@@ -99,15 +99,6 @@ pub enum Event {
 pub trait Host {
     /// Whether the host and controller can scan while initiating a BLE link.
     fn scan_and_connect(&self) -> bool;
-    fn gatt_writes(
-        &self,
-    ) -> Option<alloc::vec::Vec<cordial_protocol::messages::GattWriteDiagnostic>> {
-        None
-    }
-    fn authentication_failure(&self) -> Option<cordial_protocol::messages::AuthenticationFailure> {
-        None
-    }
-
     fn bond_capacity(&self) -> usize {
         0
     }

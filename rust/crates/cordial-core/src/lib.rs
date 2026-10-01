@@ -16,8 +16,10 @@ pub mod hidpp;
 pub mod info;
 pub mod link;
 pub mod manager;
+pub mod model;
 pub mod settings;
 pub mod storage;
+pub mod wire;
 
 pub mod identity;
 

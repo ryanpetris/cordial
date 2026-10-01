@@ -31,7 +31,7 @@ it("keeps transport failures in the action's feedback surface", async () => {
   const { act, setReporter } = await import("../src/renderer/api.ts");
   const report = vi.fn();
   setReporter(report);
-  expect(await act({ type: "settings.refresh", key: "A/d_1" }, true)).toMatchObject({ ok: false });
+  expect(await act({ type: "device.refresh", key: "A/d_1" }, true)).toMatchObject({ ok: false });
   expect(report).not.toHaveBeenCalled();
   expect(await act({ type: "adapters.refresh" })).toMatchObject({ ok: false });
   expect(report).toHaveBeenCalledExactlyOnceWith("Couldn't confirm that action.");

@@ -51,7 +51,7 @@ impl Status {
 struct HidTx {
     generation: u64,
     sequence: u64,
-    bytes: [u8; 33],
+    bytes: [u8; 69],
     length: usize,
 }
 struct HidDone {
@@ -76,10 +76,23 @@ struct SerialRx {
     length: usize,
 }
 
+const fn idle_reports() -> [[u8; 68]; 8] {
+    let mut reports = [[0; 68]; 8];
+    let mut i = 0;
+    while i < 34 {
+        reports[7][i] = 0xff;
+        if i < 6 {
+            reports[6][i] = 0xff;
+        }
+        i += 1;
+    }
+    reports
+}
+
 /// USB tasks exchange bounded owned packets with the application owner.
 pub struct Io {
     status: Watch<CS, Status, 3>,
-    reports: Mutex<CS, RefCell<[[u8; 32]; 3]>>,
+    reports: Mutex<CS, RefCell<[[u8; 68]; 8]>>,
     changed: Signal<CS, ()>,
     hid_tx: Channel<CS, HidTx, 1>,
     hid_done: Channel<CS, HidDone, 1>,
@@ -104,7 +117,7 @@ impl Io {
                 dtr: false,
                 leds: 0,
             }),
-            reports: Mutex::new(RefCell::new([[0; 32]; 3])),
+            reports: Mutex::new(RefCell::new(idle_reports())),
             changed: Signal::new(),
             hid_tx: Channel::new(),
             hid_done: Channel::new(),
@@ -127,7 +140,7 @@ impl Io {
         self.changed.signal(());
     }
     fn reset(&self, configured: bool) {
-        self.reports.lock(|r| *r.borrow_mut() = [[0; 32]; 3]);
+        self.reports.lock(|r| *r.borrow_mut() = idle_reports());
         self.update(|s| {
             s.generation = s.generation.wrapping_add(1);
             s.session = s.session.wrapping_add(1);
@@ -186,12 +199,17 @@ impl hid::RequestHandler for ReportHandler<'_> {
                 buf[..size].copy_from_slice(&[1, self.0.status().leds][..size]);
                 Some(size)
             }
-            hid::ReportId::In(id @ 1..=3) if !buf.is_empty() => {
+            hid::ReportId::In(id @ 1..=8) if !buf.is_empty() => {
                 buf[0] = id;
-                let size = [32, 10, 16][id as usize - 1].min(buf.len() - 1);
+                let size = [32, 10, 16, 68, 5, 9, 6, 34][id as usize - 1].min(buf.len() - 1);
                 self.0.reports.lock(|r| {
                     buf[1..1 + size].copy_from_slice(&r.borrow()[id as usize - 1][..size])
                 });
+                if id == 2 && size > 2 {
+                    buf[3..1 + size].fill(0);
+                } else if (4..=6).contains(&id) {
+                    buf[1..1 + size].fill(0);
+                }
                 Some(1 + size)
             }
             _ => None,
@@ -233,7 +251,7 @@ impl<'a> Buffers<'a> {
 }
 pub struct Usb<'d, D: Driver<'d>> {
     device: UsbDevice<'d, serial::SessionDriver<'d, D>>,
-    hid: hid::HidWriter<'d, serial::SessionDriver<'d, D>, 33>,
+    hid: hid::HidWriter<'d, serial::SessionDriver<'d, D>, 69>,
     tx: cdc_acm::Sender<'d, serial::SessionDriver<'d, D>>,
     rx: cdc_acm::Receiver<'d, serial::SessionDriver<'d, D>>,
     io: &'d Io,
@@ -317,8 +335,23 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
                         );
                     if success && io.status().generation == packet.generation {
                         io.reports.lock(|r| {
-                            r.borrow_mut()[packet.bytes[0] as usize - 1][..packet.length - 1]
-                                .copy_from_slice(&packet.bytes[1..packet.length])
+                            let mut reports = r.borrow_mut();
+                            let target = &mut reports[packet.bytes[0] as usize - 1];
+                            let data = &packet.bytes[1..packet.length];
+                            if packet.bytes[0] >= 7 {
+                                for (old, value) in target[..data.len()]
+                                    .as_chunks_mut::<2>()
+                                    .0
+                                    .iter_mut()
+                                    .zip(data.as_chunks::<2>().0.iter())
+                                {
+                                    if *value != [0xff, 0xff] {
+                                        old.copy_from_slice(value);
+                                    }
+                                }
+                            } else {
+                                target[..data.len()].copy_from_slice(data);
+                            }
                         });
                     }
                     io.hid_done

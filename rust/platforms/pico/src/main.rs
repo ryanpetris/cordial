@@ -90,31 +90,19 @@ async fn owner_task(
     }));
     // This is the only host instance and owner for the lifetime of the board.
     let mut backend = unsafe { Backend::new(state, Some(chipset)) };
-    let mut input = [0; 4096];
-    let mut app = Application::new(
-        &mut input,
-        Build {
-            profile: if cfg!(feature = "development") {
-                cordial_protocol::messages::BuildProfile::Development
-            } else {
-                cordial_protocol::messages::BuildProfile::Production
-            },
-            version: FIRMWARE_VERSION,
-            hardware: board::HARDWARE,
-            default_adapter_name: board::DEFAULT_ADAPTER_NAME,
-            digest: board::HARDWARE_DIGEST,
-            radio_backend: board::RADIO_BACKEND,
-            adapter_id: identity.adapter,
-            boot_id: identity.boot,
-            #[cfg(feature = "development")]
-            bootloader: Some(cordial_core::application::Bootloader {
-                mode: "bootsel",
-                enter: services::bootloader,
-            }),
-            #[cfg(feature = "production")]
-            bootloader: None,
-        },
-    );
+    let mut app = Application::new(Build {
+        development: cfg!(feature = "development"),
+        version: FIRMWARE_VERSION,
+        board: board::HARDWARE,
+        default_adapter_name: board::DEFAULT_ADAPTER_NAME,
+        adapter_id: identity.adapter,
+        #[cfg(feature = "development")]
+        bootloader: Some(cordial_core::application::Bootloader {
+            enter: services::bootloader,
+        }),
+        #[cfg(feature = "production")]
+        bootloader: None,
+    });
     let mut handle = store.handle();
     let mut owner = Owner::new(&USB_IO);
     let mut indicated = false;
@@ -127,7 +115,7 @@ async fn owner_task(
                 services::random_u64,
             )
             .await
-            .map_err(|_| cordial_protocol::errors::ErrorCode::StorageFailed)
+            .map_err(|_| cordial_core::model::errors::ErrorCode::StorageFailed)
             .and_then(|_| backend.start(Some(address)));
             if let Err(error) = started {
                 app.event(Event::Failed(error), &mut handle, &mut backend, now())

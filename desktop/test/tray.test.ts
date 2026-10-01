@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { device } from "../src/fake/adapter.ts";
 import { BatteryAlerts, batteryLevel } from "../src/core/battery.ts";
 import { trayModel } from "../src/main/tray-model.ts";
 import { DEFAULT_PREFERENCES, type AdapterEntry, type AppState, type DeviceEntry } from "../src/shared/state.ts";
+import { record } from "./helpers.ts";
 
 const adapter = (id: string, patch: Partial<AdapterEntry> = {}): AdapterEntry => ({
   id,
@@ -11,8 +11,6 @@ const adapter = (id: string, patch: Partial<AdapterEntry> = {}): AdapterEntry =>
   connectError: null,
   readiness: "ready",
   status: null,
-  capabilities: ["ble"],
-  platform: "linux",
   attention: [],
   ...patch,
 });
@@ -20,15 +18,16 @@ const adapter = (id: string, patch: Partial<AdapterEntry> = {}): AdapterEntry =>
 const entry = (adapterId: string, id: string, patch: Partial<DeviceEntry> = {}, state = "disconnected"): DeviceEntry => ({
   key: `${adapterId}/${id}`,
   adapterId,
-  device: device(id, { state: state as never }),
+  device: record(id, { state: state as never }),
   name: id,
   kind: "keyboard",
   battery: null,
-  info: [],
-  infoCurrent: true,
   pending: [],
-  infoError: null,
+  warnings: null,
+  warningsError: null,
   settings: null,
+  settingsError: null,
+  settingsSave: null,
   ...patch,
 });
 

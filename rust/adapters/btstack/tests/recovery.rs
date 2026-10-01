@@ -6,12 +6,12 @@ use cordial_btstack::{
     storage::Storage,
     transport::Io,
 };
+use cordial_core::model::{errors::ErrorCode, identifiers::Transport};
 use cordial_core::{
     bluetooth::{Bluetooth, Event},
     devices::Peer,
     link::LinkId,
 };
-use cordial_protocol::{errors::ErrorCode, identifiers::Transport};
 use embassy_futures::block_on;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 #[allow(dead_code)]

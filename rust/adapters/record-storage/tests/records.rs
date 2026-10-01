@@ -136,14 +136,14 @@ fn files_span_sectors_and_atomic_replacement_preserves_exact_bytes() {
 }
 #[test]
 fn preferences_share_one_json_file_and_have_no_512_byte_ceiling() {
+    use cordial_core::model::{
+        hidpp::{FeatureId, FeatureRevision},
+        settings::{SettingKey, SettingScope},
+    };
     use cordial_core::{
         compact::{Metadata, Preference},
         settings::PreferenceStore,
         storage::Preferences,
-    };
-    use cordial_protocol::{
-        hidpp::{FeatureId, FeatureRevision},
-        settings::{SettingKey, SettingScope},
     };
     block_on(async {
         let mut store = Storage::provision_blank(Flash::blank(), 4096..128 * 1024, [1; 32])

@@ -18,6 +18,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Validate release tag
         id: version
         run: |
@@ -42,12 +43,7 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
       - name: Check Rust and desktop
         run: |
-          make check-rust check-desktop
-      - name: Check larger output queue
-        working-directory: rust
-        env:
-          CORDIAL_CONFIG: ${{ github.workspace }}/rust/boards/xiao_esp32s3.json
-        run: cargo test --locked -p cordial-core --all-features
+          make check-rust check-desktop check-protocol
       - name: Check build tools and board presets
         run: make check-tools
   linux:

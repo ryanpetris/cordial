@@ -1,177 +1,154 @@
-import { describe, expect, it, vi } from "vitest";
-import { FakeAdapter } from "../src/fake/adapter.ts";
-import { requestProblem, responseProblem } from "../src/protocol/validate.ts";
+import { IntegrationState } from "@cordial/protocol";
+import { describe, expect, it } from "vitest";
+import { FakeAdapter, device, setting } from "../src/fake/adapter.ts";
 import { AdapterSession } from "../src/core/session.ts";
-import type { Transport } from "../src/core/transport.ts";
+import { settingsCurrent } from "../src/shared/settings.ts";
+import { integrationText, versionText } from "../src/shared/text.ts";
 import { openSession, until } from "./helpers.ts";
+import { vi } from "vitest";
 
 describe("AdapterSession", () => {
-  it.each(["null", "42", "true", '"text"', "[]"])("ignores stale %s before confirmation", async (input) => {
-    const fake = new FakeAdapter();
-    fake.staleInput = `${input}\n`;
-    const hooks = { changed: vi.fn(), closed: vi.fn(), log: vi.fn() };
-    const session = await AdapterSession.open(fake.open(), hooks);
-    expect(session.closed).toBe(false);
-    expect(hooks.log).toHaveBeenCalledWith("ignoring input left from an earlier session");
-    await session.close();
-  });
-
-  it.each(["null", "42", "true", '"text"', "[]"])("fails cleanly on %s after confirmation", async (input) => {
-    const fake = new FakeAdapter();
-    let receive!: (chunk: Uint8Array) => void;
-    const hooks = { changed: vi.fn(), closed: vi.fn(), log: vi.fn() };
-    const transport: Transport = {
-      onData(listener) { receive = listener; fake.onData(listener); },
-      onClose: (listener) => fake.onClose(listener),
-      write: (text) => fake.write(text),
-      close: () => fake.close(),
-    };
-    fake.open();
-    const session = await AdapterSession.open(transport, hooks);
-    expect(() => receive(new TextEncoder().encode(`${input}\n`))).not.toThrow();
-    expect(session.closed).toBe(true);
-    expect(hooks.closed).toHaveBeenCalledOnce();
-    expect(hooks.closed.mock.calls[0]![0].message).toBe("adapter sent a non-object message");
-    await session.close();
-  });
-
-  it("confirms the adapter, waits for readiness and builds the device view", async () => {
+  it("reads the status, then every device with its warnings and settings", async () => {
     const { fake, session } = await openSession();
-    expect(session.adapterId).toBe(fake.id);
-    expect(session.capabilities).toEqual(["classic", "ble"]);
-    await until(() => session.view.valid && session.view.infoNeeded().length === 0);
-    expect(session.readiness.state).toBe("ready");
-    expect([...session.view.devices.keys()]).toEqual(["d_1", "d_2", "d_3", "d_4"]);
-    expect(fake.monitor).toBe(true);
-    const battery = session.view.info("d_2")!.find((f) => f.key === "battery_percent");
-    expect(battery?.value).toBe(12);
-    // The handshake order from docs/protocol/transport.md.
-    expect(fake.received.slice(0, 5).map((m) => m.cmd)).toEqual([
-      "adapter.protocol",
-      "adapter.capabilities",
-      "adapter.status",
-      "session.heartbeat",
-      "adapter.wait_ready",
+    expect(session.status).toMatchObject({ id: fake.id, name: "Pico W", platform: "linux", ready: true });
+    expect(session.status.transports).toEqual([
+      { transport: "classic", maxEnabled: 7 },
+      { transport: "ble", maxEnabled: 7 },
     ]);
-    expect(fake.received[0]).toEqual({ v: 0, id: 1, cmd: "adapter.protocol", args: {} });
-    await session.close();
-    expect(fake.monitor).toBe(false);
-  });
-
-  it("applies device and information events in revision order", async () => {
-    const { fake, session } = await openSession();
-    await until(() => session.view.valid && session.view.infoNeeded().length === 0);
-    fake.changeInfo("d_2", { battery_percent: 9, battery_charging: true });
-    await until(() => session.view.info("d_2")!.find((f) => f.key === "battery_percent")?.value === 9);
-    fake.changeDevice("d_3", { state: "connected" }, "device.connected");
-    await until(() => session.view.devices.get("d_3")?.state === "connected");
-    expect(session.view.valid).toBe(true);
+    await until(() => session.listed && session.settings.size === 4);
+    expect([...session.devices.keys()]).toEqual(["d_1", "d_2", "d_3", "d_4"]);
+    expect(fake.received.map((r) => r.command.case)).toEqual([
+      "getStatus", "listDevices",
+      "listWarnings", "listSettings", "listWarnings", "listSettings", "listWarnings", "listSettings", "listWarnings", "listSettings",
+    ]);
+    expect(session.devices.get("d_4")).toMatchObject({ enabled: false, inactive: "disabled" });
     await session.close();
   });
 
-  it("resynchronizes after lost events or a revision gap", async () => {
+  it("keeps readiness reported in the same chunk as the first status", async () => {
+    const fake = new FakeAdapter({ ready: false });
+    const port = fake.open();
+    // Hold the adapter's output and deliver it as one chunk, so the readiness event arrives
+    // before open() returns.
+    let held: Uint8Array[] = [];
+    const listeners: ((chunk: Uint8Array) => void)[] = [];
+    port.onData((chunk) => held.push(chunk));
+    const flush = () => {
+      const chunk = new Uint8Array(held.flatMap((c) => [...c]));
+      held = [];
+      for (const listener of listeners) listener(chunk);
+    };
+    const stream = {
+      onData: (listener: (chunk: Uint8Array) => void) => listeners.push(listener),
+      onClose: (listener: (error: Error | null) => void) => port.onClose(listener),
+      close: () => port.close(),
+      write: async (bytes: Uint8Array) => {
+        const first = fake.received.length === 0;
+        await port.write(bytes);
+        if (first) fake.changeAdapter({ ready: true });
+        setTimeout(flush, 10);
+      },
+    };
+    const hooks = { changed: vi.fn(), closed: vi.fn(), event: vi.fn(), log: vi.fn() };
+    const session = await AdapterSession.open(stream, hooks);
+    expect(session.status.ready).toBe(true);
+    session.run();
+    await until(() => session.listed);
+    expect(hooks.log).not.toHaveBeenCalled();
+    await session.close();
+  });
+
+  it("applies responses and events in the order the adapter sent them", async () => {
     const { fake, session } = await openSession();
-    await until(() => session.view.valid && session.view.infoNeeded().length === 0);
-    const lists = () => fake.received.filter((m) => m.cmd === "device.list").length;
-    fake.loseEvents();
-    await until(() => lists() === 2 && session.view.valid);
-    fake.revision += 3; // changes whose events never arrive
-    fake.changeDevice("d_1", { trusted: false });
-    await until(() => lists() === 3 && session.view.valid);
-    expect(session.view.devices.get("d_1")?.trusted).toBe(false);
-    expect(session.view.revision).toBe(fake.revision);
+    await until(() => session.listed);
+    const read = session.connection.getDevice("d_3");
+    // The adapter answers, then reports a later change.
+    fake.changeDevice("d_3", { name: "Renamed" });
+    expect((await read).name).toBe("Travel Keyboard");
+    await until(() => session.devices.get("d_3")!.name === "Renamed");
+    await session.connection.getStatus();
+    expect(session.devices.get("d_3")!.name).toBe("Renamed");
+    await session.close();
+  });
+
+  it("reads a newly paired device's lists and drops a removed device", async () => {
+    const { fake, session } = await openSession({ devices: [device("d_1")] });
+    await until(() => session.settings.size === 1);
+    const added = device("d_9", { settings: [setting("wheel.invert", { value: true })] });
+    fake.devices.push(added);
+    fake.changeDevice("d_9", {});
+    await until(() => !!session.settings.get("d_9")?.length && session.warnings.has("d_9"));
+    expect(session.settings.get("d_9")![0]).toMatchObject({ key: "wheel.invert", type: "bool", value: true, saved: null, state: null });
+    expect(await session.connection.unpairDevice("d_9")).toBeUndefined();
+    await until(() => !session.devices.has("d_9"));
+    expect(session.settings.has("d_9") || session.warnings.has("d_9")).toBe(false);
+    await session.close();
+  });
+
+  it("converts settings with their limits, saved values and outcomes", async () => {
+    const fake = new FakeAdapter({
+      devices: [
+        device("d_1", {
+          state: "connected",
+          hidppEnabled: true,
+          hidpp: [4, 2],
+          settings: [
+            setting("backlight.level", { type: "integer", min: 0, max: 7, step: 1, value: 3, saved: 5, state: "changed_on_device" }),
+            setting("pointer.sensor.1.dpi", { type: "integer", choices: [400, 800], value: 800 }),
+            setting("wheel.mode", { type: "enum", choices: ["freespin", "ratchet"], value: "ratchet", saved: "freespin", error: 33 }),
+          ],
+        }),
+      ],
+    });
+    const session = await AdapterSession.open(fake.open(), { changed: vi.fn(), closed: vi.fn(), event: vi.fn(), log: vi.fn() });
+    session.run();
+    await until(() => !!session.settings.get("d_1")?.length);
+    expect(session.settings.get("d_1")).toEqual([
+      { integration: 1, key: "backlight.level", type: "integer", value: 3, saved: 5, state: "changed_on_device", error: null, choices: [], min: 0, max: 7, step: 1, maxBytes: null },
+      { integration: 1, key: "pointer.sensor.1.dpi", type: "integer", value: 800, saved: null, state: null, error: null, choices: [400, 800], min: null, max: null, step: null, maxBytes: null },
+      { integration: 1, key: "wheel.mode", type: "enum", value: "ratchet", saved: "freespin", state: null, error: "timeout", choices: ["freespin", "ratchet"], min: null, max: null, step: null, maxBytes: null },
+    ]);
+    const entry = () => ({ device: session.devices.get("d_1")! });
+    expect(settingsCurrent(entry())).toBe(true);
+    expect(versionText(entry().device.hidpp!)).toBe("4.2");
+    fake.changeDevice("d_1", { hidppState: IntegrationState.STARTING });
+    await until(() => session.devices.get("d_1")!.hidpp?.state === "starting");
+    expect(settingsCurrent(entry())).toBe(false);
+    expect(integrationText(entry().device.hidpp!)).toBe("Setting Up");
+    fake.changeDevice("d_1", { hidppState: null, hidppError: 50 });
+    await until(() => session.devices.get("d_1")!.hidpp?.error === "protocol_unsupported");
+    expect(integrationText(entry().device.hidpp!)).toBe("Failed: Not supported");
+    fake.changeDevice("d_1", { hidppError: null, state: "disconnected" });
+    await until(() => session.devices.get("d_1")!.hidpp?.state === "disconnected");
+    // The readings stay, possibly out of date.
+    expect(session.settings.get("d_1")![0]!.value).toBe(3);
+    expect(settingsCurrent(entry())).toBe(false);
+    await session.close();
+  });
+
+  it("lists the devices again once the adapter becomes ready", async () => {
+    const { fake, session } = await openSession({ ready: false });
+    await until(() => session.listed);
+    expect(session.status.ready).toBe(false);
+    fake.changeAdapter({ ready: true });
+    await until(() => fake.received.filter((r) => r.command.case === "listDevices").length === 2);
+    expect(session.status.ready).toBe(true);
     await session.close();
   });
 
   it("reports an unplugged adapter as closed", async () => {
     const { fake, session, hooks } = await openSession();
-    await until(() => session.view.valid);
+    await until(() => session.listed);
     fake.unplug();
     expect(hooks.closed).toHaveBeenCalledOnce();
     expect(session.closed).toBe(true);
-    await expect(session.request("adapter.status", {})).rejects.toThrow("closed");
   });
 
-  it("re-enables monitoring when a heartbeat shows it expired", async () => {
-    const { fake, session } = await openSession();
-    await until(() => session.view.valid);
-    fake.monitor = false; // as after a missed heartbeat deadline
-    await until(() => fake.monitor, 7000);
-    await until(() => session.view.valid);
-    await session.close();
-  }, 10000);
-
-  it("rejects a port that doesn't speak the protocol", async () => {
-    const closed = vi.fn(async () => {});
-    const silent: Transport = {
-      onData: () => {},
-      onClose: () => {},
-      write: async () => {},
-      close: closed,
-    };
-    await expect(AdapterSession.open(silent, { changed: vi.fn(), closed: vi.fn(), log: vi.fn() })).rejects.toThrow(
-      "no response",
-    );
-    expect(closed).toHaveBeenCalled();
-  }, 8000);
-
-  it("marks readiness failure without closing", async () => {
-    const { session } = await openSession({ readyError: "radio_unavailable" });
-    await until(() => session.readiness.state === "failed");
-    expect(session.closed).toBe(false);
-    await session.close();
-  });
-});
-
-function discoveryTransport(protocol: number) {
-  const fake = new FakeAdapter();
-  fake.open();
-  const close = vi.fn(() => fake.close());
-  const transport: Transport = {
-    onData(listener) {
-      fake.onData((chunk) => {
-        const lines = new TextDecoder().decode(chunk).split("\n").filter(Boolean).map((line) => {
-          const message = JSON.parse(line);
-          if (message.v === 0) message.result = { protocol, future: { values: [1, true, null] } };
-          return JSON.stringify(message);
-        });
-        listener(new TextEncoder().encode(`${lines.join("\n")}\n`));
-      });
-    },
-    onClose: (listener) => fake.onClose(listener),
-    write: (text) => fake.write(text),
-    close,
-  };
-  return { fake, close, transport };
-}
-
-it("ignores additional discovery result fields and rejects unsupported protocols before management", async () => {
-  const hooks = { changed: vi.fn(), closed: vi.fn(), log: vi.fn() };
-  const supported = discoveryTransport(1);
-  const session = await AdapterSession.open(supported.transport, hooks);
-  expect(session.status.protocol).toBe(1);
-  await session.close();
-  const unsupported = discoveryTransport(2);
-  await expect(AdapterSession.open(unsupported.transport, hooks)).rejects.toThrow("unsupported adapter protocol: 2");
-  expect(unsupported.fake.received.map((m) => m.cmd)).toEqual(["adapter.protocol"]);
-  expect(unsupported.close).toHaveBeenCalled();
-});
-
-it("validates the fixed discovery envelope and extensible arguments and result", () => {
-  const query = { v: 0, id: 1, cmd: "adapter.protocol" };
-  for (const args of [undefined, null, {}, { future: { values: [1, true, null] } }])
-    expect(requestProblem("adapter.protocol", args === undefined ? query : { ...query, args })).toBeNull();
-  for (const args of [1, false, "", []])
-    expect(requestProblem("adapter.protocol", { ...query, args })).not.toBeNull();
-  expect(requestProblem("adapter.protocol", { ...query, v: 1 })).not.toBeNull();
-  expect(requestProblem("adapter.status", { ...query, cmd: "adapter.status", args: {} })).not.toBeNull();
-  const reply = { v: 0, type: "response", id: 1, ok: true, done: true, result: { protocol: 1, future: [1] } };
-  expect(responseProblem("adapter.protocol", reply)).toBeNull();
-  expect(responseProblem("adapter.protocol", { ...reply, v: 1 })).not.toBeNull();
-  expect(responseProblem("adapter.protocol", { ...reply, done: false })).not.toBeNull();
-  expect(responseProblem("adapter.protocol", {
-    v: 0, type: "response", id: 1, ok: false, done: true, error: { code: "invalid_args" },
-  })).not.toBeNull();
-  for (const result of [{}, { protocol: "1" }, { protocol: null }, { protocol: -1 }, { protocol: 1.5 }])
-    expect(responseProblem("adapter.protocol", { ...reply, result })).not.toBeNull();
+  it("rejects a port that doesn't answer as an adapter", async () => {
+    const fake = new FakeAdapter();
+    fake.write = async () => {};
+    const close = vi.spyOn(fake, "close");
+    await expect(AdapterSession.open(fake.open(), { changed: vi.fn(), closed: vi.fn(), event: vi.fn(), log: vi.fn() })).rejects.toThrow("no response");
+    expect(close).toHaveBeenCalled();
+  }, 10_000);
 });

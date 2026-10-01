@@ -24,9 +24,10 @@ _Static_assert(MYNEWT_VAL(BLE_STORE_MAX_BONDS)==8,"portable bond table capacity"
 _Static_assert(!MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC),"custom IRK requires static NimBLE privacy state");
 typedef struct {
     uint32_t token;
+    uint32_t read_request;
     cordial_ble_peer peer;
     bool started;
-    uint16_t connection, mtu;
+    uint16_t connection, mtu, read_length;
     uint8_t prompt, error;
     bool pairing, closing, secure, mtu_done, reported;
 } link;
@@ -132,11 +133,20 @@ static link *by_handle(uint16_t handle) {
     for (unsigned i=0;i<4;i++) if (links[i].token && links[i].connection==handle) return &links[i];
     return NULL;
 }
+// ATT failures distinguish an unavailable operation from a transport failure.
+static uint8_t operation_error(int status) {
+    if (!status) return CORDIAL_BLE_OK;
+    if (status == BLE_HS_ENOTSUP || status == BLE_HS_ATT_ERR(BLE_ATT_ERR_READ_NOT_PERMITTED)
+            || status == BLE_HS_ATT_ERR(BLE_ATT_ERR_WRITE_NOT_PERMITTED)
+            || status == BLE_HS_ATT_ERR(BLE_ATT_ERR_REQ_NOT_SUPPORTED)
+            || status == BLE_HS_ATT_ERR(BLE_ATT_ERR_ATTR_NOT_LONG)) return CORDIAL_BLE_UNSUPPORTED;
+    if (status == BLE_HS_EMSGSIZE || status == BLE_HS_ATT_ERR(BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN)) return CORDIAL_BLE_REPORT_SIZE;
+    if (status == BLE_HS_ENOMEM) return CORDIAL_BLE_CAPACITY;
+    if (status == BLE_HS_ETIMEOUT) return CORDIAL_BLE_TIMEOUT;
+    return CORDIAL_BLE_CONNECTION;
+}
 static void complete(uint32_t request,int status) {
-#if CONFIG_CORDIAL_DEVELOPMENT
-    cordial_ble_event diagnostic={.kind=CORDIAL_BLE_WRITE_COMPLETED,.request=request,.number=(uint32_t)status};emit(&diagnostic);
-#endif
-    cordial_ble_event e={.kind=CORDIAL_BLE_COMPLETE,.request=request,.code=status ? CORDIAL_BLE_CONNECTION:CORDIAL_BLE_OK}; emit(&e);
+    cordial_ble_event e={.kind=CORDIAL_BLE_COMPLETE,.request=request,.code=operation_error(status)}; emit(&e);
 }
 static bool bonds(const ble_addr_t *absent) {
     ble_addr_t addresses[8]; int count=0;
@@ -202,22 +212,6 @@ failed:;
     cordial_ble_event e={.kind=CORDIAL_BLE_FAILED,.code=CORDIAL_BLE_RADIO};emit(&e);
     scan_id=0;reconnect_count=0;
 }
-static void auth_diagnostic(link *l,uint8_t stage,int status) {
-#if CONFIG_CORDIAL_DEVELOPMENT
-    if (!l) return;
-    struct ble_gap_conn_desc desc;
-    cordial_ble_event e={.kind=CORDIAL_BLE_AUTH_FAILURE,.token=l->token,.code=stage,.number=(uint32_t)status};
-    if (l->connection!=BLE_HS_CONN_HANDLE_NONE && !ble_gap_conn_find(l->connection,&desc)) {
-        e.encrypted=desc.sec_state.encrypted;e.bonded=desc.sec_state.bonded;
-    }
-    emit(&e);
-#else
-    (void)l;(void)stage;(void)status;
-#endif
-}
-static void auth_fail(link *l,uint8_t stage,int status) {
-    auth_diagnostic(l,stage,status);fail(l,CORDIAL_BLE_AUTH);
-}
 static void security_ready(link *l) {
     if (!l || l->closing || !l->secure || !l->mtu_done) return;
     struct ble_gap_conn_desc desc;
@@ -251,7 +245,7 @@ static void connected(link *l) {
         l->secure=true;security_ready(l);return;
     }
     int status=ble_gap_security_initiate(l->connection);
-    if(status && status!=BLE_HS_EALREADY)auth_fail(l,CORDIAL_AUTH_INITIATE,status);
+    if(status && status!=BLE_HS_EALREADY)fail(l,CORDIAL_BLE_AUTH);
 }
 static int auto_gap(struct ble_gap_event *event,void *arg) {
     uint32_t attempt=(uint32_t)(uintptr_t)arg;
@@ -323,23 +317,23 @@ static int gap(struct ble_gap_event *event,void *arg) {
     case BLE_GAP_EVENT_ENC_CHANGE: {
         l=by_handle(event->enc_change.conn_handle);if (!l || l->closing) return 0;
         struct ble_gap_conn_desc desc;
-        if (event->enc_change.status) { auth_fail(l,CORDIAL_AUTH_ENCRYPTION,event->enc_change.status);return 0; }
+        if (event->enc_change.status) { fail(l,CORDIAL_BLE_AUTH);return 0; }
         int status=ble_gap_conn_find(l->connection,&desc);
-        if (status || !desc.sec_state.encrypted || !desc.sec_state.bonded) { auth_fail(l,CORDIAL_AUTH_STATE,status);return 0; }
+        if (status || !desc.sec_state.encrypted || !desc.sec_state.bonded) { fail(l,CORDIAL_BLE_AUTH);return 0; }
         l->secure=true;security_ready(l);return 0;
     }
     case BLE_GAP_EVENT_PASSKEY_ACTION: {
-        l=by_handle(event->passkey.conn_handle);if (!l || !l->pairing || l->closing) { if(l) auth_fail(l,CORDIAL_AUTH_PROMPT,BLE_HS_EINVAL);return 0; }
+        l=by_handle(event->passkey.conn_handle);if (!l || !l->pairing || l->closing) { if(l) fail(l,CORDIAL_BLE_AUTH);return 0; }
         cordial_ble_event e={.kind=CORDIAL_BLE_PROMPT,.token=l->token};
         l->prompt=event->passkey.params.action;
         if (l->prompt==BLE_SM_IOACT_DISP) {
             struct ble_sm_io io={.action=BLE_SM_IOACT_DISP,.passkey=esp_random()%1000000};
             int status=ble_sm_inject_io(l->connection,&io);
-            if (status) { auth_fail(l,CORDIAL_AUTH_INJECT,status);return 0; }
+            if (status) { fail(l,CORDIAL_BLE_AUTH);return 0; }
             e.code=CORDIAL_BLE_DISPLAY;e.number=io.passkey;
         } else if (l->prompt==BLE_SM_IOACT_INPUT) e.code=CORDIAL_BLE_ENTER;
         else if (l->prompt==BLE_SM_IOACT_NUMCMP) { e.code=CORDIAL_BLE_CONFIRM;e.number=event->passkey.params.numcmp; }
-        else { auth_fail(l,CORDIAL_AUTH_PROMPT,BLE_HS_ENOTSUP);return 0; }
+        else { fail(l,CORDIAL_BLE_AUTH);return 0; }
         emit(&e);return 0;
     }
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
@@ -378,10 +372,24 @@ static int descriptor_callback(uint16_t conn,const struct ble_gatt_error *error,
     cordial_ble_event e={.kind=CORDIAL_BLE_DESCRIPTOR,.request=request,.handle=d->handle,.uuid=ble_uuid_u16(&d->uuid.u)};emit(&e);return 0;
 }
 static int read_callback(uint16_t conn,const struct ble_gatt_error *error,struct ble_gatt_attr *attr,void *arg) {
-    (void)conn;uint32_t request=(uint32_t)(uintptr_t)arg;
-    if (error->status) { complete(request,error->status==BLE_HS_EDONE ? 0:error->status);return 0; }
+    uint32_t request=(uint32_t)(uintptr_t)arg;
+    link *l=by_handle(conn);
+    if (!l || l->read_request!=request) return 0;
+    if (error->status) {
+        int status=error->status;
+        // A fixed-length value can reject the trailing Read Blob after a full
+        // Read response. The owner checks the report's declared length.
+        if (status==BLE_HS_EDONE || (status==BLE_HS_ATT_ERR(BLE_ATT_ERR_ATTR_NOT_LONG) && l->read_length)) status=0;
+        l->read_request=0;complete(request,status);return 0;
+    }
     uint8_t data[512];uint16_t length=OS_MBUF_PKTLEN(attr->om);
-    if (length>sizeof(data) || os_mbuf_copydata(attr->om,0,length,data)) { complete(request,BLE_HS_EMSGSIZE);return BLE_HS_EMSGSIZE; }
+    if (length>sizeof(data) || os_mbuf_copydata(attr->om,0,length,data)) { l->read_request=0;complete(request,BLE_HS_EMSGSIZE);return BLE_HS_EMSGSIZE; }
+    // Report Map reads can be longer than individual HID reports. Owners
+    // validate the assembled descriptor, report or information value.
+    if (attr->offset!=l->read_length || length>2048-l->read_length) {
+        l->read_request=0;complete(request,BLE_HS_EMSGSIZE);return BLE_HS_EMSGSIZE;
+    }
+    l->read_length+=length;
     cordial_ble_event e={.kind=CORDIAL_BLE_DATA,.request=request,.offset=attr->offset,.length=length,.data=data};emit(&e);return 0;
 }
 static int write_callback(uint16_t conn,const struct ble_gatt_error *error,struct ble_gatt_attr *attr,void *arg) {
@@ -478,7 +486,6 @@ static void command(const cordial_ble_command *c) {
         for (unsigned i=0;i<4;i++) if (!links[i].token) { l=&links[i];break; }
         if (!l) { cordial_ble_event e={.kind=CORDIAL_BLE_DISCONNECTED,.token=c->token,.code=CORDIAL_BLE_CAPACITY};emit(&e);return; }
         *l=(link){.token=c->token,.connection=BLE_HS_CONN_HANDLE_NONE,.pairing=c->pairing,.mtu=23};
-        if(c->pairing) auth_diagnostic(l,CORDIAL_AUTH_CLEAR,0);
         l->peer=c->peer;
         return;
     }
@@ -491,14 +498,14 @@ static void command(const cordial_ble_command *c) {
         return;
     }
     if (c->kind==CORDIAL_BLE_REPLY) {
-        if (!c->accept || !l->pairing) { auth_fail(l,CORDIAL_AUTH_REPLY,BLE_HS_EINVAL);return; }
+        if (!c->accept || !l->pairing) { fail(l,CORDIAL_BLE_AUTH);return; }
         struct ble_sm_io io={.action=l->prompt};
         if (l->prompt==BLE_SM_IOACT_INPUT && c->method==CORDIAL_BLE_ENTER) io.passkey=c->number;
         else if (l->prompt==BLE_SM_IOACT_NUMCMP && c->method==CORDIAL_BLE_CONFIRM) io.numcmp_accept=1;
         else if (l->prompt==BLE_SM_IOACT_DISP && c->method==CORDIAL_BLE_DISPLAY) return;
-        else { auth_fail(l,CORDIAL_AUTH_REPLY,BLE_HS_EINVAL);return; }
+        else { fail(l,CORDIAL_BLE_AUTH);return; }
         status=ble_sm_inject_io(l->connection,&io);
-        if (status) auth_fail(l,CORDIAL_AUTH_INJECT,status);
+        if (status) fail(l,CORDIAL_BLE_AUTH);
         return;
     }
     void *arg=(void *)(uintptr_t)c->request;
@@ -506,16 +513,22 @@ static void command(const cordial_ble_command *c) {
     case CORDIAL_BLE_SERVICES: { ble_uuid16_t uuid=BLE_UUID16_INIT(c->number);status=ble_gattc_disc_svc_by_uuid(l->connection,&uuid.u,service_callback,arg);break; }
     case CORDIAL_BLE_CHARACTERISTICS:status=ble_gattc_disc_all_chrs(l->connection,c->start,c->end,characteristic_callback,arg);break;
     case CORDIAL_BLE_DESCRIPTORS:status=ble_gattc_disc_all_dscs(l->connection,c->start-1,c->end,descriptor_callback,arg);break;
-    case CORDIAL_BLE_READ:status=ble_gattc_read_long(l->connection,c->handle,0,read_callback,arg);break;
+    case CORDIAL_BLE_READ:
+        l->read_request=c->request;l->read_length=0;
+        status=ble_gattc_read_long(l->connection,c->handle,0,read_callback,arg);
+        if(status) l->read_request=0;
+        break;
     case CORDIAL_BLE_SUBSCRIBE: {
         uint8_t value[2]={c->enabled ? 2:1,0};
         status=ble_gattc_write_flat(l->connection,c->start,value,2,write_callback,arg);break;
     }
     case CORDIAL_BLE_WRITE:
-#if CONFIG_CORDIAL_DEVELOPMENT
-        { cordial_ble_event diagnostic={.kind=CORDIAL_BLE_WRITE_STARTED,.request=c->request};emit(&diagnostic); }
-#endif
-        if(c->response) status=ble_gattc_write_flat(l->connection,c->handle,c->data,c->length,write_callback,arg);
+        if(c->response && c->length > l->mtu - 3) {
+            struct os_mbuf *value=ble_hs_mbuf_from_flat(c->data,c->length);
+            if(!value) status=BLE_HS_ENOMEM;
+            else status=ble_gattc_write_long(l->connection,c->handle,0,value,write_callback,arg);
+        }
+        else if(c->response) status=ble_gattc_write_flat(l->connection,c->handle,c->data,c->length,write_callback,arg);
         else { status=ble_gattc_write_no_rsp_flat(l->connection,c->handle,c->data,c->length);complete(c->request,status);return; }
         break;
     default:status=BLE_HS_ENOTSUP;

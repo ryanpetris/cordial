@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
-import type { Candidate } from "../../protocol/types.ts";
-import type { AppState, PairingPrompt } from "../../shared/state.ts";
-import { PAIR_UNAVAILABLE, TRANSPORTS, clean } from "../../shared/text.ts";
+import type { AppState, Candidate, PairingPrompt } from "../../shared/state.ts";
+import { STORAGE_FULL, TRANSPORTS, clean, storageFull } from "../../shared/text.ts";
 import { act, useAction } from "../api.ts";
 import { Banner, Dialog, Spinner, Switch } from "./common.tsx";
 import { CheckIcon, CloseIcon, DeviceIcon, LinkIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
@@ -20,23 +19,10 @@ function Signal({ rssi }: { rssi: number | null }) {
   );
 }
 
-function useCountdown(expiresAt: number | undefined) {
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    if (!expiresAt) return;
-    const t = setInterval(() => setNow(Date.now()), 500);
-    return () => clearInterval(t);
-  }, [expiresAt]);
-  return expiresAt ? Math.max(0, Math.ceil((expiresAt - now) / 1000)) : 0;
-}
-
 function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
   const [value, setValue] = useState("");
   const [busy, run] = useAction(true);
   const [error, setError] = useState<string | null>(null);
-  const seconds = useCountdown(prompt.expiresAt);
-  const p = prompt.prompt;
-  const code = (p.value ?? "").split("").join(" ");
   // A prompt that is no longer waiting goes away with its view; other failures stay here.
   const reply = async (accept: boolean) => {
     setError(null);
@@ -44,20 +30,18 @@ function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
     if (!result.ok) setError(result.message);
   };
   const problem = error ? <p className="error-text">{error}</p> : null;
-  if (prompt.kind === "display")
+  if (prompt.kind === "show")
     return (
       <div className="prompt">
-        <p>Type this {p.method === "pin" ? "PIN" : "code"} on {name}, then press Enter:</p>
-        <div className="code">{code}</div>
-        <p className="muted">{seconds} seconds left</p>
+        <p>Type this {prompt.code === "pin" ? "PIN" : "code"} on {name}, then press Enter:</p>
+        <div className="code">{prompt.value.split("").join(" ")}</div>
       </div>
     );
-  if (p.method === "confirm_passkey")
+  if (prompt.kind === "confirm")
     return (
       <div className="prompt">
         <p>Does {name} show this code?</p>
-        <div className="code">{code}</div>
-        <p className="muted">{seconds} seconds left</p>
+        <div className="code">{prompt.value.split("").join(" ")}</div>
         {problem}
         <div className="actions center">
           <button disabled={busy} onClick={() => void reply(false)}>
@@ -69,7 +53,7 @@ function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
         </div>
       </div>
     );
-  const passkey = p.method === "enter_passkey";
+  const passkey = prompt.code !== "pin";
   const valid = passkey ? /^\d{6}$/.test(value) : /^[\x20-\x7e]{1,16}$/.test(value);
   return (
     <form
@@ -89,7 +73,6 @@ function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
         value={value}
         onChange={(e) => setValue(e.target.value)}
       />
-      <p className="muted">{seconds} seconds left</p>
       {problem}
       <div className="actions center">
         <button type="button" disabled={busy} onClick={() => void reply(false)}>
@@ -117,7 +100,7 @@ export function AddDevice({
   const ready = state.adapters.filter((a) => a.connection === "connected" && a.readiness === "ready");
   const [adapterId, setAdapterId] = useState<string | null>(null);
   const [unnamed, setUnnamed] = useState(false);
-  const chosen = ready.find((a) => a.id === adapterId) ?? ready.find((a) => a.status?.capacity.pairing.some((p) => p.available)) ?? ready[0];
+  const chosen = ready.find((a) => a.id === adapterId) ?? ready.find((a) => !storageFull(a.status)) ?? ready[0];
   const scan = state.scan;
   const pairing = state.pairing;
   // Why starting a search or pairing failed; cleared by the next attempt.
@@ -168,7 +151,7 @@ export function AddDevice({
 
   const candidates = (scan?.adapterId === chosen?.id ? (scan?.candidates ?? []) : []).filter((c) => unnamed || clean(c.name ?? "") || c.kind !== "unknown");
   const hiddenCount = (scan?.candidates.length ?? 0) - candidates.length;
-  const availability = (c: Candidate) => chosen?.status?.capacity.pairing.find((p) => p.transport === c.transport);
+  const full = storageFull(chosen?.status ?? null);
 
   let body: React.ReactNode;
   if (pairing) {
@@ -181,7 +164,7 @@ export function AddDevice({
             <p>Pairing with {name}…</p>
           </div>
         ) : null}
-        {pairing.phase === "pairing" && pairing.prompt ? <PromptView key={pairing.prompt.prompt.prompt_id} name={name} prompt={pairing.prompt} /> : null}
+        {pairing.phase === "pairing" && pairing.prompt ? <PromptView key={`${pairing.candidateId}/${pairing.prompt.kind}`} name={name} prompt={pairing.prompt} /> : null}
         {pairing.phase === "connecting" ? (
           <div className="progress">
             <Spinner />
@@ -279,19 +262,18 @@ export function AddDevice({
         </div>
         <ul className="candidates" aria-label="Nearby devices">
           {candidates.map((c) => {
-            const a = availability(c);
             return (
-              <li key={c.candidate_id} className="candidate">
+              <li key={c.id} className="candidate">
                 <DeviceIcon kind={kindOf(c)} />
                 <span className="side-text">
                   <span className="side-title">{clean(c.name ?? "") || "Unnamed Device"}</span>
-                  <span className="side-subtitle">{TRANSPORTS[c.transport]}</span>
+                  <span className="side-subtitle">{c.transport ? TRANSPORTS[c.transport] : null}</span>
                 </span>
                 <Signal rssi={c.rssi} />
-                {a && !a.available ? (
-                  <span className="muted small">{a.reason ? PAIR_UNAVAILABLE[a.reason] : "Can't Add Now"}</span>
+                {full ? (
+                  <span className="muted small">{STORAGE_FULL}</span>
                 ) : (
-                  <button className="suggested" disabled={starting} onClick={() => chosen && void attempt({ type: "pair.start", adapterId: chosen.id, candidateId: c.candidate_id })}>
+                  <button className="suggested" disabled={starting} onClick={() => chosen && void attempt({ type: "pair.start", adapterId: chosen.id, candidateId: c.id })}>
                     <LinkIcon /> Pair
                   </button>
                 )}

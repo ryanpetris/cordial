@@ -1,0 +1,32 @@
+[package]
+name = "cordial-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+cordial-client = { workspace = true, features = ["serialport"] }
+cordial-protocol = { workspace = true, features = ["json"] }
+serde_json = { workspace = true, features = ["std"] }
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
+unicode-width = "=0.2.2"
+unicode-segmentation = "=1.13.3"
+unicode-properties = { version = "=0.1.4", default-features = false, features = ["general-category"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
+ctrlc = { version = "=3.5.2", features = ["termination"] }
+
+[dev-dependencies]
+prost = { version = "=0.14.4", default-features = false }
+
+[[bin]]
+name = "cordial"
+path = "src/main.rs"
+
+# Atomic no-replace publication of downloads.
+[target.'cfg(any(target_os = "linux", target_vendor = "apple"))'.dependencies]
+rustix = { version = "=1.1.5", default-features = false, features = ["fs", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }

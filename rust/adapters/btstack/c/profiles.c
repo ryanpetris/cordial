@@ -1,4 +1,8 @@
 #include "profiles_internal.h"
+#ifdef ENABLE_CLASSIC
+int cordial_classic_set_report(uint16_t cid, hid_report_type_t type,
+                              uint16_t report_id, const uint8_t *data, uint16_t size);
+#endif
 #include "ble/le_device_db.h"
 #include "host.h"
 #include <string.h>
@@ -168,9 +172,9 @@ int cordial_profiles_forget(cordial_peer peer) {
 int cordial_emit_event(cordial_connection *l, cordial_event event) {
     if (l) { event.link = l->id; event.peer = l->peer; }
     int accepted = emit(context, &event);
-    if (!accepted && l && event.kind != CORDIAL_DISCONNECTED && event.kind != CORDIAL_SECURITY && event.kind != CORDIAL_INFORMATION)
-        cordial_fail(l, event.kind == CORDIAL_DESCRIPTOR ? CORDIAL_CAPACITY : CORDIAL_OVERFLOW);
-    return accepted;
+    if (accepted <= 0 && l && event.kind != CORDIAL_DISCONNECTED && event.kind != CORDIAL_SECURITY && event.kind != CORDIAL_INFORMATION)
+        cordial_fail(l, accepted < 0 ? (uint8_t)-accepted : event.kind == CORDIAL_DESCRIPTOR ? CORDIAL_CAPACITY : CORDIAL_OVERFLOW);
+    return accepted > 0;
 }
 static void finish(cordial_connection *l) {
     if (!l || l->ended) return;
@@ -241,7 +245,7 @@ void cordial_ready(cordial_connection *l) {
     if (l->ready || l->closing || !l->authenticated || !l->profile || !l->adopted) return;
     l->ready = true; l->deadline = 0;
     (void)publish_security(l);
-    cordial_emit_event(l, (cordial_event){ .kind = CORDIAL_CONNECTED, .number = l->peer.transport == CORDIAL_CLASSIC ? 255 : CORDIAL_REPORT_BYTES });
+    cordial_emit_event(l, (cordial_event){ .kind = CORDIAL_CONNECTED, .number = CORDIAL_REPORT_BYTES });
 }
 static void bonded(cordial_connection *l) {
     if (!l->pairing || l->bonded || l->closing) return;
@@ -311,6 +315,16 @@ static void hids_handler(uint8_t type, uint16_t channel, uint8_t *packet, uint16
     }
 }
 #ifdef ENABLE_CLASSIC
+static uint8_t classic_report_error(uint8_t handshake) {
+    switch (handshake) {
+        case HID_HANDSHAKE_PARAM_TYPE_SUCCESSFUL: return CORDIAL_OK;
+        case HID_HANDSHAKE_PARAM_TYPE_NOT_READY: return CORDIAL_BUSY;
+        case HID_HANDSHAKE_PARAM_TYPE_ERR_INVALID_REPORT_ID:
+        case HID_HANDSHAKE_PARAM_TYPE_ERR_UNSUPPORTED_REQUEST:
+        case HID_HANDSHAKE_PARAM_TYPE_ERR_INVALID_PARAMETER: return CORDIAL_UNSUPPORTED;
+        default: return CORDIAL_CONNECTION;
+    }
+}
 static void classic_event(uint8_t *packet, uint16_t size) {
     if (size < 5) return;
     uint8_t event = hci_event_hid_meta_get_subevent_code(packet);
@@ -372,18 +386,19 @@ static void classic_event(uint8_t *packet, uint16_t size) {
             input(l, 0, id, data, length); break;
         }
         case HID_SUBEVENT_SET_REPORT_RESPONSE:
-            if (size >= 6) cordial_write_done(l, hid_subevent_set_report_response_get_handshake_status(packet) ? CORDIAL_CONNECTION : CORDIAL_OK);
+            if (size >= 6) cordial_write_done(l, classic_report_error(hid_subevent_set_report_response_get_handshake_status(packet)));
             break;
         case HID_SUBEVENT_GET_REPORT_RESPONSE: {
             if (size < 8 || !l->reading) return;
             uint16_t length = hid_subevent_get_report_response_get_report_len(packet);
             const uint8_t *data = hid_subevent_get_report_response_get_report(packet);
-            if (hid_subevent_get_report_response_get_handshake_status(packet) || length > size - 8) { cordial_read_done(l, CORDIAL_CONNECTION); return; }
+            uint8_t error = classic_report_error(hid_subevent_get_report_response_get_handshake_status(packet));
+            if (error || length > size - 8) { cordial_read_done(l, error ? error : CORDIAL_CONNECTION); return; }
             if (l->numbered) {
                 if (!length || *data++ != l->operation_id) { cordial_read_done(l, CORDIAL_CONNECTION); return; }
                 --length;
             }
-            if (length > sizeof l->bytes) { cordial_read_done(l, CORDIAL_OVERFLOW); return; }
+            if (length > sizeof l->bytes) { cordial_read_done(l, CORDIAL_REPORT_SIZE); return; }
             memcpy(l->bytes, data, length); l->length = length;
             cordial_read_done(l, CORDIAL_OK); break;
         }
@@ -922,8 +937,8 @@ int cordial_profiles_write(cordial_link id, uint32_t sequence, uint16_t service,
     int status;
 #ifdef ENABLE_CLASSIC
     if (l->peer.transport == CORDIAL_CLASSIC)
-        status = service || size > 255 ? CORDIAL_UNSUPPORTED :
-            (hid_host_send_set_report(l->cid, kind, report_id, l->bytes, size) ? CORDIAL_CONNECTION : CORDIAL_OK);
+        status = service ? CORDIAL_UNSUPPORTED :
+            cordial_classic_set_report(l->cid, kind, report_id, l->bytes, size);
     else
 #endif
         status = cordial_gatt_write(l);

@@ -45,7 +45,7 @@ typedef struct cordial_connection {
     uint16_t cid;
     bool used, pairing, adopted, authenticated, profile, ready, closing, ended;
     bool security_pending;
-    bool security_requested, bonded, numbered, writing, reading;
+    bool security_requested, bonded, numbered, writing, reading, read_simple;
     uint8_t error, remote_io;
     uint64_t deadline;
     uint32_t sequence;

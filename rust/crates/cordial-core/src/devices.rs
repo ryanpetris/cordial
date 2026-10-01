@@ -1,18 +1,17 @@
+use crate::model::{
+    errors::ErrorCode,
+    identifiers::{ConnectionState, DeviceId, HostPlatform, Transport},
+};
 use crate::{
     settings::Catalog,
     storage::{self, RecordStore, record_key},
 };
 use alloc::{boxed::Box, format, string::String, vec::Vec};
-use cordial_protocol::{
-    errors::ErrorCode,
-    identifiers::{ConnectionState, DeviceId, HostPlatform, PairingState, Transport},
-};
 use serde::{Deserialize, Serialize};
 
-/// Wire enumeration bound; records are allocated on demand.
+/// Live Bluetooth connections, shared across transports. Records are allocated on demand.
 pub const ACTIVE_CONNECTIONS: usize = 4;
 pub const SCAN_CANDIDATES: usize = 32;
-pub const PENDING_REQUESTS: usize = 4;
 
 /// A resolved bonded identity, or a transport-specific discovery address.
 /// Backends resolve private BLE addresses before matching a saved policy.
@@ -103,41 +102,52 @@ impl Setup {
 }
 
 pub struct Device {
-    pub pairing_state: PairingState,
     pub effective_enabled: bool,
     pub transport_supported: bool,
-    pub validation_error: Option<cordial_protocol::errors::ValidationError>,
     pub policy: Policy,
     pub catalog: Catalog,
     pub state: ConnectionState,
     pub roles: u8,
-    pub warnings: u8,
+    pub warnings: alloc::vec::Vec<crate::model::errors::DeviceWarning>,
+    pub warnings_changed: bool,
     pub paused: bool,
     pub error: Option<ErrorCode>,
-    pub settings_revision: u64,
     pub setup: Setup,
     retry_at: u64,
     last_failure: u64,
     retry_delay: u32,
 }
 impl Device {
+    pub fn update_warnings(
+        &mut self,
+        warnings: &[crate::model::errors::DeviceWarning],
+    ) -> Result<bool, ErrorCode> {
+        if self.warnings == warnings {
+            return Ok(false);
+        }
+        self.warnings
+            .try_reserve_exact(warnings.len().saturating_sub(self.warnings.len()))
+            .map_err(|_| ErrorCode::Capacity)?;
+        self.warnings.clear();
+        self.warnings.extend_from_slice(warnings);
+        self.warnings_changed = true;
+        Ok(true)
+    }
     pub fn new(policy: Policy) -> Self {
         let mut catalog = Catalog::default();
         catalog.info.battery.configure(policy.peer.transport, false);
         catalog.connection(false, policy.hidpp_enabled);
         Self {
-            pairing_state: PairingState::Paired,
             effective_enabled: true,
             transport_supported: true,
-            validation_error: None,
             policy,
             catalog,
             state: ConnectionState::Disconnected,
             roles: 0,
-            warnings: 0,
+            warnings: alloc::vec::Vec::new(),
+            warnings_changed: false,
             paused: false,
             error: None,
-            settings_revision: 0,
             setup: Setup::default(),
             retry_at: 0,
             last_failure: 0,
@@ -145,11 +155,7 @@ impl Device {
         }
     }
     pub fn allow_incoming(&self) -> bool {
-        self.pairing_state == PairingState::Paired
-            && self.effective_enabled
-            && self.policy.trusted
-            && !self.policy.blocked
-            && !self.paused
+        self.effective_enabled && self.policy.trusted && !self.policy.blocked && !self.paused
     }
     pub fn reconnect_due(&self, now: u64) -> bool {
         self.allow_incoming() && self.state == ConnectionState::Disconnected && now >= self.retry_at
@@ -201,9 +207,6 @@ impl Device {
         }
     }
     pub fn explicit_connect(&mut self) -> Result<(), ErrorCode> {
-        if self.pairing_state == PairingState::NeedsPairing {
-            return Err(ErrorCode::PairingRequired);
-        }
         if self.policy.blocked {
             return Err(ErrorCode::Blocked);
         }
@@ -233,7 +236,7 @@ impl<S: RecordStore> Policies<'_, S> {
                 if value
                     .name
                     .as_deref()
-                    .is_some_and(|name| cordial_protocol::adapter_name(name) != Some(name))
+                    .is_some_and(|name| crate::model::adapter_name(name) != Some(name))
                 {
                     return Err(storage::Error::Corrupt);
                 }
@@ -246,66 +249,6 @@ impl<S: RecordStore> Policies<'_, S> {
         self.store
             .save(record_key(1, 0), &storage::json(&value)?)
             .await
-    }
-    pub async fn load_record(
-        &mut self,
-        key: storage::RecordKey,
-    ) -> (Policy, Option<cordial_protocol::errors::ValidationError>) {
-        use cordial_protocol::errors::ValidationError;
-        let id = u64::from_be_bytes(key[1..].try_into().unwrap());
-        let decoded = match self.store.load_owned(key).await {
-            Ok(Some(bytes)) => {
-                crate::codec::read_policy(u64::from_be_bytes(key[1..].try_into().unwrap()), &bytes)
-                    .map_err(|_| ValidationError::DeviceCorrupt)
-            }
-            Ok(None) => Err(ValidationError::DeviceCorrupt),
-            Err(_) => Err(ValidationError::ReadFailed),
-        };
-        match decoded {
-            Ok(policy) if policy.id == id => (policy, None),
-            result => (
-                Policy::paired(
-                    id,
-                    Peer {
-                        transport: Transport::Ble,
-                        random: false,
-                        address: [0; 6],
-                    },
-                    b"Unreadable device record",
-                ),
-                Some(result.err().unwrap_or(ValidationError::DeviceCorrupt)),
-            ),
-        }
-    }
-    /// Preserve an entry and its ID even when its payload cannot be decoded.
-    pub async fn load_records(
-        &mut self,
-    ) -> Result<Vec<(Policy, Option<cordial_protocol::errors::ValidationError>)>, storage::Error>
-    {
-        use cordial_protocol::errors::ValidationError;
-        let mut records: Vec<(Policy, Option<ValidationError>)> = Vec::new();
-        let mut previous = None;
-        while let Some(key) = self.store.next_key(previous).await? {
-            previous = Some(key);
-            if key[0] != 2 {
-                continue;
-            }
-            let (policy, validation) = self.load_record(key).await;
-            records
-                .try_reserve(1)
-                .map_err(|_| storage::Error::Unavailable)?;
-            records.push((policy, validation));
-        }
-        records.sort_unstable_by_key(|(p, _)| p.id);
-        for i in 0..records.len() {
-            for j in 0..i {
-                if records[i].0.peer == records[j].0.peer {
-                    records[i].1 = Some(ValidationError::DeviceCorrupt);
-                    records[j].1 = Some(ValidationError::DeviceCorrupt);
-                }
-            }
-        }
-        Ok(records)
     }
     pub async fn load_devices(&mut self) -> Result<Vec<(usize, Policy)>, storage::Error> {
         let mut result = Vec::new();
@@ -342,10 +285,22 @@ impl<S: RecordStore> Policies<'_, S> {
         if !policy.valid() {
             return Err(storage::Error::Corrupt);
         }
-        let bond = crate::bonds::load(self.store, policy.id)
-            .await?
-            .ok_or(storage::Error::Corrupt)?;
-        crate::bonds::commit(self.store, policy, &bond).await
+        // A bond that is gone, unreadable or another device's means the record was lost.
+        let bond = match crate::bonds::load(self.store, policy.id).await {
+            Ok(Some(bond))
+                if bond.valid() && bond.owner == policy.id && bond.identity == policy.peer =>
+            {
+                bond
+            }
+            Ok(_) | Err(storage::Error::Corrupt) => return Err(storage::Error::Missing),
+            // The store's own errors are read and write failures, never a lost record.
+            Err(storage::Error::Missing) => return Err(storage::Error::Io),
+            Err(error) => return Err(error),
+        };
+        match crate::bonds::commit(self.store, policy, &bond).await {
+            Err(storage::Error::Missing) => Err(storage::Error::Io),
+            result => result,
+        }
     }
     /// The device file is the deletion commit. Leftover preferences are inactive
     /// and cleanup can be retried without restoring a deleted device.

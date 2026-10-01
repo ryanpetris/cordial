@@ -51,47 +51,31 @@ async fn usb_task(serial: &'static str) {
 async fn owner_task(store: Store, serial: &'static str) {
     let available = store.is_ok();
     let (mut radio, mut handle) = radio::new(store);
-    let mut input = [0; 4096];
-    let mut app = Application::new(
-        &mut input,
-        Build {
-            profile: if cfg!(feature = "development") {
-                cordial_protocol::messages::BuildProfile::Development
-            } else {
-                cordial_protocol::messages::BuildProfile::Production
-            },
-            version: FIRMWARE_VERSION,
-            hardware: board::HARDWARE,
-            default_adapter_name: board::DEFAULT_ADAPTER_NAME,
-            digest: board::HARDWARE_DIGEST,
-            radio_backend: board::RADIO_BACKEND,
-            adapter_id: serial.into(),
-            boot_id: format!("{:016x}", unsafe {
-                sys::platform::cordial_esp_boot_random()
-            }),
-            #[cfg(feature = "development")]
-            bootloader: Some(cordial_core::application::Bootloader {
-                mode: "download",
-                enter: bootloader,
-            }),
-            #[cfg(feature = "production")]
-            bootloader: None,
-        },
-    );
+    let mut app = Application::new(Build {
+        development: cfg!(feature = "development"),
+        version: FIRMWARE_VERSION,
+        board: board::HARDWARE,
+        default_adapter_name: board::DEFAULT_ADAPTER_NAME,
+        adapter_id: serial.into(),
+        #[cfg(feature = "development")]
+        bootloader: Some(cordial_core::application::Bootloader { enter: bootloader }),
+        #[cfg(feature = "production")]
+        bootloader: None,
+    });
     let started = if available {
         let mut address = [0; 6];
         let read =
             unsafe { sys::esp_read_mac(address.as_mut_ptr(), sys::esp_mac_type_t_ESP_MAC_BT) };
         if read != sys::ESP_OK {
-            Err(cordial_protocol::errors::ErrorCode::RadioUnavailable)
+            Err(cordial_core::model::errors::ErrorCode::RadioUnavailable)
         } else {
             cordial_core::identity::Identity::initialize(&mut handle, address, random)
                 .await
-                .map_err(|_| cordial_protocol::errors::ErrorCode::StorageFailed)
+                .map_err(|_| cordial_core::model::errors::ErrorCode::StorageFailed)
                 .and_then(|_| radio::start(&mut radio, &mut handle))
         }
     } else {
-        Err(cordial_protocol::errors::ErrorCode::StorageFailed)
+        Err(cordial_core::model::errors::ErrorCode::StorageFailed)
     };
     if let Err(error) = started {
         app.event(Event::Failed(error), &mut handle, &mut radio, now())

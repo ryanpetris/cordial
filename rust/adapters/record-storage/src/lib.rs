@@ -73,7 +73,8 @@ fn error(e: LfsError) -> Error {
         LfsError::NO_MEMORY => Error::Unavailable,
         LfsError::INVALID | LfsError::FILENAME_TOO_LONG => Error::Bounds,
         LfsError::FILE_TOO_BIG => Error::TooLarge,
-        LfsError::CORRUPTION => Error::Corrupt,
+        // A failed metadata checksum is a read error: the data may read back on a later try.
+        LfsError::NO_SUCH_ENTRY | LfsError::PATH_NOT_DIR => Error::Missing,
         _ => Error::Io,
     }
 }
@@ -488,7 +489,7 @@ impl<F: NorFlash, const BLOCKS: usize> RecordStore for Storage<F, BLOCKS> {
         }
         let got = self.read_file(&name, 0, &mut bytes[..n])?;
         if got != n {
-            return Err(Error::Corrupt);
+            return Err(Error::Io);
         }
         Ok(Some(n))
     }

@@ -12,28 +12,24 @@ mod support {
         "/../../crates/cordial-core/tests/support/mod.rs"
     ));
 }
-fn application(input: &mut [u8]) -> Application<'_> {
-    Application::new(
-        input,
-        Build {
-            profile: cordial_protocol::messages::BuildProfile::Development,
-            version: "test",
-            hardware: "test",
-            default_adapter_name: "Test adapter",
-            radio_backend: "pico-sdk-cyw43",
-            digest: "test",
-            adapter_id: "adapter".into(),
-            boot_id: "boot".into(),
-            bootloader: None,
-        },
-    )
+fn application() -> Application {
+    Application::new(Build {
+        development: true,
+        version: "test",
+        board: "test",
+        default_adapter_name: "Test adapter",
+        adapter_id: "adapter".into(),
+        bootloader: None,
+    })
+}
+fn ok() -> cordial_protocol::Response {
+    cordial_protocol::Response { result: None }
 }
 #[test]
 fn serial_waits_for_completion_and_rejects_old_session_packets() {
     let io = Io::new();
     let mut owner = owner::Owner::new(&io);
-    let mut input = [0; 4095];
-    let mut app = application(&mut input);
+    let mut app = application();
     let mut store = support::Store::default();
     let mut radio = support::Radio::default();
     BusHandler(&io).configured(true);
@@ -41,10 +37,11 @@ fn serial_waits_for_completion_and_rejects_old_session_packets() {
     block_on(owner.poll(&mut app, &mut store, &mut radio, 1));
     assert!(app.serial.active());
     let separator = io.serial_tx.try_receive().ok().unwrap();
-    assert_eq!(&separator.bytes[..separator.length], b"\n");
-    app.serial
-        .response(1.try_into().unwrap(), true, true, 2)
-        .unwrap();
+    assert_eq!(
+        &separator.bytes[..separator.length],
+        &[cordial_protocol::frame::DELIMITER]
+    );
+    app.serial.respond(ok());
     block_on(owner.poll(&mut app, &mut store, &mut radio, 2));
     assert!(io.serial_tx.is_empty());
     io.serial_done
@@ -64,9 +61,7 @@ fn serial_waits_for_completion_and_rejects_old_session_packets() {
     io.dtr(false);
     io.dtr(true);
     block_on(owner.poll(&mut app, &mut store, &mut radio, 5));
-    app.serial
-        .response(1.try_into().unwrap(), true, false, 5)
-        .unwrap();
+    app.serial.respond(ok());
     io.serial_done
         .try_send(SerialDone {
             session: packet.session,
@@ -83,8 +78,7 @@ fn serial_waits_for_completion_and_rejects_old_session_packets() {
 fn suspend_completion_cannot_consume_resumed_input_and_leds_use_standard_report() {
     let io = Io::new();
     let mut owner = owner::Owner::new(&io);
-    let mut input = [0; 4095];
-    let mut app = application(&mut input);
+    let mut app = application();
     let mut store = support::Store::default();
     let mut radio = support::Radio::default();
     BusHandler(&io).configured(true);
@@ -101,6 +95,7 @@ fn suspend_completion_cannot_consume_resumed_input_and_leds_use_standard_report(
             Input {
                 held,
                 motion: [0; 4],
+                ..Input::default()
             },
         )
         .unwrap();
@@ -168,8 +163,8 @@ fn hid_control_reports_include_the_report_id() {
 
 #[test]
 fn dtr_during_dispatch_discards_remaining_old_commands() {
+    use cordial_core::model::identifiers::HostPlatform;
     use cordial_core::storage::{Error, RecordKey, RecordStore};
-    use cordial_protocol::identifiers::HostPlatform;
     struct ClosingStore<'a> {
         io: &'a Io,
         writes: usize,
@@ -198,17 +193,33 @@ fn dtr_during_dispatch_discards_remaining_old_commands() {
     }
     let io = Io::new();
     let mut owner = owner::Owner::new(&io);
-    let mut input = [0; 4095];
-    let mut app = application(&mut input);
+    let mut app = application();
     app.manager.storage_ready = true;
     let mut store = ClosingStore { io: &io, writes: 0 };
     let mut radio = support::Radio::default();
     BusHandler(&io).configured(true);
     io.dtr(true);
     block_on(owner.poll(&mut app, &mut store, &mut radio, 1));
-    let prefix = br#"{"v":1,"id":1,"cmd":"adapter.platform.set","args":{"platform":"mac"}}"#;
-    assert_eq!(app.serial.feed(prefix, 2).0, prefix.len());
-    let tail = b"\n{\"v\":1,\"id\":2,\"cmd\":\"adapter.platform.set\",\"args\":{\"platform\":\"windows\"}}\n";
+    let request = |platform: cordial_protocol::Platform| {
+        let mut bytes = std::vec::Vec::new();
+        cordial_protocol::frame::encode(
+            &cordial_protocol::Request {
+                command: Some(cordial_protocol::request::Command::SetAdapter(
+                    cordial_protocol::SetAdapter {
+                        name: None,
+                        platform: Some(platform as i32),
+                    },
+                )),
+            },
+            &mut bytes,
+        );
+        bytes
+    };
+    let first = request(cordial_protocol::Platform::Mac);
+    let prefix = &first[..first.len() - 1];
+    assert_eq!(app.serial.feed(prefix).0, prefix.len());
+    let mut tail = first[first.len() - 1..].to_vec();
+    tail.extend(request(cordial_protocol::Platform::Windows));
     let old_session = io.status().session;
     for chunk in tail.chunks(64) {
         let mut packet = SerialRx {
@@ -227,4 +238,46 @@ fn dtr_during_dispatch_discards_remaining_old_commands() {
         "The second old-session command must not save after DTR falls"
     );
     assert_eq!(app.manager.preference.host_platform, HostPlatform::Mac);
+}
+
+#[test]
+fn descriptor_ranges_are_valid_for_signed_global_item_parsers() {
+    let mut minimum = 0i32;
+    let mut maximum = 0i32;
+    let mut offset = 0;
+    while offset < descriptor::REPORT_DESCRIPTOR.len() {
+        let tag = descriptor::REPORT_DESCRIPTOR[offset];
+        offset += 1;
+        let size = match tag & 3 {
+            3 => 4,
+            value => usize::from(value),
+        };
+        let data = &descriptor::REPORT_DESCRIPTOR[offset..offset + size];
+        offset += size;
+        let mut bytes = [0u8; 4];
+        bytes[..size].copy_from_slice(data);
+        if size > 0 && data[size - 1] & 0x80 != 0 {
+            bytes[size..].fill(0xff);
+        }
+        let value = i32::from_le_bytes(bytes);
+        match tag & 0xfc {
+            0x14 => minimum = value,
+            0x24 => maximum = value,
+            0x80 | 0x90 | 0xb0 => assert!(
+                minimum <= maximum,
+                "invalid signed range {minimum}..{maximum}"
+            ),
+            _ => {}
+        }
+    }
+    let map = cordial_core::hid::Map::compile(descriptor::REPORT_DESCRIPTOR).unwrap();
+    let mut payload = [0; 16];
+    payload[..2].copy_from_slice(&0x500u16.to_le_bytes());
+    assert_eq!(
+        map.decode(&mut map.state().unwrap(), 3, &payload)
+            .unwrap()
+            .held
+            .consumers[0],
+        0x500
+    );
 }

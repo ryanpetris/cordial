@@ -2,13 +2,7 @@
 //! The owner keeps polling Bluetooth/USB while this state machine waits for replies.
 mod handlers;
 
-use crate::{
-    compact::{Metadata, Observed, Range, Record},
-    hidpp::{Client, Error as ExchangeError},
-    settings::{Catalog, MAX_FEATURES, MAX_RECORDS},
-};
-use alloc::{boxed::Box, format, string::String, vec::Vec};
-use cordial_protocol::{
+use crate::model::{
     errors::ErrorCode as Error,
     hidpp::{Feature, FeatureFlags, FeatureId as Id, FeatureRevision},
     identifiers::SettingsState,
@@ -16,6 +10,12 @@ use cordial_protocol::{
         ObservationSource, SettingKey as Key, SettingOutcome as Outcome, SettingScope, SettingState,
     },
 };
+use crate::{
+    compact::{Metadata, Observed, Range, Record},
+    hidpp::{Client, Error as ExchangeError},
+    settings::{Catalog, MAX_FEATURES, MAX_RECORDS},
+};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 
 const JOB_MS: u64 = 90_000;
 fn bit(key: Key) -> u32 {
@@ -386,7 +386,7 @@ impl Engine {
             && (!requested || self.requested & bit(r.metadata.key) != 0)
     }
     fn handler_failed(&mut self, catalog: &mut Catalog, error: Error, uncertain: bool) {
-        use cordial_protocol::info::InfoKey as I;
+        use crate::model::info::InfoKey as I;
         let keys: &[I] = match self.current() {
             Some(Handler::Firmware) if self.stage == Stage::Serial => &[I::Serial],
             Some(Handler::Firmware) => &[I::Firmware, I::Hardware, I::Serial],
@@ -539,7 +539,7 @@ impl Engine {
     fn discovery_failure(&mut self, catalog: &mut Catalog, error: Error) {
         catalog
             .info
-            .invalidate_vendor(&cordial_protocol::info::InfoKey::ALL);
+            .invalidate_vendor(&crate::model::info::InfoKey::ALL);
         for r in &mut catalog.records {
             failed(r, error, false);
             if !self.apply || self.requested & bit(r.metadata.key) != 0 {

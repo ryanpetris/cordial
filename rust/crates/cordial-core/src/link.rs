@@ -1,6 +1,13 @@
 //! A live HID connection. Backends copy submitted bytes before returning and
 //! report completion with the same token; callbacks never borrow this owner.
+use crate::model::{
+    errors::{DeviceWarning, ErrorCode as Error, WarningCode},
+    hidpp::ProtocolState,
+    identifiers::{HostPlatform, NormalizationState, SettingsState},
+    settings::SettingKey,
+};
 use crate::{
+    bluetooth::ReportType,
     features::Engine,
     forward::Forwarder,
     hid::{self, Held, Input, Map, State},
@@ -8,12 +15,6 @@ use crate::{
     settings::Catalog,
 };
 use alloc::{boxed::Box, vec::Vec};
-use cordial_protocol::{
-    errors::ErrorCode as Error,
-    hidpp::ProtocolState,
-    identifiers::{HostPlatform, NormalizationState, SettingsState},
-    settings::SettingKey,
-};
 
 /// The owner advances generation each time a connection slot is reused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,20 +31,67 @@ pub struct WriteId {
     pub sequence: u32,
 }
 
+#[derive(Clone, Copy)]
+struct IndicatorState {
+    report: usize,
+    kind: crate::bluetooth::ReportType,
+    settled: Option<u8>,
+    retry_at: u64,
+    rearm: bool,
+}
+impl Default for IndicatorState {
+    fn default() -> Self {
+        Self {
+            report: 0,
+            kind: crate::bluetooth::ReportType::Output,
+            settled: None,
+            retry_at: 0,
+            rearm: true,
+        }
+    }
+}
 pub struct Profile {
     pub service: ServiceId,
     map: Map,
     input: State,
     held: Held,
+    indicators: Box<[IndicatorState]>,
+    indicator_cache: hid::IndicatorCache,
+    colors_ready: bool,
 }
 impl Profile {
+    fn indicator(&self, report: usize) -> &IndicatorState {
+        &self.indicators[report]
+    }
+    fn indicator_mut(&mut self, report: usize) -> &mut IndicatorState {
+        &mut self.indicators[report]
+    }
     pub fn compile(service: ServiceId, descriptor: &[u8]) -> Result<Self, Error> {
         let map = Map::compile(descriptor).map_err(|e| match e {
             hid::Error::Capacity => Error::Capacity,
             _ => Error::UnsupportedHid,
         })?;
+        Self::from_map(service, map)
+    }
+    pub(crate) fn from_map(service: ServiceId, map: Map) -> Result<Self, Error> {
         let input = map.state().map_err(|_| Error::Capacity)?;
+        let mut indicators = Vec::new();
+        indicators
+            .try_reserve_exact(map.indicator_reports().count())
+            .map_err(|_| Error::Capacity)?;
+        indicators.extend(
+            map.indicator_reports()
+                .map(|(report, kind)| IndicatorState {
+                    report,
+                    kind,
+                    ..IndicatorState::default()
+                }),
+        );
+        let indicator_cache = map.indicator_cache().map_err(|_| Error::Capacity)?;
         Ok(Self {
+            indicators: indicators.into_boxed_slice(),
+            indicator_cache,
+            colors_ready: false,
             service,
             map,
             input,
@@ -54,18 +102,26 @@ impl Profile {
 #[derive(Clone, Copy)]
 enum Writing {
     Hidpp,
-    Leds,
+    Leds {
+        profile: usize,
+        report: usize,
+        target: u8,
+        rearm: bool,
+        unknown: u8,
+        complete: bool,
+    },
 }
 pub struct Output<'a> {
     pub id: WriteId,
     pub service: ServiceId,
+    pub kind: crate::bluetooth::ReportType,
     /// None is an unnumbered report. Payload never includes the report ID.
     pub report_id: Option<u8>,
     pub payload: &'a [u8],
 }
 
 #[derive(Clone, Copy)]
-pub struct BatteryRead {
+pub struct ReportRead {
     pub id: WriteId,
     pub service: ServiceId,
     pub kind: crate::bluetooth::ReportType,
@@ -76,8 +132,7 @@ pub struct Link {
     pub client: Client,
     pub settings: Engine,
     pub roles: u8,
-    /// Bit 0: unsupported HID fields; bit 1: unavailable lock-indicator output.
-    pub warnings: u8,
+    pub warnings: Vec<DeviceWarning>,
     profiles: Box<[Profile]>,
     vendor_service: Option<ServiceId>,
     enabled: bool,
@@ -91,13 +146,22 @@ pub struct Link {
     writing: Option<Writing>,
     write_deadline: u64,
     output: [u8; hid::REPORT_BYTES],
-    max_output: usize,
+    led_read: Option<ReportRead>,
+    led_read_needed: bool,
+    led_read_for_state: bool,
+    led_color_read: bool,
+    led_feedback_cursor: usize,
+    led_read_attempted: bool,
+    led_base_valid: bool,
+    led_base: [u8; hid::REPORT_BYTES],
+    led_base_len: usize,
+    led_retry: u64,
     sent_leds: Option<u8>,
     led_target: u8,
     led_profile: usize,
     led_report: usize,
     pub(crate) info_refresh_pending: bool,
-    battery_read: Option<BatteryRead>,
+    battery_read: Option<ReportRead>,
     battery_read_valid: bool,
     battery_cursor: usize,
     battery_due: u64,
@@ -129,7 +193,26 @@ impl Link {
         }
         let max_output = max_output.min(hid::REPORT_BYTES);
         let mut roles = 0;
-        let mut warnings = 0;
+        let mut warnings = Vec::new();
+        let warning_capacity: usize = profiles
+            .iter()
+            .map(|p| {
+                p.map.limitations().len()
+                    + p.map.indicator_field_count()
+                    + p.indicators
+                        .iter()
+                        .map(|state| {
+                            p.map
+                                .indicator_locations_kind(state.report, state.kind, 31)
+                                .count()
+                                + 1
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+        warnings
+            .try_reserve_exact(warning_capacity)
+            .map_err(|_| Error::Capacity)?;
         let mut vendor_service = None;
         let mut reports = 0;
         for (i, profile) in profiles.iter().enumerate() {
@@ -137,7 +220,19 @@ impl Link {
                 return Err(Error::UnsupportedHid);
             }
             roles |= profile.map.roles;
-            warnings |= u8::from(profile.map.ignored_fields);
+            warnings.extend(profile.map.limitations().iter().map(|l| DeviceWarning {
+                code: l.code,
+                service: profile.service.0,
+                report_id: profile.map.numbered.then_some(l.report_id),
+                report_type: Some(match l.kind {
+                    1 => ReportType::Output,
+                    2 => ReportType::Feature,
+                    _ => ReportType::Input,
+                }),
+                bit_offset: Some(l.bit_offset),
+                usage_page: Some(l.usage_page),
+                usage: Some(l.usage),
+            }));
             if vendor_service.is_none()
                 && profile.map.hidpp_reports != 0
                 && max_output
@@ -149,11 +244,6 @@ impl Link {
             {
                 vendor_service = Some(profile.service);
                 reports = profile.map.hidpp_reports;
-            }
-            if profile.map.reports().iter().any(|r| {
-                r.leds && (r.output_other || (r.bits[1] as usize).div_ceil(8) > max_output)
-            }) {
-                warnings |= 2;
             }
         }
         catalog.info.battery.hidpp_reports(reports != 0);
@@ -185,7 +275,16 @@ impl Link {
             writing: None,
             write_deadline: 0,
             output: [0; hid::REPORT_BYTES],
-            max_output,
+            led_read: None,
+            led_read_needed: false,
+            led_read_for_state: false,
+            led_color_read: false,
+            led_feedback_cursor: 0,
+            led_read_attempted: false,
+            led_base_valid: false,
+            led_base: [0; hid::REPORT_BYTES],
+            led_base_len: 0,
+            led_retry: 0,
             sent_leds: None,
             led_target: 0,
             led_profile: 0,
@@ -204,7 +303,7 @@ impl Link {
             legacy_due: 0,
         })
     }
-    fn forward(&self, motion: [i64; 4], forward: &mut Forwarder) -> Result<(), Error> {
+    fn forward(&self, mut input: Input, forward: &mut Forwarder) -> Result<(), Error> {
         let mut held = Held::default();
         for profile in &self.profiles {
             held = held
@@ -217,7 +316,10 @@ impl Link {
                 .map_err(|_| Error::InputOverflow)?;
         }
         forward
-            .input(self.id.slot as usize, Input { held, motion })
+            .input(self.id.slot as usize, {
+                input.held = held;
+                input
+            })
             .map_err(|_| Error::InputOverflow)
     }
     fn hidpp_changed(&mut self, catalog: &mut Catalog) -> bool {
@@ -339,7 +441,7 @@ impl Link {
             let mut changed =
                 !self.configure_pending && self.settings.receive(catalog, report_id, payload, now);
             if self.client.receive(report_id, payload, now) {
-                self.forward([0; 4], forward)?;
+                self.forward(Input::default(), forward)?;
             }
             changed |= self.hidpp_changed(catalog);
             return Ok(changed);
@@ -365,8 +467,37 @@ impl Link {
             Err(hid::Error::Overflow) => return Err(Error::InputOverflow),
             Err(_) => return Err(Error::ConnectionFailed),
         };
+        let numeric = profile.map.observe_numeric_indicators(
+            &mut profile.indicator_cache,
+            report_id,
+            crate::bluetooth::ReportType::Input,
+            payload,
+            true,
+        );
+        let boolean = profile.map.observe_indicator_feedback(
+            &mut profile.indicator_cache,
+            report_id,
+            crate::bluetooth::ReportType::Input,
+            payload,
+            true,
+        );
+        if numeric
+            && profile
+                .indicators
+                .iter()
+                .all(|state| state.settled == Some(self.led_target))
+        {
+            profile.map.capture_colors(&mut profile.indicator_cache, 31);
+        }
+        if numeric || boolean {
+            for state in &mut profile.indicators {
+                state.settled = None;
+            }
+            self.sent_leds = None;
+            self.led_retry = 0;
+        }
         profile.held = input.held;
-        self.forward(input.motion, forward)?;
+        self.forward(input, forward)?;
         Ok(false)
     }
     /// Poll even while a transport write is outstanding, so HID++ timeouts and
@@ -378,21 +509,21 @@ impl Link {
         now: u64,
     ) -> Result<bool, Error> {
         if self.forward_pending {
-            self.forward([0; 4], forward)?;
+            self.forward(Input::default(), forward)?;
             self.forward_pending = false;
         }
         if self.writing.is_some() && now >= self.write_deadline {
             return Err(Error::ConnectionFailed);
         }
         if self.client.tick(now) {
-            self.forward([0; 4], forward)?;
+            self.forward(Input::default(), forward)?;
         }
         self.poll_legacy(catalog, now);
         let mut changed = self.settings.poll(catalog, &mut self.client, now);
         if self.configure_pending && self.client.quiesce() {
             self.configure_pending = false;
             self.client.configure(self.enabled, self.platform, now);
-            self.forward([0; 4], forward)?;
+            self.forward(Input::default(), forward)?;
             self.activate_pending = true;
             changed = true;
         }
@@ -407,7 +538,7 @@ impl Link {
     /// Call only when the backend has room to own a copy through completion.
     /// Do not call again until output_complete or connection teardown.
     pub fn output(&mut self, leds: u8, now: u64) -> Result<Option<Output<'_>>, Error> {
-        if self.writing.is_some() || self.battery_read.is_some() {
+        if self.writing.is_some() || self.battery_read.is_some() || self.led_read.is_some() {
             return Ok(None);
         }
         if let Some(payload) = self.client.next_output(now) {
@@ -416,41 +547,253 @@ impl Link {
             self.output[..length].copy_from_slice(&payload[..length]);
             let service = self.vendor_service.ok_or(Error::InternalError)?;
             return self
-                .begin_write(service, Some(report), length, Writing::Hidpp, now)
+                .begin_write(
+                    service,
+                    crate::bluetooth::ReportType::Output,
+                    Some(report),
+                    length,
+                    Writing::Hidpp,
+                    now,
+                )
                 .map(Some);
         }
         let leds = leds & 0x1f;
-        if self.sent_leds == Some(leds) {
+        if self.sent_leds == Some(leds) && self.led_target == leds {
             return Ok(None);
         }
         if self.led_target != leds {
+            self.sent_leds = None;
+            self.led_feedback_cursor = 0;
+            self.led_read_attempted = false;
             self.led_target = leds;
             self.led_profile = 0;
             self.led_report = 0;
+            self.led_base_valid = false;
+            self.led_read_needed = false;
+            for p in &mut self.profiles {
+                p.colors_ready = false;
+                for state in &mut p.indicators {
+                    state.rearm = true;
+                    state.retry_at = 0;
+                    state.settled = None;
+                }
+            }
+            self.led_retry = 0;
+        }
+        if now < self.led_retry {
+            return Ok(None);
         }
         while self.led_profile < self.profiles.len() {
-            let p = &self.profiles[self.led_profile];
-            while self.led_report < p.map.reports().len() {
+            while self.led_report < self.profiles[self.led_profile].indicators.len() {
                 let index = self.led_report;
-                self.led_report += 1;
-                let Some(length) =
-                    p.map
-                        .led_report(index, leds, &mut self.output[..self.max_output])
-                else {
+                let p = &self.profiles[self.led_profile];
+                let state = p.indicator(index);
+                let report_index = state.report;
+                let kind = state.kind;
+                if p.indicator(index).settled == Some(leds) || now < p.indicator(index).retry_at {
+                    self.advance_indicator();
                     continue;
-                };
-                let report_id = p.map.numbered.then_some(p.map.reports()[index].id);
-                return self
-                    .begin_write(p.service, report_id, length, Writing::Leds, now)
-                    .map(Some);
+                }
+                if !p.colors_ready && p.map.color_reports().next().is_some() {
+                    self.led_read_needed = true;
+                    return Ok(None);
+                }
+                let rearm =
+                    p.indicator(index).rearm && p.map.relative_indicators_kind(report_index, kind);
+                let baseline = self
+                    .led_base_valid
+                    .then_some(&self.led_base[..self.led_base_len]);
+                let result = p.map.indicator_report_scoped(
+                    report_index,
+                    kind,
+                    leds,
+                    &p.indicator_cache,
+                    baseline,
+                    rearm,
+                    &mut self.output,
+                );
+                match result {
+                    Ok(Some(encoding)) => {
+                        if encoding.unknown != 0 && !self.led_read_attempted {
+                            self.led_read_for_state = true;
+                            self.led_read_needed = true;
+                            return Ok(None);
+                        }
+                        let report_id = p.map.numbered.then_some(p.map.reports()[report_index].id);
+                        let service = p.service;
+                        let p = &mut self.profiles[self.led_profile];
+                        p.map
+                            .begin_numeric_write(&mut p.indicator_cache, report_index, kind);
+                        return self
+                            .begin_write(
+                                service,
+                                kind,
+                                report_id,
+                                encoding.length,
+                                Writing::Leds {
+                                    profile: self.led_profile,
+                                    report: index,
+                                    target: leds,
+                                    rearm,
+                                    unknown: encoding.unknown,
+                                    complete: encoding.complete,
+                                },
+                                now,
+                            )
+                            .map(Some);
+                    }
+                    Err(hid::IndicatorFailure {
+                        reason:
+                            reason @ (hid::IndicatorError::ReadRequired
+                            | hid::IndicatorError::StateUnknown),
+                        ..
+                    }) if !self.led_read_attempted => {
+                        self.led_read_for_state = reason == hid::IndicatorError::StateUnknown;
+                        self.led_read_needed = true;
+                        return Ok(None);
+                    }
+                    Err(failure) => {
+                        let code = match failure.reason {
+                            hid::IndicatorError::ReadRequired => WarningCode::IndicatorReadFailed,
+                            hid::IndicatorError::StateUnknown => WarningCode::IndicatorStateUnknown,
+                            hid::IndicatorError::ArrayCapacity => WarningCode::IndicatorArrayFull,
+                            hid::IndicatorError::RelativeArray => {
+                                WarningCode::IndicatorRelativeSelectorUnsupported
+                            }
+                            hid::IndicatorError::Range => WarningCode::IndicatorRangeUnsupported,
+                            hid::IndicatorError::Buffered => {
+                                WarningCode::BufferedIndicatorUnsupported
+                            }
+                            hid::IndicatorError::Mode => WarningCode::IndicatorModeUnsupported,
+                            hid::IndicatorError::Nonlinear => {
+                                WarningCode::IndicatorNonlinearUnsupported
+                            }
+                            hid::IndicatorError::Scale => WarningCode::IndicatorScaleUnsupported,
+                        };
+                        self.indicator_field_warning(
+                            self.led_profile,
+                            index,
+                            code,
+                            failure.bit_offset,
+                            failure.usage,
+                        );
+                        self.profiles[self.led_profile].indicator_mut(index).settled = Some(leds);
+                    }
+                    Ok(None) => {}
+                }
+                self.advance_indicator();
             }
             self.led_profile += 1;
             self.led_report = 0;
         }
-        self.sent_leds = Some(leds);
+        let retry = self
+            .profiles
+            .iter()
+            .flat_map(|p| p.indicators.iter())
+            .filter(|s| s.settled != Some(leds) && s.retry_at != 0)
+            .map(|s| s.retry_at)
+            .min();
+        if let Some(retry) = retry {
+            self.led_retry = retry;
+        } else {
+            self.led_retry = 0;
+            if self
+                .profiles
+                .iter()
+                .flat_map(|p| p.indicators.iter())
+                .all(|s| s.settled == Some(leds))
+            {
+                self.sent_leds = Some(leds);
+            }
+        }
         self.led_profile = 0;
         self.led_report = 0;
+        self.led_feedback_cursor = 0;
+        self.led_read_attempted = false;
         Ok(None)
+    }
+    fn advance_indicator(&mut self) {
+        self.led_report += 1;
+        self.led_base_valid = false;
+        self.led_feedback_cursor = 0;
+        self.led_read_attempted = false;
+    }
+    fn indicator_warning(&mut self, profile: usize, report: usize, code: WarningCode) {
+        self.indicator_field_warning(profile, report, code, None, None);
+    }
+    fn indicator_field_warning(
+        &mut self,
+        profile: usize,
+        report: usize,
+        code: WarningCode,
+        bit_offset: Option<u16>,
+        usage: Option<u32>,
+    ) {
+        let p = &self.profiles[profile];
+        let r = &p.map.reports()[p.indicator(report).report];
+        let warning = DeviceWarning {
+            code,
+            service: p.service.0,
+            report_id: p.map.numbered.then_some(r.id),
+            report_type: Some(p.indicator(report).kind),
+            bit_offset,
+            usage_page: Some(usage.map_or(8, |u| (u >> 16) as u16)),
+            usage: usage.map(|u| u as u16),
+        };
+        self.warnings.retain(|w| {
+            matches!(
+                w.code,
+                WarningCode::NumericSelectorUnsupported
+                    | WarningCode::PointerSelectorUnsupported
+                    | WarningCode::BufferedInputUnsupported
+            ) || w.service != warning.service
+                || w.report_id != warning.report_id
+                || w.report_type != warning.report_type
+                || w.bit_offset != warning.bit_offset
+                || w.usage_page != warning.usage_page
+                || w.usage != warning.usage
+        });
+        self.warnings.push(warning);
+    }
+    fn read_indicator_warning(&mut self, request: ReportRead, code: WarningCode) {
+        self.warnings.retain(|w| {
+            !(matches!(
+                w.code,
+                WarningCode::IndicatorReadFailed
+                    | WarningCode::IndicatorReadUnsupported
+                    | WarningCode::IndicatorReportTooLarge
+            ) && w.service == request.service.0
+                && w.report_id == request.report_id
+                && w.report_type == Some(request.kind)
+                && w.bit_offset.is_none())
+        });
+        self.warnings.push(DeviceWarning {
+            code,
+            service: request.service.0,
+            report_id: request.report_id,
+            report_type: Some(request.kind),
+            bit_offset: None,
+            usage_page: Some(8),
+            usage: None,
+        });
+    }
+    fn clear_indicator_warning(&mut self, profile: usize, report: usize) {
+        let p = &self.profiles[profile];
+        let report_id = p
+            .map
+            .numbered
+            .then_some(p.map.reports()[p.indicator(report).report].id);
+        let report_type = Some(p.indicator(report).kind);
+        self.warnings.retain(|w| {
+            matches!(
+                w.code,
+                WarningCode::NumericSelectorUnsupported
+                    | WarningCode::PointerSelectorUnsupported
+                    | WarningCode::BufferedInputUnsupported
+            ) || w.service != p.service.0
+                || w.report_id != report_id
+                || w.report_type != report_type
+        });
     }
     fn poll_legacy(&mut self, catalog: &mut Catalog, now: u64) {
         if self.legacy_waiting {
@@ -519,10 +862,63 @@ impl Link {
                 && self.client.protocol.major() == 1
                 && (self.legacy_waiting || self.legacy_due == 0))
     }
-    pub fn battery_read(&mut self, catalog: &Catalog, now: u64) -> Option<BatteryRead> {
+    pub fn report_read(&mut self, catalog: &Catalog, now: u64) -> Option<ReportRead> {
+        if self.led_read_needed
+            && self.writing.is_none()
+            && self.battery_read.is_none()
+            && self.led_read.is_none()
+            && now >= self.led_retry
+        {
+            let p = &mut self.profiles[self.led_profile];
+            self.sequence = self.sequence.checked_add(1)?;
+            let color = !p.colors_ready && p.map.color_reports().next().is_some();
+            if color && self.led_feedback_cursor == 0 {
+                p.indicator_cache.begin_colors();
+            }
+            let feedback = if color {
+                p.map.color_reports().nth(self.led_feedback_cursor)
+            } else {
+                p.map.indicator_feedback().nth(self.led_feedback_cursor)
+            };
+            if color && feedback.is_none() {
+                p.map.capture_colors(&mut p.indicator_cache, 31);
+                p.colors_ready = true;
+                self.led_feedback_cursor = 0;
+                self.led_read_needed = false;
+                return None;
+            }
+            self.led_color_read = color;
+            if !color && feedback.is_none() && self.led_read_for_state {
+                self.led_read_attempted = true;
+                self.led_read_needed = false;
+                return None;
+            }
+            self.led_feedback_cursor += 1;
+            let state = p.indicator(self.led_report);
+            let actual_id = p.map.reports()[state.report].id;
+            let actual_kind = state.kind;
+            let (report_id, kind) = feedback.unwrap_or((actual_id, actual_kind));
+            if !color && report_id == actual_id && kind == actual_kind {
+                self.led_read_attempted = true;
+            }
+            p.indicator_cache.begin_read();
+            let request = ReportRead {
+                id: WriteId {
+                    link: self.id,
+                    sequence: self.sequence,
+                },
+                service: p.service,
+                kind,
+                report_id: p.map.numbered.then_some(report_id),
+            };
+            self.led_read_needed = false;
+            self.led_read = Some(request);
+            return Some(request);
+        }
         if !catalog.info.battery.standard_hid()
             || self.writing.is_some()
             || self.battery_read.is_some()
+            || self.led_read.is_some()
             || !self.client.idle()
             || self.busy()
             || now < self.battery_due
@@ -550,7 +946,7 @@ impl Link {
                 continue;
             }
             self.sequence = self.sequence.checked_add(1)?;
-            let request = BatteryRead {
+            let request = ReportRead {
                 id: WriteId {
                     link: self.id,
                     sequence: self.sequence,
@@ -563,6 +959,129 @@ impl Link {
             self.battery_read_valid = true;
             return Some(request);
         }
+    }
+    pub fn report_read_complete(
+        &mut self,
+        id: WriteId,
+        kind: crate::bluetooth::ReportType,
+        result: Result<&crate::bluetooth::InputReport, Error>,
+        catalog: &mut Catalog,
+        now: u64,
+    ) {
+        if let Some(request) = self.led_read.filter(|r| r.id == id) {
+            self.led_read = None;
+            let color_read = core::mem::take(&mut self.led_color_read);
+            let p = &mut self.profiles[self.led_profile];
+            let expected = p
+                .map
+                .reports()
+                .iter()
+                .find(|r| r.id == request.report_id.unwrap_or(0))
+                .map_or(0, |r| {
+                    usize::from(
+                        r.bits[match request.kind {
+                            crate::bluetooth::ReportType::Input => 0,
+                            crate::bluetooth::ReportType::Output => 1,
+                            crate::bluetooth::ReportType::Feature => 2,
+                        }],
+                    )
+                    .div_ceil(8)
+                });
+            let bytes = result
+                .ok()
+                .filter(|r| {
+                    kind == request.kind
+                        && r.link == id.link
+                        && r.service == request.service
+                        && r.report_id == request.report_id.unwrap_or(0)
+                        && r.payload().len() >= expected
+                })
+                .map(|r| r.payload());
+            if let Some(bytes) = bytes {
+                self.warnings.retain(|w| {
+                    !(matches!(
+                        w.code,
+                        WarningCode::IndicatorReadFailed
+                            | WarningCode::IndicatorReadUnsupported
+                            | WarningCode::IndicatorReportTooLarge
+                    ) && w.service == request.service.0
+                        && w.report_id == request.report_id
+                        && w.report_type == Some(request.kind)
+                        && w.bit_offset.is_none())
+                });
+                p.map.remember_indicator_values(
+                    &mut p.indicator_cache,
+                    request.report_id.unwrap_or(0),
+                    kind,
+                    bytes,
+                );
+                p.map.observe_numeric_indicators(
+                    &mut p.indicator_cache,
+                    request.report_id.unwrap_or(0),
+                    kind,
+                    bytes,
+                    false,
+                );
+                if p.map.observe_indicator_feedback(
+                    &mut p.indicator_cache,
+                    request.report_id.unwrap_or(0),
+                    kind,
+                    bytes,
+                    false,
+                ) {
+                    for state in &mut p.indicators {
+                        state.settled = None;
+                    }
+                    self.sent_leds = None;
+                }
+                let state = p.indicator(self.led_report);
+                if kind == state.kind
+                    && request.report_id.unwrap_or(0) == p.map.reports()[state.report].id
+                {
+                    self.led_base[..bytes.len()].copy_from_slice(bytes);
+                    self.led_base_len = bytes.len();
+                    self.led_base_valid = true;
+                }
+            } else {
+                let unsupported = matches!(result, Err(Error::UnsupportedHid));
+                let permanent = unsupported || matches!(result, Err(Error::HidReportTooLarge));
+                let code = if unsupported {
+                    WarningCode::IndicatorReadUnsupported
+                } else if matches!(result, Err(Error::HidReportTooLarge)) {
+                    WarningCode::IndicatorReportTooLarge
+                } else {
+                    WarningCode::IndicatorReadFailed
+                };
+                let actual = p.indicator(self.led_report);
+                let actual_read = !color_read
+                    && request.kind == actual.kind
+                    && request.report_id.unwrap_or(0) == p.map.reports()[actual.report].id;
+                let cannot_write = actual_read
+                    && p.map
+                        .indicator_report_scoped(
+                            actual.report,
+                            actual.kind,
+                            self.led_target,
+                            &p.indicator_cache,
+                            None,
+                            false,
+                            &mut self.output,
+                        )
+                        .is_err();
+                self.read_indicator_warning(request, code);
+                if !permanent || cannot_write {
+                    let state = self.profiles[self.led_profile].indicator_mut(self.led_report);
+                    if permanent {
+                        state.settled = Some(self.led_target);
+                    } else {
+                        state.retry_at = now.saturating_add(1_000);
+                    }
+                    self.advance_indicator();
+                }
+            }
+            return;
+        }
+        self.battery_read_complete(id, kind, result, catalog);
     }
     pub fn battery_read_complete(
         &mut self,
@@ -600,6 +1119,7 @@ impl Link {
     fn begin_write(
         &mut self,
         service: ServiceId,
+        kind: crate::bluetooth::ReportType,
         report_id: Option<u8>,
         length: usize,
         writing: Writing,
@@ -617,6 +1137,7 @@ impl Link {
                 sequence: self.sequence,
             },
             service,
+            kind,
             report_id,
             payload: &self.output[..length],
         })
@@ -624,7 +1145,7 @@ impl Link {
     pub fn output_complete(
         &mut self,
         id: WriteId,
-        success: bool,
+        result: Result<(), Error>,
         catalog: &mut Catalog,
         forward: &mut Forwarder,
         now: u64,
@@ -637,12 +1158,132 @@ impl Link {
         };
         match writing {
             Writing::Hidpp => {
-                if self.client.tx_complete(success, now) {
-                    self.forward([0; 4], forward)?;
+                if self.client.tx_complete(result.is_ok(), now) {
+                    self.forward(Input::default(), forward)?;
                 }
             }
-            Writing::Leds if !success => self.warnings |= 2,
-            Writing::Leds => {}
+            Writing::Leds {
+                profile,
+                report,
+                target,
+                rearm,
+                unknown,
+                complete,
+            } => {
+                self.led_base_valid = false;
+                if result.is_ok() {
+                    if rearm {
+                        self.profiles[profile].indicator_mut(report).rearm = false;
+                    } else {
+                        let p = &mut self.profiles[profile];
+                        let state = *p.indicator(report);
+                        p.map.remember_indicator_values(
+                            &mut p.indicator_cache,
+                            p.map.reports()[state.report].id,
+                            state.kind,
+                            &self.output,
+                        );
+                        let confirmed = p.map.numeric_written(
+                            &mut p.indicator_cache,
+                            state.report,
+                            state.kind,
+                            &self.output,
+                            true,
+                        );
+                        p.map.observe_numeric_indicators(
+                            &mut p.indicator_cache,
+                            p.map.reports()[state.report].id,
+                            state.kind,
+                            &self.output,
+                            false,
+                        );
+                        p.map.confirm_indicators(
+                            &mut p.indicator_cache,
+                            state.report,
+                            state.kind,
+                            target,
+                            true,
+                        );
+                        let state = self.profiles[profile].indicator_mut(report);
+                        state.settled = (complete && confirmed).then_some(target);
+                        state.retry_at = 0;
+                        state.rearm = true;
+                        let p = &mut self.profiles[profile];
+                        if p.indicators
+                            .iter()
+                            .all(|state| state.settled == Some(target))
+                        {
+                            p.map.capture_colors(&mut p.indicator_cache, target);
+                        }
+                        self.clear_indicator_warning(profile, report);
+                        let p = &self.profiles[profile];
+                        for (bit_offset, usage) in p.map.unknown_indicator_locations(
+                            p.indicator(report).report,
+                            p.indicator(report).kind,
+                            unknown,
+                            &p.indicator_cache,
+                        ) {
+                            self.warnings.push(DeviceWarning {
+                                code: WarningCode::IndicatorStateUnknown,
+                                service: p.service.0,
+                                report_type: Some(p.indicator(report).kind),
+                                report_id: p
+                                    .map
+                                    .numbered
+                                    .then_some(p.map.reports()[p.indicator(report).report].id),
+                                bit_offset: Some(bit_offset),
+                                usage_page: Some((usage >> 16) as u16),
+                                usage: Some(usage as u16),
+                            });
+                        }
+                        if complete && confirmed {
+                            self.advance_indicator();
+                        } else if !confirmed {
+                            self.led_feedback_cursor = 0;
+                            self.led_read_attempted = false;
+                        }
+                    }
+                } else {
+                    let p = &mut self.profiles[profile];
+                    let state = *p.indicator(report);
+                    p.map.confirm_indicators(
+                        &mut p.indicator_cache,
+                        state.report,
+                        state.kind,
+                        target,
+                        false,
+                    );
+                    p.map.numeric_written(
+                        &mut p.indicator_cache,
+                        state.report,
+                        state.kind,
+                        &self.output,
+                        false,
+                    );
+                    let unsupported = matches!(
+                        result,
+                        Err(Error::UnsupportedHid | Error::HidReportTooLarge)
+                    );
+                    self.indicator_warning(
+                        profile,
+                        report,
+                        if matches!(result, Err(Error::HidReportTooLarge)) {
+                            WarningCode::IndicatorReportTooLarge
+                        } else if unsupported {
+                            WarningCode::IndicatorWriteUnsupported
+                        } else {
+                            WarningCode::IndicatorWriteFailed
+                        },
+                    );
+                    if unsupported {
+                        self.profiles[profile].indicator_mut(report).settled = Some(target);
+                    }
+                    self.profiles[profile].indicator_mut(report).retry_at =
+                        now.saturating_add(1_000);
+                    self.profiles[profile].indicator_mut(report).rearm = true;
+                    self.advance_indicator();
+                }
+            }
         }
         Ok(self.hidpp_changed(catalog))
     }
@@ -704,7 +1345,7 @@ fn legacy_battery(battery: &mut crate::battery::Battery, register: u8, p: &[u8])
 #[cfg(test)]
 mod battery_tests {
     use super::*;
-    use cordial_protocol::{identifiers::Transport, info::InfoKey, settings::SettingValue};
+    use crate::model::{identifiers::Transport, info::InfoKey, settings::SettingValue};
     #[test]
     fn legacy_registers_and_notifications() {
         let mut b = crate::battery::Battery::default();

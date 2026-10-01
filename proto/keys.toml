@@ -1,0 +1,219 @@
+# Keys for Info and Setting records in cordial.proto.
+#
+# Each [[key]] lists:
+#   key     The key name. `{n}` stands for the index of a repeated part of the device.
+#   lists   Where it can appear: "adapter" (Status.info), "device" (Device.info), "setting".
+#           A key that is a setting where the device accepts writes and information where it
+#           does not lists both "device" and "setting".
+#   type    bool, integer, enum, text or color.
+#   unit    Optional unit for integer keys.
+#   values  Enum values, in display order.
+#   retired Set instead of deleting a key that is no longer sent, so its name is never reused.
+#   retired_values  Enum values no longer sent, for the same reason.
+#
+# Each [[row]] lists keys a client shows together with one Save. Rows are presentation only.
+#
+# tools/check_keys.py validates this file and compares it with an earlier version.
+
+# Adapter information.
+
+[[key]]
+key = "firmware.version"
+lists = ["adapter", "device"]
+type = "text"
+
+[[key]]
+key = "board.name"
+lists = ["adapter"]
+type = "text"
+
+[[key]]
+key = "build.development"
+lists = ["adapter"]
+type = "bool"
+
+[[key]]
+key = "storage.full"
+lists = ["adapter"]
+type = "bool"
+
+# Device information.
+
+[[key]]
+key = "device.manufacturer"
+lists = ["device"]
+type = "text"
+
+[[key]]
+key = "device.model"
+lists = ["device"]
+type = "text"
+
+[[key]]
+key = "device.serial"
+lists = ["device"]
+type = "text"
+
+[[key]]
+key = "bootloader.version"
+lists = ["device"]
+type = "text"
+
+[[key]]
+key = "hardware.revision"
+lists = ["device"]
+type = "text"
+
+[[key]]
+key = "software.revision"
+lists = ["device"]
+type = "text"
+
+[[key]]
+key = "vendor.id"
+lists = ["device"]
+type = "integer"
+
+[[key]]
+key = "vendor.registry"
+lists = ["device"]
+type = "enum"
+values = ["usb", "bluetooth"]
+
+[[key]]
+key = "product.id"
+lists = ["device"]
+type = "integer"
+
+[[key]]
+key = "product.version"
+lists = ["device"]
+type = "integer"
+
+[[key]]
+key = "battery.level"
+lists = ["device"]
+type = "integer"
+unit = "percent"
+
+[[key]]
+key = "battery.charging"
+lists = ["device"]
+type = "bool"
+
+[[key]]
+key = "backlight.current_level"
+lists = ["device"]
+type = "integer"
+
+[[key]]
+key = "backlight.status"
+lists = ["device"]
+type = "enum"
+values = ["disabled", "battery", "automatic", "saturated", "manual", "permanent_manual"]
+
+[[key]]
+key = "wheel.resolution_multiplier"
+lists = ["device"]
+type = "integer"
+
+[[key]]
+key = "wheel.ratchets_per_rotation"
+lists = ["device"]
+type = "integer"
+
+[[key]]
+key = "wheel.diameter"
+lists = ["device"]
+type = "integer"
+unit = "millimetres"
+
+# Settings.
+
+[[key]]
+key = "keyboard.fn_row"
+lists = ["device", "setting"]
+type = "enum"
+values = ["function_keys", "special_actions"]
+
+[[key]]
+key = "backlight.enabled"
+lists = ["device", "setting"]
+type = "bool"
+
+[[key]]
+key = "backlight.mode"
+lists = ["device", "setting"]
+type = "enum"
+values = ["none", "automatic", "temporary_manual", "permanent_manual"]
+
+[[key]]
+key = "backlight.level"
+lists = ["device", "setting"]
+type = "integer"
+
+[[key]]
+key = "backlight.delay.hands_out"
+lists = ["device", "setting"]
+type = "integer"
+unit = "seconds"
+
+[[key]]
+key = "backlight.delay.hands_in"
+lists = ["device", "setting"]
+type = "integer"
+unit = "seconds"
+
+[[key]]
+key = "backlight.delay.powered"
+lists = ["device", "setting"]
+type = "integer"
+unit = "seconds"
+
+[[key]]
+key = "backlight.power_on"
+lists = ["device", "setting"]
+type = "bool"
+
+[[key]]
+key = "backlight.crown"
+lists = ["device", "setting"]
+type = "bool"
+
+[[key]]
+key = "backlight.power_save"
+lists = ["device", "setting"]
+type = "bool"
+
+[[key]]
+key = "backlight.effect"
+lists = ["device", "setting"]
+type = "enum"
+values = ["static", "none", "breathing", "contrast", "reaction", "random", "waves"]
+
+[[key]]
+key = "pointer.sensor.{n}.dpi"
+lists = ["device", "setting"]
+type = "integer"
+unit = "dpi"
+
+[[key]]
+key = "wheel.mode"
+lists = ["device", "setting"]
+type = "enum"
+values = ["freespin", "ratchet"]
+
+[[key]]
+key = "wheel.threshold"
+lists = ["device", "setting"]
+type = "integer"
+
+[[key]]
+key = "wheel.invert"
+lists = ["device", "setting"]
+type = "bool"
+
+[[key]]
+key = "thumbwheel.invert"
+lists = ["device", "setting"]
+type = "bool"

@@ -20,6 +20,5 @@
   "usb_backend": "embassy",
   "storage_backend": "littlefs",
   "radio_backend": "pico-sdk-cyw43",
-  "firmware_bytes": 1048576,
-  "output_frames": 4
+  "firmware_bytes": 1048576
 }

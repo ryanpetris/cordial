@@ -17,7 +17,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isAction } from "../core/actions.ts";
 import { Controller } from "../core/controller.ts";
-import { candidatePorts, hostPlatform, openSerial, watchHotplug } from "../node/serial.ts";
+import { listPorts, openSerial } from "@cordial/client/node";
+import { hostPlatform, watchHotplug } from "../node/host.ts";
 import { preferencesFrom, type Action, type AppState, type Navigation, type Preferences } from "../shared/state.ts";
 import { trayModel, type TrayModel } from "./tray-model.ts";
 import { closeNotifications, showNotification } from "./notifications.ts";
@@ -39,7 +40,6 @@ let controller: Controller;
 let stopHotplug: (() => Promise<void>) | null = null;
 let pendingNavigation: Navigation | null = null;
 /** The device whose settings the window shows, kept while it is hidden. */
-let windowWatch: string | null = null;
 
 // ---- Preferences ----------------------------------------------------------
 
@@ -97,7 +97,6 @@ function showWindow(to?: Navigation) {
   if (to) pendingNavigation = to;
   if (!window) createWindow();
   else {
-    if (!window.isVisible() && windowWatch) void controller.act({ type: "settings.watch", key: windowWatch });
     if (window.isMinimized()) window.restore();
     window.show();
     window.focus();
@@ -162,7 +161,6 @@ function createWindow() {
       window?.hide();
       // Nothing runs for a hidden window: stop discovery and uncommitted
       // pairing, and close the window's dialogs.
-      void controller.act({ type: "settings.watch", key: null });
       void controller.act({ type: "pair.cancel" });
       void controller.act({ type: "pair.dismiss" });
       void controller.act({ type: "scan.stop" });
@@ -276,7 +274,7 @@ function adapterMenu(adapterId: string) {
           enabled: adapter.connection === "disconnected",
           click: () => void act({ type: "adapter.connect", adapterId }),
         },
-    { label: "Rename", enabled: connected && !!adapter.status?.storage_ready, click: () => showWindow({ page: "adapter", id: adapterId, rename: true }) },
+    { label: "Rename", enabled: connected && !!adapter.status?.ready, click: () => showWindow({ page: "adapter", id: adapterId, rename: true }) },
   ]).popup({ window });
 }
 
@@ -322,7 +320,7 @@ void app.whenReady().then(async () => {
   const preferences = loadPreferences();
   savedAutostart = preferences.startAtLogin;
   const fake = Number(process.env.CORDIAL_DESKTOP_SIMULATE ?? 0);
-  const ports = fake > 0 ? (await import("../fake/ports.ts")).simulatedPorts(fake) : { listPorts: candidatePorts, openTransport: openSerial };
+  const ports = fake > 0 ? (await import("../fake/ports.ts")).simulatedPorts(fake) : { listPorts, openTransport: openSerial };
   controller = new Controller({
     ...ports,
     log,
@@ -349,7 +347,6 @@ void app.whenReady().then(async () => {
   ipcMain.handle("act", (event, action: unknown) => {
     if (event.sender !== window?.webContents) throw new Error("unexpected sender");
     if (!isAction(action)) throw new Error("invalid action");
-    if (action.type === "settings.watch") windowWatch = action.key;
     if (action.type === "adapter.menu") {
       adapterMenu(action.adapterId);
       return { ok: true };
