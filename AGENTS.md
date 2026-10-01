@@ -1,5 +1,22 @@
 # Instructions for agents working on Cordial
 
+## Definitions
+
+- Dongle: The embedded system running the Cordial software, such as a Raspberry Pi Pico 2 or an
+  ESP32-S3
+- Device: A keyboard or mouse connected via Bluetooth to the Dongle
+- Host: The computer that uses the emulated USB keyboard and/or mouse and runs the client software.
+
+## Scope
+
+Cordial is software that runs on a Dongle to connect to and translate Bluetooth Classic, BLE, and
+Logitech HID++ Devices into a standard USB keyboard and mouse. The Host software does not provide
+any functionality other than configuration of the Dongle as well as a small amount of reporting
+such as battery percentage and charging status. Any feature that otherwise requires software
+running on the Host to operate is out of scope. Any feature to directly control the Device other
+than to configure it is out of scope. All settings that would be needed to configure the Device
+upon connect must be stored on the Dongle.
+
 ## Commits and pushes
 
 - Commit often, after each working increment. Small commits, plain messages.
