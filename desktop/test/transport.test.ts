@@ -7,8 +7,8 @@ vi.mock("serialport", () => ({ SerialPort: { list: vi.fn() } }));
 it("discovers only ports with the Cordial USB ID and manufacturer", async () => {
   const expected = {
     path: "/dev/ttyACM0",
-    vendorId: "CAFE",
-    productId: "4014",
+    vendorId: "1209",
+    productId: "C0D1",
     manufacturer: "Cordial",
     serialNumber: "0123456789ABCDEF",
     pnpId: undefined,

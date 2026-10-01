@@ -2,7 +2,7 @@
 
 [Protocol index](README.md)
 
-Automatic USB discovery requires VID/PID `cafe:4014` and manufacturer `Cordial`.
+Automatic USB discovery requires VID/PID `1209:c0d1` and manufacturer `Cordial`.
 Hosts read these descriptors before opening the serial port. Explicit CLI port
 selection bypasses discovery filtering.
 CDC occupies interfaces 0 and 1; HID occupies interface 2 with report IDs 1, 2 and 3. Endpoint numbers, optional interface strings and class-descriptor revisions are supplied by the USB implementation and are not host discovery keys. The USB serial number string equals the adapter's `adapter_id`, so a host can recognize an adapter before opening its port; opening and `adapter.status` still confirm it.

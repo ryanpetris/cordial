@@ -10,7 +10,7 @@ class MockPort extends EventTarget {
   written = "";
   #input!: ReadableStreamDefaultController<Uint8Array>;
 
-  constructor(readonly info: SerialPortInfo = { usbVendorId: 0xcafe, usbProductId: 0x4014 }) {
+  constructor(readonly info: SerialPortInfo = { usbVendorId: 0x1209, usbProductId: 0xc0d1 }) {
     super();
   }
   #stream() {
@@ -57,7 +57,7 @@ describe("Web Serial transport", () => {
   it("lists granted Cordial ports with stable paths and no serial number", async () => {
     const a = new MockPort();
     const b = new MockPort();
-    const other = new MockPort({ usbVendorId: 0x1234, usbProductId: 0x4014 });
+    const other = new MockPort({ usbVendorId: 0x1234, usbProductId: 0xc0d1 });
     const first = await listPorts(serialOf(a, other, b));
     expect(first.map((p) => p.serial)).toEqual([null, null]);
     expect(new Set(first.map((p) => p.path)).size).toBe(2);

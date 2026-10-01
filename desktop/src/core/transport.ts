@@ -23,5 +23,5 @@ export interface PortInfo {
 }
 
 /** Cordial's USB vendor and product IDs. */
-export const USB_VENDOR_ID = 0xcafe;
-export const USB_PRODUCT_ID = 0x4014;
+export const USB_VENDOR_ID = 0x1209;
+export const USB_PRODUCT_ID = 0xc0d1;

@@ -248,7 +248,7 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         io: &'d Io,
         buffers: &'d mut Buffers<'d>,
     ) -> Self {
-        let mut config = Config::new(0xcafe, 0x4014);
+        let mut config = Config::new(0x1209, 0xc0d1);
         config.manufacturer = Some("Cordial");
         config.product = Some(default_adapter_name);
         config.serial_number = Some(serial);

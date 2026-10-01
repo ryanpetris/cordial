@@ -25,7 +25,7 @@ pub fn ports() -> io::Result<Vec<PortInfo>> {
     Ok(unique_ports(found))
 }
 fn is_cordial(info: &serialport::UsbPortInfo) -> bool {
-    info.vid == 0xcafe && info.pid == 0x4014 && info.manufacturer.as_deref() == Some("Cordial")
+    info.vid == 0x1209 && info.pid == 0xc0d1 && info.manufacturer.as_deref() == Some("Cordial")
 }
 fn unique_ports(mut found: Vec<PortInfo>) -> Vec<PortInfo> {
     // macOS exposes callout and dial-in names for the same USB serial service.
@@ -101,8 +101,8 @@ mod tests {
     #[test]
     fn discovery_requires_cordial_usb_metadata() {
         let expected = serialport::UsbPortInfo {
-            vid: 0xcafe,
-            pid: 0x4014,
+            vid: 0x1209,
+            pid: 0xc0d1,
             manufacturer: Some("Cordial".into()),
             serial_number: Some("0123456789ABCDEF".into()),
             product: Some("Pico 2 W".into()),
