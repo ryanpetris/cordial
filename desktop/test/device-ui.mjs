@@ -474,7 +474,7 @@ try {
   state.devices = [];
   await page.getByRole("button", { name: "Overview", exact: true }).click();
   await publish();
-  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  await page.getByRole("button", { name: "Refresh Adapters", exact: true }).click();
   assert.ok((await actions()).some((a) => a.type === "adapters.refresh"));
   assert.deepEqual(errors, []);
   console.log("Device UI: settings form, recovery, and Refresh/Retry labels passed");

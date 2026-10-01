@@ -3,7 +3,7 @@ import type { AdapterEntry, AppState, DeviceEntry } from "../../shared/state.ts"
 import { adapterStatus, batteryStale, batteryText, deviceStatus } from "../../shared/text.ts";
 import { act, api, chooseAdapter, reportError } from "../api.ts";
 import type { Selection } from "../App.tsx";
-import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, MenuIcon, PlusIcon, WarningIcon } from "./icons.tsx";
+import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, MenuIcon, PlugIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
 import { isLow } from "../../shared/battery.ts";
 
 function DeviceRow({ d, selected, threshold, onSelect }: { d: DeviceEntry; selected: boolean; threshold: number; onSelect: () => void }) {
@@ -26,6 +26,16 @@ function DeviceRow({ d, selected, threshold, onSelect }: { d: DeviceEntry; selec
       ) : needs ? (
         <WarningIcon />
       ) : null}
+    </button>
+  );
+}
+
+/** A placeholder row that takes the next step for an empty section. */
+function ActionRow({ icon, label, title, onClick }: { icon: React.ReactNode; label: string; title?: string; onClick: () => void }) {
+  return (
+    <button className="side-row action" title={title} onClick={onClick}>
+      <span className="side-icon">{icon}</span>
+      <span className="side-title">{label}</span>
     </button>
   );
 }
@@ -101,6 +111,9 @@ export function Sidebar({
   const connected = state.adapters.filter((a) => a.connection === "connected");
   const threshold = state.preferences.lowBatteryPercent;
   const canAdd = connected.some((a) => a.readiness === "ready");
+  // Without a ready adapter there is nothing to add to, so offer to connect the ones that can be.
+  const connectable = canAdd ? [] : state.adapters.filter((a) => a.connection === "disconnected");
+  const pick = () => void chooseAdapter().then((result) => { if (!result.ok) reportError(result.message); });
   return (
     <nav className="sidebar" aria-label="Devices and adapters">
       <header className="sidebar-header">
@@ -133,7 +146,7 @@ export function Sidebar({
           </span>
           <span className="side-title">Overview</span>
         </button>
-        <h3 className="side-heading">Devices</h3>
+        {state.devices.length || canAdd || connectable.length ? <h3 className="side-heading">Devices</h3> : null}
         {state.devices.map((d) => (
           <DeviceRow
             key={d.key}
@@ -143,11 +156,14 @@ export function Sidebar({
             onSelect={() => onSelect({ page: "device", key: d.key })}
           />
         ))}
-        {state.devices.length === 0 ? <p className="side-empty">{connected.length ? "No Saved Devices" : "No Adapter Connected"}</p> : null}
+        {canAdd && state.devices.length === 0 ? <ActionRow icon={<PlusIcon size={24} />} label="Add Device" onClick={onAdd} /> : null}
+        {connectable.map((a) => (
+          <ActionRow key={a.id} icon={<PlugIcon size={24} />} label={`Connect ${a.name}`} onClick={() => void act({ type: "adapter.connect", adapterId: a.id })} />
+        ))}
         <h3 className="side-heading">
           Adapters
-          {choose ? (
-            <button className="icon-button" title="Choose Adapter" aria-label="Choose Adapter" onClick={() => void chooseAdapter().then((result) => { if (!result.ok) reportError(result.message); })}>
+          {choose && state.adapters.length ? (
+            <button className="icon-button" title="Choose Adapter" aria-label="Choose Adapter" onClick={pick}>
               <PlusIcon />
             </button>
           ) : null}
@@ -177,16 +193,24 @@ export function Sidebar({
             </button>
           );
         })}
-        {state.adapters.length === 0 ? <p className="side-empty">None Found</p> : null}
+        {state.adapters.length === 0 ? (
+          choose ? (
+            <ActionRow icon={<PlusIcon size={24} />} label="Choose Adapter" onClick={pick} />
+          ) : (
+            <ActionRow icon={<RefreshIcon size={24} />} label="Refresh Adapters" title={api.host.desktop ? "Refresh Adapters (F5)" : undefined} onClick={() => void act({ type: "adapters.refresh" })} />
+          )
+        ) : null}
         {menuAdapter ? (
           <AdapterMenu key={menu.id} adapter={menuAdapter} x={menu.x} y={menu.y} onRename={() => onRename(menu.id)} onClose={() => setMenu(null)} />
         ) : null}
       </div>
-      <footer className="sidebar-footer">
-        <button className="suggested wide" disabled={!canAdd} onClick={onAdd}>
-          <PlusIcon /> Add Device
-        </button>
-      </footer>
+      {state.devices.length ? (
+        <footer className="sidebar-footer">
+          <button className="suggested wide" onClick={onAdd}>
+            <PlusIcon /> Add Device
+          </button>
+        </footer>
+      ) : null}
     </nav>
   );
 }

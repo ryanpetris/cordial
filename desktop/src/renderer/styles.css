@@ -14,6 +14,8 @@
   --scrollbar-hover: rgba(0, 0, 6, 0.4);
   --accent: #3584e4;
   --accent-fg: #1c71d8;
+  /* Accent text on the sidebar background, dark enough for 4.5:1 contrast. */
+  --sidebar-accent-fg: #1a5fb4;
   --accent-contrast: #ffffff;
   --destructive: #e01b24;
   --destructive-fg: #c01c28;
@@ -46,6 +48,7 @@
     --scrollbar-hover: rgba(255, 255, 255, 0.4);
     --accent: #3584e4;
     --accent-fg: #78aeed;
+    --sidebar-accent-fg: #78aeed;
     --destructive-fg: #ff7b63;
     --warning-fg: #f8e45c;
     --success: #8ff0a4;
@@ -258,11 +261,6 @@ input.number {
   letter-spacing: 0.04em;
 }
 
-.side-empty {
-  margin: 4px 10px;
-  color: var(--dim);
-}
-
 .side-row {
   display: flex;
   width: 100%;
@@ -292,6 +290,22 @@ input.number {
 
 .side-row.compact {
   min-height: 40px;
+}
+
+/* A dashed slot in accent colour, so an action row reads as the next step rather than an item. */
+.side-row.action {
+  min-height: 44px;
+  margin: 2px 0;
+  border: 1px dashed color-mix(in srgb, var(--sidebar-accent-fg) 45%, transparent);
+  color: var(--sidebar-accent-fg);
+}
+
+.side-row.action .side-icon {
+  color: inherit;
+}
+
+.side-row.action:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
 .side-icon {
