@@ -943,8 +943,12 @@ impl<B: Backend> Model<B> {
                 SettingValue::Bool(b) => Some(b),
                 _ => None,
             };
-            let turn = Action::Draft(s.key, SettingValue::Bool(on != Some(true)));
-            b.toggle("Value", EDITOR_KEY, on, turn);
+            let options = layout::on_off(
+                on,
+                Action::Draft(s.key, SettingValue::Bool(true)),
+                Action::Draft(s.key, SettingValue::Bool(false)),
+            );
+            b.choice("Value", EDITOR_KEY, options);
         } else if !s.choices.is_empty() {
             let options = s
                 .choices
@@ -965,17 +969,12 @@ impl<B: Backend> Model<B> {
                     _ => None,
                 };
                 let on = n.is_some_and(|n| n != 255);
-                let turn = if on {
-                    SettingValue::Integer(255)
-                } else {
-                    smartshift_on(s, &value)
-                };
-                b.toggle(
-                    "Value",
-                    EDITOR_KEY,
+                let options = layout::on_off(
                     n.map(|_| on),
-                    Action::Switch(s.key, turn),
+                    Action::Switch(s.key, smartshift_on(s, &value)),
+                    Action::Switch(s.key, SettingValue::Integer(255)),
                 );
+                b.choice("Value", EDITOR_KEY, options);
                 if on {
                     stepper(&mut b, "Threshold", &smartshift_range(s), &value);
                 }
@@ -1568,7 +1567,7 @@ impl<B: Backend> Model<B> {
     }
 
     /// Left and Right edit the selected setting: the previous or next choice,
-    /// or a fine step. Space turns a toggle over.
+    /// or a fine step. Space switches between On and Off.
     pub(super) fn edit_selected(&mut self, delta: i64, toggle: bool) {
         let Some(st) = self.state() else {
             return;

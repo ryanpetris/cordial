@@ -1057,19 +1057,19 @@ fn an_apply_timeout_reads_the_settings_again_and_keeps_unsent_drafts() {
 }
 
 #[test]
-fn logitech_features_stay_a_dim_toggle_while_settings_are_busy() {
+fn logitech_features_stay_dim_options_while_settings_are_busy() {
     let mut app = App::connected(100, 60);
     app.click(Action::Device("d_1".into()));
-    // The toggle, on its own line, with the cells after its label.
-    let toggle = |app: &mut App| {
+    // The On and Off options, on their own line, with the cells after its label.
+    let options = |app: &mut App| {
         let mut buf = Buffer::empty(Rect::new(0, 0, app.m.width as u16, app.m.height as u16));
         app.m.render(&mut buf);
         for y in 0..buf.area.height {
             let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
             if let Some(i) = row.find("Logitech Features") {
-                let at = row[i..].find("[■ On]").expect(&row) + i;
+                let at = row[i..].find("[● On] [○ Off]").expect(&row) + i;
                 let x = row[..at].chars().count() as u16;
-                return (x..x + 6).map(|x| buf[(x, y)].clone()).collect::<Vec<_>>();
+                return (x..x + 14).map(|x| buf[(x, y)].clone()).collect::<Vec<_>>();
             }
         }
         panic!("no Logitech Features:\n{}", app.screen());
@@ -1080,20 +1080,23 @@ fn logitech_features_stay_a_dim_toggle_while_settings_are_busy() {
             .iter()
             .any(|h| matches!(h.action, Action::Hidpp(_)))
     };
-    let idle = toggle(&mut app);
+    let idle = options(&mut app);
     assert!(hidpp(&app));
     assert!(!idle[0].modifier.contains(ratatui::style::Modifier::DIM));
-    // While the device's settings are applied, it keeps its place and width,
-    // dim and without a target, and sends nothing.
+    // While the device's settings are applied, both options keep their place
+    // and width, dim and without targets, and send nothing.
     app.edit(|st| st.devices[0].settings_state = SettingsState::Applying);
-    let busy = toggle(&mut app);
+    let busy = options(&mut app);
     assert_eq!(busy.len(), idle.len());
     assert!(
         busy.iter()
+            .filter(|c| c.symbol() != " ")
             .all(|c| c.modifier.contains(ratatui::style::Modifier::DIM))
     );
     assert!(!hidpp(&app), "{}", app.screen());
-    app.m.action(Action::Hidpp(false));
+    for on in [true, false] {
+        app.m.action(Action::Hidpp(on));
+    }
     assert!(!app.ran("Hidpp("), "{:?}", app.calls());
 }
 
@@ -1460,7 +1463,7 @@ fn saved_devices_enable_and_disable_without_pairing() {
     app.click(Action::Device("d_1".into()));
     let screen = app.screen();
     assert!(
-        screen.contains("○ Disabled") && screen.contains("Use This Device        [□ Off]"),
+        screen.contains("○ Disabled") && screen.contains("Use This Device        [○ On] [● Off]"),
         "{screen}"
     );
     assert!(!screen.contains("[Connect]"), "{screen}");
@@ -1479,7 +1482,7 @@ fn saved_devices_enable_and_disable_without_pairing() {
     let screen = app.screen();
     assert!(
         screen.contains("! Inactive")
-            && screen.contains("Use This Device        [■ On]")
+            && screen.contains("Use This Device        [● On] [○ Off]")
             && !screen.contains("[Connect]"),
         "{screen}"
     );
@@ -2016,7 +2019,7 @@ fn unnamed_devices_of_unknown_kind_are_hidden_until_shown() {
         "Unnamed Keyboard ",
         "Unnamed Mouse",
         "Unnamed Keyboard/Mouse",
-        "Show Unnamed Devices [□ Off]",
+        "Show Unnamed Devices [○ On] [● Off]",
         "2 unnamed devices hidden",
     ] {
         assert!(screen.contains(shown), "{shown} missing:\n{screen}");
@@ -2077,7 +2080,7 @@ fn unnamed_devices_of_unknown_kind_are_hidden_until_shown() {
     app.click(Action::ShowUnnamed(true));
     let screen = app.screen();
     assert!(
-        screen.contains("Show Unnamed Devices [■ On]")
+        screen.contains("Show Unnamed Devices [● On] [○ Off]")
             && screen.contains("Unnamed Device ")
             && !screen.contains("hidden"),
         "{screen}"
@@ -2104,7 +2107,7 @@ fn unnamed_devices_of_unknown_kind_are_hidden_until_shown() {
 }
 
 #[test]
-fn hiding_unnamed_devices_drops_their_selection_and_space_toggles() {
+fn hiding_unnamed_devices_drops_their_selection_and_space_chooses() {
     use crate::{client::Envelope, controller::Notice};
     use cordial_protocol::messages::DeviceKind;
     let mut app = App::connected(100, 34);
@@ -2127,7 +2130,7 @@ fn hiding_unnamed_devices_drops_their_selection_and_space_toggles() {
     app.edit(|st| st.candidates.clear());
     assert!(app.screen().contains("Use Scan to find nearby devices"));
     app.edit(|st| st.candidates.push(c.clone()));
-    // Tab reaches the toggle; Space and Enter turn it over, keeping the highlight.
+    // Tab reaches each option; Space and Enter choose it, keeping the highlight.
     while app.m.focus != Some(Action::ShowUnnamed(true)) {
         app.press(KeyCode::Tab);
     }
@@ -2153,10 +2156,7 @@ fn hiding_unnamed_devices_drops_their_selection_and_space_toggles() {
     app.m.focus = Some(Action::ShowUnnamed(true));
     app.m.focus_ctx = app.m.focus_context();
     app.press(KeyCode::Enter);
-    assert!(
-        app.m.show_unnamed,
-        "Enter turns the highlighted toggle over"
-    );
+    assert!(app.m.show_unnamed, "Enter chooses the highlighted option");
     app.click(Action::ShowUnnamed(false));
     app.press(KeyCode::Char('p'));
     assert!(!app.ran("Pair("), "{:?}", app.calls());
@@ -2358,7 +2358,7 @@ fn battery_is_listed_once_and_details_show_device_info() {
     for (label, value) in [
         ("Status", "● Connected"),
         ("Security", "Encrypted"),
-        ("Logitech Features", "[■ On]"),
+        ("Logitech Features", "[● On]"),
         ("Vendor ID Namespace", "Bluetooth"),
         ("Serial Number", "SN-0123456789ABCDEF"),
         ("Warning", ""),

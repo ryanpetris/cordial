@@ -1020,7 +1020,7 @@ impl<B: Backend> Model<B> {
             Action::ShowUnnamed(on) => {
                 self.show_unnamed = on;
                 self.drop_hidden_selection();
-                // The checkbox keeps the highlight across the selection change.
+                // The option keeps the highlight across the selection change.
                 self.focus_ctx = self.focus_context();
                 self.reveal = true;
             }

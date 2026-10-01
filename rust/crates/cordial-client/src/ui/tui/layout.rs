@@ -208,6 +208,22 @@ pub struct Choice {
     pub chosen: bool,
 }
 
+/// On and Off options for a boolean. An unknown value chooses neither.
+pub fn on_off(on: Option<bool>, on_action: Action, off_action: Action) -> Vec<Choice> {
+    vec![
+        Choice {
+            label: "On".into(),
+            action: on_action,
+            chosen: on == Some(true),
+        },
+        Choice {
+            label: "Off".into(),
+            action: off_action,
+            chosen: on == Some(false),
+        },
+    ]
+}
+
 impl Layout {
     pub fn new(width: usize) -> Self {
         Self {
@@ -369,42 +385,6 @@ impl Layout {
                 });
             }
             x += w;
-        }
-    }
-    /// An On/Off toggle: one target that turns it over. An unknown value
-    /// shows as such, and the action turns it On.
-    pub fn toggle(&mut self, key: &str, kw: usize, on: Option<bool>, action: Action) {
-        self.toggle_if(key, kw, on, action, true);
-    }
-    /// A toggle drawn in place but dim and without a click target while it
-    /// is unavailable, like `choice_if`.
-    pub fn toggle_if(
-        &mut self,
-        key: &str,
-        kw: usize,
-        on: Option<bool>,
-        action: Action,
-        enabled: bool,
-    ) {
-        self.line(styled(pad_str(key, kw), dim()));
-        let (text, mut look) = match on {
-            Some(true) => ("[■ On]", Tone::Chosen.style()),
-            Some(false) => ("[□ Off]", Tone::Normal.style()),
-            None => ("[□ Unknown]", Tone::Normal.style()),
-        };
-        if !enabled {
-            look = dim();
-        }
-        let text = truncate_str(text, self.width.saturating_sub(kw));
-        let (y, w) = (self.lines.len() - 1, width(&text));
-        self.lines[y].spans.push(span(text, look));
-        if enabled {
-            self.hits.push(Hit {
-                x: kw,
-                y,
-                w,
-                action,
-            });
         }
     }
     /// Indents every line and hit by one cell.

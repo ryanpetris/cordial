@@ -114,30 +114,32 @@ impl Column {
         }
         b.hang(prefix, value, look);
     }
-    /// An On/Off toggle that takes effect at once; `action` turns it over.
-    /// Drawn as a plain value when the adapter doesn't offer changing it.
-    fn toggle(self, b: &mut Layout, label: &str, on: bool, action: Option<Action>) {
-        self.toggle_if(b, label, on, action, true);
+    /// On and Off options that take effect at once; `actions` choose On
+    /// and Off. Drawn as a plain value when the adapter doesn't offer
+    /// changing it.
+    fn on_off(self, b: &mut Layout, label: &str, on: bool, actions: Option<(Action, Action)>) {
+        self.on_off_if(b, label, on, actions, true);
     }
-    /// A toggle that stays in place, dim and without a target, while
-    /// `enabled` is false.
-    fn toggle_if(
+    /// On and Off options that stay in place, dim and without targets,
+    /// while `enabled` is false.
+    fn on_off_if(
         self,
         b: &mut Layout,
         label: &str,
         on: bool,
-        action: Option<Action>,
+        actions: Option<(Action, Action)>,
         enabled: bool,
     ) {
-        let Some(action) = action else {
+        let Some((on_action, off_action)) = actions else {
             self.field(b, label, if on { "On" } else { "Off" }, layout::plain());
             return;
         };
+        let options = layout::on_off(Some(on), on_action, off_action);
         if self.stacked {
             b.line(styled(label.to_string(), dim()));
-            b.toggle_if("", 2, Some(on), action, enabled);
+            b.choice_if("", 2, options, enabled);
         } else {
-            b.toggle_if(label, self.kw, Some(on), action, enabled);
+            b.choice_if(label, self.kw, options, enabled);
         }
     }
 }
@@ -354,11 +356,11 @@ pub(super) fn settings_status(d: &Device) -> Option<(String, Style)> {
 
 /// The Logitech Features preference and the status of what it permits:
 /// special keys and device settings. The preference is saved per device, so
-/// it stays changeable while the device is disconnected. The toggle is dim
-/// and has no target while `idle` is false.
+/// it stays changeable while the device is disconnected. Its options are dim
+/// and have no targets while `idle` is false.
 fn hidpp_section(b: &mut Layout, c: Column, st: &State, d: &Device, offered: bool, idle: bool) {
-    let action = offered.then_some(Action::Hidpp(!d.hidpp_enabled));
-    c.toggle_if(b, "Logitech Features", d.hidpp_enabled, action, idle);
+    let actions = offered.then_some((Action::Hidpp(true), Action::Hidpp(false)));
+    c.on_off_if(b, "Logitech Features", d.hidpp_enabled, actions, idle);
     if pending_for(st, "device.hidpp.set", &d.device_id.0).is_some() {
         c.more(b, None, &format!("{} Saving…", spinner()), warn());
         return;
@@ -378,8 +380,8 @@ fn hidpp_section(b: &mut Layout, c: Column, st: &State, d: &Device, offered: boo
     }
 }
 
-/// Actions drawn as the details card's toggles rather than buttons.
-fn policy_toggle(action: &Action) -> bool {
+/// Actions drawn as the details card's On and Off options rather than buttons.
+fn policy_option(action: &Action) -> bool {
     matches!(
         action,
         Action::Enable
@@ -608,7 +610,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("r", "Refresh the device list."),
             (
                 "Tab",
-                "Move between controls; Shift+Tab moves back. Enter activates the highlighted control, and Enter or Space toggles a highlighted checkbox such as Show Unnamed Devices.",
+                "Move between controls; Shift+Tab moves back. Enter activates the highlighted control, and Enter or Space chooses a highlighted On or Off option such as Show Unnamed Devices.",
             ),
             ("y n", "Answer confirmations and code comparisons."),
             ("PgUp PgDn", "Scroll the activity log."),
@@ -1407,12 +1409,14 @@ impl<B: Backend> Model<B> {
         b.line(styled("NEARBY", dim()));
         let hidden = self.unnamed_hidden();
         if !scan_choices(st).is_empty() || !st.candidates.is_empty() || hidden > 0 {
-            let on = self.show_unnamed;
-            b.toggle(
+            b.choice(
                 "Show Unnamed Devices ",
                 21,
-                Some(on),
-                Action::ShowUnnamed(!on),
+                layout::on_off(
+                    Some(self.show_unnamed),
+                    Action::ShowUnnamed(true),
+                    Action::ShowUnnamed(false),
+                ),
             );
         }
         let mut nearby = 0;
@@ -1543,31 +1547,26 @@ impl<B: Backend> Model<B> {
                     kind = format!("{roles} · {kind}");
                 }
                 c.field(&mut b, "Type", &kind, layout::plain());
-                // A toggle offers turning it over, so its action follows the value.
-                let policy = |value: bool, on: Action, off: Action| {
-                    (self.offers(st, &on) && self.offers(st, &off)).then_some(if value {
-                        off
-                    } else {
-                        on
-                    })
+                let policy = |on: Action, off: Action| {
+                    (self.offers(st, &on) && self.offers(st, &off)).then_some((on, off))
                 };
-                c.toggle(
+                c.on_off(
                     &mut b,
                     "Use This Device",
                     d.enabled,
-                    policy(d.enabled, Action::Enable, Action::Disable),
+                    policy(Action::Enable, Action::Disable),
                 );
-                c.toggle(
+                c.on_off(
                     &mut b,
                     "Automatic Connections",
                     d.trusted,
-                    policy(d.trusted, Action::Trust, Action::Untrust),
+                    policy(Action::Trust, Action::Untrust),
                 );
-                c.toggle(
+                c.on_off(
                     &mut b,
                     "Block Connections",
                     d.blocked,
-                    policy(d.blocked, Action::Block, Action::Unblock),
+                    policy(Action::Block, Action::Unblock),
                 );
                 if needs {
                     c.field(&mut b, "Reconnect", "Not Until Paired Again", warn());
@@ -1618,12 +1617,12 @@ impl<B: Backend> Model<B> {
             }
             _ => b.para("Select a device to see its details and actions.", dim()),
         }
-        // Policy toggles are drawn as toggles in the card; their
+        // Policy actions are drawn as On and Off options in the card; their
         // shortcuts still use these actions.
         for a in self
             .device_actions(st)
             .into_iter()
-            .filter(|a| !policy_toggle(&a.action))
+            .filter(|a| !policy_option(&a.action))
         {
             if a.right {
                 actions.button_right(a.label, a.action, a.tone);
@@ -2141,9 +2140,9 @@ mod tests {
             let shown = help_text(&st, "Mouse and Keyboard", key, text).unwrap();
             assert!(shown.contains("Nearby"), "{key}: {shown}");
         }
-        // Checkbox keys are described wherever the controls are.
+        // On and Off option keys are described wherever the controls are.
         let tab = keys.iter().find(|(k, _)| *k == "Tab").unwrap().1;
         let shown = help_text(&st, "Mouse and Keyboard", "Tab", tab).unwrap();
-        assert!(shown.contains("Enter or Space toggles"), "{shown}");
+        assert!(shown.contains("Enter or Space chooses"), "{shown}");
     }
 }

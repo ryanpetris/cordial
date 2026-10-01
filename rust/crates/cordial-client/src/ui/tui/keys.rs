@@ -35,30 +35,28 @@ pub fn name(k: &KeyEvent) -> String {
     base.to_owned()
 }
 
-/// Whether two actions are the same toggle, before and after it flips, so
-/// the highlight stays on it.
-fn same_toggle(a: &Action, b: &Action) -> bool {
+/// Whether an action is an On or Off option, which Space also chooses.
+fn on_off_option(a: &Action) -> bool {
     use Action::*;
-    match (a, b) {
-        (Enable | Disable, Enable | Disable)
-        | (Trust | Untrust, Trust | Untrust)
-        | (Block | Unblock, Block | Unblock)
-        | (Hidpp(_), Hidpp(_))
-        | (ShowUnnamed(_), ShowUnnamed(_)) => true,
-        (Draft(j, SettingValue::Bool(_)), Draft(k, SettingValue::Bool(_))) => j == k,
-        (Switch(j, _), Switch(k, _)) => j == k,
-        _ => false,
-    }
+    matches!(
+        a,
+        Enable
+            | Disable
+            | Trust
+            | Untrust
+            | Block
+            | Unblock
+            | Hidpp(_)
+            | ShowUnnamed(_)
+            | Draft(_, SettingValue::Bool(_))
+            | Switch(..)
+    )
 }
 
 impl<B: Backend> Model<B> {
     pub(super) fn focus_hit(&self) -> Option<Hit> {
         let focus = self.focus.as_ref()?;
-        self.hits
-            .iter()
-            .find(|h| h.action == *focus)
-            .or_else(|| self.hits.iter().find(|h| same_toggle(&h.action, focus)))
-            .cloned()
+        self.hits.iter().find(|h| h.action == *focus).cloned()
     }
 
     fn move_focus(&mut self, delta: isize) {
@@ -72,10 +70,11 @@ impl<B: Backend> Model<B> {
             return;
         }
         let n = controls.len() as isize;
-        let i = match self.focus.as_ref().and_then(|f| {
-            (controls.iter().position(|a| *a == f))
-                .or_else(|| controls.iter().position(|a| same_toggle(a, f)))
-        }) {
+        let i = match self
+            .focus
+            .as_ref()
+            .and_then(|f| controls.iter().position(|a| *a == f))
+        {
             Some(i) => i as isize,
             None if delta < 0 => 0,
             None => -1,
@@ -221,7 +220,7 @@ impl<B: Backend> Model<B> {
         let check = key == " "
             && !self.form_focused
             && !self.files.editing
-            && self.focus.as_ref().is_some_and(|f| same_toggle(f, f));
+            && self.focus.as_ref().is_some_and(on_off_option);
         if (key == "enter" || check)
             && let Some(h) = self.focus_hit()
         {
