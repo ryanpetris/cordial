@@ -16,14 +16,17 @@ try {
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1100, 900));
   await page.getByRole('button', { name: /^Pico W/ }).first().waitFor();
   await page.getByRole('button', { name: /^Pico W/ }).first().click();
-  const rename = page.getByRole('button', { name: 'Rename…', exact: true });
+  // The page bar's Rename opens the dialog; the dialog's Rename submits it.
+  const bar = page.locator('.page-bar');
+  const rename = bar.getByRole('button', { name: 'Rename', exact: true });
+  const submit = page.getByRole('dialog').getByRole('button', { name: 'Rename', exact: true });
   await rename.click();
   const input = page.getByRole('textbox', { name: 'Adapter name' });
   assert.equal(await input.inputValue(), 'Pico W');
   await input.fill('é'.repeat(33));
-  assert.equal(await page.getByRole('button', { name: 'Rename', exact: true }).isDisabled(), true);
+  assert.equal(await submit.isDisabled(), true);
   await input.fill('Desk \u{10400}');
-  await page.getByRole('button', { name: 'Rename', exact: true }).click();
+  await submit.click();
   await input.waitFor({ state: 'hidden' });
   await page.getByRole('heading', { name: 'Desk \u{10400}', exact: true }).waitFor({ state: 'attached' });
   await rename.click();
@@ -38,17 +41,18 @@ try {
   // Give both adapters the same name and verify the displayed and editable values.
   await rename.click();
   await input.fill('XIAO ESP32-S3');
-  await page.getByRole('button', { name: 'Rename', exact: true }).click();
+  await submit.click();
   await input.waitFor({ state: 'hidden' });
   await page.getByRole('heading', { name: 'XIAO ESP32-S3', exact: true }).waitFor({ state: 'attached' });
   await rename.click();
   assert.equal(await input.inputValue(), 'XIAO ESP32-S3');
   await page.getByRole('button', { name: 'Cancel', exact: true }).click();
-  await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
-  await page.getByRole('button', { name: 'Connect', exact: true }).waitFor();
+  assert.equal(await page.locator('.page-header button').count(), 0);
+  await bar.getByRole('button', { name: 'Disconnect', exact: true }).click();
+  await bar.getByRole('button', { name: 'Connect', exact: true }).waitFor();
   assert.equal(await rename.isDisabled(), true);
-  await page.getByRole('button', { name: 'Connect', exact: true }).click();
-  await page.getByRole('button', { name: 'Disconnect', exact: true }).waitFor();
+  await bar.getByRole('button', { name: 'Connect', exact: true }).click();
+  await bar.getByRole('button', { name: 'Disconnect', exact: true }).waitFor();
   await page.getByRole('heading', { name: 'XIAO ESP32-S3', exact: true }).waitFor({ state: 'attached' });
   await app.evaluate(({ ipcMain }) => {
     ipcMain.removeHandler('act');
@@ -56,14 +60,14 @@ try {
   });
   await rename.click();
   await input.fill('Failed draft');
-  await page.getByRole('button', { name: 'Rename', exact: true }).click();
+  await submit.click();
   await page.getByText('Could not save name', { exact: true }).waitFor();
   assert.equal(await input.inputValue(), 'Failed draft');
   await app.evaluate(({ ipcMain }) => {
     ipcMain.removeHandler('act');
     ipcMain.handle('act', () => new Promise((resolve) => { globalThis.renameReply = resolve; }));
   });
-  await page.getByRole('button', { name: 'Rename', exact: true }).click();
+  await submit.click();
   assert.equal(await page.getByRole('button', { name: 'Cancel', exact: true }).isDisabled(), true);
   await page.keyboard.press('Escape');
   assert.equal(await input.isVisible(), true);

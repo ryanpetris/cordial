@@ -93,6 +93,15 @@ export const MenuIcon = ({ size = 16 }: Props) => svg(size, <path d="M4 7h16M4 1
 export const ChevronIcon = ({ size = 16 }: Props) => svg(size, <path d="M9 6l6 6-6 6" />);
 export const PlusIcon = ({ size = 16 }: Props) => svg(size, <path d="M12 5v14M5 12h14" />);
 export const CheckIcon = ({ size = 16 }: Props) => svg(size, <path d="M5 12.5l4.5 4.5L19 7.5" />);
+export const CloseIcon = ({ size = 16 }: Props) => svg(size, <path d="M7 7l10 10M17 7 7 17" />);
+export const UndoIcon = ({ size = 16 }: Props) => svg(size, <path d="M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11" />);
+export const TrashIcon = ({ size = 16 }: Props) => svg(size, <path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3" />);
+export const PencilIcon = ({ size = 16 }: Props) => svg(size, <path d="M4 20l1-4.5L15.5 5a2.1 2.1 0 0 1 3 3L8 18.5zM13.5 7l3 3" />);
+export const PlugIcon = ({ size = 16 }: Props) => svg(size, <path d="M9 3v4M15 3v4M7 7h10v3a5 5 0 0 1-10 0zM12 15v6" />);
+export const UnplugIcon = ({ size = 16 }: Props) => svg(size, <path d="M9 3v4M15 3v4M7 7h10v3a5 5 0 0 1-10 0zM12 15v6M3 3l18 18" />);
+export const LinkIcon = ({ size = 16 }: Props) =>
+  svg(size, <path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1.2 1.2M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1.2-1.2" />);
+export const SwapIcon = ({ size = 16 }: Props) => svg(size, <path d="M4 8h15M15 4l4 4-4 4M20 16H5M9 12l-4 4 4 4" />);
 export const WarningIcon = ({ size = 16 }: Props) =>
   svg(size, <path d="M12 3.5l9.5 16.5h-19zM12 10v4.5M12 17.2h.01" />);
 

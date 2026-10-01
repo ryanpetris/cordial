@@ -4,7 +4,7 @@ import type { AppState, PairingPrompt } from "../../shared/state.ts";
 import { PAIR_UNAVAILABLE, TRANSPORTS, clean } from "../../shared/text.ts";
 import { act, useAction } from "../api.ts";
 import { Banner, Dialog, Spinner, Switch } from "./common.tsx";
-import { CheckIcon, DeviceIcon, WarningIcon } from "./icons.tsx";
+import { CheckIcon, CloseIcon, DeviceIcon, LinkIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
 
 const kindOf = (c: Candidate) => (c.kind === "unknown" ? "other" : c.kind);
 
@@ -61,10 +61,10 @@ function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
         {problem}
         <div className="actions center">
           <button disabled={busy} onClick={() => void reply(false)}>
-            Codes Differ
+            <CloseIcon /> Codes Differ
           </button>
           <button className="suggested" disabled={busy} onClick={() => void reply(true)}>
-            Codes Match
+            <CheckIcon /> Codes Match
           </button>
         </div>
       </div>
@@ -93,10 +93,10 @@ function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
       {problem}
       <div className="actions center">
         <button type="button" disabled={busy} onClick={() => void reply(false)}>
-          Reject
+          <CloseIcon /> Reject
         </button>
         <button type="submit" className="suggested" disabled={busy || !valid}>
-          Pair
+          <LinkIcon /> Pair
         </button>
       </div>
     </form>
@@ -213,11 +213,21 @@ export function AddDevice({
           </div>
         ) : null}
         <footer className="dialog-footer">
-          {pairing.phase === "pairing" ? <button onClick={cancelPairing}>Cancel Pairing</button> : null}
-          {pairing.phase === "failed" || pairing.phase === "cancelled" ? <button onClick={again}>{pairing.phase === "failed" ? "Retry" : "Refresh"}</button> : null}
+          {pairing.phase === "pairing" ? (
+            <button onClick={cancelPairing}>
+              <CloseIcon /> Cancel Pairing
+            </button>
+          ) : null}
+          {pairing.phase === "failed" || pairing.phase === "cancelled" ? (
+            <button onClick={again}>
+              <RefreshIcon /> {pairing.phase === "failed" ? "Retry" : "Refresh"}
+            </button>
+          ) : null}
           {pairing.phase === "connected" || pairing.phase === "saved" ? (
             <>
-              <button onClick={again}>Add Another</button>
+              <button onClick={again}>
+                <PlusIcon /> Add Another
+              </button>
               <button
                 className="suggested"
                 onClick={() => {
@@ -225,13 +235,13 @@ export function AddDevice({
                   close();
                 }}
               >
-                Done
+                <CheckIcon /> Done
               </button>
             </>
           ) : null}
           {pairing.phase === "failed" || pairing.phase === "cancelled" ? (
             <button className="suggested" onClick={close}>
-              Close
+              <CloseIcon /> Close
             </button>
           ) : null}
         </footer>
@@ -258,11 +268,13 @@ export function AddDevice({
               <Spinner /> Searching…
             </>
           ) : (problem ?? scan?.error) ? (
-            <Banner kind="error" action={<button disabled={starting} onClick={again}>{searchFailed || scan?.error ? "Retry" : "Refresh"}</button>}>
+            <Banner kind="error" action={<button disabled={starting} onClick={again}><RefreshIcon /> {searchFailed || scan?.error ? "Retry" : "Refresh"}</button>}>
               {problem ?? scan?.error}
             </Banner>
           ) : (
-            <button disabled={starting} onClick={again}>Refresh</button>
+            <button disabled={starting} onClick={again}>
+              <RefreshIcon /> Refresh
+            </button>
           )}
         </div>
         <ul className="candidates" aria-label="Nearby devices">
@@ -280,7 +292,7 @@ export function AddDevice({
                   <span className="muted small">{a.reason ? PAIR_UNAVAILABLE[a.reason] : "Can't Add Now"}</span>
                 ) : (
                   <button className="suggested" disabled={starting} onClick={() => chosen && void attempt({ type: "pair.start", adapterId: chosen.id, candidateId: c.candidate_id })}>
-                    Pair
+                    <LinkIcon /> Pair
                   </button>
                 )}
               </li>
@@ -300,7 +312,9 @@ export function AddDevice({
           <Switch label="Show Unnamed Devices" checked={unnamed} onChange={setUnnamed} />
         </div>
         <footer className="dialog-footer">
-          <button onClick={close}>Cancel</button>
+          <button onClick={close}>
+            <CloseIcon /> Cancel
+          </button>
         </footer>
       </>
     );

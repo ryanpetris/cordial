@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import type { Setting, SettingKey, SettingValue } from "../../protocol/types.ts";
 import { isLow } from "../../shared/battery.ts";
 import { settingsBusy, settingsLive } from "../../shared/settings.ts";
@@ -24,8 +25,21 @@ import {
   wheelInfo,
 } from "../../shared/text.ts";
 import { act, useAction } from "../api.ts";
-import { Banner, Card, Dialog, Fact, Facts, Page, Pill, Row, Segmented, Spinner, Switch, SwitchRow, Tabs } from "./common.tsx";
-import { BatteryGlyph, DeviceIcon, RefreshIcon, StateMark, type MarkShape } from "./icons.tsx";
+import { Banner, Card, Dialog, Fact, Facts, Page, Pill, Row, Segmented, Spinner, Switch, SwitchRow, TabBar, TabPanel } from "./common.tsx";
+import {
+  BatteryGlyph,
+  CheckIcon,
+  CloseIcon,
+  DeviceIcon,
+  PlugIcon,
+  PlusIcon,
+  RefreshIcon,
+  StateMark,
+  TrashIcon,
+  UndoIcon,
+  UnplugIcon,
+  type MarkShape,
+} from "./icons.tsx";
 
 function valueText(s: Setting, v: SettingValue): string {
   if (v === null) return "Unknown";
@@ -488,14 +502,17 @@ function resolved(entry: DeviceEntry, s: Setting | undefined, item: SettingsSave
 /** Statuses that end a submitted change's draft: it is saved, even if not applied. */
 const DONE: SettingsSaveItem["status"][] = ["applied", "saved", "not_applied"];
 
-/** The settings form: every staged change goes to the device together with Save. */
-function Settings({ entry, adapter, drafts, waited, onRetry }: {
+/** The settings form: every staged change goes to the device together with
+ * Save. Its buttons go in the page bar, `bar`, outside the form. */
+function Settings({ entry, adapter, drafts, bar, waited, onRetry }: {
   entry: DeviceEntry;
   adapter: AdapterEntry | undefined;
   drafts: Drafts;
+  bar: HTMLElement | null;
   waited: (ms: number) => boolean;
   onRetry: () => void;
 }) {
+  const formId = useId();
   const [refreshing, runRefresh] = useAction(true);
   const [saving, runSave] = useAction(true);
   const [problem, setProblem] = useState<string | null>(null);
@@ -569,7 +586,7 @@ function Settings({ entry, adapter, drafts, waited, onRetry }: {
     <>
       <span className="muted">Couldn't read the device's settings.</span>
       <button type="button" onClick={onRetry}>
-        Retry
+        <RefreshIcon /> Retry
       </button>
     </>
   );
@@ -608,58 +625,65 @@ function Settings({ entry, adapter, drafts, waited, onRetry }: {
   });
   const working = saving || refreshing || !!submission?.running || d.settings_state === "applying" || d.settings_state === "discovering";
 
+  const footer = (
+    <>
+      <span className="bar-start">
+        {working ? <Spinner /> : null}
+        {note ? <span className="error-text">{note}</span> : null}
+        {loadFailed ? loadProblem : null}
+      </span>
+      <button type="button" {...guard(!busy && live && !loadFailed, () => void refresh())}>
+        <RefreshIcon /> Refresh
+      </button>
+      {retryable.length ? (
+        <button type="button" {...guard(canRetry, () => void submit(retry.map((i) => i.change), []))}>
+          <RefreshIcon /> Retry
+        </button>
+      ) : null}
+      <button type="button" {...guard(!busy && dirty, () => drafts.clear())}>
+        <UndoIcon /> Discard
+      </button>
+      <button type="submit" form={formId} className="suggested" aria-disabled={!canSave}>
+        <CheckIcon /> Save
+      </button>
+    </>
+  );
+
   return (
-    <form
-      ref={form}
-      className={busy ? "settings-form busy" : "settings-form"}
-      aria-busy={working}
-      onSubmit={onSubmit}
-      onKeyDown={(e) => {
-        const t = e.target as HTMLElement;
-        if (e.key === "Enter" && (t.tagName === "INPUT" || t.tagName === "SELECT")) {
-          e.preventDefault();
-          save();
-        }
-      }}
-    >
-      <div className="settings-fields">
-        {categories.map((category) => {
-          const rows = settings.filter((s) => SETTINGS[s.key].category === category);
-          const wheel = rows.find((s) => s.key === "wheel.info");
-          return (
-            <Card key={category} title={category}>
-              {rows
-                .filter((s) => s !== wheel)
-                .map((s) => (
-                  <SettingRow key={s.key} entry={entry} s={s} drafts={drafts} guards={guards} item={itemFor(s.key)} />
-                ))}
-              {wheel ? <WheelInfo entry={entry} s={wheel} /> : null}
-            </Card>
-          );
-        })}
-      </div>
-      <div className="settings-footer">
-        <span className="actions-note">
-          {working ? <Spinner /> : null}
-          {note ? <span className="error-text">{note}</span> : null}
-          {loadFailed ? loadProblem : null}
-        </span>
-        <button type="button" {...guard(!busy && live && !loadFailed, () => void refresh())}>
-          <RefreshIcon /> Refresh
-        </button>
-        {retryable.length ? (
-          <button type="button" {...guard(canRetry, () => void submit(retry.map((i) => i.change), []))}>
-            Retry
-          </button>
-        ) : null}
-        <button type="button" {...guard(!busy && dirty, () => drafts.clear())}>
-          Discard
-        </button>
-        <button type="submit" className="suggested" aria-disabled={!canSave}>
-          Save
-        </button>
-      </div>
-    </form>
+    <>
+      <form
+        ref={form}
+        id={formId}
+        className={busy ? "settings-form busy" : "settings-form"}
+        aria-busy={working}
+        onSubmit={onSubmit}
+        onKeyDown={(e) => {
+          const t = e.target as HTMLElement;
+          if (e.key === "Enter" && (t.tagName === "INPUT" || t.tagName === "SELECT")) {
+            e.preventDefault();
+            save();
+          }
+        }}
+      >
+        <div className="settings-fields">
+          {categories.map((category) => {
+            const rows = settings.filter((s) => SETTINGS[s.key].category === category);
+            const wheel = rows.find((s) => s.key === "wheel.info");
+            return (
+              <Card key={category} title={category}>
+                {rows
+                  .filter((s) => s !== wheel)
+                  .map((s) => (
+                    <SettingRow key={s.key} entry={entry} s={s} drafts={drafts} guards={guards} item={itemFor(s.key)} />
+                  ))}
+                {wheel ? <WheelInfo entry={entry} s={wheel} /> : null}
+              </Card>
+            );
+          })}
+        </div>
+      </form>
+      {bar ? createPortal(footer, bar) : null}
+    </>
   );
 }
 
@@ -674,7 +698,11 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
   // The last failed action on this page, shown next to the control that ran it.
   const [failure, setFailure] = useState<{ at: string; message: string } | null>(null);
   const [forgetting, setForgetting] = useState(false);
-  const [chosen, setTab] = useState<"settings" | "details">("settings");
+  // A connected device opens on its settings, any other on its details,
+  // where Connect is; the tab stays put as the connection changes.
+  const [chosen, setTab] = useState<"settings" | "details">(() => (entry.device.state === "connected" ? "settings" : "details"));
+  const tabs = useId();
+  const [settingsBar, setSettingsBar] = useState<HTMLElement | null>(null);
   const d = entry.device;
   const adapter = state.adapters.find((a) => a.id === entry.adapterId);
   const connected = d.state === "connected";
@@ -732,27 +760,54 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
           ) : null}
         </>
       }
-      actions={
-        <>
-          {busy || connecting ? <Spinner /> : null}
-          {connecting ? (
-            <button disabled={cancelBusy} onClick={cancel}>
-              Cancel
-            </button>
-          ) : connected || d.state === "connecting" ? (
-            <button disabled={busy} onClick={() => void perform("connection", run, { type: "device.disconnect", key: entry.key })}>
-              Disconnect
-            </button>
-          ) : (
-            <button disabled={busy || !canConnect} onClick={() => void connect()}>
-              Connect
-            </button>
-          )}
-        </>
+      nav={
+        <TabBar
+          id={tabs}
+          label="Device"
+          tabs={[
+            ["settings", "Settings", !settings],
+            ["details", "Details"],
+          ]}
+          value={tab}
+          onChange={setTab}
+        />
+      }
+      bar={
+        tab === "settings" ? (
+          <div ref={setSettingsBar} className="bar-slot" />
+        ) : (
+          <>
+            <span className="bar-start">
+              <button
+                className="destructive"
+                onClick={() => {
+                  setFailure(null);
+                  setForgetting(true);
+                }}
+              >
+                <TrashIcon /> Forget Device
+              </button>
+            </span>
+            {busy || connecting ? <Spinner /> : null}
+            {connecting ? (
+              <button disabled={cancelBusy} onClick={cancel}>
+                <CloseIcon /> Cancel
+              </button>
+            ) : connected || d.state === "connecting" ? (
+              <button disabled={busy} onClick={() => void perform("connection", run, { type: "device.disconnect", key: entry.key })}>
+                <UnplugIcon /> Disconnect
+              </button>
+            ) : (
+              <button className={canConnect ? "suggested" : undefined} disabled={busy || !canConnect} onClick={() => void connect()}>
+                <PlugIcon /> Connect
+              </button>
+            )}
+          </>
+        )
       }
     >
       {d.pairing_state === "needs_pairing" ? (
-        <Banner kind="warning" action={<button onClick={onAdd}>Add Device…</button>}>
+        <Banner kind="warning" action={<button onClick={onAdd}><PlusIcon /> Add Device</button>}>
           Needs Pairing Again
         </Banner>
       ) : d.validation_error ? (
@@ -766,20 +821,13 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
         <Banner key={w}>{WARNINGS[w]}</Banner>
       ))}
 
-      <Tabs
-        label="Device"
-        tabs={[
-          ["settings", "Settings", !settings],
-          ["details", "Details"],
-        ]}
-        value={tab}
-        onChange={setTab}
-      >
+      <TabPanel id={tabs} value={tab}>
         {tab === "settings" ? (
           <Settings
             entry={entry}
             adapter={adapter}
             drafts={drafts}
+            bar={settingsBar}
             waited={settingsWaited}
             onRetry={() => {
               setAttempt((n) => n + 1);
@@ -867,27 +915,17 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
                 </div>
               ) : null}
             </Card>
-
-            <div className="actions">
-              <button
-                className="destructive"
-                onClick={() => {
-                  setFailure(null);
-                  setForgetting(true);
-                }}
-              >
-                Forget Device…
-              </button>
-            </div>
           </>
         )}
-      </Tabs>
+      </TabPanel>
 
       <Dialog open={forgetting} title={`Forget “${entry.name}”?`} onClose={() => setForgetting(false)}>
         <p className="dialog-body">The adapter deletes its pairing and saved settings for this device.</p>
         {failed("unpair") ? <p className="dialog-body error-text">{failed("unpair")}</p> : null}
         <footer className="dialog-footer">
-          <button onClick={() => setForgetting(false)}>Cancel</button>
+          <button onClick={() => setForgetting(false)}>
+            <CloseIcon /> Cancel
+          </button>
           <button
             className="destructive"
             disabled={busy}
@@ -896,7 +934,7 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
               if (result.ok) setForgetting(false);
             }}
           >
-            Forget
+            <TrashIcon /> Forget
           </button>
         </footer>
       </Dialog>

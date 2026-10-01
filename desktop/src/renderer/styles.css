@@ -214,7 +214,6 @@ input.number {
 }
 
 .sidebar-header button,
-.page-header button,
 .dialog {
   -webkit-app-region: no-drag;
 }
@@ -366,7 +365,7 @@ input.number {
 }
 
 /* A bar as tall as the window controls, which sit over its right end; its
-   actions stop short of them. */
+   contents stop short of them. */
 .page-header {
   display: flex;
   height: 46px;
@@ -393,14 +392,6 @@ input.number {
   font-weight: 800;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.page-actions {
-  display: flex;
-  flex: 1;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
 }
 
 .pill {
@@ -438,11 +429,13 @@ input.number {
   color: var(--destructive-fg);
 }
 
-/* An empty state inside a page, centred in the space below its header. */
+/* An empty state inside a page, centred in the space the page scrolls in;
+   even padding above and below keeps it centred. */
 .page:has(> .page-empty) {
   display: flex;
   min-height: 100%;
   flex-direction: column;
+  padding-bottom: 8px;
 }
 
 .page-empty {
@@ -643,11 +636,69 @@ button.row {
   box-shadow: 0 1px 2px rgba(0, 0, 6, 0.18);
 }
 
-.tabs {
-  display: flex;
-  gap: 4px;
-  margin: 18px 0;
+/* A tab row joined to the page header, fixed above the scrolling page: the
+   header's rule moves below the tabs. */
+.page-header:has(+ .tab-bar) {
+  border-bottom: none;
+}
+
+/* The tab row and the page bar line up with the page column; their side
+   padding stands in for the page's 10px scrollbar gutter. */
+.tab-bar,
+.page-bar {
+  flex: none;
+  padding: 0 10px;
+}
+
+.tab-bar {
   border-bottom: 1px solid var(--border);
+}
+
+.tab-bar-inner,
+.page-bar-inner {
+  display: flex;
+  max-width: 740px;
+  margin: 0 auto;
+  padding: 0 22px;
+}
+
+.tab-bar-inner {
+  gap: 4px;
+}
+
+/* The page's actions, fixed below the scrolling page. A bar with no buttons
+   in it is hidden. */
+.page-bar {
+  border-top: 1px solid var(--border);
+}
+
+.page-bar:not(:has(button)) {
+  display: none;
+}
+
+/* In a narrow window the buttons wrap onto a second row rather than overflow. */
+.page-bar-inner {
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-block: 10px;
+}
+
+/* Lays its contents out as part of the page bar. */
+.bar-slot {
+  display: contents;
+}
+
+/* The start of the page bar; the buttons after it sit at the end. When its
+   contents don't fit beside them, it takes a row of its own. */
+.bar-start {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 
 .tab {
@@ -969,18 +1020,6 @@ button.row {
   color: var(--accent-fg);
 }
 
-.settings-footer {
-  position: sticky;
-  bottom: 0;
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  justify-content: flex-end;
-  margin: 14px 0 0;
-  padding: 10px 0;
-  background: var(--window);
-}
-
 button[aria-disabled="true"] {
   opacity: 0.5;
   cursor: default;
@@ -1028,15 +1067,6 @@ button.suggested[aria-disabled="true"]:hover {
 /* Concise feedback about a failed action, next to where it ran. */
 .error-text {
   color: var(--destructive-fg);
-}
-
-.actions-note {
-  display: flex;
-  flex: 1;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
 }
 
 /* Last known battery readings. */
@@ -1113,7 +1143,7 @@ button.suggested[aria-disabled="true"]:hover {
   background: color-mix(in srgb, var(--warning) 18%, transparent);
 }
 
-.banner.warning svg {
+.banner.warning > svg {
   color: var(--warning-fg);
 }
 
@@ -1121,7 +1151,7 @@ button.suggested[aria-disabled="true"]:hover {
   background: color-mix(in srgb, var(--destructive) 14%, transparent);
 }
 
-.banner.error svg {
+.banner.error > svg {
   color: var(--destructive-fg);
 }
 
@@ -1129,9 +1159,10 @@ button.suggested[aria-disabled="true"]:hover {
   flex: 1;
 }
 
+/* Floats clear of the page bar's buttons. */
 .toast {
   position: fixed;
-  bottom: 20px;
+  bottom: 76px;
   left: 50%;
   max-width: 560px;
   padding: 10px 18px;

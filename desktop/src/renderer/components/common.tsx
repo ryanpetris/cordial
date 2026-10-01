@@ -3,14 +3,16 @@ import { useEffect, useId, useRef, type ReactNode } from "react";
 import { WarningIcon } from "./icons.tsx";
 
 /** A content page. Its header is a bar level with the window controls that
- * moves the window and holds the page's name, status and actions; the rest
- * scrolls. */
+ * moves the window and holds the page's name and status. A `nav` row such as
+ * a TabBar sits fixed under the header, the page scrolls, and the `bar` holds
+ * the page's actions fixed below it. */
 export function Page({
   icon,
   active = true,
   title,
   status,
-  actions,
+  nav,
+  bar,
   children,
 }: {
   icon: ReactNode;
@@ -18,7 +20,8 @@ export function Page({
   active?: boolean;
   title: string;
   status?: ReactNode;
-  actions?: ReactNode;
+  nav?: ReactNode;
+  bar?: ReactNode;
   children: ReactNode;
 }) {
   return (
@@ -27,11 +30,16 @@ export function Page({
         <span className={active ? "page-icon" : "page-icon off"}>{icon}</span>
         <h1 title={title}>{title}</h1>
         {status}
-        <span className="page-actions">{actions}</span>
       </header>
+      {nav}
       <div className="content-scroll">
         <div className="page">{children}</div>
       </div>
+      {bar ? (
+        <footer className="page-bar">
+          <div className="page-bar-inner">{bar}</div>
+        </footer>
+      ) : null}
     </>
   );
 }
@@ -162,21 +170,21 @@ export function SwitchRow(props: {
   );
 }
 
-/** Tabs over one panel; the arrow keys move between the enabled tabs. */
-export function Tabs<T extends string>({
+/** A row of tabs over one TabPanel with the same `id`; the arrow keys move
+ * between the enabled tabs. */
+export function TabBar<T extends string>({
+  id,
   label,
   tabs,
   value,
   onChange,
-  children,
 }: {
+  id: string;
   label: string;
   tabs: [T, string, boolean?][];
   value: T;
   onChange: (value: T) => void;
-  children: ReactNode;
 }) {
-  const id = useId();
   const list = useRef<HTMLDivElement>(null);
   const enabled = tabs.filter(([, , disabled]) => !disabled).map(([v]) => v);
   const move = (step: number) => {
@@ -186,10 +194,10 @@ export function Tabs<T extends string>({
     list.current?.querySelector<HTMLElement>(`[data-tab="${next}"]`)?.focus();
   };
   return (
-    <>
+    <div className="tab-bar">
       <div
         ref={list}
-        className="tabs"
+        className="tab-bar-inner"
         role="tablist"
         aria-label={label}
         onKeyDown={(e) => {
@@ -217,10 +225,16 @@ export function Tabs<T extends string>({
           </button>
         ))}
       </div>
-      <div id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-${value}`}>
-        {children}
-      </div>
-    </>
+    </div>
+  );
+}
+
+/** The panel a TabBar with the same `id` switches; `value` is the shown tab. */
+export function TabPanel({ id, value, children }: { id: string; value: string; children: ReactNode }) {
+  return (
+    <div id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-${value}`}>
+      {children}
+    </div>
   );
 }
 

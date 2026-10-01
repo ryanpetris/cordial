@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { AppState, Preferences as Prefs } from "../../shared/state.ts";
 import { act, api } from "../api.ts";
 import { Card, Dialog, SwitchRow } from "./common.tsx";
+import { CloseIcon } from "./icons.tsx";
 
 export function Preferences({ state, open, onClose }: { state: AppState; open: boolean; onClose: () => void }) {
   const p = state.preferences;
@@ -49,7 +50,7 @@ export function Preferences({ state, open, onClose }: { state: AppState; open: b
       </div>
       <footer className="dialog-footer">
         <button className="suggested" onClick={onClose}>
-          Close
+          <CloseIcon /> Close
         </button>
       </footer>
     </Dialog>

@@ -142,6 +142,20 @@ try {
   await page.getByRole("button", { name: /Example Keys/ }).first().click();
   assert.equal(await backlight.isChecked(), false);
 
+  // A connected device opens on Settings, whose buttons sit in the page bar;
+  // any other opens on Details, where the bar holds Forget Device and the
+  // connection button. The header holds no buttons.
+  const bar = page.locator(".page-bar");
+  assert.equal(await page.getByRole("tab", { name: "Settings" }).getAttribute("aria-selected"), "true");
+  assert.equal(await bar.getByRole("button", { name: "Save", exact: true }).count(), 1);
+  assert.equal(await page.locator(".page-header button").count(), 0);
+  await page.getByRole("button", { name: /Travel Keyboard/ }).first().click();
+  assert.equal(await page.getByRole("tab", { name: "Details" }).getAttribute("aria-selected"), "true");
+  await bar.getByRole("button", { name: "Forget Device", exact: true }).waitFor();
+  await bar.getByRole("button", { name: "Connect", exact: true }).waitFor();
+  assert.equal(await page.locator(".page-header button").count(), 0);
+  await page.getByRole("button", { name: /Example Keys/ }).first().click();
+
   // Escape undoes only the typed row; Enter submits every staged change in catalog order.
   assert.equal(await hands.inputValue(), "30");
   await hands.fill("45");
@@ -186,7 +200,7 @@ try {
   const running = { running: true, items: [{ change: { type: "set", setting: "backlight.delay.hands_out", value: 60 }, status: "saving", error: null }] };
   entry.settingsSave = running;
   await publish();
-  assert.equal(await page.evaluate(() => document.activeElement?.textContent), "Save");
+  assert.equal(await page.evaluate(() => document.activeElement?.textContent?.trim()), "Save");
   assert.equal(await refresh.getAttribute("aria-disabled"), "true");
   assert.equal(await discard.getAttribute("aria-disabled"), "true");
   assert.equal(await backlight.isDisabled(), true);
@@ -273,8 +287,11 @@ try {
   entry.device.state = "connecting";
   entry.pending = [{ id: 100, command: "device.connect" }];
   await publish();
-  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  // Cancel sits with the connection button in the Details bar.
+  await page.getByRole("tab", { name: "Details" }).click();
+  await page.locator(".page-bar").getByRole("button", { name: "Cancel", exact: true }).click();
   assert.ok((await actions()).some((a) => a.type === "device.connect.cancel" && a.key === entry.key));
+  await page.getByRole("tab", { name: "Settings" }).click();
 
   await page.clock.install({ time: new Date("2030-01-01T00:00:00Z") });
   await page.clock.pauseAt(new Date("2030-01-01T00:00:01Z"));
@@ -370,7 +387,7 @@ try {
   await app.evaluate(() => { globalThis.uiFail = "device.info.refresh"; });
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await page.getByRole("button", { name: "Retry", exact: true }).waitFor();
-  await page.getByRole("button", { name: "Forget Device…", exact: true }).click();
+  await page.getByRole("button", { name: "Forget Device", exact: true }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Cancel", exact: true }).click();
   await page.getByRole("button", { name: "Retry", exact: true }).waitFor();
   await app.evaluate(() => { globalThis.uiFail = null; });

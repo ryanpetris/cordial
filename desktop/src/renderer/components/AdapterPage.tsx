@@ -7,7 +7,7 @@ import { PAIR_UNAVAILABLE, PLATFORMS, TRANSPORTS, adapterStatus, batteryStale, d
 import { useAction } from "../api.ts";
 import type { Selection } from "../App.tsx";
 import { Banner, Card, Dialog, Fact, Facts, Meter, Page, Pill, Segmented, Spinner } from "./common.tsx";
-import { AdapterIcon, ChevronIcon, DeviceIcon } from "./icons.tsx";
+import { AdapterIcon, ChevronIcon, CloseIcon, DeviceIcon, PencilIcon, PlugIcon, SwapIcon, UndoIcon, UnplugIcon } from "./icons.tsx";
 
 /** The rename dialog's contents; mounted each time it opens, so it starts from the current name. */
 function Rename({ adapter, busy, error, onRename, onDone }: {
@@ -34,13 +34,13 @@ function Rename({ adapter, busy, error, onRename, onDone }: {
       {error ? <p className="dialog-body error-text">{error}</p> : null}
       <footer className="dialog-footer">
         <button type="button" disabled={busy || !available} onClick={() => void onRename(null)}>
-          Reset to Default
+          <UndoIcon /> Reset to Default
         </button>
         <button type="button" disabled={busy} onClick={onDone}>
-          Cancel
+          <CloseIcon /> Cancel
         </button>
         <button type="submit" className="suggested" disabled={busy || !available || !valid}>
-          Rename
+          <PencilIcon /> Rename
         </button>
       </footer>
     </form>
@@ -82,6 +82,11 @@ export function AdapterPage({
     const result = await runQuiet({ type: "adapter.platform", adapterId: adapter.id, platform: p });
     if (!result.ok) setPlatformError(result.message);
   };
+  const connect = async () => {
+    setConnectError(null);
+    const result = await runQuiet({ type: "adapter.connect", adapterId: adapter.id });
+    if (!result.ok) setConnectError(result.message);
+  };
   const devices = state.devices.filter((d) => d.adapterId === adapter.id);
   const threshold = state.preferences.lowBatteryPercent;
 
@@ -95,13 +100,19 @@ export function AdapterPage({
           {status.text}
         </Pill>
       }
-      actions={
+      bar={
         <>
-          {busy || quietBusy ? <Spinner /> : null}
-          <button disabled={!connected || !s?.storage_ready} onClick={() => setEditing(true)}>Rename…</button>
+          {busy || quietBusy || adapter.connection === "connecting" ? <Spinner /> : null}
+          <button disabled={!connected || !s?.storage_ready} onClick={() => setEditing(true)}>
+            <PencilIcon /> Rename
+          </button>
           {connected ? (
             <button disabled={busy} onClick={() => void run({ type: "adapter.disconnect", adapterId: adapter.id })}>
-              Disconnect
+              <UnplugIcon /> Disconnect
+            </button>
+          ) : adapter.connection === "disconnected" ? (
+            <button className="suggested" disabled={quietBusy} onClick={() => void connect()}>
+              <PlugIcon /> Connect
             </button>
           ) : null}
         </>
@@ -120,21 +131,6 @@ export function AdapterPage({
         <div className="page-empty">
           <AdapterIcon size={64} />
           <h2>{status.text}</h2>
-          {adapter.connection === "connecting" ? (
-            <Spinner />
-          ) : (
-            <button
-              className="suggested"
-              disabled={quietBusy}
-              onClick={async () => {
-                setConnectError(null);
-                const result = await runQuiet({ type: "adapter.connect", adapterId: adapter.id });
-                if (!result.ok) setConnectError(result.message);
-              }}
-            >
-              Connect
-            </button>
-          )}
         </div>
       ) : null}
       {adapter.attention.map((a) => (
@@ -161,7 +157,7 @@ export function AdapterPage({
             </div>
           </div>
           {platform !== state.hostPlatform ? (
-            <Banner action={<button disabled={quietBusy || !s?.storage_ready} onClick={() => void setPlatform(state.hostPlatform)}>Switch to {PLATFORMS[state.hostPlatform]}</button>}>
+            <Banner action={<button disabled={quietBusy || !s?.storage_ready} onClick={() => void setPlatform(state.hostPlatform)}><SwapIcon /> Switch to {PLATFORMS[state.hostPlatform]}</button>}>
               This computer runs {PLATFORMS[state.hostPlatform]}.
             </Banner>
           ) : null}

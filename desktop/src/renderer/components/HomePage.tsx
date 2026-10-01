@@ -5,7 +5,7 @@ import { adapterStatus, batteryStale } from "../../shared/text.ts";
 import { act, api, chooseAdapter } from "../api.ts";
 import type { Selection } from "../App.tsx";
 import { Card, Meter, Page, Summary } from "./common.tsx";
-import { AdapterIcon, BatteryGlyph, ChevronIcon, DeviceIcon, HomeIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
+import { AdapterIcon, BatteryGlyph, ChevronIcon, DeviceIcon, HomeIcon, LinkIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
 
 export function HomePage({ state, onSelect, onAdd }: { state: AppState; onSelect: (s: Selection) => void; onAdd: () => void }) {
   const [chooseError, setChooseError] = useState<string | null>(null);
@@ -23,7 +23,7 @@ export function HomePage({ state, onSelect, onAdd }: { state: AppState; onSelect
           <h2>No Adapter Found</h2>
           {choose ? (
             <button className="suggested" onClick={() => void pick()}>
-              <PlusIcon /> Choose Adapter…
+              <PlusIcon /> Choose Adapter
             </button>
           ) : (
             <button onClick={() => void act({ type: "adapters.refresh" })}>
@@ -66,7 +66,9 @@ export function HomePage({ state, onSelect, onAdd }: { state: AppState; onSelect
                 </div>
               </div>
               <div className="row-end">
-                <button onClick={onAdd}>Pair…</button>
+                <button onClick={onAdd}>
+                  <LinkIcon /> Pair
+                </button>
               </div>
             </div>
           ))}
