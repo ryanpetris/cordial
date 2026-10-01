@@ -35,6 +35,7 @@ Device record:
   "reconnect": "auto",
   "last_error": null,
   "hidpp_enabled": true,
+  "hidpp_protocol": {"state": "detected", "major": 4, "minor": 2},
   "normalization_state": "active",
   "normalization_error": null,
   "settings_state": "ready",
@@ -63,11 +64,22 @@ Device record:
 | `last_error` | `null` or an object containing `code` for the most recent connection/profile failure. Clear it on a successful connection. |
 | `warnings` | Optional array of HID limitations, currently `unsupported_fields` or `led_output_unavailable`. The latter means recognized lock-indicator output cannot be safely encoded. Vendor/HID++ output alone and devices without indicator reports do not trigger it. Input can remain connected. |
 | `hidpp_enabled` | Persisted Boolean permitting HID++ normalization and setting application for this saved device; read-only discovery remains available when false. False for a new pairing until the device's first connection detects HID++ 2.0 or newer with usable long reports and turns it on. Otherwise independent of whether the peripheral supports HID++. |
+| `hidpp_protocol` | Protocol negotiation on the current link: `{"state":"unknown"}`, `{"state":"probing"}`, `{"state":"detected","major":4,"minor":2}`, `{"state":"unavailable"}`, or `{"state":"error","code":"hidpp_timeout"}`. Clients accept an absent field as `unknown`. Detected versions are HID++ versions defined by Logitech. |
 | `normalization_state` | Runtime state: `off`, `pending`, `probing`, `resetting`, `configuring`, `active`, `unsupported`, or `error`; see the [HID++ lifecycle](commands.md#hid-settings-and-lifecycle). |
 | `normalization_error` | `null` or a diagnostic string for the current normalization failure. Separate from `last_error`, which concerns the ordinary HID connection. |
 | `settings_state` | `off`, `pending`, `discovering`, `ready`, `applying`, `unsupported`, or `error`. Independent of normalization support. |
 | `settings_error` | Nullable settings discovery/session error. Individual setting errors remain in their setting records. |
 | `settings_revision` | Shared revision at the last catalog change, or zero. |
+
+Protocol detection is independent of the saved preference, special-key translation
+and settings readiness. A successful version reply survives missing optional
+features, preference changes and feature exchange failures on that link. A new
+connection starts at `unknown`. `unavailable` means no qualified HID++ report
+transport; a timeout, transport failure, device error or invalid version reply
+reports `error` without establishing protocol support. A recognized HID++ 1.0
+invalid-sub-ID response establishes version 1.0; legacy battery handling remains
+available. A modern version discovered over short reports remains detected even
+when feature exchanges require unavailable long reports.
 
 Every record in the default `device.list` snapshot represents a saved device, including retained `needs_pairing`, disabled, unsupported-transport and invalid entries. Discovered but unpaired candidates are returned by `discovery.scan`, separately from saved devices. `connected` means required Bluetooth security setup, supported HID report setup, and input forwarding are ready, not merely that a radio link exists. Profile setup uses `connecting`; a failed setup leaves a saved, disconnected device with `last_error`.
 

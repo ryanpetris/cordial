@@ -394,6 +394,12 @@
         "hidpp_enabled": {
           "type": "boolean"
         },
+        "hidpp_protocol": {
+          "$ref": "#/$defs/ProtocolState",
+          "default": {
+            "state": "unknown"
+          }
+        },
         "last_error": {
           "anyOf": [
             {
@@ -2158,6 +2164,94 @@
         "protocol"
       ],
       "type": "object"
+    },
+    "ProtocolState": {
+      "description": "Protocol negotiation on the current connection, independent of feature readiness.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "probing",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "major": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "minor": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "state": {
+              "const": "detected",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "major",
+            "minor"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "state": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/ErrorCode"
+            },
+            "state": {
+              "const": "error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "code"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "ReadyResult": {
       "oneOf": [

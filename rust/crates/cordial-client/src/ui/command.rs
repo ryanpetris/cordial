@@ -1077,6 +1077,7 @@ pub(crate) mod tests {
             last_error: None,
             warnings: Vec::new(),
             hidpp_enabled: true,
+            hidpp_protocol: cordial_protocol::hidpp::ProtocolState::Detected { major: 2, minor: 0 },
             normalization_state: NormalizationState::Active,
             normalization_error: None,
             settings_state: SettingsState::Ready,

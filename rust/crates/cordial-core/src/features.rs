@@ -98,6 +98,8 @@ pub(crate) fn supported(id: Id, flags: FeatureFlags) -> bool {
                 | Id::FEATURE_SET
                 | Id::DEVICE_INFORMATION
                 | Id::DEVICE_NAME
+                | Id::CONFIG_CHANGE
+                | Id::REPROG_CONTROLS
                 | Id::BATTERY
                 | Id::UNIFIED_BATTERY
                 | Id::SOLAR
@@ -685,16 +687,11 @@ impl Engine {
         if !client.idle() && reply.is_none() {
             return false;
         }
-        if client.protocol[0] < 2 {
-            self.discovery_failure(
-                catalog,
-                client
-                    .error
-                    .map_or(Error::HidppProtocolUnsupported, ExchangeError::code),
-            );
+        if let Some(error) = client.feature_error() {
+            self.discovery_failure(catalog, error);
             self.state = if matches!(
-                client.error,
-                None | Some(ExchangeError::NoReports | ExchangeError::ProtocolUnsupported)
+                error,
+                Error::HidppReportsUnavailable | Error::HidppProtocolUnsupported
             ) {
                 SettingsState::Unsupported
             } else {

@@ -2219,7 +2219,12 @@ fn first_connection_setup_turns_hidpp_on_for_a_hidpp_2_device() {
     // Turning HID++ on starts normalization on the live connection.
     t.poll();
     let (_, request) = t.radio.writes.last().unwrap();
-    assert_eq!(request[5], 0xa5);
+    assert_eq!((request[1], request[2] >> 4), (0, 0));
+    assert_eq!(&request[3..5], &[0, 0x20]);
+    assert_eq!(
+        t.app.manager.record(0).unwrap().hidpp_protocol,
+        cordial_protocol::hidpp::ProtocolState::Detected { major: 4, minor: 0 }
+    );
     assert_eq!(
         t.app.manager.record(0).unwrap().normalization_state,
         cordial_protocol::identifiers::NormalizationState::Probing

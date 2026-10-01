@@ -396,6 +396,8 @@ pub struct Device {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<crate::errors::WarningCode>,
     pub hidpp_enabled: bool,
+    #[serde(default)]
+    pub hidpp_protocol: crate::hidpp::ProtocolState,
     pub normalization_state: NormalizationState,
     pub normalization_error: Option<crate::errors::ErrorCode>,
     pub settings_state: SettingsState,

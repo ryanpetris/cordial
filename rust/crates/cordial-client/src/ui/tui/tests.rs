@@ -28,6 +28,41 @@ struct App {
     fake: Fake,
 }
 
+#[test]
+fn hidpp_detection_translation_and_settings_have_separate_statuses() {
+    use cordial_protocol::{hidpp::ProtocolState, identifiers::NormalizationState};
+    let mut app = App::connected(120, 70);
+    app.edit(|st| {
+        let d = &mut st.devices[0];
+        d.hidpp_protocol = ProtocolState::Detected { major: 4, minor: 2 };
+        d.normalization_state = NormalizationState::Unsupported;
+        d.normalization_error = Some(ErrorCode::HidppControlsUnavailable);
+        d.settings_state = SettingsState::Ready;
+        d.settings_error = None;
+    });
+    app.click(Action::Device("d_1".into()));
+    let screen = app.screen();
+    assert!(screen.contains("HID++ 4.2"), "{screen}");
+    assert!(screen.contains("Special-Key Translation"), "{screen}");
+    assert!(screen.contains("Unavailable"), "{screen}");
+    assert!(screen.contains("Settings Ready"), "{screen}");
+    app.edit(|st| {
+        let d = &mut st.devices[0];
+        d.hidpp_enabled = false;
+        d.normalization_state = NormalizationState::Off;
+        d.normalization_error = None;
+        d.hidpp_protocol = ProtocolState::Error {
+            code: ErrorCode::HidppTimeout,
+        };
+    });
+    app.render();
+    assert!(
+        app.screen().contains("HID++ Failed: no response"),
+        "{}",
+        app.screen()
+    );
+}
+
 fn port(name: &str) -> PortInfo {
     PortInfo {
         port: name.into(),
@@ -2327,7 +2362,7 @@ fn battery_is_listed_once_and_details_show_device_info() {
     }
     for more in [
         "● Encryption: Yes",
-        "● Special Keys Active",
+        "● Special-Key Translation",
         "● Settings Ready",
     ] {
         assert_eq!(at(&screen, more), v, "{more}:\n{screen}");
@@ -2373,7 +2408,7 @@ fn battery_is_listed_once_and_details_show_device_info() {
         assert_eq!(x, k + 2, "{label}:\n{small}");
         assert!(next.contains(value), "{label}:\n{small}");
     }
-    for more in ["● Encryption: Yes", "● Special Keys Active"] {
+    for more in ["● Encryption: Yes", "● Special-Key Translation"] {
         assert_eq!(at(&small, more), k + 2, "{more}:\n{small}");
     }
     // An unknown charge is never 0%, and "not charging" differs from unknown.

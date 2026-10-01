@@ -1,5 +1,6 @@
 use crate::hid::{HIDPP_LONG, HIDPP_SHORT, Held};
 use cordial_protocol::{
+    hidpp::ProtocolState,
     identifiers::{HostPlatform, NormalizationState},
     translation::control,
 };
@@ -63,7 +64,7 @@ pub struct Client {
     pub held: Held,
     pub status: NormalizationState,
     pub error: Option<Error>,
-    pub protocol: [u8; 2],
+    pub protocol: ProtocolState,
     pub exchange_sent: bool,
     selected: u32,
     deadline: u64,
@@ -92,7 +93,7 @@ impl Client {
             held: Held::default(),
             status: NormalizationState::Off,
             error: None,
-            protocol: [0; 2],
+            protocol: ProtocolState::Unknown,
             exchange_sent: false,
             selected: 0,
             deadline: 0,
@@ -128,6 +129,9 @@ impl Client {
             self.waiting = false;
             self.step = Step::Idle;
             return false;
+        }
+        if self.step == Step::Protocol && self.protocol.major() == 0 {
+            self.protocol = ProtocolState::Error { code: error.code() };
         }
         let changed = (self.reset_uncertain || matches!(self.step, Step::Reset | Step::Disable))
             && self.clear_held();
@@ -183,16 +187,11 @@ impl Client {
         if self.response.is_some() {
             return false;
         }
-        self.queued = false;
-        self.step = Step::Idle;
+        // Unsent normalization requests stay valid until configure replaces them.
         true
     }
     pub fn exchange(&mut self, feature: u8, function: u8, parameters: &[u8], now: u64) -> bool {
-        if self.reports & HIDPP_LONG == 0
-            || self.protocol[0] < 2
-            || !self.idle()
-            || function > 15
-            || parameters.len() > 16
+        if self.feature_error().is_some() || !self.idle() || function > 15 || parameters.len() > 16
         {
             return false;
         }
@@ -201,7 +200,7 @@ impl Client {
         true
     }
     pub fn register(&mut self, write: bool, register: u8, parameters: &[u8], now: u64) -> bool {
-        if self.protocol[0] != 1 || !self.idle() || parameters.len() > 3 {
+        if self.protocol.major() != 1 || !self.idle() || parameters.len() > 3 {
             return false;
         }
         self.exchange_sent = false;
@@ -216,7 +215,7 @@ impl Client {
         true
     }
     pub fn output_report(&self) -> u8 {
-        if self.protocol[0] == 1 || self.reports & HIDPP_LONG == 0 {
+        if self.protocol.major() == 1 || self.reports & HIDPP_LONG == 0 {
             0x10
         } else {
             0x11
@@ -225,6 +224,17 @@ impl Client {
     pub fn response(&mut self) -> Option<Result<Response, Error>> {
         self.response.take()
     }
+    /// Feature exchanges require a negotiated modern protocol and long reports.
+    pub fn feature_error(&self) -> Option<cordial_protocol::errors::ErrorCode> {
+        use cordial_protocol::errors::ErrorCode as C;
+        match self.protocol {
+            ProtocolState::Error { code } => Some(code),
+            ProtocolState::Unavailable => Some(C::HidppReportsUnavailable),
+            ProtocolState::Detected { major: 2.., .. } if self.reports & HIDPP_LONG != 0 => None,
+            ProtocolState::Detected { major: 2.., .. } => Some(C::HidppReportsUnavailable),
+            _ => Some(C::HidppProtocolUnsupported),
+        }
+    }
     fn reset(&mut self, step: Step, now: u64) {
         self.status = NormalizationState::Resetting;
         self.request(step, self.reset_feature, 1, &[0, 0], now);
@@ -232,6 +242,7 @@ impl Client {
     fn probe(&mut self, now: u64) {
         self.error = None;
         if self.reports == 0 {
+            self.protocol = ProtocolState::Unavailable;
             self.fail(Error::NoReports);
             return;
         }
@@ -240,8 +251,23 @@ impl Client {
         } else {
             NormalizationState::Off
         };
-        self.protocol = [0; 2];
+        self.protocol = ProtocolState::Probing;
         self.request(Step::Protocol, 0, 1, &[0, 0, 0xa5], now);
+    }
+    fn normalize(&mut self, now: u64) {
+        if self.protocol.major() == 0 {
+            self.probe(now);
+        } else if self.protocol.major() == 1 {
+            self.fail(Error::ProtocolUnsupported);
+        } else if self.reports & HIDPP_LONG == 0 {
+            self.fail(Error::NoReports);
+        } else if self.enabled {
+            self.status = NormalizationState::Probing;
+            self.get_feature(Step::ResetFeature, 0x0020, now);
+        } else {
+            self.status = NormalizationState::Off;
+            self.step = Step::Idle;
+        }
     }
     /// Reconfiguration requires `quiesce()` to succeed first. A settings owner
     /// must drain its response before this replaces the normalization sequence.
@@ -249,7 +275,7 @@ impl Client {
         let before = self.held;
         if self.enabled == enabled && (!enabled || self.platform == platform) {
             self.platform = platform;
-            if !enabled && self.protocol[0] == 0 && self.idle() {
+            if !enabled && self.protocol.major() == 0 && self.idle() {
                 self.probe(now);
             }
             return self.held != before;
@@ -270,12 +296,12 @@ impl Client {
             } else {
                 self.status = NormalizationState::Off;
                 self.step = Step::Idle;
-                if self.protocol[0] == 0 {
+                if self.protocol.major() == 0 {
                     self.probe(now);
                 }
             }
         } else {
-            self.probe(now);
+            self.normalize(now);
         }
         self.held != before
     }
@@ -379,13 +405,10 @@ impl Client {
             && payload[3] == self.request[2]
         {
             if self.step == Step::Protocol && payload[1] == 0x8f && payload[4] == 1 {
-                self.protocol = [1, 0];
+                self.protocol = ProtocolState::Detected { major: 1, minor: 0 };
+                return self.fail(Error::ProtocolUnsupported) || changed;
             }
-            return self.fail(if self.step == Step::Protocol {
-                Error::ProtocolUnsupported
-            } else {
-                Error::Device(payload[4])
-            }) || changed;
+            return self.fail(Error::Device(payload[4])) || changed;
         }
         if payload[1..3] != self.request[1..3] {
             return changed;
@@ -421,21 +444,14 @@ impl Client {
                 self.step = Step::Idle;
             }
             Step::Protocol => {
-                if p[0] < 2 {
-                    self.protocol = [1, 0];
-                    changed |= self.fail(Error::ProtocolUnsupported);
+                if p[0] == 0 {
+                    changed |= self.fail(Error::InvalidResponse);
                 } else {
-                    self.protocol = [p[0], p[1]];
-                    if self.reports & HIDPP_LONG == 0 {
-                        self.protocol = [0, 0];
-                        return changed | self.fail(Error::NoReports);
-                    }
-                    if self.enabled {
-                        self.get_feature(Step::ResetFeature, 0x0020, now);
-                    } else {
-                        self.status = NormalizationState::Off;
-                        self.step = Step::Idle;
-                    }
+                    self.protocol = ProtocolState::Detected {
+                        major: p[0],
+                        minor: p[1],
+                    };
+                    self.normalize(now);
                 }
             }
             Step::ResetFeature | Step::ControlsFeature => {
@@ -509,7 +525,7 @@ impl Client {
                 self.reset_uncertain = false;
                 self.status = NormalizationState::Off;
                 self.step = Step::Idle;
-                if self.protocol[0] == 0 {
+                if self.protocol.major() == 0 {
                     self.probe(now);
                 }
             }

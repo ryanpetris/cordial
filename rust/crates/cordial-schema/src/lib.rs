@@ -377,6 +377,11 @@ pub fn generate() -> Artifacts {
     }
     definitions["InfoField"]["allOf"] = json!([{"oneOf":information}]);
     definitions["DeviceInfo"]["properties"]["fields"]["maxItems"] = json!(28);
+    // A missing negotiation result carries no evidence of protocol support.
+    definitions["Device"]["required"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| field != "hidpp_protocol");
     definitions["Scan"]["properties"]["duration_ms"] = json!({"anyOf":[{"const":0},{"type":"integer","minimum":1000,"maximum":60000}],"default":10000});
     for (name, max, default) in [("Pair", 180000, 120000), ("Connect", 60000, 30000)] {
         definitions[name]["properties"]["timeout_ms"] =

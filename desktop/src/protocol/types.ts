@@ -1,7 +1,9 @@
 // Typed views of the generated wire contract.
-import type { Event, Request, ResponseMap, WireError } from "./wire.ts";
+import type { Device, Event, Request, ResponseMap, WireError } from "./wire.ts";
 
 export type * from "./wire.ts";
+
+export type ProtocolState = NonNullable<Device["hidpp_protocol"]>;
 
 export type CommandName = Request["cmd"];
 export type ArgsOf<C extends CommandName> = Extract<Request, { cmd: C }>["args"];

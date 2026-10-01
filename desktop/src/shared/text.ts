@@ -10,11 +10,13 @@ import type {
   InfoField,
   InfoKey,
   NormalizationState,
+  ProtocolState,
   PairUnavailable,
   Role,
   SettingKey,
   SettingState,
   SettingValue,
+  SettingsState,
   Transport,
   ValidationError,
   WarningCode,
@@ -138,9 +140,29 @@ export const NORMALIZATION: Record<NormalizationState, string> = {
   resetting: "Resetting",
   configuring: "Setting Up",
   active: "Active",
-  unsupported: "Unsupported",
+  unsupported: "Unavailable",
   error: "Failed",
 };
+
+export const SETTINGS_STATUS: Record<SettingsState, string> = {
+  off: "Off",
+  pending: "Waiting to Connect",
+  discovering: "Reading",
+  ready: "Ready",
+  applying: "Applying",
+  unsupported: "Unavailable",
+  error: "Failed",
+};
+
+export function hidppProtocolText(protocol?: ProtocolState): string {
+  switch (protocol?.state) {
+    case "detected": return `${protocol.major}.${protocol.minor}`;
+    case "probing": return "Checking";
+    case "unavailable": return "Unavailable";
+    case "error": return `Failed: ${codeText(protocol.code)}`;
+    default: return "Unknown";
+  }
+}
 
 /** A saved setting's state as its marker names it. */
 export const SETTING_STATES: Record<SettingState, string> = {

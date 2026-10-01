@@ -37,6 +37,10 @@ function settingProblem(s: Setting, limits?: Limits): string | null {
 }
 
 function deviceProblem(d: Device): string | null {
+  const protocol = d.hidpp_protocol;
+  if (protocol?.state === "error" && !["hidpp_timeout", "hidpp_transport_error", "hidpp_device_error", "hidpp_invalid_response"].includes(protocol.code)) {
+    return "invalid HID++ protocol state";
+  }
   const paired = d.pairing_state === "paired";
   const needsPairing = d.validation_error === "bond_missing" || d.validation_error === "bond_corrupt" || d.validation_error === "bond_mismatch";
   const reason = d.enabled_reason;

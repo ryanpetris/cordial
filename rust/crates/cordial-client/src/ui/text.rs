@@ -12,6 +12,7 @@ use cordial_protocol::{
         CapacityReason, DisabledReason, ErrorCode, PairUnavailable, StorageOutcome,
         ValidationError, WarningCode,
     },
+    hidpp::ProtocolState,
     identifiers::{
         ConnectionState, DeviceId, HostPlatform, NormalizationState, PairingState, Role,
         SettingsState, Transport,
@@ -371,6 +372,16 @@ pub fn hidpp_words(code: ErrorCode) -> String {
 /// Explains a HID++ runtime error of a device record.
 pub fn hidpp_error_text(code: Option<ErrorCode>) -> String {
     code.map_or_else(|| "unknown error".into(), hidpp_words)
+}
+
+pub fn hidpp_protocol_text(protocol: ProtocolState) -> String {
+    match protocol {
+        ProtocolState::Unknown => "Unknown".into(),
+        ProtocolState::Probing => "Checking".into(),
+        ProtocolState::Detected { major, minor } => format!("{major}.{minor}"),
+        ProtocolState::Unavailable => "Unavailable".into(),
+        ProtocolState::Error { code } => format!("Failed: {}", hidpp_words(code)),
+    }
 }
 
 /// The command-specific or general explanation of an error code.
@@ -782,7 +793,18 @@ pub fn device_line(d: &Device) -> String {
     }
     // The saved preference and the runtime states are separate: an enabled
     // device is pending until it connects, and may turn out unsupported.
-    let _ = write!(line, " hidpp={}", on_off(d.hidpp_enabled));
+    let protocol = match d.hidpp_protocol {
+        ProtocolState::Unknown => "unknown".into(),
+        ProtocolState::Probing => "probing".into(),
+        ProtocolState::Detected { major, minor } => format!("{major}.{minor}"),
+        ProtocolState::Unavailable => "unavailable".into(),
+        ProtocolState::Error { code } => format!("error:{}", wire(&code)),
+    };
+    let _ = write!(
+        line,
+        " hidpp={} hidpp-protocol={protocol}",
+        on_off(d.hidpp_enabled)
+    );
     if d.hidpp_enabled
         || d.normalization_state != NormalizationState::Off
         || d.settings_state != SettingsState::Off
@@ -1014,10 +1036,11 @@ pub fn device_info(d: &Device) -> String {
     field("Trusted", &yes_no(d.trusted).to_lowercase());
     field("Blocked", &yes_no(d.blocked).to_lowercase());
     field("Reconnect", &wire(&d.reconnect));
-    field("HID++", on_off(d.hidpp_enabled));
-    field("Key Normalization", &wire(&d.normalization_state));
+    field("Logitech Features", on_off(d.hidpp_enabled));
+    field("HID++ Protocol", &hidpp_protocol_text(d.hidpp_protocol));
+    field("Special-Key Translation", &wire(&d.normalization_state));
     if let Some(code) = d.normalization_error {
-        field("Key Normalization Error", &hidpp_words(code));
+        field("Special-Key Translation Error", &hidpp_words(code));
     }
     field("Device Settings", &wire(&d.settings_state));
     if let Some(code) = d.settings_error {

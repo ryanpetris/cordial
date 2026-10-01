@@ -20,6 +20,7 @@ use crate::{
     },
 };
 use cordial_protocol::{
+    hidpp::ProtocolState,
     identifiers::{
         ConnectionState, HostPlatform, NormalizationState, PairingState, Reconnect, ScanTransport,
         SettingsState,
@@ -313,21 +314,38 @@ fn signal(rssi: Option<i16>, base: Style) -> Vec<ratatui::text::Span<'static>> {
     ]
 }
 
-/// What HID++ is doing for special keys, which can differ from the saved
-/// preference: an enabled device waits to connect and may not support it.
+/// The current link's protocol result is independent of enabled features.
+fn protocol_status(d: &Device) -> Option<(String, Style)> {
+    let (mark, look) = match d.hidpp_protocol {
+        ProtocolState::Unknown if !connected(d) => return None,
+        ProtocolState::Detected { .. } => ("●", ok()),
+        ProtocolState::Probing => ("◌", warn()),
+        ProtocolState::Error { .. } => ("✕", err()),
+        _ => ("○", dim()),
+    };
+    Some((
+        format!(
+            "{mark} HID++ {}",
+            text::hidpp_protocol_text(d.hidpp_protocol)
+        ),
+        look,
+    ))
+}
+
+/// Special-key translation readiness, independent of other HID++ features.
 fn normalization_status(d: &Device) -> Option<(String, Style)> {
     use NormalizationState::*;
     Some(match d.normalization_state {
-        Active => ("● Special Keys Active".into(), ok()),
-        Pending if connected(d) => ("◌ Starting Special Keys…".into(), warn()),
+        Active => ("● Special-Key Translation Active".into(), ok()),
+        Pending if connected(d) => ("◌ Starting Special-Key Translation…".into(), warn()),
         Pending => ("○ Waiting to Connect".into(), dim()),
-        Probing | Configuring => ("◌ Setting Up Special Keys…".into(), warn()),
-        Resetting if d.hidpp_enabled => ("◌ Setting Up Special Keys…".into(), warn()),
+        Probing | Configuring => ("◌ Setting Up Special-Key Translation…".into(), warn()),
+        Resetting if d.hidpp_enabled => ("◌ Setting Up Special-Key Translation…".into(), warn()),
         Resetting => ("◌ Turning Off…".into(), warn()),
-        Unsupported => ("○ Special Keys Unsupported".into(), dim()),
+        Unsupported => ("○ Special-Key Translation Unavailable".into(), dim()),
         Error => (
             format!(
-                "✕ Special Keys Failed: {}",
+                "✕ Special-Key Translation Failed: {}",
                 hidpp_error_text(d.normalization_error)
             ),
             err(),
@@ -345,7 +363,7 @@ pub(super) fn settings_status(d: &Device) -> Option<(String, Style)> {
         Discovering => ("◌ Reading Settings…".into(), warn()),
         Ready => ("● Settings Ready".into(), ok()),
         Applying => ("◌ Applying Settings…".into(), warn()),
-        Unsupported => ("○ Settings Unsupported".into(), dim()),
+        Unsupported => ("○ Settings Unavailable".into(), dim()),
         Error => (
             format!("✕ Settings Failed: {}", hidpp_error_text(d.settings_error)),
             err(),
@@ -354,9 +372,9 @@ pub(super) fn settings_status(d: &Device) -> Option<(String, Style)> {
     })
 }
 
-/// The Logitech Features preference and the status of what it permits:
-/// special keys and device settings. The preference is saved per device, so
-/// it stays changeable while the device is disconnected. Its options are dim
+/// The Logitech Features preference, protocol detection and feature readiness.
+/// The preference is saved per device, so it stays changeable while the device
+/// is disconnected. Its options are dim
 /// and have no targets while `idle` is false.
 fn hidpp_section(b: &mut Layout, c: Column, st: &State, d: &Device, offered: bool, idle: bool) {
     let actions = offered.then_some((Action::Hidpp(true), Action::Hidpp(false)));
@@ -372,9 +390,13 @@ fn hidpp_section(b: &mut Layout, c: Column, st: &State, d: &Device, offered: boo
         c.more(b, None, "○ Waiting to Connect", dim());
         return;
     }
-    for (text, look) in [normalization_status(d), settings_status(d)]
-        .into_iter()
-        .flatten()
+    for (text, look) in [
+        protocol_status(d),
+        normalization_status(d),
+        settings_status(d),
+    ]
+    .into_iter()
+    .flatten()
     {
         c.more(b, None, &text, look);
     }

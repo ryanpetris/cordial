@@ -10,6 +10,7 @@ use crate::{
 use alloc::{boxed::Box, vec::Vec};
 use cordial_protocol::{
     errors::ErrorCode as Error,
+    hidpp::ProtocolState,
     identifiers::{HostPlatform, NormalizationState, SettingsState},
     settings::SettingKey,
 };
@@ -85,6 +86,7 @@ pub struct Link {
     activate_pending: bool,
     forward_pending: bool,
     normalization: NormalizationState,
+    protocol: ProtocolState,
     sequence: u32,
     writing: Option<Writing>,
     write_deadline: u64,
@@ -178,6 +180,7 @@ impl Link {
             activate_pending: false,
             forward_pending: false,
             normalization: NormalizationState::Pending,
+            protocol: ProtocolState::Unknown,
             sequence: 0,
             writing: None,
             write_deadline: 0,
@@ -217,12 +220,14 @@ impl Link {
             .input(self.id.slot as usize, Input { held, motion })
             .map_err(|_| Error::InputOverflow)
     }
-    fn normalization_changed(&mut self, catalog: &mut Catalog) -> bool {
-        let changed = self.normalization != self.client.status;
-        if changed && self.client.status == NormalizationState::Resetting {
+    fn hidpp_changed(&mut self, catalog: &mut Catalog) -> bool {
+        let normalization_changed = self.normalization != self.client.status;
+        let changed = normalization_changed || self.protocol != self.client.protocol;
+        if normalization_changed && self.client.status == NormalizationState::Resetting {
             catalog.invalidate();
         }
         self.normalization = self.client.status;
+        self.protocol = self.client.protocol;
         changed
     }
     pub fn reconfigure(&mut self, enabled: bool, platform: HostPlatform, catalog: &mut Catalog) {
@@ -255,12 +260,12 @@ impl Link {
     /// transport failure leaves it unknown.
     pub fn hidpp_found(&self) -> Option<bool> {
         let client = &self.client;
-        if client.protocol[0] >= 2 {
-            Some(true)
-        } else if client.protocol[0] == 1 || client.error == Some(crate::hidpp::Error::NoReports) {
-            Some(false)
-        } else {
-            None
+        match client.protocol {
+            ProtocolState::Detected { major, .. } => {
+                Some(major >= 2 && client.feature_error().is_none())
+            }
+            ProtocolState::Unavailable => Some(false),
+            _ => None,
         }
     }
     pub fn busy(&self) -> bool {
@@ -291,7 +296,7 @@ impl Link {
             return Err(Error::Busy);
         }
         // A manual read retries an earlier failed read-only protocol probe.
-        if !self.enabled && self.client.protocol[0] == 0 && self.client.quiesce() {
+        if !self.enabled && self.client.protocol.major() == 0 && self.client.quiesce() {
             self.client.configure(false, self.platform, now);
         }
         self.settings
@@ -320,7 +325,7 @@ impl Link {
                 return Ok(false);
             }
             if catalog.info.battery.vendor()
-                && self.client.protocol[0] == 1
+                && self.client.protocol.major() == 1
                 && payload.len() >= 6
                 && payload[0] == 0xff
                 && matches!(payload[1], 7 | 0x0d)
@@ -336,7 +341,7 @@ impl Link {
             if self.client.receive(report_id, payload, now) {
                 self.forward([0; 4], forward)?;
             }
-            changed |= self.normalization_changed(catalog);
+            changed |= self.hidpp_changed(catalog);
             return Ok(changed);
         }
         if catalog.info.battery.standard_hid() {
@@ -396,7 +401,7 @@ impl Link {
             self.activate_pending = false;
             changed = true;
         }
-        changed |= self.normalization_changed(catalog);
+        changed |= self.hidpp_changed(catalog);
         Ok(changed)
     }
     /// Call only when the backend has room to own a copy through completion.
@@ -481,7 +486,7 @@ impl Link {
             }
         }
         if !catalog.info.battery.vendor()
-            || self.client.protocol[0] != 1
+            || self.client.protocol.major() != 1
             || self.configure_pending
             || self.activate_pending
             || self.settings.busy()
@@ -511,7 +516,7 @@ impl Link {
         (catalog.info.battery.standard_hid()
             && (self.battery_read.is_some() || self.battery_initial))
             || (catalog.info.battery.vendor()
-                && self.client.protocol[0] == 1
+                && self.client.protocol.major() == 1
                 && (self.legacy_waiting || self.legacy_due == 0))
     }
     pub fn battery_read(&mut self, catalog: &Catalog, now: u64) -> Option<BatteryRead> {
@@ -639,7 +644,7 @@ impl Link {
             Writing::Leds if !success => self.warnings |= 2,
             Writing::Leds => {}
         }
-        Ok(self.normalization_changed(catalog))
+        Ok(self.hidpp_changed(catalog))
     }
     /// Call before dropping a link, including failed setup after input admission.
     /// The manager retains explicit job results until their terminal response.

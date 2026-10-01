@@ -256,7 +256,7 @@ impl Device {
         let mut engine = Engine::default();
         engine.activate(&mut catalog, 100).unwrap();
         let mut client = Client::new(HIDPP_LONG);
-        client.protocol = [2, 0];
+        client.protocol = cordial_protocol::hidpp::ProtocolState::Detected { major: 2, minor: 0 };
         Self {
             catalog,
             engine,

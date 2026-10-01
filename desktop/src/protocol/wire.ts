@@ -1343,6 +1343,28 @@ export interface Device {
   enabled: boolean;
   enabled_reason: DisabledReason | null;
   hidpp_enabled: boolean;
+  /**
+   * Protocol negotiation on the current connection, independent of feature readiness.
+   */
+  hidpp_protocol?:
+    | {
+        state: "unknown";
+      }
+    | {
+        state: "probing";
+      }
+    | {
+        major: number;
+        minor: number;
+        state: "detected";
+      }
+    | {
+        state: "unavailable";
+      }
+    | {
+        code: ErrorCode;
+        state: "error";
+      };
   last_error: WireError | null;
   name: string | null;
   normalization_error: ErrorCode | null;

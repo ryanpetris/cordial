@@ -1246,6 +1246,7 @@ impl Manager {
             }),
             warnings,
             hidpp_enabled: d.policy.hidpp_enabled,
+            hidpp_protocol: runtime.map_or(Default::default(), |r| r.client.protocol),
             normalization_state: runtime.map_or(pending, |r| r.client.status),
             normalization_error: runtime
                 .filter(|r| r.client.status != NormalizationState::Off)

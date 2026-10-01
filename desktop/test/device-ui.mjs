@@ -422,6 +422,20 @@ try {
   await publish();
   await page.getByRole("tab", { name: "Details", selected: true }).waitFor();
   assert.equal(await automatic.evaluate((e) => e === document.activeElement), true);
+  const normalization = { state: entry.device.normalization_state, error: entry.device.normalization_error };
+  entry.device.hidpp_protocol = { state: "detected", major: 4, minor: 2 };
+  entry.device.normalization_state = "unsupported";
+  entry.device.normalization_error = "hidpp_controls_unavailable";
+  await publish();
+  await page.getByText("4.2", { exact: true }).waitFor();
+  await page.getByText("Special-Key Translation", { exact: true }).waitFor();
+  await page.getByText("Unavailable: Special keys unavailable", { exact: true }).waitFor();
+  await page.getByText("Ready", { exact: true }).waitFor();
+  const logitechRow = page.locator(".row").filter({ has: page.getByRole("switch", { name: "Logitech Features", exact: true }) });
+  assert.equal(await logitechRow.getByText(/Unavailable|Unsupported/).count(), 0);
+  entry.device.normalization_state = normalization.state;
+  entry.device.normalization_error = normalization.error;
+  await publish();
   await page.getByRole("tab", { name: "Settings" }).click();
 
   state.scan = { adapterId: entry.adapterId, running: false, candidates: [], error: null };

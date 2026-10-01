@@ -9,6 +9,7 @@ import {
   NORMALIZATION,
   ROLES,
   SETTINGS,
+  SETTINGS_STATUS,
   SETTING_STATES,
   TRANSPORTS,
   VALIDATION,
@@ -20,6 +21,7 @@ import {
   deviceStatus,
   infoLabel,
   infoValue,
+  hidppProtocolText,
   securityFacts,
   settingOrder,
   wheelInfo,
@@ -855,15 +857,7 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
               />
               <SwitchRow
                 title="Logitech Features"
-                subtitle={
-                  failedText("device.hidpp") ??
-                  (d.normalization_state === "unsupported" || d.normalization_state === "error" ? (
-                    <>
-                      {NORMALIZATION[d.normalization_state]}
-                      {d.normalization_error ? ` — ${codeText(d.normalization_error)}` : ""}
-                    </>
-                  ) : undefined)
-                }
+                subtitle={failedText("device.hidpp")}
                 checked={d.hidpp_enabled}
                 disabled={busy || settingsBusy(entry)}
                 onChange={set("device.hidpp")}
@@ -879,6 +873,15 @@ export function DevicePage({ state, entry, drafts, onAdd }: { state: AppState; e
 
             <Card title="Information">
               <Facts>
+                <Fact label="HID++ Protocol">{hidppProtocolText(d.hidpp_protocol)}</Fact>
+                <Fact label="Special-Key Translation">
+                  {NORMALIZATION[d.normalization_state]}
+                  {d.normalization_error ? `: ${codeText(d.normalization_error)}` : ""}
+                </Fact>
+                <Fact label="Device Settings">
+                  {SETTINGS_STATUS[d.settings_state]}
+                  {d.settings_error ? `: ${codeText(d.settings_error)}` : ""}
+                </Fact>
                 {info.map((f) => (
                   <Fact key={`${f.key}/${f.instance}`} label={infoLabel(f)} dim={!f.fresh || !entry.infoCurrent}>
                     {infoValue(f)}

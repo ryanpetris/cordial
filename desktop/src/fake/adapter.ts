@@ -8,6 +8,7 @@ import type {
   HostPlatform,
   InfoField,
   InfoKey,
+  ProtocolState,
   Setting,
   SettingValue,
   Status,
@@ -57,6 +58,7 @@ export function device(id: string, patch: Partial<Device> = {}): Device {
     reconnect: "auto",
     last_error: null,
     hidpp_enabled: true,
+    hidpp_protocol: { state: "unknown" },
     normalization_state: "pending",
     normalization_error: null,
     settings_state: "pending",
@@ -127,6 +129,7 @@ export function demoDevices(): FakeDevice[] {
         roles: ["keyboard", "consumer_control"],
         security: connected,
         normalization_state: "active",
+        hidpp_protocol: { state: "detected", major: 4, minor: 5 },
         settings_state: "ready",
         settings_revision: 3,
       }),
@@ -181,6 +184,7 @@ export function demoDevices(): FakeDevice[] {
         roles: ["mouse"],
         security: connected,
         normalization_state: "active",
+        hidpp_protocol: { state: "detected", major: 4, minor: 5 },
         settings_state: "ready",
         settings_revision: 3,
       }),
@@ -252,6 +256,7 @@ export class FakeAdapter implements Transport {
   #scan: number | null = null;
   #pairing: { id: number; candidate: Candidate; prompt: string | null } | null = null;
   #nextDevice = 10;
+  readonly #protocols = new Map<string, ProtocolState>();
 
   constructor(options: FakeOptions = {}) {
     this.id = options.adapterId ?? "0000FAKE0001";
@@ -259,6 +264,7 @@ export class FakeAdapter implements Transport {
     this.name = ({ pico_w: "Pico W", pico2_w: "Pico 2 W", xiao_esp32s3: "XIAO ESP32-S3", waveshare_rp2350b_plus_w: "RP2350B-Plus-W" } as Record<string, string>)[this.board] ?? this.board;
     this.defaultName = this.name;
     this.devices = options.devices ?? demoDevices();
+    for (const d of this.devices) this.#protocols.set(d.device.device_id, d.device.hidpp_protocol ?? { state: "unknown" });
     this.candidates = options.candidates ?? demoCandidates();
     this.pairingMethod = options.pairingMethod === undefined ? "confirm_passkey" : options.pairingMethod;
     this.capabilities = options.capabilities ?? ["classic", "ble"];
@@ -339,6 +345,11 @@ export class FakeAdapter implements Transport {
   /** Changes a device record and reports it like the firmware would. */
   changeDevice(id: string, patch: Partial<Device>, event = "device.changed") {
     const d = this.find(id);
+    if (patch.hidpp_protocol) this.#protocols.set(id, patch.hidpp_protocol);
+    if (patch.state && patch.state !== "connected") patch = { ...patch, hidpp_protocol: { state: "unknown" } };
+    else if (patch.state === "connected" && d.device.state !== "connected" && !patch.hidpp_protocol) {
+      patch = { ...patch, hidpp_protocol: this.#protocols.get(id) ?? { state: "unknown" } };
+    }
     d.device = { ...d.device, ...patch };
     const revision = this.#bump();
     if (this.monitor) this.#event(event, { revision, device: d.device, ...(event === "device.disconnected" ? { reason: "remote" } : {}) });

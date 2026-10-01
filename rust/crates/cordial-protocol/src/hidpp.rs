@@ -1,5 +1,46 @@
 use serde::{Deserialize, Serialize};
 
+/// Protocol negotiation on the current connection, independent of feature readiness.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProtocolState {
+    #[default]
+    Unknown,
+    Probing,
+    Detected {
+        #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+        major: u8,
+        minor: u8,
+    },
+    Unavailable,
+    Error {
+        code: crate::errors::ErrorCode,
+    },
+}
+impl ProtocolState {
+    pub const fn major(self) -> u8 {
+        match self {
+            Self::Detected { major, .. } => major,
+            _ => 0,
+        }
+    }
+    pub fn valid(self) -> bool {
+        use crate::errors::ErrorCode as C;
+        match self {
+            Self::Detected { major, .. } => major != 0,
+            Self::Error { code } => matches!(
+                code,
+                C::HidppTimeout
+                    | C::HidppTransportError
+                    | C::HidppDeviceError
+                    | C::HidppInvalidResponse
+            ),
+            _ => true,
+        }
+    }
+}
+
 /// Stable protocol feature number, independent of each device's feature table.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

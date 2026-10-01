@@ -669,6 +669,9 @@ pub(crate) fn valid_id(id: &str) -> Result<()> {
 pub(crate) fn validate_device(device: &Device) -> Result<()> {
     valid_id(&device.device_id.0)?;
     valid_revision(device.settings_revision)?;
+    if !device.hidpp_protocol.valid() {
+        return Err(Error::new("invalid HID++ protocol state"));
+    }
     if device.name.as_ref().is_some_and(|s| s.len() > 128) {
         return Err(Error::new("invalid device name"));
     }
@@ -894,6 +897,39 @@ mod tests {
 
     use cordial_protocol::errors::{DisabledReason, ValidationError};
     use cordial_protocol::identifiers::{ConnectionState, PairingState, Transport};
+
+    #[test]
+    fn protocol_evidence_is_validated_separately_from_feature_readiness() {
+        use cordial_protocol::{errors::ErrorCode, hidpp::ProtocolState};
+        use cordial_protocol::{identifiers::NormalizationState, messages::Device};
+        let mut d = crate::ui::command::tests::device("d_1", "Kbd");
+        d.normalization_state = NormalizationState::Unsupported;
+        d.normalization_error = Some(ErrorCode::HidppControlsUnavailable);
+        for protocol in [
+            ProtocolState::Unknown,
+            ProtocolState::Detected { major: 4, minor: 2 },
+            ProtocolState::Error {
+                code: ErrorCode::HidppTimeout,
+            },
+        ] {
+            d.hidpp_protocol = protocol;
+            assert!(validate_device(&d).is_ok());
+        }
+        for protocol in [
+            ProtocolState::Detected { major: 0, minor: 0 },
+            ProtocolState::Error {
+                code: ErrorCode::HidppControlsUnavailable,
+            },
+        ] {
+            d.hidpp_protocol = protocol;
+            assert!(validate_device(&d).is_err());
+        }
+        let mut value = serde_json::to_value(&d).unwrap();
+        value.as_object_mut().unwrap().remove("hidpp_protocol");
+        let d: Device = serde_json::from_value(value).unwrap();
+        assert_eq!(d.hidpp_protocol, ProtocolState::Unknown);
+        assert!(validate_device(&d).is_ok());
+    }
 
     /// Unreadable or corrupt device records stay paired but invalid; bond
     /// problems need pairing. Firmware snapshots of both are accepted.
