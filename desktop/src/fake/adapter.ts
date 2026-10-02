@@ -189,6 +189,26 @@ export function demoDevices(): FakeDevice[] {
   ];
 }
 
+/** A second, BLE-only set of synthetic devices, so a second simulated adapter is distinguishable. */
+export function demoDevicesBle(): FakeDevice[] {
+  return [
+    device("d_1", {
+      name: "Example Compact Keyboard",
+      state: "connected",
+      roles: ["keyboard", "consumer_control"],
+      info: { "device.manufacturer": "Example Co", "battery.level": 54, "battery.charging": true },
+    }),
+    device("d_2", { name: "Example Trackball", kind: "mouse", roles: ["mouse"] }),
+  ];
+}
+
+export function demoCandidatesBle(): Candidate[] {
+  return [
+    { id: "c_1", kind: "keyboard", name: "Example Numpad", transport: "ble", rssi: -55 },
+    { id: "c_2", kind: "unknown", name: "", transport: "ble", rssi: -78 },
+  ];
+}
+
 export function demoCandidates(): Candidate[] {
   return [
     { id: "c_1", kind: "keyboard", name: "Example Keys Mini", transport: "ble", rssi: -48 },
