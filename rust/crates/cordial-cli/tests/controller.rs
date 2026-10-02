@@ -229,14 +229,26 @@ fn pairing_follows_its_prompt_and_reports_the_saved_device() {
     assert_eq!(busy.code_of(), Some(ErrorCode::Busy));
     let short = run(&c, &rx, Command::Accept(Some("12".into()))).unwrap_err();
     assert_eq!(short.message, "passkey must contain exactly six digits");
-    run(&c, &rx, Command::Accept(Some("123456".into()))).unwrap();
-    let Event::Done { result, .. } = until(
-        &rx,
-        |e| matches!(e, Event::Done { ticket: t, .. } if *t == ticket),
-    ) else {
-        unreachable!()
-    };
-    match result.unwrap() {
+    // The pairing and the answer finish in either order; collect both results.
+    let accept = c.run(
+        Command::Accept(Some("123456".into())),
+        RunOptions::default(),
+    );
+    let (mut paired, mut accepted) = (None, None);
+    while paired.is_none() || accepted.is_none() {
+        if let Event::Done {
+            ticket: t, result, ..
+        } = until(&rx, |e| matches!(e, Event::Done { .. }))
+        {
+            if t == ticket {
+                paired = Some(result);
+            } else if t == accept {
+                accepted = Some(result);
+            }
+        }
+    }
+    accepted.unwrap().unwrap();
+    match paired.unwrap().unwrap() {
         Outcome::Paired { subject, device } => {
             assert_eq!(subject.id, "d_9");
             assert_eq!(device.unwrap().name, "New Keyboard");
