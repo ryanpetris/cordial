@@ -274,10 +274,24 @@ fn parse_color(text: &str) -> Option<u32> {
         .flatten()
 }
 
+/// Why a value for `s` was refused: the values it takes, or that it has none.
+fn rejected(s: &p::Setting) -> String {
+    let none = match model::kind(s) {
+        Some(Type::Enum) => model::choices(s).is_empty(),
+        None => true,
+        _ => false,
+    };
+    if none {
+        format!("{} has no values to choose from", s.key)
+    } else {
+        format!("{} takes {}", s.key, legal_text(s))
+    }
+}
+
 /// Types a command-line value from a setting's type and limits.
 fn parse_value(s: &p::Setting, text: &str) -> Result<Value, String> {
     let key = &s.key;
-    let invalid = || format!("{key} takes {}", legal_text(s));
+    let invalid = || rejected(s);
     let v = match model::kind(s) {
         Some(Type::Bool) => match text.to_lowercase().as_str() {
             "on" | "true" | "yes" => Value::Bool(true),
@@ -310,7 +324,7 @@ pub fn setting_value(s: &p::Setting, input: &SettingInput) -> Result<Value, Stri
     match input {
         SettingInput::Text(text) => parse_value(s, text),
         SettingInput::Value(v) if model::accepts(s, v) => Ok(v.clone()),
-        SettingInput::Value(_) => Err(format!("{} takes {}", s.key, legal_text(s))),
+        SettingInput::Value(_) => Err(rejected(s)),
     }
 }
 
@@ -367,7 +381,7 @@ pub fn setting_line(d: &p::Device, s: &p::Setting) -> String {
         Some(saved) => {
             let _ = write!(
                 line,
-                "; saved on dongle: {}, {}",
+                "; saved on adapter: {}, {}",
                 safe(&value_string(&saved)),
                 apply_state(s)
             );
@@ -435,7 +449,7 @@ pub fn setting_detail(d: &p::Device, s: &p::Setting) -> String {
     match model::saved(s) {
         Some(saved) => {
             field(
-                "Saved on Dongle",
+                "Saved on Adapter",
                 &format!("yes, {}", safe(&value_string(&saved))),
             );
             field("State", &apply_state(s));
@@ -447,7 +461,7 @@ pub fn setting_detail(d: &p::Device, s: &p::Setting) -> String {
             }
         }
         None => {
-            field("Saved on Dongle", "no (Default)");
+            field("Saved on Adapter", "no (Default)");
             field("State", &apply_state(s));
         }
     }
@@ -514,9 +528,9 @@ pub fn saved_text(
         let value = safe(&maybe_value(model::saved(s).as_ref()));
         let key = safe(key);
         lines.push(if hidpp_on {
-            format!("Saved on dongle: {key} = {value} ({}).", apply_state(s))
+            format!("Saved on adapter: {key} = {value} ({}).", apply_state(s))
         } else {
-            format!("Saved on dongle: {key} = {value} (not applied: HID++ is off).")
+            format!("Saved on adapter: {key} = {value} (not applied: HID++ is off).")
         });
     }
     if !set.is_empty() {

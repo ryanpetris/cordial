@@ -78,6 +78,8 @@ pub enum Action {
     Port(String),
     Device(String),
     DeviceSettings,
+    /// Opens the selected device's Diagnostics.
+    Diagnostics,
     /// Asks the selected connected device for current information.
     RefreshInfo,
     /// Scans one transport, or every supported one.
@@ -139,6 +141,8 @@ pub enum Action {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Dialog {
     Help,
+    /// The selected device's warnings, HID++ details, security and identifiers.
+    Diagnostics,
     /// Adapter settings.
     Settings,
     Rename,
@@ -201,8 +205,6 @@ pub(crate) struct Model<B: Backend> {
     logs: Vec<LogEntry>,
     /// Last reported state, to describe changes.
     known: HashMap<String, p::Device>,
-    /// Last known warning list of each device, to report additions.
-    known_warnings: HashMap<String, Vec<p::DeviceWarning>>,
     /// Candidate names for devices no longer listed.
     names: HashMap<String, String>,
     /// Candidates the activity reported this scan, and whether by name.
@@ -270,7 +272,6 @@ impl<B: Backend> Model<B> {
             selected: String::new(),
             logs: Vec::new(),
             known: HashMap::new(),
-            known_warnings: HashMap::new(),
             names: HashMap::new(),
             found: HashMap::new(),
             show_unnamed: false,
@@ -306,6 +307,13 @@ impl<B: Backend> Model<B> {
             m.open(port);
         }
         m
+    }
+
+    /// Whether the device the Diagnostics dialog shows is connected, so it can be refreshed.
+    pub(super) fn diagnosed_connected(&self) -> bool {
+        self.state().is_some_and(
+            |st| matches!(Self::find(&st, &self.selected), (Some(d), _) if connected(d)),
+        )
     }
 
     /// The session's current state, while it is the one shown, without the
@@ -855,7 +863,7 @@ impl<B: Backend> Model<B> {
                 self.focus = None;
                 self.form_focused = true;
             }
-            Action::Help | Action::AdapterSettings => {
+            Action::Help | Action::AdapterSettings | Action::Diagnostics => {
                 if self.auth().is_some()
                     || matches!(
                         self.dialog,
@@ -864,10 +872,10 @@ impl<B: Backend> Model<B> {
                 {
                     return; // Prompts and confirmations stay in front until answered.
                 }
-                self.dialog = Some(if action == Action::Help {
-                    Dialog::Help
-                } else {
-                    Dialog::Settings
+                self.dialog = Some(match action {
+                    Action::Help => Dialog::Help,
+                    Action::Diagnostics => Dialog::Diagnostics,
+                    _ => Dialog::Settings,
                 });
                 self.dialog_scroll = 0;
                 self.form_err.clear();

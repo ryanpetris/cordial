@@ -1,5 +1,5 @@
-import { create, toBinary } from "@bufbuild/protobuf";
-import { DeviceWarningSchema, ReportType, WarningCode } from "@cordial/protocol";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { DeviceWarningSchema, DeviceWarningsSchema, ReportType, WarningCode } from "@cordial/protocol";
 import { describe, expect, it } from "vitest";
 import { warning } from "../src/core/convert.ts";
 import type { DeviceWarning } from "../src/shared/state.ts";
@@ -19,6 +19,18 @@ describe("device warnings", () => {
     fake.changeWarnings("d_1", selectors);
     await until(() => session.warnings.get("d_1")!.length === 3);
     expect(session.warnings.get("d_1")).toEqual(selectors);
+    fake.changeWarnings("d_1", []);
+    await until(() => session.warnings.get("d_1")!.length === 0);
+    await session.close();
+  });
+
+  it("reads a list sent without warnings as having none", async () => {
+    const bytes = toBinary(DeviceWarningsSchema, create(DeviceWarningsSchema, { device: "d_1" }));
+    expect(fromBinary(DeviceWarningsSchema, bytes).warnings.map(warning)).toEqual([]);
+    const { fake, session } = await openSession();
+    await until(() => session.listed && session.warnings.size === fake.devices.length);
+    fake.changeWarnings("d_1", [field]);
+    await until(() => session.warnings.get("d_1")!.length === 1);
     fake.changeWarnings("d_1", []);
     await until(() => session.warnings.get("d_1")!.length === 0);
     await session.close();
@@ -61,6 +73,12 @@ describe("device warnings", () => {
       text: "The adapter couldn't update the indicator lights.",
       context: "Service 0, Report 0",
     });
+  });
+
+  it("labels a warning this app doesn't know as a device warning", () => {
+    const w: DeviceWarning = { ...field, code: "unknown" };
+    expect(warningFact(w).label).toBe("Device Warning");
+    expect(warningFact(w).text).toBe("The adapter can't use part of this device.");
   });
 
   it("keeps a usage page reported without a usage", () => {

@@ -2,7 +2,7 @@
 // from responses and events in the order the adapter sent them. Each device
 // record, settings list and warning list arrives whole, so the latest one
 // wins. Opening lists the devices, then each device's warnings and settings.
-import { Connection, ConnectionClosedError, CordialError, type ByteStream } from "@cordial/client";
+import { Connection, ConnectionClosedError, CordialError, UnexpectedResponseError, type ByteStream } from "@cordial/client";
 import type { Event, Request, Response } from "@cordial/protocol";
 import type { AdapterStatus, DeviceRecord, DeviceWarning, Setting } from "../shared/state.ts";
 import { errorText } from "../shared/text.ts";
@@ -23,7 +23,8 @@ export interface SessionHooks {
 /** Why a failed request failed, in words. */
 export const failure = (error: unknown) =>
   error instanceof CordialError ? errorText(convert.wireError(error))
-    : error instanceof ConnectionClosedError ? "The adapter disconnected."
+    : error instanceof ConnectionClosedError ? "The adapter disconnected before the change finished."
+      : error instanceof UnexpectedResponseError ? "The adapter returned an unexpected result."
       : (error as Error).message;
 
 export class AdapterSession {

@@ -57,18 +57,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Install archive build prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git pkg-config
-      - name: Install static Rust target
-        working-directory: rust
-        run: rustup target add x86_64-unknown-linux-musl
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-          cache: npm
-          cache-dependency-path: desktop/package-lock.json
       - name: Build portable applications
         run: make package-desktop package-cli package-web
       - name: Check desktop archive
@@ -90,17 +78,12 @@ jobs:
   arch:
     needs: [validate, linux]
     runs-on: ubuntu-24.04
-    container: archlinux:base-devel
     env:
       CORDIAL_VERSION: ${{ needs.validate.outputs.version }}
       SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.epoch }}
       CORDIAL_HOMEPAGE: https://github.com/${{ github.repository }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - name: Install packaging tools
-        run: |
-          pacman -Syu --noconfirm git namcap python
-          sed -i '/^NoExtract.*usr\/share\/doc/d' /etc/pacman.conf
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -109,38 +92,11 @@ jobs:
           name: packages-linux
           path: build/portable
       - name: Build native packages
-        shell: bash
         run: |
-          cd build/portable
-          sha256sum -c SHA256SUMS-linux
-          cd ../..
-          CORDIAL_ARCHIVE_SHA256=SKIP source desktop/packaging/arch/PKGBUILD
-          pacman -S --needed --noconfirm "${depends[@]}"
-          useradd -m builder
-          chown -R builder .
-          runuser -u builder -- make package-desktop-arch package-cli-arch DESKTOP_ARCHIVE="build/portable/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" CLI_ARCHIVE="build/portable/cordial-cli-$CORDIAL_VERSION-linux-amd64.tar.gz"
+          (cd build/portable && sha256sum -c SHA256SUMS-linux)
+          make package-desktop-arch package-cli-arch DESKTOP_ARCHIVE="build/portable/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" CLI_ARCHIVE="build/portable/cordial-cli-$CORDIAL_VERSION-linux-amd64.tar.gz"
       - name: Check independent installations, reinstall and removal
-        run: |
-          pacman -U --noconfirm build/packages/cli-arch/cordial-cli-*.pkg.tar.zst
-          python tools/check_linux_package.py cordial-cli --version "$CORDIAL_VERSION"
-          test ! -e /usr/bin/cordial-desktop
-          pacman -U --noconfirm build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst
-          python tools/check_linux_package.py cordial-desktop --version "$CORDIAL_VERSION"
-          # Bundled Electron belongs in /opt under the Arch Electron guidelines.
-          namcap -e elfpaths build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst > namcap.log
-          namcap build/packages/cli-arch/cordial-cli-*.pkg.tar.zst >> namcap.log
-          cat namcap.log
-          if grep -q ' E:' namcap.log; then exit 1; fi
-          pacman -U --noconfirm build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst build/packages/cli-arch/cordial-cli-*.pkg.tar.zst
-          pacman -R --noconfirm cordial-cli
-          test ! -e /usr/bin/cordial
-          python tools/check_linux_package.py cordial-desktop --version "$CORDIAL_VERSION"
-          pacman -R --noconfirm cordial-desktop
-          test ! -e /usr/bin/cordial-desktop
-          mkdir release
-          cp build/packages/desktop-arch/*.pkg.tar.zst build/packages/cli-arch/*.pkg.tar.zst release/
-          cd release
-          sha256sum ./*.pkg.tar.zst > SHA256SUMS-arch
+        run: docker run --rm -v "$PWD:$PWD" -w "$PWD" -e CORDIAL_VERSION archlinux:base-devel packaging/check-arch.sh
       - uses: actions/upload-artifact@v7
         with:
           name: packages-arch
@@ -160,14 +116,12 @@ jobs:
             distribution: noble
           - image: ubuntu:26.04
             distribution: resolute
-    container: ${{ matrix.image }}
     env:
       CORDIAL_VERSION: ${{ needs.validate.outputs.version }}
       SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.epoch }}
       CORDIAL_HOMEPAGE: https://github.com/${{ github.repository }}
       DEB_DISTRIBUTION: ${{ matrix.distribution }}
-      DEBIAN_FRONTEND: noninteractive
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -176,38 +130,12 @@ jobs:
         with:
           name: packages-linux
           path: build/portable
-      - name: Install native packaging prerequisites
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential debhelper devscripts dh-apparmor equivs python3 lintian
-          mk-build-deps --install --remove --tool 'apt-get -y --no-install-recommends' desktop/packaging/debian/control
       - name: Build native packages
         run: |
-          cd build/portable
-          sha256sum -c SHA256SUMS-linux
-          cd ../..
-          make package-desktop-deb package-cli-deb DESKTOP_ARCHIVE="build/portable/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" CLI_ARCHIVE="build/portable/cordial-cli-$CORDIAL_VERSION-linux-amd64.tar.gz"
+          (cd build/portable && sha256sum -c SHA256SUMS-linux)
+          make package-desktop-deb package-cli-deb DEB_DISTRIBUTION="$DEB_DISTRIBUTION" DESKTOP_ARCHIVE="build/portable/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" CLI_ARCHIVE="build/portable/cordial-cli-$CORDIAL_VERSION-linux-amd64.tar.gz"
       - name: Check independent installations, reinstall and removal
-        run: |
-          echo 'path-include=/usr/share/doc/cordial-*' > /etc/dpkg/dpkg.cfg.d/zz-cordial-check
-          apt-get install -y --no-install-recommends ./build/packages/cli-deb/"$DEB_DISTRIBUTION"/cordial-cli_*_amd64.deb
-          python3 tools/check_linux_package.py cordial-cli --debian --version "$CORDIAL_VERSION"
-          test ! -e /usr/bin/cordial-desktop
-          apt-get install -y --no-install-recommends ./build/packages/desktop-deb/"$DEB_DISTRIBUTION"/cordial-desktop_*_amd64.deb
-          python3 tools/check_linux_package.py cordial-desktop --debian --version "$CORDIAL_VERSION"
-          # Vendor ELF files retain their published bytes under /opt.
-          lintian --suppress-tags dir-or-file-in-opt,embedded-library,shared-library-is-executable,unstripped-binary-or-object build/packages/desktop-deb/"$DEB_DISTRIBUTION"/*.deb
-          lintian --suppress-tags unstripped-binary-or-object build/packages/cli-deb/"$DEB_DISTRIBUTION"/*.deb
-          apt-get install -y --reinstall ./build/packages/cli-deb/"$DEB_DISTRIBUTION"/*.deb ./build/packages/desktop-deb/"$DEB_DISTRIBUTION"/*.deb
-          apt-get purge -y cordial-cli
-          test ! -e /usr/bin/cordial
-          python3 tools/check_linux_package.py cordial-desktop --debian --version "$CORDIAL_VERSION"
-          apt-get purge -y cordial-desktop
-          test ! -e /usr/bin/cordial-desktop
-          mkdir release
-          cp build/packages/desktop-deb/"$DEB_DISTRIBUTION"/*.deb build/packages/cli-deb/"$DEB_DISTRIBUTION"/*.deb release/
-          cd release
-          sha256sum ./*.deb > "SHA256SUMS-$DEB_DISTRIBUTION"
+        run: docker run --rm -v "$PWD:$PWD" -w "$PWD" -e CORDIAL_VERSION -e DEB_DISTRIBUTION '${{ matrix.image }}' packaging/check-deb.sh
       - uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.distribution }}
@@ -251,41 +179,28 @@ jobs:
       fail-fast: false
       matrix:
         board: [pico_w, pico2_w, waveshare_rp2350b_plus_w, xiao_esp32s3]
+        profile: [production, development]
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Install firmware build prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git cmake ninja-build clang libclang-dev pkg-config python3-venv libusb-1.0-0
-      - name: Build production firmware
-        if: matrix.board != 'xiao_esp32s3'
-        run: |
-          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
-          make package-firmware BOARD='${{ matrix.board }}' PROFILE=production
-      - name: Build production ESP firmware
-        if: matrix.board == 'xiao_esp32s3'
-        run: |
-          cargo install espup --version 0.17.1 --locked
-          cargo install ldproxy --version 0.3.5 --locked
-          espup install --toolchain-version 1.97.0.0 --targets esp32s3 --std --export-file "$RUNNER_TEMP/export-esp.sh"
-          git clone --branch v6.1 --depth 1 --recursive --shallow-submodules https://github.com/espressif/esp-idf.git "$RUNNER_TEMP/esp-idf"
-          "$RUNNER_TEMP/esp-idf/install.sh" esp32s3
-          . "$RUNNER_TEMP/export-esp.sh"
-          . "$RUNNER_TEMP/esp-idf/export.sh"
-          make package-firmware BOARD=xiao_esp32s3 PROFILE=production
+      - name: Check firmware
+        run: make check-firmware BOARD='${{ matrix.board }}' PROFILE='${{ matrix.profile }}'
+      - name: Build firmware
+        run: make package-firmware BOARD='${{ matrix.board }}' PROFILE='${{ matrix.profile }}'
       - name: Archive complete firmware package
         env:
           BOARD: ${{ matrix.board }}
+          # Development firmware is published as the debug build.
+          SUFFIX: ${{ matrix.profile == 'development' && '-debug' || '' }}
         run: |
           mkdir release
-          tar -C "build/firmware/$CORDIAL_VERSION" -czf "release/cordial-firmware-$CORDIAL_VERSION-$BOARD-production.tar.gz" .
+          tar -C "build/firmware/$CORDIAL_VERSION" -czf "release/cordial-firmware-$CORDIAL_VERSION-$BOARD$SUFFIX.tar.gz" .
           cd release
-          sha256sum ./*.tar.gz > "SHA256SUMS-firmware-$BOARD"
+          sha256sum ./*.tar.gz > "SHA256SUMS-firmware-$BOARD$SUFFIX"
       - uses: actions/upload-artifact@v7
         with:
-          name: packages-firmware-${{ matrix.board }}
+          name: packages-firmware-${{ matrix.board }}-${{ matrix.profile }}
           path: release/
           compression-level: 0
           if-no-files-found: error
@@ -321,7 +236,8 @@ jobs:
             done
           done
           for board in pico_w pico2_w waveshare_rp2350b_plus_w xiao_esp32s3; do
-            test -f "cordial-firmware-$CORDIAL_VERSION-$board-production.tar.gz"
+            test -f "cordial-firmware-$CORDIAL_VERSION-$board.tar.gz"
+            test -f "cordial-firmware-$CORDIAL_VERSION-$board-debug.tar.gz"
           done
       - name: Publish release
         env:

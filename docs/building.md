@@ -19,30 +19,45 @@ separate from transient port names. Select an adapter by its reported identity.
 
 ## Build
 
-Run commands from the repository root on Linux. Install Python 3.11.4+, Node.js
-24 with npm, Rust through [rustup](https://rustup.rs/), and native build tools.
-Cargo uses the pinned toolchain in `rust/rust-toolchain.toml`. The rustup `cargo`
-and `rustc` commands must be on `PATH`.
+Run commands from the repository root on Linux. Builds run in Docker, so the only
+prerequisites are GNU Make, Git and [Docker](https://docs.docker.com/engine/install/)
+with your user allowed to run it. `DOCKER=podman` uses Podman instead.
 
-On Debian and Ubuntu, install the native prerequisites with:
+```sh
+make desktop
+make cli
+make firmware BOARD=pico_w
+```
+
+Each build runs in a toolchain image from `docker/`, created on first use and
+reused afterwards. The build copies the checkout into the image, leaving out the
+paths in `.dockerignore` (build outputs, caches, installed dependencies and Git
+data), builds there, and copies only its outputs back to the same places a local
+build would put them, replacing the earlier copy of each output. Every build
+starts from that clean copy, downloading its dependencies and compiling from
+scratch; only a build of identical sources can reuse Docker's cached result.
+Docker keeps those results until `docker builder prune` removes them, and
+firmware builds take several gigabytes each. Docker BuildKit is required.
+
+The CLI executable is `rust/target/release/cordial`. The desktop build is in
+`desktop/out/`.
+
+### Building without Docker
+
+`make local-desktop`, `make local-web` and `make local-cli` build the desktop
+application, its web version and the CLI with locally installed tools. Install
+Python 3.11.4+, Node.js 24 with npm, Rust through [rustup](https://rustup.rs/), and
+native build tools. Cargo uses the pinned toolchain in `rust/rust-toolchain.toml`;
+the rustup `cargo` and `rustc` commands must be on `PATH`. On Debian and Ubuntu:
 
 ```sh
 sudo apt-get install build-essential git clang libclang-dev pkg-config python3
 ```
 
-On Arch, install `base-devel`, `git`, `clang`, `pkgconf` and `python`.
-Desktop targets run `npm ci` when the manifests change or dependencies are
-missing, then invoke the Vite CLI. Rust targets invoke Cargo directly. Firmware
-builds run in Docker; see [Firmware](#firmware).
-
-```sh
-make desktop
-make cli
-```
-
-The CLI executable is `rust/target/release/cordial`. The desktop build is in
-`desktop/out/`. After installing desktop dependencies, `npm --prefix desktop run
-start` builds and starts the desktop application.
+On Arch, install `base-devel`, `git`, `clang`, `pkgconf` and `python`. Desktop
+targets run `npm ci` when the manifests change or dependencies are missing. After
+installing desktop dependencies, `npm --prefix desktop run start` builds and starts
+the desktop application. The software checks below use the same local tools.
 
 ### Web version
 
@@ -95,22 +110,15 @@ adapter. Changes in Settings last until the server stops.
 
 ### Firmware
 
-Firmware builds run in Docker, so the ARM, Xtensa and ESP-IDF toolchains need no
-local setup. Install [Docker](https://docs.docker.com/engine/install/) and allow
-your user to run it. `DOCKER=podman` uses Podman instead.
-
 ```sh
-make docker-firmware BOARD=pico_w
-make docker-firmware BOARD=xiao_esp32s3
-make docker-firmware-all
+make firmware BOARD=pico_w
+make firmware BOARD=xiao_esp32s3 PROFILE=production
+make firmware-all
 ```
 
-The first build of each platform creates its image from `rust/docker/`: the Pico
-image has Rust and ARM GCC, and the ESP32-S3 image adds Rust, espup and ldproxy to
-Espressif's ESP-IDF v6.1 image. Later builds reuse the image. The build runs as
-your user with the checkout mounted at its own path, and keeps the Cargo cache in
-`.cache/docker/`. Pico SDK and BTstack source dependencies remain pinned and
-unmodified in `.cache/dependencies/`.
+The Pico image has Rust and ARM GCC; the ESP32-S3 image adds Rust, espup and
+ldproxy to Espressif's ESP-IDF v6.1 image. Each build fetches the pinned Pico SDK
+and BTstack sources inside the image.
 
 `BOARD` defaults to `pico_w`. `PROFILE` defaults to `development`, independently
 of compiler release optimization. `PROFILE=production` excludes development
@@ -118,7 +126,9 @@ commands, including remote bootloader entry and filesystem inspection. No Make
 target installs firmware.
 
 Firmware packages are written under
-`build/firmware/<version>/<board>-<bluetooth-backend>-<radio-backend>-<profile>/`.
+`build/firmware/<version>/<board>-<bluetooth-backend>-<radio-backend>/` for production
+and the same directory with a `-debug` suffix for development firmware, the debug
+build.
 They contain the ELF, binary, artifact metadata and checksums. Pico packages also
 contain UF2; ESP packages contain bootloader and partition-table images plus
 `flash.json`. Packaging verifies image metadata and storage bounds.
@@ -137,7 +147,7 @@ remain unchanged.
 
 ```sh
 export CORDIAL_VERSION=1.2.3
-make package-desktop package-cli package-web docker-firmware BOARD=pico_w
+make package-desktop package-cli package-web package-firmware BOARD=pico_w
 ```
 
 The tag-triggered release workflow reads `GITHUB_REF_NAME`, validates
@@ -152,33 +162,24 @@ bundle Electron and the application's native modules.
 `make package-cli` builds the static Rust executable, documentation, protocol definitions and
 dependency notices, then creates `build/release/cordial-cli-<version>-linux-<arch>.tar.gz`.
 `make package-cli-tar` is the same target. The CLI has no Electron dependency.
-Install its musl target once with rustup before packaging:
-
-```sh
-(cd rust && rustup target add x86_64-unknown-linux-musl)
-```
-
-On ARM64 use `aarch64-unknown-linux-musl`. `CLI_TARGET` can select either target;
-the default matches the build machine.
+`CLI_TARGET` selects `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`;
+the default matches the build machine. The app image includes both targets.
 
 `make package-web` writes `build/packages/web/cordial-web-<version>/`, a directory
 ready for a static host. Firmware packages are separate from host applications.
 
 ### Native distribution packages
 
-Build each package on its target distribution. Supported native targets are
-Arch Linux x86-64, Debian 13, Ubuntu 24.04 and Ubuntu 26.04. Each native recipe
-consumes a portable archive. The Make targets build that archive when none is
-supplied:
+Supported native targets are Arch Linux x86-64, Debian 13, Ubuntu 24.04 and
+Ubuntu 26.04. Each package is built in an image of its distribution from a
+portable archive, which the Make targets build first when none is supplied:
 
 ```sh
 CORDIAL_VERSION=1.2.3 make package-desktop-arch package-cli-arch
-CORDIAL_VERSION=1.2.3 make package-desktop-deb package-cli-deb
+CORDIAL_VERSION=1.2.3 make package-desktop-deb package-cli-deb DEB_DISTRIBUTION=noble
 ```
 
-Use `DESKTOP_ARCHIVE` and `CLI_ARCHIVE` to package existing archives. This path
-requires Python and the native packaging tools, without Node, Cargo, firmware
-tools or Git:
+Use `DESKTOP_ARCHIVE` and `CLI_ARCHIVE` to package existing archives:
 
 ```sh
 export CORDIAL_VERSION=1.2.3
@@ -193,24 +194,15 @@ follows the [Arch Electron guidelines](https://wiki.archlinux.org/title/Electron
 for applications with bundled Electron. The native packages configure Electron's
 sandbox helper; Debian and Ubuntu also install its AppArmor user namespace profile.
 
-Arch uses `makepkg` and `fakeroot`. Recipes are in `desktop/packaging/arch/` and
-`rust/packaging/arch/`; output goes to `build/packages/desktop-arch/` and
-`build/packages/cli-arch/` as `.pkg.tar.zst` files. Run `makepkg` as a regular user
-with the recipe's dependencies installed.
-
-Debian and Ubuntu use `dpkg-buildpackage`, debhelper and `dch`. Install
-`build-essential`, `debhelper`, `devscripts`, `dh-apparmor`, `equivs` and `python3`,
-then install the desktop recipe's build dependencies:
-
-```sh
-sudo mk-build-deps --install --remove --tool 'apt-get -y --no-install-recommends' desktop/packaging/debian/control
-```
-
-Recipes are in `desktop/packaging/debian/` and `rust/packaging/debian/`. Package
-output goes to `build/packages/<application>-deb/<distribution>/`. By default,
-`DEB_DISTRIBUTION` is the build system's codename and `DEB_REVISION` is
-`1~<distribution>`, producing distinct Debian and Ubuntu files. Debian's library
-tools derive dependency versions from the bundled binaries on each distribution.
+Arch packages are built with `makepkg` from `desktop/packaging/arch/` and
+`rust/packaging/arch/` into `build/packages/desktop-arch/` and
+`build/packages/cli-arch/` as `.pkg.tar.zst` files. Debian and Ubuntu packages are
+built with `dpkg-buildpackage` from `desktop/packaging/debian/` and
+`rust/packaging/debian/` into `build/packages/<application>-deb/<distribution>/`.
+`DEB_DISTRIBUTION` is `trixie`, `noble` or `resolute` and defaults to `trixie`;
+`DEB_REVISION` is `1~<distribution>`, producing distinct Debian and Ubuntu files.
+Debian's library tools derive dependency versions from the bundled binaries on
+each distribution.
 
 `CORDIAL_HOMEPAGE` can override the project homepage in native package metadata.
 `SOURCE_DATE_EPOCH` can supply the release timestamp in Unix seconds; otherwise
@@ -218,12 +210,15 @@ native packaging uses the archive's `VERSION` timestamp. Supplied archives and
 tracked recipes remain unchanged.
 
 The GitHub release workflow resolves the tag once and supplies the same version
-to desktop, web, CLI and firmware builds. It builds the portable archives first,
-then builds each native package on its target distribution from those archives.
-Installation, native module loading, package checks and artifact checksums must
-pass before publication. Releases include the AppImage, desktop, CLI and web
-archives, both applications' Arch packages, separate Debian and Ubuntu packages,
-and production firmware archives for all four boards.
+to desktop, web, CLI and firmware builds, which use the same Make targets and
+images as a local build. It builds the portable archives first, then each native
+package from those archives. Installation, native module loading, package checks
+and artifact checksums are verified in a clean container of each distribution
+before publication. Releases include the AppImage, desktop, CLI and web archives,
+both applications' Arch packages, separate Debian and Ubuntu packages, and for each
+board a production firmware archive, `cordial-firmware-<version>-<board>.tar.gz`,
+and a debug archive, `cordial-firmware-<version>-<board>-debug.tar.gz`, built with
+the development profile.
 
 Third-party license material is retained in `notices/`. Firmware and CLI packages
 include the project license, generated dependency inventories and license notices.
@@ -257,7 +252,15 @@ make check-memory
 ```
 
 The allocation check runs simulated device workloads on QEMU without accessing
-hardware. To exercise the desktop with simulated adapters:
+hardware. Clippy for the firmware platform crates also runs in the firmware
+images, for one board and profile or for all of them:
+
+```sh
+make check-firmware BOARD=xiao_esp32s3 PROFILE=production
+make check-firmware-all
+```
+
+To exercise the desktop with simulated adapters:
 
 ```sh
 npm --prefix desktop run simulate
@@ -273,6 +276,8 @@ Adapter names are stored on the adapter. Rename through adapter settings in the 
 - `desktop/`: Electron, React and TypeScript application, its web version and development server.
 - `docs/`: control protocol, storage format and HID++ references.
 - `proto/`: serial protocol messages and the information and settings key catalog.
+- `docker/`: build images for the applications, firmware and distribution packages.
+- `packaging/`: the distribution packaging steps and their installation checks.
 - `tools/`: version validation, package checks and their tests.
 
 `make all` builds desktop, CLI and the selected firmware. `make clean` removes

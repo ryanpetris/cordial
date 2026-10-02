@@ -164,7 +164,7 @@ fn refusals_name_their_code_and_explanation() {
     let (result, _, _) = script(&dongle, &["adapter", "set", "name", "Desk 2"], false, b"");
     assert_eq!(
         result.unwrap_err().message,
-        "storage_failed: reading or writing the adapter's saved data failed"
+        "storage_failed: the adapter couldn't read or write its saved data"
     );
 }
 

@@ -1824,3 +1824,51 @@ fn a_pairing_cancelled_by_the_session_ending_reports_nothing_to_the_next_one() {
     assert!(pairing_steps(&t.events()).is_empty());
     assert!(t.app.manager.devices.iter().all(Option::is_none));
 }
+
+#[test]
+fn a_connected_device_going_away_records_no_error() {
+    let mut t = Test::new(true);
+    let link = connect_saved(&mut t, hidpp_descriptor());
+    t.poll();
+    assert_eq!(t.device(SAVED).state, p::DeviceState::Connected as i32);
+    t.event(Event::Disconnected {
+        link,
+        error: Some(cordial_core::model::errors::ErrorCode::ConnectionFailed),
+    });
+    let d = t.device(SAVED);
+    assert_eq!(d.state, p::DeviceState::Disconnected as i32);
+    assert_eq!(d.error, None);
+}
+
+#[test]
+fn a_link_lost_while_connecting_records_its_error() {
+    let mut t = Test::new(true);
+    t.poll();
+    let link = t.radio.connects.last().unwrap().0;
+    t.event(Event::Disconnected {
+        link,
+        error: Some(cordial_core::model::errors::ErrorCode::ConnectionFailed),
+    });
+    assert_eq!(
+        t.device(SAVED).error,
+        Some(p::ErrorCode::ConnectionFailed as i32)
+    );
+}
+
+#[test]
+fn a_connected_device_refusing_authentication_stops_reconnecting() {
+    let mut t = Test::new(true);
+    let link = connect_saved(&mut t, hidpp_descriptor());
+    t.poll();
+    assert_eq!(t.device(SAVED).state, p::DeviceState::Connected as i32);
+    t.event(Event::Disconnected {
+        link,
+        error: Some(cordial_core::model::errors::ErrorCode::AuthenticationFailed),
+    });
+    assert_eq!(t.device(SAVED).error, Some(p::ErrorCode::AuthFailed as i32));
+    // It waits for an explicit connect instead of reconnecting.
+    let attempts = t.radio.connects.len();
+    t.now += 600_000;
+    t.poll();
+    assert_eq!(t.radio.connects.len(), attempts);
+}

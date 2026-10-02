@@ -101,7 +101,7 @@ impl Wait {
     }
     pub fn check(&self) -> Result<(), Error> {
         if self.cancellation.cancelled() {
-            return Err(Error::new("cancelled"));
+            return Err(Error::new("the operation was cancelled"));
         }
         if self.deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(Error::new("operation timed out"));
@@ -299,7 +299,7 @@ impl Cell {
                 return Ok(result);
             }
             if !st.available {
-                return Err(Error::new("the adapter connection closed"));
+                return Err(Error::new("the connection to the adapter closed"));
             }
             wait.check()?;
             st = self

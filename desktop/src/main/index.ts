@@ -333,8 +333,8 @@ void app.whenReady().then(async () => {
     },
     lowBattery: (alert) =>
       notify(
-        alert.level === "critical" ? `${alert.name} battery is critical` : `${alert.name} battery is low`,
-        `${alert.percent}% remaining. Charge it soon.`,
+        alert.level === "critical" ? `${alert.name}'s battery is critically low.` : `${alert.name} has a low battery.`,
+        `The battery is at ${alert.percent}%. Charge it soon.`,
         { page: "device", key: alert.key },
       ),
     connection: (name, connected) => notify(name, connected ? "Connected" : "Disconnected"),

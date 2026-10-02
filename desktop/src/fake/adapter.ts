@@ -171,6 +171,9 @@ export function demoDevices(): FakeDevice[] {
         "wheel.ratchets_per_rotation": 24,
         "wheel.diameter": 50,
       },
+      warnings: [
+        { code: "pointer_selector_unsupported", service: 1, reportId: 2, reportType: "input", bitOffset: 24, usagePage: 1, usage: 0x38 },
+      ],
       settings: [
         setting("pointer.sensor.0.dpi", { type: "integer", min: 200, max: 8000, step: 50, value: 1000 }),
         setting("wheel.mode", { type: "enum", choices: ["freespin", "ratchet"], value: "ratchet" }),

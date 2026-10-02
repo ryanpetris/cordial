@@ -154,7 +154,7 @@ pub(crate) fn execute(
         }
         Command::CancelPairing => {
             if !st.pairing.as_ref().is_some_and(model::pairing_running) {
-                return Err(Error::new("there is no pairing to cancel"));
+                return Err(Error::new("no pairing is in progress"));
             }
             session.call(C::CancelPairing(p::CancelPairing {}), "pair cancel", true)?;
             Ok(Outcome::PairingCancelled)
@@ -380,7 +380,9 @@ fn accept(session: &Session, st: &State, value: Option<&str>) -> Result<Outcome,
             value
         }
         (Some(Prompt::EnterCode(_)), None) => {
-            return Err(Error::new("the pairing asks for a code"));
+            return Err(Error::new(
+                "this pairing needs a code; use pair accept CODE",
+            ));
         }
         (Some(Prompt::ConfirmCode(_)), _) => "",
         _ => return Err(refused(ErrorCode::NoPrompt, "pair accept")),

@@ -12,56 +12,102 @@ PROTOCOL_BASE ?= $(shell git describe --tags --abbrev=0 HEAD^ 2>/dev/null)
 BOARDS := pico_w pico2_w waveshare_rp2350b_plus_w xiao_esp32s3
 ESP_BOARDS := xiao_esp32s3
 DOCKER ?= docker
+DEB_DISTRIBUTION ?= trixie
+DEB_BASE_trixie := debian:13
+DEB_BASE_noble := ubuntu:24.04
+DEB_BASE_resolute := ubuntu:26.04
+DEB_BASE = $(or $(DEB_BASE_$(DEB_DISTRIBUTION)),$(error Unknown DEB_DISTRIBUTION $(DEB_DISTRIBUTION)))
 FIRMWARE_PLATFORM = $(if $(filter $(ESP_BOARDS),$(BOARD)),esp32s3,pico)
 
-.PHONY: help all desktop web cli firmware firmware-all docker-firmware docker-firmware-all docker-image check-memory-local package-desktop package-desktop-tar package-desktop-arch package-desktop-deb package-web package-cli package-cli-tar package-cli-arch package-cli-deb package-firmware check check-memory check-rust check-desktop check-protocol check-tools version clean
+.PHONY: help all desktop web cli local-desktop local-web local-cli firmware firmware-all \
+	package-desktop package-desktop-tar package-desktop-arch package-desktop-deb package-web \
+	package-cli package-cli-tar package-cli-arch package-cli-deb package-firmware \
+	local-package-desktop local-package-desktop-tar local-package-web local-package-cli \
+	image-app image-pico image-esp32s3 image-arch image-deb \
+	check check-memory check-firmware check-firmware-all check-rust check-desktop check-protocol check-tools version clean
 help:
-	@echo 'Cordial: all desktop web cli firmware firmware-all check check-memory version clean'
-	@echo 'Firmware in Docker: docker-firmware docker-firmware-all (DOCKER=$(DOCKER))'
+	@echo 'Cordial: all desktop web cli firmware firmware-all check check-memory check-firmware check-firmware-all version clean'
+	@echo 'Without Docker: local-desktop local-web local-cli'
 	@echo 'Release packages: package-desktop package-web package-cli package-firmware (CORDIAL_VERSION, default 0.0.0)'
-	@echo 'Distribution packages: package-desktop-arch package-desktop-deb package-cli-arch package-cli-deb'
+	@echo 'Distribution packages: package-desktop-arch package-desktop-deb package-cli-arch package-cli-deb (DEB_DISTRIBUTION=$(DEB_DISTRIBUTION))'
 	@echo 'Firmware options: BOARD=$(BOARD) PROFILE=$(PROFILE)'
 	@echo 'Boards: $(BOARDS)'
-all: desktop cli docker-firmware
+all: desktop cli firmware
+
+# Toolchain images from docker/. Each build copies the checkout into one of them (without the
+# paths in .dockerignore), runs there, and exports only its outputs back into the checkout.
+image-app:
+	$(DOCKER) build -t cordial-app -f docker/app.Dockerfile docker
+image-pico:
+	$(DOCKER) build -t cordial-pico -f docker/pico.Dockerfile docker
+image-esp32s3:
+	$(DOCKER) build -t cordial-esp32s3 -f docker/esp32s3.Dockerfile docker
+image-arch:
+	$(DOCKER) build -t cordial-arch -f docker/arch.Dockerfile desktop/packaging/arch
+image-deb:
+	$(DOCKER) build -t cordial-deb-$(DEB_DISTRIBUTION) --build-arg BASE=$(DEB_BASE) -f docker/deb.Dockerfile desktop/packaging/debian
+comma := ,
+# $(call build,IMAGE,COMMAND,OUTPUTS[,INPUT]) runs COMMAND with bash in the image and exports the
+# paths matching OUTPUTS, relative to the checkout; each replaces the checkout's copy, so nothing
+# from an earlier build is left inside it. INPUT is a file the build reads from /inputs. Each
+# target has its own working directories under .cache/docker/, so parallel builds stay apart.
+define build
+rm -rf .cache/docker/$@
+mkdir -p .cache/docker/$@/inputs
+$(if $(4),cp --reflink=auto '$(4)' .cache/docker/$@/inputs/)
+$(DOCKER) build --progress=plain -f docker/build.Dockerfile --build-arg IMAGE=cordial-$(1) \
+  --build-arg CORDIAL_VERSION --build-arg SOURCE_DATE_EPOCH --build-arg CORDIAL_HOMEPAGE \
+  --build-arg COMMAND='$(2)' --build-arg OUTPUTS='$(3)' --build-context inputs=.cache/docker/$@/inputs \
+  --output type=local$(comma)dest=.cache/docker/$@/out .
+for pattern in $(foreach p,$(3),'$(p)'); do
+  for exported in .cache/docker/$@/out/$$pattern; do
+    path=$${exported#.cache/docker/$@/out/}
+    rm -rf "$$path"
+    mkdir -p "$$(dirname "$$path")"
+    mv "$$exported" "$$path"
+  done
+done
+endef
+
+desktop: image-app
+	$(call build,app,make local-desktop,desktop/out/main desktop/out/preload desktop/out/renderer)
+web: image-app
+	$(call build,app,make local-web,desktop/out/web)
+cli: image-app
+	$(call build,app,make local-cli,rust/target/release/cordial)
 
 desktop/node_modules/.package-lock.json: desktop/package.json desktop/package-lock.json $(wildcard desktop/packages/*/package.json)
 	npm ci --include=dev --prefix desktop
-desktop: desktop/node_modules/.package-lock.json
+local-desktop: desktop/node_modules/.package-lock.json
 	npm --prefix desktop run build
-web: desktop/node_modules/.package-lock.json
+local-web: desktop/node_modules/.package-lock.json
 	npm --prefix desktop run build:web
-cli:
+local-cli:
 	$(PYTHON) tools/version.py
 	cd rust
 	cargo build --locked --release -p cordial-cli --bin cordial
-firmware:
-	$(PYTHON) rust/tools/build_firmware.py rust/boards/$(BOARD).json --profile $(PROFILE)
+
+firmware: image-$(FIRMWARE_PLATFORM)
+	$(call build,$(FIRMWARE_PLATFORM),python3 rust/tools/build_firmware.py rust/boards/$(BOARD).json --profile $(PROFILE),build/firmware/*/*)
 firmware-all:
 	@set -e; for board in $(BOARDS); do $(MAKE) firmware BOARD=$$board PROFILE=$(PROFILE); done
-# The firmware toolchains live in an image per platform. The checkout is mounted at its own path
-# and the build runs as the calling user, so outputs and caches are the same as a local build.
-docker-image:
-	$(DOCKER) build -t cordial-firmware-$(FIRMWARE_PLATFORM) -f rust/docker/$(FIRMWARE_PLATFORM).Dockerfile rust/docker
-DOCKER_RUN = mkdir -p .cache/docker/home .cache/docker/cargo && \
-	$(DOCKER) run --rm -u "$$(id -u):$$(id -g)" -v "$(CURDIR):$(CURDIR)" -w "$(CURDIR)" \
-	  -e HOME="$(CURDIR)/.cache/docker/home" -e CARGO_HOME="$(CURDIR)/.cache/docker/cargo" \
-	  -e CORDIAL_VERSION -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
-	  cordial-firmware-$(FIRMWARE_PLATFORM)
-docker-firmware: docker-image
-	$(DOCKER_RUN) make firmware BOARD=$(BOARD) PROFILE=$(PROFILE)
-docker-firmware-all:
-	@set -e; for board in $(BOARDS); do $(MAKE) docker-firmware BOARD=$$board PROFILE=$(PROFILE); done
-package-desktop-tar: DESKTOP_TARGETS = tar.gz
-package-desktop package-desktop-tar: desktop
+package-firmware: firmware
+
+package-desktop: image-app
+	$(call build,app,make local-package-desktop,desktop/dist/*.AppImage desktop/dist/*.tar.gz)
+package-desktop-tar: image-app
+	$(call build,app,make local-package-desktop-tar,desktop/dist/*.tar.gz)
+package-web: image-app
+	$(call build,app,make local-package-web,build/packages/web/*)
+package-cli package-cli-tar: image-app
+	$(call build,app,make local-package-cli CLI_TARGET=$(CLI_TARGET),build/release/cordial-cli-*.tar.gz)
+local-package-desktop-tar: DESKTOP_TARGETS = tar.gz
+local-package-desktop local-package-desktop-tar: local-desktop
 	version=$$($(PYTHON) tools/version.py)
 	printf '%s\n' "$$version" > desktop/out/VERSION
 	cd desktop
 	npm exec -- electron-builder --linux $(DESKTOP_TARGETS) --publish never --config.extraMetadata.version="$$version"
-package-desktop-arch: $(if $(DESKTOP_ARCHIVE),,package-desktop-tar)
-	$(MAKE) -f packaging/Makefile arch APP=desktop
-package-desktop-deb: $(if $(DESKTOP_ARCHIVE),,package-desktop-tar)
-	$(MAKE) -f packaging/Makefile deb APP=desktop
-package-web: web
+local-package-web: local-web
 	version=$$($(PYTHON) tools/version.py)
 	destination="build/packages/web/cordial-web-$$version"
 	rm -r -f "$$destination"
@@ -69,8 +115,7 @@ package-web: web
 	cp -r desktop/out/web/. "$$destination/"
 	cp LICENSE "$$destination/"
 	printf '%s\n' "$$version" > "$$destination/VERSION"
-package-cli: package-cli-tar
-package-cli-tar:
+local-package-cli:
 	version=$$($(PYTHON) tools/version.py)
 	case '$(CLI_TARGET)' in
 	  x86_64-unknown-linux-musl) arch=amd64 ;;
@@ -90,20 +135,28 @@ package-cli-tar:
 	(cd "$$temporary/$$name" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 	tar -C "$$temporary" -czf "$$temporary/$$name.tar.gz" "$$name"
 	mv "$$temporary/$$name.tar.gz" "build/release/$$name.tar.gz"
-package-cli-arch: $(if $(CLI_ARCHIVE),,package-cli-tar)
-	$(MAKE) -f packaging/Makefile arch APP=cli
-package-cli-deb: $(if $(CLI_ARCHIVE),,package-cli-tar)
-	$(MAKE) -f packaging/Makefile deb APP=cli
-package-firmware: firmware
+# Distribution packages repackage the portable archives, which are built first unless
+# DESKTOP_ARCHIVE or CLI_ARCHIVE names an existing one.
+desktop_archive = $(or $(DESKTOP_ARCHIVE),desktop/dist/cordial-desktop-$(CORDIAL_VERSION)-x64.tar.gz)
+cli_archive = $(or $(CLI_ARCHIVE),build/release/cordial-cli-$(CORDIAL_VERSION)-linux-amd64.tar.gz)
+package-desktop-arch: image-arch $(if $(DESKTOP_ARCHIVE),,package-desktop-tar)
+	$(call build,arch,make -f packaging/Makefile arch APP=desktop DESKTOP_ARCHIVE=/inputs/$(notdir $(desktop_archive)),build/packages/desktop-arch/*.pkg.tar.zst,$(desktop_archive))
+package-cli-arch: image-arch $(if $(CLI_ARCHIVE),,package-cli-tar)
+	$(call build,arch,make -f packaging/Makefile arch APP=cli CLI_ARCHIVE=/inputs/$(notdir $(cli_archive)),build/packages/cli-arch/*.pkg.tar.zst,$(cli_archive))
+package-desktop-deb: image-deb $(if $(DESKTOP_ARCHIVE),,package-desktop-tar)
+	$(call build,deb-$(DEB_DISTRIBUTION),make -f packaging/Makefile deb APP=desktop DESKTOP_ARCHIVE=/inputs/$(notdir $(desktop_archive)) DEB_DISTRIBUTION=$(DEB_DISTRIBUTION)$(if $(DEB_REVISION), DEB_REVISION=$(DEB_REVISION)),build/packages/desktop-deb/$(DEB_DISTRIBUTION)/*.deb,$(desktop_archive))
+package-cli-deb: image-deb $(if $(CLI_ARCHIVE),,package-cli-tar)
+	$(call build,deb-$(DEB_DISTRIBUTION),make -f packaging/Makefile deb APP=cli CLI_ARCHIVE=/inputs/$(notdir $(cli_archive)) DEB_DISTRIBUTION=$(DEB_DISTRIBUTION)$(if $(DEB_REVISION), DEB_REVISION=$(DEB_REVISION)),build/packages/cli-deb/$(DEB_DISTRIBUTION)/*.deb,$(cli_archive))
 
 check: check-rust check-desktop check-protocol check-tools
-check-memory: override BOARD = pico_w
-check-memory: docker-image
-	$(DOCKER_RUN) make check-memory-local
-check-memory-local:
-	$(MAKE) firmware BOARD=pico_w PROFILE=development
-	version=$$($(PYTHON) tools/version.py)
-	$(PYTHON) rust/tools/check_memory.py "build/firmware/$$version/pico_w-btstack-pico-sdk-cyw43-development/cordial-pico_w-btstack-pico-sdk-cyw43-development.elf"
+# Clippy on the firmware platform crates for BOARD and PROFILE, in the board's image.
+check-firmware: image-$(FIRMWARE_PLATFORM)
+	$(call build,$(FIRMWARE_PLATFORM),python3 rust/tools/build_firmware.py rust/boards/$(BOARD).json --profile $(PROFILE) --clippy)
+check-firmware-all:
+	@set -e; for board in $(BOARDS); do for profile in development production; do $(MAKE) check-firmware BOARD=$$board PROFILE=$$profile; done; done
+# The allocation check builds Pico W development firmware and runs it under QEMU in the Pico image.
+check-memory: image-pico
+	$(call build,pico,python3 rust/tools/build_firmware.py rust/boards/pico_w.json --profile development; python3 rust/tools/check_memory.py build/firmware/$$CORDIAL_VERSION/pico_w-btstack-pico-sdk-cyw43-debug/cordial-pico_w-btstack-pico-sdk-cyw43-debug.elf)
 check-rust:
 	$(PYTHON) rust/tools/firmware_dependencies.py --btstack
 	cd rust

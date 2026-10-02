@@ -53,6 +53,16 @@ export class CordialError extends Error {
   }
 }
 
+/** The Dongle answered a command with a result of another kind. */
+export class UnexpectedResponseError extends Error {
+  readonly command: string;
+  constructor(command: string) {
+    super(`${command} got an unexpected response`);
+    this.name = "UnexpectedResponseError";
+    this.command = command;
+  }
+}
+
 /** The session ended before a request was answered. */
 export class ConnectionClosedError extends Error {
   constructor(message = "connection closed") {
@@ -170,7 +180,7 @@ export class Connection {
 
   async #call<C extends ResultCase>(command: Command, result: C): Promise<ResultOf<C>> {
     const response = await this.send(command);
-    if (response.result.case !== result) throw new Error(`${command.case} got an unexpected response`);
+    if (response.result.case !== result) throw new UnexpectedResponseError(command.case);
     return response.result.value as ResultOf<C>;
   }
 

@@ -125,7 +125,7 @@ fn device_changes(old: &p::Device, d: &p::Device) -> Vec<(Kind, String)> {
         out.push((
             Kind::Bad,
             format!(
-                "Logitech Features failed on {name}: {}",
+                "Logitech Features couldn't start on {name}: {}",
                 text::hidpp_words(code)
             ),
         ));
@@ -177,26 +177,15 @@ impl<B: Backend> Model<B> {
 
     pub(super) fn reset_activity(&mut self) {
         self.known.clear();
-        self.known_warnings.clear();
         self.names.clear();
         self.found.clear();
     }
 
-    /// Tracks saved devices so later events can say what changed. The first
-    /// warning list of a device is only recorded.
+    /// Tracks saved devices so later events can say what changed.
     pub(super) fn remember(&mut self) {
         let Some(st) = self.state() else {
             return;
         };
-        for d in &st.devices {
-            if let Some(w) = st.warnings.get(&d.id) {
-                self.known_warnings
-                    .entry(d.id.clone())
-                    .or_insert_with(|| w.clone());
-            }
-        }
-        self.known_warnings
-            .retain(|id, _| st.devices.iter().any(|d| d.id == *id));
         for d in st.devices {
             self.known.entry(d.id.clone()).or_insert(d);
         }
@@ -224,7 +213,7 @@ impl<B: Backend> Model<B> {
             event::Kind::ScanFound(c) => self.found_candidate(c),
             event::Kind::ScanDone(done) => {
                 let text = if done.truncated {
-                    "Scan finished; the list is full"
+                    "Scan finished; the list of nearby devices is full"
                 } else {
                     "Scan finished"
                 };
@@ -247,7 +236,6 @@ impl<B: Backend> Model<B> {
                 let text = format!("Removed {}", self.label(&r.id));
                 self.note(Kind::Info, text);
                 self.known.remove(&r.id);
-                self.known_warnings.remove(&r.id);
                 self.forget_device(&r.id);
             }
             event::Kind::Adapter(a) => {
@@ -263,22 +251,9 @@ impl<B: Backend> Model<B> {
                     self.setting_activity(&s.device, setting);
                 }
             }
-            event::Kind::Warnings(w) => {
-                let name = self.label(&w.device);
-                let old = self
-                    .known_warnings
-                    .insert(w.device.clone(), w.warnings.clone());
-                if let Some(old) = old {
-                    for warning in w.warnings.iter().filter(|x| !old.contains(x)) {
-                        self.note(
-                            Kind::Warn,
-                            format!("{name}: {}", text::warning_text(warning.code())),
-                        );
-                    }
-                }
-            }
-            // The pairing command reports how it ended.
-            event::Kind::Pairing(_) => {}
+            // Warnings are shown in the device's Diagnostics; the pairing command reports how
+            // it ended.
+            event::Kind::Warnings(_) | event::Kind::Pairing(_) => {}
         }
     }
 
@@ -434,7 +409,7 @@ impl<B: Backend> Model<B> {
             (Refresh(_), _) => {
                 self.note(
                     Kind::Info,
-                    format!("Refreshing the information of {target}"),
+                    format!("Reading current information from {target}"),
                 );
             }
             // Events report the saved device; only the result says it won't connect.
@@ -447,7 +422,7 @@ impl<B: Backend> Model<B> {
             (Bootloader, _) => {
                 self.note(
                     Kind::Warn,
-                    "Adapter is restarting into its bootloader".into(),
+                    "The adapter is restarting into its bootloader".into(),
                 );
             }
             (Platform(p), _) => {
@@ -469,7 +444,7 @@ fn command_name(command: &Command) -> &'static str {
         Settings(_) => "list the device settings",
         SettingGet(..) => "read the setting",
         Accept(_) | Reject => "answer pairing",
-        Warnings(_) => "read the device warnings",
+        Warnings(_) => "read the device's warnings",
         _ => "run the command",
     }
 }

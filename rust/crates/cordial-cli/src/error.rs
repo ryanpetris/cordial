@@ -48,10 +48,10 @@ impl Error {
             E::Dongle(e) => Self::dongle(e, Some(command)),
             E::UnexpectedResponse => Self::new("the adapter returned an unexpected result"),
             E::Timeout => Self::new("the adapter didn't respond in time"),
-            E::TooLong => Self::new("the request is too long for the adapter"),
-            E::Io(e) => Self::new(format!("serial I/O failed: {e}")),
-            E::Protocol => Self::new("the adapter sent an invalid message"),
-            E::Closed => Self::new("the adapter connection closed"),
+            E::TooLong => Self::new("the request was too large for the adapter"),
+            E::Io(e) => Self::new(format!("the serial connection to the adapter failed: {e}")),
+            E::Protocol => Self::new("the adapter sent a message Cordial couldn't read"),
+            E::Closed => Self::new("the connection to the adapter closed"),
         }
     }
 

@@ -63,7 +63,7 @@ function PromptView({ name, prompt }: { name: string; prompt: PairingPrompt }) {
         if (valid && !busy) void reply(true);
       }}
     >
-      <p>{passkey ? `Enter the 6-digit passkey shown by ${name}:` : `Enter the PIN for ${name}:`}</p>
+      <p>{passkey ? `Enter the six-digit passkey shown on ${name}.` : `Enter the PIN for ${name}.`}</p>
       <input
         autoFocus
         className="code-input"
@@ -191,7 +191,7 @@ export function AddDevice({
         ) : pairing.phase === "failed" ? (
           <div className="result bad">
             <WarningIcon size={40} />
-            <p>Couldn't add {name}.</p>
+            <p>Cordial couldn't pair with {name}.</p>
             <p className="muted">{pairing.message}</p>
           </div>
         ) : null}

@@ -14,7 +14,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && CARGO_HOME=/opt/cargo espup install --toolchain-version 1.97.0.0 --targets esp32s3 --std \
         --export-file /opt/export-esp.sh \
     && rm -rf /opt/cargo/registry /opt/cargo/git \
-    && chmod -R a+rwX /opt/rustup
+    && chmod -R a+rX,go-w /opt/rustup
 
-COPY esp32s3-entrypoint.sh /opt/cordial-entrypoint.sh
-ENTRYPOINT ["/opt/cordial-entrypoint.sh"]
+COPY esp32s3-run.sh /opt/cordial-run

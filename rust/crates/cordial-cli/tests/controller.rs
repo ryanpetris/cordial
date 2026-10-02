@@ -269,14 +269,26 @@ fn a_failed_pairing_ends_the_pair_command_with_its_code() {
             .as_ref()
             .is_some_and(|p| matches!(p.step, Some(p::pairing::Step::ConfirmCode(_))))
     });
-    run(&c, &rx, Command::Reject).unwrap();
-    let Event::Done { result, .. } = until(
-        &rx,
-        |e| matches!(e, Event::Done { ticket: t, .. } if *t == ticket),
-    ) else {
-        unreachable!()
-    };
-    assert_eq!(result.unwrap_err().code_of(), Some(ErrorCode::Rejected));
+    // The pairing and the rejection finish in either order; collect both results.
+    let reject = c.run(Command::Reject, RunOptions::default());
+    let (mut paired, mut rejected) = (None, None);
+    while paired.is_none() || rejected.is_none() {
+        if let Event::Done {
+            ticket: t, result, ..
+        } = until(&rx, |e| matches!(e, Event::Done { .. }))
+        {
+            if t == ticket {
+                paired = Some(result);
+            } else if t == reject {
+                rejected = Some(result);
+            }
+        }
+    }
+    rejected.unwrap().unwrap();
+    assert_eq!(
+        paired.unwrap().unwrap_err().code_of(),
+        Some(ErrorCode::Rejected)
+    );
 }
 
 #[test]

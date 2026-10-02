@@ -282,7 +282,14 @@ impl<B: Backend> Model<B> {
             return true;
         }
         match self.dialog {
-            Some(Dialog::Help) => {
+            Some(Dialog::Help | Dialog::Diagnostics) => {
+                if key == "r" && self.dialog == Some(Dialog::Diagnostics) {
+                    // Like the dialog's Refresh Info button, only for a connected device.
+                    if self.diagnosed_connected() {
+                        self.action(Action::RefreshInfo);
+                    }
+                    return true;
+                }
                 let delta: isize = match key {
                     "up" | "k" => -1,
                     "down" | "j" => 1,
@@ -379,6 +386,7 @@ impl<B: Backend> Model<B> {
             "a" => self.action(Action::Menu(Menu::Adapter)),
             "r" if st.available => self.action(Action::Refresh),
             "o" => self.shortcut(&[Action::DeviceSettings]),
+            "i" => self.shortcut(&[Action::Diagnostics]),
             "p" => self.shortcut(&[Action::Pair]),
             "c" => self.shortcut(&[Action::Connect]),
             "d" => self.shortcut(&[Action::Disconnect]),
@@ -430,6 +438,10 @@ impl<B: Backend> Model<B> {
         }
         match (&self.dialog, self.gate()) {
             (Some(Dialog::Help), _) => return format!("↑↓ scroll · {enter}esc close"),
+            (Some(Dialog::Diagnostics), _) if self.diagnosed_connected() => {
+                return format!("↑↓ scroll · {enter}r refresh · esc close");
+            }
+            (Some(Dialog::Diagnostics), _) => return format!("↑↓ scroll · {enter}esc close"),
             (Some(Dialog::Remove(_) | Dialog::Bootloader | Dialog::Replace(_)), _) => {
                 return format!("y confirm · {enter}n or esc cancel");
             }

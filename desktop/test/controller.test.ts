@@ -36,10 +36,10 @@ describe("Controller", () => {
     await until(() => started);
     await manager.stop();
     opening.resolve();
-    expect(await reconnect).toBe("That adapter is no longer available.");
+    expect(await reconnect).toBe("This adapter is no longer available.");
     expect(manager.connected.size).toBe(0);
     expect(close).toHaveBeenCalledOnce();
-    expect(await manager.connect(fake.id)).toBe("That adapter is no longer available.");
+    expect(await manager.connect(fake.id)).toBe("This adapter is no longer available.");
   });
 
   it("combines adapters and hides a port that isn't one", async () => {
@@ -59,7 +59,8 @@ describe("Controller", () => {
       ["XIAO ESP32-S3", "connected"],
     ]);
     const mouse = s.devices.find((d) => d.key === "AAAA0001/d_2")!;
-    expect(mouse).toMatchObject({ name: "Example Mouse", kind: "mouse", warnings: [] });
+    expect(mouse).toMatchObject({ name: "Example Mouse", kind: "mouse" });
+    expect(mouse.warnings!.map((w) => w.code)).toEqual(["pointer_selector_unsupported"]);
     expect(mouse.battery).toEqual({ percent: 12, charging: false, percentFresh: true, chargingFresh: true });
     expect(mouse.device.hidpp).toEqual({ kind: 1, enabled: true, version: { major: 4, minor: 5 }, state: "active", error: null });
     // Only setting values the device accepts writes for are settings; readings are information.
@@ -307,7 +308,7 @@ describe("Controller", () => {
       await until(() => state()?.pairing?.phase === "failed");
       await c.act({ type: "pair.dismiss" });
       fake.changeAdapter({ storageFull: true });
-      await until(() => state()!.adapters[0]!.attention.includes("Storage Full"));
+      await until(() => state()!.adapters[0]!.attention.includes("The adapter's storage is full. Remove an unused device or forget a saved setting to pair another device."));
       const sent = fake.received.length;
       expect(await c.act({ type: "pair.start", adapterId: fake.id, candidateId: "c_2" })).toMatchObject({ ok: false, message: expect.stringContaining("storage") });
       expect(fake.received.length).toBe(sent);

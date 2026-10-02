@@ -57,10 +57,13 @@
 
 | Board | Bluetooth | Firmware download |
 | --- | --- | --- |
-| Raspberry Pi Pico W | Classic and Low Energy | `cordial-firmware-*-pico_w-production.tar.gz` |
-| Raspberry Pi Pico 2 W | Classic and Low Energy | `cordial-firmware-*-pico2_w-production.tar.gz` |
-| Waveshare RP2350B-Plus-W | Classic and Low Energy | `cordial-firmware-*-waveshare_rp2350b_plus_w-production.tar.gz` |
-| Seeed Studio XIAO ESP32S3 | Low Energy only | `cordial-firmware-*-xiao_esp32s3-production.tar.gz` |
+| Raspberry Pi Pico W | Classic and Low Energy | `cordial-firmware-*-pico_w.tar.gz` |
+| Raspberry Pi Pico 2 W | Classic and Low Energy | `cordial-firmware-*-pico2_w.tar.gz` |
+| Waveshare RP2350B-Plus-W | Classic and Low Energy | `cordial-firmware-*-waveshare_rp2350b_plus_w.tar.gz` |
+| Seeed Studio XIAO ESP32S3 | Low Energy only | `cordial-firmware-*-xiao_esp32s3.tar.gz` |
+
+Each board also has a `-debug` archive for development, which adds adapter file access and
+restarting into the bootloader from the app.
 
 ## Get started
 
@@ -120,11 +123,11 @@ Hold **BOOT** while plugging the board in, then flash it with
 [esptool](https://docs.espressif.com/projects/esptool/):
 
 ```sh
-cd xiao_esp32s3-esp-nimble-esp-idf-production
+cd xiao_esp32s3-esp-nimble-esp-idf
 esptool --chip esp32s3 write_flash \
   0x0 bootloader.bin \
   0x8000 partition-table.bin \
-  0x10000 cordial-xiao_esp32s3-esp-nimble-esp-idf-production.bin
+  0x10000 cordial-xiao_esp32s3-esp-nimble-esp-idf.bin
 ```
 
 ### 3. Pair your devices

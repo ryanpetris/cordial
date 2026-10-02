@@ -1,0 +1,14 @@
+# Builds copy the checkout without its build outputs, caches or installed dependencies.
+.git
+**/node_modules
+target
+rust/target
+rust/platforms/*/target
+rust/tests/memory-arm/target
+build
+desktop/out
+desktop/dist
+.cache
+# Notes at the top level stay out; README.md is part of builds.
+*.md
+!README.md

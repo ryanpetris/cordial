@@ -141,7 +141,9 @@ def build(config_path, profile, output, clippy=False):
     # that don't affect physical wiring identity (backend and storage layout).
     raw = json.loads(Path(config_path).read_text(), object_pairs_hook=firmware_config.unique_object)
     digest = hashlib.sha256(json.dumps([raw, profile], sort_keys=True).encode()).hexdigest()[:12]
-    name = f"{config['name']}-{config['bluetooth_backend']}-{config['radio_backend']}-{profile}"
+    # Production packages carry no suffix; development packages are the debug builds.
+    suffix = "-debug" if profile == "development" else ""
+    name = f"{config['name']}-{config['bluetooth_backend']}-{config['radio_backend']}{suffix}"
     directory = ROOT.parent / "target/firmware" / f"{name}-{digest}"
     generated = directory / "config"
     # esp-idf-sys regenerates its SDK configuration from these tracked defaults

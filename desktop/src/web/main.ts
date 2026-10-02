@@ -38,9 +38,9 @@ const simulate = params.has("simulate") ? Math.min(Math.max(Math.trunc(Number(pa
 const demo = { href: "?simulate=2", label: "Try it with simulated adapters" };
 
 if (!simulate && !navigator.serial)
-  explain("This browser can't reach adapters", "Cordial needs Web Serial. Open this page in Chrome, Edge or another Chromium-based browser on a computer.", demo);
+  explain("This browser can't reach adapters", "Open Cordial in a desktop browser that supports Web Serial, such as Chrome or Edge.", demo);
 else if (!simulate && !(await exclusive()))
-  explain("Cordial is already open", "Only one tab can manage adapters. Use the other tab, or close it and reload this one.");
+  explain("Cordial is already open", "Cordial is open in another tab. Use that tab, or close it and reload this one.");
 else {
   window.cordial = await startWebBackend(simulate);
   await import("../renderer/main.tsx");

@@ -49,6 +49,39 @@ upon connect must be stored on the Dongle.
   the UI. Ordinary control labels and concise feedback about an action's result do not require this
   additional approval.
 
+### Writing copy
+
+Messages:
+
+- Write complete sentences that name the device or adapter, say what happened, and give a next step
+  when there is a useful one: "The adapter is busy. Try again when the current operation finishes."
+- Put the statement and the next step in separate sentences, not joined with a semicolon.
+- Name the failed action instead of a vague fragment: "The adapter couldn't save the change.", not
+  "Couldn't send." Add the specific reason after it as its own sentence.
+- Say "the adapter" for the Dongle, "this device" or the device's name for a Device, and "Cordial"
+  for the app. Never show "dongle", internal command or field names, or raw codes.
+- When an outcome is unknown, say so ("The adapter couldn't confirm whether the change was saved.")
+  rather than reporting success or failure.
+- Desktop messages and TUI prompts start with a capital letter and end with a period. Error reasons
+  that are inserted into other text, such as "Failed: {reason}", have no final period. CLI and TUI
+  error reasons are lowercase clauses that follow "Error:" or a colon, such as "the request was too
+  large for the adapter".
+- Use the same words for the same thing in the desktop app, CLI and TUI, including labels such as
+  "Logitech Features", "Pointer Speed {n}" and status words such as "Setting Up" and "Unsupported".
+
+Labels, buttons and status:
+
+- Use short Title Case noun or verb phrases without a final period.
+- Hide a section or row with nothing to show rather than showing "None".
+
+Placement:
+
+- Device warnings, protocol details, link security, identifiers and a device's last connection error
+  belong on the device's Diagnostics tab (the TUI's Diagnostics dialog), never as banners or on the
+  Details or Settings tabs.
+- The result of an action the user just took appears next to that action, such as in the page's
+  bottom bar, and clears when it no longer applies.
+
 ## Comments and source text
 
 Comments describe current behavior in present tense. Documentation comments for public modules,

@@ -157,7 +157,7 @@ export function AdapterPage({
           </div>
           {platform !== state.hostPlatform ? (
             <Banner action={<button disabled={quietBusy || !s?.ready} onClick={() => void setPlatform(state.hostPlatform)}><SwapIcon /> Switch to {PLATFORMS[state.hostPlatform]}</button>}>
-              This computer runs {PLATFORMS[state.hostPlatform]}.
+              This computer runs {state.hostPlatform === "mac" ? "macOS" : PLATFORMS[state.hostPlatform]}.
             </Banner>
           ) : null}
         </Card>

@@ -251,7 +251,7 @@ impl<B: Backend> Model<B> {
                 if open {
                     // The session stays for diagnosis and recovery.
                     self.log(format!(
-                        "Error: {line}. adapter status, file access and adapter bootloader still work; use adapter select to retry."
+                        "Error: {line}. adapter status, file list, file get and adapter bootloader still work; use adapter select to retry."
                     ));
                 } else {
                     self.session = None;
@@ -286,7 +286,7 @@ impl<B: Backend> Model<B> {
     fn key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
-            KeyCode::Char('c') if ctrl => return self.interrupt(),
+            KeyCode::Char('c') if ctrl => return self.quit(),
             KeyCode::Char('d') if ctrl => return self.quit(),
             KeyCode::Enter => return self.submit(),
             _ => {}
@@ -332,23 +332,6 @@ impl<B: Backend> Model<B> {
             self.input.set_value(&choices[index % choices.len()]);
         }
         self.completion = Some((base, index + 1));
-    }
-
-    /// Ctrl+C: rejects a pairing prompt, clears typed input, or cancels a
-    /// running pairing. The shell stays open.
-    fn interrupt(&mut self) {
-        let pairing = self.state().and_then(|st| st.pairing);
-        if self.answering() {
-            self.send(Command::Reject);
-            return;
-        }
-        if !self.input.is_empty() {
-            self.input.reset();
-            return;
-        }
-        if pairing.as_ref().is_some_and(model::pairing_running) {
-            self.send(Command::CancelPairing);
-        }
     }
 
     /// Commands the adapter doesn't offer are never sent.
@@ -519,8 +502,8 @@ pub fn shell(options: UiOptions) -> (Shell, Interrupter) {
 }
 
 impl Shell {
-    /// Runs until quit, exit, Ctrl+D or an interrupt; an interrupt returns
-    /// `UiError::Interrupted`.
+    /// Runs until quit, exit, Ctrl+C, Ctrl+D, SIGINT or SIGTERM. Closing the adapter's port ends
+    /// a running scan and an unsaved pairing.
     pub fn run(self) -> Result<(), UiError> {
         let modes = Modes::enter(false)?;
         let input = Input::spawn(self.tx.clone());
@@ -557,9 +540,6 @@ impl Shell {
         screen.clear(&mut out)?;
         out.flush()?;
         drop(modes);
-        if self.interrupted.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(UiError::Interrupted);
-        }
         Ok(())
     }
 }
@@ -684,20 +664,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_stays_open() {
+    fn ctrl_c_quits_from_typed_input_and_from_a_pairing_prompt() {
         let mut app = App::new();
         app.m.update(Msg::Paste("unfinished".into()));
         app.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert!(app.m.input.is_empty() && !app.m.quitting);
-        app.pairing(p::pairing::Step::Connecting(p::PairingConnecting {}));
-        app.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(app.runs(), ["CancelPairing"]);
+        assert!(app.m.quitting);
+        let mut app = App::new();
         app.pairing(p::pairing::Step::EnterCode(p::EnterCode {
             kind: CodeKind::Passkey as i32,
         }));
         app.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(app.runs().last().unwrap(), "Reject");
-        assert!(!app.m.quitting);
+        assert!(app.m.quitting);
+        let mut app = App::new();
         app.key(KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert!(app.m.quitting);
     }
@@ -785,7 +763,7 @@ mod tests {
             },
         })));
         assert!(m.output.last().unwrap().ends_with(
-            "adapter status, file access and adapter bootloader still work; use adapter select to retry."
+            "adapter status, file list, file get and adapter bootloader still work; use adapter select to retry."
         ));
     }
 }

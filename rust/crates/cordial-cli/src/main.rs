@@ -7,7 +7,7 @@ use std::{
     io::{self, IsTerminal},
     process::ExitCode,
 };
-const USAGE: &str = "Usage: cordial [--port PORT] [--json] [--timeout SECONDS] [COMMAND ...]\n       cordial [--port PORT] tui\n\nNo command opens the interactive shell. Piped input is a command script.\n\n  --port PORT        USB CDC serial port\n  --json             Emit responses and events as protobuf JSON, one per\n                     line. File contents are never printed.\n  --timeout SECONDS  Overall one-shot timeout; finite scan duration\n  --version          Print version\n  --help             Show usage";
+const USAGE: &str = "Usage: cordial [--port PORT] [--json] [--timeout SECONDS] [COMMAND ...]\n       cordial [--port PORT] tui\n\nNo command opens the interactive shell. Piped input is a command script.\n\n  --port PORT        USB CDC serial port\n  --json             Print each response and event as one line of protobuf\n                     JSON. File contents are never printed.\n  --timeout SECONDS  Overall one-shot timeout; finite scan duration\n  --version          Print version\n  --help             Show usage";
 fn main() -> ExitCode {
     let options = match Options::parse(std::env::args().skip(1)) {
         Ok(options) => options,

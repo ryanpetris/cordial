@@ -202,9 +202,31 @@ fn info_section(b: &mut Layout, c: Column, st: &State, d: &p::Device, rows: Vec<
     }
 }
 
-/// The device's warning list, ahead of its HID++ details.
-fn warnings_section(b: &mut Layout, c: Column, st: &State, d: &p::Device) {
-    for warning in st.warnings_of(&d.id) {
+/// A device's diagnostics: its warnings, HID++ details, link security and identifiers.
+fn diagnostics(b: &mut Layout, st: &State, d: &p::Device) {
+    let ids: Vec<_> = text::info_rows(&d.info)
+        .into_iter()
+        .filter(|r| text::IDENTIFIER_KEYS.contains(&r.key.as_str()))
+        .collect();
+    let warnings = st.warnings_of(&d.id);
+    let labels = warnings
+        .iter()
+        .map(|w| warning_label(w.code()))
+        .chain(ids.iter().map(|r| r.label.as_str()))
+        .chain(["HID++ Protocol", "Security", "ID", "Last Error"]);
+    let c = Column::new(b.width, labels);
+    // Sections are separated by a blank row; a section with nothing to show is left out.
+    let mut started = false;
+    let mut section = |b: &mut Layout| {
+        if std::mem::replace(&mut started, true) {
+            b.row();
+        }
+    };
+    if !warnings.is_empty() {
+        section(b);
+        b.line(styled("Device Warnings", title()));
+    }
+    for warning in warnings {
         c.field(
             b,
             warning_label(warning.code()),
@@ -213,6 +235,33 @@ fn warnings_section(b: &mut Layout, c: Column, st: &State, d: &p::Device) {
         );
         c.more(b, None, &warning_context(warning), dim());
     }
+    if let Some(code) = model::last_error(d) {
+        section(b);
+        b.line(styled("Connection", title()));
+        let e = p::Error {
+            code: code as i32,
+            ..Default::default()
+        };
+        c.field(b, "Last Error", &text::wire_text(&e, None), err());
+    }
+    let hidpp = [protocol_status(d), hidpp_status(d)];
+    if hidpp.iter().any(Option::is_some) {
+        section(b);
+        b.line(styled("Logitech Features", title()));
+        for (text, look) in hidpp.into_iter().flatten() {
+            b.line(styled(text, look));
+        }
+    }
+    if text::link_security(d).is_some() {
+        section(b);
+        security_section(b, c, d);
+    }
+    section(b);
+    b.line(styled("Identifiers", title()));
+    for r in ids {
+        c.field(b, &r.label, &r.value, layout::plain());
+    }
+    c.field(b, "ID", &display(&d.id), dim());
 }
 
 /// A short tag for a device's current link security in the device list, or
@@ -301,7 +350,7 @@ pub(super) fn hidpp_status(d: &p::Device) -> Option<(String, Style)> {
         Up::Disconnected => ("○ Waiting to Connect".into(), dim()),
         Up::Starting => ("◌ Setting Up Logitech Features…".into(), warn()),
         Up::Active => ("● Logitech Features Active".into(), ok()),
-        Up::Unsupported => ("○ Logitech Features Unavailable".into(), dim()),
+        Up::Unsupported => ("○ Logitech Features Unsupported".into(), dim()),
         Up::Error(code) => (
             format!("✕ Logitech Features Failed: {}", text::hidpp_words(code)),
             err(),
@@ -324,10 +373,6 @@ fn hidpp_section(b: &mut Layout, c: Column, st: &State, d: &p::Device, idle: boo
     );
     if pending_for(st, "device set hidpp", &d.id) {
         c.more(b, None, &format!("{} Saving…", spinner()), warn());
-        return;
-    }
-    for (text, look) in [protocol_status(d), hidpp_status(d)].into_iter().flatten() {
-        c.more(b, None, &text, look);
     }
 }
 
@@ -454,12 +499,16 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "Open a saved device's settings. Opening and browsing them never changes the device or what is saved.",
             ),
             (
+                "Diagnostics…",
+                "Show the selected saved device's warnings, HID++ status, link security and identifiers.",
+            ),
+            (
                 "Files",
                 "Browse the adapter's filesystem from Adapter ▾ › Files… and download a file to this computer. Click a directory to open it, or a file to choose where to save it. The download is kept only when every byte arrives, and an existing local file is replaced only after you confirm. Files work even when the adapter's Bluetooth isn't ready. In Files: ↑↓ select, Enter opens or downloads, Backspace goes up, r refreshes, Esc closes.",
             ),
             (
                 "Platform",
-                "The computer's system: Linux, Windows or Mac. Special keys on every device using HID++ send its standard shortcuts. Choose it in Adapter ▾ › Adapter settings; it is saved on the adapter, even with no devices paired.",
+                "The computer's system: Linux, Windows or macOS. Special keys on every device using HID++ send its standard shortcuts. Choose it in Adapter ▾ › Adapter settings; it is saved on the adapter, even with no devices paired.",
             ),
         ],
     ),
@@ -476,7 +525,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ),
             (
                 "Save",
-                "Choose a new value with the controls, then Save stores it on the dongle and applies it. With Logitech Features off, Save only stores it; it is applied when Logitech Features are turned on. Nothing is sent until you click Save; Discard discards the change.",
+                "Choose a new value with the controls, then Save stores it on the adapter and applies it. With Logitech Features off, Save only stores it; it is applied when Logitech Features are turned on. Nothing is sent until you click Save; Discard discards the change.",
             ),
             (
                 "Forget Saved Value",
@@ -523,6 +572,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "o",
                 "Open the selected saved device's settings; Esc goes back.",
             ),
+            ("i", "Open the selected saved device's diagnostics."),
             ("a", "Open the Adapter menu."),
             ("r", "Refresh the device list."),
             (
@@ -1003,7 +1053,7 @@ impl<B: Backend> Model<B> {
         if !st.available {
             let mut banner = Layout::new(w.saturating_sub(2));
             let (mut text, mut choose) = (
-                "✕ Lost the adapter connection. Showing the last known state.",
+                "✕ Cordial lost its connection to the adapter. The displayed information may be out of date.",
                 "Choose adapter",
             );
             if text::width(text) + 30 > banner.width {
@@ -1335,12 +1385,14 @@ impl<B: Backend> Model<B> {
         match Self::find(st, &self.selected) {
             (Some(d), _) => {
                 heading = display_name(Some(&d.name));
-                let rows = text::info_rows(&d.info);
+                let rows: Vec<_> = text::info_rows(&d.info)
+                    .into_iter()
+                    .filter(|r| !text::IDENTIFIER_KEYS.contains(&r.key.as_str()))
+                    .collect();
                 let c = Column::new(b.width, rows.iter().map(|r| r.label.as_str()));
                 let (text, look) = device_status(d);
                 c.field(&mut b, "Status", text, look);
                 enablement_section(&mut b, d);
-                security_section(&mut b, c, d);
                 let mut kind = transport_long(d.transport()).to_string();
                 let roles = role_names(&model::roles(d));
                 if !roles.is_empty() {
@@ -1372,12 +1424,10 @@ impl<B: Backend> Model<B> {
                 } else {
                     c.field(&mut b, "Reconnect", "Automatic", layout::plain());
                 }
-                warnings_section(&mut b, c, st, d);
                 // Logitech Features wait while the device's settings work runs.
                 let idle = settings_busy(st, d, self.saving(&d.id)).is_empty();
                 hidpp_section(&mut b, c, st, d, idle);
                 info_section(&mut b, c, st, d, rows);
-                c.field(&mut b, "ID", &display(&d.id), dim());
             }
             (_, Some(c)) => {
                 heading = display_candidate_name(c);
@@ -1464,10 +1514,8 @@ impl<B: Backend> Model<B> {
                 } else {
                     add("Block", Action::Block, Tone::Normal, false);
                 }
-                if connected(d) {
-                    add("Refresh Info", Action::RefreshInfo, Tone::Normal, false);
-                }
                 add("Settings…", Action::DeviceSettings, Tone::Normal, false);
+                add("Diagnostics…", Action::Diagnostics, Tone::Normal, false);
                 add("Remove", Action::Remove, Tone::Danger, true);
             }
             (_, Some(c)) => {
@@ -1584,7 +1632,7 @@ impl<B: Backend> Model<B> {
             match prompt {
                 Prompt::ShowCode(_, value) => {
                     body.para(
-                        &format!("Type this code on {name}, then press Enter on it:"),
+                        &format!("Enter this code on {name}, then press Enter on it."),
                         layout::plain(),
                     );
                     code(&mut body, value);
@@ -1601,9 +1649,9 @@ impl<B: Backend> Model<B> {
                 }
                 Prompt::EnterCode(_) => {
                     let prompt = if code_kind(prompt) == CodeKind::Pin {
-                        format!("Enter the PIN for {name}:")
+                        format!("Enter the PIN for {name}.")
                     } else {
-                        format!("Type the 6-digit code shown on {name}:")
+                        format!("Enter the six-digit passkey shown on {name}.")
                     };
                     body.para(&prompt, layout::plain());
                     let field = self.field_line(body.width.saturating_sub(3));
@@ -1617,6 +1665,23 @@ impl<B: Backend> Model<B> {
             }
         } else {
             match self.dialog.clone() {
+                Some(Dialog::Diagnostics) => {
+                    let st = st?;
+                    heading = "Diagnostics".into();
+                    if let (Some(d), _) = Self::find(st, &self.selected) {
+                        heading = format!("Diagnostics · {}", display_name(Some(&d.name)));
+                        if pending_for(st, "device refresh", &d.id) {
+                            body.para(&format!("{} Reading…", spinner()), warn());
+                        }
+                        diagnostics(&mut body, st, d);
+                        if connected(d) {
+                            pinned.button("Refresh Info", Action::RefreshInfo, Tone::Normal);
+                        }
+                    } else {
+                        body.para("Select a saved device to see its diagnostics.", dim());
+                    }
+                    pinned.button("Close", Action::CancelDialog, Tone::Normal);
+                }
                 Some(Dialog::Help) => {
                     w = self.width.min(80);
                     body.width = w - 4;
@@ -1806,8 +1871,8 @@ impl<B: Backend> Model<B> {
                             if let Some(e) = &self.list_err {
                                 body.para(
                                     &format!(
-                                        "Couldn't list adapters: {}. Click Refresh to try again.",
-                                        display(e)
+                                        "Cordial couldn't list adapters. {} Select Refresh to try again.",
+                                        text::sentence(&display(e))
                                     ),
                                     err(),
                                 );

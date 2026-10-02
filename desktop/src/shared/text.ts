@@ -32,37 +32,37 @@ const ERRORS: Record<Code, string> = {
   bad_request: "the adapter rejected a malformed request",
   unknown_command: "this adapter's firmware doesn't support that command",
   bad_args: "the adapter rejected the command's arguments",
-  too_long: "a request exceeded the adapter's size limit",
-  not_ready: "the adapter's Bluetooth or storage isn't ready",
-  not_found: "the adapter couldn't find that device or setting",
-  not_connected: "the device isn't connected; connect it first",
-  busy: "the adapter is busy with a conflicting operation; try again when it finishes",
+  too_long: "the request was too large for the adapter",
+  not_ready: "the adapter's Bluetooth or storage isn't ready. Try again in a moment",
+  not_found: "the adapter couldn't find this device or setting",
+  not_connected: "the device isn't connected. Connect it first",
+  busy: "the adapter is busy. Try again when the current operation finishes",
   disabled: "the device is turned off in Cordial; turn on “Use This Device” first",
-  blocked: "the device is blocked; unblock it before connecting",
-  unsupported: "this adapter or device doesn't support that",
+  blocked: "connections to this device are blocked. Unblock it before connecting",
+  unsupported: "the adapter or device doesn't support this action",
   no_capacity: "the adapter has no room for that right now",
   no_prompt: "that pairing prompt is no longer waiting for an answer",
-  storage_failed: "the adapter couldn't save the change; what it had saved is unchanged",
+  storage_failed: "the adapter couldn't save the change. Your saved data hasn't changed",
   internal: "the adapter hit an unexpected failure",
-  candidate_expired: "that nearby device is no longer available; search again",
+  candidate_expired: "this device is no longer available. Search again",
   auth_failed: "Bluetooth authentication failed",
   rejected: "authentication was rejected by you or the device",
-  timeout: "the operation took too long",
+  timeout: "the operation timed out",
   cancelled: "the operation was cancelled",
   connection_failed: "the Bluetooth link or HID setup failed",
   unsupported_hid: "the device's HID format isn't supported",
   protocol_unsupported: "not supported",
-  feature_unavailable: "a needed feature is unavailable",
+  feature_unavailable: "the device doesn't provide a feature this action needs",
   transport_error: "couldn't send",
   device_error: "device error",
   invalid_response: "unexpected reply",
-  readback_mismatch: "the device reported a different value after the change",
+  readback_mismatch: "the device reported a different value from the one requested",
 };
 
 const CAPACITY: Record<NonNullable<WireError["reason"]>, string> = {
   unknown: ERRORS.no_capacity,
   enabled: "every enabled-device place is in use; turn off another device first",
-  storage: "the adapter's storage has no room; remove unused devices or saved settings",
+  storage: "the adapter's storage is full. Remove an unused device or forget a saved setting, then try again",
   connections: "every connection is in use; disconnect a device first",
 };
 
@@ -70,7 +70,7 @@ const CAPACITY: Record<NonNullable<WireError["reason"]>, string> = {
 export function errorText(error: WireError): string {
   if (error.code === "no_capacity") return sentence(CAPACITY[error.reason ?? "unknown"]);
   if (error.code === "storage_failed" && error.outcomeUnknown)
-    return "The adapter may or may not have saved the change; check the device and try again.";
+    return "The adapter couldn't confirm whether the change was saved. Check before trying again.";
   return sentence(ERRORS[error.code]);
 }
 
@@ -78,12 +78,18 @@ export const codeText = (code: Code) => sentence(ERRORS[code]);
 
 /** Why a device the adapter doesn't use is inactive. */
 export const INACTIVE: Record<Inactive, string> = {
-  unknown: "The adapter isn't using it.",
-  unsupported_transport: "This adapter doesn't support its Bluetooth type.",
-  blocked: "It is blocked.",
+  unknown: "The adapter isn't using this device.",
+  unsupported_transport: "This adapter doesn't support the device's Bluetooth type.",
+  blocked: "Connections to this device are blocked.",
   disabled: "It is turned off.",
-  capacity: "Every enabled-device place is in use; turn off another device to make room.",
+  capacity: "The adapter can't enable another device. Turn off another device first.",
 };
+
+/** Why `d` is inactive, naming its Bluetooth type where that is the reason. */
+export function inactiveText(d: DeviceRecord): string {
+  if (d.inactive === "unsupported_transport" && d.transport) return `This adapter doesn't support ${TRANSPORTS[d.transport]}.`;
+  return INACTIVE[d.inactive ?? "unknown"];
+}
 
 export const WARNINGS: Record<WarningName, string> = {
   unknown: "The adapter can't use part of this device.",
@@ -127,7 +133,7 @@ export function warningFact(w: DeviceWarning): { label: string; text: string; co
   if (w.bitOffset !== null) context.push(`Bit ${w.bitOffset}`);
   if (w.usagePage !== null) context.push(`Usage ${hex(w.usagePage)}${w.usage !== null ? `:${hex(w.usage)}` : ""}`);
   return {
-    label: INPUT_WARNINGS.includes(w.code) ? "Input Field" : "Lock Indicators",
+    label: INPUT_WARNINGS.includes(w.code) ? "Input Field" : w.code === "unknown" ? "Device Warning" : "Lock Indicators",
     text: WARNINGS[w.code],
     context: context.join(", "),
   };
@@ -159,7 +165,7 @@ export const SETTING_STATES: Record<SettingStateName | "unmanaged" | "error", st
   error: "Failed",
 };
 
-export const PLATFORMS: Record<HostPlatform, string> = { linux: "Linux", windows: "Windows", mac: "Mac" };
+export const PLATFORMS: Record<HostPlatform, string> = { linux: "Linux", windows: "Windows", mac: "macOS" };
 export const TRANSPORTS: Record<TransportName, string> = { ble: "Bluetooth LE", classic: "Bluetooth Classic" };
 export const ROLES: Record<RoleName, string> = { keyboard: "Keyboard", mouse: "Mouse", consumer_control: "Media Keys", system_control: "System Keys" };
 
@@ -256,7 +262,7 @@ export function settingInfo(key: string): SettingInfo | null {
   const info = SETTINGS[template(key)];
   if (!info) return null;
   const sensor = Number(SENSOR.exec(key)?.[1] ?? 0);
-  return sensor === 0 ? info : { ...info, label: sensor === 1 ? "Second Sensor Speed" : `Sensor ${sensor + 1} Speed` };
+  return sensor === 0 ? info : { ...info, label: `Pointer Speed ${sensor + 1}` };
 }
 
 const ORDER = Object.keys(SETTINGS);

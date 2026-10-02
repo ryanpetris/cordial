@@ -203,7 +203,7 @@ export class AdapterManager {
 
   /** Opens a disconnected adapter again. Resolves with an error message. */
   async connect(id: string): Promise<string | null> {
-    if (this.#stopped) return "That adapter is no longer available.";
+    if (this.#stopped) return "This adapter is no longer available.";
     const d = this.disconnected.get(id);
     if (!d || d.connecting) return null;
     if (!d.path) return "The adapter isn't plugged in.";
@@ -214,7 +214,7 @@ export class AdapterManager {
     await this.#closing.get(id);
     if (this.#stopped) {
       d.connecting = false;
-      return "That adapter is no longer available.";
+      return "This adapter is no longer available.";
     }
     const path = d.path;
     this.#probing.add(path);
@@ -223,7 +223,7 @@ export class AdapterManager {
       d.connecting = false;
       if (this.#stopped) {
         await session?.close();
-        return "That adapter is no longer available.";
+        return "This adapter is no longer available.";
       }
       if (!session || session.adapterId !== id) {
         await session?.close();

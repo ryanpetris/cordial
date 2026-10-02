@@ -25,7 +25,7 @@ import {
 } from "../shared/state.ts";
 import { enabledFull } from "../shared/capacity.ts";
 import { settingsBusy } from "../shared/settings.ts";
-import { INACTIVE, clean, codeText, errorText, infoOf, storageFull } from "../shared/text.ts";
+import { clean, codeText, errorText, inactiveText, infoOf, storageFull } from "../shared/text.ts";
 import { BatteryAlerts, CRITICAL_PERCENT, type Alert } from "./battery.ts";
 import * as convert from "./convert.ts";
 import { AdapterManager, type ManagerDeps } from "./manager.ts";
@@ -46,7 +46,7 @@ const PUBLISH_MS = 30;
 const SCAN_SECONDS = 30;
 
 const failed = (error: unknown): ActionResult => ({ ok: false, message: failure(error) });
-const GONE: ActionResult = { ok: false, message: "That device or adapter is no longer available." };
+const GONE: ActionResult = { ok: false, message: "This device or adapter is no longer available." };
 
 export function batteryOf(info: InfoEntry[], current = true): Battery | null {
   const percent = infoOf(info, "battery.level");
@@ -132,7 +132,8 @@ export class Controller {
       const status = session.status;
       const entries = session.listed ? [...session.devices.values()].map((d) => this.#device(id, session, d)) : [];
       const attention: string[] = [];
-      if (status.ready && storageFull(status)) attention.push("Storage Full");
+      if (status.ready && storageFull(status))
+        attention.push("The adapter's storage is full. Remove an unused device or forget a saved setting to pair another device.");
       adapters.push({
         name: status.name,
         id,
@@ -222,11 +223,11 @@ export class Controller {
     else if (d.inactive !== null) {
       p.phase = "saved";
       p.message = d.inactive === "disabled"
-        ? "It was saved but is turned off; turn on “Use This Device” to connect it."
-        : `It was saved but can't connect yet. ${INACTIVE[d.inactive]}`;
+        ? "The device is paired but turned off in Cordial. Turn on “Use This Device” to connect it."
+        : `The device is paired but can't connect. ${inactiveText(d)}`;
     } else if (d.state === "disconnected" && d.error) {
       p.phase = "saved";
-      p.message = `It was saved, but connecting failed. ${codeText(d.error)}`;
+      p.message = `The device is paired, but the adapter couldn't connect to it. ${codeText(d.error)}`;
     }
     if (p.phase !== "connecting" && p.dismissed) this.#pairing = null;
   }
@@ -293,7 +294,7 @@ export class Controller {
     }
     const incomplete = save.items.find((i) => i.status !== "saved");
     return incomplete
-      ? { ok: false, message: incomplete.error ?? "Some settings were not saved.", inline: true, settingsSave: save }
+      ? { ok: false, message: incomplete.error ?? "The adapter couldn't save some settings.", inline: true, settingsSave: save }
       : { ok: true, settingsSave: save };
   }
 
@@ -449,7 +450,7 @@ export class Controller {
       } else {
         pairing.prompt = null;
         pairing.phase = step.code === "cancelled" ? "cancelled" : "failed";
-        pairing.message = step.code === "cancelled" ? "Adding the device was cancelled." : codeText(step.code);
+        pairing.message = step.code === "cancelled" ? "Pairing was cancelled." : codeText(step.code);
         if (pairing.dismissed) this.#pairing = null;
       }
     } else return;
@@ -458,7 +459,7 @@ export class Controller {
 
   async #startScan(adapterId: string): Promise<ActionResult> {
     const session = this.#session(adapterId);
-    if (!session) return { ok: false, message: "That adapter is no longer available." };
+    if (!session) return { ok: false, message: "This adapter is no longer available." };
     const transports = session.status.transports.map((t) => convert.wire(Transport, t.transport));
     if (!transports.length) return { ok: false, message: "This adapter can't search for devices." };
     if (this.#scan?.running && this.#scan.session !== session) await this.#stopScan();
@@ -488,7 +489,7 @@ export class Controller {
 
   async #pair(adapterId: string, candidateId: string): Promise<ActionResult> {
     const session = this.#session(adapterId);
-    if (!session) return { ok: false, message: "That adapter is no longer available." };
+    if (!session) return { ok: false, message: "This adapter is no longer available." };
     if (this.#pairing?.phase === "pairing" && !this.#pairing.dismissed) return { ok: false, message: "Another device is being added." };
     if (storageFull(session.status)) return { ok: false, message: errorText({ code: "no_capacity", reason: "storage", outcomeUnknown: false }) };
     const candidate = this.#scan?.candidates.find((c) => c.id === candidateId);

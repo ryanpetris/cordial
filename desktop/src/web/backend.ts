@@ -59,7 +59,7 @@ export async function startWebBackend(simulate: number): Promise<DesktopApi> {
       for (const listener of listeners) listener(state);
     },
     lowBattery: (alert) =>
-      notify(alert.level === "critical" ? `${alert.name} battery is critical` : `${alert.name} battery is low`, `${alert.percent}% remaining. Charge it soon.`),
+      notify(alert.level === "critical" ? `${alert.name}'s battery is critically low.` : `${alert.name} has a low battery.`, `The battery is at ${alert.percent}%. Charge it soon.`),
     connection: (name, connected) => notify(name, connected ? "Connected" : "Disconnected"),
   });
   if (serial && !simulate) {

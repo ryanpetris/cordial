@@ -45,8 +45,8 @@ The CLI never picks silently between duplicate names. Setting keys are the catal
 - A pairing prompt asks for the passkey or PIN, or a yes/no comparison, directly. While a prompt is
   open, `/COMMAND` runs a normal command; `pair accept` and `pair reject` answer it explicitly.
   Saving the bond and the later connection result are reported separately.
-- Ctrl-C clears partial input or rejects the open prompt; at an idle prompt it leaves the shell
-  open. Ctrl-D or end of input exits and stops a running scan.
+- Ctrl-C, Ctrl-D, end of input, SIGINT and SIGTERM quit the shell, which closes the port: a
+  running scan stops and an unsaved pairing is cancelled.
 - One-shot commands and scripts run each command after the previous one's result and exit nonzero
   on failure. `--timeout SECONDS` bounds a one-shot command and sets the length of a one-shot scan.
   A one-shot `pair start` finds the candidate by name within the same invocation, since candidate
@@ -85,8 +85,10 @@ the adapter goes away.
 - The view is built from the first full listing and then from events, and is marked unavailable
   when the session ends. After reconnecting it shows the current state and retries nothing.
 - Adapter settings hold the name, with a rename dialog that keeps the draft on failure, and the
-  Linux, Windows and Mac platform choices. A saved device shows its Logitech Features switch even
-  while disconnected, and its HID++ status.
+  Linux, Windows and macOS platform choices. A saved device shows its Logitech Features switch even
+  while disconnected. Its Diagnostics dialog lists its warnings, HID++ protocol and status, link
+  security and identifiers, and refreshes a connected device's information. New warnings are not
+  written to the activity log.
 - Settings are edited in place; Save sends every change in one request, and apply results arrive
   as they happen.
 - Development firmware adds the bootloader action and Files, which browses adapter directories and
@@ -119,7 +121,10 @@ The desktop application uses the same commands and session rules as the CLI.
   the scan before pairing, answers prompts in the dialog, and follows the new device until it
   connects or fails. Closing the dialog, or hiding the window, stops a scan or cancels an unsaved
   pairing.
-- Devices open on the Details tab; Settings is the second tab.
+- Devices open on the Details tab, with the connection switches and the device's own facts.
+  Settings follows when the device has settings to show, then Diagnostics: the device's
+  warnings with the HID field or report each applies to, the HID++ protocol and status, link
+  security and identifiers, with Refresh. Warnings never appear as banners.
 - Battery: a device's battery is low when a known `battery.level` is at or below the user's
   threshold (20% by default) and `battery.charging` is not true; at most 5% is critical. It notifies
   once on entering low and once on entering critical, and resets only after a reading above the

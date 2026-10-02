@@ -5,7 +5,7 @@ import { enabledFull } from "../../shared/capacity.ts";
 import { settingsBusy, settingsCurrent } from "../../shared/settings.ts";
 import type { AdapterEntry, AppState, DeviceEntry, InfoEntry, Scalar, Setting, SettingsChange, SettingsSaveItem } from "../../shared/state.ts";
 import {
-  INACTIVE,
+  inactiveText,
   INFO_LABELS,
   ROLES,
   SETTING_STATES,
@@ -41,6 +41,16 @@ import {
   UnplugIcon,
   type MarkShape,
 } from "./icons.tsx";
+
+const DEVICE_TABS: ["details" | "settings" | "diagnostics", string][] = [
+  ["details", "Details"],
+  ["settings", "Settings"],
+  ["diagnostics", "Diagnostics"],
+];
+/** Information keys shown on Details, in order. */
+const DETAILS_INFO = ["device.manufacturer", "device.model", "device.serial", "firmware.version", "hardware.revision", "software.revision"];
+/** Information keys shown under Identifiers on Diagnostics, in order. */
+const IDENTIFIERS = ["vendor.registry", "vendor.id", "product.id", "product.version", "bootloader.version"];
 
 /** The label of a setting this page shows; only known keys are listed. */
 const label = (key: string) => settingInfo(key)!.label;
@@ -465,10 +475,11 @@ function settingsView(entry: DeviceEntry) {
   return { rows, readings, figures };
 }
 
-/** Whether the device page has a settings tab; saved settings stay visible while disconnected. */
+/** Whether the device page has a settings tab: only once the device has settings to show. Saved
+ * settings stay visible while disconnected. */
 function hasSettings(entry: DeviceEntry) {
   const { rows, readings, figures } = settingsView(entry);
-  return rows.length > 0 || readings.length > 0 || figures.length > 0 || entry.settingsError !== null || starting(entry);
+  return rows.length > 0 || readings.length > 0 || figures.length > 0;
 }
 
 /** HID++ is coming up on the connected device, reading its settings. */
@@ -544,7 +555,7 @@ function Settings({ entry, adapter, drafts, bar }: {
 
   const loadProblem = (
     <>
-      <span className="muted">Couldn't read the device's settings.</span>
+      <span className="muted">The adapter couldn't read the device's settings.</span>
       <button type="button" disabled={reloading} onClick={() => void runReload({ type: "device.reload", key: entry.key })}>
         <RefreshIcon /> Retry
       </button>
@@ -552,17 +563,8 @@ function Settings({ entry, adapter, drafts, bar }: {
   );
   const hidppError = d.hidpp?.error ?? null;
 
-  if (!settings.length && !readings.length && !figures.length)
-    return entry.settingsError ? (
-      <div className="panel-state">{loadProblem}</div>
-    ) : hidppError ? (
-      <p className="muted">Settings unavailable: {codeText(hidppError)}.</p>
-    ) : (
-      <div className="panel-state">
-        <Spinner />
-        <span className="muted">Reading the device's settings…</span>
-      </div>
-    );
+  // The tab is only offered while there are settings.
+  if (!settings.length && !readings.length && !figures.length) return null;
 
   const counts: [string, number][] = [
     ["Couldn't Save", items.filter((i) => i.status === "not_saved").length],
@@ -664,7 +666,7 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
   const [failure, setFailure] = useState<{ at: string; message: string } | null>(null);
   const [forgetting, setForgetting] = useState(false);
   // A device opens on its details, where Connect is; the tab stays put as the connection changes.
-  const [chosen, setTab] = useState<"details" | "settings">("details");
+  const [chosen, setTab] = useState<"details" | "settings" | "diagnostics">("details");
   const tabs = useId();
   const [settingsBar, setSettingsBar] = useState<HTMLElement | null>(null);
   const d = entry.device;
@@ -681,18 +683,21 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
   const failed = (at: string) => (failure?.at === at ? failure.message : null);
   const failedText = (at: string) => (failure?.at === at ? <span className="error-text">{failure.message}</span> : undefined);
   const connecting = connectBusy || d.state === "connecting";
-  const tab = settings ? chosen : "details";
+  const tab = chosen === "settings" && !settings ? "details" : chosen;
   const low = isLow(entry.battery, state.preferences.lowBatteryPercent);
   const battery = batteryText(entry.battery);
   const canConnect = d.inactive === null && d.state === "disconnected";
   const peers = state.devices.filter((x) => x.adapterId === entry.adapterId).map((x) => x.device);
   // Turning the device on is not offered while every place for its transport is in use.
   const full = !d.enabled && enabledFull(adapter?.status ?? null, peers, d);
-  const info = Object.keys(INFO_LABELS).flatMap((key) => d.info.filter((f) => f.key === key));
+  const facts = (keys: string[]) => keys.flatMap((key) => d.info.filter((f) => f.key === key));
+  const info = facts(DETAILS_INFO);
+  const identifiers = facts(IDENTIFIERS);
   const set = (type: "device.enabled" | "device.trusted" | "device.blocked" | "device.hidpp") => (value: boolean) =>
     void perform(type, run, { type, key: entry.key, value });
-  const connectionProblem = failed("connection") ?? (d.state === "disconnected" && d.error ? codeText(d.error) : null);
   const warningsFailed = !!entry.warningsError;
+  // A failed list read is retried by reading the lists again rather than asking the device.
+  const listsFailed = warningsFailed || !!entry.settingsError;
 
   return (
     <Page
@@ -713,22 +718,28 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
         </>
       }
       nav={
-        settings ? (
-          <TabBar
-            id={tabs}
-            label="Device"
-            tabs={[
-              ["details", "Details"],
-              ["settings", "Settings"],
-            ]}
-            value={tab}
-            onChange={setTab}
-          />
-        ) : undefined
+        <TabBar
+          id={tabs}
+          label="Device"
+          tabs={DEVICE_TABS.filter(([t]) => t !== "settings" || settings)}
+          value={tab}
+          onChange={setTab}
+        />
       }
       bar={
         tab === "settings" ? (
           <div ref={setSettingsBar} className="bar-slot" />
+        ) : tab === "diagnostics" ? (
+          <>
+            {failed("info") ? <span className="bar-start error-text">{failed("info")}</span> : null}
+            {infoBusy ? <Spinner /> : null}
+            <button
+              disabled={infoBusy}
+              onClick={() => void perform("info", runInfo, { type: listsFailed || !connected ? "device.reload" : "device.refresh", key: entry.key })}
+            >
+              <RefreshIcon /> {listsFailed || failed("info") ? "Retry" : "Refresh"}
+            </button>
+          </>
         ) : (
           <>
             <span className="bar-start">
@@ -741,6 +752,7 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
               >
                 <TrashIcon /> Forget Device
               </button>
+              {failedText("connection")}
             </span>
             {busy || connectBusy ? <Spinner /> : null}
             {connected || connecting ? (
@@ -760,12 +772,79 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
         )
       }
     >
-      {connectionProblem ? <Banner kind="error">{connectionProblem}</Banner> : null}
-      {d.inactive !== null && d.inactive !== "disabled" ? <Banner>Inactive: {INACTIVE[d.inactive]}</Banner> : null}
+      {d.inactive !== null && d.inactive !== "disabled" ? <Banner>{inactiveText(d)}</Banner> : null}
 
-      <TabPanel id={tabs} value={settings ? tab : null}>
+      <TabPanel id={tabs} value={tab}>
         {tab === "settings" ? (
           <Settings entry={entry} adapter={adapter} drafts={drafts} bar={settingsBar} />
+        ) : tab === "diagnostics" ? (
+          <>
+            {warningsFailed || entry.warnings?.length ? (
+              <Card title="Device Warnings">
+                {warningsFailed ? (
+                  <Row title={WARNINGS_READ_FAILED} />
+                ) : (
+                  <Facts>
+                    {(entry.warnings ?? []).map((w, i) => {
+                      const fact = warningFact(w);
+                      return (
+                        <Fact key={i} label={fact.label} dim={!connected}>
+                          {fact.text}
+                          <span className="fact-detail">{fact.context}</span>
+                        </Fact>
+                      );
+                    })}
+                  </Facts>
+                )}
+              </Card>
+            ) : null}
+
+            {d.error ? (
+              <Card title="Connection">
+                <Facts>
+                  <Fact label="Last Error">{codeText(d.error)}</Fact>
+                </Facts>
+              </Card>
+            ) : null}
+
+            {entry.settingsError ? (
+              <Card title="Device Settings">
+                <Row title={`The adapter couldn't read the device's settings. ${entry.settingsError}`} />
+              </Card>
+            ) : null}
+
+            {d.hidpp ? (
+              <Card title="Logitech Features">
+                <Facts>
+                  <Fact label="HID++ Protocol">{versionText(d.hidpp)}</Fact>
+                  <Fact label="Status">{integrationText(d.hidpp)}</Fact>
+                </Facts>
+              </Card>
+            ) : null}
+
+            {connected && d.security ? (
+              <Card title="Security">
+                <Facts>
+                  {securityFacts(d.security).map(([name, value]) => (
+                    <Fact key={name} label={name}>
+                      {value}
+                    </Fact>
+                  ))}
+                </Facts>
+              </Card>
+            ) : null}
+
+            <Card title="Identifiers">
+              <Facts>
+                {identifiers.map((f) => (
+                  <Fact key={f.key} label={INFO_LABELS[f.key]} dim={!connected}>
+                    {infoValue(f)}
+                  </Fact>
+                ))}
+                <Fact label="Device ID">{d.id}</Fact>
+              </Facts>
+            </Card>
+          </>
         ) : (
           <>
             <Card title="Connection">
@@ -801,18 +880,6 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
 
             <Card title="Information">
               <Facts>
-                {warningsFailed ? <Fact label="Device Warnings">{WARNINGS_READ_FAILED}</Fact> : null}
-                {(entry.warnings ?? []).map((w, i) => {
-                  const fact = warningFact(w);
-                  return (
-                    <Fact key={i} label={fact.label} dim={!connected}>
-                      {fact.text}
-                      <span className="fact-detail">{fact.context}</span>
-                    </Fact>
-                  );
-                })}
-                {d.hidpp ? <Fact label="HID++ Protocol">{versionText(d.hidpp)}</Fact> : null}
-                {d.hidpp ? <Fact label="Logitech Features">{integrationText(d.hidpp)}</Fact> : null}
                 {d.kind !== "unknown" ? <Fact label="Device Type">{kindText(entry.kind)}</Fact> : null}
                 {info.map((f) => (
                   <Fact key={f.key} label={INFO_LABELS[f.key]} dim={!connected}>
@@ -822,40 +889,14 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
                 {adapter ? <Fact label="Adapter">{adapter.name}</Fact> : null}
                 {d.transport ? <Fact label="Bluetooth">{TRANSPORTS[d.transport]}</Fact> : null}
                 {d.roles.length ? <Fact label="Input">{d.roles.map((r) => ROLES[r]).join(", ")}</Fact> : null}
-                {connected && d.security
-                  ? securityFacts(d.security).map(([name, value]) => (
-                      <Fact key={name} label={name}>
-                        {value}
-                      </Fact>
-                    ))
-                  : null}
-                <Fact label="Device ID">{d.id}</Fact>
               </Facts>
-              {failed("info") ? (
-                <Row title="Couldn't Read Information" subtitle={failedText("info")} />
-              ) : entry.warnings === null && !warningsFailed ? (
-                <Row title="Reading Information…">
-                  <Spinner />
-                </Row>
-              ) : null}
-              {connected || warningsFailed ? (
-                <div className="card-actions">
-                  {infoBusy ? <Spinner /> : null}
-                  <button
-                    disabled={infoBusy}
-                    onClick={() => void perform("info", runInfo, { type: warningsFailed || !connected ? "device.reload" : "device.refresh", key: entry.key })}
-                  >
-                    <RefreshIcon /> {warningsFailed || failed("info") ? "Retry" : "Refresh"}
-                  </button>
-                </div>
-              ) : null}
             </Card>
           </>
         )}
       </TabPanel>
 
       <Dialog open={forgetting} title={`Forget “${entry.name}”?`} onClose={() => setForgetting(false)}>
-        <p className="dialog-body">The adapter deletes its pairing and saved settings for this device.</p>
+        <p className="dialog-body">Forgetting this device deletes its pairing and saved settings from the adapter.</p>
         {failed("unpair") ? <p className="dialog-body error-text">{failed("unpair")}</p> : null}
         <footer className="dialog-footer">
           <button onClick={() => setForgetting(false)}>

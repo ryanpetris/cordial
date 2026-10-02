@@ -286,7 +286,7 @@ pub fn warning_text(w: WarningCode) -> &'static str {
         WarningCode::IndicatorRangeUnsupported => {
             "The indicator's value range can't represent both states."
         }
-        WarningCode::Unknown => "Unrecognized warning.",
+        WarningCode::Unknown => "The adapter can't use part of this device.",
     }
 }
 
@@ -346,7 +346,7 @@ pub fn platform_name(p: Platform) -> &'static str {
     match p {
         Platform::Linux => "Linux",
         Platform::Windows => "Windows",
-        Platform::Mac => "Mac",
+        Platform::Mac => "macOS",
     }
 }
 
@@ -363,19 +363,19 @@ fn general_text(code: ErrorCode) -> Option<&'static str> {
         BadRequest => "the adapter rejected a malformed request",
         UnknownCommand => "this adapter's firmware doesn't support that command",
         BadArgs => "the adapter rejected the command's arguments",
-        TooLong => "a request exceeded the adapter's size limit",
+        TooLong => "the request was too large for the adapter",
         NotReady => "the adapter's Bluetooth or storage isn't ready",
         NotFound => "the adapter has no saved device with that ID",
-        NotConnected => "the device isn't connected; connect it first",
-        Busy => "the adapter is busy with a conflicting operation; try again when it finishes",
+        NotConnected => "the device isn't connected. Connect it first",
+        Busy => "the adapter is busy. Try again when the current operation finishes",
         Disabled => "the device is disabled; enable it before connecting",
-        Blocked => "the device is blocked; unblock it before connecting",
-        Unsupported => "the adapter or the device doesn't support that",
+        Blocked => "connections to this device are blocked. Unblock it before connecting",
+        Unsupported => "the adapter or device doesn't support this",
         NoCapacity => "the adapter has no room for that right now",
         NoPrompt => "that pairing prompt is no longer waiting for an answer",
-        StorageFailed => "reading or writing the adapter's saved data failed",
+        StorageFailed => "the adapter couldn't read or write its saved data",
         Internal => "the adapter hit an unexpected failure",
-        CandidateExpired => "that nearby device is no longer available; scan again",
+        CandidateExpired => "this device is no longer available. Scan again",
         AuthFailed => "Bluetooth authentication failed",
         Rejected => "authentication was rejected by the user or the device",
         Timeout => "the operation's deadline expired",
@@ -395,11 +395,11 @@ fn hidpp_text(code: ErrorCode) -> Option<&'static str> {
         TransportError => "couldn't send",
         DeviceError => "device error",
         InvalidResponse => "unexpected reply",
-        FeatureUnavailable => "special keys unavailable",
+        FeatureUnavailable => "the device doesn't provide a feature this needs",
         ProtocolUnsupported => "not supported",
         NotConnected => "the device disconnected",
         Unsupported => "not supported by the device now",
-        ReadbackMismatch => "the device reported a different value after the change",
+        ReadbackMismatch => "the device reported a different value from the one requested",
         _ => return None,
     })
 }
@@ -433,7 +433,7 @@ fn code_text(code: ErrorCode, command: Option<&str>) -> String {
             Some("this build does not support the requested Bluetooth transport")
         }
         (Unsupported, Some("setting set")) => {
-            Some("the device doesn't support that setting or value now")
+            Some("the device can't use this setting or value right now")
         }
         _ => None,
     };
@@ -469,7 +469,7 @@ pub fn inactive_words(reason: InactiveReason) -> &'static str {
         InactiveReason::Capacity => {
             "every enabled-device place is in use; disable another device to make room"
         }
-        InactiveReason::Unknown => "the adapter isn't using it",
+        InactiveReason::Unknown => "the adapter isn't using this device",
     }
 }
 
@@ -538,6 +538,12 @@ pub fn capitalized(s: &str) -> String {
     }
 }
 
+/// A reason as a sentence: capitalized and ending with a period.
+pub fn sentence(s: &str) -> String {
+    let s = capitalized(s);
+    if s.ends_with('.') { s } else { format!("{s}.") }
+}
+
 /// HID++'s status as the CLI spells it.
 pub fn up_token(up: Up) -> String {
     match up {
@@ -555,9 +561,9 @@ pub fn up_words(up: Up) -> String {
     match up {
         Up::Off => "Off".into(),
         Up::Disconnected => "Waiting to Connect".into(),
-        Up::Starting => "Starting".into(),
+        Up::Starting => "Setting Up".into(),
         Up::Active => "Active".into(),
-        Up::Unsupported => "Unavailable".into(),
+        Up::Unsupported => "Unsupported".into(),
         Up::Error(code) => format!("Failed: {}", hidpp_words(code)),
     }
 }
@@ -818,6 +824,9 @@ pub fn device_info(d: &p::Device, warnings: &[p::DeviceWarning]) -> String {
     field("Trusted", &yes_no(d.trusted).to_lowercase());
     field("Blocked", &yes_no(d.blocked).to_lowercase());
     field("Reconnect", if d.paused { "paused" } else { "automatic" });
+    field("Logitech Features", on_off(model::hidpp_enabled(d)));
+    field("HID++ Protocol", &hidpp_protocol_text(d));
+    field("HID++ Status", &up_words(model::hidpp_up(d)));
     for warning in warnings {
         field(
             warning_label(warning.code()),
@@ -828,9 +837,6 @@ pub fn device_info(d: &p::Device, warnings: &[p::DeviceWarning]) -> String {
             ),
         );
     }
-    field("Logitech Features", on_off(model::hidpp_enabled(d)));
-    field("HID++ Protocol", &hidpp_protocol_text(d));
-    field("HID++ Status", &up_words(model::hidpp_up(d)));
     if let Some(code) = model::last_error(d) {
         let e = p::Error {
             code: code as i32,
@@ -915,9 +921,21 @@ pub fn battery(info: &[p::Info]) -> Option<Battery> {
 /// A labeled line of device information.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InfoRow {
+    /// The information key the row shows.
+    pub key: String,
     pub label: String,
     pub value: String,
 }
+
+/// Information keys that identify the device rather than describe it, shown with its
+/// diagnostics.
+pub const IDENTIFIER_KEYS: [&str; 5] = [
+    keys::VENDOR_REGISTRY,
+    keys::VENDOR_ID,
+    keys::PRODUCT_ID,
+    keys::PRODUCT_VERSION,
+    keys::BOOTLOADER_VERSION,
+];
 
 /// The reported information in display order: the battery's charge and
 /// charging, then the other keys this build knows. With either battery value
@@ -927,10 +945,12 @@ pub fn info_rows(info: &[p::Info]) -> Vec<InfoRow> {
     let mut rows: Vec<InfoRow> = Vec::new();
     if let Some(b) = battery(info) {
         rows.push(InfoRow {
+            key: keys::BATTERY_LEVEL.into(),
             label: catalog::label(keys::BATTERY_LEVEL),
             value: b.percent_words(),
         });
         rows.push(InfoRow {
+            key: keys::BATTERY_CHARGING.into(),
             label: catalog::label(keys::BATTERY_CHARGING),
             value: b.charging_words(),
         });
@@ -954,6 +974,7 @@ pub fn info_rows(info: &[p::Info]) -> Vec<InfoRow> {
             value = format!("{value} ({})", info_value(keys::VENDOR_REGISTRY, r));
         }
         rows.push(InfoRow {
+            key: key.into(),
             label: catalog::label(key),
             value,
         });
@@ -1072,7 +1093,7 @@ pub fn file_line(e: &p::FileEntry) -> String {
 pub fn warnings_text(subject: &Subject, warnings: &[p::DeviceWarning]) -> String {
     let mut b = format!("Warnings of {}", label(subject));
     if warnings.is_empty() {
-        b.push_str("\n  None.");
+        b.push_str("\n  No warnings.");
     }
     for w in warnings {
         let _ = write!(b, "\n  {}", warning_line(w));
@@ -1102,7 +1123,7 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
         }
         Outcome::Name(name) => format!("Adapter renamed to {}.", display(name)),
         Outcome::Platform(p) => format!("Platform set to {}.", platform_name(*p)),
-        Outcome::Bootloader => "Adapter is restarting into its bootloader.".into(),
+        Outcome::Bootloader => "The adapter is restarting into its bootloader.".into(),
         Outcome::ScanStarted(transports) => format!(
             "Discovery started ({}).",
             transports
@@ -1149,7 +1170,9 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
         Outcome::Candidate(c) => candidate_info(c),
         Outcome::Hidden(subject) => format!("Candidate hidden: {}", safe(&subject.id)),
         Outcome::Unpaired(subject) => format!("Forgot {}.", label(subject)),
-        Outcome::Refreshing(subject) => format!("Refreshing {}.", label(subject)),
+        Outcome::Refreshing(subject) => {
+            format!("Reading current information from {}.", label(subject))
+        }
         Outcome::Warnings { subject, warnings } => warnings_text(subject, warnings),
         Outcome::Settings(subject) => catalog::subject_text(subject, state),
         Outcome::Setting { subject, setting } => match state.and_then(|s| s.device(&subject.id)) {

@@ -11,6 +11,6 @@ RUN apt-get update \
 ENV RUSTUP_HOME=/opt/rustup PATH=/opt/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | CARGO_HOME=/opt/cargo sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
-    && CARGO_HOME=/opt/cargo rustup toolchain install 1.98.1 --profile minimal \
+    && CARGO_HOME=/opt/cargo rustup toolchain install 1.98.1 --profile minimal --component clippy \
         --target thumbv6m-none-eabi --target thumbv8m.main-none-eabihf \
-    && chmod -R a+rwX /opt/rustup
+    && chmod -R a+rX,go-w /opt/rustup

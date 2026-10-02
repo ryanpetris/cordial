@@ -64,7 +64,7 @@ const SPECS: &[Spec] = &[
     ),
     spec("pair accept", "[VALUE]", "Answer a pairing prompt"),
     spec("pair reject", "", "Reject a pairing prompt"),
-    spec("pair cancel", "", "Cancel the pairing"),
+    spec("pair cancel", "", "Cancel the pairing in progress"),
     spec(
         "device connect",
         "DEV",
@@ -88,9 +88,13 @@ const SPECS: &[Spec] = &[
     spec(
         "device set",
         "DEV enabled | trusted | blocked | hidpp on | off",
-        "Enabled uses a saved device for connections and needs a free enabled place; trusted allows unattended connections; blocked denies connections; hidpp allows HID++ special keys and applying device settings",
+        "enabled uses a saved device for connections and needs a free enabled place; trusted allows automatic connections; blocked refuses connections; hidpp lets the adapter use HID++ for special keys and saved settings",
     ),
-    spec("warning list", "DEV", "Device warnings"),
+    spec(
+        "warning list",
+        "DEV",
+        "What the adapter can't use on a device",
+    ),
     spec(
         "setting list",
         "DEV",
@@ -100,7 +104,7 @@ const SPECS: &[Spec] = &[
     spec(
         "setting set",
         "DEV KEY VALUE",
-        "Save a preference on the dongle; applied now if HID++ is on",
+        "Save a preference on the adapter; applied now if HID++ is on",
     ),
     spec(
         "setting forget",
@@ -166,9 +170,9 @@ an adapter platform change, overriding changes made on the device or from
 another computer meanwhile.
 Changes made on the device are shown but never saved or corrected. A setting's
 values come from the device: see setting get. With HID++ off, setting set only
-saves the value on the dongle without applying it. While disconnected,
+saves the value on the adapter without applying it. While disconnected,
 setting list shows what the adapter last knew, and setting forget still
-returns a setting to Default. Only settings this cordial recognizes can be
+returns a setting to Default. Only settings this version of Cordial recognizes can be
 shown or changed.",
     ),
 ];
@@ -206,10 +210,7 @@ pub fn help(st: Option<&State>) -> String {
     for (words, text) in NOTES {
         match words[0] {
             "ctrl-c" => {
-                out.push(
-                    "Ctrl-C clears input, rejects a prompt, or cancels a foreground operation."
-                        .into(),
-                );
+                out.push("Ctrl-C quits the shell.".into());
             }
             "direct" => {
                 let direct: Vec<&str> = DIRECT.iter().copied().filter(|w| listed(w)).collect();
@@ -253,7 +254,7 @@ fn scan_row(st: Option<&State>) -> (String, String) {
         .collect();
     let text = match kinds.len() {
         1 => format!("Discover {} devices", kinds[0]),
-        _ => "Discover devices on both transports, or one".to_owned(),
+        _ => "Discover devices on both transports, or on one".to_owned(),
     };
     let syntax = match words.len() {
         1 => format!("{SCAN} [{}] [SECONDS]", words[0]),

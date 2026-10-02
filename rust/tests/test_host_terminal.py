@@ -110,10 +110,12 @@ class Terminal(unittest.TestCase):
             self.read()
         self.assertIn(b"Device settings are saved only when you set them", self.transcript)
         os.write(self.master, b"unfinished\x03")
-        self.read(.1)
-        self.assertIsNone(self.process.poll())
+        self.exited(0)
+        self.doCleanups()
+        self.start(False)
+        self.wait_text("Open failed:")
         self.process.send_signal(signal.SIGINT)
-        self.exited(1)
+        self.exited(0)
 
 
 if __name__ == "__main__":

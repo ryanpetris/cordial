@@ -282,7 +282,7 @@ fn pairing_code_survives_resize_and_is_submitted() {
     }));
     let screen = app.screen();
     assert!(
-        screen.contains("Pair With Keyboard") && screen.contains("6-digit"),
+        screen.contains("Pair With Keyboard") && screen.contains("six-digit"),
         "{screen}"
     );
     for c in "0427".chars() {
@@ -435,6 +435,10 @@ fn hidpp_status_is_one_line_and_translation_is_never_reported() {
         }];
     });
     app.click(Action::Device("d_1".into()));
+    // The details pane keeps the switch; the status lines are in Diagnostics.
+    let screen = app.screen();
+    assert!(!screen.contains("HID++ 4.2"), "{screen}");
+    app.click(Action::Diagnostics);
     let screen = app.screen();
     assert!(screen.contains("HID++ 4.2"), "{screen}");
     assert!(screen.contains("Logitech Features Active"), "{screen}");
@@ -449,6 +453,7 @@ fn hidpp_status_is_one_line_and_translation_is_never_reported() {
         screen.contains("Logitech Features Failed:") && screen.contains("couldn't send"),
         "{screen}"
     );
+    app.click(Action::CancelDialog);
 }
 
 #[test]
@@ -527,6 +532,8 @@ fn link_security_follows_the_connection() {
         })
     });
     app.click(Action::Device("d_1".into()));
+    assert!(!app.screen().contains("128 bits"));
+    app.click(Action::Diagnostics);
     let screen = app.screen();
     assert!(screen.contains("Encrypted, Unauthenticated"), "{screen}");
     assert!(screen.contains("Encryption Key: 128 bits"), "{screen}");
@@ -568,7 +575,36 @@ fn battery_is_listed_and_details_show_device_info() {
 }
 
 #[test]
-fn warnings_show_in_details_and_new_ones_are_reported() {
+fn diagnostics_show_the_last_connection_error() {
+    let mut app = App::connected(120, 60);
+    app.edit(|st| {
+        let d = st.devices.iter_mut().find(|d| d.id == "d_1").unwrap();
+        d.state = p::DeviceState::Disconnected as i32;
+        d.error = Some(p::ErrorCode::ConnectionFailed as i32);
+    });
+    app.click(Action::Device("d_1".into()));
+    app.click(Action::Diagnostics);
+    let screen = app.screen();
+    assert!(screen.contains("Last Error"), "{screen}");
+    // The reason is shown in words, never as a raw code.
+    assert!(!screen.contains("connection_failed"), "{screen}");
+    // Refreshing needs a connection, so the dialog doesn't offer it.
+    assert!(!screen.contains("Refresh Info"), "{screen}");
+}
+
+#[test]
+fn a_device_without_warnings_has_no_warnings_section_in_diagnostics() {
+    let mut app = App::connected(120, 60);
+    app.click(Action::Device("d_1".into()));
+    app.click(Action::Diagnostics);
+    let screen = app.screen();
+    assert!(!screen.contains("Device Warnings"), "{screen}");
+    assert!(screen.contains("Identifiers"), "{screen}");
+    assert!(screen.contains("d_1"), "{screen}");
+}
+
+#[test]
+fn warnings_show_in_diagnostics_and_are_not_logged() {
     let mut app = App::connected(120, 60);
     let warning = p::DeviceWarning {
         code: p::WarningCode::IndicatorWriteFailed as i32,
@@ -594,11 +630,15 @@ fn warnings_show_in_details_and_new_ones_are_reported() {
         first: false,
         changed: vec![],
     });
-    assert_eq!(
-        app.m.logs.last().unwrap().text,
-        "Keyboard: The adapter couldn't update the indicator lights."
+    assert!(
+        app.m
+            .logs
+            .iter()
+            .all(|l| !l.text.contains("indicator lights"))
     );
     app.click(Action::Device("d_1".into()));
+    assert!(!app.screen().contains("Service 1, Output Report 3"));
+    app.click(Action::Diagnostics);
     let screen = app.screen();
     assert!(screen.contains("Service 1, Output Report 3"), "{screen}");
 }

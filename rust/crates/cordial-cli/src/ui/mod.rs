@@ -33,14 +33,11 @@ pub struct UiOptions {
 
 #[derive(Debug)]
 pub enum UiError {
-    /// SIGINT or SIGTERM closed the shell.
-    Interrupted,
     Terminal(std::io::Error),
 }
 impl fmt::Display for UiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            UiError::Interrupted => f.write_str("interrupted"),
             UiError::Terminal(e) => write!(f, "terminal: {e}"),
         }
     }

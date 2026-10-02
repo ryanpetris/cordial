@@ -759,7 +759,12 @@ impl Manager {
             if let Some(link) = &mut c.runtime {
                 link.disconnected(&mut d.catalog, &mut self.forward);
             }
-            d.connection(State::Disconnected, c.error.or(error), now);
+            // A connected device going away, such as being switched off, is not a failure. Other
+            // errors, such as authentication after a virtual cable unplug, still count.
+            let lost = d.state == State::Connected
+                && matches!(error, Some(Error::ConnectionFailed | Error::Timeout));
+            let error = c.error.or(error.filter(|_| !lost));
+            d.connection(State::Disconnected, error, now);
         } else {
             self.forward.remove(id.slot as usize);
         }

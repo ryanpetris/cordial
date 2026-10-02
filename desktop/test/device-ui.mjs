@@ -23,7 +23,7 @@ try {
   // A device opens on Details, the first tab, whose bar holds Forget Device
   // and the connection button; the header holds no buttons.
   await tab("Details").waitFor();
-  assert.deepEqual(await page.getByRole("tab").allTextContents(), ["Details", "Settings"]);
+  assert.deepEqual(await page.getByRole("tab").allTextContents(), ["Details", "Settings", "Diagnostics"]);
   assert.equal(await tab("Details").getAttribute("aria-selected"), "true");
   await bar.getByRole("button", { name: "Forget Device", exact: true }).waitFor();
   await bar.getByRole("button", { name: "Disconnect", exact: true }).waitFor();
@@ -160,9 +160,10 @@ try {
   await tab("Settings").click();
   assert.equal(await backlight.isChecked(), false);
 
-  // A device with no settings to show has no tabs.
+  // A device with no settings to show has no Settings tab.
   await page.getByRole("button", { name: /Travel Keyboard/ }).first().click();
-  await page.getByRole("tablist").waitFor({ state: "detached" });
+  await tab("Settings").waitFor({ state: "detached" });
+  assert.deepEqual(await page.getByRole("tab").allTextContents(), ["Details", "Diagnostics"]);
   await bar.getByRole("button", { name: "Forget Device", exact: true }).waitFor();
   await bar.getByRole("button", { name: "Connect", exact: true }).waitFor();
   await page.getByRole("button", { name: /Example Keys/ }).first().click();
@@ -231,7 +232,7 @@ try {
   await publish();
   await app.evaluate((_electron, outcome) => { globalThis.uiReply({ ok: true, settingsSave: outcome }); globalThis.uiHold = null; }, outcome);
   await page.getByRole("button", { name: "Timeout With Hands Away, Failed, Options", exact: true }).waitFor();
-  await page.getByText("The operation took too long", { exact: true }).waitFor();
+  await page.getByText("The operation timed out", { exact: true }).waitFor();
   assert.equal(await save.getAttribute("aria-disabled"), "true");
   // Retry works beside other drafts and leaves them staged, but not while
   // that setting's own draft differs or is invalid.
@@ -251,7 +252,7 @@ try {
   Object.assign(handsSaved, { state: "applied", error: null, value: 60 });
   await publish();
   await page.getByRole("button", { name: "Timeout With Hands Away, Saved, Options", exact: true }).waitFor();
-  assert.equal(await page.getByText("The operation took too long", { exact: true }).count(), 0);
+  assert.equal(await page.getByText("The operation timed out", { exact: true }).count(), 0);
   assert.equal(await retryButton.count(), 0);
   // A refused save says why for each change it held.
   entry.settingsSave = {
@@ -301,14 +302,19 @@ try {
   await tab("Details").click();
   await bar.getByRole("button", { name: "Disconnect", exact: true }).click();
   assert.ok((await actions()).some((a) => a.type === "device.disconnect" && a.key === entry.key));
-  // A failed connection says why.
+  // A failed connection says why on Diagnostics, never as a banner.
   entry.device.state = "disconnected";
   entry.device.error = "connection_failed";
   await publish();
-  await page.locator(".banner").getByText("The Bluetooth link or HID setup failed", { exact: true }).waitFor();
+  await tab("Diagnostics").click();
+  await page.getByText("The Bluetooth link or HID setup failed", { exact: true }).waitFor();
+  assert.equal(await page.locator(".banner").count(), 0);
+  await tab("Details").click();
+  assert.equal(await page.getByText("The Bluetooth link or HID setup failed", { exact: true }).count(), 0);
   entry.device.error = null;
 
-  // While HID++ starts, the settings tab says it is reading; a failed read offers Retry.
+  // There is no Settings tab until the device has settings, even while HID++ starts; a failed
+  // read is shown on Diagnostics.
   entry.device.state = "connected";
   entry.device.hidpp = { ...entry.device.hidpp, state: "starting" };
   const settings = entry.settings;
@@ -316,42 +322,50 @@ try {
   entry.settings = [];
   entry.device.info = [];
   await publish();
-  await tab("Settings").click();
-  await page.getByText("Reading the device's settings…", { exact: true }).waitFor();
+  await tab("Diagnostics").waitFor();
+  assert.equal(await tab("Settings").count(), 0);
   entry.settingsError = "The adapter is busy";
   await publish();
-  await page.getByText("Couldn't read the device's settings.", { exact: true }).waitFor();
-  await retryButton.click();
+  await tab("Diagnostics").click();
+  await page.getByText("The adapter couldn't read the device's settings. The adapter is busy", { exact: true }).waitFor();
+  assert.equal(await tab("Settings").count(), 0);
+  // Retry reads the lists again.
+  await bar.getByRole("button", { name: "Retry", exact: true }).click();
   assert.equal((await actions()).at(-1).type, "device.reload");
-  assert.equal(await page.locator(".toast").count(), 0);
   entry.settingsError = null;
   entry.settings = settings;
   entry.device.info = info;
   entry.device.hidpp = { ...entry.device.hidpp, state: "active" };
   await publish();
+  await tab("Settings").click();
   await page.getByRole("group", { name: "Backlight", exact: true }).waitFor();
 
-  // Information: HID++ as a whole, the device's own facts, and a refresh of
-  // the connected device.
+  // Details keeps the device's own facts; HID++, warnings, security and
+  // identifiers are on Diagnostics, which refreshes the connected device.
   await tab("Details").click();
-  await page.getByText("4.5", { exact: true }).waitFor();
   const fact = (label) => page.locator(".fact").filter({ has: page.locator("dt", { hasText: new RegExp(`^${label}$`) }) }).locator("dd");
-  assert.equal(await fact("Logitech Features").textContent(), "Active");
+  await fact("Manufacturer").waitFor();
+  for (const label of ["HID\\+\\+ Protocol", "Device ID", "Vendor ID", "Encrypted"]) assert.equal(await fact(label).count(), 0, label);
+  await tab("Diagnostics").click();
+  await page.getByText("4.5", { exact: true }).waitFor();
+  assert.equal(await fact("Status").textContent(), "Active");
+  await fact("Device ID").waitFor();
   assert.equal(await page.getByText("Special-Key Translation", { exact: true }).count(), 0);
+  // A device without warnings has no warnings section.
+  assert.equal(await page.getByRole("heading", { name: "Device Warnings" }).count(), 0);
   entry.device.hidpp = { ...entry.device.hidpp, state: null, error: "protocol_unsupported" };
   await publish();
   await page.getByText("Failed: Not supported", { exact: true }).waitFor();
   entry.device.hidpp = { ...entry.device.hidpp, state: "active", error: null };
   await publish();
   await fail("device.refresh");
-  await page.getByRole("button", { name: "Refresh", exact: true }).click();
-  await page.getByText("Couldn't Read Information", { exact: true }).waitFor();
-  await page.getByText("Couldn't save this value.", { exact: true }).waitFor();
+  await bar.getByRole("button", { name: "Refresh", exact: true }).click();
+  await bar.getByText("Couldn't save this value.", { exact: true }).waitFor();
   await fail(null);
-  await page.getByRole("button", { name: "Retry", exact: true }).click();
-  await page.getByRole("button", { name: "Refresh", exact: true }).waitFor();
+  await bar.getByRole("button", { name: "Retry", exact: true }).click();
+  await bar.getByRole("button", { name: "Refresh", exact: true }).waitFor();
 
-  // HID warnings are Information facts ahead of HID++ Protocol, naming where they apply.
+  // HID warnings are listed on Diagnostics, naming where they apply, never as a banner.
   const fieldWarning = "The adapter can't derive a value from this numeric selector field.";
   entry.warnings = [
     { code: "numeric_selector_unsupported", service: 1, reportId: 3, reportType: "input", bitOffset: 16, usagePage: 0x0c, usage: 0x238 },
@@ -360,21 +374,26 @@ try {
   await publish();
   await page.getByText(fieldWarning).waitFor();
   const labels = await page.locator(".fact dt").filter({ visible: true }).allTextContents();
-  assert.deepEqual(labels.slice(0, 4), ["Input Field", "Lock Indicators", "HID++ Protocol", "Logitech Features"]);
+  assert.deepEqual(labels.slice(0, 2), ["Input Field", "Lock Indicators"]);
   await page.getByText("Service 1, Input Report 3, Bit 16, Usage 000C:0238", { exact: true }).waitFor();
   await page.getByText("Service 0, Output Report", { exact: true }).waitFor();
   assert.equal(await page.locator(".banner").filter({ hasText: fieldWarning }).count(), 0);
+  await tab("Details").click();
+  await fact("Manufacturer").waitFor();
+  assert.equal(await page.getByText(fieldWarning).count(), 0);
+  await tab("Diagnostics").click();
   // A failed read of the list reports in the card and offers Retry.
   entry.warnings = null;
   entry.warningsError = "The adapter is busy";
   await publish();
   await page.getByText("The adapter couldn't read the device's warnings.", { exact: true }).waitFor();
-  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  await bar.getByRole("button", { name: "Retry", exact: true }).click();
   assert.equal((await actions()).at(-1).type, "device.reload");
   entry.warnings = [];
   entry.warningsError = null;
   await publish();
-  await page.getByRole("button", { name: "Refresh", exact: true }).waitFor();
+  await bar.getByRole("button", { name: "Refresh", exact: true }).waitFor();
+  await tab("Details").click();
 
   // Turning a device on isn't offered while its transport's places are full.
   const use = page.getByRole("switch", { name: "Use This Device", exact: true });
@@ -391,24 +410,29 @@ try {
   entry.device.inactive = null;
   await publish();
 
-  // A device without settings shows its details without tabs, and the tab
-  // chosen earlier returns with them. A focused control keeps its focus.
+  // A device without settings shows its details without a Settings tab, and
+  // the tab chosen earlier returns with it. A focused control keeps its focus.
   await tab("Settings").click();
   entry.settings = [];
   entry.device.info = info.filter((f) => f.key.startsWith("device."));
   entry.device.hidpp = { ...entry.device.hidpp, state: "unsupported" };
   await publish();
-  await page.getByRole("tablist").waitFor({ state: "detached" });
+  await tab("Settings").waitFor({ state: "detached" });
   const automatic = page.getByRole("switch", { name: "Automatic Connections", exact: true });
   await automatic.focus();
+  // HID++ starting again does not bring the tab back; its settings do.
   entry.device.hidpp = { ...entry.device.hidpp, state: "starting" };
+  await publish();
+  assert.equal(await tab("Settings").count(), 0);
+  entry.settings = settings;
   await publish();
   await page.getByRole("tab", { name: "Settings", selected: true }).waitFor();
   await tab("Details").click();
   await automatic.focus();
+  entry.settings = [];
   entry.device.hidpp = { ...entry.device.hidpp, state: "unsupported" };
   await publish();
-  await page.getByRole("tablist").waitFor({ state: "detached" });
+  await tab("Settings").waitFor({ state: "detached" });
   assert.equal(await automatic.evaluate((e) => e === document.activeElement), true);
   entry.settings = settings;
   entry.device.info = info;
