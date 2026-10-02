@@ -120,15 +120,17 @@ The Pico image has Rust and ARM GCC; the ESP32-S3 image adds Rust, espup and
 ldproxy to Espressif's ESP-IDF v6.1 image. Each build fetches the pinned Pico SDK
 and BTstack sources inside the image.
 
-`BOARD` defaults to `pico_w`. `PROFILE` defaults to `development`, independently
-of compiler release optimization. `PROFILE=production` excludes development
-commands, including remote bootloader entry and filesystem inspection. No Make
+`BOARD` defaults to `pico_w`. `PROFILE` is `production`, `debug` or `development`
+and defaults to `development`, independently of compiler release optimization.
+`PROFILE=production` excludes development commands, including remote bootloader
+entry and filesystem inspection. `debug` and `development` include them and run
+the same code; only their version and embedded profile name differ. No Make
 target installs firmware.
 
+The firmware version is the release version for `production`, with a `-debug`
+suffix for `debug` and a `-dev` suffix for `development`, such as `1.2.3-debug`.
 Firmware packages are written under
-`build/firmware/<version>/<board>-<bluetooth-backend>-<radio-backend>/` for production
-and the same directory with a `-debug` suffix for development firmware, the debug
-build.
+`build/firmware/<firmware-version>/<board>-<bluetooth-backend>-<radio-backend>/`.
 They contain the ELF, binary, artifact metadata and checksums. Pico packages also
 contain UF2; ESP packages contain bootloader and partition-table images plus
 `flash.json`. Packaging verifies image metadata and storage bounds.
@@ -141,9 +143,9 @@ Ordinary firmware updates preserve saved bonds, identities and preferences.
 ### Versioning and release packages
 
 First-party manifest versions are `0.0.0`. Builds use `CORDIAL_VERSION` when
-supplied and otherwise use `0.0.0`. The value is `MAJOR.MINOR.PATCH`, without
-leading zeroes or a `v` prefix. Tracked manifests and native package recipes
-remain unchanged.
+supplied and otherwise use `0.0.0`; firmware adds its profile suffix. The value is
+`MAJOR.MINOR.PATCH`, without leading zeroes or a `v` prefix. Tracked manifests
+and native package recipes remain unchanged.
 
 ```sh
 export CORDIAL_VERSION=1.2.3
@@ -217,8 +219,8 @@ and artifact checksums are verified in a clean container of each distribution
 before publication. Releases include the AppImage, desktop, CLI and web archives,
 both applications' Arch packages, separate Debian and Ubuntu packages, and for each
 board a production firmware archive, `cordial-firmware-<version>-<board>.tar.gz`,
-and a debug archive, `cordial-firmware-<version>-<board>-debug.tar.gz`, built with
-the development profile.
+and a debug archive, `cordial-firmware-<version>-debug-<board>.tar.gz`, built with
+the debug profile. Each archive holds its firmware version's package directory.
 
 Third-party license material is retained in `notices/`. Firmware and CLI packages
 include the project license, generated dependency inventories and license notices.

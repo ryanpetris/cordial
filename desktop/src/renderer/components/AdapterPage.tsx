@@ -219,9 +219,7 @@ export function AdapterPage({
       {connected && s ? (
         <Card title="About">
           <Facts>
-            <Fact label="Firmware">
-              {String(infoOf(s.info, "firmware.version") ?? "Unknown")} ({infoOf(s.info, "build.development") === true ? "Development" : "Production"})
-            </Fact>
+            <Fact label="Firmware">{String(infoOf(s.info, "firmware.version") ?? "Unknown")}</Fact>
             {infoOf(s.info, "board.name") !== undefined ? <Fact label="Board">{String(infoOf(s.info, "board.name"))}</Fact> : null}
             <Fact label="Adapter ID">{s.id}</Fact>
           </Facts>

@@ -20,10 +20,12 @@ fn main() {
     let profile = match (
         env::var_os("CARGO_FEATURE_DEVELOPMENT").is_some(),
         env::var_os("CARGO_FEATURE_PRODUCTION").is_some(),
+        env::var_os("CARGO_FEATURE_DEBUG").is_some(),
     ) {
-        (true, false) => "development",
-        (false, true) => "production",
-        _ => panic!("Select exactly one firmware profile: development or production"),
+        (true, false, false) => "development",
+        (true, false, true) => "debug",
+        (false, true, false) => "production",
+        _ => panic!("Select exactly one firmware profile: production, debug or development"),
     };
     println!("cargo:rerun-if-changed={}", config.display());
     println!("cargo:rerun-if-changed={}", generator.display());

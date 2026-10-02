@@ -57,13 +57,13 @@
 
 | Board | Bluetooth | Firmware download |
 | --- | --- | --- |
-| Raspberry Pi Pico W | Classic and Low Energy | `cordial-firmware-*-pico_w.tar.gz` |
-| Raspberry Pi Pico 2 W | Classic and Low Energy | `cordial-firmware-*-pico2_w.tar.gz` |
-| Waveshare RP2350B-Plus-W | Classic and Low Energy | `cordial-firmware-*-waveshare_rp2350b_plus_w.tar.gz` |
-| Seeed Studio XIAO ESP32S3 | Low Energy only | `cordial-firmware-*-xiao_esp32s3.tar.gz` |
+| Raspberry Pi Pico W | Classic and Low Energy | `cordial-firmware-<version>-pico_w.tar.gz` |
+| Raspberry Pi Pico 2 W | Classic and Low Energy | `cordial-firmware-<version>-pico2_w.tar.gz` |
+| Waveshare RP2350B-Plus-W | Classic and Low Energy | `cordial-firmware-<version>-waveshare_rp2350b_plus_w.tar.gz` |
+| Seeed Studio XIAO ESP32S3 | Low Energy only | `cordial-firmware-<version>-xiao_esp32s3.tar.gz` |
 
-Each board also has a `-debug` archive for development, which adds adapter file access and
-restarting into the bootloader from the app.
+Each board also has a debug archive, `cordial-firmware-<version>-debug-<board>.tar.gz`, which adds
+adapter file access and restarting into the bootloader from the app.
 
 ## Get started
 
@@ -114,16 +114,16 @@ Download your board's firmware from the
 
 1. Hold the **BOOTSEL** (or **BOOT**) button while plugging the board into USB.
    It appears as a USB drive.
-2. Copy the `.uf2` file from the extracted folder onto that drive. The board restarts as
+2. Copy the extracted `.uf2` file onto that drive. The board restarts as
    a Cordial adapter.
 
 **Seeed Studio XIAO ESP32S3**
 
 Hold **BOOT** while plugging the board in, then flash it with
-[esptool](https://docs.espressif.com/projects/esptool/):
+[esptool](https://docs.espressif.com/projects/esptool/) from the extracted
+`xiao_esp32s3-esp-nimble-esp-idf` folder:
 
 ```sh
-cd xiao_esp32s3-esp-nimble-esp-idf
 esptool --chip esp32s3 write_flash \
   0x0 bootloader.bin \
   0x8000 partition-table.bin \

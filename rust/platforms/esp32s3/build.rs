@@ -58,10 +58,12 @@ fn main() {
                 .arg(env::var_os("OUT_DIR").unwrap())
                 .args([
                     "--profile",
-                    if development {
-                        "development"
-                    } else {
+                    if !development {
                         "production"
+                    } else if std::env::var_os("CARGO_FEATURE_DEBUG").is_some() {
+                        "debug"
+                    } else {
+                        "development"
                     }
                 ])
                 .status()

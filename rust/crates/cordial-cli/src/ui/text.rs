@@ -725,14 +725,6 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
     if let Some(v) = model::info_text(&st.info, keys::BOARD_NAME) {
         field("Board", v);
     }
-    field(
-        "Build Profile",
-        if model::development(st) {
-            "development"
-        } else {
-            "production"
-        },
-    );
     field("Name", &display(&st.name));
     field("Platform", &platform_token(st.platform()));
     field("Ready", &yes_no(st.ready).to_lowercase());

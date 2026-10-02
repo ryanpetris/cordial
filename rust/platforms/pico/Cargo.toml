@@ -15,6 +15,8 @@ rp2040 = ["embassy-rp/rp2040"]
 rp235xa = ["embassy-rp/rp235xa"]
 rp235xb = ["embassy-rp/rp235xb"]
 development = ["cordial-core/development"]
+# The development commands under the debug profile, whose version has a -debug suffix.
+debug = ["development"]
 production = []
 pico-sdk-cyw43 = []
 embassy-cyw43 = ["dep:cyw43", "dep:cyw43-pio", "dep:bt-hci", "dep:embedded-io", "dep:embedded-io-async"]

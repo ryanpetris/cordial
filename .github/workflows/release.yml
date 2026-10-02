@@ -179,7 +179,7 @@ jobs:
       fail-fast: false
       matrix:
         board: [pico_w, pico2_w, waveshare_rp2350b_plus_w, xiao_esp32s3]
-        profile: [production, development]
+        profile: [production, debug]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -191,13 +191,12 @@ jobs:
       - name: Archive complete firmware package
         env:
           BOARD: ${{ matrix.board }}
-          # Development firmware is published as the debug build.
-          SUFFIX: ${{ matrix.profile == 'development' && '-debug' || '' }}
+          VERSION: ${{ needs.validate.outputs.version }}${{ matrix.profile == 'debug' && '-debug' || '' }}
         run: |
           mkdir release
-          tar -C "build/firmware/$CORDIAL_VERSION" -czf "release/cordial-firmware-$CORDIAL_VERSION-$BOARD$SUFFIX.tar.gz" .
+          tar -C build/firmware -czf "release/cordial-firmware-$VERSION-$BOARD.tar.gz" "$VERSION"
           cd release
-          sha256sum ./*.tar.gz > "SHA256SUMS-firmware-$BOARD$SUFFIX"
+          sha256sum ./*.tar.gz > "SHA256SUMS-firmware-$VERSION-$BOARD"
       - uses: actions/upload-artifact@v7
         with:
           name: packages-firmware-${{ matrix.board }}-${{ matrix.profile }}
@@ -237,7 +236,7 @@ jobs:
           done
           for board in pico_w pico2_w waveshare_rp2350b_plus_w xiao_esp32s3; do
             test -f "cordial-firmware-$CORDIAL_VERSION-$board.tar.gz"
-            test -f "cordial-firmware-$CORDIAL_VERSION-$board-debug.tar.gz"
+            test -f "cordial-firmware-$CORDIAL_VERSION-debug-$board.tar.gz"
           done
       - name: Publish release
         env:

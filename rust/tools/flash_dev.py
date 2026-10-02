@@ -98,8 +98,8 @@ def inspect_uf2(data):
 
 def verify_development(data, serial, hardware):
     manifest = inspect_uf2(data)
-    if manifest["profile"] != "development" or manifest["bootloader"] != "bootsel":
-        raise ValueError("Refusing production firmware: only development firmware with remote BOOTSEL may be flashed")
+    if manifest["profile"] == "production" or manifest["bootloader"] != "bootsel":
+        raise ValueError("Refusing production firmware: only debug or development firmware with remote BOOTSEL may be flashed")
     if manifest["hardware"] != hardware:
         raise ValueError("Artifact hardware does not match the selected hardware")
     if serial.upper() == PROTECTED_SERIAL:

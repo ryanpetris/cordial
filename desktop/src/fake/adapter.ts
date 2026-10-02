@@ -385,7 +385,7 @@ export class FakeAdapter implements ByteStream {
 
   status() {
     const info: { key: string; value: ValueInit }[] = [
-      { key: "firmware.version", value: wireValue("text", "0.0.0") },
+      { key: "firmware.version", value: wireValue("text", "0.0.0-dev") },
       { key: "board.name", value: wireValue("text", this.board) },
       { key: "build.development", value: wireValue("bool", true) },
     ];

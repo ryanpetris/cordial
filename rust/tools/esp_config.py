@@ -47,7 +47,7 @@ cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_byte
 """)
     values = {
         "IDF_TARGET": "esp32s3", "BT_ENABLED": True, "BT_CONTROLLER_ENABLED": True,
-        "CORDIAL_DEVELOPMENT": config["profile"] == "development",
+        "CORDIAL_DEVELOPMENT": config["profile"] != "production",
         "ESP_CONSOLE_NONE": True, "ESP_CONSOLE_SECONDARY_NONE": True,
         "USJ_ENABLE_USB_SERIAL_JTAG": True, "LOG_DEFAULT_LEVEL_NONE": True,
         "BOOTLOADER_LOG_LEVEL_NONE": True,

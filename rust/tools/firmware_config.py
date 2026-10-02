@@ -43,8 +43,8 @@ def load(path, profile):
               "bluetooth_backend", "radio_backend", "usb_backend", "storage_backend", "firmware_bytes"}
     if not isinstance(config, dict) or set(config) != fields:
         raise ValueError(f"Board configuration requires exactly: {', '.join(sorted(fields))}")
-    if profile not in ("development", "production"):
-        raise ValueError("Select development or production profile explicitly")
+    if profile not in ("production", "debug", "development"):
+        raise ValueError("Select the production, debug or development profile explicitly")
     if not isinstance(config["name"], str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", config["name"]):
         raise ValueError("Invalid hardware configuration name")
     name = config["default_adapter_name"]
@@ -197,7 +197,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("out", type=Path)
-    parser.add_argument("--profile", choices=("development", "production"), required=True)
+    parser.add_argument("--profile", choices=("production", "debug", "development"), required=True)
     args = parser.parse_args()
     config = load(args.config, args.profile)
     if os.environ.get("TARGET") != config["target"]:

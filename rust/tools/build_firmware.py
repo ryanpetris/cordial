@@ -135,15 +135,13 @@ def package(config, built, elf, output, name, gcc, env):
 
 
 def build(config_path, profile, output, clippy=False):
-    version = artifact.resolve()
+    version = artifact.version(profile)
     config = firmware_config.load(config_path, profile)
     # All board values and the profile affect this directory, including settings
     # that don't affect physical wiring identity (backend and storage layout).
     raw = json.loads(Path(config_path).read_text(), object_pairs_hook=firmware_config.unique_object)
     digest = hashlib.sha256(json.dumps([raw, profile], sort_keys=True).encode()).hexdigest()[:12]
-    # Production packages carry no suffix; development packages are the debug builds.
-    suffix = "-debug" if profile == "development" else ""
-    name = f"{config['name']}-{config['bluetooth_backend']}-{config['radio_backend']}{suffix}"
+    name = f"{config['name']}-{config['bluetooth_backend']}-{config['radio_backend']}"
     directory = ROOT.parent / "target/firmware" / f"{name}-{digest}"
     generated = directory / "config"
     # esp-idf-sys regenerates its SDK configuration from these tracked defaults
@@ -151,7 +149,7 @@ def build(config_path, profile, output, clippy=False):
     firmware_config.generate(config, generated)
     (generated / "board.json").write_text(json.dumps(raw, sort_keys=True))
     env = dict(os.environ, CORDIAL_PYTHON=sys.executable)
-    env["CORDIAL_VERSION"] = version
+    env["CORDIAL_VERSION"] = artifact.resolve()
     temporary = ROOT.parent / "target/tmp"
     temporary.mkdir(parents=True, exist_ok=True)
     env.update(TMPDIR=str(temporary), CORDIAL_CONFIG=str(generated / "board.json"),
@@ -202,7 +200,7 @@ def build(config_path, profile, output, clippy=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
-    parser.add_argument("--profile", choices=("development", "production"), default="development")
+    parser.add_argument("--profile", choices=artifact.PROFILES, default="development")
     parser.add_argument("--output", type=Path, default=ROOT.parent / "build/firmware")
     parser.add_argument("--clippy", action="store_true")
     args = parser.parse_args()

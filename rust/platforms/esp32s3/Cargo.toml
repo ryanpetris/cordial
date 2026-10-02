@@ -12,6 +12,8 @@ resolver = "3"
 [features]
 default = ["development"]
 development = ["cordial-core/development"]
+# The development commands under the debug profile, whose version has a -debug suffix.
+debug = ["development"]
 production = []
 btstack = ["dep:cordial-btstack"]
 esp-nimble = ["dep:cordial-ble-hid"]

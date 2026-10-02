@@ -138,6 +138,10 @@ class FlashPolicy(unittest.TestCase):
     def test_development(self):
         self.assertEqual(flash.verify_development(image(), flash.PROTECTED_SERIAL, "pico_w")["profile"], "development")
 
+    def test_debug(self):
+        data = image(profile="debug", version="1.2.3-debug")
+        self.assertEqual(flash.verify_development(data, flash.PROTECTED_SERIAL, "pico_w")["version"], "1.2.3-debug")
+
     def test_production_rejected_before_hardware_access(self):
         data = image(profile="production", bootloader=None)
         manifest = flash.inspect_uf2(data)

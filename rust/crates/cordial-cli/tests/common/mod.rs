@@ -127,7 +127,7 @@ pub fn status(ready: bool) -> p::Status {
             },
         ],
         info: vec![
-            info(keys::FIRMWARE_VERSION, Value::Text("1.2.3".into())),
+            info(keys::FIRMWARE_VERSION, Value::Text("1.2.3-dev".into())),
             info(keys::BUILD_DEVELOPMENT, Value::Bool(true)),
         ],
     }

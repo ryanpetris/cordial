@@ -972,9 +972,6 @@ impl<B: Backend> Model<B> {
             if let Some(board) = model::info_text(&st.status.info, keys::BOARD_NAME) {
                 parts.push(display(board));
             }
-            if model::development(&st.status) {
-                parts.push("development build".into());
-            }
         }
         let mut heading = Line::from(vec![span(" ", Style::new()), span("Cordial", title())]);
         if !parts.is_empty() {

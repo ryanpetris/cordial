@@ -12,7 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent / "tools"))
 from version import resolve, RELEASE
 
-VERSION = rf"(?:{RELEASE}|0\.0\.0-dev(?:\+g[0-9a-f]+(?:\.dirty)?)?)"
+PROFILES = ("production", "debug", "development")
+# Production versions are bare; debug and development builds carry their profile.
+SUFFIXES = {"production": "", "debug": "-debug", "development": "-dev"}
+VERSION = rf"{RELEASE}(?:-debug|-dev)?"
+
+
+def version(profile):
+    """The firmware version for a build profile."""
+    return resolve() + SUFFIXES[profile]
 
 
 def manifest(config):
@@ -22,8 +30,8 @@ def manifest(config):
     value["hardware"] = value.pop("name")
     value.update(schema=1, erase_bytes=4096, storage_identity=config["storage_identity"].hex(),
                  bootloader=("download" if config["chip"] == "esp32s3" else "bootsel")
-                 if config["profile"] == "development" else None,
-                 version=resolve())
+                 if config["profile"] != "production" else None,
+                 version=version(config["profile"]))
     if config["chip"] == "esp32s3":
         value.update(native_storage_offset=0x9000, native_storage_bytes=0x6000)
     return value
@@ -66,9 +74,9 @@ def inspect(data):
         required |= {"native_storage_offset", "native_storage_bytes"}
     if set(value) != required or type(value["schema"]) is not int or value["schema"] != 1:
         raise ValueError("Unsupported artifact manifest")
-    if value["profile"] not in ("development", "production"):
+    if value["profile"] not in PROFILES:
         raise ValueError("Invalid build profile")
-    method = ("download" if esp else "bootsel") if value["profile"] == "development" else None
+    method = ("download" if esp else "bootsel") if value["profile"] != "production" else None
     if value["bootloader"] != method:
         raise ValueError("Inconsistent firmware profile and bootloader capability")
     for field, pattern in (("hardware", r"[a-z][a-z0-9_]{0,47}"), ("hardware_digest", r"[0-9a-f]{64}"),

@@ -153,10 +153,10 @@ check: check-rust check-desktop check-protocol check-tools
 check-firmware: image-$(FIRMWARE_PLATFORM)
 	$(call build,$(FIRMWARE_PLATFORM),python3 rust/tools/build_firmware.py rust/boards/$(BOARD).json --profile $(PROFILE) --clippy)
 check-firmware-all:
-	@set -e; for board in $(BOARDS); do for profile in development production; do $(MAKE) check-firmware BOARD=$$board PROFILE=$$profile; done; done
+	@set -e; for board in $(BOARDS); do for profile in production debug; do $(MAKE) check-firmware BOARD=$$board PROFILE=$$profile; done; done
 # The allocation check builds Pico W development firmware and runs it under QEMU in the Pico image.
 check-memory: image-pico
-	$(call build,pico,python3 rust/tools/build_firmware.py rust/boards/pico_w.json --profile development; python3 rust/tools/check_memory.py build/firmware/$$CORDIAL_VERSION/pico_w-btstack-pico-sdk-cyw43-debug/cordial-pico_w-btstack-pico-sdk-cyw43-debug.elf)
+	$(call build,pico,python3 rust/tools/build_firmware.py rust/boards/pico_w.json --profile development; python3 rust/tools/check_memory.py build/firmware/$$CORDIAL_VERSION-dev/pico_w-btstack-pico-sdk-cyw43/cordial-pico_w-btstack-pico-sdk-cyw43.elf)
 check-rust:
 	$(PYTHON) rust/tools/firmware_dependencies.py --btstack
 	cd rust
