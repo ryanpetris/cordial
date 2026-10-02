@@ -247,7 +247,7 @@ static irk_lookup_state_t sm_identity_resolving_state(int h){(void)h;return stat
 static void cordial_fail(cordial_connection *l,int error){(void)l;assert(error==CORDIAL_AUTHENTICATION);failed++;}
 static int gap_encryption_key_size(int h){(void)h;return key_size;}
 static bool gap_bonded(int h){(void)h;return bonded;}
-static void begin_hids(cordial_connection *l){assert(l->authenticated);started++;}
+static void cordial_begin_profile(cordial_connection *l){assert(l->authenticated);started++;}
 static int sm_le_device_index(int h){return h;}
 static bool le_identity(int i,cordial_peer *p){(void)i;(void)p;return false;}
 static bool has_key(cordial_peer p){(void)p;return false;}
@@ -379,7 +379,7 @@ int main(void) {
         begin=functions.index("// Call only after the target link")
         end=functions.index("static int start_scan(",begin)
         functions=functions[:begin]+functions[end:]
-        bonds = source[source.index("static bool bonds("):source.index("static void fail(")]
+        bonds = source[source.index("static bool bonds("):source.index("static uint8_t security_error(")]
         report = source[source.index("        struct ble_hs_adv_fields fields;"):
                         source.index("    case BLE_GAP_EVENT_DISC_COMPLETE:")].rsplit("    }", 1)[0]
         run_c(r'''
@@ -472,39 +472,132 @@ int main(void) {
 
     def test_native_authentication_failure_keeps_link_insecure(self):
         source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
+        classify = source[source.index("static uint8_t security_error("):source.index("static void fail(")]
         encryption = source[source.index("    case BLE_GAP_EVENT_ENC_CHANGE: {"):source.index("    case BLE_GAP_EVENT_PASSKEY_ACTION: {")]
         encryption = encryption[encryption.index("{")+1:encryption.rindex("}")]
-        run_c(r'''
-#include <assert.h>
-#include <stdbool.h>
-#include "ble.h"
+        run_c(NIMBLE_SECURITY + classify + r'''
 struct ble_gap_conn_desc { struct {bool encrypted,bonded;} sec_state; };
 struct ble_gap_event {struct {uint16_t conn_handle;int status;} enc_change;};
 typedef struct {uint32_t token;uint16_t connection;bool closing,secure;} link;
 static link current={.token=42,.connection=1};
 static struct ble_gap_conn_desc state;
-static int lookup_error, failures, successes;
+static int lookup_error;
+static unsigned failures, successes;
+static uint8_t failed_code;
 static link *by_handle(uint16_t h) {return h==current.connection ? &current:0;}
 static int ble_gap_conn_find(uint16_t h,struct ble_gap_conn_desc *out) {
     assert(h==1);*out=state;return lookup_error;
 }
-static void fail(link *l,uint8_t code) {assert(l==&current && code==CORDIAL_BLE_AUTH);failures++;}
+static void fail(link *l,uint8_t code) {assert(l==&current);failed_code=code;failures++;}
 static void security_ready(link *l) {assert(l==&current);successes++;}
 static int encryption_changed(struct ble_gap_event *event) {link *l;
 ''' + encryption + r'''
 }
+static uint8_t failure(int status) {
+    struct ble_gap_event e={.enc_change={.conn_handle=1,.status=status}};
+    unsigned before=failures;
+    assert(!encryption_changed(&e) && failures==before+1 && !successes && !current.secure);
+    return failed_code;
+}
 int main(void) {
-    struct ble_gap_event e={.enc_change={.conn_handle=1,.status=0x40b}};
-    assert(!encryption_changed(&e) && failures==1 && successes==0);
-    e.enc_change.status=0;state.sec_state.encrypted=true;
-    assert(!encryption_changed(&e) && failures==2 && successes==0 && !current.secure);
+    // Rejected keys, or a peer that wants to pair again, fail authentication.
+    const int rejected[]={BLE_HS_SM_US_ERR(0x0b),BLE_HS_SM_PEER_ERR(0x03),BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL),
+        BLE_HS_HCI_ERR(BLE_ERR_PINKEY_MISSING),BLE_HS_HCI_ERR(BLE_ERR_CONN_TERM_MIC)};
+    for(unsigned i=0;i<sizeof rejected/sizeof *rejected;i++) assert(failure(rejected[i])==CORDIAL_BLE_AUTH);
+    // A link that fails or drops while encryption starts can reconnect.
+    const int link_level[]={BLE_HS_ETIMEOUT,BLE_HS_ENOTCONN,BLE_HS_ENOMEM,BLE_HS_HCI_ERR(0x08),
+        BLE_HS_HCI_ERR(0x13),BLE_HS_HCI_ERR(0x16),BLE_HS_HCI_ERR(0x22),BLE_HS_HCI_ERR(0x28),
+        BLE_HS_HCI_ERR(0x3b),BLE_HS_HCI_ERR(0x3e),BLE_HS_ATT_ERR(0x05)};
+    for(unsigned i=0;i<sizeof link_level/sizeof *link_level;i++) assert(failure(link_level[i])==CORDIAL_BLE_CONNECTION);
+    struct ble_gap_event e={.enc_change={.conn_handle=1}};
+    state.sec_state.encrypted=true;
+    assert(!encryption_changed(&e) && failed_code==CORDIAL_BLE_AUTH && !successes && !current.secure);
     state.sec_state.bonded=true;
-    assert(!encryption_changed(&e) && failures==2 && successes==1 && current.secure);
-    lookup_error=7;
-    assert(!encryption_changed(&e) && failures==3 && successes==1);
+    unsigned before=failures;
+    assert(!encryption_changed(&e) && failures==before && successes==1 && current.secure);
+    // A link that is gone before its state can be read is a connection failure.
+    current.secure=false;lookup_error=7;
+    assert(!encryption_changed(&e) && failures==before+1 && failed_code==CORDIAL_BLE_CONNECTION);
+    current.closing=true;
+    assert(!encryption_changed(&e) && failures==before+1);
     return 0;
 }
 ''')
+
+    def test_native_disconnect_during_encryption_reports_rejected_keys_only(self):
+        source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
+        classify = source[source.index("static uint8_t security_error("):source.index("static void fail(")]
+        disconnect = source[source.index("    case BLE_GAP_EVENT_DISCONNECT: {"):source.index("    case BLE_GAP_EVENT_ENC_CHANGE: {")]
+        disconnect = disconnect[disconnect.index("{")+1:disconnect.rindex("}")]
+        run_c(NIMBLE_SECURITY + classify + r'''
+#include <string.h>
+#define BLE_HS_CONN_HANDLE_NONE 0xffff
+struct ble_gap_event {struct {struct {uint16_t conn_handle;} conn;int reason;} disconnect;};
+typedef struct {uint32_t token;uint16_t connection;uint8_t error;bool closing,reported;} link;
+static link current;
+static struct {uint32_t attempt;uint16_t handle;} incoming={.handle=BLE_HS_CONN_HANDLE_NONE};
+static bool auto_consumed, stored=true;
+static int incoming_timeout;
+static uint8_t code;
+static void ble_npl_callout_stop(int *c) {(void)c;}
+static void schedule_radio(void) {}
+static bool bonds(const void *absent) {(void)absent;return stored;}
+static link *by_handle(uint16_t h) {return h==1 && current.token ? &current:0;}
+static void emit(const cordial_ble_event *e) {assert(e->kind==CORDIAL_BLE_DISCONNECTED && e->token==42);code=e->code;}
+static int disconnected(struct ble_gap_event *event) {link *l;
+''' + disconnect + r'''
+}
+static uint8_t drop(link state,int reason) {
+    current=state;code=0xff;
+    struct ble_gap_event e={.disconnect={.conn={.conn_handle=1},.reason=reason}};
+    assert(!disconnected(&e) && !current.token);
+    return code;
+}
+int main(void) {
+    const link securing={.token=42,.connection=1};
+    assert(drop(securing,BLE_HS_HCI_ERR(BLE_ERR_CONN_TERM_MIC))==CORDIAL_BLE_AUTH);
+    assert(drop(securing,BLE_HS_HCI_ERR(BLE_ERR_PINKEY_MISSING))==CORDIAL_BLE_AUTH);
+    assert(drop(securing,BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL))==CORDIAL_BLE_AUTH);
+    assert(drop(securing,BLE_HS_HCI_ERR(0x08))==CORDIAL_BLE_CONNECTION);
+    assert(drop(securing,BLE_HS_HCI_ERR(0x13))==CORDIAL_BLE_CONNECTION);
+    // An encryption failure already classified as a link failure is upgraded
+    // when the peer's reason shows rejected keys.
+    link failed=securing;failed.error=CORDIAL_BLE_CONNECTION;failed.closing=true;
+    assert(drop(failed,BLE_HS_HCI_ERR(BLE_ERR_CONN_TERM_MIC))==CORDIAL_BLE_AUTH);
+    // Established links and requested disconnects keep their own result.
+    link secure=securing;secure.reported=true;
+    assert(drop(secure,BLE_HS_HCI_ERR(BLE_ERR_CONN_TERM_MIC))==CORDIAL_BLE_CONNECTION);
+    link closing=securing;closing.closing=true;
+    assert(drop(closing,BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL))==CORDIAL_BLE_OK);
+    link storage=securing;storage.error=CORDIAL_BLE_STORAGE;storage.closing=true;
+    assert(drop(storage,BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL))==CORDIAL_BLE_STORAGE);
+    stored=false;
+    assert(drop(securing,BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL))==CORDIAL_BLE_STORAGE);
+    return 0;
+}
+''')
+
+# NimBLE's security status encoding, as in host/ble_hs.h and nimble/ble.h.
+NIMBLE_SECURITY = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include "ble.h"
+#define BLE_HS_ETIMEOUT 13
+#define BLE_HS_ENOTCONN 7
+#define BLE_HS_ENOMEM 6
+#define BLE_HS_ERR_ATT_BASE 0x100
+#define BLE_HS_ERR_HCI_BASE 0x200
+#define BLE_HS_ERR_SM_US_BASE 0x400
+#define BLE_HS_ERR_SM_PEER_BASE 0x500
+#define BLE_HS_ERR_HW_BASE 0x600
+#define BLE_HS_ATT_ERR(x) ((x) ? BLE_HS_ERR_ATT_BASE + (x) : 0)
+#define BLE_HS_HCI_ERR(x) ((x) ? BLE_HS_ERR_HCI_BASE + (x) : 0)
+#define BLE_HS_SM_US_ERR(x) ((x) ? BLE_HS_ERR_SM_US_BASE + (x) : 0)
+#define BLE_HS_SM_PEER_ERR(x) ((x) ? BLE_HS_ERR_SM_PEER_BASE + (x) : 0)
+#define BLE_ERR_AUTH_FAIL 0x05
+#define BLE_ERR_PINKEY_MISSING 0x06
+#define BLE_ERR_CONN_TERM_MIC 0x3d
+'''
 
 if __name__ == "__main__":
     unittest.main()

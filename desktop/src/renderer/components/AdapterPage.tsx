@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { isLow } from "../../shared/battery.ts";
 import { adapterName } from "../../shared/adapter-name.ts";
-import type { AdapterEntry, AppState, HostPlatform } from "../../shared/state.ts";
+import type { AdapterEntry, AppState, HostPlatform, TransportName } from "../../shared/state.ts";
 import { PLATFORMS, STORAGE_FULL, TRANSPORTS, adapterStatus, batteryStale, deviceStatus, infoOf, storageFull } from "../../shared/text.ts";
 import { useAction } from "../api.ts";
 import type { Selection } from "../App.tsx";
-import { Banner, Card, Dialog, Fact, Facts, Meter, Page, Pill, Segmented, Spinner } from "./common.tsx";
+import { Banner, Card, Dialog, Fact, Facts, Meter, Page, Pill, Segmented, Spinner, SwitchRow } from "./common.tsx";
 import { AdapterIcon, ChevronIcon, CloseIcon, DeviceIcon, PencilIcon, PlugIcon, SwapIcon, UndoIcon, UnplugIcon } from "./icons.tsx";
 
 /** The rename dialog's contents; mounted each time it opens, so it starts from the current name. */
@@ -63,6 +63,7 @@ export function AdapterPage({
   const [quietBusy, runQuiet] = useAction(true);
   const [renameError, setRenameError] = useState<string | null>(null);
   const [platformError, setPlatformError] = useState<string | null>(null);
+  const [transportError, setTransportError] = useState<{ transport: TransportName; message: string } | null>(null);
   const [connectError, setConnectError] = useState<string | null>(null);
   const [editing, setEditing] = useState(renaming);
   useEffect(() => setEditing(renaming), [renaming]);
@@ -80,6 +81,11 @@ export function AdapterPage({
     setPlatformError(null);
     const result = await runQuiet({ type: "adapter.platform", adapterId: adapter.id, platform: p });
     if (!result.ok) setPlatformError(result.message);
+  };
+  const setTransport = async (transport: TransportName, enabled: boolean) => {
+    setTransportError(null);
+    const result = await runQuiet({ type: "adapter.transport", adapterId: adapter.id, transport, enabled });
+    if (!result.ok) setTransportError({ transport, message: result.message });
   };
   const connect = async () => {
     setConnectError(null);
@@ -160,6 +166,16 @@ export function AdapterPage({
               This computer runs {state.hostPlatform === "mac" ? "macOS" : PLATFORMS[state.hostPlatform]}.
             </Banner>
           ) : null}
+          {s?.transports.filter((t) => t.settable).map(({ transport, enabled }) => (
+            <SwitchRow
+              key={transport}
+              title={TRANSPORTS[transport]}
+              subtitle={transportError?.transport === transport ? transportError.message : null}
+              checked={enabled}
+              disabled={quietBusy || !s.ready}
+              onChange={(value) => void setTransport(transport, value)}
+            />
+          ))}
         </Card>
       ) : null}
 
@@ -184,10 +200,10 @@ export function AdapterPage({
         </Card>
       ) : null}
 
-      {connected && s && s.transports.some((t) => t.maxEnabled !== null) ? (
+      {connected && s && s.transports.some((t) => t.enabled && t.maxEnabled !== null) ? (
         <Card title="Active Devices">
-          {s.transports.map(({ transport, maxEnabled }) => {
-            if (maxEnabled === null) return null;
+          {s.transports.map(({ transport, maxEnabled, enabled }) => {
+            if (!enabled || maxEnabled === null) return null;
             const used = devices.filter((d) => d.device.transport === transport && d.device.inactive === null).length;
             return (
               <div key={transport} className="row meter-row">
@@ -204,10 +220,10 @@ export function AdapterPage({
         </Card>
       ) : null}
 
-      {connected && s && s.transports.length ? (
+      {connected && s && s.transports.some((t) => t.enabled) ? (
         <Card title="New Pairings">
           <Facts>
-            {s.transports.map(({ transport }) => (
+            {s.transports.filter((t) => t.enabled).map(({ transport }) => (
               <Fact key={transport} label={TRANSPORTS[transport]}>
                 {storageFull(s) ? STORAGE_FULL : "Available"}
               </Fact>

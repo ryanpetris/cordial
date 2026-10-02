@@ -22,10 +22,11 @@ import {
   type ScanState,
   type SettingsChange,
   type SettingsSave,
+  type TransportName,
 } from "../shared/state.ts";
 import { enabledFull } from "../shared/capacity.ts";
 import { settingsBusy } from "../shared/settings.ts";
-import { clean, codeText, errorText, inactiveText, infoOf, storageFull } from "../shared/text.ts";
+import { TRANSPORTS, clean, codeText, errorText, inactiveText, infoOf, storageFull, transportDisabledText } from "../shared/text.ts";
 import { BatteryAlerts, CRITICAL_PERCENT, type Alert } from "./battery.ts";
 import * as convert from "./convert.ts";
 import { AdapterManager, type ManagerDeps } from "./manager.ts";
@@ -46,6 +47,19 @@ const PUBLISH_MS = 30;
 const SCAN_SECONDS = 30;
 
 const failed = (error: unknown): ActionResult => ({ ok: false, message: failure(error) });
+
+const unsupported = (error: unknown) => error instanceof CordialError && convert.errorCode(error.code) === "unsupported";
+
+/** Whether the adapter supports `t` and has it disabled. */
+const disabled = (session: AdapterSession, t: TransportName | null) => session.status.transports.some((x) => x.transport === t && !x.enabled);
+
+/** A failure of work on `transports`, naming the transport when the adapter refused it because it
+ * now has the transport disabled. */
+function transportFailure(error: unknown, session: AdapterSession, transports: (TransportName | null)[]) {
+  const off = unsupported(error) ? transports.find((t) => disabled(session, t)) : undefined;
+  return off ? transportDisabledText(off) : failure(error);
+}
+
 const GONE: ActionResult = { ok: false, message: "This device or adapter is no longer available." };
 
 export function batteryOf(info: InfoEntry[], current = true): Battery | null {
@@ -68,7 +82,7 @@ function kindOf(device: DeviceRecord): DeviceEntry["kind"] {
 }
 
 type Scan = ScanState & { session: AdapterSession };
-type Pairing = PairingState & { session: AdapterSession; dismissed: boolean };
+type Pairing = PairingState & { session: AdapterSession; dismissed: boolean; transport: TransportName | null };
 
 export class Controller {
   readonly manager: AdapterManager;
@@ -315,8 +329,14 @@ export class Controller {
           if (!t) return GONE;
           const { session, id, device } = t;
           if (action.type === "device.refresh" && device.state !== "connected") return { ok: false, message: codeText("not_connected") };
-          if (action.type === "device.connect") await session.perform(id, "connect", (c) => c.connectDevice(id));
-          else if (action.type === "device.disconnect") await session.perform(id, "disconnect", (c) => c.disconnectDevice(id));
+          if (action.type === "device.connect") {
+            if (device.inactive === "transport_disabled" && device.transport) return { ok: false, message: transportDisabledText(device.transport) };
+            try {
+              await session.perform(id, "connect", (c) => c.connectDevice(id));
+            } catch (error) {
+              return { ok: false, message: transportFailure(error, session, [device.transport]) };
+            }
+          } else if (action.type === "device.disconnect") await session.perform(id, "disconnect", (c) => c.disconnectDevice(id));
           else if (action.type === "device.unpair") await session.perform(id, "unpair", (c) => c.unpairDevice(id));
           else await session.perform(id, "refresh", (c) => c.refreshDevice(id));
           return { ok: true };
@@ -345,7 +365,8 @@ export class Controller {
         case "settings.save":
           return await this.#saveSettings(action.key, action.changes);
         case "adapter.name":
-        case "adapter.platform": {
+        case "adapter.platform":
+        case "adapter.transport": {
           const session = this.#session(action.adapterId);
           if (!session) return GONE;
           if (!session.status.ready) return { ok: false, message: codeText("not_ready") };
@@ -353,7 +374,12 @@ export class Controller {
             const name = action.name === null ? "" : adapterName(action.name);
             if (name === null) return { ok: false, message: "Invalid adapter name" };
             await session.connection.setAdapter({ name });
-          } else await session.connection.setAdapter({ platform: convert.wire(Platform, action.platform) });
+          } else if (action.type === "adapter.platform") await session.connection.setAdapter({ platform: convert.wire(Platform, action.platform) });
+          else {
+            if (!(action.transport in TRANSPORTS) || !session.status.transports.some((t) => t.transport === action.transport && t.settable))
+              return { ok: false, message: codeText("unsupported") };
+            await session.connection.setAdapter({ transports: [{ transport: convert.wire(Transport, action.transport), enabled: action.enabled }] });
+          }
           return { ok: true };
         }
         case "adapter.disconnect":
@@ -420,7 +446,8 @@ export class Controller {
     if (stopped) return;
     if (response.result.case === "error") {
       scan.running = false;
-      scan.error = failure(new CordialError("startScan", response.result.value.code, response.result.value.reason, response.result.value.outcomeUnknown));
+      const error = new CordialError("startScan", response.result.value.code, response.result.value.reason, response.result.value.outcomeUnknown);
+      scan.error = transportFailure(error, session, request.command.value.transports.map(convert.transport));
     }
     this.#scan = scan;
     this.changed();
@@ -450,7 +477,10 @@ export class Controller {
       } else {
         pairing.prompt = null;
         pairing.phase = step.code === "cancelled" ? "cancelled" : "failed";
-        pairing.message = step.code === "cancelled" ? "Pairing was cancelled." : codeText(step.code);
+        pairing.message =
+          step.code === "cancelled" ? "Pairing was cancelled."
+            : step.code === "unsupported" && pairing.transport && disabled(session, pairing.transport) ? transportDisabledText(pairing.transport)
+              : codeText(step.code);
         if (pairing.dismissed) this.#pairing = null;
       }
     } else return;
@@ -460,8 +490,11 @@ export class Controller {
   async #startScan(adapterId: string): Promise<ActionResult> {
     const session = this.#session(adapterId);
     if (!session) return { ok: false, message: "This adapter is no longer available." };
-    const transports = session.status.transports.map((t) => convert.wire(Transport, t.transport));
-    if (!transports.length) return { ok: false, message: "This adapter can't search for devices." };
+    const supported = session.status.transports;
+    if (!supported.length) return { ok: false, message: "This adapter can't search for devices." };
+    const transports = supported.filter((t) => t.enabled).map((t) => convert.wire(Transport, t.transport));
+    // With every transport disabled, the one named is the last listed: BLE, when there are two.
+    if (!transports.length) return { ok: false, message: transportDisabledText(supported.at(-1)!.transport) };
     if (this.#scan?.running && this.#scan.session !== session) await this.#stopScan();
     // Events before the adapter answers the scan still belong to the earlier one; the new scan
     // replaces it, and its candidates, at its response.
@@ -470,7 +503,7 @@ export class Controller {
     try {
       await session.connection.startScan(transports, SCAN_SECONDS);
     } catch (error) {
-      return { ok: false, message: failure(error) };
+      return { ok: false, message: transportFailure(error, session, transports.map(convert.transport)) };
     }
     return { ok: true };
   }
@@ -493,6 +526,8 @@ export class Controller {
     if (this.#pairing?.phase === "pairing" && !this.#pairing.dismissed) return { ok: false, message: "Another device is being added." };
     if (storageFull(session.status)) return { ok: false, message: errorText({ code: "no_capacity", reason: "storage", outcomeUnknown: false }) };
     const candidate = this.#scan?.candidates.find((c) => c.id === candidateId);
+    const transport = candidate?.transport ?? null;
+    if (transport && disabled(session, transport)) return { ok: false, message: transportDisabledText(transport) };
     // Candidates stay usable after their scan stops.
     if (this.#scan?.running && this.#scan.session === session) {
       this.#scan.running = false;
@@ -508,6 +543,7 @@ export class Controller {
       message: null,
       session,
       dismissed: false,
+      transport,
     };
     this.#pairing = pairing;
     this.changed();
@@ -516,7 +552,7 @@ export class Controller {
     } catch (error) {
       if (this.#pairing === pairing) {
         pairing.phase = "failed";
-        pairing.message = failure(error);
+        pairing.message = transportFailure(error, session, [transport]);
         if (pairing.dismissed) this.#pairing = null;
         this.changed();
       }

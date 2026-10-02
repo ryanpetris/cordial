@@ -35,12 +35,13 @@ storage unavailable. None of these failures triggers an automatic erase.
 | --- | --- |
 | `/format.json` | `format:1` and `initialized`, recording whether roots have been committed |
 | `/identity.json` | Bluetooth address, IR, ER and derived IRK as hex strings |
-| `/adapter.json` | `host_platform` and optional custom `name`; without the file, use Linux and the image's default name |
+| `/adapter.json` | `host_platform`, optional custom `name` and enabled `transports`; without the file, use Linux, the image's default name and BLE alone |
 | `/sequence.json` | Last allocated device ID as a JSON integer |
 | `/devices/<16 lowercase hex digits>/device.json` | `policy` and complete portable `bond` in one document |
 | `/devices/<id>/hidpp.json` | Array of all explicitly saved HID++ preferences |
+| `/devices/<id>/layout.json` | The device's HID layout: `maps` and, for BLE, `reports` |
 
-The adapter name override is a trimmed string of 1..64 UTF-8 bytes without control characters. A null or absent `name` uses the board default baked into the image. `adapter.name.set` with `name: null` clears the override. Name and platform updates preserve each other and commit before runtime state changes.
+The adapter name override is a trimmed string of 1..64 UTF-8 bytes without control characters. A null or absent `name` uses the board default baked into the image. `adapter.name.set` with `name: null` clears the override. `transports` lists the enabled transports by name (`"classic"`, `"ble"`); an absent field means BLE alone, and an empty list disables both. Name, platform and transport updates preserve each other and commit before runtime state changes.
 
 A device policy contains its ID, peer address/type/transport, name, trusted,
 blocked, HID++ and preferred-enabled flags. A new device's policy also
@@ -58,6 +59,25 @@ contains the named setting key, feature ID, feature revision, scope, choices
 and optional min/max/step range. One settings file is rewritten for a setting
 change. Forgetting the last setting deletes the file.
 
+The HID layout file holds each HID service's raw report map as a hex string in
+`maps`. A BLE layout also lists its report characteristics in `reports`: owning
+service index, report type, report ID, value handle, properties and the
+optional CCCD handle. When the device exposes a GATT Database Hash, `hash`
+holds it as a hex string. The file is written when a connection discovers the
+device, including at pairing, and when a connected device's HID layout changes,
+but not while storage is not ready. It is written only when free space covers
+the 32 KiB maintenance reserve, the 16 KiB reserved for pairing another device
+and the file itself, and it is removed again when writing it leaves less than
+both reserves. A layout that cannot be saved removes the saved file instead.
+Later connections supply it to the Bluetooth backend so input starts without
+rediscovery. The file is optional: a missing, undecodable or unusable
+file means the next connection discovers the device. An undecodable or
+unusable file is removed when it is read, and the file is removed when a
+connection ends because the device's HID layout could not be used. Re-pairing
+removes it, and deleting the device removes it with the preferences. Layout
+files are read by device ID and are not part of record enumeration; mounting
+removes them with the directories of deleted devices.
+
 Files are compact JSON. There is no 512-byte document ceiling and no configured
 number of saved devices. Setting counts follow the supported setting-key table;
 choices use the u16 domain. Native connection/bond-table and wire-frame bounds
@@ -74,12 +94,13 @@ The initial zero sequence is committed before the `initialized` marker. A missin
 sequence after initialization is a storage fault. The device ID sequence is committed before pairing can publish a new device.
 IDs are never reused, including after deletion; failed pairing may leave gaps.
 Provisional pairing exists only in RAM. Re-pairing retains the device ID, policy
-and preference files, then replaces policy and bond together. Separate stored
-bond IDs and pending-pairing records do not exist.
+and preference files, then replaces policy and bond together and removes the
+saved layout. Separate stored bond IDs and pending-pairing records do not exist.
 
 Unpair first closes admission and forgets the active native entry. Removing
-`device.json` commits deletion. Preference cleanup follows and is retried on
-startup. Without `device.json`, a directory is inactive and can be reclaimed.
+`device.json` commits deletion. Preference and layout cleanup follows and is
+retried on startup. Without `device.json`, a directory is inactive and can be
+reclaimed.
 Startup removes interrupted temporary files and orphan device directories.
 Native forget failure blocks the session. Missing roots after initialization,
 corrupt roots or an address mismatch prevent Bluetooth startup. BTstack reads
@@ -101,7 +122,9 @@ preferences still consume heap proportional to saved devices; the filesystem
 itself does not build a full file index in RAM.
 
 Documents are loaded one at a time at startup. Inactive catalogs remain resident
-to support offline settings inspection. There is no configured saved-device
+to support offline settings inspection. HID layout files are not loaded at
+startup; one is read when its device's connection starts and released once the
+backend has accepted it. There is no configured saved-device
 count, but RAM can be exhausted before flash.
 
 Directory enumeration reopens and skips to an index, trading O(n²) enumeration

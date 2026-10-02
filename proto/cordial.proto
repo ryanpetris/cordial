@@ -99,6 +99,17 @@ message SetAdapter {
   // 1..64 bytes, no control characters. "" restores the firmware default name.
   optional string name = 1;
   optional Platform platform = 2;
+  // Transport preferences to change. Transports not listed are left unchanged. A transport this
+  // firmware does not support returns ERROR_CODE_UNSUPPORTED.
+  repeated TransportUpdate transports = 3;
+}
+
+// Partial update of one transport's preferences.
+message TransportUpdate {
+  // Required.
+  Transport transport = 1;
+  // Whether the Dongle uses this transport: scans, connects and accepts connections on it.
+  optional bool enabled = 2;
 }
 
 // Responds, then reboots into the ROM programming mode. Development firmware only.
@@ -114,8 +125,8 @@ message Status {
   // Bluetooth and storage have started. Until then, commands that need either return
   // ERROR_CODE_NOT_READY.
   bool ready = 4;
-  // One entry per transport this firmware supports. A transport that is not listed is not
-  // supported.
+  // One entry per transport this firmware supports, whether enabled or not. A transport that is
+  // not listed is not supported.
   repeated TransportSupport transports = 5;
   // Facts about the Dongle itself, with keys from the same catalog as Device.info.
   repeated Info info = 6;
@@ -130,6 +141,10 @@ message TransportSupport {
   // bond table for it, less one entry kept free for pairing. Reported by the Dongle from its stack,
   // never assumed by a client. Missing means unknown; the client lets the Dongle decide.
   optional uint32 max_enabled = 2;
+  // The transport is enabled on the Dongle. A disabled transport's devices are inactive, and the
+  // Dongle does not scan, connect or accept connections on it. Classic starts disabled and BLE
+  // enabled. The Dongle always sets it. Missing means enabled.
+  optional bool enabled = 3;
 }
 
 enum Platform {
@@ -145,8 +160,9 @@ enum Platform {
 // Candidates arrive as scan_found events; the scan ends with scan_done. Starting a running scan
 // restarts its timer.
 message StartScan {
-  // Required, at least one. Transports to scan, chosen from Status.transports. An empty list returns
-  // ERROR_CODE_BAD_ARGS; a transport the firmware does not support returns ERROR_CODE_UNSUPPORTED.
+  // Required, at least one. Transports to scan. Those the firmware does not support or has disabled
+  // are left out. An empty list returns ERROR_CODE_BAD_ARGS, and a list with nothing left to scan
+  // returns ERROR_CODE_UNSUPPORTED.
   repeated Transport transports = 1;
   // 1..60. Zero means 10.
   uint32 seconds = 2;
@@ -385,12 +401,15 @@ enum DeviceState {
 enum InactiveReason {
   // Inactive for a reason this client does not know.
   INACTIVE_REASON_UNKNOWN = 0;
+  // This firmware does not support the device's transport.
   INACTIVE_REASON_UNSUPPORTED_TRANSPORT = 1;
   INACTIVE_REASON_BLOCKED = 2;
   INACTIVE_REASON_DISABLED = 3;
   // Enabled, but the stack's bond table has no room for it. Only happens when the table is
   // smaller than the number of devices already enabled, such as after a firmware change.
   INACTIVE_REASON_CAPACITY = 4;
+  // The firmware supports the device's transport, but it is disabled on the Dongle.
+  INACTIVE_REASON_TRANSPORT_DISABLED = 5;
 }
 
 // The device's current warnings. Responds with DeviceWarnings.

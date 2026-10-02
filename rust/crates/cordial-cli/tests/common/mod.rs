@@ -120,10 +120,12 @@ pub fn status(ready: bool) -> p::Status {
             p::TransportSupport {
                 transport: Transport::Classic as i32,
                 max_enabled: Some(1),
+                enabled: Some(true),
             },
             p::TransportSupport {
                 transport: Transport::Ble as i32,
                 max_enabled: Some(7),
+                enabled: Some(true),
             },
         ],
         info: vec![
@@ -272,6 +274,39 @@ impl Sim {
         }
     }
 
+    /// Enables or disables a supported transport: its saved devices are inactive while it is
+    /// disabled. Enabled-place capacity isn't modeled.
+    pub fn set_transport(&mut self, transport: Transport, on: bool) {
+        let transport = transport as i32;
+        for t in self
+            .status
+            .transports
+            .iter_mut()
+            .filter(|t| t.transport == transport)
+        {
+            t.enabled = Some(on);
+        }
+        let ids: Vec<String> = self
+            .devices
+            .iter()
+            .filter(|d| d.transport == transport)
+            .map(|d| d.id.clone())
+            .collect();
+        for id in ids {
+            let d = self.device_mut(&id).unwrap();
+            d.inactive = if !on {
+                Some(p::InactiveReason::TransportDisabled as i32)
+            } else if d.blocked {
+                Some(p::InactiveReason::Blocked as i32)
+            } else if !d.enabled {
+                Some(p::InactiveReason::Disabled as i32)
+            } else {
+                None
+            };
+            self.device_event(&id);
+        }
+    }
+
     fn prompt(&mut self, candidate: &str, step: pairing::Step) {
         self.event(p::event::Kind::Pairing(p::Pairing {
             candidate: candidate.into(),
@@ -306,6 +341,10 @@ impl Sim {
                 self.respond(Some(response::Result::Status(status)));
             }
             Command::SetAdapter(update) => {
+                let supported = |t: i32| self.status.transports.iter().any(|s| s.transport == t);
+                if !update.transports.iter().all(|t| supported(t.transport)) {
+                    return self.respond(error(ErrorCode::Unsupported));
+                }
                 if let Some(name) = update.name {
                     self.status.name = if name.is_empty() {
                         "Cordial".into()
@@ -316,6 +355,12 @@ impl Sim {
                 if let Some(platform) = update.platform {
                     self.status.platform = platform;
                 }
+                for t in update.transports {
+                    if let (Ok(transport), Some(on)) = (Transport::try_from(t.transport), t.enabled)
+                    {
+                        self.set_transport(transport, on);
+                    }
+                }
                 let status = self.status.clone();
                 self.respond(Some(response::Result::Status(status.clone())));
                 self.event(p::event::Kind::Adapter(status));
@@ -324,6 +369,14 @@ impl Sim {
             Command::StartScan(scan) => {
                 if scan.transports.is_empty() {
                     return self.respond(error(ErrorCode::BadArgs));
+                }
+                // Transports that are unsupported or disabled are left out.
+                let usable =
+                    self.status.transports.iter().any(|s| {
+                        scan.transports.contains(&s.transport) && s.enabled != Some(false)
+                    });
+                if !usable {
+                    return self.respond(error(ErrorCode::Unsupported));
                 }
                 self.respond(None);
                 for c in self.candidates.clone() {

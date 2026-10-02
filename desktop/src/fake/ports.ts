@@ -6,7 +6,11 @@ import { FakeAdapter } from "./adapter.ts";
 export function simulatedPorts(count: number) {
   const fakes = new Map<string, FakeAdapter>();
   for (let i = 0; i < count; i++)
-    fakes.set(`/simulated/${i}`, new FakeAdapter({ adapterId: `0000FAKE000${i + 1}`, board: i ? "xiao_esp32s3" : "pico_w", latency: 5 }));
+    fakes.set(
+      `/simulated/${i}`,
+      // The ESP32-S3 has no Bluetooth Classic.
+      new FakeAdapter({ adapterId: `0000FAKE000${i + 1}`, board: i ? "xiao_esp32s3" : "pico_w", transports: i ? ["ble"] : ["classic", "ble"], latency: 5 }),
+    );
   return {
     listPorts: async (): Promise<PortInfo[]> => [...fakes].map(([path, f]) => ({ path, serial: f.id })),
     openTransport: async (path: string): Promise<ByteStream> => fakes.get(path)!.open(),

@@ -206,8 +206,8 @@ fn dtr_during_dispatch_discards_remaining_old_commands() {
             &cordial_protocol::Request {
                 command: Some(cordial_protocol::request::Command::SetAdapter(
                     cordial_protocol::SetAdapter {
-                        name: None,
                         platform: Some(platform as i32),
+                        ..Default::default()
                     },
                 )),
             },

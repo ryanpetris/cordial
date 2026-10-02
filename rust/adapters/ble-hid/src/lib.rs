@@ -6,7 +6,10 @@ pub mod native;
 use alloc::{boxed::Box, collections::VecDeque, vec::Vec};
 use cordial_core::model::{errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod};
 use cordial_core::{
-    bluetooth::{Bluetooth, Capabilities, Descriptor, Event, InputReport, ReportType},
+    bluetooth::{
+        Bluetooth, Capabilities, DatabaseHash, Descriptor, Event, InputReport, Layout,
+        LayoutReport, ReportMap, ReportType,
+    },
     devices::Peer,
     hid,
     link::{LinkId, ServiceId, WriteId},
@@ -16,6 +19,8 @@ use native::{Event as NativeEvent, Host};
 const EVENTS: usize = 8;
 const SERVICES: usize = 3;
 const CHARACTERISTICS: usize = 32;
+/// Most notifications a link holds until it can route them.
+const EARLY: usize = 8;
 const SETUP_TIMEOUT: u64 = 120_000;
 #[derive(Clone, Copy)]
 struct Service {
@@ -29,17 +34,45 @@ struct Characteristic {
     properties: u8,
     uuid: u16,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Report {
     service: ServiceId,
     value: u16,
     properties: u8,
     id: u8,
     kind: ReportType,
+    cccd: u16,
 }
+impl Report {
+    /// Input reports, and Feature reports that notify or indicate, deliver
+    /// data through their Client Characteristic Configuration descriptor.
+    fn notifying(kind: ReportType, properties: u8) -> bool {
+        kind == ReportType::Input || (kind == ReportType::Feature && properties & 0x30 != 0)
+    }
+    fn layout(&self) -> LayoutReport {
+        LayoutReport {
+            service: self.service.0,
+            kind: self.kind,
+            id: self.id,
+            value: self.value,
+            properties: self.properties,
+            cccd: self.cccd,
+        }
+    }
+}
+/// Admission phase of a link. Discovery of a supplied layout runs while the
+/// link is Ready.
 #[derive(Clone, Copy)]
 enum Stage {
     Security,
+    Setup,
+    Ready,
+}
+/// One ATT procedure of HID service discovery.
+#[derive(Clone, Copy, PartialEq)]
+enum Step {
+    /// Reads the GATT Database Hash, if the device has one.
+    Hash,
     Services,
     Characteristics,
     Map,
@@ -47,14 +80,18 @@ enum Stage {
     Descriptors,
     Reference,
     Subscribe,
-    Ready,
 }
 #[derive(Clone, Copy)]
 enum Operation {
     Information,
-    Setup,
+    Discover(Step),
+    /// Rewrites the CCCD of the indexed report of a supplied layout.
+    Subscribe(usize),
     Write(WriteId),
-    Read { id: WriteId, report: Report },
+    Read {
+        id: WriteId,
+        report: Report,
+    },
 }
 struct Pending {
     request: u32,
@@ -70,6 +107,8 @@ struct Link {
     secured: bool,
     bonded: bool,
     closing: bool,
+    /// The host has not yet accepted this closing link's disconnect request.
+    unsent: bool,
     error: Option<Error>,
     deadline: u64,
     max_output: usize,
@@ -82,9 +121,50 @@ struct Link {
     reference: u16,
     cccd: u16,
     descriptors: Vec<Descriptor>,
+    /// Raw report maps read by the current discovery.
+    maps: Vec<ReportMap>,
+    /// Reports found by the current discovery, in discovery order.
+    found: Vec<Report>,
+    /// The report table that routes notifications and HID requests.
     reports: Vec<Report>,
+    /// The supplied layout while it awaits its hash check or verification.
+    saved: Option<Saved>,
+    /// The Database Hash read by the current discovery.
+    hash: Option<DatabaseHash>,
+    /// The next verification step, started when the link is idle.
+    verify: Option<Step>,
+    /// Lets one poll pass between verification steps so HID requests can run.
+    verify_yield: bool,
+    /// A CCCD write of the supplied layout failed. Verification rewrites every
+    /// CCCD; until it finishes, the link cannot rely on its subscriptions.
+    cccd_failed: bool,
+    /// Notifications not yet routed, oldest first: those received before the
+    /// link is Ready, and those that arrive while the event queue is full.
+    early: VecDeque<(u16, Box<[u8]>)>,
     pending: Option<Pending>,
     info: information::Information,
+}
+/// The parts of a supplied layout that its report table does not hold.
+struct Saved {
+    maps: Vec<ReportMap>,
+    hash: Option<DatabaseHash>,
+}
+impl Link {
+    fn clear_discovery(&mut self) {
+        self.hash = None;
+        self.services = Vec::new();
+        self.characteristics = Vec::new();
+        self.descriptors = Vec::new();
+        self.maps = Vec::new();
+        self.found = Vec::new();
+    }
+    /// Verification failed without learning the device's layout. The supplied
+    /// layout remains in use.
+    fn abandon_verify(&mut self) {
+        self.saved = None;
+        self.verify = None;
+        self.clear_discovery();
+    }
 }
 
 pub struct Backend<H> {
@@ -95,7 +175,16 @@ pub struct Backend<H> {
     links: [Option<Link>; 4],
     events: VecDeque<Event>,
     incoming: Option<(u32, Peer)>,
+    /// The accept list the host currently holds.
     reconnect: Vec<Peer>,
+    /// The accept list the application last supplied.
+    wanted: Vec<Peer>,
+    /// BLE is enabled. The value survives host restarts.
+    ble: bool,
+    /// The host may be scanning at the application's request.
+    scanning: bool,
+    /// An incoming offer the host has not yet been told to decline.
+    decline: Option<u32>,
 }
 fn push<T>(values: &mut Vec<T>, value: T, limit: usize) -> Result<(), Error> {
     if values.len() == limit {
@@ -104,6 +193,40 @@ fn push<T>(values: &mut Vec<T>, value: T, limit: usize) -> Result<(), Error> {
     values.try_reserve(1).map_err(|_| Error::Capacity)?;
     values.push(value);
     Ok(())
+}
+/// The report table of a layout this profile can admit without discovery.
+fn saved_reports(layout: &Layout) -> Option<Vec<Report>> {
+    if !layout.valid(Transport::Ble)
+        || layout.maps.len() > SERVICES
+        || layout.reports.len() > CHARACTERISTICS
+        || layout.reports.iter().any(|r| {
+            (r.kind == ReportType::Input && r.properties & 0x30 == 0)
+                || (Report::notifying(r.kind, r.properties) && r.cccd == 0)
+        })
+    {
+        return None;
+    }
+    let mut reports = Vec::new();
+    reports.try_reserve_exact(layout.reports.len()).ok()?;
+    reports.extend(layout.reports.iter().map(|r| Report {
+        service: ServiceId(r.service),
+        value: r.value,
+        properties: r.properties,
+        id: r.id,
+        kind: r.kind,
+        cccd: r.cccd,
+    }));
+    Some(reports)
+}
+fn compile(maps: &[ReportMap]) -> Result<Vec<Descriptor>, Error> {
+    let mut descriptors = Vec::new();
+    descriptors
+        .try_reserve_exact(maps.len())
+        .map_err(|_| Error::Capacity)?;
+    for (i, map) in maps.iter().enumerate() {
+        descriptors.push(Descriptor::from_slice(ServiceId(i as u16), &map.0)?);
+    }
+    Ok(descriptors)
 }
 impl<H: Host> Backend<H> {
     pub fn new(host: H, now: fn() -> u64) -> Result<Self, Error> {
@@ -120,6 +243,10 @@ impl<H: Host> Backend<H> {
             events,
             incoming: None,
             reconnect: Vec::new(),
+            wanted: Vec::new(),
+            ble: true,
+            scanning: false,
+            decline: None,
         })
     }
     fn open(
@@ -128,11 +255,12 @@ impl<H: Host> Backend<H> {
         peer: Peer,
         pairing: bool,
         attempt: Option<u32>,
+        layout: Option<&Layout>,
     ) -> Result<(), Error> {
         if !self.ready {
             return Err(Error::RadioUnavailable);
         }
-        if peer.transport != Transport::Ble {
+        if peer.transport != Transport::Ble || !self.ble {
             return Err(Error::UnsupportedTransport);
         }
         let slot = usize::from(id.slot);
@@ -152,6 +280,23 @@ impl<H: Host> Backend<H> {
         if !pairing && !bonds.contains(&peer) {
             return Err(Error::AuthenticationFailed);
         }
+        // A layout the profile cannot use is discovered again instead.
+        let (reports, saved) = match layout.filter(|_| !pairing).and_then(|l| {
+            let reports = saved_reports(l)?;
+            let mut maps = Vec::new();
+            maps.try_reserve_exact(l.maps.len()).ok()?;
+            maps.extend(l.maps.iter().cloned());
+            Some((reports, maps))
+        }) {
+            Some((reports, maps)) => (
+                reports,
+                Some(Saved {
+                    maps,
+                    hash: layout.and_then(|l| l.hash),
+                }),
+            ),
+            None => (Vec::new(), None),
+        };
         let token = self.sequence()?;
         if let Some(attempt) = attempt {
             self.host.incoming(attempt, Some(token))?;
@@ -167,6 +312,7 @@ impl<H: Host> Backend<H> {
             secured: false,
             bonded: false,
             closing: false,
+            unsent: false,
             error: None,
             deadline: (self.now)().saturating_add(SETUP_TIMEOUT),
             max_output: 20,
@@ -179,11 +325,66 @@ impl<H: Host> Backend<H> {
             reference: 0,
             cccd: 0,
             descriptors: Vec::new(),
-            reports: Vec::new(),
+            maps: Vec::new(),
+            found: Vec::new(),
+            reports,
+            saved,
+            hash: None,
+            verify: None,
+            verify_yield: false,
+            cccd_failed: false,
+            early: VecDeque::new(),
             pending: None,
             info: information::Information::default(),
         });
         Ok(())
+    }
+    /// Gives the host the application's accept list while BLE is enabled, and
+    /// an empty one while it is disabled.
+    fn apply_reconnect(&mut self) -> Result<(), Error> {
+        let peers: &[Peer] = if self.ble { &self.wanted } else { &[] };
+        if peers == self.reconnect.as_slice() {
+            return Ok(());
+        }
+        self.host.reconnect(peers)?;
+        self.reconnect = peers.to_vec();
+        Ok(())
+    }
+    /// Brings the host in line with the requested transport state: the
+    /// application's accept list while BLE is enabled, and while it is
+    /// disabled an empty accept list, no scan, no offer and no open link.
+    /// Every step is attempted; the first failure is returned and the step is
+    /// retried by the next call.
+    fn reconcile(&mut self) -> Result<(), Error> {
+        let mut result = self.apply_reconnect();
+        if self.ble {
+            return result;
+        }
+        if let Some((attempt, _)) = self.incoming.take() {
+            self.decline = Some(attempt);
+        }
+        if let Some(attempt) = self.decline {
+            match self.host.incoming(attempt, None) {
+                Ok(()) => self.decline = None,
+                Err(error) => result = result.and(Err(error)),
+            }
+        }
+        if self.scanning {
+            match self.host.scan(0, false) {
+                Ok(()) => self.scanning = false,
+                Err(error) => result = result.and(Err(error)),
+            }
+        }
+        for slot in 0..self.links.len() {
+            if let Some(id) = self.links[slot]
+                .as_ref()
+                .filter(|l| !l.closing)
+                .map(|l| l.id)
+            {
+                Bluetooth::disconnect(self, id);
+            }
+        }
+        result
     }
     pub fn start(&mut self) -> Result<(), Error> {
         self.host.start()
@@ -209,10 +410,20 @@ impl<H: Host> Backend<H> {
             link.error = Some(error);
             link.closing = true;
             link.pending = None;
-            self.host.disconnect(link.token);
+            link.early = VecDeque::new();
+            self.send_disconnect(link);
         }
     }
+    /// A request the host cannot queue now is retried from `poll`. The link
+    /// stays closing meanwhile, so no later event admits it.
+    fn send_disconnect(&mut self, link: &mut Link) {
+        link.unsent = self.host.disconnect(link.token).is_err();
+    }
     pub async fn poll(&mut self) {
+        if self.ready {
+            // Failures are retried on the next poll.
+            let _ = self.reconcile();
+        }
         // Pairing security can emit both an observation and a newly saved bond.
         while self.incoming.is_none() && self.events.len() + 2 <= EVENTS {
             let Some(event) = self.host.next_event() else {
@@ -222,15 +433,24 @@ impl<H: Host> Backend<H> {
         }
         for slot in 0..self.links.len() {
             if let Some(mut link) = self.links[slot].take() {
+                if link.closing && link.unsent {
+                    self.send_disconnect(&mut link);
+                }
                 if !link.closing
                     && !matches!(link.stage, Stage::Ready)
                     && (self.now)() >= link.deadline
                 {
                     self.close(&mut link, Error::Timeout);
                 }
+                if !link.closing
+                    && let Err(error) = self.flush(&mut link)
+                {
+                    self.close(&mut link, error);
+                }
                 if self.events.len() + 2 <= EVENTS {
                     self.information_poll(&mut link);
                 }
+                self.verify_poll(&mut link);
                 self.links[slot] = Some(link);
             }
         }
@@ -238,6 +458,12 @@ impl<H: Host> Backend<H> {
     async fn event(&mut self, event: NativeEvent) {
         let (token, request) = match &event {
             NativeEvent::Incoming { attempt, peer } => {
+                if !self.ble {
+                    self.decline = Some(*attempt);
+                    // A failed decline is retried on the next poll.
+                    let _ = self.reconcile();
+                    return;
+                }
                 self.incoming = Some((*attempt, *peer));
                 self.events.push_back(Event::Incoming {
                     attempt: *attempt,
@@ -246,7 +472,10 @@ impl<H: Host> Backend<H> {
                 return;
             }
             NativeEvent::Ready => {
+                // The restarted host holds no accept list, scan or offer.
                 self.reconnect.clear();
+                self.scanning = false;
+                self.decline = None;
                 self.ready = true;
                 self.events.push_back(Event::Ready);
                 return;
@@ -352,21 +581,23 @@ impl<H: Host> Backend<H> {
         self.links[slot] = Some(link);
     }
     fn link_event(&mut self, link: &mut Link, event: NativeEvent) -> Result<(), Error> {
-        if link
-            .pending
-            .as_ref()
-            .is_some_and(|p| matches!(p.operation, Operation::Information))
-            && matches!(
-                &event,
-                NativeEvent::Service { .. }
-                    | NativeEvent::Characteristic { .. }
-                    | NativeEvent::Descriptor { .. }
-                    | NativeEvent::Data { .. }
-                    | NativeEvent::Complete { .. }
-            )
-        {
-            self.information_event(link, event);
-            return Ok(());
+        let attribute = matches!(
+            &event,
+            NativeEvent::Service { .. }
+                | NativeEvent::Characteristic { .. }
+                | NativeEvent::Descriptor { .. }
+                | NativeEvent::Data { .. }
+                | NativeEvent::Complete { .. }
+        );
+        match link.pending.as_ref().map(|p| p.operation) {
+            Some(Operation::Information) if attribute => {
+                self.information_event(link, event);
+                return Ok(());
+            }
+            Some(Operation::Discover(step)) if attribute => {
+                return self.discover_event(link, step, event);
+            }
+            _ => {}
         }
         match event {
             NativeEvent::Connected { max_output, .. } => {
@@ -391,7 +622,12 @@ impl<H: Host> Backend<H> {
                         identity,
                     });
                 } else if link.adopted && matches!(link.stage, Stage::Security) {
-                    self.setup(link, Stage::Services)?;
+                    // A saved layout with a hash waits for the device's current
+                    // hash before it is used.
+                    let check = link.saved.as_ref().is_some_and(|s| s.hash.is_some());
+                    if check || !self.admit(link) {
+                        self.setup(link, Step::Hash)?;
+                    }
                 }
             }
             NativeEvent::Prompt { method, value, .. } => {
@@ -404,8 +640,303 @@ impl<H: Host> Backend<H> {
                     value,
                 });
             }
+            NativeEvent::Service { .. }
+            | NativeEvent::Characteristic { .. }
+            | NativeEvent::Descriptor { .. } => return Err(Error::UnsupportedHid),
+            NativeEvent::Data { offset, data, .. } => {
+                let pending = link.pending.as_mut().unwrap();
+                let bytes = data.bytes();
+                if usize::from(offset) != pending.data.len()
+                    || pending.data.len() + bytes.len() > hid::REPORT_BYTES
+                {
+                    return Err(Error::InputOverflow);
+                }
+                pending
+                    .data
+                    .try_reserve(bytes.len())
+                    .map_err(|_| Error::Capacity)?;
+                pending.data.extend_from_slice(bytes);
+            }
+            NativeEvent::Complete { result, .. } => {
+                let pending = link.pending.take().unwrap();
+                match pending.operation {
+                    Operation::Information | Operation::Discover(_) => unreachable!(),
+                    Operation::Subscribe(index) => {
+                        link.cccd_failed |= result.is_err();
+                        self.subscribe_saved(link, index + 1);
+                    }
+                    Operation::Write(id) => self.events.push_back(Event::Written { id, result }),
+                    Operation::Read { id, report } => {
+                        let result = result.and_then(|()| {
+                            InputReport::new(link.id, report.service, report.id, &pending.data)
+                        });
+                        self.events.push_back(Event::Read {
+                            id,
+                            report_type: report.kind,
+                            result,
+                        });
+                    }
+                }
+            }
+            NativeEvent::Notification { handle, data, .. } if link.adopted => {
+                self.notification(link, handle, data.bytes())?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    /// Notifications are routed in arrival order. Until the link is Ready, or
+    /// while the event queue is full, they wait in a small buffer that drops
+    /// its oldest entry when full.
+    fn notification(&mut self, link: &mut Link, handle: u16, bytes: &[u8]) -> Result<(), Error> {
+        if matches!(link.stage, Stage::Ready) {
+            self.flush(link)?;
+            if link.early.is_empty() && self.events.len() < EVENTS {
+                return self.route(link, handle, bytes);
+            }
+        }
+        if link.early.len() == EARLY {
+            link.early.pop_front();
+        }
+        let mut copy = Vec::new();
+        if link.early.try_reserve(1).is_ok() && copy.try_reserve_exact(bytes.len()).is_ok() {
+            copy.extend_from_slice(bytes);
+            link.early.push_back((handle, copy.into_boxed_slice()));
+        }
+        Ok(())
+    }
+    fn flush(&mut self, link: &mut Link) -> Result<(), Error> {
+        while matches!(link.stage, Stage::Ready) && self.events.len() < EVENTS {
+            let Some((handle, bytes)) = link.early.pop_front() else {
+                break;
+            };
+            self.route(link, handle, &bytes)?;
+        }
+        Ok(())
+    }
+    fn route(&mut self, link: &Link, handle: u16, bytes: &[u8]) -> Result<(), Error> {
+        if self.information_notification(link, handle, bytes) {
+            return Ok(());
+        }
+        if let Some(report) = link
+            .reports
+            .iter()
+            .find(|r| r.value == handle && r.kind != ReportType::Output)
+        {
+            self.events.push_back(Event::Input(InputReport::new(
+                link.id,
+                report.service,
+                report.id,
+                bytes,
+            )?));
+        }
+        Ok(())
+    }
+    /// Admits a link through its supplied layout, then rewrites its CCCDs and
+    /// queues background verification. Returns false when discovery must run.
+    fn admit(&mut self, link: &mut Link) -> bool {
+        let Some(saved) = &link.saved else {
+            return false;
+        };
+        let descriptors = match compile(&saved.maps) {
+            Ok(descriptors) => descriptors,
+            Err(_) => {
+                link.saved = None;
+                link.reports = Vec::new();
+                return false;
+            }
+        };
+        link.stage = Stage::Ready;
+        link.existing_bonds = Vec::new();
+        link.verify = Some(Step::Hash);
+        self.events.push_back(Event::Connected {
+            link: link.id,
+            descriptors,
+            max_output: link.max_output,
+            layout: None,
+        });
+        self.subscribe_saved(link, 0);
+        true
+    }
+    /// Writes the CCCD of the next notifying report at or after `start`. After
+    /// the last one, verification starts at once if any write failed.
+    fn subscribe_saved(&mut self, link: &mut Link, start: usize) {
+        for index in start..link.reports.len() {
+            let r = link.reports[index];
+            if !Report::notifying(r.kind, r.properties) {
+                continue;
+            }
+            let Ok(request) = self.sequence() else {
+                link.cccd_failed = true;
+                break;
+            };
+            link.pending = Some(Pending {
+                request,
+                operation: Operation::Subscribe(index),
+                data: Vec::new(),
+            });
+            if self
+                .host
+                .subscribe(
+                    link.token,
+                    request,
+                    r.value,
+                    r.cccd,
+                    r.properties & 0x10 == 0,
+                )
+                .is_ok()
+            {
+                return;
+            }
+            link.pending = None;
+            link.cccd_failed = true;
+        }
+        if link.cccd_failed {
+            self.verify_step(link, Step::Hash);
+        }
+    }
+    /// Verification is a low-priority job. It starts after the supplied CCCDs
+    /// are written and the initial information pass has finished, and each
+    /// step waits until no other ATT operation is pending on the link. A
+    /// device layout the profile cannot use closes the link with the error a
+    /// new connection would report. An error response, or a request the host
+    /// cannot submit, leaves the supplied layout in use.
+    fn verify_poll(&mut self, link: &mut Link) {
+        let Some(step) = link.verify else {
+            return;
+        };
+        if !matches!(link.stage, Stage::Ready) || link.closing || link.pending.is_some() {
+            return;
+        }
+        if core::mem::take(&mut link.verify_yield) {
+            return;
+        }
+        if step == Step::Hash && !link.info.settled() {
+            return;
+        }
+        self.verify_step(link, step);
+    }
+    /// Verification failed without learning the device's layout, so the
+    /// supplied layout stays in use. A link with a failed CCCD write would
+    /// miss input, so it closes instead and the device reconnects.
+    fn abandon(&mut self, link: &mut Link) {
+        if link.cccd_failed {
+            self.close(link, Error::ConnectionFailed);
+        } else {
+            link.abandon_verify();
+        }
+    }
+    fn verify_step(&mut self, link: &mut Link, step: Step) {
+        if link.verify.take().is_none() {
+            return;
+        }
+        if let Err(error) = self.setup(link, step) {
+            self.close(link, error);
+        }
+    }
+    /// Discovery before admission chains its steps. Verification queues each
+    /// next step for `verify_poll`.
+    fn advance(&mut self, link: &mut Link, step: Step) -> Result<(), Error> {
+        if matches!(link.stage, Stage::Ready) {
+            link.verify = Some(step);
+            link.verify_yield = true;
+            Ok(())
+        } else {
+            self.setup(link, step)
+        }
+    }
+    /// Starts a discovery step. Errors describe a layout the profile cannot
+    /// use, except that a request the host cannot submit during verification
+    /// abandons the verification instead.
+    fn setup(&mut self, link: &mut Link, step: Step) -> Result<(), Error> {
+        let request = self.sequence()?;
+        let token = link.token;
+        if !matches!(link.stage, Stage::Ready) {
+            link.stage = Stage::Setup;
+        }
+        link.pending = Some(Pending {
+            request,
+            operation: Operation::Discover(step),
+            data: Vec::new(),
+        });
+        let submitted = match step {
+            Step::Hash => {
+                link.clear_discovery();
+                self.host.read_by_uuid(token, request, 0x2b2a)
+            }
+            Step::Services => {
+                link.service = 0;
+                self.host.services(token, request, 0x1812)
+            }
+            Step::Characteristics => {
+                link.characteristics.clear();
+                let service = link.services[link.service];
+                self.host
+                    .characteristics(token, request, service.start, service.end)
+            }
+            Step::Map => {
+                let c = link
+                    .characteristics
+                    .iter()
+                    .find(|c| c.uuid == 0x2a4b)
+                    .ok_or(Error::UnsupportedHid)?;
+                self.host.read(token, request, c.value, false)
+            }
+            Step::Protocol => {
+                let c = link
+                    .characteristics
+                    .iter()
+                    .find(|c| c.uuid == 0x2a4e)
+                    .ok_or(Error::UnsupportedHid)?;
+                if c.properties & 0x0c == 0 {
+                    return Err(Error::UnsupportedHid);
+                }
+                self.host
+                    .write(token, request, c.value, &[1], c.properties & 0x04 == 0)
+            }
+            Step::Descriptors => {
+                link.reference = 0;
+                link.cccd = 0;
+                let c = link.characteristics[link.characteristic];
+                if c.value >= c.end {
+                    return Err(Error::UnsupportedHid);
+                }
+                self.host.descriptors(token, request, c.value + 1, c.end)
+            }
+            Step::Reference => {
+                if link.reference == 0 {
+                    return Err(Error::UnsupportedHid);
+                }
+                self.host.read(token, request, link.reference, true)
+            }
+            Step::Subscribe => {
+                let c = link.characteristics[link.characteristic];
+                if link.cccd == 0 || c.properties & 0x30 == 0 {
+                    return Err(Error::UnsupportedHid);
+                }
+                self.host
+                    .subscribe(token, request, c.value, link.cccd, c.properties & 0x10 == 0)
+            }
+        };
+        if submitted.is_err() && step == Step::Subscribe {
+            return Err(Error::ConnectionFailed);
+        }
+        if submitted.is_err() && matches!(link.stage, Stage::Ready) {
+            link.pending = None;
+            self.abandon(link);
+            return Ok(());
+        }
+        submitted
+    }
+    fn discover_event(
+        &mut self,
+        link: &mut Link,
+        step: Step,
+        event: NativeEvent,
+    ) -> Result<(), Error> {
+        match event {
             NativeEvent::Service { start, end, .. } => {
-                if !matches!(link.stage, Stage::Services)
+                if step != Step::Services
                     || start == 0
                     || end < start
                     || link
@@ -424,12 +955,14 @@ impl<H: Host> Backend<H> {
                 uuid,
                 ..
             } => {
+                if step != Step::Characteristics {
+                    return Err(Error::UnsupportedHid);
+                }
                 let service = link.services[link.service];
                 // Some public cache APIs expose only the value handle. The
                 // descriptor enumeration remains scoped to this characteristic.
                 let boundary = declaration.unwrap_or(value);
-                if !matches!(link.stage, Stage::Characteristics)
-                    || boundary < service.start
+                if boundary < service.start
                     || value < boundary
                     || value > service.end
                     || declaration.is_some_and(|d| d >= value)
@@ -455,9 +988,11 @@ impl<H: Host> Backend<H> {
                 )?;
             }
             NativeEvent::Descriptor { handle, uuid, .. } => {
+                if step != Step::Descriptors {
+                    return Err(Error::UnsupportedHid);
+                }
                 let c = link.characteristics[link.characteristic];
-                if !matches!(link.stage, Stage::Descriptors) || handle <= c.value || handle > c.end
-                {
+                if handle <= c.value || handle > c.end {
                     return Err(Error::UnsupportedHid);
                 }
                 match uuid {
@@ -470,9 +1005,7 @@ impl<H: Host> Backend<H> {
             NativeEvent::Data { offset, data, .. } => {
                 let pending = link.pending.as_mut().unwrap();
                 let bytes = data.bytes();
-                let limit = if matches!(pending.operation, Operation::Setup)
-                    && matches!(link.stage, Stage::Map)
-                {
+                let limit = if step == Step::Map {
                     hid::DESCRIPTOR_BYTES
                 } else {
                     hid::REPORT_BYTES
@@ -490,138 +1023,90 @@ impl<H: Host> Backend<H> {
             }
             NativeEvent::Complete { result, .. } => {
                 let pending = link.pending.take().unwrap();
-                match pending.operation {
-                    Operation::Information => unreachable!(),
-                    Operation::Write(id) => self.events.push_back(Event::Written { id, result }),
-                    Operation::Read { id, report } => {
-                        let result = result.and_then(|()| {
-                            InputReport::new(link.id, report.service, report.id, &pending.data)
-                        });
-                        self.events.push_back(Event::Read {
-                            id,
-                            report_type: report.kind,
-                            result,
-                        });
+                let result = if step == Step::Hash {
+                    // The host reports an ATT error response as UnsupportedHid:
+                    // the device offers no readable hash, as it does when its
+                    // value is not 16 bytes. Any other failure reveals nothing.
+                    match result {
+                        Ok(()) => {
+                            link.hash = <[u8; 16]>::try_from(pending.data.as_slice())
+                                .ok()
+                                .map(DatabaseHash);
+                            Ok(())
+                        }
+                        Err(Error::UnsupportedHid) => Ok(()),
+                        Err(error) => Err(error),
                     }
-                    Operation::Setup => {
-                        result?;
-                        self.setup_complete(link, pending.data)?;
+                } else {
+                    result
+                };
+                // Without a CCCD on a discovered handle the report's input would
+                // never arrive; the device reconnects instead.
+                if step == Step::Subscribe && result.is_err() {
+                    return Err(Error::ConnectionFailed);
+                }
+                if let Err(error) = result {
+                    // A failed procedure says nothing about the device's layout.
+                    if matches!(link.stage, Stage::Ready) {
+                        self.abandon(link);
+                        return Ok(());
                     }
+                    return Err(error);
                 }
-            }
-            NativeEvent::Notification { handle, data, .. }
-                if matches!(link.stage, Stage::Ready) && link.adopted && link.secured =>
-            {
-                if self.information_notification(link, handle, data.bytes()) {
-                    return Ok(());
-                }
-                if let Some(report) = link
-                    .reports
-                    .iter()
-                    .find(|r| r.value == handle && r.kind != ReportType::Output)
-                {
-                    self.events.push_back(Event::Input(InputReport::new(
-                        link.id,
-                        report.service,
-                        report.id,
-                        data.bytes(),
-                    )?));
-                }
+                self.setup_complete(link, step, pending.data)?;
             }
             _ => {}
         }
         Ok(())
     }
-    fn setup(&mut self, link: &mut Link, stage: Stage) -> Result<(), Error> {
-        let request = self.sequence()?;
-        let token = link.token;
-        link.stage = stage;
-        link.pending = Some(Pending {
-            request,
-            operation: Operation::Setup,
-            data: Vec::new(),
-        });
-        match stage {
-            Stage::Services => self.host.services(token, request, 0x1812),
-            Stage::Characteristics => {
-                link.characteristics.clear();
-                let service = link.services[link.service];
-                self.host
-                    .characteristics(token, request, service.start, service.end)
+    /// Before admission, a supplied layout is used only when the device's
+    /// hash matches its saved one. Otherwise the device is discovered.
+    fn hashed(&mut self, link: &mut Link) -> Result<(), Error> {
+        if !matches!(link.stage, Stage::Ready)
+            && let Some(saved) = &link.saved
+        {
+            if saved.hash.is_some() && saved.hash == link.hash && self.admit(link) {
+                return Ok(());
             }
-            Stage::Map => {
-                let c = link
-                    .characteristics
-                    .iter()
-                    .find(|c| c.uuid == 0x2a4b)
-                    .ok_or(Error::UnsupportedHid)?;
-                self.host.read(token, request, c.value, false)
-            }
-            Stage::Protocol => {
-                let c = link
-                    .characteristics
-                    .iter()
-                    .find(|c| c.uuid == 0x2a4e)
-                    .ok_or(Error::UnsupportedHid)?;
-                if c.properties & 0x0c == 0 {
-                    return Err(Error::UnsupportedHid);
-                }
-                self.host
-                    .write(token, request, c.value, &[1], c.properties & 0x04 == 0)
-            }
-            Stage::Descriptors => {
-                link.reference = 0;
-                link.cccd = 0;
-                let c = link.characteristics[link.characteristic];
-                if c.value >= c.end {
-                    return Err(Error::UnsupportedHid);
-                }
-                self.host.descriptors(token, request, c.value + 1, c.end)
-            }
-            Stage::Reference => {
-                if link.reference == 0 {
-                    return Err(Error::UnsupportedHid);
-                }
-                self.host.read(token, request, link.reference, true)
-            }
-            Stage::Subscribe => {
-                let c = link.characteristics[link.characteristic];
-                if link.cccd == 0 || c.properties & 0x30 == 0 {
-                    return Err(Error::UnsupportedHid);
-                }
-                self.host
-                    .subscribe(token, request, c.value, link.cccd, c.properties & 0x10 == 0)
-            }
-            _ => Err(Error::InternalError),
+            link.saved = None;
+            link.reports = Vec::new();
         }
+        self.advance(link, Step::Services)
     }
-    fn setup_complete(&mut self, link: &mut Link, data: Vec<u8>) -> Result<(), Error> {
-        match link.stage {
-            Stage::Services => {
+    fn setup_complete(&mut self, link: &mut Link, step: Step, data: Vec<u8>) -> Result<(), Error> {
+        match step {
+            Step::Hash => self.hashed(link),
+            Step::Services => {
                 if link.services.is_empty() {
                     return Err(Error::UnsupportedHid);
                 }
-                self.setup(link, Stage::Characteristics)
+                self.advance(link, Step::Characteristics)
             }
-            Stage::Characteristics => self.setup(link, Stage::Map),
-            Stage::Map => {
+            Step::Characteristics => self.advance(link, Step::Map),
+            Step::Map => {
                 if data.is_empty() {
                     return Err(Error::UnsupportedHid);
                 }
-                push(
-                    &mut link.descriptors,
-                    Descriptor::from_owned(ServiceId(link.service as u16), data)?,
-                    SERVICES,
-                )?;
+                let mut data = data;
+                data.shrink_to_fit();
+                // Verification compiles maps only when the layout changed.
+                if !matches!(link.stage, Stage::Ready) {
+                    push(
+                        &mut link.descriptors,
+                        Descriptor::from_slice(ServiceId(link.service as u16), &data)?,
+                        SERVICES,
+                    )?;
+                }
+                push(&mut link.maps, ReportMap(data), SERVICES)?;
                 if link.characteristics.iter().any(|c| c.uuid == 0x2a4e) {
-                    self.setup(link, Stage::Protocol)
+                    self.advance(link, Step::Protocol)
                 } else {
                     self.next_report(link, 0)
                 }
             }
-            Stage::Protocol => self.next_report(link, 0),
-            Stage::Descriptors => self.setup(link, Stage::Reference),
-            Stage::Reference => {
+            Step::Protocol => self.next_report(link, 0),
+            Step::Descriptors => self.advance(link, Step::Reference),
+            Step::Reference => {
                 if data.len() != 2 {
                     return Err(Error::UnsupportedHid);
                 }
@@ -633,7 +1118,7 @@ impl<H: Host> Backend<H> {
                 };
                 let service = ServiceId(link.service as u16);
                 if link
-                    .reports
+                    .found
                     .iter()
                     .any(|r| r.service == service && r.kind == kind && r.id == data[0])
                 {
@@ -641,26 +1126,24 @@ impl<H: Host> Backend<H> {
                 }
                 let c = link.characteristics[link.characteristic];
                 push(
-                    &mut link.reports,
+                    &mut link.found,
                     Report {
                         service,
                         value: c.value,
                         properties: c.properties,
                         id: data[0],
                         kind,
+                        cccd: link.cccd,
                     },
                     CHARACTERISTICS,
                 )?;
-                if kind == ReportType::Input
-                    || (kind == ReportType::Feature && c.properties & 0x30 != 0)
-                {
-                    self.setup(link, Stage::Subscribe)
+                if Report::notifying(kind, c.properties) {
+                    self.advance(link, Step::Subscribe)
                 } else {
                     self.next_report(link, link.characteristic + 1)
                 }
             }
-            Stage::Subscribe => self.next_report(link, link.characteristic + 1),
-            _ => Err(Error::InternalError),
+            Step::Subscribe => self.next_report(link, link.characteristic + 1),
         }
     }
     fn next_report(&mut self, link: &mut Link, start: usize) -> Result<(), Error> {
@@ -668,26 +1151,72 @@ impl<H: Host> Backend<H> {
             (start..link.characteristics.len()).find(|&i| link.characteristics[i].uuid == 0x2a4d)
         {
             link.characteristic = index;
-            self.setup(link, Stage::Descriptors)
+            return self.advance(link, Step::Descriptors);
+        }
+        link.service += 1;
+        if link.service < link.services.len() {
+            return self.advance(link, Step::Characteristics);
+        }
+        if !link.found.iter().any(|r| r.kind == ReportType::Input) {
+            return Err(Error::UnsupportedHid);
+        }
+        self.discovered(link)
+    }
+    /// Admits a newly discovered layout, or finishes verification of a
+    /// supplied one by switching to the discovered layout when it differs.
+    fn discovered(&mut self, link: &mut Link) -> Result<(), Error> {
+        link.characteristics = Vec::new();
+        link.services = Vec::new();
+        let maps = core::mem::take(&mut link.maps);
+        let found = core::mem::take(&mut link.found);
+        let verifying = matches!(link.stage, Stage::Ready);
+        // Verification has written every CCCD of the device's layout.
+        link.cccd_failed = false;
+        let hash = link.hash.take();
+        if verifying
+            && link
+                .saved
+                .take()
+                .is_some_and(|s| s.maps == maps && s.hash == hash)
+            && found == link.reports
+        {
+            return Ok(());
+        }
+        let mut reports = Vec::new();
+        reports
+            .try_reserve_exact(found.len())
+            .map_err(|_| Error::Capacity)?;
+        reports.extend(found.iter().map(Report::layout));
+        if verifying {
+            let descriptors = compile(&maps)?;
+            // Notifications routed before this point precede the event in the
+            // queue; every later one is routed by the new table.
+            link.reports = found;
+            self.events.push_back(Event::Layout {
+                link: link.id,
+                descriptors,
+                layout: Layout {
+                    maps,
+                    reports,
+                    hash,
+                },
+            });
         } else {
-            link.service += 1;
-            if link.service < link.services.len() {
-                return self.setup(link, Stage::Characteristics);
-            }
-            if !link.reports.iter().any(|r| r.kind == ReportType::Input) {
-                return Err(Error::UnsupportedHid);
-            }
             link.stage = Stage::Ready;
-            link.characteristics = Vec::new();
-            link.services = Vec::new();
             link.existing_bonds = Vec::new();
+            link.reports = found;
             self.events.push_back(Event::Connected {
                 link: link.id,
                 descriptors: core::mem::take(&mut link.descriptors),
                 max_output: link.max_output,
+                layout: Some(Layout {
+                    maps,
+                    reports,
+                    hash,
+                }),
             });
-            Ok(())
         }
+        Ok(())
     }
     fn report(
         &self,
@@ -740,29 +1269,51 @@ impl<H: Host> Bluetooth for Backend<H> {
         }
     }
     fn scan(&mut self, id: u64, classic: bool, ble: bool) -> Result<(), Error> {
-        if classic {
+        if classic || (ble && !self.ble) {
             return Err(Error::UnsupportedTransport);
         }
         if !self.ready {
             return Err(Error::RadioUnavailable);
         }
-        self.host.scan(id, ble)
-    }
-    fn reconnect(&mut self, peers: &[Peer]) -> Result<(), Error> {
-        if peers == self.reconnect {
-            return Ok(());
-        }
-        self.host.reconnect(peers)?;
-        self.reconnect = peers.to_vec();
+        self.host.scan(id, ble)?;
+        self.scanning = ble;
         Ok(())
     }
-    fn connect(&mut self, id: LinkId, peer: Peer, pairing: bool) -> Result<(), Error> {
+    fn reconnect(&mut self, peers: &[Peer]) -> Result<(), Error> {
+        if peers != self.wanted {
+            self.wanted = peers.to_vec();
+        }
+        self.apply_reconnect()
+    }
+    fn set_transport(&mut self, transport: Transport, enabled: bool) -> Result<(), Error> {
+        if transport != Transport::Ble {
+            return Ok(());
+        }
+        self.ble = enabled;
+        match self.reconcile() {
+            // The host's command queue is full; poll retries.
+            Err(Error::Busy | Error::Capacity) => Ok(()),
+            result => result,
+        }
+    }
+    fn connect(
+        &mut self,
+        id: LinkId,
+        peer: Peer,
+        pairing: bool,
+        layout: Option<&Layout>,
+    ) -> Result<(), Error> {
         if let Some((attempt, _)) = self.incoming.take() {
             self.host.incoming(attempt, None)?;
         }
-        self.open(id, peer, pairing, None)
+        self.open(id, peer, pairing, None, layout)
     }
-    fn incoming(&mut self, attempt: u32, id: Option<LinkId>) -> Result<(), Error> {
+    fn incoming(
+        &mut self,
+        attempt: u32,
+        id: Option<LinkId>,
+        layout: Option<&Layout>,
+    ) -> Result<(), Error> {
         let Some((pending, peer)) = self.incoming else {
             return Err(Error::NotConnected);
         };
@@ -771,7 +1322,7 @@ impl<H: Host> Bluetooth for Backend<H> {
         }
         self.incoming = None;
         if let Some(id) = id {
-            if let Err(error) = self.open(id, peer, false, Some(attempt)) {
+            if let Err(error) = self.open(id, peer, false, Some(attempt), layout) {
                 self.host.incoming(attempt, None)?;
                 return Err(error);
             }
@@ -785,7 +1336,7 @@ impl<H: Host> Bluetooth for Backend<H> {
             let mut link = self.links[slot].take().unwrap();
             link.closing = true;
             link.pending = None;
-            self.host.disconnect(link.token);
+            self.send_disconnect(&mut link);
             self.links[slot] = Some(link);
         }
     }
@@ -799,7 +1350,7 @@ impl<H: Host> Bluetooth for Backend<H> {
                 self.links[slot] = Some(link);
                 return Err(error);
             }
-            self.setup(&mut link, Stage::Services).map(|()| {
+            self.setup(&mut link, Step::Hash).map(|()| {
                 link.adopted = true;
                 link.pairing = false;
             })

@@ -5,7 +5,7 @@ use crate::{
     error::Error,
     model::{self, Prompt},
     storage,
-    ui::catalog,
+    ui::{catalog, text},
     view::State,
 };
 use cordial_protocol::{
@@ -44,34 +44,44 @@ fn no_capacity(reason: CapacityReason, command: &'static str) -> Error {
     )
 }
 
-/// The scan's transports: those named, or every one the adapter supports.
+/// The scan's transports: those named, or every one the adapter supports, less those it has
+/// disabled.
 pub fn scan_transports(st: &State, named: &[p::Transport]) -> Result<Vec<p::Transport>, String> {
     let supported = model::transports(&st.status);
-    if named.is_empty() {
-        if supported.is_empty() {
-            return Err("this adapter doesn't support scanning".into());
-        }
-        return Ok(supported);
+    if supported.is_empty() {
+        return Err("this adapter doesn't support scanning".into());
     }
-    if named.iter().any(|t| !supported.contains(t)) {
+    let wanted = if named.is_empty() {
+        supported.clone()
+    } else {
+        named.to_vec()
+    };
+    if wanted.iter().any(|t| !supported.contains(t)) {
         return Err("this adapter does not support the requested scan".into());
     }
-    Ok(named.to_vec())
+    let usable: Vec<p::Transport> = wanted
+        .iter()
+        .copied()
+        .filter(|t| model::transport_enabled(&st.status, *t) == Some(true))
+        .collect();
+    // With every transport disabled, the one named is the last wanted: BLE, when there are two.
+    match wanted.last() {
+        Some(last) if usable.is_empty() => Err(text::transport_disabled(*last)),
+        _ => Ok(usable),
+    }
 }
 
 /// Why `command` can't run on this adapter, as far as the view tells.
-pub fn unsupported(st: &State, command: &Command) -> Option<&'static str> {
+pub fn unsupported(st: &State, command: &Command) -> Option<String> {
     let development = model::development(&st.status);
     match command {
         Command::Files(_) | Command::FileGet { .. } if !development => {
-            Some("this adapter doesn't offer file access")
+            Some("this adapter doesn't offer file access".into())
         }
         Command::Bootloader | Command::Features(_) if !development => {
-            Some("this adapter doesn't offer development functions")
+            Some("this adapter doesn't offer development functions".into())
         }
-        Command::Scan { transports, .. } if scan_transports(st, transports).is_err() => {
-            Some("this adapter does not support the requested scan")
-        }
+        Command::Scan { transports, .. } => scan_transports(st, transports).err(),
         _ => None,
     }
 }
@@ -111,7 +121,7 @@ pub(crate) fn execute(
                 session,
                 p::SetAdapter {
                     name: Some(name),
-                    platform: None,
+                    ..Default::default()
                 },
             )?;
             Ok(Outcome::Name(status.name))
@@ -120,11 +130,30 @@ pub(crate) fn execute(
             let status = set_adapter(
                 session,
                 p::SetAdapter {
-                    name: None,
                     platform: Some(*platform as i32),
+                    ..Default::default()
                 },
             )?;
             Ok(Outcome::Platform(status.platform()))
+        }
+        Command::Transport(transport, on) => {
+            if !model::transport_settable(&st.status, *transport) {
+                return Err(refused(ErrorCode::Unsupported, "adapter transport"));
+            }
+            let status = set_adapter(
+                session,
+                p::SetAdapter {
+                    transports: vec![p::TransportUpdate {
+                        transport: *transport as i32,
+                        enabled: Some(*on),
+                    }],
+                    ..Default::default()
+                },
+            )?;
+            Ok(Outcome::Transport(
+                *transport,
+                model::transport_enabled(&status, *transport) == Some(true),
+            ))
         }
         Command::Bootloader => {
             session.call(
@@ -214,6 +243,22 @@ pub(crate) fn execute(
     }
 }
 
+/// An adapter's UNSUPPORTED refusal of work on `transports`, as the reason when the adapter now
+/// has one of them disabled.
+fn transport_refusal(session: &Session, transports: &[p::Transport], error: Error) -> Error {
+    if error.code_of() != Some(ErrorCode::Unsupported) {
+        return error;
+    }
+    let st = session.state();
+    match transports
+        .iter()
+        .find(|t| model::transport_disabled(&st.status, **t))
+    {
+        Some(t) => Error::new(text::transport_disabled(*t)),
+        None => error,
+    }
+}
+
 fn unexpected() -> Error {
     Error::new("the adapter returned an unexpected result")
 }
@@ -221,6 +266,8 @@ fn unexpected() -> Error {
 fn set_adapter(session: &Session, update: p::SetAdapter) -> Result<p::Status, Error> {
     let name = if update.name.is_some() {
         "adapter name"
+    } else if !update.transports.is_empty() {
+        "adapter transport"
     } else {
         "adapter platform"
     };
@@ -241,14 +288,16 @@ fn scan(
     if seconds > MAX_SCAN_SECONDS {
         return Err(Error::new("scan duration must be between 1s and 60s"));
     }
-    session.call(
-        C::StartScan(p::StartScan {
-            transports: transports.iter().map(|t| *t as i32).collect(),
-            seconds,
-        }),
-        "scan start",
-        true,
-    )?;
+    session
+        .call(
+            C::StartScan(p::StartScan {
+                transports: transports.iter().map(|t| *t as i32).collect(),
+                seconds,
+            }),
+            "scan start",
+            true,
+        )
+        .map_err(|e| transport_refusal(session, &transports, e))?;
     if !options.one_shot {
         return Ok(Outcome::ScanStarted(transports));
     }
@@ -303,17 +352,23 @@ fn pair(session: &Session, target: &str, options: &RunOptions) -> Result<Outcome
     if st.pairing.as_ref().is_some_and(model::pairing_running) {
         return Err(refused(ErrorCode::Busy, "pair start"));
     }
+    let transport = candidate.transport();
+    if model::transport_disabled(&st.status, transport) {
+        return Err(Error::new(text::transport_disabled(transport)));
+    }
     if model::transport(candidate.transport).is_none_or(|t| !model::supports(&st.status, t)) {
         return Err(refused(ErrorCode::Unsupported, "pair start"));
     }
     let _pending = session.pending("pair start", Some(&candidate.id));
-    session.call(
-        C::StartPairing(p::StartPairing {
-            candidate: candidate.id.clone(),
-        }),
-        "pair start",
-        true,
-    )?;
+    session
+        .call(
+            C::StartPairing(p::StartPairing {
+                candidate: candidate.id.clone(),
+            }),
+            "pair start",
+            true,
+        )
+        .map_err(|e| transport_refusal(session, &[transport], e))?;
     let ended = session.cell.wait_for(&options.wait, |st| {
         let p = st
             .pairing
@@ -327,7 +382,13 @@ fn pair(session: &Session, target: &str, options: &RunOptions) -> Result<Outcome
     });
     let device = match ended {
         Ok(Ok(device)) => device,
-        Ok(Err(code)) => return Err(Error::code(code, Some("pair start"))),
+        Ok(Err(code)) => {
+            return Err(transport_refusal(
+                session,
+                &[transport],
+                Error::code(code, Some("pair start")),
+            ));
+        }
         Err(error) => {
             let _ = session.connection.cancel_pairing();
             return Err(error);
@@ -494,6 +555,9 @@ fn device_command(
             Ok(Outcome::Device { subject, device })
         }
         Command::Connect(_) => {
+            if model::inactive(&d) == Some(p::InactiveReason::TransportDisabled) {
+                return Err(Error::new(text::transport_disabled(d.transport())));
+            }
             if d.blocked {
                 return Err(refused(ErrorCode::Blocked, "device connect"));
             }
@@ -503,12 +567,17 @@ fn device_command(
             if model::inactive(&d) == Some(p::InactiveReason::Capacity) {
                 return Err(no_capacity(CapacityReason::Enabled, "device connect"));
             }
+            let transport = d.transport();
             let _pending = session.pending("device connect", Some(&id));
-            let device = device_result(session.call(
-                C::ConnectDevice(p::ConnectDevice { device: id }),
-                "device connect",
-                true,
-            )?)?;
+            let device = device_result(
+                session
+                    .call(
+                        C::ConnectDevice(p::ConnectDevice { device: id }),
+                        "device connect",
+                        true,
+                    )
+                    .map_err(|e| transport_refusal(session, &[transport], e))?,
+            )?;
             Ok(Outcome::Device { subject, device })
         }
         Command::Disconnect(_) => {

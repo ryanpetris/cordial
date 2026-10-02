@@ -25,6 +25,9 @@ const fn spec(words: &'static str, args: &'static str, text: &'static str) -> Sp
 /// The scan row's arguments and description follow the offered transports.
 const SCAN: &str = "scan start";
 
+/// The transport row's arguments follow the supported transports.
+const TRANSPORT_SET: &str = "adapter set transport";
+
 const SPECS: &[Spec] = &[
     spec("adapter list", "", "List attached adapters"),
     spec(
@@ -43,6 +46,11 @@ const SPECS: &[Spec] = &[
         "adapter set platform",
         "linux | windows | mac",
         "OS whose shortcuts HID++ keys send (saved on the adapter)",
+    ),
+    spec(
+        TRANSPORT_SET,
+        "classic | ble enabled on | off",
+        "Enable or disable a Bluetooth transport (saved on the adapter)",
     ),
     spec(
         "adapter bootloader",
@@ -198,6 +206,13 @@ pub fn help(st: Option<&State>) -> String {
     {
         let (syntax, text) = match r.words {
             SCAN => scan_row(st),
+            TRANSPORT_SET => (
+                format!(
+                    "{TRANSPORT_SET} {} enabled on | off",
+                    transport_words(st).join(" | ")
+                ),
+                r.text.to_owned(),
+            ),
             "quit" => ("quit | exit".to_owned(), r.text.to_owned()),
             _ => (
                 format!("{} {}", r.words, r.args).trim_end().to_owned(),
@@ -263,12 +278,30 @@ fn scan_row(st: Option<&State>) -> (String, String) {
     (syntax, text)
 }
 
-/// The transports a scan can name.
+/// The transports a scan can name: those enabled.
 fn scan_words(st: Option<&State>) -> Vec<&'static str> {
-    let Some(st) = st else {
-        return vec!["classic", "ble"];
-    };
-    model::transports(&st.status)
+    match st {
+        Some(st) => words_of(model::enabled_transports(&st.status)),
+        None => vec!["classic", "ble"],
+    }
+}
+
+/// The transports that can be enabled or disabled: those supported, on firmware with the
+/// setting.
+fn transport_words(st: Option<&State>) -> Vec<&'static str> {
+    match st {
+        Some(st) => words_of(
+            model::transports(&st.status)
+                .into_iter()
+                .filter(|t| model::transport_settable(&st.status, *t))
+                .collect(),
+        ),
+        None => vec!["classic", "ble"],
+    }
+}
+
+fn words_of(transports: Vec<Transport>) -> Vec<&'static str> {
+    transports
         .into_iter()
         .filter_map(|t| match t {
             Transport::Classic => Some("classic"),
@@ -285,6 +318,7 @@ fn offered(words: &str, st: &State) -> bool {
     match words {
         SCAN | "scan stop" => !scan_words(Some(st)).is_empty(),
         "adapter bootloader" | "feature list" | "file list" | "file get" => development,
+        TRANSPORT_SET => !transport_words(Some(st)).is_empty(),
         _ => true,
     }
 }
@@ -457,6 +491,10 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
             "mac" => Platform::Mac,
             _ => return usage(),
         })),
+        (TRANSPORT_SET, 3) => match (transport(words[0]), words[1], on_off(words[2])) {
+            (Some(t), "enabled", Some(on)) => Line::Run(Command::Transport(t, on)),
+            _ => return usage(),
+        },
         ("adapter bootloader", 0) => Line::Run(Command::Bootloader),
         (SCAN, 0..=2) => {
             let mut transports = Vec::new();
@@ -520,7 +558,7 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
 /// Checks a command against what the connected adapter offers.
 pub fn offer(command: Command, st: &State) -> Result<Command, String> {
     match commands::unsupported(st, &command) {
-        Some(reason) => Err(reason.into()),
+        Some(reason) => Err(reason),
         None => Ok(command),
     }
 }
@@ -687,14 +725,20 @@ fn device_words(st: &State, cmd: &str, accepts: impl Fn(&str) -> bool) -> Vec<St
 }
 
 /// Whether a device's state allows the command: only scanned candidates
-/// pair, a disabled or blocked device can't be connected, and the
-/// remaining device commands need a saved device.
+/// pair, a disabled or blocked device can't be connected, devices of a
+/// disabled transport neither pair nor connect, and the remaining device
+/// commands need a saved device.
 fn usable(cmd: &str, id: &str, st: &State) -> bool {
     let saved = st.device(id);
+    let disabled = |transport: Transport| model::transport_disabled(&st.status, transport);
     match cmd {
-        "pair start" => saved.is_none(),
+        "pair start" => {
+            saved.is_none() && st.candidate(id).is_none_or(|c| !disabled(c.transport()))
+        }
         "device get" | "device unpair" => true,
-        "device connect" => saved.is_some_and(|d| d.enabled && !d.blocked),
+        "device connect" => {
+            saved.is_some_and(|d| d.enabled && !d.blocked && !disabled(d.transport()))
+        }
         "device refresh" | "feature list" => saved.is_some_and(model::connected),
         _ => saved.is_some(),
     }
@@ -777,6 +821,18 @@ fn completions(words: &[String], st: Option<&State>) -> Vec<String> {
     let args = &words[n..];
     let arguments = match (cmd, args.len()) {
         ("adapter set platform", 0) => owned(&["linux", "windows", "mac"]),
+        (TRANSPORT_SET, 0) => owned(&transport_words(st)),
+        (TRANSPORT_SET, 1) => owned(&["enabled"]),
+        (TRANSPORT_SET, 2) => {
+            let current = st.and_then(|st| {
+                transport(&args[0]).and_then(|t| model::transport_enabled(&st.status, t))
+            });
+            match current {
+                Some(true) => owned(&["off"]),
+                Some(false) => owned(&["on"]),
+                None => owned(&["on", "off"]),
+            }
+        }
         (SCAN, 0) => owned(&scan_words(st)),
         ("device list", 0) => owned(&["Saved", "Enabled", "Connected", "Trusted"]),
         ("help", 0) => heads(st).into_iter().map(str::to_owned).collect(),
@@ -884,10 +940,12 @@ pub(crate) mod tests {
                 p::TransportSupport {
                     transport: Transport::Classic as i32,
                     max_enabled: Some(4),
+                    enabled: Some(true),
                 },
                 p::TransportSupport {
                     transport: Transport::Ble as i32,
                     max_enabled: Some(7),
+                    enabled: Some(true),
                 },
             ],
             info: vec![p::Info {
@@ -1066,6 +1124,98 @@ pub(crate) mod tests {
         assert!(!shown.contains("file list") && !shown.contains("adapter bootloader"));
         assert!(shown.contains("except adapter status."), "{shown}");
         assert!(help(None).contains("adapter bootloader"));
+    }
+
+    #[test]
+    fn transports_are_enabled_and_disabled_only_when_supported() {
+        let run = |line: &str| match parse(&words(line)).unwrap() {
+            Line::Run(c) => c,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            run("adapter set transport classic enabled on"),
+            Command::Transport(Transport::Classic, true)
+        );
+        assert_eq!(
+            run("adapter set transport ble enabled off"),
+            Command::Transport(Transport::Ble, false)
+        );
+        assert!(parse(&words("adapter set transport ble enabled yes")).is_err());
+        assert!(parse(&words("adapter set transport ble on")).is_err());
+
+        let mut st = state();
+        assert!(
+            help(Some(&st)).contains("adapter set transport classic | ble enabled on | off"),
+            "{}",
+            help(Some(&st))
+        );
+        assert_eq!(
+            complete("adapter set transport ", Some(&st)),
+            ["adapter set transport classic", "adapter set transport ble"]
+        );
+        assert_eq!(
+            complete("adapter set transport ble ", Some(&st)),
+            ["adapter set transport ble enabled"]
+        );
+        assert_eq!(
+            complete("adapter set transport classic enabled ", Some(&st)),
+            ["adapter set transport classic enabled off"]
+        );
+        // While Classic is disabled, its devices neither connect nor pair, and no scan names it.
+        st.status.transports[0].enabled = Some(false);
+        st.devices[1].transport = Transport::Classic as i32;
+        st.candidates[0].transport = Transport::Classic as i32;
+        assert_eq!(
+            complete("adapter set transport classic enabled ", Some(&st)),
+            ["adapter set transport classic enabled on"]
+        );
+        let connect = complete("device connect ", Some(&st));
+        assert!(connect.contains(&"device connect d_1".to_owned()));
+        assert!(!connect.iter().any(|c| c.ends_with("d_2")));
+        let pair = complete("pair start ", Some(&st));
+        assert!(pair.contains(&"pair start c_2".to_owned()));
+        assert!(!pair.iter().any(|c| c.ends_with("c_1")));
+        assert_eq!(complete("scan start ", Some(&st)), ["scan start ble"]);
+        let scan = |named: Vec<Transport>| Command::Scan {
+            transports: named,
+            seconds: 0,
+        };
+        assert_eq!(
+            offer(scan(vec![Transport::Classic]), &st),
+            Err("Bluetooth Classic is disabled on the adapter".into())
+        );
+        assert!(offer(scan(vec![]), &st).is_ok());
+        st.status.transports[1].enabled = Some(false);
+        assert_eq!(
+            offer(scan(vec![]), &st),
+            Err("Bluetooth LE is disabled on the adapter".into())
+        );
+        assert!(!help(Some(&st)).contains("scan start"));
+
+        // Firmware that predates the setting uses every transport it supports, and the
+        // setting isn't offered for it.
+        st.status.transports[0].enabled = None;
+        assert_eq!(model::enabled_transports(&st.status), [Transport::Classic]);
+        assert_eq!(
+            complete("adapter set transport ", Some(&st)),
+            ["adapter set transport ble"]
+        );
+        st.status.transports[0].enabled = Some(true);
+
+        // A BLE-only adapter lists only BLE.
+        st.status
+            .transports
+            .retain(|t| t.transport != Transport::Classic as i32);
+        assert!(
+            help(Some(&st)).contains("adapter set transport ble enabled on | off"),
+            "{}",
+            help(Some(&st))
+        );
+        assert_eq!(
+            complete("adapter set transport ", Some(&st)),
+            ["adapter set transport ble"]
+        );
+        assert!(help(None).contains("adapter set transport classic | ble enabled on | off"));
     }
 
     #[test]

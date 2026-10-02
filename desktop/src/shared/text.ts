@@ -76,10 +76,15 @@ export function errorText(error: WireError): string {
 
 export const codeText = (code: Code) => sentence(ERRORS[code]);
 
+/** Why work on a transport is refused, and its saved devices are unused, while the adapter has it
+ * disabled. */
+export const transportDisabledText = (t: TransportName) => `${TRANSPORTS[t]} is disabled. Enable it in the adapter settings.`;
+
 /** Why a device the adapter doesn't use is inactive. */
 export const INACTIVE: Record<Inactive, string> = {
   unknown: "The adapter isn't using this device.",
   unsupported_transport: "This adapter doesn't support the device's Bluetooth type.",
+  transport_disabled: "The adapter isn't using this device.",
   blocked: "Connections to this device are blocked.",
   disabled: "It is turned off.",
   capacity: "The adapter can't enable another device. Turn off another device first.",
@@ -88,6 +93,7 @@ export const INACTIVE: Record<Inactive, string> = {
 /** Why `d` is inactive, naming its Bluetooth type where that is the reason. */
 export function inactiveText(d: DeviceRecord): string {
   if (d.inactive === "unsupported_transport" && d.transport) return `This adapter doesn't support ${TRANSPORTS[d.transport]}.`;
+  if (d.inactive === "transport_disabled" && d.transport) return transportDisabledText(d.transport);
   return INACTIVE[d.inactive ?? "unknown"];
 }
 

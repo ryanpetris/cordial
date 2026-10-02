@@ -8,7 +8,7 @@ use cordial_core::model::{
 };
 use cordial_core::{
     application::{Application, Bootloader, Build},
-    bluetooth::{Event, InputReport},
+    bluetooth::{Event, InputReport, Layout, LayoutReport, ReportMap, ReportType},
     compact::{Metadata, Preference},
     devices::{Device as SavedDevice, Peer, Policy},
     link::ServiceId,
@@ -28,6 +28,8 @@ use prost::Message;
 use support::*;
 
 const SAVED: &str = "d_000000000000004d";
+/// The first delay after a failure, which doubles per further failure.
+const FIRST_RETRY: u64 = cordial_core::devices::RETRY_DELAY_MS as u64;
 
 fn build(development: bool, bootloader: Option<fn() -> !>) -> Build {
     Build {
@@ -61,6 +63,7 @@ impl Test {
                 || 42,
             ))
             .unwrap();
+            all_transports(&mut store);
         }
         Self::with(store, radio, build(false, None))
     }
@@ -301,10 +304,12 @@ fn status_reports_identity_transports_and_facts() {
             p::TransportSupport {
                 transport: p::Transport::Classic as i32,
                 max_enabled: Some(7),
+                enabled: Some(true),
             },
             p::TransportSupport {
                 transport: p::Transport::Ble as i32,
                 max_enabled: Some(7),
+                enabled: Some(true),
             },
         ]
     );
@@ -499,8 +504,9 @@ fn scans_validate_their_transports_and_report_candidates() {
         );
     }
     assert!(t.radio.scans.is_empty());
+    // An unsupported or unknown transport beside a usable one is left out.
     t.ok(Command::StartScan(p::StartScan {
-        transports: vec![p::Transport::Ble as i32],
+        transports: vec![p::Transport::Classic as i32, 7, p::Transport::Ble as i32],
         seconds: 0,
     }));
     let (token, classic, ble) = *t.radio.scans.last().unwrap();
@@ -619,6 +625,7 @@ fn pairing_saves_the_device_and_forwarding_survives_the_session() {
         link,
         descriptors: descriptor(),
         max_output: 255,
+        layout: None,
     });
     for _ in 0..5 {
         t.poll();
@@ -847,6 +854,7 @@ fn blocking_keeps_an_earlier_reconnect_pause() {
 #[test]
 fn unpair_finishes_once_the_link_is_gone() {
     let mut t = Test::new(true);
+    put_layout(&mut t, &classic_layout(KEYBOARD_MAP));
     t.poll();
     let link = t.radio.connects[0].0;
     assert_eq!(
@@ -865,6 +873,7 @@ fn unpair_finishes_once_the_link_is_gone() {
             .records
             .contains_key(&cordial_core::storage::record_key(2, 77))
     );
+    assert!(!t.store.records.contains_key(&layout_key()));
     assert_eq!(
         t.code(Command::UnpairDevice(p::UnpairDevice {
             device: SAVED.into()
@@ -894,8 +903,24 @@ fn lost_records_are_deleted_at_startup() {
     store
         .records
         .insert(key, serde_json::to_vec(&record).unwrap());
+    // Layouts of the lost devices and of the saved one. A layout whose device record is gone
+    // is the record store's to reclaim with the device's directory.
+    let layout = cordial_core::storage::json(&classic_layout(KEYBOARD_MAP)).unwrap();
+    for id in [77, 90, 91] {
+        store
+            .records
+            .insert(cordial_core::storage::record_key(5, id), layout.clone());
+    }
     let mut t = Test::with(store, radio, build(false, None));
     assert_eq!(t.app.manager.devices.iter().flatten().count(), 1);
+    let layouts: Vec<_> = t
+        .store
+        .records
+        .keys()
+        .filter(|key| key[0] == 5)
+        .copied()
+        .collect();
+    assert_eq!(layouts, [layout_key()]);
     assert!(
         !t.store
             .records
@@ -1122,6 +1147,7 @@ fn adapter_name_and_platform_are_partial_updates() {
     let s = status(t.ok(Command::SetAdapter(p::SetAdapter {
         name: Some("Desk".into()),
         platform: None,
+        ..Default::default()
     })));
     assert_eq!(
         (s.name.as_str(), s.platform),
@@ -1135,6 +1161,7 @@ fn adapter_name_and_platform_are_partial_updates() {
     let s = status(t.ok(Command::SetAdapter(p::SetAdapter {
         name: None,
         platform: Some(p::Platform::Mac as i32),
+        ..Default::default()
     })));
     assert_eq!(
         (s.name.as_str(), s.platform),
@@ -1143,6 +1170,7 @@ fn adapter_name_and_platform_are_partial_updates() {
     let s = status(t.ok(Command::SetAdapter(p::SetAdapter {
         name: Some(String::new()),
         platform: None,
+        ..Default::default()
     })));
     assert_eq!(s.name, "Test adapter", "an empty name restores the default");
     assert_eq!(s.platform, p::Platform::Mac as i32);
@@ -1151,6 +1179,7 @@ fn adapter_name_and_platform_are_partial_updates() {
             t.code(Command::SetAdapter(p::SetAdapter {
                 name: Some(name.into()),
                 platform: None,
+                ..Default::default()
             })),
             p::ErrorCode::BadArgs
         );
@@ -1161,6 +1190,7 @@ fn adapter_name_and_platform_are_partial_updates() {
     t.ok(Command::SetAdapter(p::SetAdapter {
         name: None,
         platform: Some(p::Platform::Mac as i32),
+        ..Default::default()
     }));
     assert_eq!(t.store.records, saved);
     assert!(t.events().is_empty());
@@ -1232,7 +1262,7 @@ fn bootloader_releases_input_before_reboot() {
     let link = t
         .app
         .manager
-        .connect(0, true, 30_000, &mut t.radio)
+        .connect(0, true, 30_000, None, &mut t.radio)
         .unwrap()
         .unwrap();
     t.app.manager.connected(link, descriptor(), 255, 0).unwrap();
@@ -1350,8 +1380,9 @@ fn ble_accept_list_rechecks_policy_on_arrival_and_respects_failure_cooldown() {
         assert_eq!(t.radio.incoming.last(), Some(&None), "{reason}");
         t.poll();
         assert!(t.radio.reconnect.is_empty(), "{reason}");
-        if reason == "cooldown" {
-            t.now += 5000;
+        // A failure, authentication included, only delays the next attempt.
+        if matches!(reason, "authentication" | "cooldown") {
+            t.now += FIRST_RETRY;
             t.poll();
             assert_eq!(t.radio.reconnect, [peer]);
             t.event(Event::Incoming { attempt: 2, peer });
@@ -1461,6 +1492,7 @@ fn radio_restart_releases_keys_then_reconnects_saved_devices_after_ready() {
         link,
         descriptors: descriptor(),
         max_output: 255,
+        layout: None,
     });
     while t.app.manager.forward.packet().is_some() {
         t.app.manager.forward.complete();
@@ -1477,7 +1509,7 @@ fn radio_restart_releases_keys_then_reconnects_saved_devices_after_ready() {
         t.app.manager.forward.complete();
     }
     assert!(!t.status().ready);
-    t.now += 5000;
+    t.now += FIRST_RETRY;
     t.poll();
     assert_eq!(t.radio.connects.len(), 1);
     t.event(Event::Input(
@@ -1602,6 +1634,7 @@ fn connect_saved(
         link,
         descriptors,
         max_output: 255,
+        layout: None,
     });
     link
 }
@@ -1740,6 +1773,7 @@ fn standalone_key_forwarding_and_idle_polling_do_not_allocate() {
         link,
         descriptors: descriptor(),
         max_output: 255,
+        layout: None,
     });
     for _ in 0..10 {
         t.poll();
@@ -1856,7 +1890,7 @@ fn a_link_lost_while_connecting_records_its_error() {
 }
 
 #[test]
-fn a_connected_device_refusing_authentication_stops_reconnecting() {
+fn a_device_failing_authentication_keeps_reconnecting() {
     let mut t = Test::new(true);
     let link = connect_saved(&mut t, hidpp_descriptor());
     t.poll();
@@ -1865,10 +1899,1030 @@ fn a_connected_device_refusing_authentication_stops_reconnecting() {
         link,
         error: Some(cordial_core::model::errors::ErrorCode::AuthenticationFailed),
     });
+    let failed = t.now;
     assert_eq!(t.device(SAVED).error, Some(p::ErrorCode::AuthFailed as i32));
-    // It waits for an explicit connect instead of reconnecting.
+    // Anyone can fail a handshake with the device's address, so this only backs off.
     let attempts = t.radio.connects.len();
-    t.now += 600_000;
+    t.now = failed + FIRST_RETRY - 2;
     t.poll();
     assert_eq!(t.radio.connects.len(), attempts);
+    t.poll();
+    assert_eq!(t.radio.connects.len(), attempts + 1);
+}
+
+#[test]
+fn no_error_stops_automatic_reconnection() {
+    for error in [
+        ErrorCode::UnsupportedHid,
+        ErrorCode::UnsupportedTransport,
+        ErrorCode::AuthenticationFailed,
+        ErrorCode::AuthenticationRejected,
+    ] {
+        let mut t = Test::new(true);
+        t.poll();
+        let link = t.radio.connects[0].0;
+        t.event(Event::Security {
+            link,
+            security: cordial_core::bluetooth::ConnectionSecurity {
+                encrypted: Some(true),
+                authenticated: None,
+                secure_connections: None,
+                key_size: Some(16),
+                bonded: Some(true),
+            },
+        });
+        t.event(Event::Disconnected {
+            link,
+            error: Some(error),
+        });
+        let failed = t.now;
+        assert!(t.device(SAVED).error.is_some(), "{error:?}");
+        t.now = failed + FIRST_RETRY - 2;
+        t.poll();
+        assert_eq!(t.radio.connects.len(), 1, "{error:?}");
+        t.poll();
+        assert_eq!(t.radio.connects.len(), 2, "{error:?}");
+    }
+}
+
+const KEYBOARD_MAP: &[u8] = &[
+    5, 1, 9, 6, 0xa1, 1, 5, 7, 0x19, 4, 0x29, 11, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8, 0x81, 2, 0xc0,
+];
+/// The same keyboard sending report ID 1.
+const NUMBERED_MAP: &[u8] = &[
+    5, 1, 9, 6, 0xa1, 1, 0x85, 1, 5, 7, 0x19, 4, 0x29, 11, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8,
+    0x81, 2, 0xc0,
+];
+fn classic_layout(map: &[u8]) -> Layout {
+    Layout {
+        maps: vec![ReportMap(map.to_vec())],
+        reports: Vec::new(),
+        hash: None,
+    }
+}
+fn ble_layout() -> Layout {
+    Layout {
+        maps: vec![ReportMap(KEYBOARD_MAP.to_vec())],
+        reports: vec![LayoutReport {
+            service: 0,
+            kind: ReportType::Input,
+            id: 0,
+            value: 0x10,
+            properties: 0x12,
+            cccd: 0x11,
+        }],
+        hash: None,
+    }
+}
+fn layout_key() -> cordial_core::storage::RecordKey {
+    cordial_core::storage::record_key(5, 77)
+}
+fn put_layout(t: &mut Test, layout: &Layout) {
+    t.store
+        .records
+        .insert(layout_key(), cordial_core::storage::json(layout).unwrap());
+}
+fn saved_layout(t: &Test) -> Option<Layout> {
+    t.store
+        .records
+        .get(&layout_key())
+        .map(|bytes| serde_json::from_slice(bytes).unwrap())
+}
+fn drain_forward(t: &mut Test) {
+    while t.app.manager.forward.packet().is_some() {
+        t.app.manager.forward.complete();
+    }
+}
+/// Adds a saved BLE device after the Classic one.
+fn add_ble(t: &mut Test) -> Peer {
+    let peer = Peer {
+        transport: Transport::Ble,
+        ..peer(2)
+    };
+    let mut policy = Policy::paired(78, peer, b"Mouse");
+    policy.bond = 78;
+    policy.setup_pending = false;
+    block_on(cordial_core::bonds::commit(
+        &mut t.store,
+        &policy,
+        &bond(78, peer),
+    ))
+    .unwrap();
+    t.radio.bonds.push(peer);
+    t.app.manager.devices.push(Some(SavedDevice::new(policy)));
+    peer
+}
+
+#[test]
+fn saved_layouts_are_supplied_to_reconnections() {
+    let mut t = Test::new(true);
+    let layout = classic_layout(KEYBOARD_MAP);
+    put_layout(&mut t, &layout);
+    t.poll();
+    assert_eq!(t.radio.layouts, [Some(layout.clone())], "background paging");
+    let link = t.radio.connects[0].0;
+    t.event(Event::Disconnected {
+        link,
+        error: Some(ErrorCode::ConnectionFailed),
+    });
+    t.ok(Command::ConnectDevice(p::ConnectDevice {
+        device: SAVED.into(),
+    }));
+    assert_eq!(
+        t.radio.layouts.last(),
+        Some(&Some(layout)),
+        "explicit connect"
+    );
+
+    let mut t = Test::new(true);
+    let peer = saved_ble(&mut t);
+    put_layout(&mut t, &ble_layout());
+    t.poll();
+    t.event(Event::Incoming { attempt: 1, peer });
+    assert_eq!(t.radio.layouts, [Some(ble_layout())], "incoming link");
+}
+
+#[test]
+fn an_unusable_saved_layout_is_ignored_and_removed() {
+    for bytes in [
+        b"{".to_vec(),
+        cordial_core::storage::json(&ble_layout()).unwrap(),
+    ] {
+        let mut t = Test::new(true);
+        t.store.records.insert(layout_key(), bytes);
+        t.poll();
+        assert_eq!(t.radio.layouts, [None]);
+        assert_eq!(saved_layout(&t), None);
+    }
+}
+
+#[test]
+fn pairing_supplies_no_layout_and_saves_the_discovered_one() {
+    let mut t = Test::new(true);
+    t.app.manager.devices[0].as_mut().unwrap().paused = true;
+    put_layout(&mut t, &classic_layout(KEYBOARD_MAP));
+    let candidate = t.candidate(peer(1), peer(1));
+    t.pair(&candidate);
+    t.poll();
+    assert_eq!(t.radio.connects.len(), 1);
+    assert!(t.radio.connects[0].1, "a pairing link");
+    assert_eq!(t.radio.layouts, [None]);
+    let link = t.radio.connects[0].0;
+    t.event(Event::Bonded {
+        link,
+        identity: peer(1),
+    });
+    assert_eq!(
+        saved_layout(&t),
+        None,
+        "the new bond's layout is not known yet"
+    );
+    let discovered = classic_layout(NUMBERED_MAP);
+    t.event(Event::Connected {
+        link,
+        descriptors: descriptor(),
+        max_output: 255,
+        layout: Some(discovered.clone()),
+    });
+    assert_eq!(saved_layout(&t), Some(discovered));
+}
+
+#[test]
+fn only_a_usable_discovered_layout_is_saved() {
+    for (layout, available, saved) in [
+        (None, None, false),
+        (Some(classic_layout(KEYBOARD_MAP)), None, true),
+        (Some(ble_layout()), None, false),
+        // The space kept for maintenance and for pairing another device stays free.
+        (
+            Some(classic_layout(KEYBOARD_MAP)),
+            Some(cordial_core::bonds::MAINTENANCE_BYTES + cordial_core::bonds::PAIR_BYTES),
+            false,
+        ),
+        (Some(classic_layout(KEYBOARD_MAP)), Some(60_000), true),
+    ] {
+        let mut t = Test::new(true);
+        t.store.available = available;
+        t.poll();
+        let link = t.radio.connects[0].0;
+        t.event(Event::Connected {
+            link,
+            descriptors: descriptor(),
+            max_output: 255,
+            layout: layout.clone(),
+        });
+        assert_eq!(t.device(SAVED).state, p::DeviceState::Connected as i32);
+        assert_eq!(saved_layout(&t), layout.filter(|_| saved));
+    }
+}
+
+#[test]
+fn a_changed_layout_moves_the_live_link_and_is_saved() {
+    let mut t = Test::new(true);
+    t.poll();
+    let link = t.radio.connects[0].0;
+    let changed = classic_layout(NUMBERED_MAP);
+    // A link still in setup has no layout to change.
+    t.event(Event::Layout {
+        link,
+        descriptors: descriptor(),
+        layout: changed.clone(),
+    });
+    assert_eq!(saved_layout(&t), None);
+    t.event(Event::Connected {
+        link,
+        descriptors: descriptor(),
+        max_output: 255,
+        layout: None,
+    });
+    drain_forward(&mut t);
+    t.event(Event::Input(
+        InputReport::new(link, ServiceId(7), 0, &[1]).unwrap(),
+    ));
+    assert_eq!(t.app.manager.forward.packet().unwrap().bytes()[0], 16);
+    t.app.manager.forward.complete();
+    let numbered =
+        vec![cordial_core::bluetooth::Descriptor::from_slice(ServiceId(7), NUMBERED_MAP).unwrap()];
+    t.event(Event::Layout {
+        link,
+        descriptors: numbered,
+        layout: changed.clone(),
+    });
+    // The old layout's held key is released, and the device stays connected.
+    assert_eq!(t.app.manager.forward.packet().unwrap().bytes(), &[0; 32]);
+    drain_forward(&mut t);
+    assert_eq!(t.device(SAVED).state, p::DeviceState::Connected as i32);
+    assert!(t.radio.closes.is_empty());
+    assert_eq!(saved_layout(&t), Some(changed));
+    t.event(Event::Input(
+        InputReport::new(link, ServiceId(7), 1, &[1]).unwrap(),
+    ));
+    assert_eq!(t.app.manager.forward.packet().unwrap().bytes()[0], 16);
+    t.app.manager.forward.complete();
+    // A layout the link cannot use closes it, and the saved one no longer applies.
+    t.event(Event::Layout {
+        link,
+        descriptors: Vec::new(),
+        layout: classic_layout(KEYBOARD_MAP),
+    });
+    assert_eq!(t.radio.closes, [link]);
+    assert_eq!(saved_layout(&t), None);
+}
+
+#[test]
+fn a_changed_layout_that_cannot_be_saved_removes_the_saved_one() {
+    for (layout, available) in [
+        (ble_layout(), None),
+        (
+            classic_layout(NUMBERED_MAP),
+            Some(cordial_core::bonds::MAINTENANCE_BYTES - 1),
+        ),
+    ] {
+        let mut t = Test::new(true);
+        put_layout(&mut t, &classic_layout(KEYBOARD_MAP));
+        let link = connect_saved(&mut t, descriptor());
+        t.store.available = available;
+        t.event(Event::Layout {
+            link,
+            descriptors: descriptor(),
+            layout,
+        });
+        assert_eq!(t.device(SAVED).state, p::DeviceState::Connected as i32);
+        assert_eq!(saved_layout(&t), None);
+    }
+}
+
+#[test]
+fn a_busy_radio_delays_the_page_without_reading_the_layout_each_poll() {
+    let mut t = Test::new(true);
+    put_layout(&mut t, &classic_layout(KEYBOARD_MAP));
+    t.radio.reject_connect = Some(ErrorCode::Busy);
+    t.poll();
+    let loads = t.store.loads;
+    t.poll();
+    assert_eq!(t.store.loads, loads);
+    t.radio.reject_connect = None;
+    t.now += 1000;
+    t.poll();
+    assert_eq!(t.radio.layouts, [Some(classic_layout(KEYBOARD_MAP))]);
+}
+
+#[test]
+fn a_ble_device_that_went_away_may_return_at_once() {
+    let mut t = Test::new(true);
+    let peer = saved_ble(&mut t);
+    t.poll();
+    t.event(Event::Incoming { attempt: 1, peer });
+    let link = t.radio.connects[0].0;
+    t.event(Event::Connected {
+        link,
+        descriptors: descriptor(),
+        max_output: 255,
+        layout: None,
+    });
+    t.event(Event::Disconnected {
+        link,
+        error: Some(ErrorCode::ConnectionFailed),
+    });
+    t.poll();
+    assert_eq!(t.radio.reconnect, [peer]);
+    t.event(Event::Incoming { attempt: 2, peer });
+    assert!(t.radio.incoming.last().unwrap().is_some());
+    // A connection that fails before it is connected still backs off.
+    let link = t.radio.connects[1].0;
+    t.event(Event::Disconnected {
+        link,
+        error: Some(ErrorCode::ConnectionFailed),
+    });
+    t.poll();
+    assert!(t.radio.reconnect.is_empty());
+    t.event(Event::Incoming { attempt: 3, peer });
+    assert_eq!(t.radio.incoming.last(), Some(&None));
+}
+
+#[test]
+fn a_classic_device_that_went_away_is_paged_after_the_first_delay() {
+    let mut t = Test::new(true);
+    let link = connect_saved(&mut t, descriptor());
+    t.event(Event::Disconnected {
+        link,
+        error: Some(ErrorCode::ConnectionFailed),
+    });
+    let lost = t.now;
+    t.now = lost + FIRST_RETRY - 2;
+    t.poll();
+    assert_eq!(t.radio.connects.len(), 1);
+    t.poll();
+    assert_eq!(t.radio.connects.len(), 2);
+    // A failed page doubles the delay.
+    t.event(Event::Disconnected {
+        link: t.radio.connects[1].0,
+        error: Some(ErrorCode::Timeout),
+    });
+    let failed = t.now;
+    t.now = failed + 2 * FIRST_RETRY - 2;
+    t.poll();
+    assert_eq!(t.radio.connects.len(), 2);
+    t.poll();
+    assert_eq!(t.radio.connects.len(), 3);
+}
+
+#[test]
+fn an_outgoing_classic_page_does_not_hold_up_ble_reconnection() {
+    let mut t = Test::new(true);
+    let ble = add_ble(&mut t);
+    t.poll();
+    assert_eq!(t.radio.connects.len(), 1, "the Classic page");
+    assert_eq!(t.radio.reconnect, [ble]);
+    t.event(Event::Incoming {
+        attempt: 1,
+        peer: ble,
+    });
+    assert!(t.radio.incoming.last().unwrap().is_some());
+    t.poll();
+    assert!(t.radio.reconnect.is_empty(), "BLE setups run one at a time");
+    assert_eq!(t.radio.connects.len(), 2);
+}
+
+#[test]
+fn a_ble_link_with_a_changed_layout_reads_its_information_again() {
+    let mut t = Test::new(true);
+    let peer = saved_ble(&mut t);
+    t.poll();
+    t.event(Event::Incoming { attempt: 1, peer });
+    let link = t.radio.connects[0].0;
+    t.event(Event::Connected {
+        link,
+        descriptors: descriptor(),
+        max_output: 255,
+        layout: None,
+    });
+    t.poll();
+    assert!(t.radio.info_refreshes.is_empty());
+    t.event(Event::Layout {
+        link,
+        descriptors: descriptor(),
+        layout: ble_layout(),
+    });
+    t.poll();
+    assert_eq!(t.radio.info_refreshes, [link]);
+}
+
+fn update(transport: p::Transport, enabled: bool) -> p::TransportUpdate {
+    p::TransportUpdate {
+        transport: transport as i32,
+        enabled: Some(enabled),
+    }
+}
+fn set_transports(t: &mut Test, updates: &[(p::Transport, bool)]) -> p::Status {
+    match t.ok(Command::SetAdapter(p::SetAdapter {
+        transports: updates.iter().map(|(t, on)| update(*t, *on)).collect(),
+        ..Default::default()
+    })) {
+        Some(R::Status(s)) => s,
+        other => panic!("{other:?}"),
+    }
+}
+/// The supported transports, each with whether it is enabled.
+fn transports(s: &p::Status) -> Vec<(i32, bool)> {
+    s.transports
+        .iter()
+        .map(|t| (t.transport, t.enabled.expect("always set")))
+        .collect()
+}
+const CLASSIC: i32 = p::Transport::Classic as i32;
+const BLE: i32 = p::Transport::Ble as i32;
+const SAVED_BLE: &str = "d_000000000000004e";
+
+#[test]
+fn classic_starts_disabled_and_ble_enabled() {
+    let mut store = Store::default();
+    block_on(cordial_core::identity::Identity::initialize(
+        &mut store,
+        [2; 6],
+        || 42,
+    ))
+    .unwrap();
+    let mut t = Test::with(store, Radio::default(), build(false, None));
+    let s = t.status();
+    assert_eq!(transports(&s), [(CLASSIC, false), (BLE, true)]);
+    assert_eq!(
+        t.radio.applied,
+        [(Transport::Classic, false), (Transport::Ble, true)]
+    );
+    assert_eq!(
+        t.code(Command::StartScan(p::StartScan {
+            transports: vec![CLASSIC],
+            seconds: 0,
+        })),
+        p::ErrorCode::Unsupported
+    );
+
+    // Only supported transports are listed and applied.
+    let (_, store, mut radio) = setup();
+    radio.applied.clear();
+    radio.transports = Some(cordial_core::bluetooth::Capabilities {
+        classic: false,
+        ble: true,
+        ble_scan_and_connect: false,
+    });
+    let mut t = Test::with(store, radio, build(false, None));
+    assert_eq!(transports(&t.status()), [(BLE, true)]);
+    assert_eq!(t.radio.applied, [(Transport::Ble, true)]);
+}
+
+#[test]
+fn an_unsupported_transport_cannot_be_changed() {
+    let (_, store, mut radio) = setup();
+    radio.transports = Some(cordial_core::bluetooth::Capabilities {
+        classic: false,
+        ble: true,
+        ble_scan_and_connect: false,
+    });
+    let mut t = Test::with(store, radio, build(false, None));
+    assert_eq!(
+        t.device(SAVED).inactive,
+        Some(p::InactiveReason::UnsupportedTransport as i32)
+    );
+    let saved = t.store.records.clone();
+    for (transport, code) in [
+        (CLASSIC, p::ErrorCode::Unsupported),
+        (99, p::ErrorCode::Unsupported),
+        (p::Transport::Unspecified as i32, p::ErrorCode::BadArgs),
+    ] {
+        assert_eq!(
+            t.code(Command::SetAdapter(p::SetAdapter {
+                name: Some("Desk".into()),
+                transports: vec![p::TransportUpdate {
+                    transport,
+                    enabled: Some(false),
+                }],
+                ..Default::default()
+            })),
+            code
+        );
+    }
+    assert_eq!(t.store.records, saved);
+}
+
+#[test]
+fn disabling_classic_closes_its_links_and_refuses_classic_work() {
+    let mut t = Test::new(true);
+    let ble = add_ble(&mut t);
+    t.radio.applied.clear();
+    t.poll();
+    let link = t.radio.connects[0].0;
+    t.scan(&[p::Transport::Classic, p::Transport::Ble]);
+    let token = t.radio.scans.last().unwrap().0;
+    let saved = t.store.records.clone();
+    let s = set_transports(&mut t, &[(p::Transport::Classic, false)]);
+    assert_ne!(t.store.records, saved);
+    assert_eq!(transports(&s), [(CLASSIC, false), (BLE, true)]);
+    assert_eq!(t.radio.applied, [(Transport::Classic, false)]);
+    assert_eq!(t.radio.closes, [link]);
+    t.finish_disconnects();
+    // The scan continues over BLE only.
+    assert_eq!(t.radio.scans.last(), Some(&(token, false, true)));
+    let d = t.device(SAVED);
+    assert_eq!(
+        d.inactive,
+        Some(p::InactiveReason::TransportDisabled as i32)
+    );
+    assert_eq!(d.error, None);
+    assert!(!t.radio.bonds.contains(&peer(1)));
+    // Classic devices are neither paged nor admitted, and Classic commands are refused as for
+    // an unsupported transport. BLE is unaffected.
+    t.now += 600_000;
+    t.poll();
+    assert_eq!(t.radio.connects.len(), 1);
+    assert_eq!(t.radio.reconnect, [ble]);
+    t.event(Event::Incoming {
+        attempt: 1,
+        peer: peer(1),
+    });
+    assert_eq!(t.radio.incoming.last(), Some(&None));
+    assert_eq!(
+        t.code(Command::ConnectDevice(p::ConnectDevice {
+            device: SAVED.into()
+        })),
+        p::ErrorCode::Unsupported
+    );
+    assert_eq!(
+        t.code(Command::StartScan(p::StartScan {
+            transports: vec![CLASSIC],
+            seconds: 0,
+        })),
+        p::ErrorCode::Unsupported
+    );
+    t.event(Event::Incoming {
+        attempt: 2,
+        peer: ble,
+    });
+    assert!(t.radio.incoming.last().unwrap().is_some());
+
+    // Enabling it makes the saved device eligible again.
+    let s = set_transports(&mut t, &[(p::Transport::Classic, true)]);
+    assert_eq!(transports(&s), [(CLASSIC, true), (BLE, true)]);
+    assert_eq!(
+        t.radio.applied,
+        [(Transport::Classic, false), (Transport::Classic, true)]
+    );
+    assert_eq!(t.device(SAVED).inactive, None);
+    assert!(t.radio.bonds.contains(&peer(1)));
+    t.ok(Command::ConnectDevice(p::ConnectDevice {
+        device: SAVED.into(),
+    }));
+    assert_eq!(t.radio.addresses.last(), Some(&peer(1)));
+}
+
+#[test]
+fn disabling_ble_closes_its_links_and_stops_reconnecting() {
+    let mut t = Test::new(true);
+    let ble = add_ble(&mut t);
+    t.radio.applied.clear();
+    t.poll();
+    let classic = t.radio.connects[0].0;
+    assert_eq!(t.radio.reconnect, [ble]);
+    t.event(Event::Incoming {
+        attempt: 1,
+        peer: ble,
+    });
+    let link = t.radio.connects[1].0;
+    t.scan(&[p::Transport::Classic, p::Transport::Ble]);
+    let token = t.radio.scans.last().unwrap().0;
+    let s = set_transports(&mut t, &[(p::Transport::Ble, false)]);
+    assert_eq!(transports(&s), [(CLASSIC, true), (BLE, false)]);
+    assert_eq!(t.radio.applied, [(Transport::Ble, false)]);
+    assert_eq!(t.radio.closes, [link]);
+    assert!(t.app.manager.connection(classic).is_some());
+    t.finish_disconnects();
+    assert_eq!(t.radio.scans.last(), Some(&(token, true, false)));
+    assert!(t.radio.reconnect.is_empty());
+    assert_eq!(
+        t.device(SAVED_BLE).inactive,
+        Some(p::InactiveReason::TransportDisabled as i32)
+    );
+    assert_eq!(t.device(SAVED).inactive, None);
+    t.event(Event::Incoming {
+        attempt: 2,
+        peer: ble,
+    });
+    assert_eq!(t.radio.incoming.last(), Some(&None));
+    for command in [
+        Command::ConnectDevice(p::ConnectDevice {
+            device: SAVED_BLE.into(),
+        }),
+        Command::StartScan(p::StartScan {
+            transports: vec![BLE],
+            seconds: 0,
+        }),
+    ] {
+        assert_eq!(t.code(command), p::ErrorCode::Unsupported);
+    }
+    set_transports(&mut t, &[(p::Transport::Ble, true)]);
+    assert_eq!(t.device(SAVED_BLE).inactive, None);
+    // The closed link's backoff still applies.
+    t.now += FIRST_RETRY;
+    t.poll();
+    assert_eq!(t.radio.reconnect, [ble]);
+}
+
+#[test]
+fn both_transports_can_be_disabled() {
+    let mut t = Test::new(true);
+    add_ble(&mut t);
+    t.radio.applied.clear();
+    let s = set_transports(
+        &mut t,
+        &[(p::Transport::Classic, false), (p::Transport::Ble, false)],
+    );
+    assert_eq!(transports(&s), [(CLASSIC, false), (BLE, false)]);
+    assert_eq!(
+        t.radio.applied,
+        [(Transport::Classic, false), (Transport::Ble, false)]
+    );
+    t.now += 600_000;
+    t.poll();
+    assert!(t.radio.connects.is_empty());
+    assert!(t.radio.reconnect.is_empty());
+    for id in [SAVED, SAVED_BLE] {
+        assert_eq!(
+            t.device(id).inactive,
+            Some(p::InactiveReason::TransportDisabled as i32)
+        );
+    }
+    let mut reloaded = cordial_core::manager::Manager::default();
+    block_on(reloaded.load(&mut t.store, &mut t.radio)).unwrap();
+    assert_eq!(
+        reloaded.preference.transports,
+        cordial_core::devices::Transports::NONE
+    );
+}
+
+#[test]
+fn transport_updates_apply_in_order() {
+    let mut t = Test::new(true);
+    t.radio.applied.clear();
+    let s = set_transports(
+        &mut t,
+        &[
+            (p::Transport::Classic, false),
+            (p::Transport::Classic, true),
+        ],
+    );
+    assert_eq!(transports(&s), [(CLASSIC, true), (BLE, true)]);
+    assert!(t.radio.applied.is_empty(), "unchanged");
+    // An update without a value changes nothing.
+    let saved = t.store.records.clone();
+    t.ok(Command::SetAdapter(p::SetAdapter {
+        transports: vec![p::TransportUpdate {
+            transport: CLASSIC,
+            enabled: None,
+        }],
+        ..Default::default()
+    }));
+    assert_eq!(t.store.records, saved);
+}
+
+#[test]
+fn disabling_a_transport_ends_its_scan_and_pairing() {
+    for (transport, candidate) in [
+        (p::Transport::Classic, peer(2)),
+        (
+            p::Transport::Ble,
+            Peer {
+                transport: Transport::Ble,
+                ..peer(2)
+            },
+        ),
+    ] {
+        let mut t = Test::new(false);
+        let id = t.candidate(candidate, candidate);
+        t.pair(&id);
+        t.poll();
+        let link = t.radio.connects[0].0;
+        t.ok(Command::StopScan(p::StopScan {}));
+        t.scan(&[transport]);
+        t.events();
+        set_transports(&mut t, &[(transport, false)]);
+        assert_eq!(t.radio.closes, [link]);
+        t.finish_disconnects();
+        let events = t.events();
+        assert!(events.iter().any(|e| matches!(e, Ev::ScanDone(_))));
+        assert_eq!(
+            pairing_steps(&events).last(),
+            Some(&p::pairing::Step::Failed(p::ErrorCode::Unsupported as i32))
+        );
+        assert_eq!(
+            t.radio.scans.last().map(|s| (s.1, s.2)),
+            Some((false, false))
+        );
+    }
+}
+
+#[test]
+fn disabling_a_transport_ends_a_pairing_that_has_not_started_its_link() {
+    let mut t = Test::new(false);
+    let candidate = t.candidate(peer(2), peer(2));
+    t.pair(&candidate);
+    set_transports(&mut t, &[(p::Transport::Classic, false)]);
+    let events = t.events();
+    assert!(t.radio.connects.is_empty());
+    assert_eq!(
+        pairing_steps(&events).last(),
+        Some(&p::pairing::Step::Failed(p::ErrorCode::Unsupported as i32))
+    );
+}
+
+#[test]
+fn adapter_updates_keep_the_transport_settings() {
+    let mut t = Test::new(true);
+    let s = match t.ok(Command::SetAdapter(p::SetAdapter {
+        platform: Some(p::Platform::Mac as i32),
+        transports: vec![update(p::Transport::Classic, false)],
+        ..Default::default()
+    })) {
+        Some(R::Status(s)) => s,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(s.platform, p::Platform::Mac as i32);
+    assert_eq!(transports(&s), [(CLASSIC, false), (BLE, true)]);
+    let s = match t.ok(Command::SetAdapter(p::SetAdapter {
+        name: Some("Desk".into()),
+        ..Default::default()
+    })) {
+        Some(R::Status(s)) => s,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(transports(&s), [(CLASSIC, false), (BLE, true)]);
+    let mut reloaded = cordial_core::manager::Manager::default();
+    block_on(reloaded.load(&mut t.store, &mut t.radio)).unwrap();
+    assert_eq!(
+        reloaded.preference,
+        cordial_core::devices::AdapterPreference {
+            name: Some("Desk".into()),
+            host_platform: cordial_core::model::identifiers::HostPlatform::Mac,
+            transports: Default::default(),
+        }
+    );
+}
+
+#[test]
+fn a_radio_that_cannot_apply_a_transport_fails_but_the_setting_is_saved() {
+    let mut t = Test::new(true);
+    let link = connect_saved(&mut t, descriptor());
+    t.radio.reject_transport = Some(ErrorCode::RadioUnavailable);
+    let s = set_transports(&mut t, &[(p::Transport::Classic, false)]);
+    assert!(!s.ready);
+    assert!(
+        !t.app
+            .manager
+            .preference
+            .transports
+            .contains(Transport::Classic)
+    );
+    assert_eq!(
+        t.app.manager.devices[0].as_ref().unwrap().state,
+        ConnectionState::Disconnected
+    );
+    assert!(t.app.manager.connection(link).is_none());
+}
+
+#[test]
+fn a_saved_layout_refreshes_the_free_space_estimate() {
+    let mut t = Test::new(true);
+    t.poll();
+    let link = t.radio.connects[0].0;
+    t.store.available = Some(60_000);
+    t.event(Event::Connected {
+        link,
+        descriptors: descriptor(),
+        max_output: 255,
+        layout: Some(classic_layout(KEYBOARD_MAP)),
+    });
+    assert_eq!(t.app.manager.available_bytes, 60_000);
+}
+
+#[test]
+fn layouts_are_not_written_while_storage_is_not_ready() {
+    let mut t = Test::new(true);
+    put_layout(&mut t, &classic_layout(KEYBOARD_MAP));
+    t.poll();
+    let link = t.radio.connects[0].0;
+    t.app.manager.storage_ready = false;
+    let saved = t.store.records.clone();
+    t.event(Event::Connected {
+        link,
+        descriptors: descriptor(),
+        max_output: 255,
+        layout: Some(classic_layout(NUMBERED_MAP)),
+    });
+    t.event(Event::Layout {
+        link,
+        descriptors: Vec::new(),
+        layout: ble_layout(),
+    });
+    t.event(Event::Disconnected {
+        link,
+        error: Some(ErrorCode::UnsupportedHid),
+    });
+    assert_eq!(t.store.records, saved);
+}
+
+#[test]
+fn a_link_ending_with_an_unusable_layout_removes_the_saved_one() {
+    for (error, kept) in [
+        (ErrorCode::ConnectionFailed, true),
+        (ErrorCode::Timeout, true),
+        (ErrorCode::UnsupportedHid, false),
+    ] {
+        let mut t = Test::new(true);
+        put_layout(&mut t, &classic_layout(KEYBOARD_MAP));
+        t.poll();
+        let link = t.radio.connects[0].0;
+        t.event(Event::Disconnected {
+            link,
+            error: Some(error),
+        });
+        assert_eq!(saved_layout(&t).is_some(), kept, "{error:?}");
+    }
+    // A link the adapter closes because the HID layout cannot be used.
+    let mut t = Test::new(true);
+    put_layout(&mut t, &classic_layout(KEYBOARD_MAP));
+    t.poll();
+    let link = t.radio.connects[0].0;
+    t.event(Event::Connected {
+        link,
+        descriptors: Vec::new(),
+        max_output: 255,
+        layout: None,
+    });
+    assert_eq!(t.radio.closes, [link]);
+    t.finish_disconnects();
+    assert_eq!(saved_layout(&t), None);
+}
+
+#[test]
+fn a_layout_with_the_same_maps_keeps_the_live_link() {
+    let mut t = Test::new(true);
+    put_layout(&mut t, &classic_layout(KEYBOARD_MAP));
+    let link = connect_saved(&mut t, descriptor());
+    drain_forward(&mut t);
+    t.event(Event::Input(
+        InputReport::new(link, ServiceId(7), 0, &[1]).unwrap(),
+    ));
+    assert_eq!(t.app.manager.forward.packet().unwrap().bytes()[0], 16);
+    t.app.manager.forward.complete();
+    let moved = Layout {
+        hash: Some(cordial_core::bluetooth::DatabaseHash([7; 16])),
+        ..classic_layout(KEYBOARD_MAP)
+    };
+    t.event(Event::Layout {
+        link,
+        descriptors: descriptor(),
+        layout: moved.clone(),
+    });
+    // The held key is not released, and the new layout is saved.
+    assert!(t.app.manager.forward.packet().is_none());
+    assert_eq!(saved_layout(&t), Some(moved));
+}
+
+#[test]
+fn a_ble_device_that_keeps_dropping_right_after_connecting_waits() {
+    let mut t = Test::new(true);
+    let peer = saved_ble(&mut t);
+    t.poll();
+    for attempt in 1..=3 {
+        t.event(Event::Incoming { attempt, peer });
+        let link = t.radio.connects.last().unwrap().0;
+        t.event(Event::Connected {
+            link,
+            descriptors: descriptor(),
+            max_output: 255,
+            layout: None,
+        });
+        t.event(Event::Disconnected {
+            link,
+            error: Some(ErrorCode::ConnectionFailed),
+        });
+        t.poll();
+    }
+    // Two rapid drops are readmitted at once; the third waits a second.
+    assert_eq!(t.radio.incoming.iter().flatten().count(), 3);
+    assert!(t.radio.reconnect.is_empty());
+    t.event(Event::Incoming { attempt: 4, peer });
+    assert_eq!(t.radio.incoming.last(), Some(&None));
+    t.now += 1000;
+    t.poll();
+    assert_eq!(t.radio.reconnect, [peer]);
+}
+
+#[test]
+fn a_ble_device_power_cycled_every_few_seconds_is_always_readmitted() {
+    let mut t = Test::new(true);
+    let peer = saved_ble(&mut t);
+    t.poll();
+    for (attempt, connected_for) in [2000, 6000, 3000, 2500, 4000, 2000].into_iter().enumerate() {
+        t.event(Event::Incoming {
+            attempt: attempt as u32,
+            peer,
+        });
+        assert!(t.radio.incoming.last().unwrap().is_some(), "{attempt}");
+        let link = t.radio.connects.last().unwrap().0;
+        t.event(Event::Connected {
+            link,
+            descriptors: descriptor(),
+            max_output: 255,
+            layout: None,
+        });
+        t.now += connected_for;
+        t.event(Event::Disconnected { link, error: None });
+        t.poll();
+        assert_eq!(t.radio.reconnect, [peer], "{attempt}");
+    }
+}
+
+#[test]
+fn a_layout_never_takes_the_room_kept_for_pairing() {
+    let mut t = Test::new(true);
+    t.poll();
+    let link = t.radio.connects[0].0;
+    // The file fits by size, but its block does not.
+    let block = 4096;
+    t.store.block = Some(block);
+    let used: usize = t
+        .store
+        .records
+        .values()
+        .map(|r| r.len().div_ceil(block) * block)
+        .sum();
+    t.store.capacity =
+        Some(used + cordial_core::bonds::MAINTENANCE_BYTES + cordial_core::bonds::PAIR_BYTES + 200);
+    t.event(Event::Connected {
+        link,
+        descriptors: descriptor(),
+        max_output: 255,
+        layout: Some(classic_layout(KEYBOARD_MAP)),
+    });
+    assert_eq!(saved_layout(&t), None);
+    assert!(!t.app.manager.storage_full());
+}
+
+#[test]
+fn a_discovered_layout_the_adapter_cannot_use_removes_the_saved_one() {
+    let mut t = Test::new(true);
+    put_layout(&mut t, &classic_layout(KEYBOARD_MAP));
+    t.poll();
+    let link = t.radio.connects[0].0;
+    t.app.manager.devices[0].as_mut().unwrap().effective_enabled = false;
+    t.event(Event::Connected {
+        link,
+        descriptors: descriptor(),
+        max_output: 255,
+        layout: Some(classic_layout(NUMBERED_MAP)),
+    });
+    assert_eq!(t.radio.closes, [link]);
+    assert_eq!(saved_layout(&t), None);
+}
+
+#[test]
+fn a_transport_change_the_radio_missed_is_applied_when_it_is_ready() {
+    let mut t = Test::new(true);
+    t.radio.reject_transport = Some(ErrorCode::RadioUnavailable);
+    let s = set_transports(&mut t, &[(p::Transport::Classic, false)]);
+    assert!(!s.ready);
+    t.radio.reject_transport = None;
+    t.radio.applied.clear();
+    t.event(Event::Ready);
+    assert!(t.status().ready);
+    assert_eq!(
+        t.radio.applied,
+        [(Transport::Classic, false), (Transport::Ble, true)]
+    );
+    assert_eq!(transports(&t.status()), [(CLASSIC, false), (BLE, true)]);
+}
+
+#[test]
+fn scans_leave_out_disabled_transports() {
+    let mut t = Test::new(false);
+    set_transports(&mut t, &[(p::Transport::Classic, false)]);
+    t.ok(Command::StartScan(p::StartScan {
+        transports: vec![CLASSIC, BLE],
+        seconds: 0,
+    }));
+    assert_eq!(
+        t.radio.scans.last().map(|s| (s.1, s.2)),
+        Some((false, true))
+    );
+    t.ok(Command::StopScan(p::StopScan {}));
+    set_transports(&mut t, &[(p::Transport::Ble, false)]);
+    let scans = t.radio.scans.len();
+    assert_eq!(
+        t.code(Command::StartScan(p::StartScan {
+            transports: vec![CLASSIC, BLE],
+            seconds: 0,
+        })),
+        p::ErrorCode::Unsupported
+    );
+    assert_eq!(t.radio.scans.len(), scans);
 }

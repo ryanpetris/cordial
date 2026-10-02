@@ -79,7 +79,10 @@ fn device_changes(old: &p::Device, d: &p::Device) -> Vec<(Kind, String)> {
     {
         out.push((
             Kind::Warn,
-            format!("{name} is inactive: {}", text::inactive_words(reason)),
+            format!(
+                "{name} is inactive: {}",
+                text::inactive_words(reason, d.transport())
+            ),
         ));
     }
     if old.trusted != d.trusted {
@@ -385,6 +388,11 @@ impl<B: Backend> Model<B> {
             Bootloader => "enter the bootloader".into(),
             CancelPairing => "cancel the pairing".into(),
             Platform(_) => "set the platform".into(),
+            Transport(t, on) => format!(
+                "{} {}",
+                if *on { "enable" } else { "disable" },
+                text::transport_long(*t)
+            ),
             Name(_) => "rename the adapter".into(),
             Refresh(_) => format!("refresh the information of {target}"),
             other => command_name(other).into(),
@@ -414,8 +422,10 @@ impl<B: Backend> Model<B> {
             }
             // Events report the saved device; only the result says it won't connect.
             (Pair(_), Outcome::Paired { subject, device }) => {
-                if let Some(reason) = device.as_ref().and_then(model::inactive) {
-                    let text = text::paired_disabled(subject, reason);
+                if let Some(d) = device
+                    && let Some(reason) = model::inactive(d)
+                {
+                    let text = text::paired_disabled(subject, reason, d.transport());
                     self.note(Kind::Warn, text.trim_end_matches('.').into());
                 }
             }
@@ -427,6 +437,10 @@ impl<B: Backend> Model<B> {
             }
             (Platform(p), _) => {
                 let text = format!("Platform set to {}", text::platform_name(*p));
+                self.note(Kind::Good, text);
+            }
+            (Transport(..), Outcome::Transport(t, on)) => {
+                let text = format!("{} {}", text::transport_long(*t), text::enabled_word(*on));
                 self.note(Kind::Good, text);
             }
             _ => {}

@@ -176,7 +176,11 @@ impl<F: NorFlash, const BLOCKS: usize> Storage<F, BLOCKS> {
                         }
                         Err(e) => return Err(e),
                         Ok(_) => {
-                            for temp in [path!("device.json.tmp"), path!("hidpp.json.tmp")] {
+                            for temp in [
+                                path!("device.json.tmp"),
+                                path!("hidpp.json.tmp"),
+                                path!("layout.json.tmp"),
+                            ] {
                                 match fs.remove(&entry.path().join(temp)) {
                                     Ok(()) | Err(LfsError::NO_SUCH_ENTRY) => (),
                                     Err(e) => return Err(e),
@@ -382,6 +386,7 @@ fn record_path(key: RecordKey) -> Result<alloc::string::String, Error> {
         (7, 0) => "/sequence.json".into(),
         (2, id) if id != 0 => format!("/devices/{id:016x}/device.json"),
         (4, id) if id != 0 => format!("/devices/{id:016x}/hidpp.json"),
+        (5, id) if id != 0 => format!("/devices/{id:016x}/layout.json"),
         _ => return Err(Error::Bounds),
     })
 }
@@ -458,6 +463,8 @@ impl<F: NorFlash, const BLOCKS: usize> RecordStore for Storage<F, BLOCKS> {
                         continue;
                     }
                     let id = u64::from_str_radix(name, 16).map_err(|_| LfsError::CORRUPTION)?;
+                    // Saved layouts are read by key only; mounting removes the
+                    // directories whose device is gone.
                     for (kind, suffix) in [(2, "device.json"), (4, "hidpp.json")] {
                         let path = PathBuf::try_from(format!("/devices/{name}/{suffix}").as_str())
                             .map_err(|_| LfsError::INVALID)?;

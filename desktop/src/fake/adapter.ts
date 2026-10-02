@@ -82,7 +82,11 @@ export interface FakeDevice {
 export interface FakeOptions {
   adapterId?: string;
   board?: string;
+  /** Transports the firmware supports. */
   transports?: ("classic" | "ble")[];
+  /** Which supported transports are enabled; as in the firmware, Classic starts disabled and BLE
+   * enabled. */
+  enabled?: Partial<Record<"classic" | "ble", boolean>>;
   devices?: FakeDevice[];
   candidates?: Candidate[];
   /** How pairing authenticates; null pairs without a prompt. */
@@ -228,6 +232,7 @@ export class FakeAdapter implements ByteStream {
   candidates: Candidate[];
   pairingMethod: FakeOptions["pairingMethod"];
   transports: ("classic" | "ble")[];
+  enabled: Record<"classic" | "ble", boolean>;
   platform: "linux" | "windows" | "mac" = "linux";
   name: string;
   readonly defaultName: string;
@@ -251,6 +256,8 @@ export class FakeAdapter implements ByteStream {
   #starting = false;
   #session = 0;
   #scan: ReturnType<typeof setTimeout>[] | null = null;
+  /** The transports the running scan still covers. */
+  #scanning: ("classic" | "ble")[] = [];
   #pairing: { candidate: Candidate; prompt: boolean } | null = null;
   #nextDevice = 10;
   /** Replies and events waiting for the reply delay, in order. */
@@ -266,6 +273,7 @@ export class FakeAdapter implements ByteStream {
     this.candidates = options.candidates ?? demoCandidates();
     this.pairingMethod = options.pairingMethod === undefined ? "confirm" : options.pairingMethod;
     this.transports = options.transports ?? ["classic", "ble"];
+    this.enabled = { classic: false, ble: true, ...options.enabled };
     this.ready = options.ready ?? true;
     this.maxEnabled = options.maxEnabled ?? 7;
     this.#latency = options.latency ?? 0;
@@ -383,6 +391,11 @@ export class FakeAdapter implements ByteStream {
     return d;
   }
 
+  /** The transports in use: those supported and enabled. */
+  available(): ("classic" | "ble")[] {
+    return this.transports.filter((t) => this.enabled[t]);
+  }
+
   status() {
     const info: { key: string; value: ValueInit }[] = [
       { key: "firmware.version", value: wireValue("text", "0.0.0-dev") },
@@ -395,7 +408,7 @@ export class FakeAdapter implements ByteStream {
       name: this.name,
       platform: upper(Platform, this.platform),
       ready: this.ready,
-      transports: this.transports.map((t) => ({ transport: TRANSPORT[t], maxEnabled: this.maxEnabled })),
+      transports: this.transports.map((t) => ({ transport: TRANSPORT[t], maxEnabled: this.maxEnabled, enabled: this.enabled[t] })),
       info,
     });
   }
@@ -403,6 +416,7 @@ export class FakeAdapter implements ByteStream {
   /** Why the adapter doesn't use `d`, as the firmware decides it: the first enabled devices fill each transport's places. */
   inactive(d: FakeDevice): InactiveReason | undefined {
     if (!this.transports.includes(d.transport)) return InactiveReason.UNSUPPORTED_TRANSPORT;
+    if (!this.available().includes(d.transport)) return InactiveReason.TRANSPORT_DISABLED;
     if (d.blocked) return InactiveReason.BLOCKED;
     if (!d.enabled) return InactiveReason.DISABLED;
     const before = this.devices.filter((x) => x.transport === d.transport && x.enabled && !x.blocked);
@@ -577,31 +591,44 @@ export class FakeAdapter implements ByteStream {
       case "getStatus":
         return this.#reply({ result: { case: "status", value: this.status() } });
       case "setAdapter": {
-        const { name, platform } = command.value;
+        const { name, platform, transports } = command.value;
         const next = name === undefined ? this.name : name === "" ? this.defaultName : adapterName(name);
         if (next === null) throw new Refusal(ErrorCode.BAD_ARGS);
         if (platform !== undefined && !(platform in Platform)) throw new Refusal(ErrorCode.BAD_ARGS);
+        if (transports.some((u) => u.transport === Transport.UNSPECIFIED)) throw new Refusal(ErrorCode.BAD_ARGS);
+        const updates = transports.map((u) => ({ transport: this.transports.find((t) => TRANSPORT[t] === u.transport), enabled: u.enabled }));
+        if (updates.some((u) => !u.transport)) throw new Refusal(ErrorCode.UNSUPPORTED);
         this.#needReady();
-        const changed = next !== this.name || (platform !== undefined && Platform[platform]!.toLowerCase() !== this.platform);
+        const toggled: ("classic" | "ble")[] = [];
+        for (const { transport, enabled } of updates) {
+          if (enabled === undefined || this.enabled[transport!] === enabled) continue;
+          this.enabled[transport!] = enabled;
+          if (!toggled.includes(transport!)) toggled.push(transport!);
+        }
+        const changed = next !== this.name || (platform !== undefined && Platform[platform]!.toLowerCase() !== this.platform) || toggled.length > 0;
         this.name = next;
         if (platform !== undefined) this.platform = Platform[platform]!.toLowerCase() as FakeAdapter["platform"];
         this.#reply({ result: { case: "status", value: this.status() } });
         if (changed) this.#event({ case: "adapter", value: this.status() });
+        for (const t of toggled) this.#applyTransport(t);
         return;
       }
       case "startScan": {
         const { transports, seconds } = command.value;
         if (!transports.length || seconds > 60) throw new Refusal(ErrorCode.BAD_ARGS);
-        if (transports.some((t) => !this.transports.some((x) => TRANSPORT[x] === t))) throw new Refusal(ErrorCode.UNSUPPORTED);
+        // Transports that are unsupported or disabled are left out.
+        const scanned = this.available().filter((t) => transports.includes(TRANSPORT[t]));
+        if (!scanned.length) throw new Refusal(ErrorCode.UNSUPPORTED);
         this.#needReady();
         // A running scan ends, and reports so, before the new one is answered.
         this.#stopScan(this.candidates.length);
-        const found = this.candidates.filter((c) => c.transport && transports.includes(TRANSPORT[c.transport]));
+        const found = this.candidates.filter((c) => c.transport && scanned.includes(c.transport));
         this.#reply({});
         const session = this.#session;
+        this.#scanning = scanned;
         const timers = found.map((c, i) =>
           setTimeout(() => {
-            if (this.#session === session) this.#event({ case: "scanFound", value: { id: c.id, transport: TRANSPORT[c.transport!], name: c.name, kind: upper(Kind, c.kind), rssi: c.rssi ?? undefined } });
+            if (this.#session === session && this.#scanning.includes(c.transport!)) this.#event({ case: "scanFound", value: { id: c.id, transport: TRANSPORT[c.transport!], name: c.name, kind: upper(Kind, c.kind), rssi: c.rssi ?? undefined } });
           }, 30 * (i + 1)),
         );
         timers.push(setTimeout(() => this.#stopScan(found.length), (seconds || 10) * 1000));
@@ -617,6 +644,7 @@ export class FakeAdapter implements ByteStream {
         const candidate = this.candidates.find((c) => c.id === command.value.candidate);
         if (!candidate) throw new Refusal(ErrorCode.NOT_FOUND);
         this.#needReady();
+        if (!this.available().includes(candidate.transport ?? "ble")) throw new Refusal(ErrorCode.UNSUPPORTED);
         if (this.storageFull) throw new Refusal(ErrorCode.NO_CAPACITY, CapacityReason.STORAGE);
         const pairing = { candidate, prompt: false };
         this.#pairing = pairing;
@@ -691,7 +719,7 @@ export class FakeAdapter implements ByteStream {
         if (inactive === InactiveReason.DISABLED) throw new Refusal(ErrorCode.DISABLED);
         if (inactive === InactiveReason.BLOCKED) throw new Refusal(ErrorCode.BLOCKED);
         if (inactive === InactiveReason.CAPACITY) throw new Refusal(ErrorCode.NO_CAPACITY, CapacityReason.ENABLED);
-        if (inactive === InactiveReason.UNSUPPORTED_TRANSPORT) throw new Refusal(ErrorCode.UNSUPPORTED);
+        if (inactive === InactiveReason.UNSUPPORTED_TRANSPORT || inactive === InactiveReason.TRANSPORT_DISABLED) throw new Refusal(ErrorCode.UNSUPPORTED);
         if (d.state === "connected") return this.#reply({ result: { case: "device", value: this.record(d) } });
         Object.assign(d, { state: "connecting", paused: false, error: null });
         this.#reply({ result: { case: "device", value: this.record(d) } });
@@ -759,6 +787,29 @@ export class FakeAdapter implements ByteStream {
         return this.#reply({ result: { case: "files", value: { entries: [] } } });
       default:
         throw new Refusal(ErrorCode.UNKNOWN_COMMAND);
+    }
+  }
+
+  /** Applies a transport change as the firmware does after saving it: disabling one closes its
+   * links, ends a pairing over it as an unsupported transport would and drops it from a running
+   * scan, ending the scan when no transport is left. Its saved devices report their new state. */
+  #applyTransport(transport: "classic" | "ble") {
+    const on = this.enabled[transport];
+    if (!on) {
+      const p = this.#pairing;
+      if (p && (p.candidate.transport ?? "ble") === transport) {
+        this.#pairing = null;
+        this.#pairingEvent({ case: "failed", value: ErrorCode.UNSUPPORTED }, p.candidate.id);
+      }
+      if (this.#scan) {
+        this.#scanning = this.#scanning.filter((t) => t !== transport);
+        if (!this.#scanning.length) this.#stopScan(this.candidates.length);
+      }
+    }
+    for (const d of this.devices.filter((x) => x.transport === transport)) {
+      const wasActive = this.#active(d);
+      if (!on) d.state = "disconnected";
+      this.#changed(d, wasActive);
     }
   }
 

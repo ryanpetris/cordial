@@ -75,7 +75,7 @@ fn selected_stack_initializes_through_public_profiles_and_record_callbacks() {
         random: false,
         transport: Transport::Ble,
     };
-    radio.connect(link, peer, true).unwrap();
+    radio.connect(link, peer, true, None).unwrap();
     assert_eq!(
         radio.connect(
             LinkId {
@@ -86,7 +86,8 @@ fn selected_stack_initializes_through_public_profiles_and_record_callbacks() {
                 address: [2; 6],
                 ..peer
             },
-            true
+            true,
+            None
         ),
         Err(ErrorCode::Busy)
     );
@@ -121,6 +122,7 @@ fn selected_stack_initializes_through_public_profiles_and_record_callbacks() {
             },
             peer,
             true,
+            None,
         )
         .unwrap();
 }

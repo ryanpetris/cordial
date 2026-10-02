@@ -95,6 +95,7 @@ const WARNINGS: u8 = 4;
 const PAIR_TIMEOUT_MS: u64 = 120_000;
 const PROMPT_TIMEOUT_MS: u64 = 30_000;
 const CONNECT_TIMEOUT_MS: u64 = 30_000;
+const PAGE_BUSY_MS: u64 = 1000;
 const SCAN_DEFAULT_SECONDS: u32 = 10;
 const SCAN_MAX_SECONDS: u32 = 60;
 
@@ -176,7 +177,8 @@ impl Application {
     }
 
     pub fn status<B: Bluetooth>(&self, radio: &B) -> p::Status {
-        let caps = radio.capabilities();
+        let supported = radio.capabilities();
+        let enabled = self.manager.capabilities(radio);
         let mut info = Vec::new();
         let mut fact = |key: &str, value: p::value::Value| {
             info.push(p::Info {
@@ -203,15 +205,16 @@ impl Application {
             name: self.adapter_name().into(),
             platform: wire::platform(self.manager.preference.host_platform) as i32,
             ready: self.manager.radio_ready && self.manager.storage_ready,
-            transports: [Transport::Classic, Transport::Ble]
+            transports: devices::Transports::ALL
                 .into_iter()
-                .filter(|t| caps.supports(*t))
+                .filter(|t| supported.supports(*t))
                 .map(|t| p::TransportSupport {
                     transport: wire::transport(t) as i32,
                     max_enabled: self
                         .manager
                         .storage_ready
                         .then(|| self.manager.max_enabled(t) as u32),
+                    enabled: Some(enabled.supports(t)),
                 })
                 .collect(),
             info,
@@ -295,7 +298,7 @@ impl Application {
                 let status = self.status(radio);
                 self.reply(Some(R::Status(status)));
             }
-            Command::SetAdapter(args) => self.set_adapter(args, store, radio).await,
+            Command::SetAdapter(args) => self.set_adapter(args, store, radio, now).await,
             Command::EnterBootloader(_) => self.bootloader(now),
             Command::StartScan(args) => self.start_scan(args, radio, now),
             Command::StopScan(_) => {
@@ -320,7 +323,7 @@ impl Application {
                 Err(e) => self.fail(e),
             },
             Command::SetDevice(args) => self.set_device(args, store, radio).await,
-            Command::ConnectDevice(args) => self.connect(&args.device, radio, now),
+            Command::ConnectDevice(args) => self.connect(&args.device, store, radio, now).await,
             Command::DisconnectDevice(args) => match self.find(&args.device) {
                 Ok(slot) => {
                     self.manager.disconnect(slot, radio).ok();
@@ -397,7 +400,8 @@ impl Application {
         &mut self,
         args: p::SetAdapter,
         store: &mut S,
-        radio: &B,
+        radio: &mut B,
+        now: u64,
     ) {
         let name = match args.name.as_deref() {
             None => self.manager.preference.name.clone(),
@@ -412,12 +416,36 @@ impl Application {
             Some(Ok(platform)) => wire::host_platform(platform),
             Some(Err(_)) => return self.fail(bad_args()),
         };
+        let mut transports = self.manager.preference.transports;
+        for update in &args.transports {
+            let transport = match p::Transport::try_from(update.transport) {
+                Ok(p::Transport::Classic) => Transport::Classic,
+                Ok(p::Transport::Ble) => Transport::Ble,
+                Ok(p::Transport::Unspecified) => return self.fail(bad_args()),
+                Err(_) => return self.fail(failure(Error::UnsupportedTransport)),
+            };
+            if !radio.capabilities().supports(transport) {
+                return self.fail(failure(Error::UnsupportedTransport));
+            }
+            if let Some(enabled) = update.enabled {
+                transports.set(transport, enabled);
+            }
+        }
         if !self.manager.storage_ready {
             return self.fail(failure(Error::RadioUnavailable));
         }
         let platform_changed = platform != self.manager.preference.host_platform;
-        if name != self.manager.preference.name || platform_changed {
-            if let Err(code) = self.manager.adapter(name, platform, store).await {
+        let changed: Vec<Transport> = devices::Transports::ALL
+            .into_iter()
+            .filter(|t| transports.contains(*t) != self.manager.preference.transports.contains(*t))
+            .collect();
+        if name != self.manager.preference.name || platform_changed || !changed.is_empty() {
+            let preference = devices::AdapterPreference {
+                name,
+                host_platform: platform,
+                transports,
+            };
+            if let Err(code) = self.manager.adapter(preference, store).await {
                 let uncertain = self.manager.write_uncertain;
                 return self.fail(wire::error(code, None, uncertain));
             }
@@ -431,9 +459,82 @@ impl Application {
                     }
                 }
             }
+            if !changed.is_empty()
+                && let Err(code) = self.apply_transports(&changed, store, radio, now).await
+            {
+                return self.fail(failure(code));
+            }
         }
         let status = self.status(radio);
         self.reply(Some(R::Status(status)));
+    }
+
+    /// Applies saved changes to the enabled transports, all supported by the
+    /// radio. Disabling a transport closes its links, ends a pairing over it as
+    /// an unsupported transport would, and drops it from a running scan, ending
+    /// the scan when nothing is left. Saved devices of a disabled transport
+    /// become inactive, and eligible again once it is enabled.
+    async fn apply_transports<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        changed: &[Transport],
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> Result<(), Error> {
+        let enabled = self.manager.preference.transports;
+        for &transport in changed.iter().filter(|t| !enabled.contains(**t)) {
+            if self
+                .pair
+                .as_ref()
+                .is_some_and(|p| p.address.transport == transport)
+            {
+                self.stop_pairing(Error::UnsupportedTransport, radio);
+            }
+            let links: Vec<LinkId> = self
+                .manager
+                .connections
+                .iter()
+                .flatten()
+                .filter(|c| c.peer.transport == transport)
+                .map(|c| c.id)
+                .collect();
+            for link in links {
+                self.close(link, None, radio);
+            }
+            if let Some(scan) = &mut self.scan {
+                match transport {
+                    Transport::Classic => scan.classic = false,
+                    Transport::Ble => scan.ble = false,
+                }
+                if !scan.classic && !scan.ble {
+                    self.stop_scan(radio);
+                }
+            }
+        }
+        self.manager.refresh_enabled();
+        for slot in 0..self.manager.devices.len() {
+            if self.manager.devices[slot]
+                .as_ref()
+                .is_some_and(|d| changed.contains(&d.policy.peer.transport))
+            {
+                self.mark(slot, DEVICE);
+            }
+        }
+        for &transport in changed {
+            if let Err(error) = radio.set_transport(transport, enabled.contains(transport)) {
+                self.event(Event::Failed(error), store, radio, now).await;
+                return Ok(());
+            }
+        }
+        // A pairing syncs once it ends. A radio failure here is retried at the next sync; a
+        // storage read failure fails the command, with the saved change kept.
+        if self.pair.is_some() {
+            return Ok(());
+        }
+        match self.manager.sync_bonds(store, radio).await {
+            Err(Error::StorageFailed) => Err(Error::StorageFailed),
+            _ => Ok(()),
+        }
     }
 
     fn bootloader(&mut self, now: u64) {
@@ -467,14 +568,18 @@ impl Application {
             s if s <= SCAN_MAX_SECONDS => s,
             _ => return self.fail(bad_args()),
         };
-        let caps = radio.capabilities();
+        // Requested transports that are unsupported or disabled are left out.
+        let caps = self.manager.capabilities(radio);
         let (mut classic, mut ble) = (false, false);
         for transport in &args.transports {
             match p::Transport::try_from(*transport) {
-                Ok(p::Transport::Classic) if caps.classic => classic = true,
-                Ok(p::Transport::Ble) if caps.ble => ble = true,
-                _ => return self.fail(failure(Error::UnsupportedTransport)),
+                Ok(p::Transport::Classic) => classic |= caps.classic,
+                Ok(p::Transport::Ble) => ble |= caps.ble,
+                _ => {}
             }
+        }
+        if !classic && !ble {
+            return self.fail(failure(Error::UnsupportedTransport));
         }
         if !self.manager.radio_ready {
             return self.fail(failure(Error::RadioUnavailable));
@@ -529,7 +634,7 @@ impl Application {
         if !self.manager.storage_ready || !self.manager.radio_ready {
             return self.fail(failure(Error::RadioUnavailable));
         }
-        if !radio.capabilities().supports(peer.transport)
+        if !self.manager.capabilities(radio).supports(peer.transport)
             || radio.bond_capacity(peer.transport) == 0
         {
             return self.fail(failure(Error::UnsupportedTransport));
@@ -743,7 +848,13 @@ impl Application {
         }
     }
 
-    fn connect<B: Bluetooth>(&mut self, id: &str, radio: &mut B, now: u64) {
+    async fn connect<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: &str,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
         let slot = match self.find(id) {
             Ok(slot) => slot,
             Err(e) => return self.fail(e),
@@ -754,10 +865,19 @@ impl Application {
         if self.pair.is_some() {
             return self.fail(failure(Error::Busy));
         }
-        match self
-            .manager
-            .connect(slot, true, now.saturating_add(CONNECT_TIMEOUT_MS), radio)
-        {
+        let d = self.manager.devices[slot].as_ref().unwrap();
+        let layout = if d.state == ConnectionState::Disconnected {
+            crate::layouts::load(store, d.policy.id, d.policy.peer.transport).await
+        } else {
+            None
+        };
+        match self.manager.connect(
+            slot,
+            true,
+            now.saturating_add(CONNECT_TIMEOUT_MS),
+            layout.as_ref(),
+            radio,
+        ) {
             Ok(_) => {
                 self.mark(slot, DEVICE);
                 self.device_result(slot);
@@ -1065,8 +1185,12 @@ impl Application {
         match event {
             Event::Ready => {
                 self.manager.radio_ready = true;
+                // A change the backend could not apply before it restarted is applied now.
                 let ready = if self.manager.storage_ready {
-                    self.manager.sync_bonds(store, radio).await
+                    match self.manager.apply_transports(radio) {
+                        Ok(()) => self.manager.sync_bonds(store, radio).await,
+                        Err(error) => Err(error),
+                    }
                 } else {
                     self.manager.load(store, radio).await
                 };
@@ -1160,10 +1284,20 @@ impl Application {
             }
             Event::Incoming { attempt, peer } => {
                 if self.pair.is_some() {
-                    let _ = radio.incoming(attempt, None);
+                    let _ = radio.incoming(attempt, None, None);
                     return;
                 }
-                if let Ok(Some(slot)) = self.manager.incoming(attempt, peer, now, radio) {
+                let layout = match self.manager.admits(peer, now) {
+                    Some(slot) => {
+                        let id = self.manager.devices[slot].as_ref().unwrap().policy.id;
+                        crate::layouts::load(store, id, peer.transport).await
+                    }
+                    None => None,
+                };
+                if let Ok(Some(slot)) =
+                    self.manager
+                        .incoming(attempt, peer, now, layout.as_ref(), radio)
+                {
                     self.mark(slot, DEVICE);
                 }
             }
@@ -1242,18 +1376,73 @@ impl Application {
                 link,
                 descriptors,
                 max_output,
+                layout,
             } => match self.manager.connected(link, descriptors, max_output, now) {
-                Ok(Some(slot)) => self.mark(slot, DEVICE | SETTINGS | WARNINGS),
+                Ok(Some(slot)) => {
+                    self.mark(slot, DEVICE | SETTINGS | WARNINGS);
+                    if let Some(layout) = layout {
+                        self.manager.connection_mut(link).unwrap().maps =
+                            Some(crate::layouts::maps(&layout));
+                        self.save_layout(slot, &layout, store).await;
+                    }
+                }
                 Ok(None) => {}
-                Err(e) => self.close(link, Some(e), radio),
+                Err(e) => {
+                    // The backend could not use the saved layout.
+                    if layout.is_some()
+                        && let Some(slot) = self.manager.connection(link).and_then(|c| c.device)
+                    {
+                        self.remove_layout(slot, store).await;
+                    }
+                    self.close(link, Some(e), radio);
+                }
             },
+            Event::Layout {
+                link,
+                descriptors,
+                layout,
+            } => {
+                let maps = crate::layouts::maps(&layout);
+                let Some((slot, unchanged)) = self
+                    .manager
+                    .connection(link)
+                    .filter(|c| !c.closing && c.runtime.is_some())
+                    .and_then(|c| Some((c.device?, c.maps == Some(maps))))
+                else {
+                    return;
+                };
+                // Changed report characteristics alone leave the parsed maps as they are.
+                if unchanged {
+                    return self.save_layout(slot, &layout, store).await;
+                }
+                match self.manager.relayout(link, descriptors) {
+                    Ok(Some(slot)) => {
+                        self.manager.connection_mut(link).unwrap().maps = Some(maps);
+                        self.mark(slot, DEVICE | SETTINGS | WARNINGS);
+                        self.save_layout(slot, &layout, store).await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        self.remove_layout(slot, store).await;
+                        self.close(link, Some(e), radio);
+                    }
+                }
+            }
             Event::Security { link, security } => {
                 if let Some(slot) = self.manager.security(link, security) {
                     self.mark(slot, DEVICE);
                 }
             }
             Event::Disconnected { link, error } => {
+                let ended = self
+                    .manager
+                    .connection(link)
+                    .and_then(|c| Some((c.device?, c.error.or(error))));
                 self.dropped(link, error, now);
+                // A device whose HID layout could not be used is discovered again next time.
+                if let Some((slot, Some(Error::UnsupportedHid))) = ended {
+                    self.remove_layout(slot, store).await;
+                }
                 // A failed sync is retried at the next one.
                 if self.pair.is_none() && self.manager.storage_ready {
                     let _ = self.manager.sync_bonds(store, radio).await;
@@ -1320,6 +1509,50 @@ impl Application {
                     );
                 }
             }
+        }
+    }
+
+    /// A failed save leaves the next connection to discover the device again.
+    async fn save_layout<S: RecordStore>(
+        &mut self,
+        slot: usize,
+        layout: &crate::bluetooth::Layout,
+        store: &mut S,
+    ) {
+        if !self.manager.storage_ready {
+            return;
+        }
+        let policy = &self.manager.devices[slot].as_ref().unwrap().policy;
+        let (id, transport) = (policy.id, policy.peer.transport);
+        let full = self.manager.storage_full();
+        let saved = crate::layouts::save(store, id, transport, layout).await;
+        self.refresh_available(store).await;
+        // Whole-block allocation can take more than the file's size. A layout never takes
+        // the room kept for pairing another device.
+        if saved && self.manager.storage_full() {
+            crate::layouts::remove(store, id).await;
+            self.refresh_available(store).await;
+        }
+        self.adapter_dirty |= full != self.manager.storage_full();
+    }
+
+    /// A failed read keeps the last estimate.
+    async fn refresh_available<S: RecordStore>(&mut self, store: &mut S) {
+        if let Ok(bytes) = store.available().await {
+            self.manager.available_bytes = bytes;
+        }
+    }
+
+    /// Removes a saved layout that no longer describes the device.
+    async fn remove_layout<S: RecordStore>(&mut self, slot: usize, store: &mut S) {
+        if let Some(d) = self
+            .manager
+            .devices
+            .get(slot)
+            .and_then(Option::as_ref)
+            .filter(|_| self.manager.storage_ready)
+        {
+            crate::layouts::remove(store, d.policy.id).await;
         }
     }
 
@@ -1678,19 +1911,28 @@ impl Application {
                 {
                     break;
                 }
-                if !self.manager.devices[slot].as_ref().is_some_and(|d| {
-                    d.policy.peer.transport == Transport::Classic && d.reconnect_due(now)
-                }) {
+                let Some(d) = self.manager.devices[slot]
+                    .as_ref()
+                    .filter(|d| d.policy.peer.transport == Transport::Classic && d.page_due(now))
+                else {
                     continue;
-                }
+                };
+                let id = d.policy.id;
+                let layout = crate::layouts::load(store, id, Transport::Classic).await;
                 match self.manager.connect(
                     slot,
                     false,
                     now.saturating_add(CONNECT_TIMEOUT_MS),
+                    layout.as_ref(),
                     radio,
                 ) {
                     Ok(_) => self.mark(slot, DEVICE),
-                    Err(Error::Busy | Error::Capacity) => {}
+                    // A radio busy with other link setup takes the page shortly, without
+                    // reading the saved layout on every poll meanwhile.
+                    Err(Error::Busy | Error::Capacity) => self.manager.devices[slot]
+                        .as_mut()
+                        .unwrap()
+                        .defer_page(now.saturating_add(PAGE_BUSY_MS)),
                     Err(e) => {
                         self.manager.devices[slot].as_mut().unwrap().connection(
                             ConnectionState::Disconnected,
@@ -1705,20 +1947,14 @@ impl Application {
         let available = self.pair.is_none()
             && self.manager.storage_ready
             && self.manager.radio_ready
-            && self.manager.connections.iter().flatten().count() < devices::ACTIVE_CONNECTIONS - 1
-            && !self
-                .manager
-                .connections
-                .iter()
-                .flatten()
-                .any(|c| c.runtime.is_none() || c.closing);
+            && self.manager.ble_admission();
         let peers: Vec<_> = self
             .manager
             .devices
             .iter()
             .filter_map(|device| {
                 let d = device.as_ref()?;
-                (available && d.policy.peer.transport == Transport::Ble && d.reconnect_due(now))
+                (available && d.policy.peer.transport == Transport::Ble && d.admit_due(now))
                     .then_some(d.policy.peer)
             })
             .collect();

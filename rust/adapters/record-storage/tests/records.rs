@@ -406,3 +406,55 @@ fn full_filesystem_preserves_old_file_and_allows_deletion() {
         assert_eq!(fs.file_size("/important").unwrap(), None);
     });
 }
+
+#[test]
+fn device_documents_have_their_own_files_and_layouts_are_not_enumerated() {
+    use cordial_core::storage::{RecordStore, record_key};
+    block_on(async {
+        let mut store = Storage::provision_blank(Flash::blank(), 4096..128 * 1024, [1; 32])
+            .await
+            .unwrap();
+        for kind in [5, 4, 2] {
+            store.save(record_key(kind, 1), &[kind]).await.unwrap();
+        }
+        for name in ["device.json", "hidpp.json", "layout.json"] {
+            let path = format!("/devices/0000000000000001/{name}");
+            assert_eq!(store.file_size(&path).unwrap(), Some(1), "{name}");
+        }
+        // Layouts are read by key and never enumerated.
+        assert_eq!(
+            store.keys().await.unwrap(),
+            [record_key(2, 1), record_key(4, 1)]
+        );
+        // Mounting removes an interrupted replacement and keeps the saved file.
+        store
+            .replace_file("/devices/0000000000000001/layout.json.tmp", b"partial")
+            .unwrap();
+        let mut store = Storage::open(store.into_flash(), 4096..128 * 1024, [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .file_size("/devices/0000000000000001/layout.json.tmp")
+                .unwrap(),
+            None
+        );
+        let mut bytes = [0; 4];
+        assert_eq!(
+            store.load(record_key(5, 1), &mut bytes).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(bytes[0], 5);
+        store.remove(record_key(5, 1)).await.unwrap();
+        assert_eq!(
+            store.load(record_key(5, 1), &mut bytes).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .file_size("/devices/0000000000000001/layout.json")
+                .unwrap(),
+            None
+        );
+    });
+}

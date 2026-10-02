@@ -29,7 +29,7 @@ typedef struct {
     bool started;
     uint16_t connection, mtu, read_length;
     uint8_t prompt, error;
-    bool pairing, closing, secure, mtu_done, reported;
+    bool pairing, closing, secure, mtu_done, reported, read_found;
 } link;
 static link links[4];
 static cordial_ble_emit emit;
@@ -159,6 +159,16 @@ static bool bonds(const ble_addr_t *absent) {
     }
     cordial_ble_event e={.kind=CORDIAL_BLE_BONDS,.data=(const uint8_t *)peers,.length=count*sizeof(peers[0])};emit(&e);return true;
 }
+// Only failures showing that the peer rejected the stored keys, or wants to
+// pair again, report AUTH: authentication failure, a missing key, a MIC
+// failure or a failed pairing exchange. A link that drops or fails while
+// encryption starts reports CONNECTION, so reconnects continue.
+static uint8_t security_error(int status) {
+    if (status==BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL) || status==BLE_HS_HCI_ERR(BLE_ERR_PINKEY_MISSING)
+        || status==BLE_HS_HCI_ERR(BLE_ERR_CONN_TERM_MIC)
+        || (status>=BLE_HS_ERR_SM_US_BASE && status<BLE_HS_ERR_HW_BASE)) return CORDIAL_BLE_AUTH;
+    return CORDIAL_BLE_CONNECTION;
+}
 static void fail(link *l,uint8_t code) {
     if (!l) return;
     cordial_ble_event e={.kind=CORDIAL_BLE_DISCONNECTED,.token=l->token,.code=code};
@@ -215,7 +225,8 @@ failed:;
 static void security_ready(link *l) {
     if (!l || l->closing || !l->secure || !l->mtu_done) return;
     struct ble_gap_conn_desc desc;
-    if (ble_gap_conn_find(l->connection,&desc) || !bonds(NULL)) { fail(l,CORDIAL_BLE_STORAGE);return; }
+    if (ble_gap_conn_find(l->connection,&desc)) { fail(l,CORDIAL_BLE_CONNECTION);return; }
+    if (!bonds(NULL)) { fail(l,CORDIAL_BLE_STORAGE);return; }
     if (!l->reported) {
         cordial_ble_event connected={.kind=CORDIAL_BLE_CONNECTED,.token=l->token,.number=l->mtu-3};emit(&connected);
     }
@@ -245,7 +256,7 @@ static void connected(link *l) {
         l->secure=true;security_ready(l);return;
     }
     int status=ble_gap_security_initiate(l->connection);
-    if(status && status!=BLE_HS_EALREADY)fail(l,CORDIAL_BLE_AUTH);
+    if(status && status!=BLE_HS_EALREADY)fail(l,security_error(status));
 }
 static int auto_gap(struct ble_gap_event *event,void *arg) {
     uint32_t attempt=(uint32_t)(uintptr_t)arg;
@@ -311,15 +322,19 @@ static int gap(struct ble_gap_event *event,void *arg) {
         l=by_handle(event->disconnect.conn.conn_handle);if (!l) return 0;
         cordial_ble_event e={.kind=CORDIAL_BLE_DISCONNECTED,.token=l->token,
             .code=l->error ? l->error:(l->closing ? CORDIAL_BLE_OK:CORDIAL_BLE_CONNECTION)};
+        // A peer that rejects the stored keys can drop the link while
+        // encryption starts, before or instead of an encryption event.
+        if(!l->reported && e.code==CORDIAL_BLE_CONNECTION && security_error(event->disconnect.reason)==CORDIAL_BLE_AUTH)
+            e.code=CORDIAL_BLE_AUTH;
         if(!bonds(NULL)) e.code=CORDIAL_BLE_STORAGE;
         emit(&e);memset(l,0,sizeof(*l));return 0;
     }
     case BLE_GAP_EVENT_ENC_CHANGE: {
         l=by_handle(event->enc_change.conn_handle);if (!l || l->closing) return 0;
         struct ble_gap_conn_desc desc;
-        if (event->enc_change.status) { fail(l,CORDIAL_BLE_AUTH);return 0; }
-        int status=ble_gap_conn_find(l->connection,&desc);
-        if (status || !desc.sec_state.encrypted || !desc.sec_state.bonded) { fail(l,CORDIAL_BLE_AUTH);return 0; }
+        if (event->enc_change.status) { fail(l,security_error(event->enc_change.status));return 0; }
+        if (ble_gap_conn_find(l->connection,&desc)) { fail(l,CORDIAL_BLE_CONNECTION);return 0; }
+        if (!desc.sec_state.encrypted || !desc.sec_state.bonded) { fail(l,CORDIAL_BLE_AUTH);return 0; }
         l->secure=true;security_ready(l);return 0;
     }
     case BLE_GAP_EVENT_PASSKEY_ACTION: {
@@ -338,6 +353,8 @@ static int gap(struct ble_gap_event *event,void *arg) {
     }
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
         l=by_handle(event->repeat_pairing.conn_handle);
+        // A saved device that asks to pair again has lost its bond.
+        if(l && !l->pairing && !l->closing) { fail(l,CORDIAL_BLE_AUTH);return BLE_GAP_REPEAT_PAIRING_IGNORE; }
         if(!l || !l->pairing || l->closing)return BLE_GAP_REPEAT_PAIRING_IGNORE;
         struct ble_gap_conn_desc desc;
         if(ble_gap_conn_find(l->connection,&desc))return BLE_GAP_REPEAT_PAIRING_IGNORE;
@@ -391,6 +408,27 @@ static int read_callback(uint16_t conn,const struct ble_gatt_error *error,struct
     }
     l->read_length+=length;
     cordial_ble_event e={.kind=CORDIAL_BLE_DATA,.request=request,.offset=attr->offset,.length=length,.data=data};emit(&e);return 0;
+}
+// Read Using Characteristic UUID delivers only the first matching attribute.
+// Any ATT error response from the peer, such as Attribute Not Found, means it
+// offers no readable value and completes as UNSUPPORTED. Host and transport
+// failures never do, so the owner can tell the two apart.
+static void complete_uuid(uint32_t request,int status) {
+    uint8_t code=operation_error(status);
+    if(status>BLE_HS_ERR_ATT_BASE && status<BLE_HS_ERR_HCI_BASE) code=CORDIAL_BLE_UNSUPPORTED;
+    else if(code==CORDIAL_BLE_UNSUPPORTED) code=CORDIAL_BLE_CONNECTION;
+    cordial_ble_event e={.kind=CORDIAL_BLE_COMPLETE,.request=request,.code=code}; emit(&e);
+}
+static int uuid_callback(uint16_t conn,const struct ble_gatt_error *error,struct ble_gatt_attr *attr,void *arg) {
+    uint32_t request=(uint32_t)(uintptr_t)arg;
+    link *l=by_handle(conn);
+    if (!l || l->read_request!=request) return 0;
+    if (error->status) { l->read_request=0;complete_uuid(request,error->status==BLE_HS_EDONE ? 0:error->status);return 0; }
+    if (l->read_found) return 0;
+    uint8_t data[512];uint16_t length=OS_MBUF_PKTLEN(attr->om);
+    if (length>sizeof(data) || os_mbuf_copydata(attr->om,0,length,data)) { l->read_request=0;complete_uuid(request,BLE_HS_EMSGSIZE);return BLE_HS_EMSGSIZE; }
+    l->read_found=true;
+    cordial_ble_event e={.kind=CORDIAL_BLE_DATA,.request=request,.offset=0,.length=length,.data=data};emit(&e);return 0;
 }
 static int write_callback(uint16_t conn,const struct ble_gatt_error *error,struct ble_gatt_attr *attr,void *arg) {
     (void)conn;(void)attr;complete((uint32_t)(uintptr_t)arg,error->status);return 0;
@@ -518,6 +556,13 @@ static void command(const cordial_ble_command *c) {
         status=ble_gattc_read_long(l->connection,c->handle,0,read_callback,arg);
         if(status) l->read_request=0;
         break;
+    case CORDIAL_BLE_READ_UUID: {
+        ble_uuid16_t uuid=BLE_UUID16_INIT(c->number);
+        l->read_request=c->request;l->read_found=false;
+        status=ble_gattc_read_by_uuid(l->connection,1,0xffff,&uuid.u,uuid_callback,arg);
+        if(status) { l->read_request=0;complete_uuid(c->request,status);return; }
+        break;
+    }
     case CORDIAL_BLE_SUBSCRIBE: {
         uint8_t value[2]={c->enabled ? 2:1,0};
         status=ble_gattc_write_flat(l->connection,c->start,value,2,write_callback,arg);break;

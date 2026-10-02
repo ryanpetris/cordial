@@ -46,7 +46,7 @@ refuses, the client shows the error and does nothing else, since events bring it
 | Answering a prompt: `NO_PROMPT` | The latest pairing step is `enter_code` or `confirm_code` |
 | Connecting: `DISABLED`, `BLOCKED` | `Device.enabled`, `Device.blocked`, `Device.inactive` |
 | Scanning with no transports: `BAD_ARGS` | The request itself |
-| A transport the firmware lacks: `UNSUPPORTED` | `Status.transports` |
+| Scanning only transports the firmware lacks or has disabled, or using one otherwise: `UNSUPPORTED` | `Status.transports` and `TransportSupport.enabled` |
 | Commands that need Bluetooth or storage: `NOT_READY` | `Status.ready` |
 | Commands that need a connection: `NOT_CONNECTED` | `Device.state` |
 | A setting value out of range or too long: `BAD_ARGS` | The setting type's limits |

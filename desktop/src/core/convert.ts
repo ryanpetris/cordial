@@ -54,7 +54,7 @@ export function wire<E extends Record<string, string | number>>(e: E, value: Low
   return e[value.toUpperCase() as keyof E];
 }
 
-const transport = (t: Transport) => (t === Transport.CLASSIC ? "classic" : t === Transport.BLE ? "ble" : null);
+export const transport = (t: Transport) => (t === Transport.CLASSIC ? "classic" : t === Transport.BLE ? "ble" : null);
 const optional = <T>(value: T | undefined): T | null => (value === undefined ? null : value);
 /** Device values fit in a double; larger ones only lose precision. */
 const number = (n: bigint) => Number(n);
@@ -103,7 +103,8 @@ export function status(s: Status): AdapterStatus {
     ready: s.ready,
     transports: s.transports.flatMap((t) => {
       const kind = transport(t.transport);
-      return kind ? [{ transport: kind, maxEnabled: optional(t.maxEnabled) }] : [];
+      // Firmware that predates the setting doesn't report it, and uses every transport it supports.
+      return kind ? [{ transport: kind, maxEnabled: optional(t.maxEnabled), enabled: t.enabled !== false, settable: t.enabled !== undefined }] : [];
     }),
     info: info(s.info),
   };

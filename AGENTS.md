@@ -109,6 +109,11 @@ environment variables, and configuration keys in backticks.
   approval before it is introduced, anywhere in the project. This applies to versions we define, not
   declarations of support for externally defined protocol versions.
 - Changing any such version requires explicit user approval.
+- Any change to the serial protocol between the Dongle and the Host software, including
+  `proto/cordial.proto`, framing, and the documented behaviour of its messages, requires explicit
+  maintainer approval before it is made.
+- Firmware downgrades are not supported. Saved data written by newer firmware does not need to
+  stay readable by older firmware.
 
 ## Issues
 

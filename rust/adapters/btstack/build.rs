@@ -87,7 +87,6 @@ fn main() {
         "src/ble/att_server.c",
         "src/ble/gatt_client.c",
         "src/ble/sm.c",
-        "src/ble/gatt-service/hids_host.c",
     ] {
         println!("cargo:rerun-if-changed={}", source.join(path).display());
         build.file(source.join(path));

@@ -104,6 +104,7 @@ pub trait Host {
     }
     /// Callbacks never reenter the profile owner. Tokens are copied, retained
     /// through completion, and never inferred from a reused connection slot.
+    /// Notifications are published only from an encrypted, bonded link.
     fn start(&mut self) -> Result<(), Error>;
     fn next_event(&mut self) -> Option<Event>;
     async fn changed(&self);
@@ -112,7 +113,9 @@ pub trait Host {
     fn incoming(&mut self, attempt: u32, token: Option<u32>) -> Result<(), Error>;
     fn connect(&mut self, token: u32, peer: Peer, pairing: bool) -> Result<(), Error>;
     fn adopt(&mut self, token: u32) -> Result<(), Error>;
-    fn disconnect(&mut self, token: u32);
+    /// An error means the host could not accept the request now; the link
+    /// is unchanged and the profile repeats the request later.
+    fn disconnect(&mut self, token: u32) -> Result<(), Error>;
     fn pair_reply(
         &mut self,
         token: u32,
@@ -136,6 +139,11 @@ pub trait Host {
         handle: u16,
         descriptor: bool,
     ) -> Result<(), Error>;
+    /// Reads the value of the first attribute of type `uuid` in the whole
+    /// database, delivering Data and Complete like `read`. Any ATT error
+    /// response from the device completes with `UnsupportedHid`; no other
+    /// failure does.
+    fn read_by_uuid(&mut self, token: u32, request: u32, uuid: u16) -> Result<(), Error>;
     fn subscribe(
         &mut self,
         token: u32,

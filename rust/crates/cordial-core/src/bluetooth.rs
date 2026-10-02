@@ -53,6 +53,84 @@ impl Descriptor {
         Self::from_slice(service, &scratch[..length])
     }
 }
+/// Most report characteristics a saved BLE layout may describe.
+pub const LAYOUT_REPORTS: usize = 32;
+/// Most HID services a saved layout may describe.
+pub const LAYOUT_SERVICES: usize = 3;
+
+/// A bonded device's HID layout. The application saves it after discovery and
+/// supplies it to later connections, which admit input without rediscovering
+/// it. The backend then verifies it in the background and reports a change.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Layout {
+    /// The raw report map of each HID service, indexed by `ServiceId`.
+    /// Classic devices have exactly one.
+    pub maps: Vec<ReportMap>,
+    /// BLE report characteristics. Classic devices have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<LayoutReport>,
+    /// The device's GATT Database Hash when it exposes one. A backend given a
+    /// layout with a hash reads the device's current hash before using the
+    /// layout and discovers the device instead when they differ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<DatabaseHash>,
+}
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ReportMap(#[serde(with = "crate::hex::bytes")] pub Vec<u8>);
+/// The value of the GATT Database Hash characteristic (0x2B2A).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct DatabaseHash(#[serde(with = "crate::hex")] pub [u8; 16]);
+
+/// One HID Report characteristic of a saved BLE layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LayoutReport {
+    /// Index of the owning service in `Layout::maps`.
+    pub service: u16,
+    pub kind: ReportType,
+    /// Report ID from the Report Reference descriptor; zero when unnumbered.
+    pub id: u8,
+    /// Characteristic value handle.
+    pub value: u16,
+    /// GATT characteristic properties.
+    pub properties: u8,
+    /// Client Characteristic Configuration descriptor handle; zero when absent.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cccd: u16,
+}
+fn is_zero(value: &u16) -> bool {
+    *value == 0
+}
+impl Layout {
+    /// Whether a backend can use this layout for `transport` without discovery.
+    pub fn valid(&self, transport: Transport) -> bool {
+        let services = self.maps.len();
+        (1..=LAYOUT_SERVICES).contains(&services)
+            && self
+                .maps
+                .iter()
+                .all(|m| !m.0.is_empty() && m.0.len() <= hid::DESCRIPTOR_BYTES)
+            && match transport {
+                Transport::Classic => services == 1 && self.reports.is_empty(),
+                Transport::Ble => {
+                    self.reports.len() <= LAYOUT_REPORTS
+                        && self.reports.iter().any(|r| r.kind == ReportType::Input)
+                        && self.reports.iter().enumerate().all(|(i, r)| {
+                            usize::from(r.service) < services
+                                && r.value != 0
+                                && (r.cccd == 0 || r.cccd > r.value)
+                                && !self.reports[..i].iter().any(|o| {
+                                    o.service == r.service && o.kind == r.kind && o.id == r.id
+                                })
+                        })
+                }
+            }
+    }
+}
+
 /// Inline data keeps ordinary input free of allocator calls.
 pub struct InputReport {
     pub link: LinkId,
@@ -119,10 +197,21 @@ pub enum Event {
     },
     /// Security and all report-map setup have completed. Descriptors belong to
     /// their service, and all reports below exclude any prefixed report ID.
+    /// `layout` is the newly discovered layout when the backend could not use
+    /// a supplied one; it is `None` when the supplied layout is in use.
     Connected {
         link: LinkId,
         descriptors: Vec<Descriptor>,
         max_output: usize,
+        layout: Option<Layout>,
+    },
+    /// Background verification of a supplied layout found a different one.
+    /// The backend already routes reports by the new layout; input after this
+    /// event belongs to these descriptors.
+    Layout {
+        link: LinkId,
+        descriptors: Vec<Descriptor>,
+        layout: Layout,
     },
     Security {
         link: LinkId,
@@ -164,7 +253,22 @@ pub trait Bluetooth {
         false
     }
 
+    /// What the backend and controller support, whether or not a transport is
+    /// enabled.
     fn capabilities(&self) -> Capabilities;
+    /// Enables or disables a transport. The backend starts with Classic
+    /// disabled and BLE enabled, keeps the last values across its own restarts
+    /// and applies them whenever it starts. With Classic disabled it is neither
+    /// connectable nor discoverable over BR/EDR, does not page or inquire, and
+    /// declines incoming Classic connections. With BLE disabled it does not
+    /// scan, initiates no accept-list or explicit LE connection, and declines
+    /// incoming LE connections. For each transport in `capabilities`, the
+    /// application calls it after loading its saved adapter preference and
+    /// whenever the backend reports Ready; for a changed transport, it calls it
+    /// on every change. An error is a radio failure.
+    fn set_transport(&mut self, _transport: Transport, _enabled: bool) -> Result<(), Error> {
+        Ok(())
+    }
     /// Native database capacity, including the temporary pairing entry.
     fn bond_capacity(&self, _transport: Transport) -> usize {
         0
@@ -173,8 +277,21 @@ pub trait Bluetooth {
     /// Connections are offered through Incoming and must still be admitted.
     fn reconnect(&mut self, peers: &[Peer]) -> Result<(), Error>;
     fn scan(&mut self, id: u64, classic: bool, ble: bool) -> Result<(), Error>;
-    fn connect(&mut self, link: LinkId, peer: Peer, pairing: bool) -> Result<(), Error>;
-    fn incoming(&mut self, attempt: u32, accept: Option<LinkId>) -> Result<(), Error>;
+    /// `layout` is the device's saved layout, never supplied when pairing. A
+    /// backend that cannot use it discovers the device instead.
+    fn connect(
+        &mut self,
+        link: LinkId,
+        peer: Peer,
+        pairing: bool,
+        layout: Option<&Layout>,
+    ) -> Result<(), Error>;
+    fn incoming(
+        &mut self,
+        attempt: u32,
+        accept: Option<LinkId>,
+        layout: Option<&Layout>,
+    ) -> Result<(), Error>;
     /// Reject further authentication for this generation. Before Disconnected,
     /// finish native cleanup for a pairing that has not been adopted. Do not
     /// publish later callbacks under a reused slot or remove another live bond.

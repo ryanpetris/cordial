@@ -216,7 +216,7 @@ fn accept_list_admits_any_advertiser_and_serializes_cancellation() {
         }
         _ => panic!("expected saved-peer admission"),
     };
-    radio.incoming(attempt, None).unwrap();
+    radio.incoming(attempt, None, None).unwrap();
     // Rejecting admission disconnects the actual ACL rather than starting SMP.
     let mut disconnected = false;
     for sequence in 0..20 {
@@ -306,7 +306,7 @@ fn accept_list_admits_any_advertiser_and_serializes_cancellation() {
         slot: 0,
         generation: 1,
     };
-    radio.connect(link, replacement[7], true).unwrap();
+    radio.connect(link, replacement[7], true, None).unwrap();
     io.finish_outbound(true);
     radio.poll();
     receive(io, &[0x0f, 4, 0, 1, 0x0d, 0x20]);
@@ -328,7 +328,7 @@ fn accept_list_admits_any_advertiser_and_serializes_cancellation() {
         Event::Incoming { attempt, .. } => attempt,
         _ => panic!("late automatic ACL"),
     };
-    radio.incoming(attempt, None).unwrap();
+    radio.incoming(attempt, None, None).unwrap();
     let mut retired = false;
     for sequence in 0..30 {
         radio.poll();

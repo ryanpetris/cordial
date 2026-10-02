@@ -212,7 +212,7 @@ static void peer_service_queries(void) {
 int main(void){
     cordial_runtime_callbacks cb={.time_ms=time_cb,.wake=wake_cb,.fatal=fatal_cb,.can_send=can_send_cb,.send=send_cb};
     btstack_tlv_t tlv={.get_tag=get,.store_tag=save,.delete_tag=del};
-    cordial_runtime_init(&cb,&tlv,NULL,NULL); cordial_profiles_init(NULL,event_cb);
+    cordial_runtime_init(&cb,&tlv,NULL,NULL); cordial_profiles_init(NULL,event_cb); transport_enabled[CORDIAL_CLASSIC] = true;
     scan_tokens_restart_duplicate_filtering();
     resolved_reports_keep_identity_and_private_address();
     security_precedes_initial_connected_snapshot();
@@ -268,11 +268,11 @@ int main(void){
     // Reusing an existing Classic ACL emits HID opened without HCI created.
     cordial_peer classic={.address={9,8,7,6,5,4},.transport=CORDIAL_CLASSIC};
     cordial_connection *reuse=allocate((cordial_link){.generation=4,.slot=0},classic,false);
-    assert(reuse); reuse->cid=42; initiating=reuse;
+    assert(reuse); reuse->cid=42; initiating[CORDIAL_CLASSIC]=reuse;
     uint8_t opened[15]={HCI_EVENT_HID_META,13,HID_SUBEVENT_CONNECTION_OPENED,42,0,0};
     little_endian_store_16(opened,12,0x40);
     classic_event(opened,sizeof opened);
-    assert(initiating == NULL);
+    assert(initiating[CORDIAL_CLASSIC] == NULL);
     cordial_profiles_disconnect(reuse->id); // Unknown native handle must terminate.
     assert(reuse->ended);
     cordial_profiles_poll(3);

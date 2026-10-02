@@ -7,7 +7,7 @@ use super::{
         self, Choice, Hit, Layout, Styled, Tone, accent, beside, bold, dim, err, inherit, join,
         line_width, ok, pad, pad_str, span, spread, strip, styled, title, truncate, warn,
     },
-    pair_blocked, pending_for, scan_choices, scan_name,
+    pair_blocked, pending_for, scan_choices, scan_name, scanning_name,
     settings::settings_busy,
 };
 use crate::{
@@ -141,17 +141,21 @@ impl Column {
 
 /// Why a saved device is inactive.
 fn enablement_section(b: &mut Layout, d: &p::Device) {
-    if let Some(reason) = model::inactive(d).filter(|r| *r != InactiveReason::Disabled) {
-        b.para(
-            &text::capitalized(&format!("{}.", text::inactive_words(reason))),
+    match model::inactive(d) {
+        None | Some(InactiveReason::Disabled) => {}
+        Some(InactiveReason::TransportDisabled) => {
+            b.para(&text::transport_disabled_sentence(d.transport()), warn())
+        }
+        Some(reason) => b.para(
+            &text::capitalized(&format!("{}.", text::inactive_words(reason, d.transport()))),
             warn(),
-        );
+        ),
     }
 }
 
 /// Enabled devices of each transport against how many can be enabled.
 fn capacity_section(b: &mut Layout, st: &State) {
-    let limits: Vec<(Transport, u32)> = model::transports(&st.status)
+    let limits: Vec<(Transport, u32)> = model::enabled_transports(&st.status)
         .into_iter()
         .filter_map(|t| Some((t, model::max_enabled(&st.status, t)?)))
         .collect();
@@ -993,7 +997,7 @@ impl<B: Backend> Model<B> {
             Some(st) if prepared && !st.available => bar.row(),
             Some(st) if prepared && st.scanning.is_some() => {
                 bar.button("Stop Scan", Action::ScanOff, Tone::Normal);
-                let label = format!("Scanning {}", self.scan_label);
+                let label = format!("Scanning {}", scanning_name(st));
                 let room = bar
                     .width
                     .saturating_sub(line_width(&bar.lines[0]) + line_width(&right.lines[0]) + 3);
@@ -1432,6 +1436,8 @@ impl<B: Backend> Model<B> {
                 if !pairing_with(st, &c.id) {
                     if model::storage_full(&st.status) {
                         b.field("Pair", "Storage Full", warn());
+                    } else if model::transport_disabled(&st.status, c.transport()) {
+                        b.para(&text::transport_disabled_sentence(c.transport()), warn());
                     } else if st.pairing.as_ref().is_some_and(model::pairing_running) {
                         b.field("Pair", "Pairing in Progress", warn());
                     } else {
@@ -1518,7 +1524,7 @@ impl<B: Backend> Model<B> {
             (_, Some(c)) => {
                 if pairing_with(st, &c.id) {
                     add("Cancel Pairing", Action::CancelPairing, Tone::Normal, false);
-                } else if pair_blocked(st).is_none() {
+                } else if pair_blocked(st, c).is_none() {
                     // The details card says why Pair is unavailable.
                     add("Pair", Action::Pair, Tone::Primary, false);
                 }
@@ -1767,6 +1773,51 @@ impl<B: Backend> Model<B> {
                     }
                     body.row();
                     body.para("The computer's system. Special keys on every device using HID++ send its standard shortcuts. Saved on the adapter for all devices, including ones paired later.", dim());
+                    // One On and Off choice per transport the firmware can enable and disable,
+                    // labelled by its name.
+                    const KW: usize = "Bluetooth Classic".len() + 2;
+                    let indent = || Line::from(pad_str("", KW));
+                    for t in model::transports(&st.status) {
+                        let Some(on) = model::transport_enabled(&st.status, t)
+                            .filter(|_| model::transport_settable(&st.status, t))
+                        else {
+                            continue;
+                        };
+                        let label = transport_long(t);
+                        body.row();
+                        if !st.status.ready {
+                            body.field_at(
+                                label,
+                                KW,
+                                "Unavailable until adapter storage is ready",
+                                warn(),
+                            );
+                        } else if can_set_platform(st) {
+                            let options = layout::on_off(
+                                Some(on),
+                                Action::Transport(t, true),
+                                Action::Transport(t, false),
+                            );
+                            body.choice(label, KW, options);
+                        } else {
+                            body.field_at(
+                                label,
+                                KW,
+                                if on { "On" } else { "Off" },
+                                layout::plain(),
+                            );
+                        }
+                        let running = self.running(
+                            |c| matches!(c, crate::controller::Command::Transport(r, _) if *r == t),
+                        );
+                        if running {
+                            body.hang(indent(), &format!("{} Saving…", spinner()), warn());
+                        } else if let Some((_, e)) =
+                            self.transport_err.as_ref().filter(|(r, _)| *r == t)
+                        {
+                            body.hang(indent(), &format!("✕ {e}"), err());
+                        }
+                    }
                     capacity_section(&mut body, st);
                     pinned.button("Close", Action::CancelDialog, Tone::Normal);
                 }

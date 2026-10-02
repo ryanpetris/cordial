@@ -10,10 +10,11 @@ import { vi } from "vitest";
 describe("AdapterSession", () => {
   it("reads the status, then every device with its warnings and settings", async () => {
     const { fake, session } = await openSession();
+    // Both transports are supported; Classic starts disabled and BLE enabled, as in the firmware.
     expect(session.status).toMatchObject({ id: fake.id, name: "Pico W", platform: "linux", ready: true });
     expect(session.status.transports).toEqual([
-      { transport: "classic", maxEnabled: 7 },
-      { transport: "ble", maxEnabled: 7 },
+      { transport: "classic", maxEnabled: 7, enabled: false, settable: true },
+      { transport: "ble", maxEnabled: 7, enabled: true, settable: true },
     ]);
     await until(() => session.listed && session.settings.size === 4);
     expect([...session.devices.keys()]).toEqual(["d_1", "d_2", "d_3", "d_4"]);

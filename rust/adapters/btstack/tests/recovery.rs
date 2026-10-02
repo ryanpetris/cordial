@@ -35,6 +35,13 @@ struct Trace {
     failures: usize,
     commands: Vec<(u16, Vec<u8>)>,
 }
+#[cfg(feature = "classic")]
+fn scan_enable(commands: &[(u16, Vec<u8>)]) -> impl Iterator<Item = u8> + '_ {
+    commands
+        .iter()
+        .filter(|(opcode, _)| *opcode == 0x0c1a)
+        .map(|(_, params)| params[0])
+}
 fn pump(radio: &mut Backend<support::Store>, io: &Io, trace: &mut Trace) {
     for sequence in 0..160 {
         radio.poll();
@@ -100,6 +107,11 @@ fn failed_le_connection_recovers_through_public_restart_and_preserves_bonds() {
     let mut trace = Trace::default();
     pump(&mut radio, io, &mut trace);
     assert_eq!(trace.ready, 1);
+    #[cfg(feature = "classic")]
+    assert!(
+        scan_enable(&trace.commands).all(|value| value & 3 == 0),
+        "Classic starts off"
+    );
     let roots = |storage: &Storage<support::Store>| {
         [*b"SMER", *b"SMIR"].map(|tag| {
             let mut bytes = [0; 16];
@@ -125,6 +137,7 @@ fn failed_le_connection_recovers_through_public_restart_and_preserves_bonds() {
             random: false,
             transport: Transport::Classic,
         };
+        radio.set_transport(Transport::Classic, true).unwrap();
         unsafe {
             gap_store_link_key_for_bd_addr(saved.address.as_ptr(), [0x5a; 16].as_ptr(), 4);
         }
@@ -136,6 +149,7 @@ fn failed_le_connection_recovers_through_public_restart_and_preserves_bonds() {
                 },
                 saved,
                 false,
+                None,
             )
             .unwrap();
         pump(&mut radio, io, &mut trace);
@@ -153,7 +167,7 @@ fn failed_le_connection_recovers_through_public_restart_and_preserves_bonds() {
             slot: 0,
             generation: index as u64 + 1,
         };
-        radio.connect(link, peer, true).unwrap();
+        radio.connect(link, peer, true, None).unwrap();
         let mark = trace.commands.len();
         pump(&mut radio, io, &mut trace);
         assert!(
@@ -168,10 +182,49 @@ fn failed_le_connection_recovers_through_public_restart_and_preserves_bonds() {
         pump(&mut radio, io, &mut trace);
         assert_eq!(trace.restarting, index + 1);
         assert_eq!(radio.scan(7, false, true), Err(ErrorCode::RadioUnavailable));
+        if index == 1 {
+            radio.set_transport(Transport::Ble, false).unwrap();
+        }
         // The public OFF path times out the native stale, handle-less entry.
         NOW.fetch_add(2000, Relaxed);
         pump(&mut radio, io, &mut trace);
         assert_eq!(trace.ready, index + 2);
+        // Disabled BLE survives the restart: no accept-list initiation.
+        if index == 1 {
+            let mark = trace.commands.len();
+            radio.reconnect(&[peer]).unwrap();
+            pump(&mut radio, io, &mut trace);
+            assert!(
+                trace.commands[mark..]
+                    .iter()
+                    .all(|(opcode, _)| *opcode != 0x200d)
+            );
+            assert_eq!(
+                radio.scan(7, false, true),
+                Err(ErrorCode::UnsupportedTransport)
+            );
+            radio.reconnect(&[]).unwrap();
+            radio.set_transport(Transport::Ble, true).unwrap();
+            pump(&mut radio, io, &mut trace);
+        }
+        // The Classic setting survives the restart: on, then off.
+        #[cfg(feature = "classic")]
+        {
+            let written: Vec<_> = scan_enable(&trace.commands[mark..]).collect();
+            let expected = if index == 0 { 2 } else { 0 };
+            assert_eq!(written.last(), Some(&expected), "{written:?}");
+            assert!(
+                written.iter().all(|value| value & 1 == 0),
+                "never discoverable"
+            );
+            if index == 1 {
+                assert!(written.iter().all(|value| *value == 0), "{written:?}");
+            }
+            if index == 0 {
+                radio.set_transport(Transport::Classic, false).unwrap();
+                pump(&mut radio, io, &mut trace);
+            }
+        }
         assert_eq!(unsafe { hci_get_state() }, 2);
         assert_eq!(block_on(radio.bonds()).unwrap(), original_bonds);
         assert_eq!(roots(storage), original_roots);
@@ -193,6 +246,7 @@ fn failed_le_connection_recovers_through_public_restart_and_preserves_bonds() {
             },
             peer,
             true,
+            None,
         )
         .unwrap();
     let mark = trace.commands.len();

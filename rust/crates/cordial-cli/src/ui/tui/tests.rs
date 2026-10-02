@@ -760,6 +760,104 @@ fn rename_dialog_validates_and_saves() {
 }
 
 #[test]
+fn each_supported_transport_is_switched_in_adapter_settings() {
+    let mut app = App::connected(100, 44);
+    app.click(Action::Menu(Menu::Adapter));
+    app.click(Action::AdapterSettings);
+    let screen = app.screen();
+    assert!(screen.contains("Bluetooth Classic  [● On]"), "{screen}");
+    assert!(screen.contains("Bluetooth LE       [● On]"), "{screen}");
+    // The current value sends nothing.
+    app.click(Action::Transport(Transport::Ble, true));
+    assert!(!app.ran("Transport"));
+    app.click(Action::Transport(Transport::Ble, false));
+    assert!(app.ran("Transport(Ble, false)"));
+    app.done(
+        "Transport",
+        Err(Error::code(
+            ErrorCode::StorageFailed,
+            Some("adapter transport"),
+        )),
+    );
+    assert_eq!(
+        app.m.transport_err,
+        Some((
+            Transport::Ble,
+            "the adapter couldn't read or write its saved data".into()
+        ))
+    );
+    assert!(app.m.form_err.is_empty());
+    let screen = app.screen();
+    assert!(
+        screen.contains("✕ the adapter couldn't read or write"),
+        "{screen}"
+    );
+    assert!(
+        app.m
+            .logs
+            .iter()
+            .any(|l| l.text.starts_with("Couldn't disable Bluetooth LE: "))
+    );
+    app.click(Action::Transport(Transport::Ble, false));
+    assert!(app.m.transport_err.is_none());
+    app.done("Transport", Ok(Outcome::Transport(Transport::Ble, false)));
+    assert!(app.m.logs.iter().any(|l| l.text == "Bluetooth LE disabled"));
+
+    // Firmware that predates the setting offers no choice.
+    app.edit(|st| st.status.transports[0].enabled = None);
+    assert!(!app.reachable(&Action::Transport(Transport::Classic, false)));
+    app.edit(|st| st.status.transports[0].enabled = Some(true));
+
+    // A BLE-only adapter has no Classic choice.
+    app.edit(|st| {
+        st.status
+            .transports
+            .retain(|t| t.transport != Transport::Classic as i32);
+    });
+    let screen = app.screen();
+    assert!(!screen.contains("Bluetooth Classic  ["), "{screen}");
+    assert!(!app.reachable(&Action::Transport(Transport::Classic, true)));
+    assert!(app.reachable(&Action::Transport(Transport::Ble, false)));
+}
+
+#[test]
+fn devices_of_a_disabled_transport_explain_it_and_offer_no_connect_or_pair() {
+    let mut app = App::connected(120, 40);
+    app.edit(|st| {
+        st.status.transports[0].enabled = Some(false);
+        st.devices[1].transport = Transport::Classic as i32;
+        st.devices[1].inactive = Some(p::InactiveReason::TransportDisabled as i32);
+        st.candidates[0].transport = Transport::Classic as i32;
+    });
+    let screen = app.screen();
+    assert!(screen.contains("[Scan BLE]"), "{screen}");
+    app.click(Action::Device("d_2".into()));
+    let screen = app.screen();
+    assert!(
+        screen.contains("Bluetooth Classic is disabled. Enable it in the"),
+        "{screen}"
+    );
+    assert!(!app.reachable(&Action::Connect), "{screen}");
+    app.press(KeyCode::Char('c'));
+    assert!(!app.ran("Connect"));
+
+    app.click(Action::Device("c_1".into()));
+    let screen = app.screen();
+    assert!(
+        screen.contains("Bluetooth Classic is disabled. Enable it in the"),
+        "{screen}"
+    );
+    assert!(!app.reachable(&Action::Pair), "{screen}");
+    app.press(KeyCode::Char('p'));
+    assert!(!app.ran("Pair"));
+
+    // With every transport disabled, nothing is scanned.
+    app.edit(|st| st.status.transports[1].enabled = Some(false));
+    let screen = app.screen();
+    assert!(!screen.contains("[Scan"), "{screen}");
+}
+
+#[test]
 fn files_list_and_download_with_replace_confirmation() {
     let mut app = App::connected(120, 40);
     app.click(Action::Menu(Menu::Adapter));
@@ -861,4 +959,21 @@ fn an_adapter_that_keeps_starting_is_shown_not_ready_with_files() {
     });
     app.phase(session, Phase::Ready);
     assert!(!app.screen().contains("The adapter isn't ready"));
+}
+
+#[test]
+fn the_scan_bar_names_only_the_enabled_transports_being_scanned() {
+    let mut app = App::connected(100, 40);
+    app.edit(|st| st.scanning = Some(vec![Transport::Classic, Transport::Ble]));
+    let screen = app.screen();
+    assert!(screen.contains("Scanning BLE + Classic…"), "{screen}");
+    // Disabling a transport drops it from the running scan.
+    app.edit(|st| st.status.transports[0].enabled = Some(false));
+    let screen = app.screen();
+    assert!(screen.contains("Scanning BLE…"), "{screen}");
+    // With every scanned transport disabled before the scan's end arrives, the bar keeps the
+    // name the scan started with.
+    app.edit(|st| st.status.transports[1].enabled = Some(false));
+    let screen = app.screen();
+    assert!(screen.contains("Scanning BLE + Classic…"), "{screen}");
 }

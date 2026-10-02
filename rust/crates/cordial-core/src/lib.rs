@@ -14,6 +14,7 @@ pub mod forward;
 pub mod hid;
 pub mod hidpp;
 pub mod info;
+pub mod layouts;
 pub mod link;
 pub mod manager;
 pub mod model;

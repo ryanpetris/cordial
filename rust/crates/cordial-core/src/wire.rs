@@ -346,6 +346,8 @@ pub fn device(manager: &Manager, slot: usize) -> Option<p::Device> {
     };
     let inactive = if !d.transport_supported {
         Some(p::InactiveReason::UnsupportedTransport)
+    } else if d.transport_disabled {
+        Some(p::InactiveReason::TransportDisabled)
     } else if d.policy.blocked {
         Some(p::InactiveReason::Blocked)
     } else if !d.policy.enabled {

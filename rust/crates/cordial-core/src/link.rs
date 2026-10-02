@@ -134,6 +134,7 @@ pub struct Link {
     pub roles: u8,
     pub warnings: Vec<DeviceWarning>,
     profiles: Box<[Profile]>,
+    max_output: usize,
     vendor_service: Option<ServiceId>,
     enabled: bool,
     platform: HostPlatform,
@@ -263,6 +264,7 @@ impl Link {
             roles,
             warnings,
             profiles: profiles.into_boxed_slice(),
+            max_output,
             vendor_service,
             enabled,
             platform,
@@ -352,6 +354,15 @@ impl Link {
         self.configure_pending = true;
         self.activate_pending = false;
         self.forward_pending = true;
+    }
+    /// Continues `old`'s operation numbering on the same link, so a late
+    /// completion of `old`'s request never matches a request of this runtime.
+    pub(crate) fn continue_sequence(&mut self, old: &Link) {
+        self.sequence = old.sequence;
+    }
+    /// The largest output report the transport accepts.
+    pub fn max_output(&self) -> usize {
+        self.max_output
     }
     pub fn enabled(&self) -> bool {
         self.enabled

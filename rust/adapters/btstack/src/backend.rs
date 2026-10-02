@@ -1,10 +1,11 @@
 //! BTstack callbacks own their bytes before returning to the vendor stack.
 use crate::{ffi, storage::Storage, transport::Io};
-use alloc::{collections::VecDeque, format, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, format, vec::Vec};
 use cordial_core::model::{errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod};
 use cordial_core::{
     bluetooth::{
-        Bluetooth, Capabilities, ConnectionSecurity, Descriptor, Event, InputReport, ReportType,
+        Bluetooth, Capabilities, ConnectionSecurity, DatabaseHash, Descriptor, Event, InputReport,
+        LAYOUT_SERVICES, Layout, LayoutReport, ReportMap, ReportType,
     },
     devices::{Peer, display_name},
     hid,
@@ -18,10 +19,138 @@ use core::{
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
 
 const EVENTS: usize = 8;
+type Maps = [Option<Vec<u8>>; LAYOUT_SERVICES];
+/// A usable saved layout with its compiled report maps.
+type Cached = (Layout, heapless::Vec<Descriptor, LAYOUT_SERVICES>);
 struct Pending {
     events: VecDeque<Event>,
-    descriptors: [heapless::Vec<Descriptor, 3>; 4],
+    descriptors: [heapless::Vec<Descriptor, LAYOUT_SERVICES>; 4],
+    /// Raw report maps by service: discovered maps until Connected, or the
+    /// maps a verification found until its result.
+    maps: [Maps; 4],
+    /// The saved layout a link uses until its verification ends.
+    layouts: [Option<Layout>; 4],
     generations: [u64; 4],
+}
+/// A saved layout lent to C for one call.
+struct Native {
+    _reports: Vec<ffi::LayoutReport>,
+    // A heap copy: the supplied layout moves into its slot before the call.
+    _hash: Option<Box<[u8; 16]>>,
+    raw: ffi::Layout,
+}
+impl Native {
+    fn new(layout: &Layout) -> Self {
+        let reports: Vec<_> = layout
+            .reports
+            .iter()
+            .map(|r| ffi::LayoutReport {
+                value: r.value,
+                cccd: r.cccd,
+                properties: r.properties,
+                service: r.service as u8,
+                id: r.id,
+                kind: raw_type(r.kind),
+            })
+            .collect();
+        let hash = layout.hash.map(|h| Box::new(h.0));
+        let map = if reports.is_empty() {
+            layout.maps.first().map_or(&[][..], |m| &m.0)
+        } else {
+            &[]
+        };
+        let raw = ffi::Layout {
+            reports: if reports.is_empty() {
+                core::ptr::null()
+            } else {
+                reports.as_ptr()
+            },
+            descriptor: if map.is_empty() {
+                core::ptr::null()
+            } else {
+                map.as_ptr()
+            },
+            hash: hash.as_ref().map_or(core::ptr::null(), |h| h.as_ptr()),
+            count: reports.len() as u16,
+            length: map.len() as u16,
+        };
+        Self {
+            _reports: reports,
+            _hash: hash,
+            raw,
+        }
+    }
+}
+/// A saved layout is used when it is valid for the link and its maps compile.
+fn cached(layout: Option<&Layout>, transport: Option<Transport>) -> Option<Cached> {
+    let layout = layout?;
+    let valid = match transport {
+        Some(transport) => layout.valid(transport),
+        None => layout.valid(Transport::Ble) || layout.valid(Transport::Classic),
+    };
+    if !valid {
+        return None;
+    }
+    let mut descriptors = heapless::Vec::new();
+    for (service, map) in layout.maps.iter().enumerate() {
+        let descriptor = Descriptor::from_slice(ServiceId(service as u16), &map.0).ok()?;
+        descriptors.push(descriptor).ok()?;
+    }
+    Some((layout.clone(), descriptors))
+}
+/// The Database Hash C reports with a layout.
+fn hash(raw: &ffi::Event) -> Option<DatabaseHash> {
+    // SAFETY: C passes either null or 16 readable bytes that outlive the callback.
+    unsafe { raw.hash.cast::<[u8; 16]>().as_ref() }.map(|h| DatabaseHash(*h))
+}
+fn compile(maps: &[ReportMap]) -> Result<Vec<Descriptor>, Error> {
+    let mut descriptors = Vec::new();
+    descriptors
+        .try_reserve_exact(maps.len())
+        .map_err(|_| Error::Capacity)?;
+    for (service, map) in maps.iter().enumerate() {
+        descriptors.push(Descriptor::from_slice(ServiceId(service as u16), &map.0)?);
+    }
+    Ok(descriptors)
+}
+/// Decodes C's packed report table.
+fn layout_reports(bytes: &[u8]) -> Option<Vec<LayoutReport>> {
+    let (reports, rest) = bytes.as_chunks::<8>();
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut decoded = Vec::new();
+    decoded.try_reserve_exact(reports.len()).ok()?;
+    for r in reports {
+        decoded.push(LayoutReport {
+            value: u16::from_ne_bytes([r[0], r[1]]),
+            cccd: u16::from_ne_bytes([r[2], r[3]]),
+            properties: r[4],
+            service: r[5].into(),
+            id: r[6],
+            kind: match r[7] {
+                1 => ReportType::Input,
+                2 => ReportType::Output,
+                3 => ReportType::Feature,
+                _ => return None,
+            },
+        });
+    }
+    Some(decoded)
+}
+/// Moves the first `count` maps out of a slot.
+fn take_maps(maps: &mut Maps, count: usize) -> Option<Vec<ReportMap>> {
+    if count == 0 || count > maps.len() || maps[..count].iter().any(Option::is_none) {
+        return None;
+    }
+    let mut taken = Vec::new();
+    taken.try_reserve_exact(count).ok()?;
+    taken.extend(
+        maps[..count]
+            .iter_mut()
+            .map(|m| ReportMap(m.take().unwrap_or_default())),
+    );
+    Some(taken)
 }
 /// Only the application owner calls C. The controller task exchanges packets
 /// through Io and never invokes BTstack or touches this callback state.
@@ -33,6 +162,9 @@ pub struct State<S: 'static> {
     wake: Signal<NoopRawMutex, ()>,
     fault: Cell<Option<Error>>,
     stopping: Cell<bool>,
+    /// Enabled transports, indexed by `transport_index`. Classic starts
+    /// disabled and BLE enabled; both survive restarts.
+    enabled: [Cell<bool>; 2],
     pairing: Cell<Option<LinkId>>,
     pending: RefCell<Pending>,
 }
@@ -58,10 +190,13 @@ impl<S: RecordStore + 'static> State<S> {
             wake: Signal::new(),
             fault: Cell::new(None),
             stopping: Cell::new(false),
+            enabled: [Cell::new(false), Cell::new(true)],
             pairing: Cell::new(None),
             pending: RefCell::new(Pending {
                 events,
                 descriptors: core::array::from_fn(|_| heapless::Vec::new()),
+                maps: Default::default(),
+                layouts: Default::default(),
                 generations: [0; 4],
             }),
         })
@@ -69,11 +204,30 @@ impl<S: RecordStore + 'static> State<S> {
     pub async fn changed(&self) {
         embassy_futures::select::select(self.wake.wait(), self.io.wait()).await;
     }
-    fn activate(&self, link: LinkId) {
+    /// Owns a slot for `link` before C can report it. Returns the generation
+    /// it replaces so a refused call can restore it.
+    fn activate(&self, link: LinkId, cached: Option<Cached>) -> Option<u64> {
         let mut pending = self.pending.borrow_mut();
         let slot = usize::from(link.slot);
-        pending.generations[slot] = link.generation;
+        if slot >= pending.generations.len() {
+            return None;
+        }
+        let previous = core::mem::replace(&mut pending.generations[slot], link.generation);
+        let (layout, descriptors) =
+            cached.map_or((None, heapless::Vec::new()), |(l, d)| (Some(l), d));
+        pending.descriptors[slot] = descriptors;
+        pending.layouts[slot] = layout;
+        pending.maps[slot] = Default::default();
+        Some(previous)
+    }
+    fn restore(&self, link: LinkId, previous: Option<u64>) {
+        let Some(previous) = previous else { return };
+        let mut pending = self.pending.borrow_mut();
+        let slot = usize::from(link.slot);
+        pending.generations[slot] = previous;
         pending.descriptors[slot].clear();
+        pending.layouts[slot] = None;
+        pending.maps[slot] = Default::default();
     }
     unsafe extern "C" fn time(context: *mut c_void) -> u32 {
         let state = unsafe { &*context.cast::<Self>() };
@@ -118,7 +272,7 @@ impl<S: RecordStore + 'static> State<S> {
         };
         let slot = usize::from(link.slot);
         let mut pending = self.pending.borrow_mut();
-        if matches!(raw.kind, 5..=12 | 14 | 15) {
+        if matches!(raw.kind, 5..=12 | 14..=16) {
             if slot >= 4 || link.generation == 0 {
                 return 0;
             }
@@ -129,10 +283,27 @@ impl<S: RecordStore + 'static> State<S> {
             }
         }
         if raw.kind == 7 {
+            let service = usize::from(raw.service);
+            if bytes.is_empty() || bytes.len() > hid::DESCRIPTOR_BYTES || service >= LAYOUT_SERVICES
+            {
+                return 0;
+            }
+            let mut map = Vec::new();
+            if map.try_reserve_exact(bytes.len()).is_err() {
+                return -2;
+            }
+            map.extend_from_slice(bytes);
+            if raw.code != 0 {
+                // Verification compares raw maps; only a changed layout compiles.
+                pending.maps[slot][service] = Some(map);
+                return 1;
+            }
+            // Discovery means C could not use a supplied layout.
+            if pending.layouts[slot].take().is_some() {
+                pending.descriptors[slot].clear();
+            }
             let descriptors = &mut pending.descriptors[slot];
-            if bytes.is_empty()
-                || bytes.len() > hid::DESCRIPTOR_BYTES
-                || descriptors.len() >= 3
+            if descriptors.len() >= LAYOUT_SERVICES
                 || descriptors.iter().any(|d| d.service.0 == raw.service)
             {
                 return 0;
@@ -145,6 +316,13 @@ impl<S: RecordStore + 'static> State<S> {
             if descriptors.push(descriptor).is_err() {
                 return -2;
             }
+            pending.maps[slot][service] = Some(map);
+            return 1;
+        }
+        if raw.kind == 16 && raw.code != 0 {
+            // Verification ended without a result; C keeps the supplied layout.
+            pending.layouts[slot] = None;
+            pending.maps[slot] = Default::default();
             return 1;
         }
         // C retries security observations after pressure subsides. Keep room
@@ -237,15 +415,67 @@ impl<S: RecordStore + 'static> State<S> {
                 {
                     return -2;
                 }
+                // C reports whether the supplied layout is in use or delivers
+                // the discovered report table for the maps it reported.
+                let layout = if raw.code != 0 {
+                    None
+                } else {
+                    let count = pending.descriptors[slot].len();
+                    let (Some(maps), Some(reports)) = (
+                        take_maps(&mut pending.maps[slot], count),
+                        layout_reports(bytes),
+                    ) else {
+                        return -5;
+                    };
+                    Some(Layout {
+                        maps,
+                        reports,
+                        hash: hash(raw),
+                    })
+                };
                 descriptors.extend(core::mem::take(&mut pending.descriptors[slot]));
                 Event::Connected {
                     link,
                     descriptors,
                     max_output: raw.number as usize,
+                    layout,
+                }
+            }
+            16 => {
+                // Verification ended. An equal layout needs no event. A
+                // refusal reports that the device's layout cannot be used,
+                // with the error its discovery would report.
+                let Some(supplied) = pending.layouts[slot].take() else {
+                    return -5;
+                };
+                let maps = take_maps(&mut pending.maps[slot], raw.service.into());
+                pending.maps[slot] = Default::default();
+                let (Some(maps), Some(reports)) = (maps, layout_reports(bytes)) else {
+                    return -5;
+                };
+                let layout = Layout {
+                    maps,
+                    reports,
+                    hash: hash(raw),
+                };
+                if layout == supplied {
+                    return 1;
+                }
+                drop(supplied);
+                match compile(&layout.maps) {
+                    Ok(descriptors) => Event::Layout {
+                        link,
+                        descriptors,
+                        layout,
+                    },
+                    Err(Error::Capacity) => return -2,
+                    Err(_) => return -5,
                 }
             }
             9 => {
                 pending.descriptors[slot].clear();
+                pending.layouts[slot] = None;
+                pending.maps[slot] = Default::default();
                 Event::Disconnected {
                     link,
                     error: (raw.code != 0).then(|| error(raw.code)),
@@ -383,6 +613,11 @@ impl<S: RecordStore + 'static> Backend<S> {
             }
         }
     }
+    /// The transport is supported and enabled.
+    fn enabled(&self, transport: Transport) -> bool {
+        self.capabilities().supports(transport)
+            && self.state.enabled[transport_index(transport)].get()
+    }
     fn pairing_ended(&self, link: LinkId) {
         if self.state.pairing.get() == Some(link) {
             self.state.pairing.set(None);
@@ -405,6 +640,10 @@ fn peer(raw: ffi::Peer) -> Peer {
             Transport::Ble
         },
     }
+}
+/// C's transport numbering: 0 Classic, 1 BLE.
+fn transport_index(transport: Transport) -> usize {
+    usize::from(transport == Transport::Ble)
 }
 fn raw_peer(peer: Peer) -> ffi::Peer {
     ffi::Peer {
@@ -430,6 +669,8 @@ fn error(code: u8) -> Error {
         7 => Error::InputOverflow,
         8 => Error::Timeout,
         10 => Error::HidReportTooLarge,
+        11 => Error::UnsupportedTransport,
+        12 => Error::InvalidArgs,
         _ => Error::RadioUnavailable,
     }
 }
@@ -475,14 +716,30 @@ impl<S: RecordStore + 'static> Bluetooth for Backend<S> {
         let peers: Vec<_> = peers.iter().copied().map(raw_peer).collect();
         self.checked(|| unsafe { ffi::cordial_profiles_reconnect(peers.as_ptr(), peers.len()) })
     }
+    fn set_transport(&mut self, transport: Transport, enabled: bool) -> Result<(), Error> {
+        if enabled && !self.capabilities().supports(transport) {
+            return Err(Error::UnsupportedTransport);
+        }
+        let index = transport_index(transport);
+        self.checked(|| unsafe { ffi::cordial_profiles_set_transport(index as u8, enabled) })?;
+        self.state.enabled[index].set(enabled);
+        Ok(())
+    }
     fn scan(&mut self, id: u64, classic: bool, ble: bool) -> Result<(), Error> {
-        if classic && !self.capabilities().classic {
+        if (classic && !self.enabled(Transport::Classic)) || (ble && !self.enabled(Transport::Ble))
+        {
             return Err(Error::UnsupportedTransport);
         }
         self.checked(|| unsafe { ffi::cordial_profiles_scan(id, classic, ble) })
     }
-    fn connect(&mut self, link: LinkId, peer: Peer, pairing: bool) -> Result<(), Error> {
-        if !self.capabilities().supports(peer.transport) {
+    fn connect(
+        &mut self,
+        link: LinkId,
+        peer: Peer,
+        pairing: bool,
+        layout: Option<&Layout>,
+    ) -> Result<(), Error> {
+        if !self.enabled(peer.transport) {
             return Err(Error::UnsupportedTransport);
         }
         if pairing {
@@ -491,31 +748,52 @@ impl<S: RecordStore + 'static> Bluetooth for Backend<S> {
             }
             self.state.pairing.set(Some(link));
         }
+        let cached = cached(layout.filter(|_| !pairing), Some(peer.transport));
+        let native = cached.as_ref().map(|(layout, _)| Native::new(layout));
+        let previous = self.state.activate(link, cached);
         let result = self.checked(|| unsafe {
-            ffi::cordial_profiles_connect(raw_link(link), raw_peer(peer), pairing)
+            ffi::cordial_profiles_connect(
+                raw_link(link),
+                raw_peer(peer),
+                pairing,
+                native.as_ref().map_or(core::ptr::null(), |n| &n.raw),
+            )
         });
-        if result.is_ok() {
-            self.state.activate(link);
-        } else if pairing {
-            self.pairing_ended(link);
+        if result.is_err() {
+            self.state.restore(link, previous);
+            if pairing {
+                self.pairing_ended(link);
+            }
         }
         if result == Err(Error::StorageFailed) {
             self.disconnect(link);
         }
         result
     }
-    fn incoming(&mut self, attempt: u32, accept: Option<LinkId>) -> Result<(), Error> {
+    fn incoming(
+        &mut self,
+        attempt: u32,
+        accept: Option<LinkId>,
+        layout: Option<&Layout>,
+    ) -> Result<(), Error> {
         let id = accept.map(raw_link);
+        // C reports a link it admits while this call runs: its slot and any
+        // supplied layout must already be owned. C picks the layout matching
+        // the attempt's transport.
+        let cached = accept.and_then(|_| cached(layout, None));
+        let native = cached.as_ref().map(|(layout, _)| Native::new(layout));
+        let previous = accept.map(|link| self.state.activate(link, cached));
         let result = self.checked(|| unsafe {
             ffi::cordial_profiles_incoming(
                 attempt,
                 id.as_ref().map_or(core::ptr::null(), core::ptr::from_ref),
+                native.as_ref().map_or(core::ptr::null(), |n| &n.raw),
             )
         });
-        if result.is_ok()
-            && let Some(link) = accept
+        if result.is_err()
+            && let (Some(link), Some(previous)) = (accept, previous)
         {
-            self.state.activate(link);
+            self.state.restore(link, previous);
         }
         result
     }
@@ -693,7 +971,307 @@ mod tests {
             report_id: 0x11,
             report_type: 2,
             data: core::ptr::null(),
+            hash: core::ptr::null(),
         }
+    }
+    const KEYBOARD: [u8; 21] = [
+        5, 1, 9, 6, 0xa1, 1, 5, 7, 9, 4, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, 0xc0,
+    ];
+    const MOUSE: [u8; 21] = [
+        5, 1, 9, 2, 0xa1, 1, 5, 9, 9, 1, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, 0xc0,
+    ];
+    fn map_event(generation: u64, service: u16, code: u8) -> ffi::Event {
+        ffi::Event {
+            service,
+            code,
+            ..raw(7, generation)
+        }
+    }
+    fn table(reports: &[ffi::LayoutReport]) -> Vec<u8> {
+        reports
+            .iter()
+            .flat_map(|r| {
+                let mut bytes = [0; 8];
+                bytes[..2].copy_from_slice(&r.value.to_ne_bytes());
+                bytes[2..4].copy_from_slice(&r.cccd.to_ne_bytes());
+                bytes[4..].copy_from_slice(&[r.properties, r.service, r.id, r.kind]);
+                bytes
+            })
+            .collect()
+    }
+    const INPUT: ffi::LayoutReport = ffi::LayoutReport {
+        value: 5,
+        cccd: 7,
+        properties: 0x12,
+        service: 0,
+        id: 1,
+        kind: 1,
+    };
+    fn state() -> State<support::Store> {
+        let storage = Box::leak(Box::new(Storage::new(support::Store::default())));
+        let io = Box::leak(Box::new(Io::new()));
+        State::new(storage, io, || 0, || panic!("fatal")).unwrap()
+    }
+    const LINK: LinkId = LinkId {
+        slot: 0,
+        generation: 1,
+    };
+    fn saved(maps: &[&[u8]]) -> Layout {
+        Layout {
+            maps: maps.iter().map(|m| ReportMap(m.to_vec())).collect(),
+            reports: layout_reports(&table(&[INPUT])).unwrap(),
+            hash: None,
+        }
+    }
+    fn pop(state: &State<support::Store>) -> Option<Event> {
+        state.pending.borrow_mut().events.pop_front()
+    }
+    #[test]
+    fn native_link_errors_reach_the_application_unchanged() {
+        let state = state();
+        for (code, expected) in [
+            (2, Error::Capacity),
+            (3, Error::ConnectionFailed),
+            (4, Error::AuthenticationFailed),
+            (5, Error::UnsupportedHid),
+            (11, Error::UnsupportedTransport),
+            (12, Error::InvalidArgs),
+        ] {
+            state.activate(LINK, None);
+            let ended = ffi::Event { code, ..raw(9, 1) };
+            assert_eq!(state.copy_event(&ended, &[]), 1);
+            assert!(matches!(
+                pop(&state),
+                Some(Event::Disconnected { error: Some(error), .. }) if error == expected
+            ));
+        }
+    }
+    #[test]
+    fn native_report_capacity_matches_the_application_limit() {
+        assert_eq!(
+            usize::from(unsafe { ffi::cordial_layout_report_capacity }),
+            cordial_core::bluetooth::LAYOUT_REPORTS
+        );
+    }
+    #[test]
+    fn discovered_links_report_their_layout() {
+        let state = state();
+        state.activate(LINK, None);
+        assert_eq!(state.copy_event(&map_event(1, 0, 0), &KEYBOARD), 1);
+        assert_eq!(state.copy_event(&map_event(1, 1, 0), &MOUSE), 1);
+        let output = ffi::LayoutReport {
+            value: 9,
+            cccd: 0,
+            properties: 0x08,
+            service: 1,
+            id: 2,
+            kind: 2,
+        };
+        let digest = [9; 16];
+        let connected = ffi::Event {
+            number: 512,
+            hash: digest.as_ptr(),
+            ..raw(8, 1)
+        };
+        assert_eq!(state.copy_event(&connected, &table(&[INPUT, output])), 1);
+        let Some(Event::Connected {
+            descriptors,
+            layout: Some(layout),
+            ..
+        }) = pop(&state)
+        else {
+            panic!("missing discovered layout");
+        };
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(
+            layout.maps,
+            [ReportMap(KEYBOARD.to_vec()), ReportMap(MOUSE.to_vec())]
+        );
+        assert_eq!(
+            layout.reports,
+            [
+                LayoutReport {
+                    service: 0,
+                    kind: ReportType::Input,
+                    id: 1,
+                    value: 5,
+                    properties: 0x12,
+                    cccd: 7,
+                },
+                LayoutReport {
+                    service: 1,
+                    kind: ReportType::Output,
+                    id: 2,
+                    value: 9,
+                    properties: 0x08,
+                    cccd: 0,
+                },
+            ]
+        );
+        assert!(layout.valid(Transport::Ble));
+        assert_eq!(
+            layout.hash,
+            Some(cordial_core::bluetooth::DatabaseHash(digest))
+        );
+        // A Classic link's layout is its one report map.
+        state.activate(LINK, None);
+        assert_eq!(state.copy_event(&map_event(1, 0, 0), &KEYBOARD), 1);
+        assert_eq!(state.copy_event(&raw(8, 1), &[]), 1);
+        let Some(Event::Connected {
+            layout: Some(layout),
+            ..
+        }) = pop(&state)
+        else {
+            panic!("missing Classic layout");
+        };
+        assert!(layout.valid(Transport::Classic));
+        // A table that does not match the reported maps is refused.
+        state.activate(LINK, None);
+        assert_eq!(state.copy_event(&map_event(1, 1, 0), &KEYBOARD), 1);
+        assert_eq!(state.copy_event(&raw(8, 1), &[]), -5);
+        state.activate(LINK, None);
+        assert_eq!(state.copy_event(&map_event(1, 0, 0), &KEYBOARD), 1);
+        assert_eq!(state.copy_event(&raw(8, 1), &[0; 7]), -5);
+    }
+    #[test]
+    fn saved_layouts_connect_at_once_and_report_verified_changes() {
+        let state = state();
+        let supplied = saved(&[&KEYBOARD]);
+        // Unusable layouts leave discovery on.
+        assert!(cached(Some(&supplied), Some(Transport::Classic)).is_none());
+        assert!(cached(Some(&saved(&[&[0xc0]])), Some(Transport::Ble)).is_none());
+        assert!(cached(Some(&Layout::default()), None).is_none());
+        let classic = Layout {
+            maps: supplied.maps.clone(),
+            reports: Vec::new(),
+            hash: None,
+        };
+        assert!(cached(Some(&classic), None).is_some());
+        let native = Native::new(&classic);
+        assert!(native.raw.reports.is_null() && native.raw.length == KEYBOARD.len() as u16);
+        let native = Native::new(&supplied);
+        assert!(native.raw.descriptor.is_null() && native.raw.count == 1);
+        assert_eq!(unsafe { *native.raw.reports }, INPUT);
+
+        state.activate(LINK, cached(Some(&supplied), Some(Transport::Ble)));
+        let connected = ffi::Event {
+            code: 1,
+            ..raw(8, 1)
+        };
+        assert_eq!(state.copy_event(&connected, &[]), 1);
+        let Some(Event::Connected {
+            descriptors,
+            layout: None,
+            ..
+        }) = pop(&state)
+        else {
+            panic!("missing Connected");
+        };
+        assert_eq!(descriptors[0].map.roles, hid::KEYBOARD);
+        // An equal verification result needs no event.
+        assert_eq!(state.copy_event(&map_event(1, 0, 1), &KEYBOARD), 1);
+        let verified = ffi::Event {
+            service: 1,
+            ..raw(16, 1)
+        };
+        assert_eq!(state.copy_event(&verified, &table(&[INPUT])), 1);
+        assert!(pop(&state).is_none());
+        assert!(state.pending.borrow().layouts[0].is_none());
+
+        // The Database Hash is part of the layout: the same hash needs no
+        // event, and a hash-only change is reported.
+        let digest = [7; 16];
+        let hashed = Layout {
+            hash: Some(cordial_core::bluetooth::DatabaseHash(digest)),
+            ..supplied.clone()
+        };
+        let with_hash = ffi::Event {
+            hash: digest.as_ptr(),
+            ..verified
+        };
+        state.activate(LINK, cached(Some(&hashed), Some(Transport::Ble)));
+        assert_eq!(state.copy_event(&connected, &[]), 1);
+        pop(&state);
+        assert_eq!(state.copy_event(&map_event(1, 0, 1), &KEYBOARD), 1);
+        assert_eq!(state.copy_event(&with_hash, &table(&[INPUT])), 1);
+        assert!(pop(&state).is_none());
+        state.activate(LINK, cached(Some(&hashed), Some(Transport::Ble)));
+        assert_eq!(state.copy_event(&connected, &[]), 1);
+        pop(&state);
+        assert_eq!(state.copy_event(&map_event(1, 0, 1), &KEYBOARD), 1);
+        assert_eq!(state.copy_event(&verified, &table(&[INPUT])), 1);
+        assert!(matches!(
+            pop(&state),
+            Some(Event::Layout { layout, .. }) if layout == supplied
+        ));
+        let native = {
+            let moved = hashed.clone();
+            Native::new(&moved)
+        };
+        assert_eq!(
+            unsafe { *native.raw.hash.cast::<[u8; 16]>() },
+            digest,
+            "C receives the saved hash"
+        );
+
+        // A changed layout waits for queue room, then precedes later input.
+        state.activate(LINK, cached(Some(&supplied), Some(Transport::Ble)));
+        assert_eq!(state.copy_event(&connected, &[]), 1);
+        assert_eq!(state.copy_event(&map_event(1, 0, 1), &MOUSE), 1);
+        for _ in 0..EVENTS - 1 {
+            assert_eq!(state.copy_event(&raw(10, 1), &[1]), 1);
+        }
+        assert_eq!(state.copy_event(&verified, &table(&[INPUT])), 0);
+        state.pending.borrow_mut().events.clear();
+        assert_eq!(state.copy_event(&verified, &table(&[INPUT])), 1);
+        assert_eq!(state.copy_event(&raw(10, 1), &[2]), 1);
+        let Some(Event::Layout {
+            descriptors,
+            layout,
+            ..
+        }) = pop(&state)
+        else {
+            panic!("missing Layout");
+        };
+        assert_eq!(descriptors[0].map.roles, hid::MOUSE);
+        assert_eq!(layout, saved(&[&MOUSE]));
+        assert!(matches!(pop(&state), Some(Event::Input(report)) if report.payload() == [2]));
+
+        // A changed layout Cordial cannot use is refused with its error.
+        state.activate(LINK, cached(Some(&supplied), Some(Transport::Ble)));
+        assert_eq!(state.copy_event(&connected, &[]), 1);
+        pop(&state);
+        assert_eq!(state.copy_event(&map_event(1, 0, 1), &[0xc0]), 1);
+        assert_eq!(state.copy_event(&verified, &table(&[INPUT])), -5);
+        assert!(pop(&state).is_none());
+
+        // Abandoned verification releases the supplied layout, even under
+        // queue pressure.
+        state.activate(LINK, cached(Some(&supplied), Some(Transport::Ble)));
+        assert_eq!(state.copy_event(&connected, &[]), 1);
+        assert_eq!(state.copy_event(&map_event(1, 0, 1), &KEYBOARD), 1);
+        for _ in 0..EVENTS - 1 {
+            assert_eq!(state.copy_event(&raw(10, 1), &[1]), 1);
+        }
+        let abandoned = ffi::Event {
+            code: 1,
+            ..raw(16, 1)
+        };
+        assert_eq!(state.copy_event(&abandoned, &[]), 1);
+        assert!(state.pending.borrow().layouts[0].is_none());
+        assert!(state.pending.borrow().maps[0].iter().all(Option::is_none));
+        assert_eq!(state.pending.borrow().events.len(), EVENTS);
+        state.pending.borrow_mut().events.clear();
+
+        // Discovery replaces a supplied layout C did not use.
+        state.activate(LINK, cached(Some(&supplied), None));
+        assert_eq!(state.copy_event(&map_event(1, 0, 0), &MOUSE), 1);
+        assert_eq!(state.copy_event(&raw(8, 1), &table(&[INPUT])), 1);
+        assert!(matches!(
+            pop(&state),
+            Some(Event::Connected { layout: Some(layout), .. }) if layout == saved(&[&MOUSE])
+        ));
+        assert!(state.pending.borrow().layouts[0].is_none());
     }
     #[test]
     fn discovery_preserves_classic_ble_and_identity_only_addresses() {
@@ -739,10 +1317,13 @@ mod tests {
         let storage = Box::leak(Box::new(Storage::new(support::Store::default())));
         let io = Box::leak(Box::new(Io::new()));
         let state = State::new(storage, io, || 0, || panic!("fatal")).unwrap();
-        state.activate(LinkId {
-            slot: 0,
-            generation: 2,
-        });
+        state.activate(
+            LinkId {
+                slot: 0,
+                generation: 2,
+            },
+            None,
+        );
         let mut event = raw(14, 2);
         event.number = 1 | 4 | 8 | (16 << 8) | (15 << 16); // Encrypted SC Just Works bond.
         assert_eq!(state.copy_event(&event, &[]), 1);
@@ -772,30 +1353,15 @@ mod tests {
         let storage = Box::leak(Box::new(Storage::new(support::Store::default())));
         let io = Box::leak(Box::new(Io::new()));
         let state = State::new(storage, io, || 0, || panic!("fatal")).unwrap();
-        state.activate(LinkId {
-            slot: 0,
-            generation: 1,
-        });
-        assert_eq!(
-            state.copy_event(
-                &raw(7, 1),
-                &[
-                    5, 1, 9, 6, 0xa1, 1, 5, 7, 9, 4, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2,
-                    0xc0
-                ]
-            ),
-            1
+        state.activate(
+            LinkId {
+                slot: 0,
+                generation: 1,
+            },
+            None,
         );
-        assert_eq!(
-            state.copy_event(
-                &raw(7, 1),
-                &[
-                    5, 1, 9, 6, 0xa1, 1, 5, 7, 9, 4, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2,
-                    0xc0
-                ]
-            ),
-            0
-        ); // Duplicate service.
+        assert_eq!(state.copy_event(&map_event(1, 0, 0), &KEYBOARD), 1);
+        assert_eq!(state.copy_event(&map_event(1, 0, 0), &KEYBOARD), 0); // Duplicate service.
         let mut connected = raw(8, 1);
         connected.number = 512;
         assert_eq!(state.copy_event(&connected, &[]), 1);
@@ -806,7 +1372,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(max_output, 512);
-                assert_eq!(descriptors[0].service, ServiceId(2));
+                assert_eq!(descriptors[0].service, ServiceId(0));
                 assert_eq!(descriptors[0].map.roles, hid::KEYBOARD);
             }
             _ => panic!("missing Connected"),
@@ -835,20 +1401,14 @@ mod tests {
         ));
         // A new generation owns a fresh service catalog.
         state.pending.borrow_mut().events.clear();
-        state.activate(LinkId {
-            slot: 0,
-            generation: 2,
-        });
-        assert_eq!(
-            state.copy_event(
-                &raw(7, 2),
-                &[
-                    5, 1, 9, 6, 0xa1, 1, 5, 7, 9, 5, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2,
-                    0xc0
-                ]
-            ),
-            1
+        state.activate(
+            LinkId {
+                slot: 0,
+                generation: 2,
+            },
+            None,
         );
+        assert_eq!(state.copy_event(&map_event(2, 0, 0), &MOUSE), 1);
         assert_eq!(state.copy_event(&raw(9, 1), &[]), 1);
         assert_eq!(state.pending.borrow().descriptors[0].len(), 1);
         assert_eq!(state.copy_event(&raw(8, 2), &[]), 1);

@@ -16,11 +16,12 @@ Bluetooth controllers.
 | CLI command | Behavior |
 | --- | --- |
 | `adapter list` / `adapter select PORT` | List attached adapters, or switch to one. |
-| `adapter status` | Identity, readiness, platform and per-transport limits. |
+| `adapter status` | Identity, readiness, platform, and each supported transport with whether it is enabled and its limits. |
 | `adapter set name NAME` / `adapter reset name` | Save the adapter name, or restore the firmware default. Quote names containing spaces. |
 | `adapter set platform linux\|windows\|mac` | Save the host platform. |
+| `adapter set transport classic\|ble enabled on\|off` | Enable or disable a transport. Lists only the transports the firmware supports. |
 | `adapter bootloader` | Development firmware: reboot into programming mode. |
-| `scan start [classic\|ble] [SECONDS]` / `scan stop` | Discover devices on both transports or one, for 10 seconds by default. |
+| `scan start [classic\|ble] [SECONDS]` / `scan stop` | Discover devices on every enabled transport or one, for 10 seconds by default. |
 | `pair start CANDIDATE` | Pair a discovered candidate. |
 | `pair accept [VALUE]` / `pair reject` / `pair cancel` | Answer the pairing prompt, or cancel the pairing. |
 | `device list` / `device get DEV` | Saved devices and candidates, or one device with its information. |
@@ -84,11 +85,11 @@ the adapter goes away.
   dialog never reaches the controls underneath it.
 - The view is built from the first full listing and then from events, and is marked unavailable
   when the session ends. After reconnecting it shows the current state and retries nothing.
-- Adapter settings hold the name, with a rename dialog that keeps the draft on failure, and the
-  Linux, Windows and macOS platform choices. A saved device shows its Logitech Features switch even
-  while disconnected. Its Diagnostics dialog lists its warnings, HID++ protocol and status, link
-  security and identifiers, and refreshes a connected device's information. New warnings are not
-  written to the activity log.
+- Adapter settings hold the name, with a rename dialog that keeps the draft on failure, the Linux,
+  Windows and macOS platform choices, and an On and Off choice for each transport the firmware
+  supports. A saved device shows its Logitech Features switch even while disconnected. Its
+  Diagnostics dialog lists its warnings, HID++ protocol and status, link security and identifiers,
+  and refreshes a connected device's information. New warnings are not written to the activity log.
 - Settings are edited in place; Save sends every change in one request, and apply results arrive
   as they happen.
 - Development firmware adds the bootloader action and Files, which browses adapter directories and
@@ -117,10 +118,10 @@ The desktop application uses the same commands and session rules as the CLI.
 - Disconnect: the user can disconnect an adapter from its context menu. The application closes the
   port and does not reopen it, recognizing it by USB serial number, until the user chooses Connect
   or restarts the application. The web version recognizes it by its port instead.
-- Pairing: Add Device scans both transports the firmware supports while its dialog is open, stops
-  the scan before pairing, answers prompts in the dialog, and follows the new device until it
-  connects or fails. Closing the dialog, or hiding the window, stops a scan or cancels an unsaved
-  pairing.
+- Pairing: Add Device scans the transports the firmware supports and has enabled while its dialog
+  is open, stops the scan before pairing, answers prompts in the dialog, and follows the new device
+  until it connects or fails. Closing the dialog, or hiding the window, stops a scan or cancels an
+  unsaved pairing.
 - Devices open on the Details tab, with the connection switches and the device's own facts.
   Settings follows when the device has settings to show, then Diagnostics: the device's
   warnings with the HID field or report each applies to, the HID++ protocol and status, link

@@ -41,6 +41,10 @@ impl Information {
     pub(super) fn busy(&self) -> bool {
         self.current.is_some() || !self.tasks.is_empty() || self.refresh_pending
     }
+    /// The initial discovery pass has been queued and has finished.
+    pub(super) fn settled(&self) -> bool {
+        self.discovered && !self.busy()
+    }
     pub(super) fn refresh(&mut self) {
         if self.busy() {
             self.refresh_pending = true;

@@ -38,7 +38,8 @@ int main(void) {
 
     def test_descriptor_reads_span_reports_and_ignore_late_callbacks(self):
         source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
-        helper = source[source.index("static int read_callback("):source.index("static int write_callback(")]
+        helper = source[source.index("static int read_callback("):
+                        source.index("// Read Using Characteristic UUID")]
         run_c(r'''
 #include <assert.h>
 #include <string.h>
@@ -84,6 +85,88 @@ int main(void) {
     assert(!connection.read_request);
     connection=(link){.read_request=10};
     assert(!read_callback(7,&error,&attr,(void *)(uintptr_t)9) && connection.read_request==10);
+}
+''')
+
+    def test_uuid_reads_deliver_the_first_value_and_separate_peer_errors(self):
+        source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
+        errors = source[source.index("static uint8_t operation_error("):source.index("static void complete(")]
+        helper = source[source.index("static void complete_uuid("):source.index("static int write_callback(")]
+        run_c(r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+#include "ble.h"
+#define BLE_HS_EDONE 1
+#define BLE_HS_EMSGSIZE 2
+#define BLE_HS_ENOMEM 3
+#define BLE_HS_ETIMEOUT 4
+#define BLE_HS_ENOTSUP 5
+#define BLE_HS_ENOTCONN 6
+#define BLE_ATT_ERR_ATTR_NOT_FOUND 10
+#define BLE_ATT_ERR_READ_NOT_PERMITTED 2
+#define BLE_ATT_ERR_WRITE_NOT_PERMITTED 3
+#define BLE_ATT_ERR_INSUFFICIENT_AUTHOR 8
+#define BLE_ATT_ERR_REQ_NOT_SUPPORTED 6
+#define BLE_ATT_ERR_ATTR_NOT_LONG 11
+#define BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN 13
+#define BLE_HS_ERR_ATT_BASE 0x100
+#define BLE_HS_ERR_HCI_BASE 0x200
+#define BLE_HS_ATT_ERR(x) (BLE_HS_ERR_ATT_BASE+(x))
+typedef struct {uint32_t read_request;bool read_found;} link;
+static link connection;
+struct ble_gatt_error {int status;};
+struct os_mbuf {uint16_t length;uint8_t data[513];};
+struct ble_gatt_attr {uint16_t offset;struct os_mbuf *om;};
+#define OS_MBUF_PKTLEN(m) ((m)->length)
+static int os_mbuf_copydata(struct os_mbuf *m,int offset,int length,void *data) {memcpy(data,m->data+offset,length);return 0;}
+static link *by_handle(uint16_t conn) {return conn==7?&connection:NULL;}
+static unsigned values,completions;
+static uint8_t code,first;
+static void emit(const cordial_ble_event *e) {
+    assert(e->request==9);
+    if(e->kind==CORDIAL_BLE_DATA) {assert(e->offset==0 && e->length==16);first=e->data[0];values++;}
+    else {assert(e->kind==CORDIAL_BLE_COMPLETE);code=e->code;completions++;}
+}
+''' + errors + helper + r'''
+static void finish(int status) {
+    struct ble_gatt_error error={status};
+    connection.read_request=9;connection.read_found=false;
+    assert(!uuid_callback(7,&error,NULL,(void *)(uintptr_t)9) && !connection.read_request);
+}
+int main(void) {
+    struct ble_gatt_error error={0};
+    struct os_mbuf buffer={.length=16,.data={1}};
+    struct ble_gatt_attr attr={.om=&buffer};
+    connection.read_request=9;
+    assert(!uuid_callback(7,&error,&attr,(void *)(uintptr_t)9));
+    buffer.data[0]=2;
+    assert(!uuid_callback(7,&error,&attr,(void *)(uintptr_t)9));
+    assert(values==1 && first==1 && !completions);
+    error.status=BLE_HS_EDONE;
+    assert(!uuid_callback(7,&error,NULL,(void *)(uintptr_t)9));
+    assert(completions==1 && code==CORDIAL_BLE_OK && !connection.read_request);
+    assert(!uuid_callback(7,&error,NULL,(void *)(uintptr_t)9) && completions==1);
+    // Any ATT error response from the peer means it offers no readable value.
+    const int peer[]={BLE_ATT_ERR_ATTR_NOT_FOUND,BLE_ATT_ERR_READ_NOT_PERMITTED,
+        BLE_ATT_ERR_INSUFFICIENT_AUTHOR,BLE_ATT_ERR_REQ_NOT_SUPPORTED,BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN,0xff};
+    for(unsigned i=0;i<sizeof peer/sizeof *peer;i++) {
+        finish(BLE_HS_ATT_ERR(peer[i]));assert(code==CORDIAL_BLE_UNSUPPORTED);
+    }
+    // Host and transport failures never look like a missing value.
+    const int host[]={BLE_HS_ETIMEOUT,BLE_HS_ENOTCONN,BLE_HS_ENOMEM,BLE_HS_ENOTSUP,BLE_HS_EMSGSIZE,0x208};
+    for(unsigned i=0;i<sizeof host/sizeof *host;i++) {
+        finish(host[i]);assert(code!=CORDIAL_BLE_UNSUPPORTED && code!=CORDIAL_BLE_OK);
+    }
+    finish(BLE_HS_ETIMEOUT);assert(code==CORDIAL_BLE_TIMEOUT);
+    finish(BLE_HS_ENOTSUP);assert(code==CORDIAL_BLE_CONNECTION);
+    complete_uuid(9,BLE_HS_ENOMEM);assert(code==CORDIAL_BLE_CAPACITY);
+    connection=(link){.read_request=9};buffer.length=513;error.status=0;
+    assert(uuid_callback(7,&error,&attr,(void *)(uintptr_t)9)==BLE_HS_EMSGSIZE);
+    assert(!connection.read_request && code==CORDIAL_BLE_REPORT_SIZE);
+    connection=(link){.read_request=10};buffer.length=16;
+    unsigned before=values+completions;
+    assert(!uuid_callback(7,&error,&attr,(void *)(uintptr_t)9) && values+completions==before);
 }
 ''')
 

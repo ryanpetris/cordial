@@ -208,3 +208,148 @@ fn production_firmware_refuses_development_commands_locally() {
     );
     assert!(!dongle.sent().contains(&"list_files"));
 }
+
+#[test]
+fn transports_are_shown_and_set_per_transport() {
+    let dongle = Dongle::default();
+    let (result, out, _) = script(&dongle, &["adapter", "status"], false, b"");
+    result.unwrap();
+    assert!(out.contains("  Bluetooth Classic: enabled\n"), "{out}");
+    assert!(out.contains("  Bluetooth LE: enabled\n"), "{out}");
+    let (result, out, _) = script(
+        &dongle,
+        &["adapter", "set", "transport", "classic", "enabled", "off"],
+        false,
+        b"",
+    );
+    result.unwrap();
+    assert!(out.contains("Bluetooth Classic disabled."), "{out}");
+    assert!(dongle.0.lock().unwrap().log.iter().any(|c| matches!(
+        c,
+        p::request::Command::SetAdapter(s)
+            if s.transports == [p::TransportUpdate {
+                transport: p::Transport::Classic as i32,
+                enabled: Some(false),
+            }] && s.name.is_none() && s.platform.is_none()
+    )));
+    let (result, out, _) = script(&dongle, &["adapter", "status"], false, b"");
+    result.unwrap();
+    assert!(out.contains("  Bluetooth Classic: disabled\n"), "{out}");
+    assert!(out.contains("  Bluetooth LE: enabled\n"), "{out}");
+
+    // A BLE-only adapter refuses a Classic change before sending it.
+    let dongle = Dongle::with(|sim| {
+        sim.status
+            .transports
+            .retain(|t| t.transport != p::Transport::Classic as i32)
+    });
+    let (result, out, _) = script(&dongle, &["adapter", "status"], false, b"");
+    result.unwrap();
+    assert!(!out.contains("Bluetooth Classic"), "{out}");
+    let (result, _, _) = script(
+        &dongle,
+        &["adapter", "set", "transport", "classic", "enabled", "on"],
+        false,
+        b"",
+    );
+    assert_eq!(
+        result.unwrap_err().message,
+        "unsupported: the adapter or device doesn't support this"
+    );
+    assert!(!dongle.sent().contains(&"set_adapter"));
+}
+
+#[test]
+fn work_on_a_disabled_transport_names_it() {
+    let dongle = Dongle::with(|sim| {
+        let d = sim.devices.iter_mut().find(|d| d.id == "d_2").unwrap();
+        d.enabled = true;
+        d.inactive = None;
+        sim.set_transport(p::Transport::Classic, false);
+    });
+    let (result, out, _) = script(&dongle, &["device", "list"], false, b"");
+    result.unwrap();
+    assert!(out.contains("inactive=transport_disabled"), "{out}");
+    let (result, out, _) = script(&dongle, &["device", "get", "Old Keyboard"], false, b"");
+    result.unwrap();
+    assert!(
+        out.contains("enabled, not active: Bluetooth Classic is disabled on the adapter"),
+        "{out}"
+    );
+    let (result, _, _) = script(&dongle, &["device", "connect", "Old Keyboard"], false, b"");
+    assert_eq!(
+        result.unwrap_err().message,
+        "Bluetooth Classic is disabled on the adapter"
+    );
+    assert!(!dongle.sent().contains(&"connect_device"));
+    let (result, _, _) = script(&dongle, &["scan", "start", "classic"], false, b"");
+    assert_eq!(
+        result.unwrap_err().message,
+        "Bluetooth Classic is disabled on the adapter"
+    );
+    assert!(!dongle.sent().contains(&"start_scan"));
+    // A scan naming no transport scans only the enabled ones.
+    let (result, _, _) = script(&dongle, &["scan", "start"], false, b"");
+    result.unwrap();
+    assert!(dongle.0.lock().unwrap().log.iter().any(|c| matches!(
+        c,
+        p::request::Command::StartScan(s) if s.transports == [p::Transport::Ble as i32]
+    )));
+
+    // A refusal the view couldn't predict is worded the same.
+    let dongle = Dongle::with(|sim| {
+        sim.status.transports[0].enabled = Some(false);
+        let d = sim.devices.iter_mut().find(|d| d.id == "d_2").unwrap();
+        d.enabled = true;
+        d.inactive = None;
+        sim.refuse.insert("connect_device", ErrorCode::Unsupported);
+    });
+    let (result, _, _) = script(&dongle, &["device", "connect", "Old Keyboard"], false, b"");
+    assert_eq!(
+        result.unwrap_err().message,
+        "Bluetooth Classic is disabled on the adapter"
+    );
+    assert!(dongle.sent().contains(&"connect_device"));
+}
+
+#[test]
+fn pairing_on_a_disabled_transport_names_it() {
+    // A candidate found before its transport was disabled isn't paired.
+    let dongle = Dongle::with(|sim| {
+        sim.candidates[0].transport = p::Transport::Classic as i32;
+    });
+    let (result, out, _) = script(
+        &dongle,
+        &[],
+        false,
+        b"scan start\nadapter set transport classic enabled off\npair start c_1\n",
+    );
+    assert!(out.contains("[NEW] c_1"), "{out}");
+    assert_eq!(
+        result.unwrap_err().message,
+        "Bluetooth Classic is disabled on the adapter"
+    );
+    assert!(!dongle.sent().contains(&"start_pairing"));
+}
+
+#[test]
+fn firmware_without_the_setting_uses_every_transport_and_offers_no_change() {
+    let dongle = Dongle::with(|sim| {
+        for t in &mut sim.status.transports {
+            t.enabled = None;
+        }
+    });
+    let (result, _, _) = script(&dongle, &["scan", "start", "classic"], false, b"");
+    result.unwrap();
+    let (result, _, _) = script(
+        &dongle,
+        &["adapter", "set", "transport", "ble", "enabled", "off"],
+        false,
+        b"",
+    );
+    assert_eq!(
+        result.unwrap_err().message,
+        "unsupported: the adapter or device doesn't support this"
+    );
+    assert!(!dongle.sent().contains(&"set_adapter"));
+}

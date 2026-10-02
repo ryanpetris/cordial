@@ -458,18 +458,33 @@ pub fn capacity_words(reason: CapacityReason) -> &'static str {
     }
 }
 
-/// Why a saved device is not used for connections.
-pub fn inactive_words(reason: InactiveReason) -> &'static str {
+/// Why work on a transport is refused, and its saved devices are unused, while the adapter has
+/// it disabled.
+pub fn transport_disabled(t: Transport) -> String {
+    format!("{} is disabled on the adapter", transport_long(t))
+}
+
+/// `transport_disabled` as sentences, as the TUI's details of a device or candidate state it.
+pub fn transport_disabled_sentence(t: Transport) -> String {
+    format!(
+        "{} is disabled. Enable it in the adapter settings.",
+        transport_long(t)
+    )
+}
+
+/// Why a saved device of `transport` is not used for connections.
+pub fn inactive_words(reason: InactiveReason, transport: Transport) -> String {
     match reason {
         InactiveReason::UnsupportedTransport => {
-            "this build doesn't support its Bluetooth transport"
+            "this build doesn't support its Bluetooth transport".into()
         }
-        InactiveReason::Blocked => "it is blocked",
-        InactiveReason::Disabled => "it is disabled",
+        InactiveReason::TransportDisabled => transport_disabled(transport),
+        InactiveReason::Blocked => "it is blocked".into(),
+        InactiveReason::Disabled => "it is disabled".into(),
         InactiveReason::Capacity => {
-            "every enabled-device place is in use; disable another device to make room"
+            "every enabled-device place is in use; disable another device to make room".into()
         }
-        InactiveReason::Unknown => "the adapter isn't using this device",
+        InactiveReason::Unknown => "the adapter isn't using this device".into(),
     }
 }
 
@@ -481,9 +496,14 @@ pub fn enablement_words(d: &p::Device) -> String {
         (preferred, Some(reason)) => format!(
             "{}, not active: {}",
             if preferred { "enabled" } else { "disabled" },
-            inactive_words(reason)
+            inactive_words(reason, d.transport())
         ),
     }
+}
+
+/// A transport's setting as the CLI spells it.
+pub fn enabled_word(on: bool) -> &'static str {
+    if on { "enabled" } else { "disabled" }
 }
 
 /// Explains an adapter error without its code.
@@ -727,6 +747,11 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
     }
     field("Name", &display(&st.name));
     field("Platform", &platform_token(st.platform()));
+    for t in model::transports(st) {
+        if let Some(on) = model::transport_enabled(st, t) {
+            field(transport_long(t), enabled_word(on));
+        }
+    }
     field("Ready", &yes_no(st.ready).to_lowercase());
     if let Some(full) = model::info_bool(&st.info, keys::STORAGE_FULL) {
         field("Storage Full", &yes_no(full).to_lowercase());
@@ -752,7 +777,7 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
             .count()
             .to_string(),
     );
-    for t in model::transports(st) {
+    for t in model::enabled_transports(st) {
         let enabled = devices
             .iter()
             .filter(|d| d.enabled && d.transport == t as i32)
@@ -1115,6 +1140,7 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
         }
         Outcome::Name(name) => format!("Adapter renamed to {}.", display(name)),
         Outcome::Platform(p) => format!("Platform set to {}.", platform_name(*p)),
+        Outcome::Transport(t, on) => format!("{} {}.", transport_long(*t), enabled_word(*on)),
         Outcome::Bootloader => "The adapter is restarting into its bootloader.".into(),
         Outcome::ScanStarted(transports) => format!(
             "Discovery started ({}).",
@@ -1132,10 +1158,15 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
                 "Discovery is already off.".into()
             }
         }
-        Outcome::Paired { subject, device } => match device.as_ref().and_then(model::inactive) {
-            Some(reason) => paired_disabled(subject, reason),
-            None => format!("Paired and saved {}.", label(subject)),
-        },
+        Outcome::Paired { subject, device } => {
+            match device
+                .as_ref()
+                .and_then(|d| Some((model::inactive(d)?, d.transport())))
+            {
+                Some((reason, transport)) => paired_disabled(subject, reason, transport),
+                None => format!("Paired and saved {}.", label(subject)),
+            }
+        }
         Outcome::Answered => "Pairing answer sent.".into(),
         Outcome::PairingCancelled => "Pairing cancellation requested.".into(),
         Outcome::Devices => state.map_or_else(String::new, |s| devices(s, Filter::All)),
@@ -1187,13 +1218,13 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
 }
 
 /// A completed pairing whose device the adapter doesn't use now.
-pub fn paired_disabled(subject: &Subject, reason: InactiveReason) -> String {
+pub fn paired_disabled(subject: &Subject, reason: InactiveReason, transport: Transport) -> String {
     let label = label(subject);
     match reason {
         InactiveReason::Disabled => format!("Paired and saved {label}; enable it to connect."),
         reason => format!(
             "Paired and saved {label}; it can't connect now because {}.",
-            inactive_words(reason)
+            inactive_words(reason, transport)
         ),
     }
 }
@@ -1240,11 +1271,19 @@ fn event_line(
         }
         event::Kind::Device(d) => Some(format!("[CHG] {}", device_line(d, warnings(&d.id)))),
         event::Kind::DeviceRemoved(r) => Some(format!("[DEL] {}", safe(&r.id))),
-        event::Kind::Adapter(a) => Some(format!(
-            "[CHG] Adapter name={} platform={}",
-            quote(&a.name),
-            platform_token(a.platform())
-        )),
+        event::Kind::Adapter(a) => {
+            let mut line = format!(
+                "[CHG] Adapter name={} platform={}",
+                quote(&a.name),
+                platform_token(a.platform())
+            );
+            for t in model::transports(a) {
+                if let Some(on) = model::transport_enabled(a, t) {
+                    let _ = write!(line, " {}={}", transport_token(t), enabled_word(on));
+                }
+            }
+            Some(line)
+        }
         event::Kind::Settings(s) => {
             let d = state?.device(&s.device)?;
             let lines: Vec<String> = catalog::presented(&s.settings)

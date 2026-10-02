@@ -16,6 +16,7 @@ const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "settings.save": { key: "string", changes: "changes" },
   "adapter.name": { adapterId: "string", name: "nullable" },
   "adapter.platform": { adapterId: "string", platform: "string" },
+  "adapter.transport": { adapterId: "string", transport: "string", enabled: "boolean" },
   "adapter.connect": { adapterId: "string" },
   "adapter.disconnect": { adapterId: "string" },
   "adapter.menu": { adapterId: "string" },

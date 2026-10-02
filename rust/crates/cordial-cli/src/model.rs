@@ -159,7 +159,7 @@ pub fn development(st: &p::Status) -> bool {
     info_bool(&st.info, keys::BUILD_DEVELOPMENT) == Some(true)
 }
 
-/// The transports this firmware supports, in its order.
+/// The transports this firmware supports, enabled or not, in its order.
 pub fn transports(st: &p::Status) -> Vec<Transport> {
     st.transports
         .iter()
@@ -169,6 +169,36 @@ pub fn transports(st: &p::Status) -> Vec<Transport> {
 
 pub fn supports(st: &p::Status, t: Transport) -> bool {
     transports(st).contains(&t)
+}
+
+/// Whether a supported transport is enabled; `None` when the firmware doesn't support it.
+/// Firmware that predates the setting doesn't report it, and uses every transport it supports.
+pub fn transport_enabled(st: &p::Status, t: Transport) -> Option<bool> {
+    st.transports
+        .iter()
+        .find(|s| s.transport == t as i32)
+        .map(|s| s.enabled != Some(false))
+}
+
+/// Whether the firmware can enable and disable a supported transport. Firmware that predates
+/// the setting uses every transport it supports and can't change that.
+pub fn transport_settable(st: &p::Status, t: Transport) -> bool {
+    st.transports
+        .iter()
+        .any(|s| s.transport == t as i32 && s.enabled.is_some())
+}
+
+/// The supported transports that are enabled, in the firmware's order.
+pub fn enabled_transports(st: &p::Status) -> Vec<Transport> {
+    transports(st)
+        .into_iter()
+        .filter(|t| transport_enabled(st, *t) == Some(true))
+        .collect()
+}
+
+/// Whether the firmware supports the transport and has it disabled.
+pub fn transport_disabled(st: &p::Status, t: Transport) -> bool {
+    transport_enabled(st, t) == Some(false)
 }
 
 /// How many devices of a transport can be enabled at once, when the Dongle reports it.

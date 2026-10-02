@@ -102,6 +102,8 @@ pub enum Action {
     ShowUnnamed(bool),
     Hidpp(bool),
     Platform(Platform),
+    /// Enables or disables a transport.
+    Transport(Transport, bool),
     Rename,
     SaveName,
     ResetName,
@@ -201,6 +203,8 @@ pub(crate) struct Model<B: Backend> {
     form: Field,
     form_focused: bool,
     form_err: String,
+    /// The last transport change's failure, shown beside that transport's options.
+    transport_err: Option<(Transport, String)>,
     selected: String,
     logs: Vec<LogEntry>,
     /// Last reported state, to describe changes.
@@ -269,6 +273,7 @@ impl<B: Backend> Model<B> {
             form: Field::new(16),
             form_focused: false,
             form_err: String::new(),
+            transport_err: None,
             selected: String::new(),
             logs: Vec::new(),
             known: HashMap::new(),
@@ -699,6 +704,11 @@ impl<B: Backend> Model<B> {
                 // Shown beside the options, as well as in the activity.
                 self.form_err = text::error_words(e);
             }
+            if let Command::Transport(t, _) = job.command
+                && self.dialog == Some(Dialog::Settings)
+            {
+                self.transport_err = Some((t, text::error_words(e)));
+            }
         }
         if matches!(job.command, Command::Name(_)) && self.dialog == Some(Dialog::Rename) {
             if let Err(e) = &result {
@@ -879,6 +889,7 @@ impl<B: Backend> Model<B> {
                 });
                 self.dialog_scroll = 0;
                 self.form_err.clear();
+                self.transport_err = None;
                 self.form_focused = false;
             }
             Action::CancelDialog => {
@@ -1011,6 +1022,20 @@ impl<B: Backend> Model<B> {
                 self.form_err.clear();
                 self.execute(Command::Platform(p));
             }
+            Action::Transport(t, on) => {
+                let Some(st) = st else { return };
+                if !can_set_platform(&st)
+                    || self.running(|c| matches!(c, Command::Transport(r, _) if *r == t))
+                    || !model::transport_settable(&st.status, t)
+                    || model::transport_enabled(&st.status, t).is_none_or(|current| current == on)
+                {
+                    return;
+                }
+                if self.transport_err.as_ref().is_some_and(|(r, _)| *r == t) {
+                    self.transport_err = None;
+                }
+                self.execute(Command::Transport(t, on));
+            }
             Action::Pair
             | Action::Connect
             | Action::Disconnect
@@ -1065,7 +1090,9 @@ impl<B: Backend> Model<B> {
                 self.note(activity::Kind::Info, text);
                 return;
             }
-            Action::Pair if let Some(why) = st.and_then(pair_blocked) => {
+            Action::Pair
+                if let Some(why) = st.and_then(|st| pair_blocked(st, Self::find(st, &id).1?)) =>
+            {
                 let text = format!("Can't pair {} now: {why}.", self.label(&id));
                 self.note(activity::Kind::Info, text);
                 return;
@@ -1139,12 +1166,34 @@ impl<B: Backend> Model<B> {
 }
 
 /// The scans offered: both transports and each alone when the adapter
-/// supports both, else its one transport, or none.
+/// has both enabled, else its one enabled transport, or none.
 pub(super) fn scan_choices(st: &State) -> Vec<Option<Transport>> {
-    match model::transports(&st.status)[..] {
+    match model::enabled_transports(&st.status)[..] {
         [] => Vec::new(),
         [only] => vec![Some(only)],
         _ => vec![None, Some(Transport::Ble), Some(Transport::Classic)],
+    }
+}
+
+/// The running scan's name, from the transports it scans that are still enabled; disabling a
+/// transport drops it from the scan. Until the scan's end arrives after every one of them is
+/// disabled, the name is that of the transports it was started with.
+pub(super) fn scanning_name(st: &State) -> &'static str {
+    let requested: Vec<Transport> = st.scanning.iter().flatten().copied().collect();
+    let enabled: Vec<Transport> = requested
+        .iter()
+        .copied()
+        .filter(|t| model::transport_enabled(&st.status, *t) == Some(true))
+        .collect();
+    let named = if enabled.is_empty() {
+        requested
+    } else {
+        enabled
+    };
+    match named[..] {
+        [] => "",
+        [only] => scan_name(Some(only)),
+        _ => scan_name(None),
     }
 }
 
@@ -1164,19 +1213,27 @@ pub(super) fn pending_for(st: &State, command: &str, target: &str) -> bool {
 
 /// Why a saved device can't connect now, from its record.
 pub(super) fn connect_blocked(d: &p::Device) -> Option<String> {
+    let transport = d.transport();
+    if model::inactive(d) == Some(p::InactiveReason::TransportDisabled) {
+        return Some(text::transport_disabled(transport));
+    }
     if d.blocked {
-        return Some(text::inactive_words(p::InactiveReason::Blocked).into());
+        return Some(text::inactive_words(p::InactiveReason::Blocked, transport));
     }
     if !d.enabled {
-        return Some(text::inactive_words(p::InactiveReason::Disabled).into());
+        return Some(text::inactive_words(p::InactiveReason::Disabled, transport));
     }
-    model::inactive(d).map(|r| text::inactive_words(r).into())
+    model::inactive(d).map(|r| text::inactive_words(r, transport))
 }
 
-/// Why no pairing can start now: storage is full or another pairing runs.
-pub(super) fn pair_blocked(st: &State) -> Option<String> {
+/// Why `c` can't start pairing now: storage is full, its transport is disabled, or another
+/// pairing runs.
+pub(super) fn pair_blocked(st: &State, c: &p::Candidate) -> Option<String> {
     if model::storage_full(&st.status) {
         return Some("storage is full; remove unused devices or saved settings".into());
+    }
+    if model::transport_disabled(&st.status, c.transport()) {
+        return Some(text::transport_disabled(c.transport()));
     }
     if st.pairing.as_ref().is_some_and(model::pairing_running) {
         return Some("another pairing is in progress".into());

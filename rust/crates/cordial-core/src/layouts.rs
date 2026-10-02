@@ -1,0 +1,67 @@
+//! Saved HID layouts. Each bonded device's file is an optional cache that lets
+//! a later connection admit input without rediscovering the device. A missing,
+//! unreadable or unusable file means the backend discovers the device instead.
+use crate::bluetooth::Layout;
+use crate::model::identifiers::Transport;
+use crate::storage::{RecordKey, RecordStore, record_key};
+
+fn key(device: u64) -> RecordKey {
+    record_key(5, device)
+}
+
+/// The device's saved layout when it is usable for `transport`. A file that
+/// does not decode or is unusable is removed.
+pub async fn load<S: RecordStore>(
+    store: &mut S,
+    device: u64,
+    transport: Transport,
+) -> Option<Layout> {
+    let bytes = store.load_owned(key(device)).await.ok()??;
+    match serde_json::from_slice::<Layout>(&bytes) {
+        Ok(layout) if layout.valid(transport) => Some(layout),
+        _ => {
+            let _ = store.remove(key(device)).await;
+            None
+        }
+    }
+}
+
+/// Saves a usable layout, keeping the space reserved for maintenance and for
+/// pairing another device free. The store skips writing bytes equal to the
+/// saved file. A layout that is not saved removes the saved one, which no
+/// longer describes the device. Returns whether the layout was saved.
+pub async fn save<S: RecordStore>(
+    store: &mut S,
+    device: u64,
+    transport: Transport,
+    layout: &Layout,
+) -> bool {
+    if layout.valid(transport)
+        && let Ok(bytes) = crate::storage::json(layout)
+        && store.available().await.is_ok_and(|available| {
+            available >= crate::bonds::MAINTENANCE_BYTES + crate::bonds::PAIR_BYTES + bytes.len()
+        })
+        && store.save(key(device), &bytes).await.is_ok()
+    {
+        return true;
+    }
+    remove(store, device).await;
+    false
+}
+
+/// A fingerprint of a layout's report maps. Layouts with equal maps differ at
+/// most in their report characteristics, which the backend routes by itself.
+pub fn maps(layout: &Layout) -> u64 {
+    // FNV-1a over each map's length and bytes.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for map in &layout.maps {
+        for byte in (map.0.len() as u32).to_le_bytes().iter().chain(&map.0) {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+pub async fn remove<S: RecordStore>(store: &mut S, device: u64) {
+    let _ = store.remove(key(device)).await;
+}

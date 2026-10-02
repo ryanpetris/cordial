@@ -21,7 +21,7 @@ fn disconnect_releases_input_and_generation_blocks_late_events() {
         manager.forward.complete();
     }
     let old = manager
-        .connect(0, true, 30_000, &mut radio)
+        .connect(0, true, 30_000, None, &mut radio)
         .unwrap()
         .unwrap();
     manager.connected(old, descriptor(), 255, 0).unwrap();
@@ -34,9 +34,9 @@ fn disconnect_releases_input_and_generation_blocks_late_events() {
     manager.disconnected(old, None, 2).unwrap();
     assert_eq!(manager.forward.packet().unwrap().bytes(), &[0; 32]);
     manager.forward.complete();
-    assert!(!manager.devices[0].as_ref().unwrap().reconnect_due(60_000));
+    assert!(!manager.devices[0].as_ref().unwrap().admit_due(60_000));
     let new = manager
-        .connect(0, true, 30_000, &mut radio)
+        .connect(0, true, 30_000, None, &mut radio)
         .unwrap()
         .unwrap();
     assert_eq!(old.slot, new.slot);
@@ -66,7 +66,7 @@ fn policies_save_before_publish_and_unpair_keeps_adapter_preferences() {
     assert!(!manager.devices[0].as_ref().unwrap().policy.hidpp_enabled);
     block_on(manager.platform(HostPlatform::Mac, &mut store)).unwrap();
     let id = manager
-        .connect(0, true, 30_000, &mut radio)
+        .connect(0, true, 30_000, None, &mut radio)
         .unwrap()
         .unwrap();
     manager.connected(id, descriptor(), 255, 0).unwrap();
@@ -85,7 +85,8 @@ fn policies_save_before_publish_and_unpair_keeps_adapter_preferences() {
         reloaded.preference,
         AdapterPreference {
             name: None,
-            host_platform: HostPlatform::Mac
+            host_platform: HostPlatform::Mac,
+            transports: manager.preference.transports,
         }
     );
     assert!(reloaded.devices.iter().all(Option::is_none));
@@ -95,7 +96,7 @@ fn security_is_observed_per_connection_and_never_carried_across_generations() {
     use cordial_core::bluetooth::ConnectionSecurity;
     let (mut manager, _, mut radio) = setup();
     let id = manager
-        .connect(0, true, 30_000, &mut radio)
+        .connect(0, true, 30_000, None, &mut radio)
         .unwrap()
         .unwrap();
     let initial = ConnectionSecurity {
@@ -126,7 +127,7 @@ fn security_is_observed_per_connection_and_never_carried_across_generations() {
     assert_eq!(manager.security(id, initial), None);
     manager.disconnected(id, None, 1).unwrap();
     let next = manager
-        .connect(0, true, 30_000, &mut radio)
+        .connect(0, true, 30_000, None, &mut radio)
         .unwrap()
         .unwrap();
     assert_ne!(id, next);
@@ -349,7 +350,7 @@ fn unblock_at_capacity_preserves_the_working_selection() {
     block_on(manager.load(&mut store, &mut radio)).unwrap();
     manager.radio_ready = true;
     let link = manager
-        .connect(7, true, 90_000, &mut radio)
+        .connect(7, true, 90_000, None, &mut radio)
         .unwrap()
         .unwrap();
     manager.connected(link, descriptor(), 255, 0).unwrap();
@@ -455,7 +456,7 @@ fn late_identity_cannot_take_over_an_existing_live_link() {
     .unwrap();
     block_on(manager.load(&mut store, &mut radio)).unwrap();
     let old = manager
-        .connect(0, true, 30_000, &mut radio)
+        .connect(0, true, 30_000, None, &mut radio)
         .unwrap()
         .unwrap();
     manager.connected(old, descriptor(), 255, 0).unwrap();
@@ -497,7 +498,7 @@ fn disabling_ble_hidpp_requests_fresh_standard_battery() {
     .unwrap();
     d.catalog.info.battery.configure(Transport::Ble, true);
     let id = manager
-        .connect(0, true, 30_000, &mut radio)
+        .connect(0, true, 30_000, None, &mut radio)
         .unwrap()
         .unwrap();
     manager.connected(id, descriptor(), 255, 0).unwrap();

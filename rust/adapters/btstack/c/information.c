@@ -63,8 +63,11 @@ int cordial_profiles_info_busy(cordial_link id) {
     cordial_connection *l=cordial_by_id(id);
     return l && l->peer.transport==CORDIAL_BLE && (l->info.pending || l->info.phase!=INFO_IDLE || l->info.refresh_pending);
 }
+bool cordial_info_settled(const cordial_connection *l) {
+    return l->info.discovered && l->info.phase==INFO_IDLE && !l->info.pending;
+}
 void cordial_info_poll(cordial_connection *l, uint64_t now) {
-    if(!l->ready || l->closing || l->peer.transport!=CORDIAL_BLE || l->query || l->writing || l->reading)return;
+    if(!l->ready || l->closing || l->peer.transport!=CORDIAL_BLE || l->query || l->setup==SETUP_SUBSCRIBE || l->writing || l->reading)return;
     cordial_information *i=&l->info;
     if(i->pending)return;
     if(i->yield_once) { i->yield_once=false; return; }

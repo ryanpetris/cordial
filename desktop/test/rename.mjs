@@ -16,6 +16,33 @@ try {
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1100, 900));
   await page.getByRole('button', { name: /^Pico W/ }).first().waitFor();
   await page.getByRole('button', { name: /^Pico W/ }).first().click();
+  // Each supported transport has a switch: Classic starts disabled and BLE enabled, as on the
+  // adapter. A saved device of a disabled transport says so.
+  const classic = page.getByRole('switch', { name: /Bluetooth Classic/ });
+  const ble = page.getByRole('switch', { name: /Bluetooth LE/ });
+  const checked = async (control, on) => {
+    for (let i = 0; i < 100 && (await control.isChecked()) !== on; i++) await page.waitForTimeout(20);
+    assert.equal(await control.isChecked(), on);
+  };
+  const disabledText = 'Bluetooth Classic is disabled. Enable it in the adapter settings.';
+  await checked(classic, false);
+  await checked(ble, true);
+  await page.getByRole('button', { name: /Travel Keyboard/ }).first().click();
+  await page.getByText(disabledText, { exact: true }).waitFor();
+  await page.getByRole('button', { name: /^Pico W/ }).first().click();
+  await classic.click();
+  await checked(classic, true);
+  await page.getByRole('button', { name: /Travel Keyboard/ }).first().click();
+  await page.getByRole('tab', { name: 'Details', exact: true }).waitFor();
+  assert.equal(await page.getByText(disabledText, { exact: true }).count(), 0);
+  await page.getByRole('button', { name: /^Pico W/ }).first().click();
+  await classic.click();
+  await checked(classic, false);
+  // The simulated ESP32-S3 supports only BLE.
+  await page.getByRole('button', { name: /^XIAO ESP32-S3/ }).first().click();
+  await checked(ble, true);
+  assert.equal(await classic.count(), 0);
+  await page.getByRole('button', { name: /^Pico W/ }).first().click();
   // The page bar's Rename opens the dialog; the dialog's Rename submits it.
   const bar = page.locator('.page-bar');
   const rename = bar.getByRole('button', { name: 'Rename', exact: true });
@@ -73,7 +100,7 @@ try {
   assert.equal(await input.isVisible(), true);
   await app.evaluate(() => { globalThis.renameReply({ ok: true }); });
   await input.waitFor({ state: 'hidden' });
-  console.log('Desktop rename UI: save, reset, Unicode limit, cancel, errors, pending state, duplicate names and reconnect passed');
+  console.log('Desktop adapter UI: transport switches, rename save, reset, Unicode limit, cancel, errors, pending state, duplicate names and reconnect passed');
 } catch (e) {
   const page = await app.firstWindow();
   console.error(await page.locator('body').innerText());

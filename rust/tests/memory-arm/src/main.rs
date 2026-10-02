@@ -12,7 +12,7 @@ use core::{
 use embassy_futures::block_on;
 use cordial_core::{
     application::{Application, Build},
-    bluetooth::{Bluetooth, Capabilities, Descriptor, Event, ReportType},
+    bluetooth::{Bluetooth, Capabilities, Descriptor, Event, Layout as HidLayout, ReportType},
     compact::{Metadata, Observed, Range, Record, scalar},
     devices::{Device, Peer, Policy},
     link::{Link, LinkId, Profile, ServiceId, WriteId},
@@ -193,10 +193,10 @@ impl Bluetooth for Radio {
         Ok(())
     }
     fn reconnect(&mut self, _: &[Peer]) -> Result<(), Error> { Ok(()) }
-    fn connect(&mut self, _: LinkId, _: Peer, _: bool) -> Result<(), Error> {
+    fn connect(&mut self, _: LinkId, _: Peer, _: bool, _: Option<&HidLayout>) -> Result<(), Error> {
         Ok(())
     }
-    fn incoming(&mut self, _: u32, _: Option<LinkId>) -> Result<(), Error> {
+    fn incoming(&mut self, _: u32, _: Option<LinkId>, _: Option<&HidLayout>) -> Result<(), Error> {
         Ok(())
     }
     fn disconnect(&mut self, _: LinkId) {}
@@ -477,6 +477,7 @@ fn reports(app: &mut Application, count: usize, maximum: bool) {
             runtime: None,
             closing: false,
             setup_failed: false,
+            maps: None,
             error: None,
             deadline: 0,
         });
@@ -596,7 +597,8 @@ fn reconnect(app: &mut Application, maximum: bool, slot: usize) {
         device: Some(slot),
         runtime: None,
         closing: false,
-            setup_failed: false,
+        setup_failed: false,
+        maps: None,
         error: None,
         deadline: 0,
     });

@@ -49,6 +49,27 @@ describe("development server", () => {
     expect((await call("GET", "/api/other")).status).toBe(404);
   });
 
+  it("enables and disables a transport on a simulated adapter", async () => {
+    /** Waits until the adapter reports Bluetooth Classic as `enabled`. */
+    const classic = async (enabled: boolean) => {
+      for (let i = 0; i < 50; i++) {
+        const status = (await state()).adapters.find((a) => a.id === "0000FAKE0001")!.status;
+        if (status?.transports.find((t) => t.transport === "classic")?.enabled === enabled) return true;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      return false;
+    };
+    expect(await classic(false)).toBe(true);
+    // The simulated ESP32-S3 supports only BLE, enabled.
+    expect((await state()).adapters.find((a) => a.id === "0000FAKE0002")!.status!.transports).toEqual([{ transport: "ble", maxEnabled: 7, enabled: true, settable: true }]);
+    const set = (enabled: unknown) => act({ type: "adapter.transport", adapterId: "0000FAKE0001", transport: "classic", enabled });
+    expect(await set(true)).toEqual({ status: 200, body: '{"ok":true}' });
+    expect(await classic(true)).toBe(true);
+    expect((await set("on")).status).toBe(400);
+    expect(await set(false)).toEqual({ status: 200, body: '{"ok":true}' });
+    expect(await classic(false)).toBe(true);
+  });
+
   it("refuses requests another site could make", async () => {
     expect(await call("GET", "/api/state", { host: `attacker.example:${port}` })).toEqual({ status: 403, body: '{"error":"unexpected Host"}' });
     expect(await call("GET", "/api/state", { origin: "http://attacker.example" })).toEqual({ status: 403, body: '{"error":"unexpected Origin"}' });

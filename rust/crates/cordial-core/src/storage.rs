@@ -51,6 +51,7 @@ pub trait RecordStore {
         Err(Error::Unavailable)
     }
     /// Enumerate unique live keys. Physical obsolete versions are not entries.
+    /// Saved layouts (kind 5) are read by key and need not be enumerated.
     async fn keys(&mut self) -> Result<Vec<RecordKey>, Error>;
     /// One key at a time. Backends override this without collecting the namespace.
     async fn next_key(&mut self, after: Option<RecordKey>) -> Result<Option<RecordKey>, Error> {

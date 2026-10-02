@@ -192,7 +192,7 @@ export class Connection {
   getStatus(): Promise<Status> {
     return this.#call({ case: "getStatus", value: {} }, "status");
   }
-  /** Changes the name, the platform or both. An empty name restores the default name. */
+  /** Changes any of the name, the platform and the enabled transports. An empty name restores the default name. */
   setAdapter(update: MessageInitShape<typeof SetAdapterSchema>): Promise<Status> {
     return this.#call({ case: "setAdapter", value: update }, "status");
   }

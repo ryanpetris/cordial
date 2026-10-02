@@ -9,14 +9,18 @@ what the records mean and how their values are chosen.
 
 `Status` identifies the Dongle and says what it can do: its adapter ID (the USB serial number), the
 effective name, the saved host platform, whether Bluetooth and storage have started (`ready`), and
-one `TransportSupport` per transport the firmware supports with `max_enabled` for it.
+one `TransportSupport` per transport the firmware supports, with `max_enabled` and whether the
+transport is enabled (`enabled`, always set; missing means enabled, as firmware that predates the
+field omits it). Classic starts disabled and BLE enabled. A disabled transport's devices are
+inactive, and the Dongle does not scan, connect or accept connections on it.
 `Status.info` holds facts about the Dongle with keys from the [catalog](keys.md): the firmware
 version, the hardware configuration (`board.name`), `build.development` on development firmware,
 and `storage.full` when there is no room to save another device. The `adapter` event carries a
 `Status` whenever any of this changes.
 
-The host platform selects special-key translation and survives removing every device. Before
-storage has loaded it reads as Linux.
+The host platform selects special-key translation and survives removing every device. Until the
+saved adapter settings have loaded, the platform reads as Linux, Classic as disabled and BLE as
+enabled.
 
 ## Devices
 
@@ -32,7 +36,8 @@ peripheral paired over both Classic and BLE has two records. Names are labels, n
 - `state` is `connected` only once security, HID report setup and input forwarding are all ready,
   not merely when a radio link exists.
 - `inactive` says why the Dongle will not use the device, in this order: its transport is not
-  supported by this firmware, it is blocked, it is disabled, or the stack's bond table is full.
+  supported by this firmware, its transport is disabled on the Dongle, it is blocked, the device
+  is disabled, or the stack's bond table is full.
 - `error` is the last failed connection attempt, cleared by a successful connection.
 - `security` describes the live link while connected; each property is missing when the stack
   cannot report it, which does not mean false. Values describe the negotiated link and key, never

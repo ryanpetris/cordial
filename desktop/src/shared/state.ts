@@ -57,8 +57,10 @@ export interface AdapterStatus {
   name: string;
   platform: HostPlatform;
   ready: boolean;
-  /** Transports the firmware supports; `maxEnabled` is null while unknown. */
-  transports: { transport: TransportName; maxEnabled: number | null }[];
+  /** Transports the firmware supports and whether each is enabled; `maxEnabled` is null while
+   * unknown. `settable` is false on firmware that predates the setting: it uses every transport
+   * it supports and can't change that. */
+  transports: { transport: TransportName; maxEnabled: number | null; enabled: boolean; settable: boolean }[];
   info: InfoEntry[];
 }
 
@@ -274,6 +276,7 @@ export type Action =
   | { type: "settings.save"; key: string; changes: SettingsChange[] }
   | { type: "adapter.name"; adapterId: string; name: string | null }
   | { type: "adapter.platform"; adapterId: string; platform: HostPlatform }
+  | { type: "adapter.transport"; adapterId: string; transport: TransportName; enabled: boolean }
   | { type: "adapter.connect" | "adapter.disconnect" | "adapter.menu"; adapterId: string }
   | { type: "adapters.refresh" }
   /** Opens the window's app menu at a point in CSS pixels from the window's top left. */

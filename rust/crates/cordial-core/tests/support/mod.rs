@@ -1,6 +1,6 @@
 use cordial_core::model::{errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod};
 use cordial_core::{
-    bluetooth::{Bluetooth, Capabilities, Descriptor, ReportType},
+    bluetooth::{Bluetooth, Capabilities, Descriptor, Layout, ReportType},
     devices::{Peer, Policies, Policy},
     link::{LinkId, ServiceId, WriteId},
     manager::Manager,
@@ -19,6 +19,10 @@ pub struct Store {
     pub fail_save: Option<(RecordKey, bool)>,
     pub available: Option<usize>,
     pub capacity: Option<usize>,
+    /// Allocation unit for records counted against `capacity`.
+    pub block: Option<usize>,
+    /// Record reads so far.
+    pub loads: usize,
 }
 impl RecordStore for Store {
     async fn generation(&mut self) -> Result<u64, storage::Error> {
@@ -67,7 +71,15 @@ impl RecordStore for Store {
         }
         Ok(self
             .capacity
-            .map(|n| n.saturating_sub(self.records.values().map(Vec::len).sum::<usize>()))
+            .map(|n| {
+                let block = self.block.unwrap_or(1);
+                n.saturating_sub(
+                    self.records
+                        .values()
+                        .map(|r| r.len().div_ceil(block) * block)
+                        .sum::<usize>(),
+                )
+            })
             .unwrap_or(self.available.unwrap_or(65536)))
     }
 
@@ -76,6 +88,7 @@ impl RecordStore for Store {
         key: RecordKey,
         value: &mut [u8],
     ) -> Result<Option<usize>, storage::Error> {
+        self.loads += 1;
         if self.fail {
             return Err(storage::Error::Io);
         }
@@ -120,6 +133,8 @@ pub struct Radio {
     pub scans: Vec<(u64, bool, bool)>,
     pub bonds: Vec<Peer>,
     pub connects: Vec<(LinkId, bool)>,
+    /// The saved layout supplied with each entry of `connects`.
+    pub layouts: Vec<Option<Layout>>,
     pub closes: Vec<LinkId>,
     pub adopted: Vec<LinkId>,
     pub writes: Vec<(WriteId, Vec<u8>)>,
@@ -130,6 +145,10 @@ pub struct Radio {
     pub addresses: Vec<Peer>,
     pub forgotten: Vec<Peer>,
     pub incoming: Vec<Option<LinkId>>,
+    pub reject_connect: Option<Error>,
+    /// Every transport enabled or disabled, in order.
+    pub applied: Vec<(Transport, bool)>,
+    pub reject_transport: Option<Error>,
 }
 impl Bluetooth for Radio {
     fn refresh_info(&mut self, link: LinkId) -> Result<(), Error> {
@@ -153,6 +172,13 @@ impl Bluetooth for Radio {
             ble_scan_and_connect: false,
         })
     }
+    fn set_transport(&mut self, transport: Transport, enabled: bool) -> Result<(), Error> {
+        if let Some(error) = self.reject_transport {
+            return Err(error);
+        }
+        self.applied.push((transport, enabled));
+        Ok(())
+    }
     fn reconnect(&mut self, peers: &[Peer]) -> Result<(), Error> {
         self.reconnect = peers.to_vec();
         Ok(())
@@ -161,15 +187,33 @@ impl Bluetooth for Radio {
         self.scans.push((id, classic, ble));
         Ok(())
     }
-    fn connect(&mut self, link: LinkId, peer: Peer, pairing: bool) -> Result<(), Error> {
+    fn connect(
+        &mut self,
+        link: LinkId,
+        peer: Peer,
+        pairing: bool,
+        layout: Option<&Layout>,
+    ) -> Result<(), Error> {
+        if let Some(error) = self.reject_connect {
+            return Err(error);
+        }
         self.addresses.push(peer);
         self.connects.push((link, pairing));
+        self.layouts.push(layout.cloned());
         Ok(())
     }
-    fn incoming(&mut self, _: u32, accept: Option<LinkId>) -> Result<(), Error> {
+    fn incoming(
+        &mut self,
+        _: u32,
+        accept: Option<LinkId>,
+        layout: Option<&Layout>,
+    ) -> Result<(), Error> {
         self.incoming.push(accept);
         if let Some(id) = accept {
             self.connects.push((id, false));
+            self.layouts.push(layout.cloned());
+        } else {
+            assert!(layout.is_none(), "a layout for a refused link");
         }
         Ok(())
     }
@@ -261,6 +305,7 @@ pub fn descriptor() -> Vec<Descriptor> {
 pub fn setup() -> (Manager, Store, Radio) {
     let mut store = Store::default();
     block_on(storage::open(&mut store)).unwrap();
+    all_transports(&mut store);
     // A saved device that finished setup with HID++ on.
     let mut policy = Policy::paired(77, peer(1), b"Keyboard");
     policy.hidpp_enabled = true;
@@ -309,4 +354,19 @@ pub fn bond(owner: u64, identity: Peer) -> cordial_core::bonds::Bond {
             }
         },
     }
+}
+
+/// Saves the adapter preference with every transport enabled.
+pub fn all_transports(store: &mut Store) {
+    let mut transports = cordial_core::devices::Transports::NONE;
+    for transport in cordial_core::devices::Transports::ALL {
+        transports.set(transport, true);
+    }
+    block_on(
+        Policies { store }.save_adapter(&cordial_core::devices::AdapterPreference {
+            transports,
+            ..Default::default()
+        }),
+    )
+    .unwrap();
 }

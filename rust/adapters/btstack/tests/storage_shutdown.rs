@@ -79,7 +79,8 @@ fn storage_fault_disconnects_active_native_links_and_stays_unavailable() {
         random: false,
         transport: Transport::Classic,
     };
-    radio.connect(link, peer, true).unwrap();
+    common::enable_classic(&mut radio, io);
+    radio.connect(link, peer, true, None).unwrap();
     radio.poll();
     let create = take(io).unwrap();
     assert_eq!(&create.data()[..2], &[5, 4]);

@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 #[cfg(all(feature = "ffi", feature = "classic"))]
+pub mod closing;
+#[cfg(all(feature = "ffi", feature = "classic"))]
+pub mod initiation;
+#[cfg(all(feature = "ffi", feature = "classic"))]
 pub mod shutdown;
 use cordial_btstack::transport::{Io, Packet};
 use core::{
@@ -41,6 +45,8 @@ pub fn reply(io: &Io, opcode: u16, sequence: u8) {
         0x200f | 0x202a => vec![0, 8],
         0x2018 => vec![0, sequence, 2, 3, 4, 5, 6, 7, 8],
         0x0c14 => vec![0; 249],
+        // Create Connection Cancel: no page to cancel.
+        0x0408 => vec![0x02, 0, 0, 0, 0, 0, 0],
         _ => vec![0],
     };
     let mut complete = vec![
@@ -52,4 +58,20 @@ pub fn reply(io: &Io, opcode: u16, sequence: u8) {
     ];
     complete.append(&mut parameters);
     receive(io, &complete);
+}
+/// Turns Classic on and answers the scan-enable write it causes.
+#[cfg(feature = "ffi")]
+pub fn enable_classic<S: cordial_core::storage::RecordStore>(
+    radio: &mut cordial_btstack::backend::Backend<S>,
+    io: &Io,
+) {
+    use cordial_core::{bluetooth::Bluetooth, model::identifiers::Transport};
+    radio.set_transport(Transport::Classic, true).unwrap();
+    radio.poll();
+    let packet = take(io).expect("scan enable write");
+    assert_eq!(packet.data(), &[0x1a, 0x0c, 1, 2], "page scan only");
+    io.finish_outbound(true);
+    radio.poll();
+    reply(io, 0x0c1a, 0);
+    radio.poll();
 }

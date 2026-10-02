@@ -75,7 +75,8 @@ fn cancellation_removes_a_key_persisted_before_authentication_completes() {
         random: false,
         transport: Transport::Classic,
     };
-    radio.connect(link, peer, true).unwrap();
+    common::enable_classic(&mut radio, io);
+    radio.connect(link, peer, true, None).unwrap();
     radio.poll();
     let create = take(io).unwrap();
     eprintln!("Create opcode {:02x?}", &create.data()[..2]);

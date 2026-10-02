@@ -5,8 +5,10 @@ use crate::model::{
     identifiers::{ConnectionState as State, DeviceId, HostPlatform, Transport},
 };
 use crate::{
-    bluetooth::{Bluetooth, ConnectionSecurity, Descriptor},
-    devices::{ACTIVE_CONNECTIONS, AdapterPreference, Device, Peer, Policies, Policy, Setup},
+    bluetooth::{Bluetooth, Capabilities, ConnectionSecurity, Descriptor, Layout},
+    devices::{
+        ACTIVE_CONNECTIONS, AdapterPreference, Device, Peer, Policies, Policy, Setup, Transports,
+    },
     forward::Forwarder,
     link::{Link, LinkId, Profile},
     storage::{Preferences, RecordStore},
@@ -24,6 +26,8 @@ pub struct Connection {
     pub deadline: u64,
     /// A setup save failed; setup resumes on the device's next connection.
     pub setup_failed: bool,
+    /// The `layouts::maps` fingerprint of the layout the link uses, when known.
+    pub maps: Option<u64>,
 }
 
 pub struct Manager {
@@ -35,7 +39,8 @@ pub struct Manager {
     pub write_uncertain: bool,
     pub radio_ready: bool,
     generation: u64,
-    caps: crate::bluetooth::Capabilities,
+    /// What the radio supports, whether or not a transport is enabled.
+    caps: Capabilities,
     pub available_bytes: usize,
     native_limits: [usize; 2],
     pending_device: Option<u64>,
@@ -53,7 +58,7 @@ impl Default for Manager {
             write_uncertain: false,
             radio_ready: false,
             generation: 0,
-            caps: crate::bluetooth::Capabilities {
+            caps: Capabilities {
                 classic: false,
                 ble: false,
                 ble_scan_and_connect: false,
@@ -160,18 +165,43 @@ impl Manager {
         for id in stale_preferences {
             let _ = store.remove(crate::storage::record_key(4, id)).await;
         }
+        // The transports in use follow the saved preference. A failure leaves storage not
+        // ready, so the next Ready loads and applies it again.
+        self.preference = preference;
+        self.apply_transports(radio)?;
         self.devices = devices;
         self.refresh_enabled();
         self.sync_bonds(store, radio).await?;
         self.pending_device = None;
         self.available_bytes = store.available().await.map_err(|_| Error::StorageFailed)?;
-        self.preference = preference;
         self.storage_ready = true;
         Ok(())
     }
+    /// Applies the saved enabled transports to every transport the radio supports.
+    pub fn apply_transports<B: Bluetooth>(&self, radio: &mut B) -> Result<(), Error> {
+        for transport in Transports::ALL {
+            if self.caps.supports(transport) {
+                radio.set_transport(transport, self.preference.transports.contains(transport))?;
+            }
+        }
+        Ok(())
+    }
+    /// The transports in use: those the radio supports and the adapter has enabled.
+    pub fn capabilities<B: Bluetooth>(&self, radio: &B) -> Capabilities {
+        self.effective(radio.capabilities())
+    }
+    fn effective(&self, caps: Capabilities) -> Capabilities {
+        let enabled = self.preference.transports;
+        Capabilities {
+            classic: caps.classic && enabled.contains(Transport::Classic),
+            ble: caps.ble && enabled.contains(Transport::Ble),
+            ..caps
+        }
+    }
     pub fn refresh_enabled(&mut self) {
+        let caps = self.effective(self.caps);
         let eligible = |d: &Device| {
-            self.caps.supports(d.policy.peer.transport)
+            caps.supports(d.policy.peer.transport)
                 && d.policy.enabled
                 && !d.policy.blocked
                 && !d.policy.deleting
@@ -183,6 +213,7 @@ impl Manager {
             let kind =
                 usize::from(d.policy.peer.transport == crate::model::identifiers::Transport::Ble);
             d.transport_supported = self.caps.supports(d.policy.peer.transport);
+            d.transport_disabled = d.transport_supported && !caps.supports(d.policy.peer.transport);
             d.effective_enabled = d.effective_enabled
                 && eligible(d)
                 && used[kind] < self.native_limits[kind].saturating_sub(1);
@@ -284,14 +315,17 @@ impl Manager {
             error: None,
             deadline,
             setup_failed: false,
+            maps: None,
         });
         Ok(id)
     }
+    /// `layout` is the device's saved layout, if any.
     pub fn connect<B: Bluetooth>(
         &mut self,
         device: usize,
         explicit: bool,
         deadline: u64,
+        layout: Option<&Layout>,
         radio: &mut B,
     ) -> Result<Option<LinkId>, Error> {
         if !self.radio_ready {
@@ -300,12 +334,13 @@ impl Manager {
         if !self.storage_ready {
             return Err(Error::StorageFailed);
         }
+        let caps = self.capabilities(radio);
         let d = self
             .devices
             .get_mut(device)
             .and_then(Option::as_mut)
             .ok_or(Error::NotFound)?;
-        if !radio.capabilities().supports(d.policy.peer.transport) {
+        if !caps.supports(d.policy.peer.transport) {
             return Err(Error::UnsupportedTransport);
         }
         if !d.policy.enabled {
@@ -331,10 +366,11 @@ impl Manager {
         }
         let peer = d.policy.peer;
         let id = self.allocate(peer, Some(device), deadline)?;
-        if let Err(error) = radio.connect(id, peer, false) {
+        if let Err(error) = radio.connect(id, peer, false, layout) {
             self.connections[id.slot as usize] = None;
             return Err(error);
         }
+        self.connection_mut(id).unwrap().maps = layout.map(crate::layouts::maps);
         self.devices[device].as_mut().unwrap().state = State::Connecting;
         Ok(Some(id))
     }
@@ -350,7 +386,7 @@ impl Manager {
         if !self.radio_ready {
             return Err(Error::RadioUnavailable);
         }
-        if !radio.capabilities().supports(peer.transport) {
+        if !self.capabilities(radio).supports(peer.transport) {
             return Err(Error::UnsupportedTransport);
         }
         if self.native_limits
@@ -381,7 +417,7 @@ impl Manager {
             return Err(Error::Busy);
         }
         let id = self.allocate(peer, None, deadline)?;
-        if let Err(error) = radio.connect(id, peer, true) {
+        if let Err(error) = radio.connect(id, peer, true, None) {
             self.connections[id.slot as usize] = None;
             return Err(error);
         }
@@ -521,43 +557,56 @@ impl Manager {
         self.available_bytes = store.available().await.map_err(|_| Error::StorageFailed)?;
         Ok(())
     }
-    pub fn incoming<B: Bluetooth>(
-        &mut self,
-        attempt: u32,
-        peer: Peer,
-        now: u64,
-        radio: &mut B,
-    ) -> Result<Option<usize>, Error> {
-        let device = self.peer(peer).filter(|&slot| {
+    /// Whether a new BLE link may start: one connection stays free for a
+    /// pairing, and BLE link setups run one at a time. A saved Classic device's
+    /// link setup, which includes any outgoing page, does not hold up BLE; a
+    /// pairing's setup and any closing link do.
+    pub fn ble_admission(&self) -> bool {
+        let mut connections = self.connections.iter().flatten();
+        connections.clone().count() < ACTIVE_CONNECTIONS - 1
+            && !connections.any(|c| {
+                c.closing
+                    || (c.runtime.is_none()
+                        && (c.peer.transport == Transport::Ble || c.device.is_none()))
+            })
+    }
+    /// The saved device an incoming link from `peer` would be admitted for.
+    pub fn admits(&self, peer: Peer, now: u64) -> Option<usize> {
+        self.peer(peer).filter(|&slot| {
             self.storage_ready
                 && self.radio_ready
                 && self.devices[slot].as_ref().is_some_and(|d| {
                     d.allow_incoming()
                         && d.state == State::Disconnected
                         && (peer.transport != Transport::Ble
-                            || (d.reconnect_due(now)
-                                && self.connections.iter().flatten().count()
-                                    < ACTIVE_CONNECTIONS - 1
-                                && !self
-                                    .connections
-                                    .iter()
-                                    .flatten()
-                                    .any(|c| c.runtime.is_none() || c.closing)))
+                            || (d.admit_due(now) && self.ble_admission()))
                 })
-        });
+        })
+    }
+    /// `layout` is the saved layout of the device `admits` returns, if any.
+    pub fn incoming<B: Bluetooth>(
+        &mut self,
+        attempt: u32,
+        peer: Peer,
+        now: u64,
+        layout: Option<&Layout>,
+        radio: &mut B,
+    ) -> Result<Option<usize>, Error> {
+        let device = self.admits(peer, now);
         let id = device.and_then(|slot| {
             self.allocate(peer, Some(slot), now.saturating_add(30_000))
                 .ok()
         });
-        if let Err(e) = radio.incoming(attempt, id) {
+        if let Err(e) = radio.incoming(attempt, id, id.and(layout)) {
             if let Some(id) = id {
                 self.connections[id.slot as usize] = None;
             }
             return Err(e);
         }
-        if id.is_none() {
+        let Some(id) = id else {
             return Ok(None);
-        }
+        };
+        self.connection_mut(id).unwrap().maps = layout.map(crate::layouts::maps);
         let slot = device.unwrap();
         self.devices[slot].as_mut().unwrap().state = State::Connecting;
         Ok(Some(slot))
@@ -664,6 +713,9 @@ impl Manager {
         }
         if retained.is_none() {
             self.devices[slot] = Some(Device::new(policy.clone()));
+        } else {
+            // The new bond's connection discovers the device and saves its layout again.
+            crate::layouts::remove(store, policy.id).await;
         }
         let d = self.devices[slot].as_mut().unwrap();
         d.policy = policy;
@@ -709,39 +761,50 @@ impl Manager {
             return Err(Error::ConnectionFailed);
         }
         let slot = c.device.ok_or(Error::AuthenticationFailed)?;
-        let profiles = descriptors
-            .into_iter()
-            .map(|d| Profile::from_map(d.service, d.map))
-            .collect::<Result<Vec<_>, _>>()?;
+        let profiles = profiles(descriptors)?;
         let d = self.devices[slot].as_mut().ok_or(Error::NotFound)?;
         if !d.effective_enabled {
             return Err(Error::Disabled);
         }
-        let runtime = Link::new(
-            id,
-            profiles,
-            max_output,
-            d.policy.hidpp_enabled,
-            self.preference.host_platform,
-            &mut d.catalog,
-        )?;
-        d.roles = runtime.roles;
-        d.catalog.info.kind_hint(
-            match (
-                d.roles & crate::hid::KEYBOARD != 0,
-                d.roles & crate::hid::MOUSE != 0,
-            ) {
-                (true, true) => crate::model::link::DeviceKind::KeyboardMouse,
-                (true, false) => crate::model::link::DeviceKind::Keyboard,
-                (false, true) => crate::model::link::DeviceKind::Mouse,
-                _ => crate::model::link::DeviceKind::Unknown,
-            },
-        );
-        d.update_warnings(&runtime.warnings)?;
+        let runtime = runtime(id, d, profiles, max_output, self.preference.host_platform)?;
         d.connection(State::Connected, None, now);
         let c = self.connections[id.slot as usize].as_mut().unwrap();
-        c.runtime = Some(Box::new(runtime));
+        c.runtime = Some(runtime);
         c.deadline = 0;
+        Ok(Some(slot))
+    }
+    /// Moves a connected link to the layout its backend now routes reports by.
+    /// The old runtime releases held input and settings work as a disconnect
+    /// would, and the device stays connected. On an error the caller closes
+    /// the link.
+    pub fn relayout(
+        &mut self,
+        id: LinkId,
+        descriptors: Vec<Descriptor>,
+    ) -> Result<Option<usize>, Error> {
+        let Some(c) = self.connection(id) else {
+            return Ok(None);
+        };
+        let (Some(slot), Some(_), false) = (c.device, &c.runtime, c.closing) else {
+            return Ok(None);
+        };
+        let profiles = profiles(descriptors)?;
+        let c = self.connections[id.slot as usize].as_mut().unwrap();
+        let d = self.devices[slot].as_mut().ok_or(Error::NotFound)?;
+        let mut old = c.runtime.take().unwrap();
+        old.disconnected(&mut d.catalog, &mut self.forward);
+        old.settings.release(&mut d.catalog);
+        let mut runtime = runtime(
+            id,
+            d,
+            profiles,
+            old.max_output(),
+            self.preference.host_platform,
+        )?;
+        runtime.continue_sequence(&old);
+        // Reconnecting the catalog cleared its standard information and battery readings.
+        runtime.info_refresh_pending = d.policy.peer.transport == Transport::Ble;
+        c.runtime = Some(runtime);
         Ok(Some(slot))
     }
     /// The caller drains explicit settings results before dropping this returned
@@ -762,9 +825,13 @@ impl Manager {
             // A connected device going away, such as being switched off, is not a failure. Other
             // errors, such as authentication after a virtual cable unplug, still count.
             let lost = d.state == State::Connected
-                && matches!(error, Some(Error::ConnectionFailed | Error::Timeout));
-            let error = c.error.or(error.filter(|_| !lost));
-            d.connection(State::Disconnected, error, now);
+                && c.error.is_none()
+                && matches!(error, None | Some(Error::ConnectionFailed | Error::Timeout));
+            if lost {
+                d.lost(now);
+            } else {
+                d.connection(State::Disconnected, c.error.or(error), now);
+            }
         } else {
             self.forward.remove(id.slot as usize);
         }
@@ -919,7 +986,7 @@ impl Manager {
         if (!current.policy.enabled || current.policy.blocked)
             && policy.enabled
             && !policy.blocked
-            && self.caps.supports(policy.peer.transport)
+            && self.effective(self.caps).supports(policy.peer.transport)
         {
             let used = self
                 .devices
@@ -987,27 +1054,21 @@ impl Manager {
         self.refresh_enabled();
         Ok(())
     }
-    /// Saves the adapter name and host platform together. On a platform change, every ready
-    /// HID++-enabled connection reconfigures for the new platform.
+    /// Saves the adapter preference. On a platform change, every ready
+    /// HID++-enabled connection reconfigures for the new platform. The caller
+    /// applies a transport change.
     pub async fn adapter<S: RecordStore>(
         &mut self,
-        name: Option<alloc::string::String>,
-        platform: HostPlatform,
+        preference: AdapterPreference,
         store: &mut S,
     ) -> Result<(), Error> {
         self.write_uncertain = false;
         if !self.storage_ready {
             return Err(Error::StorageFailed);
         }
+        let platform = preference.host_platform;
         let changed = self.preference.host_platform != platform;
-        self.save_preference(
-            AdapterPreference {
-                name,
-                host_platform: platform,
-            },
-            store,
-        )
-        .await?;
+        self.save_preference(preference, store).await?;
         if changed {
             for c in self.connections.iter_mut().flatten().filter(|c| !c.closing) {
                 let Some(slot) = c.device else {
@@ -1157,4 +1218,42 @@ impl Manager {
         }
         Ok(())
     }
+}
+
+fn profiles(descriptors: Vec<Descriptor>) -> Result<Vec<Profile>, Error> {
+    descriptors
+        .into_iter()
+        .map(|d| Profile::from_map(d.service, d.map))
+        .collect()
+}
+/// Builds a link's runtime and records the roles, kind and warnings it reports.
+fn runtime(
+    id: LinkId,
+    d: &mut Device,
+    profiles: Vec<Profile>,
+    max_output: usize,
+    platform: HostPlatform,
+) -> Result<Box<Link>, Error> {
+    let runtime = Link::new(
+        id,
+        profiles,
+        max_output,
+        d.policy.hidpp_enabled,
+        platform,
+        &mut d.catalog,
+    )?;
+    d.roles = runtime.roles;
+    d.catalog.info.kind_hint(
+        match (
+            d.roles & crate::hid::KEYBOARD != 0,
+            d.roles & crate::hid::MOUSE != 0,
+        ) {
+            (true, true) => crate::model::link::DeviceKind::KeyboardMouse,
+            (true, false) => crate::model::link::DeviceKind::Keyboard,
+            (false, true) => crate::model::link::DeviceKind::Mouse,
+            _ => crate::model::link::DeviceKind::Unknown,
+        },
+    );
+    d.update_warnings(&runtime.warnings)?;
+    Ok(Box::new(runtime))
 }

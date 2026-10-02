@@ -139,6 +139,8 @@ pub enum Command {
     /// Renames the adapter; `None` restores its default name.
     Name(Option<String>),
     Platform(p::Platform),
+    /// Enables or disables a transport.
+    Transport(p::Transport, bool),
     Bootloader,
     /// Scans the transports, or every supported one when empty, for `seconds` (0 means the
     /// adapter's default).
@@ -205,6 +207,8 @@ pub enum Outcome {
     Status(p::Status),
     Name(String),
     Platform(p::Platform),
+    /// Whether a transport is enabled, as the adapter saved it.
+    Transport(p::Transport, bool),
     Bootloader,
     ScanStarted(Vec<p::Transport>),
     ScanFinished {

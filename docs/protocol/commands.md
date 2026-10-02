@@ -21,16 +21,17 @@ show the Dongle's error without refreshing when it refuses anyway.
 | Command | Result | Behavior |
 | --- | --- | --- |
 | `GetStatus` | `Status` | Refreshes the free-storage estimate first. |
-| `SetAdapter` | `Status` | Partial update of the name and host platform, saved together. A name is 1..64 UTF-8 bytes without control characters, trimmed; `""` restores the firmware default. An unchanged value writes nothing. A platform change reconfigures special-key translation on every connected device with HID++ on and re-applies its saved settings. |
+| `SetAdapter` | `Status` | Partial update of the name, host platform and enabled transports, saved together. A name is 1..64 UTF-8 bytes without control characters, trimmed; `""` restores the firmware default. Transport updates apply in order; one for a transport the firmware does not support returns `ERROR_CODE_UNSUPPORTED` and changes nothing. Any transport may be disabled, including all of them. An unchanged value writes nothing. A platform change reconfigures special-key translation on every connected device with HID++ on and re-applies its saved settings. Disabling a transport closes its links, fails a pairing over it that has not saved its bond with `ERROR_CODE_UNSUPPORTED`, drops it from a running scan (ending the scan when no transport is left), stops reconnecting its devices and declines their connections, and makes its saved devices inactive with `INACTIVE_REASON_TRANSPORT_DISABLED`. Enabling it makes them eligible again. A transport change that is saved but whose saved devices cannot then be read returns `ERROR_CODE_STORAGE_FAILED`. |
 | `EnterBootloader` | none | Development firmware only. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. After responding, the Dongle stops reading requests, releases held input, and reboots into ROM programming mode (BOOTSEL on Pico, download mode on ESP32-S3) within about 250 ms. Saved data is untouched. |
 
-An `adapter` event follows any change to the name, platform, readiness or adapter information.
+An `adapter` event follows any change to the name, platform, enabled transports, readiness or
+adapter information.
 
 ## Discovery and pairing
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `StartScan` | none | Scans the listed transports for 1..60 seconds (10 when zero). The list must name at least one transport the firmware supports. Starting a new scan discards earlier candidates, except one a pairing already captured. |
+| `StartScan` | none | Scans the listed transports for 1..60 seconds (10 when zero). Listed transports the firmware does not support or has disabled are left out; when none is left, the scan returns `ERROR_CODE_UNSUPPORTED`. Starting a new scan discards earlier candidates, except one a pairing already captured. |
 | `StopScan` | none | Ends the scan early; candidates already found stay usable. |
 | `StartPairing` | none | Starts pairing a candidate. Only one pairing runs at a time. |
 | `AcceptPrompt` | none | Answers the open prompt, with the passkey or PIN when the step is `EnterCode`. |
@@ -43,8 +44,8 @@ changes, and the scan ends with a `scan_done` event. At most 32 candidates are k
 ends. Results are candidates, not a promise of HID support. A saved BLE device advertising its
 identity alone is not a fresh candidate.
 
-`StartPairing` refuses a blocked saved device, a transport the firmware cannot pair, a full flash
-(`ERROR_CODE_NO_CAPACITY` with `CAPACITY_REASON_STORAGE`, also reported as `storage.full`) and a
+`StartPairing` refuses a blocked saved device, a transport the firmware cannot pair or has
+disabled, a full flash (`ERROR_CODE_NO_CAPACITY` with `CAPACITY_REASON_STORAGE`, also reported as `storage.full`) and a
 full connection table (`CAPACITY_REASON_CONNECTIONS`). It closes the selected device's own link and
 any setup link first, and never an unrelated working device.
 
@@ -95,10 +96,14 @@ keeps one free for pairing. Any enabled device connects whenever one is free.
 Automatic reconnection and incoming connections need an enabled, trusted, unblocked device without
 a disconnect pause. While eligible BLE devices are disconnected, the Dongle uses the controller's
 accept list to connect whichever advertises first; a sleeping device holds no connection. Classic
-devices get timed attempts. Transient failures back off from five seconds to five minutes;
-authentication and unsupported-device failures wait for an explicit connect. Discovery runs beside
-accept-list reconnection when the controller supports scanning while initiating; otherwise BLE
-discovery and reconnection alternate in one-second windows.
+devices get timed attempts, the first two seconds after a connected device goes away cleanly. A
+connected BLE device that goes away, such as by sleeping or being switched off, may reconnect at
+once. From its third consecutive drop within a second of connecting, it waits one second, doubling
+up to five seconds. Every failure, including an authentication failure or a device the Dongle
+cannot use, backs off from two seconds to five minutes and records its error on the device; only
+the user's own settings stop reconnection. An explicit connect starts the backoff again from two
+seconds. Discovery runs beside accept-list reconnection when the controller supports scanning
+while initiating; otherwise BLE discovery and reconnection alternate in one-second windows.
 
 Untrusting a device prevents future unattended connections without closing the current one.
 Blocking keeps the bond and any disconnect pause. All of this is enforced on the Dongle without a

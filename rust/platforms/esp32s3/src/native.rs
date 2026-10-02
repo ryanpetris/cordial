@@ -306,16 +306,12 @@ impl Host for Native {
         c.pairing = u8::from(pairing);
         Self::submit(&c)
     }
-    fn disconnect(&mut self, token: u32) {
-        if Self::submit(&Self::command(
+    fn disconnect(&mut self, token: u32) -> Result<(), Error> {
+        Self::submit(&Self::command(
             ffi::cordial_ble_command_kind_CORDIAL_BLE_DISCONNECT,
             token,
             0,
         ))
-        .is_err()
-        {
-            FAULT.store(true, Ordering::Release);
-        }
     }
     fn pair_reply(
         &mut self,
@@ -389,6 +385,15 @@ impl Host for Native {
         );
         c.handle = handle;
         c.descriptor = u8::from(descriptor);
+        Self::submit(&c)
+    }
+    fn read_by_uuid(&mut self, token: u32, request: u32, uuid: u16) -> Result<(), Error> {
+        let mut c = Self::command(
+            ffi::cordial_ble_command_kind_CORDIAL_BLE_READ_UUID,
+            token,
+            request,
+        );
+        c.number = uuid.into();
         Self::submit(&c)
     }
     fn write(

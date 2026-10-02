@@ -15,7 +15,7 @@ def main():
     output = next(Path(msg["out_dir"]) for msg in messages
                   if msg["reason"] == "build-script-executed" and "cordial-btstack" in msg["package_id"])
     source = Path(os.environ.get("CORDIAL_BTSTACK_SOURCE", ROOT.parent / ".cache/dependencies/btstack"))
-    for name in ("profiles", "gatt", "information"):
+    for name in ("profiles", "gatt", "information", "layout"):
         executable = output / f"{name}-callback-tests"
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-DENABLE_BLE", "-DENABLE_CLASSIC",
                         "-I", str(ROOT / "adapters/btstack/c"), "-I", str(source / "src"), "-I", str(output),

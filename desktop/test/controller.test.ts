@@ -1,9 +1,10 @@
-import { ErrorCode } from "@cordial/protocol";
+import { ErrorCode, Transport } from "@cordial/protocol";
 import { describe, expect, it, vi } from "vitest";
 import { AdapterManager } from "../src/core/manager.ts";
 import { FakeAdapter, device } from "../src/fake/adapter.ts";
 import type { AppState } from "../src/shared/state.ts";
-import { controller, until } from "./helpers.ts";
+import { inactiveText, transportDisabledText } from "../src/shared/text.ts";
+import { controller, openSession, until } from "./helpers.ts";
 
 /** Every adapter is ready and `devices` devices are listed. */
 const loaded = (s: AppState | null, devices: number) =>
@@ -157,7 +158,7 @@ describe("Controller", () => {
   });
 
   it("changes device preferences, follows events and reports adapter errors in words", async () => {
-    const a = new FakeAdapter({ adapterId: "AAAA0001" });
+    const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true } });
     const { c, state } = controller({ "/a": a });
     await c.manager.rescan();
     await until(() => loaded(state(), 4));
@@ -185,6 +186,7 @@ describe("Controller", () => {
   it("doesn't offer enabling a device beyond the adapter's limit", async () => {
     const a = new FakeAdapter({
       adapterId: "AAAA0001",
+      enabled: { classic: true },
       maxEnabled: 1,
       devices: [device("d_1"), device("d_2", { enabled: false }), device("d_3", { transport: "classic", enabled: false })],
     });
@@ -212,7 +214,7 @@ describe("Controller", () => {
   });
 
   it("keeps a restarted scan running when the earlier scan's end arrives first", async () => {
-    const a = new FakeAdapter({ adapterId: "AAAA0001" });
+    const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true } });
     const { c, state } = controller({ "/a": a });
     await c.manager.rescan();
     await until(() => loaded(state(), 4));
@@ -227,7 +229,7 @@ describe("Controller", () => {
   });
 
   it("matches each scan's response to its own start when one is stopped before its answer", async () => {
-    const a = new FakeAdapter({ adapterId: "AAAA0001" });
+    const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true } });
     const { c, state } = controller({ "/a": a });
     await c.manager.rescan();
     await until(() => loaded(state(), 4));
@@ -251,7 +253,7 @@ describe("Controller", () => {
   });
 
   it("searches, pairs with numeric comparison and follows the saved device until it connects", async () => {
-    const a = new FakeAdapter({ adapterId: "AAAA0001" });
+    const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true } });
     const { c, state } = controller({ "/a": a });
     await c.manager.rescan();
     await until(() => loaded(state(), 4));
@@ -274,7 +276,7 @@ describe("Controller", () => {
   });
 
   it("sends a typed passkey and reports a rejected pairing", async () => {
-    const a = new FakeAdapter({ adapterId: "AAAA0001", pairingMethod: "enter" });
+    const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true }, pairingMethod: "enter" });
     const { c, state } = controller({ "/a": a });
     await c.manager.rescan();
     await until(() => loaded(state(), 4));
@@ -364,4 +366,154 @@ it("renames the adapter, restores its default name and keeps it across reconnect
   await until(() => state()!.adapters.find((x) => x.id === a.id)?.name === "Pico W");
   expect(a.platform).toBe("mac");
   await c.stop();
+});
+
+it("enables and disables each transport and explains a disabled transport's devices", async () => {
+  const a = new FakeAdapter({ adapterId: "AAAA0001" });
+  const { c, state } = controller({ "/a": a });
+  await c.manager.rescan();
+  await until(() => loaded(state(), 4));
+  const entry = (id: string) => state()!.devices.find((d) => d.key === `AAAA0001/${id}`)!;
+  const status = () => state()!.adapters[0]!.status!;
+  const CLASSIC_DISABLED = transportDisabledText("classic");
+  // The firmware starts with Classic disabled and BLE enabled.
+  expect(status().transports).toEqual([
+    { transport: "classic", maxEnabled: 7, enabled: false, settable: true },
+    { transport: "ble", maxEnabled: 7, enabled: true, settable: true },
+  ]);
+  expect(entry("d_3").device.inactive).toBe("transport_disabled");
+  expect(inactiveText(entry("d_3").device)).toBe("Bluetooth Classic is disabled. Enable it in the adapter settings.");
+  expect(await c.act({ type: "device.connect", key: "AAAA0001/d_3" })).toEqual({ ok: false, message: CLASSIC_DISABLED });
+  expect(commands(a)).not.toContain("connectDevice");
+  await c.act({ type: "scan.start", adapterId: "AAAA0001" });
+  expect(a.received.at(-1)!.command.value).toMatchObject({ transports: [Transport.BLE] });
+  await until(() => state()!.scan?.candidates.length === 3);
+  await c.act({ type: "scan.stop" });
+
+  expect(await c.act({ type: "adapter.transport", adapterId: "AAAA0001", transport: "classic", enabled: true })).toEqual({ ok: true });
+  expect(a.received.at(-1)!.command.value).toMatchObject({ transports: [{ transport: Transport.CLASSIC, enabled: true }] });
+  expect((a.received.at(-1)!.command.value as { name?: string; platform?: number }).name).toBeUndefined();
+  await until(() => status().transports[0]!.enabled && entry("d_3").device.inactive === null);
+  expect(await c.act({ type: "device.connect", key: "AAAA0001/d_3" })).toEqual({ ok: true });
+  await until(() => entry("d_3").device.state === "connected");
+
+  // Disabling a transport closes its links and ends a pairing over it; a candidate found
+  // earlier isn't paired again.
+  await c.act({ type: "scan.start", adapterId: "AAAA0001" });
+  await until(() => state()!.scan?.candidates.length === 4);
+  expect(await c.act({ type: "pair.start", adapterId: "AAAA0001", candidateId: "c_3" })).toEqual({ ok: true });
+  await until(() => !!state()!.pairing?.prompt);
+  expect(await c.act({ type: "adapter.transport", adapterId: "AAAA0001", transport: "classic", enabled: false })).toEqual({ ok: true });
+  await until(() => !status().transports[0]!.enabled && entry("d_3").device.inactive === "transport_disabled" && entry("d_3").device.state === "disconnected");
+  await until(() => state()!.pairing?.phase === "failed");
+  expect(state()!.pairing!.message).toBe(CLASSIC_DISABLED);
+  await c.act({ type: "pair.dismiss" });
+  const pairings = commands(a).filter((x) => x === "startPairing").length;
+  expect(await c.act({ type: "pair.start", adapterId: "AAAA0001", candidateId: "c_3" })).toEqual({ ok: false, message: CLASSIC_DISABLED });
+  expect(commands(a).filter((x) => x === "startPairing").length).toBe(pairings);
+
+  // With every transport disabled nothing is scanned, and BLE devices say so.
+  expect(await c.act({ type: "adapter.transport", adapterId: "AAAA0001", transport: "ble", enabled: false })).toEqual({ ok: true });
+  await until(() => entry("d_1").device.inactive === "transport_disabled");
+  const BLE_DISABLED = "Bluetooth LE is disabled. Enable it in the adapter settings.";
+  expect(inactiveText(entry("d_1").device)).toBe(BLE_DISABLED);
+  const scans = commands(a).filter((x) => x === "startScan").length;
+  expect(await c.act({ type: "scan.start", adapterId: "AAAA0001" })).toEqual({ ok: false, message: BLE_DISABLED });
+  expect(commands(a).filter((x) => x === "startScan").length).toBe(scans);
+
+  // Saving the setting can fail like the other adapter settings.
+  a.failures.setAdapter = [ErrorCode.STORAGE_FAILED];
+  expect(await c.act({ type: "adapter.transport", adapterId: "AAAA0001", transport: "ble", enabled: true })).toEqual({
+    ok: false,
+    message: "The adapter couldn't save the change. Your saved data hasn't changed",
+  });
+  await c.stop();
+});
+
+it("names a disabled transport when the adapter refuses work on it after it was disabled elsewhere", async () => {
+  const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true } });
+  const { c, state } = controller({ "/a": a });
+  await c.manager.rescan();
+  await until(() => loaded(state(), 4));
+  // The adapter reports Classic disabled before the device's own update arrives, so the app
+  // still sends the request.
+  a.enabled.classic = false;
+  a.changeAdapter({});
+  await until(() => !state()!.adapters[0]!.status!.transports[0]!.enabled);
+  expect(state()!.devices.find((d) => d.key === "AAAA0001/d_3")!.device.inactive).toBeNull();
+  expect(await c.act({ type: "device.connect", key: "AAAA0001/d_3" })).toEqual({ ok: false, message: transportDisabledText("classic") });
+  expect(commands(a).at(-1)).toBe("connectDevice");
+  await c.stop();
+});
+
+it("names a disabled transport when the adapter refuses a scan because the transport was just disabled", async () => {
+  const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true, ble: false } });
+  const { c, state } = controller({ "/a": a });
+  await c.manager.rescan();
+  await until(() => loaded(state(), 4));
+  // Classic is disabled elsewhere; its adapter event arrives just before the scan's answer.
+  const release = a.hold();
+  a.enabled.classic = false;
+  a.changeAdapter({});
+  const started = c.act({ type: "scan.start", adapterId: "AAAA0001" });
+  await until(() => commands(a).includes("startScan"));
+  expect(a.received.at(-1)!.command.value).toMatchObject({ transports: [Transport.CLASSIC] });
+  release();
+  expect(await started).toEqual({ ok: false, message: transportDisabledText("classic") });
+  await c.stop();
+});
+
+it("refuses changing a transport the adapter doesn't support", async () => {
+  const a = new FakeAdapter({ adapterId: "AAAA0001", board: "xiao_esp32s3", transports: ["ble"] });
+  const { c, state } = controller({ "/a": a });
+  await c.manager.rescan();
+  await until(() => loaded(state(), 4));
+  expect(state()!.adapters[0]!.status!.transports).toEqual([{ transport: "ble", maxEnabled: 7, enabled: true, settable: true }]);
+  const sent = a.received.length;
+  expect(await c.act({ type: "adapter.transport", adapterId: "AAAA0001", transport: "classic", enabled: true })).toEqual({
+    ok: false,
+    message: "The adapter or device doesn't support this action",
+  });
+  expect(a.received.length).toBe(sent);
+  await c.stop();
+});
+
+it("treats transports as enabled and not settable on firmware that doesn't report the setting", async () => {
+  const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true } });
+  // Firmware that predates the setting omits TransportSupport.enabled.
+  const status = a.status.bind(a);
+  a.status = () => {
+    const s = status();
+    for (const t of s.transports) t.enabled = undefined;
+    return s;
+  };
+  const { c, state } = controller({ "/a": a });
+  await c.manager.rescan();
+  await until(() => loaded(state(), 4));
+  expect(state()!.adapters[0]!.status!.transports).toEqual([
+    { transport: "classic", maxEnabled: 7, enabled: true, settable: false },
+    { transport: "ble", maxEnabled: 7, enabled: true, settable: false },
+  ]);
+  const sent = a.received.length;
+  expect(await c.act({ type: "adapter.transport", adapterId: "AAAA0001", transport: "ble", enabled: false })).toEqual({
+    ok: false,
+    message: "The adapter or device doesn't support this action",
+  });
+  expect(a.received.length).toBe(sent);
+  await c.act({ type: "scan.start", adapterId: "AAAA0001" });
+  expect(a.received.at(-1)!.command.value).toMatchObject({ transports: [Transport.CLASSIC, Transport.BLE] });
+  await c.act({ type: "scan.stop" });
+  await c.stop();
+});
+
+it("changes nothing when a transport update names a transport the adapter doesn't support", async () => {
+  const { fake, session } = await openSession({ transports: ["ble"] });
+  await expect(
+    session.connection.setAdapter({ transports: [{ transport: Transport.BLE, enabled: false }, { transport: Transport.CLASSIC, enabled: true }] }),
+  ).rejects.toMatchObject({ code: ErrorCode.UNSUPPORTED });
+  await expect(session.connection.setAdapter({ transports: [{ transport: Transport.UNSPECIFIED, enabled: true }] })).rejects.toMatchObject({
+    code: ErrorCode.BAD_ARGS,
+  });
+  expect(fake.enabled.ble).toBe(true);
+  await session.close();
 });

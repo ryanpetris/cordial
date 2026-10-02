@@ -100,6 +100,7 @@ pub fn pending_create(classic_page: bool) {
     pump(&mut radio, io, &mut commands, &mut failures);
     assert_eq!(unsafe { hci_get_state() }, 2);
     if classic_page {
+        radio.set_transport(Transport::Classic, true).unwrap();
         unsafe {
             gap_store_link_key_for_bd_addr(CLASSIC.as_ptr(), [0x5a; 16].as_ptr(), 4);
         }
@@ -116,6 +117,7 @@ pub fn pending_create(classic_page: bool) {
                 transport: Transport::Ble,
             },
             true,
+            None,
         )
         .unwrap();
     pump(&mut radio, io, &mut commands, &mut failures);
@@ -135,6 +137,7 @@ pub fn pending_create(classic_page: bool) {
                     transport: Transport::Classic,
                 },
                 false,
+                None,
             )
             .unwrap();
         pump(&mut radio, io, &mut commands, &mut failures);

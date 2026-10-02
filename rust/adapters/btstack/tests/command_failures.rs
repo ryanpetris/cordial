@@ -37,7 +37,7 @@ fn command(radio: &mut Backend<support::Store>, io: &Io, expected: u16, status: 
     radio.poll();
 }
 #[test]
-fn serialized_initiation_keeps_classic_command_failure_out_of_le_attempts() {
+fn connection_command_failures_end_only_their_attempt() {
     let io = Box::leak(Box::new(Io::new()));
     let storage = Box::leak(Box::new(Storage::new(support::Store::default())));
     embassy_futures::block_on(cordial_core::identity::Identity::initialize(
@@ -67,6 +67,7 @@ fn serialized_initiation_keeps_classic_command_failure_out_of_le_attempts() {
         reply(io, opcode, sequence);
     }
     assert!(ready);
+    common::enable_classic(&mut radio, io);
     let classic = Peer {
         address: [1, 2, 3, 4, 5, 6],
         random: false,
@@ -81,15 +82,20 @@ fn serialized_initiation_keeps_classic_command_failure_out_of_le_attempts() {
         slot: 0,
         generation: 1,
     };
-    radio.connect(id, classic, true).unwrap();
+    radio.connect(id, classic, true, None).unwrap();
+    // One explicit connection per transport is set up at a time.
     assert_eq!(
         radio.connect(
             LinkId {
                 slot: 1,
                 generation: 1
             },
-            ble,
-            false
+            Peer {
+                address: [9; 6],
+                ..classic
+            },
+            false,
+            None
         ),
         Err(ErrorCode::Busy)
     );
@@ -100,15 +106,19 @@ fn serialized_initiation_keeps_classic_command_failure_out_of_le_attempts() {
         slot: 0,
         generation: 2,
     };
-    radio.connect(next, ble, true).unwrap();
+    radio.connect(next, ble, true, None).unwrap();
     assert_eq!(
         radio.connect(
             LinkId {
                 slot: 1,
                 generation: 2
             },
-            classic,
-            false
+            Peer {
+                address: [9; 6],
+                ..ble
+            },
+            false,
+            None
         ),
         Err(ErrorCode::Busy)
     );
@@ -151,6 +161,7 @@ fn serialized_initiation_keeps_classic_command_failure_out_of_le_attempts() {
             },
             ble,
             true,
+            None,
         )
         .unwrap();
     command(&mut radio, io, 0x200d, 0x0c);
@@ -173,6 +184,7 @@ fn serialized_initiation_keeps_classic_command_failure_out_of_le_attempts() {
             },
             ble,
             true,
+            None,
         )
         .unwrap();
     // Reconnecting can first refresh the native resolving list.

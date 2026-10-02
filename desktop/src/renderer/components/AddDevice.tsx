@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { AppState, Candidate, PairingPrompt } from "../../shared/state.ts";
-import { STORAGE_FULL, TRANSPORTS, clean, storageFull } from "../../shared/text.ts";
+import { STORAGE_FULL, TRANSPORTS, clean, storageFull, transportDisabledText } from "../../shared/text.ts";
 import { act, useAction } from "../api.ts";
 import { Banner, Dialog, Spinner, Switch } from "./common.tsx";
 import { CheckIcon, CloseIcon, DeviceIcon, LinkIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
@@ -152,6 +152,7 @@ export function AddDevice({
   const candidates = (scan?.adapterId === chosen?.id ? (scan?.candidates ?? []) : []).filter((c) => unnamed || clean(c.name ?? "") || c.kind !== "unknown");
   const hiddenCount = (scan?.candidates.length ?? 0) - candidates.length;
   const full = storageFull(chosen?.status ?? null);
+  const disabled = (c: Candidate) => !!c.transport && !!chosen?.status?.transports.some((t) => t.transport === c.transport && !t.enabled);
 
   let body: React.ReactNode;
   if (pairing) {
@@ -272,6 +273,8 @@ export function AddDevice({
                 <Signal rssi={c.rssi} />
                 {full ? (
                   <span className="muted small">{STORAGE_FULL}</span>
+                ) : c.transport && disabled(c) ? (
+                  <span className="muted small">{transportDisabledText(c.transport)}</span>
                 ) : (
                   <button className="suggested" disabled={starting} onClick={() => chosen && void attempt({ type: "pair.start", adapterId: chosen.id, candidateId: c.id })}>
                     <LinkIcon /> Pair
