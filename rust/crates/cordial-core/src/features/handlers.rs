@@ -32,6 +32,54 @@ fn bytes(c: &mut Catalog, key: Key, f: Feature, p: &[u8], now: u64) -> Result<()
 }
 
 impl Engine {
+    fn publish_platform(
+        &self,
+        c: &mut Catalog,
+        f: Feature,
+        platform: u8,
+        now: u64,
+        source: ObservationSource,
+    ) -> Result<(), Error> {
+        let mut m = metadata(Key::KeyboardPlatform, f);
+        if f.id == Id::MULTI_PLATFORM {
+            m.scope = SettingScope::CurrentHost;
+        }
+        m.choices = self
+            .platforms
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &p)| {
+                (p < 254 && self.platform_all_versions & (1 << i) != 0).then_some(i as u16)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        if m.choices.is_empty() {
+            return Err(Error::UnsupportedSetting);
+        }
+        let preferred = row(c, Key::KeyboardPlatform)
+            .and_then(|r| r.preference.as_ref())
+            .map(|p| p.value);
+        let value = preferred
+            .filter(|i| m.choices.contains(i) && self.platforms[usize::from(*i)] == platform)
+            .or_else(|| {
+                m.choices
+                    .iter()
+                    .copied()
+                    .find(|i| self.platforms[usize::from(*i)] == platform)
+            });
+        publish(
+            c,
+            m,
+            self.platform_writable,
+            value.map(Observed::Number),
+            now,
+            source,
+        )?;
+        if value.is_none() {
+            stale(c, Key::KeyboardPlatform);
+        }
+        Ok(())
+    }
     pub(super) fn read(&self, h: Handler, f: Feature) -> (u8, Option<u8>) {
         match h {
             Handler::Firmware => match self.stage {
@@ -52,6 +100,18 @@ impl Engine {
                 },
                 (f.id == Id::SOLAR).then_some(1),
             ),
+            Handler::Platform => {
+                if f.id == Id::DUAL_PLATFORM {
+                    (1, None)
+                } else {
+                    match self.stage {
+                        Stage::Initial | Stage::Config => (0, None),
+                        Stage::Second => (1, Some(self.platform_descriptor)),
+                        _ => (2, Some(0xff)),
+                    }
+                }
+            }
+            Handler::Power => (1, None),
             Handler::Fn => (0, (f.id == Id::FN_INVERSION_MULTI_HOST).then_some(0xff)),
             Handler::Backlight => (
                 if matches!(self.stage, Stage::Initial | Stage::Readback) {
@@ -459,15 +519,106 @@ impl Engine {
             }
             Handler::Fn => {
                 let multi = f.id == Id::FN_INVERSION_MULTI_HOST;
-                require(p.len() >= if multi { 4 } else { 2 })?;
+                require(
+                    p.len()
+                        >= if multi {
+                            4
+                        } else if f.id == Id::FN_INVERSION_LEGACY {
+                            1
+                        } else {
+                            2
+                        },
+                )?;
                 let i = usize::from(multi);
-                require(p[i] <= 1 && p[i + 1] <= 1)?;
+                require(p[i] <= 1 && (f.id == Id::FN_INVERSION_LEGACY || p[i + 1] <= 1))?;
                 let mut m = choices(metadata(Key::FnRowDefault, f), &[0, 1]);
                 if multi {
                     m.scope = SettingScope::CurrentHost;
                     self.fn_host = p[0];
                 }
-                number(c, m, !multi, p[i].into(), now, read)?;
+                number(c, m, true, p[i].into(), now, read)?;
+            }
+            Handler::Platform => {
+                if f.id == Id::DUAL_PLATFORM {
+                    require(!p.is_empty() && p[0] <= 1)?;
+                    self.platforms = [1, 255, 255, 255, 1, 0, 0, 255, 255];
+                    self.platform_all_versions = 0x71;
+                    self.platform_writable = true;
+                    self.publish_platform(c, f, p[0], now, read)?;
+                } else if matches!(self.stage, Stage::Initial | Stage::Config) {
+                    require(
+                        p.len() >= 7
+                            && p[2] != 0
+                            && p[3] != 0
+                            && p[4] != 0
+                            && p[5] < p[4]
+                            && p[6] < p[2],
+                    )?;
+                    self.platforms = [255; 9];
+                    self.platform_all_versions = 0;
+                    self.platform_count = p[2];
+                    self.platform_descriptors = p[3];
+                    self.platform_descriptor = 0;
+                    self.platform_host = p[5];
+                    self.platform_writable = p[0] & 2 != 0;
+                    self.stage = Stage::Second;
+                    return Ok(false);
+                } else if self.stage == Stage::Second {
+                    require(
+                        p.len() >= 8
+                            && p[0] < self.platform_count
+                            && p[1] == self.platform_descriptor,
+                    )?;
+                    // A named OS choice is safe only when it covers all versions.
+                    // Conflicting platform indices for one OS cannot be guessed.
+                    {
+                        let mask = be(&p[2..4]);
+                        for (i, flag) in [
+                            0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x8000, 1,
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        {
+                            if mask & flag != 0 {
+                                let old = self.platforms[i];
+                                self.platforms[i] =
+                                    if old == 255 || old == p[0] { p[0] } else { 254 };
+                                if p[4..8] == [0; 4] {
+                                    self.platform_all_versions |= 1 << i;
+                                }
+                            }
+                        }
+                    }
+                    self.platform_descriptor += 1;
+                    if self.platform_descriptor == self.platform_descriptors {
+                        self.stage = Stage::Third;
+                    }
+                    return Ok(false);
+                } else {
+                    require(
+                        p.len() >= 6
+                            && (p[0] == 0xff || p[0] == self.platform_host)
+                            && p[1] == 1
+                            && p[2] < self.platform_count,
+                    )?;
+                    self.publish_platform(c, f, p[2], now, read)?;
+                }
+            }
+            Handler::Power => {
+                require(!p.is_empty())?;
+                let keyboard = c.info.snapshot().iter().any(|field| field.key == I::Kind
+                    && field.available && matches!(&field.value, V::Text(kind) if kind == "keyboard" || kind == "keyboard_mouse"));
+                if !keyboard {
+                    return Err(Error::UnsupportedSetting);
+                }
+                number(
+                    c,
+                    range(metadata(Key::PowerAutoOff, f), 0, 15300, 60),
+                    true,
+                    u16::from(p[0]) * 60,
+                    now,
+                    read,
+                )?;
             }
             Handler::Backlight => {
                 if matches!(self.stage, Stage::Initial | Stage::Readback) {
@@ -645,11 +796,37 @@ impl Engine {
         let mut out = self.raw;
         let (function, length) = match h {
             Handler::Fn => {
+                let value = desired(Key::FnRowDefault)? as u8;
                 if f.id == Id::FN_INVERSION_MULTI_HOST {
-                    return Err(Error::UnsupportedSetting);
+                    // The current-host selector cannot target another paired host.
+                    // Devices rejecting it fail the write; no alternate byte order is tried.
+                    out[0] = 0xff;
+                    out[1] = value;
+                    (1, 2)
+                } else {
+                    out[0] = value;
+                    (1, 1)
                 }
-                out[0] = desired(Key::FnRowDefault)? as u8;
-                (1, 1)
+            }
+            Handler::Platform => {
+                let selected = usize::from(desired(Key::KeyboardPlatform)?);
+                let platform = *self
+                    .platforms
+                    .get(selected)
+                    .filter(|&&p| p < 254)
+                    .ok_or(Error::UnsupportedSetting)?;
+                if f.id == Id::MULTI_PLATFORM {
+                    out[0] = 0xff;
+                    out[1] = platform;
+                    (3, 2)
+                } else {
+                    out[0] = platform;
+                    (2, 1)
+                }
+            }
+            Handler::Power => {
+                out[0] = (desired(Key::PowerAutoOff)? / 60) as u8;
+                (2, 1)
             }
             Handler::Backlight => {
                 out[2] = 0xff;
@@ -771,11 +948,35 @@ impl Engine {
                 self.event_epoch = self.event_epoch.wrapping_add(1);
                 return false; // Information changes use their own field-only event.
             }
+            (Id::DUAL_PLATFORM, 0) if !p.is_empty() && p[0] <= 1 => {
+                if Handler::Platform
+                    .feature(c)
+                    .is_none_or(|selected| selected.id != f.id)
+                {
+                    return false;
+                }
+                if self.platform_descriptor == self.platform_descriptors
+                    && row(c, Key::KeyboardPlatform).is_some_and(|r| r.available)
+                {
+                    let _ = self.publish_platform(c, f, p[0], now, source);
+                }
+            }
+            (Id::MULTI_PLATFORM, 0)
+                if p.len() >= 3
+                    && (p[0] == 0xff || p[0] == self.platform_host)
+                    && p[1] < self.platform_count =>
+            {
+                if self.platform_descriptor == self.platform_descriptors
+                    && row(c, Key::KeyboardPlatform).is_some_and(|r| r.available)
+                {
+                    let _ = self.publish_platform(c, f, p[1], now, source);
+                }
+            }
             (Id::FN_INVERSION_MULTI_HOST, 0)
                 if p.len() >= 4
                     && p[1] <= 1
                     && p[2] <= 1
-                    && (p[0] == 0xff || p[0] == self.fn_host) =>
+                    && (self.fn_host == 0xff || p[0] == 0xff || p[0] == self.fn_host) =>
             {
                 observe_key(c, Key::FnRowDefault, p[1].into(), now, source);
             }

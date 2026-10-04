@@ -60,5 +60,5 @@ deb:
 	cp -R "$(RECIPE)/debian" "$$source/debian"
 	cd "$$source"
 	cp LICENSE debian/copyright
-	DEBEMAIL="$$(dpkg-parsechangelog -S Maintainer)" dch --no-auto-nmu --preserve --newversion "$$version-$(DEB_REVISION)" --distribution '$(DEB_DISTRIBUTION)' "Cordial $$version."
+	DEBEMAIL="$$(dpkg-parsechangelog -S Maintainer)" dch --no-auto-nmu --preserve --force-bad-version --newversion "$$version-$(DEB_REVISION)" --distribution '$(DEB_DISTRIBUTION)' "Cordial $$version."
 	dpkg-buildpackage --build=binary --no-sign

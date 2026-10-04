@@ -88,6 +88,9 @@ impl FeatureId {
     pub const HIRES_WHEEL: Self = Self(0x2121);
     pub const THUMBWHEEL: Self = Self(0x2150);
     pub const ADJUSTABLE_DPI: Self = Self(0x2201);
+    pub const DUAL_PLATFORM: Self = Self(0x4530);
+    pub const MULTI_PLATFORM: Self = Self(0x4531);
+    pub const FN_INVERSION_LEGACY: Self = Self(0x40a0);
     pub const FN_INVERSION: Self = Self(0x40a2);
     pub const FN_INVERSION_MULTI_HOST: Self = Self(0x40a3);
 }

@@ -16,9 +16,11 @@ import {
   choiceText,
   codeText,
   deviceStatus,
+  displayUnit,
   infoValue,
   integrationText,
   kindText,
+  neverValue,
   securityFacts,
   settingInfo,
   settingOrder,
@@ -59,6 +61,7 @@ function valueText(key: string, v: Scalar | null): string {
   if (v === null) return "Unknown";
   if (typeof v === "boolean") return v ? "On" : "Off";
   if (typeof v === "string") return choiceText(key, v);
+  if (neverValue(key, v)) return "Never";
   return String(v);
 }
 
@@ -81,6 +84,9 @@ export interface Drafts {
 const freeform = (s: Setting) => s.type === "integer" && !s.choices.length;
 /** Text and color settings show their value without an editor. */
 const editable = (s: Setting) => s.type === "bool" || s.type === "integer" || s.type === "enum";
+
+/** Whether the row shows the reading as text instead of a control. */
+const textOnly = (s: Setting) => !editable(s) || (s.type === "enum" && !s.choices.length);
 
 /** Whether the setting takes `v`. */
 function accepts(s: Setting, v: Scalar | null): v is Scalar {
@@ -261,7 +267,7 @@ function Control({ s, draft, guards, drafts, invalid }: { s: Setting; draft: Dra
   const name = label(s.key);
   const value: Scalar | null = draft?.type === "set" ? draft.value : draft?.type === "forget" ? s.value : baseValue(s);
   const change = (v: Scalar) => edit(s, drafts, v);
-  if (!editable(s) || (s.type === "enum" && !s.choices.length)) return <span className="value">{valueText(s.key, s.value)}</span>;
+  if (textOnly(s)) return <span className="value">{valueText(s.key, s.value)}</span>;
   if (s.type === "bool")
     return <Switch label={name} checked={typeof value === "boolean" ? value : null} disabled={guards.locked} onChange={change} />;
   if (s.key === "wheel.threshold" && freeform(s)) return <SmartShift s={s} value={value} guards={guards} drafts={drafts} invalid={invalid} />;
@@ -401,6 +407,8 @@ function SettingRow({ entry, s, drafts, guards, item }: {
 }) {
   const fresh = settingFresh(entry, s);
   const info = settingInfo(s.key)!;
+  // Text readings follow their value; editors keep the unit beside the number.
+  const unit = textOnly(s) ? displayUnit(s.key, s.value) : info.unit;
   const draft = drafts.get(s.key);
   const { change, invalid } = pendingChange(s, draft);
   const staged = change !== null || invalid;
@@ -440,7 +448,7 @@ function SettingRow({ entry, s, drafts, guards, item }: {
       </div>
       <fieldset className="setting-control" disabled={guards.locked}>
         <Control s={s} draft={draft} guards={guards} drafts={drafts} invalid={invalid} />
-        {info.unit ? <span className="unit">{info.unit}</span> : null}
+        {unit ? <span className="unit">{unit}</span> : null}
       </fieldset>
       <div className="setting-marker">
         <Marker label={info.label} state={state} shape={shape} options={options} sending={item?.status === "saving"} disabled={guards.busy} />
@@ -452,6 +460,7 @@ function SettingRow({ entry, s, drafts, guards, item }: {
 /** A value the device only reports, shown with the settings it belongs to. */
 function ReadingRow({ f, dim }: { f: InfoEntry; dim: boolean }) {
   const info = settingInfo(f.key)!;
+  const unit = displayUnit(f.key, f.value);
   return (
     <div className={dim ? "setting-row stale" : "setting-row"} role="group" aria-label={info.label}>
       <div className="setting-label">
@@ -459,7 +468,7 @@ function ReadingRow({ f, dim }: { f: InfoEntry; dim: boolean }) {
       </div>
       <div className="setting-control">
         <span className="value">{typeof f.value === "string" ? choiceText(f.key, f.value) : valueText(f.key, f.value)}</span>
-        {info.unit ? <span className="unit">{info.unit}</span> : null}
+        {unit ? <span className="unit">{unit}</span> : null}
       </div>
       <div className="setting-marker" />
     </div>

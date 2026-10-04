@@ -144,6 +144,8 @@ fn security(security: ConnectionSecurity) -> p::Security {
 pub fn setting_key(key: SettingKey) -> String {
     use SettingKey::*;
     match key {
+        KeyboardPlatform => keys::KEYBOARD_PLATFORM.into(),
+        PowerAutoOff => keys::POWER_AUTO_OFF.into(),
         FnRowDefault => keys::KEYBOARD_FN_ROW.into(),
         PointerDpi0 => keys::indexed(keys::POINTER_SENSOR_N_DPI, 0),
         PointerDpi1 => keys::indexed(keys::POINTER_SENSOR_N_DPI, 1),

@@ -131,6 +131,18 @@ unit = "millimetres"
 # Settings.
 
 [[key]]
+key = "keyboard.platform"
+lists = ["device", "setting"]
+type = "enum"
+values = ["windows", "windows_embedded", "linux", "chrome_os", "android", "mac", "ios", "webos", "tizen"]
+
+[[key]]
+key = "power.auto_off"
+lists = ["device", "setting"]
+type = "integer"
+unit = "seconds"
+
+[[key]]
 key = "keyboard.fn_row"
 lists = ["device", "setting"]
 type = "enum"

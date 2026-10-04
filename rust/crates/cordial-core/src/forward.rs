@@ -1,6 +1,6 @@
 use crate::hid::{
     CONSUMER, CONSUMER_AXES, CONSUMER_SWITCHES, Error, Held, Input, KEYBOARD, MOTION_LIMIT, MOUSE,
-    QUEUE, SOURCES,
+    QUEUE, RADIO, SOURCES, SYSTEM,
 };
 
 pub const REPORT_KEYBOARD: u8 = 1;
@@ -11,6 +11,8 @@ pub const REPORT_CONSUMER_TOGGLE: u8 = 5;
 pub const REPORT_CONSUMER_ON_OFF: u8 = 6;
 pub const REPORT_POINTER_POSITION: u8 = 7;
 pub const REPORT_CONSUMER_VALUES: u8 = 8;
+pub const REPORT_SYSTEM: u8 = 9;
+pub const REPORT_RADIO: u8 = 10;
 
 // A 512-byte report contains at most 128 32-bit values. Their sum fits 40 bits.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -34,6 +36,7 @@ struct Queued {
     pulse_break: bool,
     // Each pair stores neutral 0, explicit On 1, toggle 2, or explicit Off 3.
     consumer_switches: [u8; CONSUMER_SWITCHES.len().div_ceil(4)],
+    sliders: [Option<bool>; 2],
     position: [u16; 3],
     consumer_values: [u16; CONSUMER_AXES.len()],
     source: u8,
@@ -63,6 +66,7 @@ impl Default for Queued {
             pulses: Held::default(),
             pulse_break: false,
             consumer_switches: [0; CONSUMER_SWITCHES.len().div_ceil(4)],
+            sliders: [None; 2],
             position: [u16::MAX; 3],
             consumer_values: [u16::MAX; CONSUMER_AXES.len()],
             source: 0,
@@ -100,6 +104,8 @@ pub struct Forwarder {
     reconcile: bool,
     dirty: u8,
     switch_reset: u8,
+    received_sliders: [Option<(bool, u8)>; 2],
+    applied_sliders: [Option<(bool, u8)>; 2],
     received_position: [Option<(u16, u8)>; 3],
     received_values: [Option<(u16, u8)>; CONSUMER_AXES.len()],
     reconcile_position: [Option<u16>; 3],
@@ -118,8 +124,10 @@ impl Default for Forwarder {
             packet: None,
             enabled: true,
             reconcile: true,
-            dirty: KEYBOARD | CONSUMER | MOUSE,
+            dirty: KEYBOARD | CONSUMER | MOUSE | SYSTEM | RADIO,
             switch_reset: 0,
+            received_sliders: [None; 2],
+            applied_sliders: [None; 2],
             received_position: [None; 3],
             received_values: [None; CONSUMER_AXES.len()],
             reconcile_position: [None; 3],
@@ -134,6 +142,11 @@ fn combined(sources: &[Held; SOURCES]) -> Result<Held, Error> {
 }
 impl Forwarder {
     fn record_values(&mut self, source: usize, input: &Input) {
+        for (state, value) in self.received_sliders.iter_mut().zip(input.sliders) {
+            if let Some(value) = value {
+                *state = Some((value, source as u8));
+            }
+        }
         for (state, value) in self.received_position.iter_mut().zip(input.position) {
             if let Some(value) = value {
                 *state = Some((value, source as u8));
@@ -213,6 +226,11 @@ impl Forwarder {
             && input.consumer_motion == [0; CONSUMER_AXES.len()]
             && input.pulses == Held::default()
             && input.consumer_switches == [0; CONSUMER_SWITCHES.len()]
+            && input
+                .sliders
+                .iter()
+                .enumerate()
+                .all(|(i, v)| v.is_none_or(|v| self.received_sliders[i] == Some((v, source as u8))))
             && input.position.iter().enumerate().all(|(i, v)| {
                 v.is_none_or(|v| self.received_position[i] == Some((v, source as u8)))
             })
@@ -231,6 +249,8 @@ impl Forwarder {
                 && last.held == input.held
                 && last.consumer_motion == [ConsumerDelta::default(); CONSUMER_AXES.len()]
                 && input.consumer_motion == [0; CONSUMER_AXES.len()]
+                && last.sliders == [None; 2]
+                && input.sliders == [None; 2]
                 && last.pulses == Held::default()
                 && input.pulses == Held::default()
                 && last.consumer_switches == [0; CONSUMER_SWITCHES.len().div_ceil(4)]
@@ -285,6 +305,7 @@ impl Forwarder {
                     bits | (code << (2 * j))
                 })
             }),
+            sliders: input.sliders,
             position: input.position.map(|v| v.unwrap_or(u16::MAX)),
             consumer_values: input.consumer_values.map(|v| v.unwrap_or(u16::MAX)),
             source: source as u8,
@@ -299,6 +320,15 @@ impl Forwarder {
             return;
         }
         self.received[source] = Held::default();
+        for state in self
+            .received_sliders
+            .iter_mut()
+            .chain(&mut self.applied_sliders)
+        {
+            if state.is_some_and(|(_, owner)| owner as usize == source) {
+                *state = None;
+            }
+        }
         self.applied[source] = Held::default();
         for (received, snapshot) in self
             .received_position
@@ -350,9 +380,10 @@ impl Forwarder {
         self.active = None;
         self.packet = None;
         self.applied = self.received;
+        self.applied_sliders = self.received_sliders;
         self.reconcile_position = self.received_position.map(|v| v.map(|(value, _)| value));
         self.reconcile_values = self.received_values.map(|v| v.map(|(value, _)| value));
-        self.dirty = KEYBOARD | MOUSE | CONSUMER;
+        self.dirty = KEYBOARD | MOUSE | CONSUMER | SYSTEM | RADIO;
         self.reconcile = true;
     }
     pub fn enable(&mut self, enabled: bool) {
@@ -362,7 +393,7 @@ impl Forwarder {
         }
     }
     fn prepare(&mut self, active: Option<Queued>) -> bool {
-        let held = combined(&self.applied)
+        let mut held = combined(&self.applied)
             .and_then(|held| {
                 if active.is_some_and(|q| q.pulse_break) {
                     let pulse = active.unwrap().pulses;
@@ -371,6 +402,8 @@ impl Forwarder {
                         *value &= !mask;
                     }
                     held.buttons &= !pulse.buttons;
+                    held.system &= !pulse.system;
+                    held.radio &= !(pulse.radio & 1);
                     let mut consumers = Held::default();
                     for &usage in &held.consumers {
                         if usage != 0 && !pulse.consumers.contains(&usage) {
@@ -384,6 +417,16 @@ impl Forwarder {
                 }
             })
             .expect("queued input exceeded consumer capacity");
+        // Absolute sliders use the latest observed source, not held-key union.
+        held.system &= !(crate::hid::ROTATION_KNOWN | crate::hid::ROTATION_STATE);
+        held.radio &= 1;
+        if let Some((value, _)) = self.applied_sliders[0] {
+            held.system |=
+                crate::hid::ROTATION_KNOWN | if value { crate::hid::ROTATION_STATE } else { 0 };
+        }
+        if let Some((value, _)) = self.applied_sliders[1] {
+            held.radio |= 4 | (u8::from(value) << 1);
+        }
         let motion = active.map_or([0; 4], |q| q.motion);
         let consumer_motion = active.map_or([0; CONSUMER_AXES.len()], |q| {
             q.consumer_motion.map(ConsumerDelta::value)
@@ -409,6 +452,27 @@ impl Forwarder {
                 packet.bytes[2 * i..2 * i + 2].copy_from_slice(&value.to_le_bytes());
             }
             CONSUMER
+        } else if self.dirty & SYSTEM != 0 || held.system != self.sent.system {
+            packet.id = REPORT_SYSTEM;
+            let system = (held.system & !(crate::hid::ROTATION_KNOWN | crate::hid::ROTATION_STATE))
+                | if held.system & crate::hid::ROTATION_KNOWN != 0 {
+                    held.system & crate::hid::ROTATION_STATE
+                } else {
+                    crate::hid::ROTATION_STATE << 1
+                };
+            packet.bytes[..8].copy_from_slice(&system.to_le_bytes());
+            packet.length = 8;
+            SYSTEM
+        } else if self.dirty & RADIO != 0 || held.radio != self.sent.radio {
+            packet.id = REPORT_RADIO;
+            packet.bytes[0] = (held.radio & 1)
+                | if held.radio & 4 != 0 {
+                    held.radio & 2
+                } else {
+                    4
+                };
+            packet.length = 1;
+            RADIO
         } else if self.dirty & MOUSE != 0 || held.buttons != self.sent.buttons || motion != [0; 4] {
             packet.id = REPORT_MOUSE;
             packet.length = 10;
@@ -512,6 +576,11 @@ impl Forwarder {
                 self.head = (self.head + 1) % QUEUE;
                 self.count -= 1;
                 self.applied[item.source as usize] = item.held;
+                for (state, value) in self.applied_sliders.iter_mut().zip(item.sliders) {
+                    if let Some(value) = value {
+                        *state = Some((value, item.source));
+                    }
+                }
                 let held =
                     combined(&self.applied).expect("queued input exceeded consumer capacity");
                 let mut item = item;
@@ -521,6 +590,8 @@ impl Forwarder {
                     .zip(item.pulses.keys)
                     .any(|(&a, b)| a & b != 0)
                     || held.buttons & item.pulses.buttons != 0
+                    || held.system & item.pulses.system != 0
+                    || held.radio & item.pulses.radio & 1 != 0
                     || held
                         .consumers
                         .iter()
@@ -564,6 +635,23 @@ impl Forwarder {
                 for (i, value) in self.sent.consumers.iter_mut().enumerate() {
                     *value = u16::from_le_bytes([packet.bytes[2 * i], packet.bytes[2 * i + 1]]);
                 }
+            }
+            REPORT_SYSTEM => {
+                let system = u64::from_le_bytes(packet.bytes[..8].try_into().unwrap());
+                self.sent.system = (system & !(crate::hid::ROTATION_STATE << 1))
+                    | if system & (crate::hid::ROTATION_STATE << 1) == 0 {
+                        crate::hid::ROTATION_KNOWN
+                    } else {
+                        0
+                    }
+            }
+            REPORT_RADIO => {
+                self.sent.radio = (packet.bytes[0] & 1)
+                    | if packet.bytes[0] & 4 == 0 {
+                        4 | (packet.bytes[0] & 2)
+                    } else {
+                        0
+                    };
             }
             REPORT_MOUSE => {
                 self.sent.buttons = u16::from_le_bytes([packet.bytes[0], packet.bytes[1]]);

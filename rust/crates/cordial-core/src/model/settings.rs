@@ -46,10 +46,14 @@ pub enum SettingKey {
     BacklightStatus = 27,
     #[serde(rename = "wheel.info")]
     WheelInfo = 28,
+    #[serde(rename = "keyboard.platform")]
+    KeyboardPlatform = 29,
+    #[serde(rename = "power.auto_off")]
+    PowerAutoOff = 30,
 }
 
 impl SettingKey {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 22] = [
         Self::FnRowDefault,
         Self::BacklightEnabled,
         Self::BacklightMode,
@@ -70,6 +74,8 @@ impl SettingKey {
         Self::BacklightCurrentLevel,
         Self::BacklightStatus,
         Self::WheelInfo,
+        Self::KeyboardPlatform,
+        Self::PowerAutoOff,
     ];
     pub fn from_name(value: &str) -> Option<Self> {
         Self::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value))
@@ -79,9 +85,8 @@ impl SettingKey {
         use SettingKey::*;
         match self {
             WheelInfo => SettingType::Text,
-            FnRowDefault | BacklightMode | BacklightEffect | BacklightStatus | WheelMode => {
-                SettingType::Enum
-            }
+            FnRowDefault | KeyboardPlatform | BacklightMode | BacklightEffect | BacklightStatus
+            | WheelMode => SettingType::Enum,
             BacklightEnabled | BacklightPowerOn | BacklightCrown | BacklightPowerSave
             | WheelInvert | ThumbwheelInvert => SettingType::Bool,
             _ => SettingType::Integer,
@@ -90,7 +95,17 @@ impl SettingKey {
     pub fn writable_feature(self, feature: FeatureId, revision: FeatureRevision) -> bool {
         use SettingKey::*;
         match self {
-            FnRowDefault => feature == FeatureId::FN_INVERSION,
+            FnRowDefault => matches!(
+                feature,
+                FeatureId::FN_INVERSION
+                    | FeatureId::FN_INVERSION_LEGACY
+                    | FeatureId::FN_INVERSION_MULTI_HOST
+            ),
+            KeyboardPlatform => matches!(
+                feature,
+                FeatureId::DUAL_PLATFORM | FeatureId::MULTI_PLATFORM
+            ),
+            PowerAutoOff => feature == FeatureId::ADC_MEASUREMENT && revision.0 >= 2,
             BacklightEnabled | BacklightPowerOn | BacklightCrown => feature == FeatureId::BACKLIGHT,
             BacklightPowerSave => feature == FeatureId::BACKLIGHT && revision.0 >= 1,
             BacklightEffect => feature == FeatureId::BACKLIGHT && revision.0 >= 2,
@@ -109,6 +124,17 @@ impl SettingKey {
     pub fn enum_values(self) -> &'static [&'static str] {
         use SettingKey::*;
         match self {
+            KeyboardPlatform => &[
+                "windows",
+                "windows_embedded",
+                "linux",
+                "chrome_os",
+                "android",
+                "mac",
+                "ios",
+                "webos",
+                "tizen",
+            ],
             FnRowDefault => &["function_keys", "special_actions"],
             BacklightMode => &["none", "automatic", "temporary_manual", "permanent_manual"],
             BacklightEffect => &[

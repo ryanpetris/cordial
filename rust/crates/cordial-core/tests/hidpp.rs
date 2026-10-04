@@ -16,10 +16,29 @@ fn respond(client: &mut Client, packet: &[u8; 19], parameters: &[u8], now: &mut 
     client.receive(0x11, &reply, *now)
 }
 fn activate(platform: HostPlatform, version: u8) -> (Client, u64) {
+    activate_controls(platform, version, &[0xc7, 0xc8, 0xe0, 0xd1], 0, 3)
+}
+fn activate_controls(
+    platform: HostPlatform,
+    version: u8,
+    controls: &[u16],
+    native: u128,
+    expected_writes: usize,
+) -> (Client, u64) {
+    activate_controls_flags(platform, version, controls, native, expected_writes, 0x7a)
+}
+fn activate_controls_flags(
+    platform: HostPlatform,
+    version: u8,
+    controls: &[u16],
+    native: u128,
+    expected_writes: usize,
+    flags: u8,
+) -> (Client, u64) {
     let mut client = Client::new(HIDPP_SHORT | HIDPP_LONG);
+    client.native_controls([native; 3]);
     let mut now = 100;
     client.configure(true, platform, now);
-    let controls: [u16; 4] = [0xc7, 0xc8, 0xe0, 0xd1];
     let mut resets = 0;
     let mut writes = 0;
     while let Some(packet) = client.next_output(now) {
@@ -41,7 +60,7 @@ fn activate(platform: HostPlatform, version: u8) -> (Client, u64) {
             (8, 0) => response[0] = controls.len() as u8,
             (8, 1) => {
                 response[..2].copy_from_slice(&controls[packet[3] as usize].to_be_bytes());
-                response[4] = 0x7a;
+                response[4] = flags;
             }
             (8, 2) => {
                 response[..2].copy_from_slice(&packet[3..5]);
@@ -63,7 +82,7 @@ fn activate(platform: HostPlatform, version: u8) -> (Client, u64) {
         now += 1;
     }
     assert_eq!(resets, 1);
-    assert_eq!(writes, 3);
+    assert_eq!(writes, expected_writes);
     assert_eq!(client.status, NormalizationState::Active);
     assert_eq!(client.error, None);
     (client, now)
@@ -343,4 +362,33 @@ fn quiescing_an_unchanged_preference_keeps_queued_normalization_work() {
         ProtocolState::Detected { major: 4, minor: 2 }
     );
     assert_eq!(client.error, Some(Error::ResetUnavailable));
+}
+
+#[test]
+fn additional_mappings_preserve_native_input_and_release_system_keys() {
+    use cordial_core::model::translation::CONTROLS;
+    let play = CONTROLS.iter().position(|c| c.id == 1).unwrap();
+    let (mut client, now) =
+        activate_controls(HostPlatform::Linux, 4, &[1, 0x40, 0x119], 1 << play, 2);
+    assert!(notification(&mut client, &[1, 0x40, 0x119], now));
+    assert_eq!(client.held.consumers, [0; 8]);
+    assert_eq!(client.held.system, 2);
+    assert_ne!(client.held.keys, [0; 32]);
+    assert!(notification(&mut client, &[], now));
+    assert_eq!(client.held, Held::default());
+    let (mut client, now) = activate_controls(HostPlatform::Linux, 4, &[1, 0x40], 0, 2);
+    assert!(notification(&mut client, &[1, 0x40], now));
+    assert!(client.held.consumers.contains(&0xe9));
+    assert_eq!(client.held.system, 2);
+}
+
+#[test]
+fn unsupported_lock_gesture_and_zoom_reset_controls_stay_native() {
+    let (client, _) = activate_controls(HostPlatform::Linux, 4, &[0xc2, 0xc3, 0x4a], 0, 0);
+    assert_eq!(client.held, Held::default());
+}
+
+#[test]
+fn additional_keyboard_mappings_do_not_divert_mouse_buttons() {
+    activate_controls_flags(HostPlatform::Linux, 4, &[1, 0x40, 0x54, 0x119], 0, 0, 0x21);
 }

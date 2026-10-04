@@ -22,6 +22,8 @@ export const BACKLIGHT_STATUS = "backlight.status";
 export const WHEEL_RESOLUTION_MULTIPLIER = "wheel.resolution_multiplier";
 export const WHEEL_RATCHETS_PER_ROTATION = "wheel.ratchets_per_rotation";
 export const WHEEL_DIAMETER = "wheel.diameter";
+export const KEYBOARD_PLATFORM = "keyboard.platform";
+export const POWER_AUTO_OFF = "power.auto_off";
 export const KEYBOARD_FN_ROW = "keyboard.fn_row";
 export const BACKLIGHT_ENABLED = "backlight.enabled";
 export const BACKLIGHT_MODE = "backlight.mode";
@@ -62,6 +64,8 @@ export const KEYS: readonly KeyEntry[] = [
   { key: "wheel.resolution_multiplier", adapter: false, device: true, setting: false, type: "integer", unit: null, values: [] },
   { key: "wheel.ratchets_per_rotation", adapter: false, device: true, setting: false, type: "integer", unit: null, values: [] },
   { key: "wheel.diameter", adapter: false, device: true, setting: false, type: "integer", unit: "millimetres", values: [] },
+  { key: "keyboard.platform", adapter: false, device: true, setting: true, type: "enum", unit: null, values: ["windows", "windows_embedded", "linux", "chrome_os", "android", "mac", "ios", "webos", "tizen"] },
+  { key: "power.auto_off", adapter: false, device: true, setting: true, type: "integer", unit: "seconds", values: [] },
   { key: "keyboard.fn_row", adapter: false, device: true, setting: true, type: "enum", unit: null, values: ["function_keys", "special_actions"] },
   { key: "backlight.enabled", adapter: false, device: true, setting: true, type: "bool", unit: null, values: [] },
   { key: "backlight.mode", adapter: false, device: true, setting: true, type: "enum", unit: null, values: ["none", "automatic", "temporary_manual", "permanent_manual"] },

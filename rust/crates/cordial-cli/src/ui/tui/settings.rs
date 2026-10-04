@@ -122,6 +122,7 @@ pub(super) fn human_value(key: &str, v: Option<&Value>) -> String {
     match v {
         Value::Bool(b) => if *b { "On" } else { "Off" }.into(),
         Value::Integer(n) if key == keys::WHEEL_THRESHOLD && *n == SMARTSHIFT_OFF => "Off".into(),
+        Value::Integer(0) if key == keys::POWER_AUTO_OFF => "Never".into(),
         Value::Integer(n) if unit.is_empty() => n.to_string(),
         Value::Integer(n) => format!("{n} {unit}"),
         Value::Text(t) if model::key(key).is_some_and(|(k, _)| k.kind == keys::Kind::Enum) => {
@@ -1050,6 +1051,14 @@ mod tests {
         );
         assert_eq!(step_value(b, None, -5), Value::Integer(300));
         assert_eq!(step_value(b, None, 5), Value::Integer(5));
+    }
+
+    #[test]
+    fn auto_off_reads_never_at_zero() {
+        let s = integer(keys::POWER_AUTO_OFF, 0, 15300, 60);
+        assert_eq!(steps(&s), (60, 600));
+        assert_eq!(human_value(&s.key, Some(&Value::Integer(0))), "Never");
+        assert_eq!(human_value(&s.key, Some(&Value::Integer(600))), "600 s");
     }
 
     #[test]

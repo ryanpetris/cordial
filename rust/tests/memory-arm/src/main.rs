@@ -252,6 +252,8 @@ fn records(maximum: bool) -> Vec<Record> {
             use SettingKey::*;
             let feature = match key {
                 FnRowDefault => FeatureId::FN_INVERSION,
+                KeyboardPlatform => FeatureId::DUAL_PLATFORM,
+                PowerAutoOff => FeatureId::ADC_MEASUREMENT,
                 PointerDpi0 | PointerDpi1 => FeatureId::ADJUSTABLE_DPI,
                 WheelMode | WheelThreshold => FeatureId::SMART_SHIFT,
                 WheelInvert => FeatureId::HIRES_WHEEL,
@@ -291,6 +293,7 @@ fn records(maximum: bool) -> Vec<Record> {
                         (5, 7200, 5)
                     }
                     WheelThreshold => (1, 255, 1),
+                    PowerAutoOff => (0, 15300, 60),
                     BacklightCurrentLevel => (0, 254, 1),
                     _ => unreachable!(),
                 };

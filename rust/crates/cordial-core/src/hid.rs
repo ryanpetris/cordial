@@ -18,6 +18,18 @@ pub const CONSUMER_AXES: [u16; 17] = [
 pub const KEYBOARD: u8 = 1;
 pub const MOUSE: u8 = 2;
 pub const CONSUMER: u8 = 4;
+pub const SYSTEM: u8 = 8;
+pub const RADIO: u8 = 16;
+pub const ROTATION_KNOWN: u64 = 1 << 63;
+pub const ROTATION_STATE: u64 = 1 << 36;
+const SYSTEM_APPLICATION: u8 = 3;
+const RADIO_APPLICATION: u8 = 5;
+/// Standard keyboard-related Generic Desktop System usages, in USB bitmap order.
+pub const SYSTEM_USAGES: &[u16] = &[
+    0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x9b,
+    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4,
+    0xb5, 0xb6, 0xb7, 0xc9, 0xca,
+];
 const LOCK_SELECTORS: [u32; 8] = [
     0x80001, 0x80002, 0x80003, 0x80004, 0x80005, 0x70053, 0x70039, 0x70047,
 ];
@@ -41,6 +53,9 @@ pub struct Held {
     pub keys: [u8; 32],
     pub consumers: [u16; CONSUMERS],
     pub buttons: u16,
+    pub system: u64,
+    /// Bit 0 is the radio button; bit 1 is slider state, valid when bit 2 is set.
+    pub radio: u8,
 }
 impl Held {
     pub fn consumer(&mut self, usage: u16) -> Result<(), Error> {
@@ -68,6 +83,8 @@ impl Held {
             *a |= b;
         }
         combined.buttons |= other.buttons;
+        combined.system |= other.system;
+        combined.radio |= other.radio;
         for &usage in &other.consumers {
             if usage != 0 {
                 combined.consumer(usage)?;
@@ -86,6 +103,8 @@ pub struct Input {
     pub pulse_repetition_count: u8,
     pub consumer_switches: [i8; CONSUMER_SWITCHES.len()],
     pub explicit_switches: u64,
+    /// Latest rotation-lock and radio slider observations, independent of held buttons.
+    pub sliders: [Option<bool>; 2],
     pub position: [Option<u16>; 3],
     pub consumer_values: [Option<u16>; CONSUMER_AXES.len()],
 }
@@ -100,6 +119,7 @@ impl Default for Input {
             pulse_repetition_count: 0,
             consumer_switches: [0; CONSUMER_SWITCHES.len()],
             explicit_switches: 0,
+            sliders: [None; 2],
             position: [None; 3],
             consumer_values: [None; CONSUMER_AXES.len()],
         }
@@ -408,6 +428,12 @@ fn usage_kind(usage: u32, app: u8, output: bool, relative: bool) -> u8 {
         } else {
             0
         };
+    }
+    if page == 1 && SYSTEM_USAGES.contains(&(code as u16)) {
+        return SYSTEM;
+    }
+    if page == 1 && matches!(code, 0xc6 | 0xc8) {
+        return RADIO;
     }
     if page == 7 && (1..=255).contains(&code) {
         return KEYBOARD;
@@ -873,6 +899,8 @@ fn walk_descriptor(
                                 0x10006 | 0x10007 => KEYBOARD,
                                 0x10002 => MOUSE,
                                 0xc0001 => CONSUMER,
+                                0x10080 => SYSTEM_APPLICATION,
+                                0x1000c => RADIO_APPLICATION,
                                 0xff430202 => HIDPP_BLUETOOTH_APPLICATION,
                                 _ if u >> 16 == 0xff00 => HIDPP_APPLICATION,
                                 _ => 0,
@@ -1327,7 +1355,7 @@ impl Compiler {
                 7 => 255,
                 9 => 16,
                 12 => 65535,
-                1 => 56,
+                1 => 0xca,
                 8 => 5,
                 _ => 0,
             };
@@ -1453,6 +1481,28 @@ impl Compiler {
     }
 }
 impl Map {
+    /// Whether an input field can represent a standard usage on this connection.
+    pub fn supports_usage(&self, usage: u32) -> bool {
+        self.fields().iter().any(|f| {
+            if f.flags & 1 != 0 || usage_kind(usage, f.app(), false, f.flags & 4 != 0) == 0 {
+                return false;
+            }
+            let spans =
+                &self.usages()[usize::from(f.span)..usize::from(f.span) + usize::from(f.spans)];
+            if f.flags & 2 != 0 {
+                (0..f.count()).any(|i| usage_at(spans, i as u32, true) == usage)
+            } else {
+                let maximum = if f.minimum < 0 {
+                    i64::from(f.maximum as i32)
+                } else {
+                    i64::from(f.maximum)
+                };
+                selector_value(spans, usage, f.minimum)
+                    .is_some_and(|v| v <= maximum && (f.size >= 32 || v < (1i64 << f.size)))
+            }
+        })
+    }
+
     pub fn decode(&self, state: &mut State, report_id: u8, payload: &[u8]) -> Result<Input, Error> {
         if state.reports.len() != self.reports().iter().map(held_bytes).sum::<usize>() {
             return Err(Error::Invalid);
@@ -1468,6 +1518,15 @@ impl Map {
         }
         let mut next = Input::default();
         let held_offset: usize = self.reports()[..ri].iter().map(held_bytes).sum();
+        let previous_held = load_held(
+            &state.reports[held_offset..held_offset + held_bytes(&self.reports()[ri])],
+            &self.reports()[ri],
+        );
+        let slider_known = |usage| match usage {
+            0x100c8 => previous_held.radio & 4 != 0,
+            0x100ca => previous_held.system & ROTATION_KNOWN != 0,
+            _ => true,
+        };
         let previous_value = |f: &Field, j: usize| {
             if !f.history() {
                 return 0;
@@ -1497,6 +1556,10 @@ impl Map {
                         let spans = &self.usages()[usize::from(field.span)
                             ..usize::from(field.span) + usize::from(field.spans)];
                         let usage = usage_at(spans, j as u32, true);
+                        if !slider_known(usage) {
+                            continue;
+                        }
+                        let sliders = next.sliders;
                         let numeric = matches!(usage, 0x10030 | 0x10031 | 0x10038 | 0xc0238)
                             || (usage >> 16 == 12
                                 && (CONSUMER_AXES.contains(&(usage as u16))
@@ -1518,6 +1581,7 @@ impl Map {
                         {
                             next.set_usage(usage, previous_value(field, j), false)?;
                         }
+                        next.sliders = sliders;
                         continue;
                     }
                     value = value.clamp(i64::from(field.minimum), maximum);
@@ -1584,13 +1648,20 @@ impl Map {
                     && !(usage >> 16 == 12 && CONSUMER_AXES.contains(&(usage as u16)))
                 {
                     if field.minimum < 0 {
+                        if value == 0 && !slider_known(usage) {
+                            continue;
+                        }
                         let bit = usize::from(field.state) + j;
+                        let sliders = next.sliders;
                         let latched = state.latches[bit / 8] & (1 << (bit % 8)) != 0;
                         next.set_usage(
                             usage,
                             i64::from(if value == 0 { latched } else { value > 0 }),
                             false,
                         )?;
+                        if value == 0 {
+                            next.sliders = sliders;
+                        }
                     } else if value != 0 && old == 0 {
                         next.pulse(usage)?;
                     }
@@ -3380,6 +3451,8 @@ fn held_bytes(report: &Layout) -> usize {
     keyboard_bits(report).div_ceil(8)
         + usize::from(report.held_roles & MOUSE != 0) * 2
         + usize::from(report.held_roles & CONSUMER != 0) * 16
+        + usize::from(report.held_roles & SYSTEM != 0) * 8
+        + usize::from(report.held_roles & RADIO != 0)
 }
 fn load_held(bytes: &[u8], report: &Layout) -> Held {
     let mut held = Held::default();
@@ -3403,6 +3476,14 @@ fn load_held(bytes: &[u8], report: &Layout) -> Held {
         {
             *value = u16::from_le_bytes(*bytes);
         }
+        offset += 16;
+    }
+    if report.held_roles & SYSTEM != 0 {
+        held.system = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+    }
+    if report.held_roles & RADIO != 0 {
+        held.radio = bytes[offset];
     }
     held
 }
@@ -3429,6 +3510,14 @@ fn store_held(bytes: &mut [u8], report: &Layout, held: &Held) {
         {
             bytes.copy_from_slice(&value.to_le_bytes());
         }
+        offset += 16;
+    }
+    if report.held_roles & SYSTEM != 0 {
+        bytes[offset..offset + 8].copy_from_slice(&held.system.to_le_bytes());
+        offset += 8;
+    }
+    if report.held_roles & RADIO != 0 {
+        bytes[offset] = held.radio;
     }
 }
 fn held_usage(held: &Held, usage: u32) -> bool {
@@ -3437,6 +3526,12 @@ fn held_usage(held: &Held, usage: u32) -> bool {
         7 if code <= 255 => held.keys[usize::from(code) / 8] & (1 << (code % 8)) != 0,
         9 if (1..=16).contains(&code) => held.buttons & (1 << (code - 1)) != 0,
         12 => held.consumers.contains(&code),
+        1 if code == 0xc6 => held.radio & 1 != 0,
+        1 if code == 0xc8 => held.radio & 2 != 0,
+        1 => SYSTEM_USAGES
+            .iter()
+            .position(|&u| u == code)
+            .is_some_and(|i| held.system & (1 << i) != 0),
         _ => false,
     }
 }
@@ -3509,6 +3604,12 @@ fn selector_value(spans: &[Span], usage: u32, minimum: i32) -> Option<i64> {
 }
 impl Input {
     pub(crate) fn pulse(&mut self, usage: u32) -> Result<(), Error> {
+        // Relative slider toggles use the corresponding standard momentary button.
+        let usage = match usage {
+            0x100c8 => 0x100c6,
+            0x100ca => 0x100c9,
+            _ => usage,
+        };
         let mut one = Input::default();
         one.set_usage(usage, 1, false)?;
         if held_usage(&self.pulses, usage) {
@@ -3537,6 +3638,14 @@ impl Input {
     }
 
     fn set_usage(&mut self, usage: u32, value: i64, relative: bool) -> Result<(), Error> {
+        if usage == 0x100ca && !relative {
+            self.held.system |= ROTATION_KNOWN;
+            self.sliders[0] = Some(value != 0);
+        }
+        if usage == 0x100c8 && !relative {
+            self.held.radio |= 4 | (u8::from(value != 0) << 1);
+            self.sliders[1] = Some(value != 0);
+        }
         if value == 0 {
             return Ok(());
         }
@@ -3557,6 +3666,12 @@ impl Input {
             {
                 self.consumer_motion[axis] += value;
             }
+        } else if usage == 0x100c6 {
+            self.held.radio |= 1;
+        } else if page == 1
+            && let Some(i) = SYSTEM_USAGES.iter().position(|&u| usize::from(u) == code)
+        {
+            self.held.system |= 1 << i;
         } else if page == 7 && (1..=255).contains(&code) {
             if code <= 3 {
                 return Err(Error::Rollover);

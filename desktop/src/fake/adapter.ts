@@ -154,10 +154,12 @@ export function demoDevices(): FakeDevice[] {
       },
       settings: [
         setting("keyboard.fn_row", { type: "enum", choices: ["function_keys", "special_actions"], value: "special_actions" }),
+        setting("keyboard.platform", { type: "enum", choices: ["windows", "linux", "chrome_os", "android", "mac", "ios"], value: "linux" }),
         setting("backlight.enabled", { value: true, saved: true, state: "applied" }),
         setting("backlight.mode", { type: "enum", choices: ["automatic", "permanent_manual"], value: "automatic" }),
         setting("backlight.level", { type: "integer", min: 0, max: 7, step: 1, value: 3 }),
         setting("backlight.delay.hands_out", { type: "integer", min: 5, max: 7200, step: 5, value: 60, saved: 30, state: "changed_on_device" }),
+        setting("power.auto_off", { type: "integer", min: 0, max: 15300, step: 60, value: 1800 }),
       ],
     }),
     device("d_2", {

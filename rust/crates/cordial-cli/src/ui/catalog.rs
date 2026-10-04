@@ -56,6 +56,20 @@ static CATALOG: &[Info] = &[
         ],
         ..info(keys::KEYBOARD_FN_ROW, "Function Row", "Keyboard")
     },
+    Info {
+        choices: &[
+            ("windows", "Windows"),
+            ("windows_embedded", "Windows Embedded"),
+            ("linux", "Linux"),
+            ("chrome_os", "ChromeOS"),
+            ("android", "Android"),
+            ("mac", "macOS"),
+            ("ios", "iOS"),
+            ("webos", "webOS"),
+            ("tizen", "Tizen"),
+        ],
+        ..info(keys::KEYBOARD_PLATFORM, "Keyboard Platform", "Keyboard")
+    },
     info(keys::BACKLIGHT_ENABLED, "Backlight", "Backlight"),
     info(keys::BACKLIGHT_MODE, "Backlight Mode", "Backlight"),
     info(keys::BACKLIGHT_LEVEL, "Manual Backlight Level", "Backlight"),
@@ -133,6 +147,10 @@ static CATALOG: &[Info] = &[
         "Reverse Horizontal Scrolling",
         "Wheel",
     ),
+    Info {
+        unit: "s",
+        ..info(keys::POWER_AUTO_OFF, "Automatic Power-Off", "Power")
+    },
 ];
 
 /// A key's presentation, its display position and index; `None` for keys this build doesn't
@@ -612,6 +630,13 @@ pub(crate) mod tests {
             choice_words(keys::KEYBOARD_FN_ROW, "function_keys"),
             "F1-F12"
         );
+        assert_eq!(label(keys::KEYBOARD_PLATFORM), "Keyboard Platform");
+        assert_eq!(choice_words(keys::KEYBOARD_PLATFORM, "mac"), "macOS");
+        assert_eq!(
+            choice_words(keys::KEYBOARD_PLATFORM, "windows_embedded"),
+            "Windows Embedded"
+        );
+        assert_eq!(category(keys::POWER_AUTO_OFF), "Power");
         assert_eq!(label("pointer.sensor.0.dpi"), "Pointer Speed");
         assert_eq!(label("pointer.sensor.1.dpi"), "Pointer Speed 2");
         assert!(info_for("pointer.sensor.x.dpi").is_none());
@@ -624,6 +649,12 @@ pub(crate) mod tests {
         assert_eq!(
             parse_value(&s, "26").unwrap_err(),
             "backlight.delay.powered takes an integer from 5 through 300 in steps of 5"
+        );
+        let a = integer(keys::POWER_AUTO_OFF, 0, 15300, 60);
+        assert_eq!(parse_value(&a, "0"), Ok(Value::Integer(0)));
+        assert_eq!(
+            parse_value(&a, "90").unwrap_err(),
+            "power.auto_off takes an integer from 0 through 15300 in steps of 60"
         );
         let m = choice(keys::WHEEL_MODE, &["freespin", "ratchet"]);
         assert_eq!(

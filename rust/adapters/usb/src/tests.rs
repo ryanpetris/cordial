@@ -281,3 +281,56 @@ fn descriptor_ranges_are_valid_for_signed_global_item_parsers() {
         0x500
     );
 }
+
+#[test]
+fn system_and_radio_reports_round_trip_and_start_with_unknown_sliders() {
+    use cordial_core::{
+        forward::Forwarder,
+        hid::{ROTATION_KNOWN, ROTATION_STATE},
+    };
+    use embassy_usb::class::hid::RequestHandler;
+    let io = Io::new();
+    let mut handler = ReportHandler(&io);
+    let map = cordial_core::hid::Map::compile(descriptor::REPORT_DESCRIPTOR).unwrap();
+    let mut state = map.state().unwrap();
+    for (id, length) in [(9, 9), (10, 2)] {
+        let mut bytes = [0; 16];
+        assert_eq!(
+            handler.get_report(hid::ReportId::In(id), &mut bytes),
+            Some(length)
+        );
+        assert_eq!(bytes[0], id);
+        assert_eq!(
+            map.decode(&mut state, id, &bytes[1..length]).unwrap().held,
+            Held::default()
+        );
+    }
+    let mut forward = Forwarder::default();
+    while forward.packet().is_some() {
+        forward.complete();
+    }
+    let held = Held {
+        system: 3 | ROTATION_KNOWN | ROTATION_STATE,
+        radio: 7,
+        ..Held::default()
+    };
+    forward
+        .input(
+            0,
+            Input {
+                held,
+                sliders: [Some(true); 2],
+                ..Input::default()
+            },
+        )
+        .unwrap();
+    let mut output = Held::default();
+    while let Some(packet) = forward.packet() {
+        output = map
+            .decode(&mut state, packet.id, packet.bytes())
+            .unwrap()
+            .held;
+        forward.complete();
+    }
+    assert_eq!(output, held);
+}

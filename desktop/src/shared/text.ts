@@ -237,6 +237,21 @@ const SETTINGS: Record<string, SettingInfo> = {
     category: "Keyboard",
     choices: { function_keys: "F1-F12", special_actions: "Shortcuts" },
   },
+  "keyboard.platform": {
+    label: "Keyboard Platform",
+    category: "Keyboard",
+    choices: {
+      windows: "Windows",
+      windows_embedded: "Windows Embedded",
+      linux: "Linux",
+      chrome_os: "ChromeOS",
+      android: "Android",
+      mac: "macOS",
+      ios: "iOS",
+      webos: "webOS",
+      tizen: "Tizen",
+    },
+  },
   "backlight.enabled": { label: "Backlight", category: "Backlight" },
   "backlight.mode": { label: "Backlight Mode", category: "Backlight" },
   "backlight.level": { label: "Manual Backlight Level", category: "Backlight" },
@@ -258,6 +273,7 @@ const SETTINGS: Record<string, SettingInfo> = {
   "wheel.threshold": { label: "SmartShift", category: "Wheel" },
   "wheel.invert": { label: "Reverse Vertical Scrolling", category: "Wheel" },
   "thumbwheel.invert": { label: "Reverse Horizontal Scrolling", category: "Wheel" },
+  "power.auto_off": { label: "Automatic Power-Off", category: "Power", unit: "s" },
 };
 
 const SENSOR = /^pointer\.sensor\.([0-9]+)\.dpi$/;
@@ -270,6 +286,12 @@ export function settingInfo(key: string): SettingInfo | null {
   const sensor = Number(SENSOR.exec(key)?.[1] ?? 0);
   return sensor === 0 ? info : { ...info, label: `Pointer Speed ${sensor + 1}` };
 }
+
+/** Whether a displayed value reads "Never", which takes no unit. */
+export const neverValue = (key: string, v: Scalar | null) => key === "power.auto_off" && v === 0;
+
+/** The unit beside a displayed value; none when the value reads "Never". */
+export const displayUnit = (key: string, v: Scalar | null) => (neverValue(key, v) ? undefined : settingInfo(key)?.unit);
 
 const ORDER = Object.keys(SETTINGS);
 /** Display order; a second sensor follows the first. */

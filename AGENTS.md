@@ -17,6 +17,40 @@ running on the Host to operate is out of scope. Any feature to directly control 
 than to configure it is out of scope. All settings that would be needed to configure the Device
 upon connect must be stored on the Dongle.
 
+## Logitech devices
+
+- Evaluate individual controls, not whole HID++ feature IDs. A feature can contain
+  Implemented, Planned, Not Planned, and Excluded operations.
+- Normal operation must work with the Dongle alone. Host software may configure preferences and
+  display status, but must not be required to provide the feature during use.
+- User-facing writes configure ongoing Device behavior. Store preferences on the Dongle and reapply
+  them when needed. One-shot Device commands and continuous software control are out of scope.
+  Internal discovery and configuration operations needed for supported input translation are allowed.
+- Configure only the current Device connection. Other paired hosts, their settings and metadata,
+  host switching, and management of the Device's host slots are out of scope.
+- Input translation must produce standard USB input. Fixed key mappings and simultaneous held key
+  combinations are allowed. Running commands or processes, typing application names into menus,
+  and timed key sequences are out of scope. Preserve simultaneous presses and releases.
+- Do not implement diversion of standard Device behavior, such as mouse wheel scrolling, without
+  a demonstrated reason. Preserve native HID reporting when it provides the required behavior.
+  Before adding diversion, document the concrete missing capability or failure and why diversion
+  is needed to address it. Protocol support alone is not a reason. Any diverted input must have
+  complete Dongle-owned translation into standard USB input.
+- Reporting must answer a useful user question. Keep useful status and settings information, place
+  technical diagnostics on the Device's Diagnostics tab or dialog, and omit raw implementation data
+  without a useful presentation.
+- Expose operations only when supported by protocol evidence and the Device's advertised
+  capabilities. Verify writes with the relevant readback or documented confirmation. Record missing
+  documentation or hardware verification without treating it as a permanent scope exclusion.
+  Use Planned only for operations selected for implementation; use Not Planned for operations
+  without an implementation commitment. Resolving an unknown does not automatically make an
+  operation Planned.
+- Maintain [the Logitech feature inventory](docs/hidpp.md) when support or scope changes.
+  Record the feature ID, description, implementation, status, and reasons for exclusions and
+  unplanned operations. UI complexity is a consideration for each feature, not a blanket scope
+  rule. Keep scope exclusions separate from implementation priorities and unresolved research,
+  interface design, or hardware verification.
+
 ## Commits and pushes
 
 - Commit often, after each working increment. Small commits, plain messages.

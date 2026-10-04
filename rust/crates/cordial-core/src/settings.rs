@@ -501,7 +501,15 @@ impl SettingMetadata {
             return false;
         }
         if self.kind != self.key.kind()
-            || self.scope != SettingScope::Device
+            || self.scope
+                != if matches!(
+                    self.feature,
+                    FeatureId::FN_INVERSION_MULTI_HOST | FeatureId::MULTI_PLATFORM
+                ) {
+                    SettingScope::CurrentHost
+                } else {
+                    SettingScope::Device
+                }
             || !self
                 .key
                 .writable_feature(self.feature, self.feature_version)
@@ -552,6 +560,7 @@ impl SettingMetadata {
                 {
                     return false;
                 }
+                SettingKey::PowerAutoOff if (min, max, step) != (0, 15300, 60) => return false,
                 SettingKey::WheelThreshold if (min, max, step) != (1, 255, 1) => return false,
                 _ => {}
             }

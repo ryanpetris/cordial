@@ -45,6 +45,13 @@ struct Peer {
     features: Vec<(u16, u8, u8)>,
     backlight: [u8; 16],
     function: u8,
+    platform: u8,
+    power: u8,
+    platform_flags: u8,
+    platform_versioned: bool,
+    fn_host: u8,
+    platform_overlap: u8,
+    device_kind: u8,
     mode: u8,
     threshold: u8,
     hires: u8,
@@ -77,6 +84,13 @@ impl Default for Peer {
             ],
             backlight: [1, 0x0d, 0x3d, 7, 0, 3, 6, 0, 12, 0, 18, 0, 0, 0, 0, 0],
             function: 0,
+            platform: 0,
+            power: 10,
+            platform_flags: 2,
+            platform_versioned: false,
+            fn_host: 1,
+            platform_overlap: 0,
+            device_kind: 0,
             mode: 2,
             threshold: 20,
             hires: 0,
@@ -146,24 +160,76 @@ impl Peer {
                 let n = (name.len() - a[0] as usize).min(16);
                 p[..n].copy_from_slice(&name[a[0] as usize..a[0] as usize + n]);
             }
-            (5, 2) => p[0] = 0,
+            (5, 2) => p[0] = self.device_kind,
             (0x1000, 1) => p[..2].copy_from_slice(&self.battery[..2]),
             (0x1000, 0) => p[..3].copy_from_slice(&[self.battery[2], 50, 0]),
             (0x1004, 0) => p[..2].copy_from_slice(&[15, 2]),
             (0x1004, 1) => p[..4].copy_from_slice(&[51, 4, 1, 0]),
             (0x1001, 0) => p[..3].copy_from_slice(&[0x10, 0, 0x81]),
             (0x1f20, 0) => p[..3].copy_from_slice(&[0x10, 0, 3]),
+            (0x1f20, 1) => p[0] = self.power,
+            (0x1f20, 2) => {
+                self.power = a[0];
+                write = true;
+            }
+            (0x4530, 1) => p[0] = self.platform,
+            (0x4530, 2) => {
+                self.platform = a[0];
+                write = true;
+            }
+            (0x4531, 0) => {
+                p[..7].copy_from_slice(&[self.platform_flags, 0, 2, 2, 3, 1, self.platform])
+            }
+            (0x4531, 1) => {
+                let (platform, mask) = if a[0] == 0 {
+                    (0, 0x0500u16)
+                } else {
+                    (1, 0x6000u16)
+                };
+                p[0] = platform;
+                p[1] = a[0];
+                p[2..4].copy_from_slice(&mask.to_be_bytes());
+                if self.platform_overlap != 0 {
+                    p[0] = if self.platform_overlap.is_multiple_of(2) {
+                        a[0]
+                    } else {
+                        0
+                    };
+                    p[2..4].copy_from_slice(&0x0500u16.to_be_bytes());
+                    if a[0] == u8::from(self.platform_overlap <= 2) {
+                        p[4] = 10;
+                        p[6] = 10;
+                    }
+                }
+                if self.platform_versioned {
+                    p[4] = 10;
+                }
+            }
+            (0x4531, 2) => {
+                assert_eq!(a[0], 0xff);
+                p[..6].copy_from_slice(&[0xff, 1, self.platform, 3, 0, 0]);
+            }
+            (0x4531, 3) => {
+                assert_eq!(a[0], 0xff);
+                self.platform = a[1];
+                write = true;
+            }
             (0x4301, 0) => {
                 assert_eq!(&a[..2], &[1, 1]);
             }
-            (0x40a2, 0) => p[..2].copy_from_slice(&[self.function, 1]),
-            (0x40a2, 1) => {
+            (0x40a0 | 0x40a2, 0) => p[..2].copy_from_slice(&[self.function, 1]),
+            (0x40a0 | 0x40a2, 1) => {
                 self.function = a[0];
                 write = true;
             }
             (0x40a3, 0) => {
                 assert_eq!(a[0], 0xff);
-                p[..4].copy_from_slice(&[1, self.function, 1, 1]);
+                p[..4].copy_from_slice(&[self.fn_host, self.function, 1, 1]);
+            }
+            (0x40a3, 1) => {
+                assert_eq!(a[0], 0xff);
+                self.function = a[1];
+                write = true;
             }
             (0x1982, 0) => p = self.backlight,
             (0x1982, 2) => {
@@ -391,7 +457,7 @@ fn discovery_uses_advertised_features_revisions_and_capabilities() {
             d.catalog
                 .features()
                 .iter()
-                .filter(|f| matches!(f.id.0, 0xdead | 0x40a0))
+                .filter(|f| f.id.0 == 0xdead)
                 .all(|f| !f.supported())
         );
         assert_eq!(
@@ -567,13 +633,13 @@ fn timed_out_setter_is_uncertain_and_disable_cancels_without_further_writes() {
 }
 
 #[test]
-fn multi_host_is_read_only_and_ignored_setter_reports_readback_mismatch() {
+fn multi_host_is_writable_and_ignored_setter_reports_readback_mismatch() {
     let mut peer = Peer::default();
     peer.features[4].0 = 0x40a3;
     peer.ignored_setter = true;
     let mut d = Device::new(peer, true);
     d.run();
-    assert!(!d.get(K::FnRowDefault).writable);
+    assert!(d.get(K::FnRowDefault).writable);
     assert_eq!(
         d.get(K::FnRowDefault).metadata.feature,
         FeatureId::FN_INVERSION_MULTI_HOST
@@ -625,6 +691,7 @@ fn rediscovery_stales_unavailable_rows_and_transient_failures_are_not_unsupporte
     d.run();
     assert!(d.get(K::FnRowDefault).fresh);
     d.peer.features[4].2 = 0x40;
+    d.peer.features[10].2 = 0x40;
     d.engine
         .start(&mut d.catalog, false, None, true, true, d.now)
         .unwrap();
@@ -868,4 +935,193 @@ fn battery_status_capability_bands_and_zero_unknown() {
         d.run();
         assert_eq!(d.info(I::BatteryPercent).value, expected, "{battery:?}");
     }
+}
+
+#[test]
+fn keyboard_preferences_round_trip_and_reapply() {
+    for id in [0x40a0, 0x40a3] {
+        let mut peer = Peer::default();
+        peer.features.retain(|f| f.0 != 0x40a0);
+        peer.features[4].0 = id;
+        let mut d = Device::new(peer, true);
+        d.run();
+        d.set(K::FnRowDefault, V::Text("special_actions".into()));
+        d.run();
+        assert_eq!(d.get(K::FnRowDefault).state, SettingState::Applied);
+        assert_eq!(d.peer.function, 1);
+        let last = d.peer.writes.last().unwrap();
+        assert_eq!(last.0, id);
+        if id == 0x40a3 {
+            assert_eq!(&last.2[..2], &[0xff, 1]);
+        }
+        d.peer.function = 0;
+        d.engine.activate(&mut d.catalog, d.now).unwrap();
+        d.run();
+        assert_eq!(d.peer.function, 1);
+    }
+    for id in [0x4530, 0x4531] {
+        let mut peer = Peer::default();
+        peer.features.push((id, 1, 0));
+        peer.features.push((0x1f20, 2, 0));
+        let mut d = Device::new(peer, true);
+        d.run();
+        let key = K::KeyboardPlatform;
+        assert!(d.get(key).writable);
+        d.set(key, V::Text("mac".into()));
+        d.run();
+        assert_eq!(d.get(key).state, SettingState::Applied);
+        assert_eq!(d.get(key).wire().observed, V::Text("mac".into()));
+        d.set(key, V::Text("ios".into()));
+        d.run();
+        assert_eq!(d.get(key).state, SettingState::Applied);
+        assert_eq!(d.get(key).wire().observed, V::Text("ios".into()));
+        assert!(!d.get(key).wire().choices.contains(&V::Text("tizen".into())));
+        d.set(K::PowerAutoOff, V::Integer(0));
+        d.run();
+        assert_eq!(d.peer.power, 0);
+        assert_eq!(d.get(K::PowerAutoOff).state, SettingState::Applied);
+        d.set(K::PowerAutoOff, V::Integer(15300));
+        d.run();
+        assert_eq!(d.peer.power, 255);
+        assert!(block_on(d.catalog.set(K::PowerAutoOff, V::Integer(61), &mut d.store)).is_err());
+        d.peer.power = 1;
+        d.engine.activate(&mut d.catalog, d.now).unwrap();
+        d.run();
+        assert_eq!(d.peer.power, 255);
+        if id == 0x4531 {
+            let observed = d.get(key).wire().observed;
+            let index = d.peer.features.iter().position(|f| f.0 == id).unwrap() + 1;
+            let mut packet = [0; 19];
+            packet[..6].copy_from_slice(&[0xff, index as u8, 0, 2, 0, 0]);
+            assert!(!d.engine.receive(&mut d.catalog, 0x11, &packet, d.now));
+            assert_eq!(d.get(key).wire().observed, observed);
+            d.event(id, 0, &[1, 0, 1]);
+            assert_eq!(d.get(key).state, SettingState::ChangedOnDevice);
+        }
+    }
+}
+
+#[test]
+fn keyboard_settings_require_advertised_capabilities() {
+    for (revision, kind) in [(1, 0), (2, 3)] {
+        let mut peer = Peer {
+            device_kind: kind,
+            ..Peer::default()
+        };
+        peer.features.push((0x1f20, revision, 0));
+        let mut d = Device::new(peer, true);
+        d.run();
+        assert!(
+            !d.catalog
+                .records()
+                .iter()
+                .any(|r| r.metadata.key == K::PowerAutoOff && r.available)
+        );
+    }
+    let mut peer = Peer::default();
+    peer.features.push((0x4531, 1, 0));
+    peer.platform_flags = 0;
+    let mut d = Device::new(peer, true);
+    d.run();
+    assert!(!d.get(K::KeyboardPlatform).writable);
+    assert!(
+        block_on(
+            d.catalog
+                .set(K::KeyboardPlatform, V::Text("mac".into()), &mut d.store)
+        )
+        .is_err()
+    );
+    let mut peer = Peer::default();
+    peer.features.push((0x4531, 1, 0));
+    peer.platform_versioned = true;
+    let mut d = Device::new(peer, true);
+    d.run();
+    assert!(
+        !d.catalog
+            .records()
+            .iter()
+            .any(|r| r.metadata.key == K::KeyboardPlatform && r.available)
+    );
+}
+
+#[test]
+fn platform_events_cannot_publish_partial_descriptor_choices() {
+    let mut peer = Peer::default();
+    peer.features.push((0x4531, 1, 0));
+    let mut d = Device::new(peer, true);
+    d.run();
+    let expected = d.get(K::KeyboardPlatform).wire();
+    d.engine
+        .start(&mut d.catalog, false, None, false, false, d.now)
+        .unwrap();
+    let index = d.peer.features.len() as u8;
+    let mut checked = false;
+    for _ in 0..1000 {
+        let Some(packet) = d.packet() else { continue };
+        d.respond(packet);
+        if packet[1] == index && packet[2] >> 4 == 1 && packet[3] == 0 {
+            d.event(0x4531, 0, &[1, 1, 3]);
+            assert_eq!(d.get(K::KeyboardPlatform).wire().choices, expected.choices);
+            assert_eq!(
+                d.get(K::KeyboardPlatform).wire().observed,
+                expected.observed
+            );
+            checked = true;
+            break;
+        }
+    }
+    assert!(checked);
+    d.run();
+}
+
+#[test]
+fn platform_descriptors_union_version_coverage_without_ambiguous_indices() {
+    for overlap in 1..=4 {
+        let mut peer = Peer {
+            platform_overlap: overlap,
+            ..Peer::default()
+        };
+        peer.features.push((0x4531, 1, 0));
+        let mut d = Device::new(peer, true);
+        d.run();
+        if overlap % 2 != 0 {
+            assert!(
+                d.get(K::KeyboardPlatform)
+                    .wire()
+                    .choices
+                    .contains(&V::Text("windows".into()))
+            );
+            d.set(K::KeyboardPlatform, V::Text("linux".into()));
+            d.run();
+            assert_eq!(d.get(K::KeyboardPlatform).state, SettingState::Applied);
+        } else {
+            assert!(
+                !d.catalog
+                    .records()
+                    .iter()
+                    .any(|r| r.metadata.key == K::KeyboardPlatform)
+            );
+        }
+    }
+}
+
+#[test]
+fn current_host_fn_events_accept_numeric_hosts_after_selector_echo() {
+    let mut peer = Peer {
+        fn_host: 0xff,
+        ..Peer::default()
+    };
+    peer.features[4].0 = 0x40a3;
+    let mut d = Device::new(peer, true);
+    d.run();
+    d.event(0x40a3, 0, &[2, 1, 0, 1]);
+    assert_eq!(
+        d.get(K::FnRowDefault).wire().observed,
+        V::Text("special_actions".into())
+    );
+    d.event(0x40a3, 0, &[2, 0, 0, 1]);
+    assert_eq!(
+        d.get(K::FnRowDefault).wire().observed,
+        V::Text("function_keys".into())
+    );
 }

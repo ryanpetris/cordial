@@ -76,8 +76,8 @@ struct SerialRx {
     length: usize,
 }
 
-const fn idle_reports() -> [[u8; 68]; 8] {
-    let mut reports = [[0; 68]; 8];
+const fn idle_reports() -> [[u8; 68]; 10] {
+    let mut reports = [[0; 68]; 10];
     let mut i = 0;
     while i < 34 {
         reports[7][i] = 0xff;
@@ -86,13 +86,15 @@ const fn idle_reports() -> [[u8; 68]; 8] {
         }
         i += 1;
     }
+    reports[8][4] = 0x20;
+    reports[9][0] = 4;
     reports
 }
 
 /// USB tasks exchange bounded owned packets with the application owner.
 pub struct Io {
     status: Watch<CS, Status, 3>,
-    reports: Mutex<CS, RefCell<[[u8; 68]; 8]>>,
+    reports: Mutex<CS, RefCell<[[u8; 68]; 10]>>,
     changed: Signal<CS, ()>,
     hid_tx: Channel<CS, HidTx, 1>,
     hid_done: Channel<CS, HidDone, 1>,
@@ -199,9 +201,9 @@ impl hid::RequestHandler for ReportHandler<'_> {
                 buf[..size].copy_from_slice(&[1, self.0.status().leds][..size]);
                 Some(size)
             }
-            hid::ReportId::In(id @ 1..=8) if !buf.is_empty() => {
+            hid::ReportId::In(id @ 1..=10) if !buf.is_empty() => {
                 buf[0] = id;
-                let size = [32, 10, 16, 68, 5, 9, 6, 34][id as usize - 1].min(buf.len() - 1);
+                let size = [32, 10, 16, 68, 5, 9, 6, 34, 8, 1][id as usize - 1].min(buf.len() - 1);
                 self.0.reports.lock(|r| {
                     buf[1..1 + size].copy_from_slice(&r.borrow()[id as usize - 1][..size])
                 });
@@ -338,7 +340,7 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
                             let mut reports = r.borrow_mut();
                             let target = &mut reports[packet.bytes[0] as usize - 1];
                             let data = &packet.bytes[1..packet.length];
-                            if packet.bytes[0] >= 7 {
+                            if matches!(packet.bytes[0], 7 | 8) {
                                 for (old, value) in target[..data.len()]
                                     .as_chunks_mut::<2>()
                                     .0

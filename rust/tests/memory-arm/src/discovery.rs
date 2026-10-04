@@ -13,6 +13,8 @@ const KNOWN: &[(u16, u8)] = &[
     (0x2110, 0),
     (0x2121, 1),
     (0x2150, 0),
+    (0x4531, 1),
+    (0x1f20, 2),
 ];
 fn feature(index: u8) -> (u16, u8) {
     if index == 0 {
@@ -51,6 +53,10 @@ fn answer(mut packet: [u8; 19]) -> [u8; 19] {
         (5, 2) => p[0] = 0,
         (0x1000, 1) => p[..2].copy_from_slice(&[100, 6]),
         (0x1000, 0) => p[..3].copy_from_slice(&[70, 50, 0]),
+        (0x4531, 0) => p[..7].copy_from_slice(&[2, 0, 1, 1, 1, 0, 0]),
+        (0x4531, 1) => p[..8].copy_from_slice(&[0, 0, 0xff, 1, 0, 0, 0, 0]),
+        (0x4531, 2) => p[..6].copy_from_slice(&[0xff, 1, 0, 3, 0, 0]),
+        (0x1f20, 1) => p[0] = 10,
         (0x40a2, 0) => p[..2].copy_from_slice(&[0, 1]),
         (0x1982, 0) => {
             p.copy_from_slice(&[1, 0x1f, 0x3f, 0x7f, 0, 3, 6, 0, 12, 0, 18, 0, 0, 0, 0, 0])
@@ -75,8 +81,8 @@ pub fn run(catalog: &mut Catalog) {
     let mut engine = Engine::default();
     let mut client = Client::new(HIDPP_LONG);
     client.protocol = cordial_core::model::hidpp::ProtocolState::Detected { major: 2, minor: 0 };
-    catalog.connection(true, false);
-    engine.activate(catalog, 100).unwrap();
+    catalog.connection(true, true);
+    engine.start(catalog, false, None, false, true, 100).unwrap();
     for now in 101..1101 {
         client.tick(now);
         engine.poll(catalog, &mut client, now);
@@ -88,7 +94,9 @@ pub fn run(catalog: &mut Catalog) {
         if !engine.busy() || engine.done() {
             assert_eq!(engine.state, SettingsState::Ready);
             assert_eq!(catalog.features().len(), 256);
-            assert_eq!(catalog.records().len(), SettingKey::ALL.len());
+            for key in SettingKey::ALL {
+                assert!(catalog.records().iter().any(|r| r.metadata.key == key), "missing setting {key:?}");
+            }
             catalog.connection(true, true);
             return;
         }

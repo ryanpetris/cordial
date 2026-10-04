@@ -250,6 +250,28 @@ impl Link {
         catalog.info.battery.hidpp_reports(reports != 0);
         catalog.connection(true, enabled);
         let mut client = Client::new(reports);
+        client.native_controls(core::array::from_fn(|i| {
+            let platform = [
+                HostPlatform::Linux,
+                HostPlatform::Windows,
+                HostPlatform::Mac,
+            ][i];
+            crate::model::translation::CONTROLS.iter().enumerate().fold(
+                0,
+                |mask, (index, control)| {
+                    let Some(t) = control.translation(platform) else {
+                        return mask;
+                    };
+                    let supports = |usage| profiles.iter().any(|p| p.map.supports_usage(usage));
+                    let native = (t.key == 0 || supports(0x70000 | u32::from(t.key)))
+                        && (t.consumer == 0 || supports(0xc0000 | u32::from(t.consumer)))
+                        && (t.system == 0 || supports(0x10000 | u32::from(t.system)))
+                        && (0..8)
+                            .all(|bit| t.modifiers & (1 << bit) == 0 || supports(0x700e0 + bit));
+                    mask | if native { 1 << index } else { 0 }
+                },
+            )
+        }));
         client.status = if enabled {
             NormalizationState::Pending
         } else {

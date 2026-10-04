@@ -28,6 +28,8 @@ enum Handler {
     Name,
     Battery,
     Fn,
+    Platform,
+    Power,
     Backlight,
     Dpi0,
     Dpi1,
@@ -36,11 +38,13 @@ enum Handler {
     Thumb,
 }
 impl Handler {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 12] = [
         Self::Firmware,
         Self::Name,
         Self::Battery,
         Self::Fn,
+        Self::Platform,
+        Self::Power,
         Self::Backlight,
         Self::Dpi0,
         Self::Dpi1,
@@ -52,6 +56,8 @@ impl Handler {
         use Key::*;
         Some(match key {
             FnRowDefault => Self::Fn,
+            KeyboardPlatform => Self::Platform,
+            PowerAutoOff => Self::Power,
             PointerDpi0 => Self::Dpi0,
             PointerDpi1 => Self::Dpi1,
             WheelMode | WheelThreshold => Self::Wheel,
@@ -79,7 +85,18 @@ impl Handler {
                 if let Some(f) = feature(catalog, Id::FN_INVERSION_MULTI_HOST) {
                     return Some(f);
                 }
-                Id::FN_INVERSION
+                if let Some(f) = feature(catalog, Id::FN_INVERSION) {
+                    return Some(f);
+                }
+                Id::FN_INVERSION_LEGACY
+            }
+            Self::Platform => {
+                return [Id::MULTI_PLATFORM, Id::DUAL_PLATFORM]
+                    .into_iter()
+                    .find_map(|id| feature(catalog, id));
+            }
+            Self::Power => {
+                return feature(catalog, Id::ADC_MEASUREMENT).filter(|f| f.version.0 >= 2);
             }
             Self::Backlight => Id::BACKLIGHT,
             Self::Dpi0 | Self::Dpi1 => Id::ADJUSTABLE_DPI,
@@ -108,7 +125,10 @@ pub(crate) fn supported(id: Id, flags: FeatureFlags) -> bool {
                 | Id::BACKLIGHT
                 | Id::ADJUSTABLE_DPI
                 | Id::FN_INVERSION
+                | Id::FN_INVERSION_LEGACY
                 | Id::FN_INVERSION_MULTI_HOST
+                | Id::DUAL_PLATFORM
+                | Id::MULTI_PLATFORM
                 | Id::SMART_SHIFT
                 | Id::HIRES_WHEEL
                 | Id::THUMBWHEEL
@@ -209,6 +229,13 @@ pub struct Engine {
     name_length: u8,
     name: Vec<u8>,
     fn_host: u8,
+    platform_host: u8,
+    platform_count: u8,
+    platform_descriptors: u8,
+    platform_descriptor: u8,
+    platform_writable: bool,
+    platforms: [u8; 9],
+    platform_all_versions: u16,
     battery_levels: u8,
     battery_flags: u8,
     backlight_levels: u8,

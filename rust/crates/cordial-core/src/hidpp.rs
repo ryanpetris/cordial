@@ -66,7 +66,8 @@ pub struct Client {
     pub error: Option<Error>,
     pub protocol: ProtocolState,
     pub exchange_sent: bool,
-    selected: u32,
+    selected: u128,
+    native_controls: [u128; 3],
     deadline: u64,
     cid: u16,
     reports: u8,
@@ -96,6 +97,7 @@ impl Client {
             protocol: ProtocolState::Unknown,
             exchange_sent: false,
             selected: 0,
+            native_controls: [0; 3],
             deadline: 0,
             cid: 0,
             reports,
@@ -116,6 +118,23 @@ impl Client {
             tx_busy: false,
             reset_uncertain: false,
         }
+    }
+    /// Controls whose standard translation is already representable by native HID reports.
+    pub fn native_controls(&mut self, masks: [u128; 3]) {
+        self.native_controls = masks;
+    }
+    fn needs_translation(&self, index: usize, flags: u8) -> bool {
+        let platform = match self.platform {
+            HostPlatform::Linux => 0,
+            HostPlatform::Windows => 1,
+            HostPlatform::Mac => 2,
+        };
+        // Platform normalization uses its fixed activation policy. Other keyboard
+        // mappings divert only when the descriptor cannot carry their standard input.
+        index < crate::model::translation::NORMALIZED_CONTROLS
+            || flags & 1 == 0
+                && flags & 6 != 0
+                && self.native_controls[platform] & (1 << index) == 0
     }
     fn clear_held(&mut self) -> bool {
         let changed = self.held != Held::default();
@@ -377,6 +396,12 @@ impl Client {
                 held.consumer(translation.consumer)
                     .expect("translation exceeds report capacity");
             }
+            if let Some(i) = crate::hid::SYSTEM_USAGES
+                .iter()
+                .position(|&u| u == translation.system)
+            {
+                held.system |= 1 << i;
+            }
             held.keys[28] |= translation.modifiers;
         }
         let changed = held != self.held;
@@ -488,7 +513,8 @@ impl Client {
                 self.cid = u16::from_be_bytes([p[0], p[1]]);
                 if p[4] & 0x20 != 0
                     && p[4] & 0x80 == 0
-                    && control(self.cid, self.platform).is_some()
+                    && control(self.cid, self.platform)
+                        .is_some_and(|(i, _)| self.needs_translation(i, p[4]))
                 {
                     self.request(Step::Reporting, self.controls_feature, 2, &p[..2], now);
                 } else {

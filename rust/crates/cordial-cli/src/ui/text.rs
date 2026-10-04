@@ -874,6 +874,7 @@ pub fn info_value(key: &str, v: &Value) -> String {
             format!("0x{n:04X}")
         }
         (keys::BATTERY_LEVEL, Value::Integer(n)) => format!("{n}%"),
+        (keys::POWER_AUTO_OFF, Value::Integer(0)) => "Never".into(),
         (_, Value::Bool(b)) => yes_no(*b).into(),
         (_, Value::Text(t)) if model::key(key).is_some_and(|(k, _)| k.kind == keys::Kind::Enum) => {
             safe(&catalog::choice_words(key, t))
@@ -1353,6 +1354,18 @@ pub fn prompt_line(candidate: &str, prompt: &Prompt) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_off_information_reads_never_at_zero() {
+        assert_eq!(
+            info_value(keys::POWER_AUTO_OFF, &Value::Integer(0)),
+            "Never"
+        );
+        assert_eq!(
+            info_value(keys::POWER_AUTO_OFF, &Value::Integer(600)),
+            "600 s"
+        );
+    }
 
     #[test]
     fn hostile_names_are_escaped() {

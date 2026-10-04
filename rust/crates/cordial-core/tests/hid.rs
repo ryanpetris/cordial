@@ -200,7 +200,7 @@ fn drain(forward: &mut Forwarder) -> Vec<Packet> {
 #[test]
 fn usb_completion_and_source_removal_preserve_releases() {
     let mut forward = Forwarder::default();
-    assert_eq!(drain(&mut forward).len(), 3);
+    assert_eq!(drain(&mut forward).len(), 5);
     let mut pressed = Input::default();
     pressed.held.keys[0] = 1 << 4;
     forward.input(0, pressed).unwrap();
@@ -268,7 +268,7 @@ fn motion_is_conserved_and_consumer_overflow_is_explicit() {
     forward.input(1, Input::default()).unwrap();
     assert!(forward.packet().is_none());
     forward.enable(true);
-    assert_eq!(drain(&mut forward).len(), 3);
+    assert_eq!(drain(&mut forward).len(), 5);
 }
 
 const KEYBOARD: &[u8] = &[
@@ -1065,4 +1065,158 @@ fn a_consumer_range_spanning_a_numeric_control_is_not_diagnosed() {
         .decode(&mut map.state().unwrap(), 0, &[0xcd, 0])
         .unwrap();
     assert_eq!(input.held.consumers[0], 0xcd);
+}
+
+#[test]
+fn system_and_radio_inputs_preserve_simultaneous_state_and_releases() {
+    use cordial_core::forward::{REPORT_RADIO, REPORT_SYSTEM};
+    let descriptor = [
+        5, 1, 9, 0x80, 0xa1, 1, 0x85, 1, 0x19, 0x81, 0x29, 0x83, 0x15, 0, 0x25, 1, 0x75, 1, 0x95,
+        3, 0x81, 2, 0x75, 5, 0x95, 1, 0x81, 3, 0xc0, 5, 1, 9, 0x0c, 0xa1, 1, 0x85, 2, 9, 0xc6,
+        0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1, 0x81, 2, 9, 0xc8, 0x81, 2, 0x75, 6, 0x81, 3, 0xc0,
+    ];
+    let packets = |f: &mut Forwarder| {
+        drain(f)
+            .into_iter()
+            .map(|p| (p.id, p.bytes().to_vec()))
+            .collect::<Vec<_>>()
+    };
+    let map = Map::compile(&descriptor).unwrap();
+    let mut state = map.state().unwrap();
+    let mut forward = Forwarder::default();
+    drain(&mut forward);
+    forward
+        .input(0, map.decode(&mut state, 1, &[3]).unwrap())
+        .unwrap();
+    let output = packets(&mut forward);
+    assert_eq!(
+        output,
+        vec![(REPORT_SYSTEM, vec![3, 0, 0, 0, 0x20, 0, 0, 0])]
+    );
+    forward
+        .input(0, map.decode(&mut state, 2, &[3]).unwrap())
+        .unwrap();
+    assert_eq!(packets(&mut forward), vec![(REPORT_RADIO, vec![3])]);
+    forward
+        .input(0, map.decode(&mut state, 2, &[0]).unwrap())
+        .unwrap();
+    assert_eq!(packets(&mut forward), vec![(REPORT_RADIO, vec![0])]);
+    forward.remove(0);
+    let output = packets(&mut forward);
+    assert!(output.contains(&(REPORT_SYSTEM, vec![0, 0, 0, 0, 0x20, 0, 0, 0])));
+    assert!(output.contains(&(REPORT_RADIO, vec![4])));
+}
+
+#[test]
+fn native_usage_support_requires_a_reachable_field_value() {
+    let variable = Map::compile(&[
+        5, 12, 9, 1, 0xa1, 1, 0x19, 0xb5, 0x29, 0xb7, 0x15, 0, 0x25, 1, 0x75, 8, 0x95, 1, 0x81, 2,
+        0xc0,
+    ])
+    .unwrap();
+    assert!(variable.supports_usage(0xc00b5));
+    assert!(!variable.supports_usage(0xc00b6));
+    let array = Map::compile(&[
+        5, 12, 9, 1, 0xa1, 1, 0x19, 0, 0x2a, 0xff, 3, 0x15, 0, 0x25, 0x7f, 0x75, 8, 0x95, 1, 0x81,
+        0, 0xc0,
+    ])
+    .unwrap();
+    assert!(array.supports_usage(0xc0070));
+    assert!(!array.supports_usage(0xc00b5));
+}
+
+#[test]
+fn sliders_preserve_unknown_state_and_toggle_press_edges() {
+    use cordial_core::hid::{ROTATION_KNOWN, ROTATION_STATE};
+    // Two nullable absolute sliders. A first null report does not mean Off.
+    let map = Map::compile(&[
+        5, 1, 9, 0x80, 0xa1, 1, 9, 0xca, 9, 0xc8, 0x15, 0, 0x25, 1, 0x75, 2, 0x95, 2, 0x81, 0x42,
+        0xc0,
+    ])
+    .unwrap();
+    let mut state = map.state().unwrap();
+    assert_eq!(
+        map.decode(&mut state, 0, &[0x0a]).unwrap().held,
+        Held::default()
+    );
+    let on = map.decode(&mut state, 0, &[5]).unwrap().held;
+    assert_eq!(on.system, ROTATION_KNOWN | ROTATION_STATE);
+    assert_eq!(on.radio, 6);
+    assert_eq!(map.decode(&mut state, 0, &[0x0a]).unwrap().held, on);
+    let off = map.decode(&mut state, 0, &[0]).unwrap().held;
+    assert_eq!(off.system, ROTATION_KNOWN);
+    assert_eq!(off.radio, 4);
+    let map = Map::compile(&[
+        5, 1, 9, 0x0c, 0xa1, 1, 9, 0xc8, 0x15, 0, 0x25, 1, 0x75, 8, 0x95, 1, 0x81, 6, 0xc0,
+    ])
+    .unwrap();
+    let mut state = map.state().unwrap();
+    assert_eq!(map.decode(&mut state, 0, &[1]).unwrap().pulses.radio, 1);
+    assert_eq!(map.decode(&mut state, 0, &[1]).unwrap().pulses.radio, 0);
+    assert_eq!(map.decode(&mut state, 0, &[0]).unwrap().held.radio, 0);
+    assert_eq!(map.decode(&mut state, 0, &[1]).unwrap().pulses.radio, 1);
+}
+
+#[test]
+fn slider_updates_use_the_latest_source_and_report() {
+    use cordial_core::forward::{REPORT_RADIO, REPORT_SYSTEM};
+    let mut forward = Forwarder::default();
+    drain(&mut forward);
+    let update = |value| Input {
+        sliders: [Some(value); 2],
+        ..Input::default()
+    };
+    forward.input(0, update(true)).unwrap();
+    drain(&mut forward);
+    forward.input(1, update(true)).unwrap();
+    drain(&mut forward);
+    forward.input(1, update(false)).unwrap();
+    let packets = drain(&mut forward);
+    assert!(
+        packets
+            .iter()
+            .any(|p| p.id == REPORT_RADIO && p.bytes() == [0])
+    );
+    assert!(
+        packets
+            .iter()
+            .any(|p| p.id == REPORT_SYSTEM && p.bytes() == [0; 8])
+    );
+    forward.remove(1);
+    let packets = drain(&mut forward);
+    assert!(
+        packets
+            .iter()
+            .any(|p| p.id == REPORT_RADIO && p.bytes() == [4])
+    );
+    assert!(
+        packets
+            .iter()
+            .any(|p| p.id == REPORT_SYSTEM && p.bytes()[4] == 0x20)
+    );
+    // Removing the latest source must not restore another source's stale On state.
+    assert!(drain(&mut forward).is_empty());
+
+    let map = Map::compile(&[
+        5, 1, 9, 0x0c, 0xa1, 1, 0x85, 1, 9, 0xc8, 0x15, 0, 0x25, 1, 0x75, 8, 0x95, 1, 0x81, 2,
+        0x85, 2, 9, 0xc8, 0x81, 2, 0xc0,
+    ])
+    .unwrap();
+    let mut state = map.state().unwrap();
+    forward
+        .input(0, map.decode(&mut state, 1, &[1]).unwrap())
+        .unwrap();
+    drain(&mut forward);
+    forward
+        .input(0, map.decode(&mut state, 2, &[1]).unwrap())
+        .unwrap();
+    drain(&mut forward);
+    forward
+        .input(0, map.decode(&mut state, 2, &[0]).unwrap())
+        .unwrap();
+    assert!(
+        drain(&mut forward)
+            .iter()
+            .any(|p| p.id == REPORT_RADIO && p.bytes() == [0])
+    );
 }
