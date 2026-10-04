@@ -156,6 +156,44 @@ environment variables, and configuration keys in backticks.
   an unbounded fix. Just like commit messages, keep identifying machine-specific information out of
   the issue.
 
+## Required completion checks
+
+Before any item is considered done, all suites below must pass for the completed changes.
+Use targeted tests during development, then complete this checklist before reporting completion.
+Passing results from the same work can be reused while their inputs remain unchanged. A skipped
+fixture or a missing prerequisite is not a pass; resolve it or report the item as incomplete.
+Keep this catalog aligned with `Makefile`, `desktop/package.json`, and
+`.github/workflows/release.yml`. It lists suites and fixtures, not individual test cases.
+
+| Suite or fixture | Required check and coverage |
+| --- | --- |
+| Rust workspace | `make check-rust`: unit, integration, and documentation tests for all workspace crates with all features, including the core, protocol, client, CLI/TUI, USB, BLE HID, BTstack, and record storage adapters. Includes the ESP storage fixture. |
+| Rust static checks | `make check-rust`: workspace Clippy for all targets and features, with warnings treated as errors. |
+| Native BTstack callbacks | `make check-rust`: `rust/tools/test_btstack.py` builds and runs the profiles, GATT, device information, layout, and saved-security C fixtures. |
+| Generated desktop protocol | `make check-desktop`: regenerate and compare checked-in TypeScript protocol messages and setting keys. |
+| Desktop type checks | `make check-desktop`: TypeScript checks for the desktop and shared packages. |
+| Desktop and shared client tests | `make check-desktop`: all Vitest fixtures in `desktop/test` and `desktop/packages/*/test`, including desktop state, settings, serial communication, notifications, tray, server, client transports, framing, and keys. |
+| Desktop garbage-collection fixtures | `npm --prefix desktop test -- --execArgv=--expose-gc`: enables the notification and USB watcher lifetime checks that otherwise skip when `global.gc` is unavailable. |
+| Protocol compatibility | `make check-protocol`: key catalog validation and compatibility, Buf lint, and Buf breaking checks against `PROTOCOL_BASE` when that base contains the protocol. |
+| Repository tool fixtures | `make check-tools`: `tools/test_*.py`, covering versions, key catalog checks, and release archive validation. |
+| Firmware and packaging tool fixtures | `make check-tools`: `rust/tests/test_*.py`, covering board configuration, firmware artifacts, flashing, dependency notices, packaging, native BLE, HID reports, and host terminal behavior. |
+| Linux CLI/TUI terminal fixture | Build the CLI and install `pyte`, then run `CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py`. The default tool run skips this fixture without these prerequisites. |
+| ARM memory fixture | `make check-memory`: build Pico W development firmware and run the 32-bit allocation workloads in `rust/tests/memory-arm` under QEMU against the linked firmware's heap budget. |
+| Firmware static checks | `make check-firmware-all`: firmware Clippy for `pico_w`, `pico2_w`, `waveshare_rp2350b_plus_w`, and `xiao_esp32s3`, each with `production` and `debug` profiles. |
+| Firmware artifact validation | `make firmware-all PROFILE=production` and `make firmware-all PROFILE=debug`: link and package every board, including metadata, image layout, and storage-boundary checks in `rust/tools/build_firmware.py`. |
+| Portable application packages | `make package-desktop package-cli package-web`; validate the desktop and CLI archives with `tools/check_release_archive.py` for the selected `CORDIAL_VERSION`. |
+| Arch package fixture | Build both native packages with `make package-desktop-arch package-cli-arch`, then run `packaging/check-arch.sh` in a clean Arch container. Checks independent installation, native modules, package contents, Namcap, reinstallation, and removal. |
+| Debian/Ubuntu package fixtures | Build both native packages with `make package-desktop-deb package-cli-deb DEB_DISTRIBUTION=...`, then run `packaging/check-deb.sh` in the matching clean container for `trixie`, `noble`, and `resolute`. Checks independent installation, native modules, package contents, Lintian, reinstallation, and removal. |
+| Installed desktop smoke fixture | Install the Noble desktop package, then run `CORDIAL_EXECUTABLE=/opt/cordial-desktop/cordial-desktop xvfb-run -a dbus-run-session -- node desktop/scripts/smoke.mjs desktop/out/package-smoke` with the Chromium sandbox enabled. Exercises the main views and pairing with simulated adapters. |
+| Release asset validation | When assembling a release, verify all expected application and board/profile archives and their checksums using the asset checklist in `.github/workflows/release.yml`. Publishing is not a check and still requires authorization. |
+
+`make check` covers the Rust, desktop, protocol, and Python tool suites. It does not enable the
+garbage-collection or terminal prerequisites, or run the memory, firmware matrix, package
+installation, or installed desktop smoke checks. Run package installation fixtures only in
+disposable environments, never against the developer's installed
+applications. See [building documentation](docs/building.md) and the release workflow for setup
+and the distribution matrix.
+
 ## Reviews
 
 Small, trivial changes do not need an independent review. Every other completed item gets an
@@ -173,8 +211,8 @@ concrete failure scenarios.
 
 ### Rules
 
-1. For most changes, run targeted tests against the change; full test runs should be reserved for
-   large changes.
+1. During development, run targeted tests against the change. Before completion, all
+   [required completion checks](#required-completion-checks) must pass.
 2. Don't spend time trying to find blame for test failures; if they can in any way be related to the
    current change that was made, just fix it. Reserve blame finding for fixes that appear to be not
    related at all or would result in large changes to fix.
