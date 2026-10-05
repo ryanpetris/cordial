@@ -84,15 +84,26 @@ await confirm.getByRole("button", { name: "Cancel" }).click();
 await confirm.waitFor({ state: "hidden" });
 if ((await viaEnabled()) !== before) throw new Error("the interface changed without confirmation");
 await save.click();
+// The accepted save shows its values at once, before the adapter reconnects USB, so the run
+// follows the published state and notes the adapter leaving to tell the reconnect apart from
+// the state before it. waitForFunction needs a synchronous predicate: it treats a returned
+// promise as true.
+await page.evaluate((id) => {
+  window.smokeLeft = false;
+  window.cordial.onState((s) => {
+    window.smokeAdapter = s.adapters.find((a) => a.id === id);
+    if (window.smokeAdapter?.connection !== "connected") window.smokeLeft = true;
+  });
+}, smokeAdapter.id);
 await confirm.getByRole("button", { name: "Save" }).click();
 await confirm.waitFor({ state: "hidden" });
 // The adapter reconnects USB; its page and chosen tab stay through it.
 const profilesTab = page.getByRole("tab", { name: "Profiles" });
-await page.waitForFunction(async ([id, v]) => {
-  const a = (await window.cordial.state()).adapters.find((x) => x.id === id);
-  return a?.connection === "connected" && a.readiness === "ready" && a.profilePage && !a.profilePage.loading
-    && a.status?.interfaces.find((i) => i.interface === 1)?.enabled === v;
-}, [smokeAdapter.id, !before]);
+await page.waitForFunction((v) => {
+  const a = window.smokeAdapter;
+  return window.smokeLeft && a?.connection === "connected" && a.readiness === "ready" && a.profilePage
+    && !a.profilePage.loading && a.status?.interfaces.find((i) => i.interface === 1)?.enabled === v;
+}, !before);
 await page.waitForFunction(() => document.querySelector(".page-bar button.suggested")?.disabled);
 if ((await profilesTab.getAttribute("aria-selected")) !== "true") throw new Error("the adapter tab changed across a reconnect");
 // Creating and copying profiles act at once.
