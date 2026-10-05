@@ -83,6 +83,11 @@ describe("AdapterSession", () => {
     const id = await session.connection.createProfile("Work");
     expect(session.profileNames.get(id)).toEqual({ id, name: "Work", roles: [] });
     expect(fake.received.slice(sent).map((r) => r.command.case)).toEqual(["setDevice", "setAdapter", "setSettings", "createProfile"]);
+    // A saved disable or block also leaves the reason the device is inactive.
+    await session.connection.setDevice({ device: 1, enabled: false });
+    expect(session.devices.get(1)).toMatchObject({ enabled: false, inactive: "disabled" });
+    await session.connection.setDevice({ device: 1, blocked: true });
+    expect(session.devices.get(1)).toMatchObject({ blocked: true, inactive: "blocked" });
     await session.close();
   });
 

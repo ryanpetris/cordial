@@ -268,6 +268,9 @@ impl State {
         if let Some(on) = update.blocked {
             d.blocked = on;
         }
+        if update.enabled.is_some() || update.blocked.is_some() {
+            d.inactive = inactive_after(d).map(|r| r as i32);
+        }
         for i in &update.integrations {
             let Some(on) = i.enabled else { continue };
             match d.integrations.iter_mut().find(|o| o.kind == i.kind) {
@@ -417,6 +420,20 @@ impl State {
         self.hidden.clear();
         self.last_scan = None;
         self.scanning = Some(transports);
+    }
+}
+
+/// The inactive reason a saved enabled or blocked change leaves, in the adapter's order: transport
+/// reasons stay, then blocked, then disabled. An accepted enable was given room, so the device is
+/// no longer inactive for capacity.
+fn inactive_after(d: &p::Device) -> Option<p::InactiveReason> {
+    use p::InactiveReason::{Blocked, Capacity, Disabled, TransportDisabled, UnsupportedTransport};
+    match crate::model::inactive(d) {
+        Some(r @ (UnsupportedTransport | TransportDisabled)) => Some(r),
+        _ if d.blocked => Some(Blocked),
+        _ if !d.enabled => Some(Disabled),
+        Some(Capacity) => Some(Capacity),
+        _ => None,
     }
 }
 
@@ -759,6 +776,40 @@ mod tests {
         }));
         st.response(&request, &response);
         assert_eq!(st.status.name, "Office");
+    }
+
+    #[test]
+    fn an_accepted_disable_or_block_leaves_the_inactive_reason() {
+        let mut st = State::default();
+        st.devices.push(p::Device {
+            id: 1,
+            enabled: true,
+            ..Default::default()
+        });
+        let set = |st: &mut State, update: p::SetDevice| {
+            let (request, response) = accepted(Command::SetDevice(update));
+            st.response(&request, &response);
+            crate::model::inactive(&st.devices[0])
+        };
+        let disabled = p::SetDevice {
+            device: 1,
+            enabled: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(set(&mut st, disabled), Some(p::InactiveReason::Disabled));
+        let blocked = p::SetDevice {
+            device: 1,
+            blocked: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(set(&mut st, blocked), Some(p::InactiveReason::Blocked));
+        let unblocked = p::SetDevice {
+            device: 1,
+            blocked: Some(false),
+            enabled: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(set(&mut st, unblocked), None);
     }
 
     #[test]

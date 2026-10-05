@@ -109,6 +109,18 @@ interface PageState {
   read: number;
 }
 
+/**
+ * The inactive reason a saved enabled or blocked change leaves, in the adapter's order: transport
+ * reasons stay, then blocked, then disabled. An accepted enable was given room, so the device is
+ * no longer inactive for capacity.
+ */
+function inactiveAfter(d: DeviceRecord): DeviceRecord["inactive"] {
+  if (d.inactive === "unsupported_transport" || d.inactive === "transport_disabled") return d.inactive;
+  if (d.blocked) return "blocked";
+  if (!d.enabled) return "disabled";
+  return d.inactive === "capacity" ? d.inactive : null;
+}
+
 export class AdapterSession {
   status: AdapterStatus;
   readonly devices = new Map<number, DeviceRecord>();
@@ -440,6 +452,7 @@ export class AdapterSession {
     if (update.enabled !== undefined) next.enabled = update.enabled;
     if (update.trusted !== undefined) next.trusted = update.trusted;
     if (update.blocked !== undefined) next.blocked = update.blocked;
+    if (update.enabled !== undefined || update.blocked !== undefined) next.inactive = inactiveAfter(next);
     if (update.profiles) next.profiles = [...update.profiles.profiles];
     for (const i of update.integrations)
       if (i.enabled !== undefined && next.hidpp && i.kind === next.hidpp.kind) next.hidpp = { ...next.hidpp, enabled: i.enabled };
