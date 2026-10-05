@@ -8,7 +8,7 @@ include!(concat!(env!("OUT_DIR"), "/metadata.rs"));
 use alloc::boxed::Box;
 use cordial_btstack::{
     backend::{Backend, State},
-    storage::Storage,
+    storage::{Handle, Storage},
     transport::Io,
 };
 use cordial_core::{
@@ -17,9 +17,12 @@ use cordial_core::{
     storage::Error,
 };
 use cordial_pico::{DmaIrqs, board, radio, services, usb};
-use cordial_usb::{Buffers, Usb, owner::Owner};
+use cordial_usb::{
+    Buffers, Usb,
+    owner::{Owner, Shared},
+};
 use embassy_executor::Spawner;
-use embassy_futures::select::select3;
+use embassy_futures::select::select;
 use embassy_rp::flash::{Async, Flash};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 use embassy_time::{Instant, Timer};
@@ -35,6 +38,7 @@ type Records = cordial_record_storage::Storage<
 
 // A bad layout remains unavailable, while status and development recovery work.
 type Store = Result<Records, Error>;
+type App = Owner<'static, Handle<'static, Store>, Backend<Store>>;
 
 fn now() -> u64 {
     Instant::now().as_millis()
@@ -63,12 +67,14 @@ unsafe extern "C" fn set_address(address: *const u8, command: *mut u8) {
 async fn usb_task(
     driver: embassy_rp::Peri<'static, embassy_rp::peripherals::USB>,
     serial: &'static str,
+    interfaces: u8,
 ) {
     let mut buffers = Buffers::new(&USB_IO);
     Usb::new(
         usb::driver(driver),
         serial,
         board::DEFAULT_ADAPTER_NAME,
+        interfaces,
         &USB_IO,
         &mut buffers,
     )
@@ -76,67 +82,42 @@ async fn usb_task(
     .await;
 }
 #[embassy_executor::task]
-async fn owner_task(
-    store: &'static Storage<Store>,
-    state: &'static State<Store>,
-    identity: services::Identity,
-) {
-    let chipset = Box::leak(Box::new(cordial_btstack::ffi::Chipset {
-        name: c"CYW43".as_ptr(),
-        init: None,
-        next_command: None,
-        set_baudrate: None,
-        set_address: Some(set_address),
-    }));
-    // This is the only host instance and owner for the lifetime of the board.
-    let mut backend = unsafe { Backend::new(state, Some(chipset)) };
-    let mut app = Application::new(Build {
-        development: cfg!(feature = "development"),
-        version: FIRMWARE_VERSION,
-        board: board::HARDWARE,
-        default_adapter_name: board::DEFAULT_ADAPTER_NAME,
-        adapter_id: identity.adapter,
-        #[cfg(feature = "development")]
-        bootloader: Some(cordial_core::application::Bootloader {
-            enter: services::bootloader,
-        }),
-        #[cfg(feature = "production")]
-        bootloader: None,
-    });
-    let mut handle = store.handle();
-    let mut owner = Owner::new(&USB_IO);
+async fn priority_task(owner: &'static App, state: &'static State<Store>) {
     let mut indicated = false;
-    loop {
-        // Management runs while the Bluetooth host completes initialization.
-        if let Some(address) = RADIO_ADDRESS.try_take() {
-            let started = cordial_core::identity::Identity::initialize(
-                &mut handle,
-                address,
-                services::random_u64,
-            )
-            .await
-            .map_err(|_| cordial_core::model::errors::ErrorCode::StorageFailed)
-            .and_then(|_| backend.start(Some(address)));
-            if let Err(error) = started {
-                app.event(Event::Failed(error), &mut handle, &mut backend, now())
-                    .await;
-            }
-        }
-        backend.poll();
-        while let Some(event) = backend.next_event() {
-            app.event(event, &mut handle, &mut backend, now()).await;
-        }
-        owner.poll(&mut app, &mut handle, &mut backend, now()).await;
-        app.poll(&mut handle, &mut backend, USB_IO.status().leds, now())
-            .await;
-        let ready = app.manager.radio_ready && app.manager.storage_ready;
-        if ready != indicated {
-            READY.signal(ready);
-            indicated = ready;
-        }
-        // Protocol/application deadlines have millisecond resolution.
-        select3(USB_IO.changed(), state.changed(), Timer::after_millis(1)).await;
-    }
+    owner
+        .priority(
+            async |shared: &mut Shared<Handle<'static, Store>, Backend<Store>>| {
+                let Shared { app, store, radio } = shared;
+                // Management runs while the Bluetooth host completes initialization.
+                if let Some(address) = RADIO_ADDRESS.try_take() {
+                    let started = cordial_core::identity::Identity::initialize(
+                        store,
+                        address,
+                        services::random_u64,
+                    )
+                    .await
+                    .map_err(|_| cordial_core::model::errors::ErrorCode::StorageFailed)
+                    .and_then(|_| radio.start(Some(address)));
+                    if let Err(error) = started {
+                        app.event(Event::Failed(error), store, radio, now()).await;
+                    }
+                }
+                let ready = app.manager.radio_ready && app.manager.storage_ready;
+                if ready != indicated {
+                    READY.signal(ready);
+                    indicated = ready;
+                }
+            },
+            async || {
+                select(state.changed(), Timer::after_millis(1)).await;
+            },
+            now,
+        )
+        .await
+}
+#[embassy_executor::task]
+async fn secondary_task(owner: &'static App, interfaces: u8) {
+    owner.secondary(interfaces, now).await
 }
 
 #[embassy_executor::main(
@@ -154,23 +135,51 @@ async fn main(spawner: Spawner) {
     let mut flash = Flash::<_, Async, { board::FLASH_BYTES }>::new(p.FLASH, p.DMA_CH1, DmaIrqs);
     let identity = services::identity(&mut flash).expect("board identity");
     let serial = Box::leak(identity.adapter.clone().into_boxed_str());
-    let store = Box::leak(Box::new(Storage::new(
-        Records::open_or_provision_blank(
-            flash,
-            board::STORAGE_START..board::STORAGE_END,
-            board::STORAGE_IDENTITY,
-        )
-        .await,
-    )));
+    let mut records = Records::open_or_provision_blank(
+        flash,
+        board::STORAGE_START..board::STORAGE_END,
+        board::STORAGE_IDENTITY,
+    )
+    .await;
+    // USB enumerates once, with the saved configuration interfaces.
+    let interfaces =
+        cordial_usb::saved_interfaces(&mut records, board::PROFILE_MEMORY_BUDGET.is_some()).await;
+    let store = Box::leak(Box::new(Storage::new(records)));
     let unique = identity.unique;
     let state = Box::leak(Box::new(
         State::new(store, &RADIO_IO, now, fatal).expect("radio state"),
     ));
-    spawner.spawn(owner_task(store, state, identity).unwrap());
+    let chipset = Box::leak(Box::new(cordial_btstack::ffi::Chipset {
+        name: c"CYW43".as_ptr(),
+        init: None,
+        next_command: None,
+        set_baudrate: None,
+        set_address: Some(set_address),
+    }));
+    // This is the only host instance and owner for the lifetime of the board.
+    let backend = unsafe { Backend::new(state, Some(chipset)) };
+    let app = Application::new(Build {
+        development: cfg!(feature = "development"),
+        version: FIRMWARE_VERSION,
+        board: board::HARDWARE,
+        default_adapter_name: board::DEFAULT_ADAPTER_NAME,
+        adapter_id: identity.adapter,
+        profile_memory_budget: board::PROFILE_MEMORY_BUDGET,
+        #[cfg(feature = "development")]
+        bootloader: Some(cordial_core::application::Bootloader {
+            enter: services::bootloader,
+        }),
+        #[cfg(feature = "production")]
+        bootloader: None,
+    });
+    let owner: &'static App =
+        Box::leak(Box::new(Owner::new(&USB_IO, app, store.handle(), backend)));
+    spawner.spawn(priority_task(owner, state).unwrap());
+    spawner.spawn(secondary_task(owner, interfaces).unwrap());
     // Queue USB after storage reads, immediately before radio initialization.
     // The synchronous C init finishes before this executor can poll USB;
     // the async Embassy init yields and lets USB management run during startup.
-    spawner.spawn(usb_task(p.USB, serial).unwrap());
+    spawner.spawn(usb_task(p.USB, serial, interfaces).unwrap());
     let Some((mut control, mac)) = radio::init(
         spawner,
         p.PIO0,

@@ -146,6 +146,10 @@ environment variables, and configuration keys in backticks.
 - Any change to the serial protocol between the Dongle and the Host software, including
   `proto/cordial.proto`, framing, and the documented behaviour of its messages, requires explicit
   maintainer approval before it is made.
+- Any change to the Dongle's on-board storage layout requires explicit maintainer approval before
+  it is made. This includes adding, removing, or renaming files and directories, changing paths,
+  and changing the format, fields, or meaning of file contents, as documented in
+  `docs/storage-format.md` and `docs/storage.schema.json`.
 - Firmware downgrades are not supported. Saved data written by newer firmware does not need to
   stay readable by older firmware.
 
@@ -174,11 +178,11 @@ Keep this catalog aligned with `Makefile`, `desktop/package.json`, and
 | Desktop type checks | `make check-desktop`: TypeScript checks for the desktop and shared packages. |
 | Desktop and shared client tests | `make check-desktop`: all Vitest fixtures in `desktop/test` and `desktop/packages/*/test`, including desktop state, settings, serial communication, notifications, tray, server, client transports, framing, and keys. |
 | Desktop garbage-collection fixtures | `npm --prefix desktop test -- --execArgv=--expose-gc`: enables the notification and USB watcher lifetime checks that otherwise skip when `global.gc` is unavailable. |
-| Protocol compatibility | `make check-protocol`: key catalog validation and compatibility, Buf lint, and Buf breaking checks against `PROTOCOL_BASE` when that base contains the protocol. |
+| Protocol compatibility | `make check-protocol`: key catalog validation and compatibility, Buf lint, and Buf breaking checks against `PROTOCOL_BASE` (the newest earlier release in the same series as `CORDIAL_VERSION`) when that base contains the protocol. |
 | Repository tool fixtures | `make check-tools`: `tools/test_*.py`, covering versions, key catalog checks, and release archive validation. |
 | Firmware and packaging tool fixtures | `make check-tools`: `rust/tests/test_*.py`, covering board configuration, firmware artifacts, flashing, dependency notices, packaging, native BLE, HID reports, and host terminal behavior. |
 | Linux CLI/TUI terminal fixture | Build the CLI and install `pyte`, then run `CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py`. The default tool run skips this fixture without these prerequisites. |
-| ARM memory fixture | `make check-memory`: build Pico W development firmware and run the 32-bit allocation workloads in `rust/tests/memory-arm` under QEMU against the linked firmware's heap budget. |
+| ARM memory fixture | `make check-memory`: build development firmware for each Pico board and run the 32-bit allocation workloads in `rust/tests/memory-arm` under QEMU with that board's configuration, against its linked firmware's heap. |
 | Firmware static checks | `make check-firmware-all`: firmware Clippy for `pico_w`, `pico2_w`, `waveshare_rp2350b_plus_w`, and `xiao_esp32s3`, each with `production` and `debug` profiles. |
 | Firmware artifact validation | `make firmware-all PROFILE=production` and `make firmware-all PROFILE=debug`: link and package every board, including metadata, image layout, and storage-boundary checks in `rust/tools/build_firmware.py`. |
 | Portable application packages | `make package-desktop package-cli package-web`; validate the desktop and CLI archives with `tools/check_release_archive.py` for the selected `CORDIAL_VERSION`. |

@@ -338,7 +338,7 @@ a running Host client, and ordinary HID reports continue through their normal pa
 normalization preserves the keyboard's PC/Mac mode, Fn-lock, and native usages and modifier
 combinations. Explicit Fn-row configuration is available separately through settings.
 
-The per-device `hidpp_enabled` preference defaults to `false` and survives device renewal. During
+The per-device HID++ integration preference defaults to off and survives device renewal. During
 first-connection setup, Cordial enables it when the device answers the read-only probe as HID++ 2.0
 or newer and has usable long reports. A user choice made first takes precedence. An unanswered or
 refused probe leaves the setup decision for a later connection.

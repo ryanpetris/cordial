@@ -373,6 +373,7 @@ dependencies = [
  "cordial-protocol",
  "embassy-futures",
  "embassy-sync",
+ "embassy-time",
  "embassy-usb",
 ]
 

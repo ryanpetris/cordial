@@ -1,18 +1,48 @@
+//! Saved device policies, the resident reconnection entries of enabled devices and the adapter
+//! preference.
 use crate::model::{
     errors::ErrorCode,
-    identifiers::{ConnectionState, DeviceId, HostPlatform, Transport},
+    identifiers::{ConnectionState, HostPlatform, Transport},
 };
 use crate::{
+    interfaces::InterfacePreference,
     settings::Catalog,
     storage::{self, RecordStore, record_key},
 };
-use alloc::{boxed::Box, format, string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 /// The first retry delay after a failure, doubling per further failure up to
 /// `RETRY_DELAY_MAX_MS`.
 pub const RETRY_DELAY_MS: u32 = 2000;
 pub const RETRY_DELAY_MAX_MS: u32 = 300_000;
+
+/// When failed background storage work runs again: `RETRY_DELAY_MS` after the first failure,
+/// doubling per further failure up to `RETRY_DELAY_MAX_MS`. Work is never given up.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Backoff {
+    at: u64,
+    delay: u32,
+}
+impl Backoff {
+    /// Whether the work may run at `now`.
+    pub fn due(&self, now: u64) -> bool {
+        now >= self.at
+    }
+    /// Records a failure at `now`.
+    pub fn failed(&mut self, now: u64) {
+        self.delay = if self.delay == 0 {
+            RETRY_DELAY_MS
+        } else {
+            self.delay.saturating_mul(2).min(RETRY_DELAY_MAX_MS)
+        };
+        self.at = now.saturating_add(self.delay.into());
+    }
+    /// Records a success, so the next failure starts from the first delay.
+    pub fn succeeded(&mut self) {
+        *self = Self::default();
+    }
+}
 /// A connected device lost this soon after connecting has dropped rapidly.
 pub const RAPID_DROP_MS: u64 = 1000;
 /// Consecutive rapid drops that are still readmitted at once.
@@ -24,6 +54,8 @@ pub const RAPID_DROP_DELAY_MAX_MS: u64 = 5000;
 /// Live Bluetooth connections, shared across transports. Records are allocated on demand.
 pub const ACTIVE_CONNECTIONS: usize = 4;
 pub const SCAN_CANDIDATES: usize = 32;
+/// Saved devices returned by one listing page.
+pub const PAGE_SIZE: usize = 8;
 
 /// A resolved bonded identity, or a transport-specific discovery address.
 /// Backends resolve private BLE addresses before matching a saved policy.
@@ -34,6 +66,57 @@ pub struct Peer {
     pub transport: Transport,
 }
 
+/// The integrations a device can have a saved preference for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationKind {
+    Hidpp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavedIntegration {
+    pub kind: IntegrationKind,
+    pub enabled: bool,
+}
+
+/// The input roles of a device's HID descriptor, as `hid` role bits, saved as their names.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Roles(pub u8);
+impl Roles {
+    const NAMES: [(u8, &'static str); 4] = [
+        (crate::hid::KEYBOARD, "keyboard"),
+        (crate::hid::MOUSE, "mouse"),
+        (crate::hid::CONSUMER, "consumer_control"),
+        (crate::hid::SYSTEM, "system_control"),
+    ];
+}
+impl Serialize for Roles {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(None)?;
+        for (bit, name) in Self::NAMES {
+            if self.0 & bit != 0 {
+                seq.serialize_element(name)?;
+            }
+        }
+        seq.end()
+    }
+}
+impl<'de> Deserialize<'de> for Roles {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut roles = 0;
+        for name in Vec::<String>::deserialize(deserializer)? {
+            let (bit, _) = Self::NAMES
+                .into_iter()
+                .find(|(_, n)| *n == name)
+                .ok_or_else(|| serde::de::Error::custom("unknown role"))?;
+            roles |= bit;
+        }
+        Ok(Self(roles))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -42,16 +125,22 @@ pub struct Policy {
     pub name: Box<str>,
     pub trusted: bool,
     pub blocked: bool,
-    pub hidpp_enabled: bool,
     pub enabled: bool,
     /// Set from pairing until the device's first-connection setup completes;
     /// saved only while set.
     #[serde(default, skip_serializing_if = "core::ops::Not::not")]
     pub setup_pending: bool,
+    pub integrations: Vec<SavedIntegration>,
+    #[serde(default, skip_serializing_if = "is_empty_roles")]
+    pub roles: Roles,
+    /// The device's profile layers, applied in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<u64>,
     #[serde(skip)]
     pub bond: u64,
-    #[serde(skip)]
-    pub deleting: bool,
+}
+fn is_empty_roles(roles: &Roles) -> bool {
+    roles.0 == 0
 }
 impl Policy {
     pub fn paired(id: u64, peer: Peer, name: &[u8]) -> Self {
@@ -61,21 +150,45 @@ impl Policy {
             name: display_name(name),
             trusted: true,
             blocked: false,
-            hidpp_enabled: false,
             enabled: true,
             setup_pending: true,
+            integrations: Vec::new(),
+            roles: Roles::default(),
+            profiles: Vec::new(),
             bond: 0,
-            deleting: false,
         }
-    }
-    pub fn device_id(&self) -> DeviceId {
-        DeviceId(format!("d_{:016x}", self.id))
     }
     pub fn valid(&self) -> bool {
         self.id != 0
+            && self.id <= u64::from(u32::MAX)
             && self.name.len() <= 128
             && !self.name.bytes().any(|b| b < 0x20 || b == 0x7f)
             && (self.peer.transport != Transport::Classic || !self.peer.random)
+            && self
+                .integrations
+                .iter()
+                .enumerate()
+                .all(|(i, a)| !self.integrations[..i].iter().any(|b| b.kind == a.kind))
+            && self.profiles.iter().all(|&id| id != 0)
+    }
+    pub fn hidpp_enabled(&self) -> bool {
+        self.integrations
+            .iter()
+            .any(|i| i.kind == IntegrationKind::Hidpp && i.enabled)
+    }
+    /// Saves the HID++ preference, adding the integration's entry when it has none.
+    pub fn set_hidpp(&mut self, enabled: bool) {
+        match self
+            .integrations
+            .iter_mut()
+            .find(|i| i.kind == IntegrationKind::Hidpp)
+        {
+            Some(entry) => entry.enabled = enabled,
+            None => self.integrations.push(SavedIntegration {
+                kind: IntegrationKind::Hidpp,
+                enabled,
+            }),
+        }
     }
 }
 pub fn display_name(bytes: &[u8]) -> Box<str> {
@@ -113,34 +226,40 @@ impl Setup {
     }
 }
 
-pub struct Device {
-    pub effective_enabled: bool,
-    pub transport_supported: bool,
-    /// The firmware supports the device's transport, but it is disabled.
-    pub transport_disabled: bool,
-    pub policy: Policy,
+/// What a connected device keeps for its connection. Dropped when the connection ends.
+pub struct Live {
+    /// The device's saved policy, read from flash once the connection forwards input, or once
+    /// `manager::FIRST_INPUT_WAIT_MS` have passed without input.
+    pub policy: Option<Policy>,
     pub catalog: Catalog,
-    pub state: ConnectionState,
     pub roles: u8,
-    pub warnings: alloc::vec::Vec<crate::model::errors::DeviceWarning>,
+    pub warnings: Vec<crate::model::errors::DeviceWarning>,
     pub warnings_changed: bool,
-    pub paused: bool,
-    pub error: Option<ErrorCode>,
     pub setup: Setup,
-    /// When the device may next reconnect through the BLE accept list or an
-    /// incoming link.
-    admit_at: u64,
-    /// When background paging may next start an outgoing Classic connection.
-    page_at: u64,
-    /// When the last connection ended.
-    ended_at: u64,
-    retry_delay: u32,
-    /// When the current connection reached Connected.
-    connected_at: Option<u64>,
-    /// Consecutive clean losses within `RAPID_DROP_MS` of connecting.
-    rapid_drops: u32,
+    /// Why the device's profiles are not loaded, while they are not.
+    pub profile_error: Option<ErrorCode>,
+    /// When loading profiles that could not be read is tried again, and the delay after that.
+    pub profile_retry: Option<(u64, u32)>,
+    /// When reading the policy and preferences runs again after a failed read.
+    pub hydrate_retry: Backoff,
 }
-impl Device {
+impl Live {
+    pub fn new(transport: Transport, hidpp_enabled: bool) -> Self {
+        let mut catalog = Catalog::default();
+        catalog.info.battery.configure(transport, false);
+        catalog.connection(true, hidpp_enabled);
+        Self {
+            policy: None,
+            catalog,
+            roles: 0,
+            warnings: Vec::new(),
+            warnings_changed: false,
+            setup: Setup::default(),
+            profile_error: None,
+            profile_retry: None,
+            hydrate_retry: Backoff::default(),
+        }
+    }
     pub fn update_warnings(
         &mut self,
         warnings: &[crate::model::errors::DeviceWarning],
@@ -156,23 +275,53 @@ impl Device {
         self.warnings_changed = true;
         Ok(true)
     }
-    pub fn new(policy: Policy) -> Self {
-        let mut catalog = Catalog::default();
-        catalog.info.battery.configure(policy.peer.transport, false);
-        catalog.connection(false, policy.hidpp_enabled);
+}
+
+/// The resident reconnection entry of an enabled device the Bluetooth stack has room for: what
+/// accepting and making its connections needs, and its state while connected.
+pub struct Device {
+    pub id: u64,
+    pub peer: Peer,
+    pub trusted: bool,
+    pub hidpp_enabled: bool,
+    /// The device's profile layers, applied in order.
+    pub layers: Vec<u64>,
+    pub state: ConnectionState,
+    pub paused: bool,
+    pub error: Option<ErrorCode>,
+    /// The entry leaves the resident set once its link has closed, because the device was
+    /// disabled, blocked or its transport turned off.
+    pub retiring: bool,
+    /// An unpair is waiting for the device's link to close.
+    pub deleting: bool,
+    pub live: Option<Box<Live>>,
+    /// When the device may next reconnect through the BLE accept list or an
+    /// incoming link.
+    admit_at: u64,
+    /// When background paging may next start an outgoing Classic connection.
+    page_at: u64,
+    /// When the last connection ended.
+    ended_at: u64,
+    retry_delay: u32,
+    /// When the current connection reached Connected.
+    connected_at: Option<u64>,
+    /// Consecutive clean losses within `RAPID_DROP_MS` of connecting.
+    rapid_drops: u32,
+}
+impl Device {
+    pub fn new(policy: &Policy) -> Self {
         Self {
-            effective_enabled: true,
-            transport_supported: true,
-            transport_disabled: false,
-            policy,
-            catalog,
+            id: policy.id,
+            peer: policy.peer,
+            trusted: policy.trusted,
+            hidpp_enabled: policy.hidpp_enabled(),
+            layers: policy.profiles.clone(),
             state: ConnectionState::Disconnected,
-            roles: 0,
-            warnings: alloc::vec::Vec::new(),
-            warnings_changed: false,
             paused: false,
             error: None,
-            setup: Setup::default(),
+            retiring: false,
+            deleting: false,
+            live: None,
             admit_at: 0,
             page_at: 0,
             ended_at: 0,
@@ -181,8 +330,19 @@ impl Device {
             rapid_drops: 0,
         }
     }
+    /// Takes the saved fields a reconnection entry keeps from `policy`. A connection whose policy
+    /// has been read keeps the new one; a connection that has not read it yet reads the saved
+    /// policy, with its preferences, once it forwards input.
+    pub fn update(&mut self, policy: &Policy) {
+        self.trusted = policy.trusted;
+        self.hidpp_enabled = policy.hidpp_enabled();
+        self.layers.clone_from(&policy.profiles);
+        if let Some(saved) = self.live.as_mut().and_then(|l| l.policy.as_mut()) {
+            saved.clone_from(policy);
+        }
+    }
     pub fn allow_incoming(&self) -> bool {
-        self.effective_enabled && self.policy.trusted && !self.policy.blocked && !self.paused
+        !self.retiring && !self.deleting && self.trusted && !self.paused
     }
     fn reconnectable(&self) -> bool {
         self.allow_incoming() && self.state == ConnectionState::Disconnected
@@ -196,7 +356,7 @@ impl Device {
         self.reconnectable() && now >= self.page_at
     }
     pub fn watch_for_return(&self) -> bool {
-        self.policy.peer.transport == Transport::Ble && self.reconnectable()
+        self.peer.transport == Transport::Ble && self.reconnectable()
     }
     /// A BLE device seen advertising may reconnect early, but not sooner than
     /// the first retry delay after its last connection ended.
@@ -212,10 +372,10 @@ impl Device {
     /// connection on purpose.
     pub fn connection(&mut self, state: ConnectionState, error: Option<ErrorCode>, now: u64) {
         self.state = state;
-        self.catalog.connection(
-            state == ConnectionState::Connected,
-            self.policy.hidpp_enabled,
-        );
+        if let Some(live) = &mut self.live {
+            live.catalog
+                .connection(state == ConnectionState::Connected, self.hidpp_enabled);
+        }
         if error.is_some() || state == ConnectionState::Connected {
             self.error = error;
         }
@@ -224,6 +384,7 @@ impl Device {
             self.retry_delay = 0;
         }
         if state == ConnectionState::Disconnected {
+            self.live = None;
             if !self.rapid(now) && self.connected_at.is_some() {
                 self.rapid_drops = 0;
             }
@@ -262,20 +423,16 @@ impl Device {
     pub fn defer_page(&mut self, at: u64) {
         self.page_at = self.page_at.max(at);
     }
-    pub fn explicit_connect(&mut self) -> Result<(), ErrorCode> {
-        if self.policy.blocked {
-            return Err(ErrorCode::Blocked);
-        }
+    pub fn explicit_connect(&mut self) {
         self.paused = false;
         self.admit_at = 0;
         self.page_at = 0;
         self.retry_delay = 0;
         self.rapid_drops = 0;
-        Ok(())
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterPreference {
     pub name: Option<alloc::string::String>,
@@ -283,6 +440,9 @@ pub struct AdapterPreference {
     /// The enabled transports. BLE alone when absent.
     #[serde(default)]
     pub transports: Transports,
+    /// Saved preferences of each configuration interface that has any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configuration_interfaces: Vec<InterfacePreference>,
 }
 
 /// A set of transports, saved as the list of their names.
@@ -346,6 +506,7 @@ impl<S: RecordStore> Policies<'_, S> {
                     .name
                     .as_deref()
                     .is_some_and(|name| crate::model::adapter_name(name) != Some(name))
+                    || !crate::interfaces::valid(&value.configuration_interfaces)
                 {
                     return Err(storage::Error::Corrupt);
                 }
@@ -359,38 +520,17 @@ impl<S: RecordStore> Policies<'_, S> {
             .save(record_key(1, 0), &storage::json(&value)?)
             .await
     }
-    pub async fn load_devices(&mut self) -> Result<Vec<(usize, Policy)>, storage::Error> {
-        let mut result = Vec::new();
-        let mut previous = None;
-        while let Some(key) = self.store.next_key(previous).await? {
-            previous = Some(key);
-            if key[0] != 2 {
-                continue;
-            }
-            if let Some(bytes) = self.store.load_owned(key).await? {
-                let policy: Policy = crate::codec::read_policy(
-                    u64::from_be_bytes(key[1..].try_into().unwrap()),
-                    &bytes,
-                )?;
-                if !policy.valid()
-                    || result
-                        .iter()
-                        .any(|(_, p): &(usize, Policy)| p.id == policy.id || p.peer == policy.peer)
-                {
-                    return Err(storage::Error::Corrupt);
-                }
-                result
-                    .try_reserve_exact(1)
-                    .map_err(|_| storage::Error::Unavailable)?;
-                if u64::from_be_bytes(key[1..].try_into().unwrap()) != policy.id {
-                    return Err(storage::Error::Corrupt);
-                }
-                result.push((result.len(), policy));
-            }
-        }
-        Ok(result)
+    /// The saved policy of device `id`. `Missing` when the device does not exist; `Corrupt`
+    /// when its record is undecodable or does not match its ID.
+    pub async fn load(&mut self, id: u64) -> Result<Policy, storage::Error> {
+        let bytes = self
+            .store
+            .load_owned(record_key(2, id))
+            .await?
+            .ok_or(storage::Error::Missing)?;
+        crate::codec::read_policy(id, &bytes)
     }
-    pub async fn save(&mut self, _slot: usize, policy: &Policy) -> Result<(), storage::Error> {
+    pub async fn save(&mut self, policy: &Policy) -> Result<(), storage::Error> {
         if !policy.valid() {
             return Err(storage::Error::Corrupt);
         }
@@ -413,7 +553,7 @@ impl<S: RecordStore> Policies<'_, S> {
     }
     /// The device file is the deletion commit. Leftover preferences and layout
     /// are inactive and cleanup can be retried without restoring a deleted device.
-    pub async fn remove(&mut self, _slot: usize, device: u64) -> Result<(), storage::Error> {
+    pub async fn remove(&mut self, device: u64) -> Result<(), storage::Error> {
         self.store.remove(record_key(2, device)).await?;
         let _ = self.store.remove(record_key(4, device)).await;
         crate::layouts::remove(self.store, device).await;

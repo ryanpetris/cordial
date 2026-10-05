@@ -69,12 +69,13 @@ fn policies_have_independent_records_and_unpair_clears_only_the_owner() {
                 name: None,
                 host_platform: HostPlatform::Mac,
                 transports: Transports::default(),
+                ..Default::default()
             })
             .await
             .unwrap();
         for slot in 0..8 {
             let p = Policy::paired(slot as u64 + 1, peer(slot as u8), &[b'"'; 128]);
-            assert!(p.trusted && !p.hidpp_enabled && p.setup_pending && !p.blocked);
+            assert!(p.trusted && !p.hidpp_enabled() && p.setup_pending && !p.blocked);
             assert!(p.valid());
             let bond = cordial_core::bonds::Bond {
                 owner: p.id,
@@ -93,7 +94,7 @@ fn policies_have_independent_records_and_unpair_clears_only_the_owner() {
                 .await
                 .unwrap();
         }
-        assert_eq!(policies.load_devices().await.unwrap().len(), 8);
+        assert_eq!(policies.store.record_ids(2, 0, 100).await.unwrap().len(), 8);
         let pref = Preference {
             metadata: Metadata {
                 key: SettingKey::BacklightEnabled,
@@ -115,12 +116,12 @@ fn policies_have_independent_records_and_unpair_clears_only_the_owner() {
             .unwrap();
         }
         policies.store.fail_remove = true;
-        assert_eq!(policies.remove(0, 1).await, Err(Error::Io));
-        assert_eq!(policies.load_devices().await.unwrap().len(), 8);
+        assert_eq!(policies.remove(1).await, Err(Error::Io));
+        assert_eq!(policies.store.record_ids(2, 0, 100).await.unwrap().len(), 8);
         policies.store.fail_remove = false;
-        policies.remove(0, 1).await.unwrap();
-        policies.remove(0, 1).await.unwrap();
-        assert_eq!(policies.load_devices().await.unwrap().len(), 7);
+        policies.remove(1).await.unwrap();
+        policies.remove(1).await.unwrap();
+        assert_eq!(policies.store.record_ids(2, 0, 100).await.unwrap().len(), 7);
         assert!(
             Preferences {
                 store: policies.store,
@@ -146,16 +147,11 @@ fn policies_have_independent_records_and_unpair_clears_only_the_owner() {
             policies.load_adapter().await.unwrap().host_platform,
             HostPlatform::Mac
         );
-        let invalid = Policy::paired(99, peer(1), b"duplicate identity");
-        let mut bond = cordial_core::bonds::load(policies.store, 2)
-            .await
-            .unwrap()
-            .unwrap();
-        bond.owner = invalid.id;
-        cordial_core::bonds::commit(policies.store, &invalid, &bond)
-            .await
-            .unwrap();
-        assert_eq!(policies.load_devices().await, Err(Error::Corrupt));
+        // A record whose bond belongs to another device cannot be saved over.
+        let mut moved = policies.load(3).await.unwrap();
+        moved.peer = peer(9);
+        assert_eq!(policies.save(&moved).await, Err(Error::Missing));
+        assert_eq!(policies.load(1).await, Err(Error::Missing));
     });
 }
 /// The first delay after a failure, which doubles per further failure.
@@ -168,7 +164,7 @@ fn due(d: &Device, now: u64) -> bool {
 }
 #[test]
 fn a_clean_loss_admits_at_once_and_pages_after_the_first_delay() {
-    let mut d = Device::new(Policy::paired(10, peer(1), b"Keyboard"));
+    let mut d = Device::new(&Policy::paired(10, peer(1), b"Keyboard"));
     d.connection(ConnectionState::Connected, None, 0);
     d.lost(1000);
     assert!(d.admit_due(1000));
@@ -185,7 +181,7 @@ fn a_clean_loss_admits_at_once_and_pages_after_the_first_delay() {
     assert!(!due(&d, paged + 2 * FIRST - 1));
     assert!(due(&d, paged + 2 * FIRST));
     // Seeing the device advertise does not shorten that below the first delay.
-    let mut ble = Device::new(Policy::paired(
+    let mut ble = Device::new(&Policy::paired(
         11,
         Peer {
             transport: Transport::Ble,
@@ -207,7 +203,7 @@ fn reconnect_policy_and_names_survive_normal_runtime_transitions() {
     assert_eq!(&*p.name, "Example ? keyboard");
     let text = "é".repeat(65);
     assert_eq!(display_name(text.as_bytes()).len(), 128);
-    let mut d = Device::new(p);
+    let mut d = Device::new(&p);
     assert!(due(&d, 0));
     d.connection(ConnectionState::Connecting, None, 0);
     assert!(!due(&d, 100));
@@ -218,20 +214,20 @@ fn reconnect_policy_and_names_survive_normal_runtime_transitions() {
     );
     assert!(!due(&d, 100 + FIRST - 1));
     assert!(due(&d, 100 + FIRST));
-    d.policy.trusted = false;
+    d.trusted = false;
     assert!(!d.allow_incoming());
-    d.explicit_connect().unwrap();
+    d.explicit_connect();
     d.connection(ConnectionState::Connected, None, 5101);
     assert_eq!(d.error, None);
-    d.policy.trusted = true;
+    d.trusted = true;
     d.paused = true;
     assert!(!d.allow_incoming());
-    d.explicit_connect().unwrap();
+    d.explicit_connect();
     assert!(d.allow_incoming());
-    d.policy.blocked = true;
-    assert_eq!(d.explicit_connect(), Err(ErrorCode::Blocked));
+    // A retiring entry, such as a device just disabled, admits nothing.
+    d.retiring = true;
     assert!(!d.allow_incoming());
-    d.policy.blocked = false;
+    d.retiring = false;
     // An authentication failure backs off like any other failure.
     d.connection(
         ConnectionState::Disconnected,
@@ -249,7 +245,7 @@ fn reconnect_policy_and_names_survive_normal_runtime_transitions() {
         d.connection(ConnectionState::Connecting, None, at);
         d.connection(ConnectionState::Disconnected, Some(error), at);
         assert_eq!(d.error, Some(error));
-        assert!(d.watch_for_return() || d.policy.peer.transport != Transport::Ble);
+        assert!(d.watch_for_return() || d.peer.transport != Transport::Ble);
     }
     assert!(!due(&d, 40_000 + 4 * FIRST - 1));
     assert!(due(&d, 40_000 + 4 * FIRST));
@@ -356,7 +352,7 @@ fn only_repeated_rapid_drops_delay_readmission() {
         transport: Transport::Ble,
         ..peer(2)
     };
-    let mut d = Device::new(Policy::paired(11, ble, b"Mouse"));
+    let mut d = Device::new(&Policy::paired(11, ble, b"Mouse"));
     let mut now = 0;
     // Drops within a second of connecting: two are readmitted at once, then the wait
     // doubles from one second to at most five.
@@ -389,7 +385,7 @@ fn only_repeated_rapid_drops_delay_readmission() {
     // from it.
     assert!(!d.page_due(now + FIRST - 1));
     assert!(d.page_due(now + FIRST));
-    let mut d = Device::new(Policy::paired(12, peer(3), b"Keyboard"));
+    let mut d = Device::new(&Policy::paired(12, peer(3), b"Keyboard"));
     for (at, delay) in [(0, FIRST), (10_000, 2 * FIRST), (30_000, 4 * FIRST)] {
         d.connection(ConnectionState::Connecting, None, at);
         d.connection(ConnectionState::Disconnected, Some(ErrorCode::Timeout), at);
@@ -409,7 +405,7 @@ fn an_explicit_connect_resets_every_backoff() {
         transport: Transport::Ble,
         ..peer(2)
     };
-    let mut d = Device::new(Policy::paired(11, ble, b"Mouse"));
+    let mut d = Device::new(&Policy::paired(11, ble, b"Mouse"));
     let mut now = 0;
     for _ in 0..4 {
         d.connection(ConnectionState::Connecting, None, now);
@@ -426,7 +422,7 @@ fn an_explicit_connect_resets_every_backoff() {
         d.lost(now);
     }
     assert!(!d.admit_due(now));
-    d.explicit_connect().unwrap();
+    d.explicit_connect();
     assert!(d.admit_due(now) && d.page_due(now));
     d.connection(ConnectionState::Connecting, None, now);
     d.connection(
@@ -439,7 +435,7 @@ fn an_explicit_connect_resets_every_backoff() {
     // The rapid-drop count starts again too.
     for _ in 0..RAPID_DROPS_ADMITTED {
         now += 10_000;
-        d.explicit_connect().unwrap();
+        d.explicit_connect();
         d.connection(ConnectionState::Connected, None, now);
         d.lost(now);
         assert!(d.admit_due(now));
@@ -448,7 +444,7 @@ fn an_explicit_connect_resets_every_backoff() {
 
 #[test]
 fn failures_double_from_the_first_delay_up_to_the_cap() {
-    let mut d = Device::new(Policy::paired(10, peer(1), b"Keyboard"));
+    let mut d = Device::new(&Policy::paired(10, peer(1), b"Keyboard"));
     let mut now = 0;
     let mut expected = FIRST;
     for _ in 0..12 {

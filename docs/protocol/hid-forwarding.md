@@ -107,11 +107,12 @@ services. Native service and characteristic limits also apply.
 
 ## Warnings
 
-Each limitation above is reported as a `DeviceWarning`, listed by `ListWarnings` and sent whole in a
-`warnings` event when it changes. A warning identifies its code, the HID service, the report type
-and optional report ID, the field's bit offset and its usage. Input and indicator capability
-limitations are separate from retryable indicator read and write failures; a successful indicator
-update clears its failures. A reconnect replaces the earlier connection's warnings.
+Each limitation above is reported as a `DeviceWarning`, listed by `ListWarnings`, and added or
+removed by a `warnings_changed` event when it appears or clears. A warning identifies its code, the
+HID service, the report type and optional report ID, the field's bit offset and its usage. Input and
+indicator capability limitations are separate from retryable indicator read and write failures; a
+successful indicator update clears its failures. A reconnect replaces the earlier connection's
+warnings.
 
 ## Output reports
 

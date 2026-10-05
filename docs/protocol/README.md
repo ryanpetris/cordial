@@ -3,10 +3,10 @@
 The Dongle's USB CDC port carries a protobuf API. A client sends one request and gets one response
 back, in order; the Dongle also sends an event whenever something changes. There are no request
 IDs, no subscriptions, no heartbeats and no revisions. The separate USB HID interfaces carry the
-keyboard and mouse.
+keyboard and mouse, and the enabled configuration interfaces.
 
-One host process owns the port at a time. The Dongle stores its bonds, connection policy and
-settings itself and works without any host software once set up; the host only configures it and
+One host process owns the port at a time. The Dongle stores its bonds, connection policy, settings
+and profiles itself and works without any host software once set up; the host only configures it and
 reports what it says, such as battery levels.
 
 ## Documents
@@ -14,7 +14,7 @@ reports what it says, such as battery levels.
 - [USB discovery, framing and sessions](transport.md)
 - [Compatibility rules](compatibility.md)
 - [Commands](commands.md)
-- [Records: status, devices, integrations, information, settings and warnings](records.md)
+- [Records: status, profiles, devices, integrations, information, settings and warnings](records.md)
 - [Information and settings keys](keys.md)
 - [Limits and errors](limits-and-errors.md)
 - [CLI, TUI and desktop behavior](clients.md)

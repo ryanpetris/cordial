@@ -1,7 +1,20 @@
 // Run-time validation of actions arriving over IPC from the window.
 import type { Action } from "../shared/state.ts";
 
-type Kind = "string" | "boolean" | "number" | "value" | "string?" | "nullable" | "changes";
+type Kind =
+  | "string"
+  | "boolean"
+  | "number"
+  | "id"
+  | "value"
+  | "string?"
+  | "boolean?"
+  | "nullable"
+  | "changes"
+  | "transports?"
+  | "interfaces?"
+  | "ids?"
+  | "page";
 const key = { key: "string" } as const;
 const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "device.connect": key,
@@ -9,14 +22,27 @@ const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "device.unpair": key,
   "device.refresh": key,
   "device.reload": key,
-  "device.enabled": { key: "string", value: "boolean" },
-  "device.trusted": { key: "string", value: "boolean" },
-  "device.blocked": { key: "string", value: "boolean" },
-  "device.hidpp": { key: "string", value: "boolean" },
+  "device.update": {
+    key: "string",
+    enabled: "boolean?",
+    trusted: "boolean?",
+    blocked: "boolean?",
+    hidpp: "boolean?",
+    profiles: "ids?",
+  },
   "settings.save": { key: "string", changes: "changes" },
   "adapter.name": { adapterId: "string", name: "nullable" },
-  "adapter.platform": { adapterId: "string", platform: "string" },
-  "adapter.transport": { adapterId: "string", transport: "string", enabled: "boolean" },
+  "adapter.settings": {
+    adapterId: "string",
+    platform: "string?",
+    transports: "transports?",
+    interfaces: "interfaces?",
+  },
+  "profile.create": { adapterId: "string", name: "string" },
+  "profile.copy": { adapterId: "string", profile: "id", name: "string" },
+  "profile.delete": { adapterId: "string", profile: "id" },
+  "profiles.page": { adapterId: "string", page: "page", picker: "boolean?" },
+  "adapter.reload": { adapterId: "string" },
   "adapter.connect": { adapterId: "string" },
   "adapter.disconnect": { adapterId: "string" },
   "adapter.menu": { adapterId: "string" },
@@ -24,7 +50,7 @@ const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "app.menu": { x: "number", y: "number" },
   "scan.start": { adapterId: "string" },
   "scan.stop": {},
-  "pair.start": { adapterId: "string", candidateId: "string" },
+  "pair.start": { adapterId: "string", candidateId: "id" },
   "pair.reply": { accept: "boolean", value: "string?" },
   "pair.cancel": {},
   "pair.dismiss": {},
@@ -39,6 +65,10 @@ const PREFERENCES: Record<string, "boolean" | "number"> = {
   notifyConnections: "boolean",
 };
 
+/** A protocol ID: a uint32, where 0 means none. */
+const id = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
+const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
+
 function fits(value: unknown, kind: Kind): boolean {
   switch (kind) {
     case "string":
@@ -47,21 +77,35 @@ function fits(value: unknown, kind: Kind): boolean {
       return typeof value === "boolean";
     case "number":
       return typeof value === "number" && Number.isFinite(value);
+    case "id":
+      return id(value);
     case "value":
       return typeof value === "boolean" || typeof value === "string" || Number.isSafeInteger(value);
+    case "boolean?":
+      return value === undefined || typeof value === "boolean";
     case "string?":
       return value === undefined || (typeof value === "string" && value.length <= 256);
     case "nullable":
       return value === null || (typeof value === "string" && value.length <= 256);
     case "changes":
       return Array.isArray(value) && value.length > 0 && value.every((change: unknown) => {
-        if (!change || typeof change !== "object") return false;
-        const c = change as Record<string, unknown>;
-        const fields = c.type === "set" ? ["type", "setting", "value"] : ["type", "setting"];
-        return (c.type === "set" || c.type === "forget")
-          && Object.keys(c).every((k) => fields.includes(k))
-          && fits(c.setting, "string") && (c.type === "forget" || fits(c.value, "value"));
+        if (!record(change)) return false;
+        const fields = change.type === "set" ? ["type", "setting", "value"] : ["type", "setting"];
+        return (change.type === "set" || change.type === "forget")
+          && Object.keys(change).every((k) => fields.includes(k))
+          && fits(change.setting, "string") && (change.type === "forget" || fits(change.value, "value"));
       });
+    case "page":
+      return value === "first" || value === "next" || value === "previous";
+    case "ids?":
+      return value === undefined || (Array.isArray(value) && value.length <= 64 && value.every(id));
+    case "transports?":
+      return value === undefined || (record(value) && Object.entries(value).every(([k, v]) => fits(k, "string") && typeof v === "boolean"));
+    case "interfaces?":
+      return value === undefined || (record(value) && Object.entries(value).every(([k, v]) =>
+        /^[1-9][0-9]{0,9}$/.test(k) && record(v)
+        && Object.keys(v).every((f) => f === "enabled" || f === "profile")
+        && fits(v.enabled, "boolean?") && (v.profile === undefined || id(v.profile))));
   }
 }
 

@@ -27,6 +27,36 @@ class BoardConfigTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "default_adapter_name"):
                         config.load(path, "production")
 
+    def test_profile_memory_budget_is_generated_without_changing_identity(self):
+        presets = {"pico_w": None, "pico2_w": 32768, "waveshare_rp2350b_plus_w": 32768,
+                   "xiao_esp32s3": 32768}
+        for name, expected in presets.items():
+            board = config.ROOT / "boards" / f"{name}.json"
+            raw = json.loads(board.read_text())
+            self.assertEqual(raw["profile_memory_budget"], expected)
+            baseline = config.load(board, "production")
+            with tempfile.TemporaryDirectory() as temp:
+                path = Path(temp, "board.json")
+                for budget, constant in ((None, "None"), (1, "Some(1)"), (24576, "Some(24576)"),
+                                         (1048575, "Some(1048575)")):
+                    path.write_text(json.dumps(raw | {"profile_memory_budget": budget}))
+                    changed = config.load(path, "production")
+                    out = Path(temp, str(budget))
+                    config.generate(changed, out)
+                    self.assertIn(f"pub const PROFILE_MEMORY_BUDGET: Option<u32> = {constant};\n",
+                                  (out / "board.rs").read_text())
+                    for key in ("hardware_digest", "storage_identity"):
+                        self.assertEqual(baseline[key], changed[key])
+                for invalid in (0, -1, 1048576, 24576.0, "24576", True, [], {}):
+                    path.write_text(json.dumps(raw | {"profile_memory_budget": invalid}))
+                    with self.assertRaisesRegex(ValueError, "profile_memory_budget"):
+                        config.load(path, "production")
+                missing = dict(raw)
+                del missing["profile_memory_budget"]
+                path.write_text(json.dumps(missing))
+                with self.assertRaisesRegex(ValueError, "requires exactly"):
+                    config.load(path, "production")
+
     def test_radio_selection_preserves_identity_and_generates_sdk_pins(self):
         preset = json.loads((config.ROOT / "boards/waveshare_rp2350b_plus_w.json").read_text())
         preset["radio"] = {"power": 40, "data": 16, "clock": 47, "cs": 41, "led": None}

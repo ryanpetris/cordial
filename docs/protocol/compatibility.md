@@ -55,8 +55,11 @@ understood are Required.
    other kind is a repeated message with the kind as a field, like `TransportSupport` and
    `Integration`.
 
-`buf breaking` runs against the last release with the `WIRE_JSON` rule set and fails on anything
-that breaks rules 1 and 2, including renamed fields, which `--json` output exposes. `buf lint` uses
+`buf breaking` runs against the newest earlier release in the same series with the `WIRE_JSON`
+rule set and fails on anything that breaks rules 1 and 2, including renamed fields, which
+`--json` output exposes. Before 1.0, a new minor version starts a series and may break
+compatibility; from 1.0, only a new major version may. A development build compares against the
+newest release. `buf lint` uses
 its standard rules except `ENUM_ZERO_VALUE_SUFFIX`, because zero values carry the default meaning,
 and `PACKAGE_VERSION_SUFFIX`, because the package has no version. Rules 3 to 8 and the rules below
 are review rules.
@@ -69,12 +72,19 @@ wants to change, and every missing field keeps its current value.
 - Every updatable field on a set command is `optional` or a message, never a plain scalar, so
   `false`, `0` or `""` cannot overwrite a stored value by accident.
 - Fields that only make sense together are grouped in one message, replaced or kept as a whole.
-- Because a missing field means unchanged, clearing a value needs an explicit form, such as
-  `name: ""` restoring the default adapter name, or a separate command such as `ForgetSettings`.
-- A set command responds with the full updated record, so a client that sets a newer field can see
-  whether older firmware applied it.
+- Because a missing field means unchanged, clearing a value needs an explicit form, such as `name:
+  ""` restoring the default adapter name, or a `forget` entry in a list of changes, such as
+  `SettingChange.forget`.
+- A set command responds with no result once the change is applied, and the changed object's
+  event announces it when anything changed. A success means the Dongle holds what was sent, in the
+  saved form the command defines, so a client sends a newer field only when `Status` shows the
+  firmware supports it, and a field that older firmware could not ignore safely gets a new command
+  (rule 6).
 - A new updatable property of an existing object is a new `optional` field on that object's set
   command, not a new command.
+- A repeated list of updates, changes or items to forget applies in order. A later entry for the
+  same transport, integration, interface, setting or rule replaces an earlier one, and repeating an
+  entry is never refused. The command still saves in one storage write.
 
 ## Integrations
 
@@ -92,6 +102,57 @@ client needs to show, enable and edit them.
   report bytes, protocol responses and hex dumps never reach the wire, and a value the Dongle
   cannot decode is not sent. Decoded identifiers and positions, such as a report ID, a bit offset
   or a usage number, are typed fields, not raw data.
+
+## Profiles
+
+Profiles are not tied to keyboards, mice or any other kind of device. A profile is a set of rules
+keyed by HID usage, and the Dongle applies whichever of them match the input a device produces. A
+new kind of input or output, such as a joystick axis or a gamepad report, is a new usage range in
+`ProfileSupport`, never a new field, message or command. HID usages and collections are typed
+fields, decoded by the Dongle, as for warnings.
+
+Configuration interfaces follow the transport pattern. Each is a `ConfigurationInterface` value
+that reports itself as a `ConfigurationInterfaceSupport` entry with its preferences and the
+interfaces it conflicts with, and is changed through a `ConfigurationInterfaceUpdate`. Any number
+can be enabled at once; firmware that cannot run two together lists each in the other's
+`conflicts`.
+
+- A client keeps an interface or collection it does not know and passes it back unchanged, and
+  skips a role it does not know.
+
+## Identifiers
+
+Saved records and scan candidates are identified by positive `uint32` IDs, never strings. Each
+kind of record has its own IDs, and a saved record's ID is never reused. Where a field refers to an
+optional record, `0` means none.
+
+## Listings
+
+Every `List` command reads its list in pages, the same way:
+
+- The request carries `after`, the key of the last entry the client received. A missing `after`,
+  `0` or `""` starts from the beginning.
+- The reply holds the entries that follow `after` in the listing's order, and `end` is set when
+  nothing follows the last of them. A reply holds at least one entry unless `end` is set.
+- The Dongle chooses how many entries a page holds, and can choose differently for every page. A
+  client never assumes a page size, and reads until `end` when it needs the whole list.
+- The listing reflects the Dongle's state as each page is read. Entries that change between pages
+  are reported by events, so a client that applies events while it pages ends with the current list.
+
+| Command | `after` | Order |
+| --- | --- | --- |
+| `ListDevices` | Device ID | Ascending ID |
+| `ListProfiles` | Profile ID | Ascending ID |
+| `ListProfileRules` | The rule's input `Usage` | Usage page, then usage |
+| `ListSettings` | `SettingRef`: integration and key | Integration, then key compared bytewise |
+| `ListWarnings` | The last `DeviceWarning` itself | Service, report type, report ID, bit offset, usage page, usage, then code; a missing field orders before any value |
+| `ListFeatures` | `FeatureRef`: integration and index | Integration, then index |
+| `ListFiles` | Entry name | Name compared bytewise |
+
+A listing of saved records bounded only by flash, `ListDevices` and `ListProfiles`, holds one entry
+per record: the record, or its ID as `unreadable` when its saved record could not be read from
+flash, so the listing continues past it. An undecodable record is removed as lost and is not
+listed.
 
 ## Information and settings
 

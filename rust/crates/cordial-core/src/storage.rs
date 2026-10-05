@@ -51,7 +51,8 @@ pub trait RecordStore {
         Err(Error::Unavailable)
     }
     /// Enumerate unique live keys. Physical obsolete versions are not entries.
-    /// Saved layouts (kind 5) are read by key and need not be enumerated.
+    /// Saved layouts (kind 5) and profile rules (kind 9) are read by key and need not be
+    /// enumerated.
     async fn keys(&mut self) -> Result<Vec<RecordKey>, Error>;
     /// One key at a time. Backends override this without collecting the namespace.
     async fn next_key(&mut self, after: Option<RecordKey>) -> Result<Option<RecordKey>, Error> {
@@ -61,6 +62,25 @@ pub trait RecordStore {
             .into_iter()
             .filter(|key| after.is_none_or(|a| *key > a))
             .min())
+    }
+    /// The lowest IDs above `after` that have a record of `kind`, at most `limit`, in ascending
+    /// order. Filesystem backends select them in one directory pass and list the IDs of record
+    /// directories without opening them, so a listed ID's record can be missing; callers read
+    /// each record and treat a missing one as absent.
+    async fn record_ids(&mut self, kind: u8, after: u64, limit: usize) -> Result<Vec<u64>, Error> {
+        let mut ids = Vec::new();
+        let mut previous = Some(record_key(kind, after));
+        while ids.len() < limit {
+            let Some(key) = self.next_key(previous).await? else {
+                break;
+            };
+            if key[0] != kind {
+                break;
+            }
+            previous = Some(key);
+            ids.push(u64::from_be_bytes(key[1..].try_into().unwrap()));
+        }
+        Ok(ids)
     }
     async fn load_owned(&mut self, key: RecordKey) -> Result<Option<Vec<u8>>, Error> {
         let mut bytes = Vec::new();
@@ -127,6 +147,12 @@ impl<S: RecordStore> RecordStore for Result<S, Error> {
             .file_read(path, offset, bytes)
             .await
     }
+    async fn record_ids(&mut self, kind: u8, after: u64, limit: usize) -> Result<Vec<u64>, Error> {
+        self.as_mut()
+            .map_err(|e| *e)?
+            .record_ids(kind, after, limit)
+            .await
+    }
     async fn next_key(&mut self, after: Option<RecordKey>) -> Result<Option<RecordKey>, Error> {
         self.as_mut().map_err(|e| *e)?.next_key(after).await
     }
@@ -148,11 +174,58 @@ impl<S: RecordStore> RecordStore for Result<S, Error> {
     }
 }
 
+/// The ID a record directory is named after: a positive decimal number of at most 32 bits,
+/// without a prefix or padding.
+pub fn parse_id(value: &str) -> Option<u64> {
+    if value.is_empty() || value.starts_with('0') || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok().filter(|id| *id <= u64::from(u32::MAX))
+}
+
 pub fn record_key(kind: u8, owner: u64) -> RecordKey {
     let mut key = [0; 9];
     key[0] = kind;
     key[1..].copy_from_slice(&owner.to_be_bytes());
     key
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sequence {
+    pub device: u64,
+    pub profile: u64,
+}
+
+pub async fn allocate<S: RecordStore>(store: &mut S, profile: bool) -> Result<u64, Error> {
+    let key = record_key(7, 0);
+    let bytes = store.load_owned(key).await?.ok_or(Error::Corrupt)?;
+    let mut sequence: Sequence = serde_json::from_slice(&bytes).map_err(|_| Error::Corrupt)?;
+    let counter = if profile {
+        &mut sequence.profile
+    } else {
+        &mut sequence.device
+    };
+    // Identifiers are 32-bit on the wire.
+    *counter = counter
+        .checked_add(1)
+        .filter(|id| *id <= u64::from(u32::MAX))
+        .ok_or(Error::Full)?;
+    let id = *counter;
+    store.save(key, &json(&sequence)?).await?;
+    Ok(id)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Integration {
+    Hidpp,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedPreference<T> {
+    integration: Integration,
+    #[serde(flatten)]
+    preference: T,
 }
 
 pub struct Preferences<'a, S> {
@@ -167,8 +240,9 @@ impl<S: RecordStore> Preferences<'_, S> {
         let Some(bytes) = self.store.load_owned(self.key()).await? else {
             return Ok(Vec::new());
         };
-        let result: Vec<crate::compact::Preference> =
+        let saved: Vec<SavedPreference<crate::compact::Preference>> =
             serde_json::from_slice(&bytes).map_err(|_| Error::Corrupt)?;
+        let result: Vec<_> = saved.into_iter().map(|p| p.preference).collect();
         for (i, p) in result.iter().enumerate() {
             if !p.valid()
                 || result[..i]
@@ -184,7 +258,14 @@ impl<S: RecordStore> Preferences<'_, S> {
         if values.is_empty() {
             self.store.remove(self.key()).await
         } else {
-            self.store.save(self.key(), &json(values)?).await
+            let saved: Vec<_> = values
+                .iter()
+                .map(|preference| SavedPreference {
+                    integration: Integration::Hidpp,
+                    preference,
+                })
+                .collect();
+            self.store.save(self.key(), &json(&saved)?).await
         }
     }
 }
@@ -294,7 +375,7 @@ pub async fn initialized<S: RecordStore>(store: &mut S) -> Result<(), Error> {
         if initialized {
             return Err(Error::Corrupt);
         }
-        store.save(sequence, b"0").await?;
+        store.save(sequence, &json(&Sequence::default())?).await?;
     }
     if !initialized {
         store

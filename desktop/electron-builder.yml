@@ -36,3 +36,5 @@ extraFiles:
     to: cordial-desktop.desktop
   - from: assets/icons/app-512.png
     to: cordial-desktop.png
+  - from: ../configs/50-cordial.rules
+    to: 50-cordial.rules

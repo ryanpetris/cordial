@@ -8,6 +8,10 @@ override_dh_strip:
 override_dh_dwz:
 override_dh_shlibdeps:
 
+# Each package names its own copy of the rules, so both packages can be installed.
+execute_after_dh_install:
+	install -Dm644 50-cordial.rules debian/cordial-cli/usr/lib/udev/rules.d/50-cordial-cli.rules
+
 override_dh_compress:
 	dh_compress -Xdocs -Xproto -Xnotices -Xdependencies.json -XDEPENDENCIES.md
 

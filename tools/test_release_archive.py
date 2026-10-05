@@ -17,7 +17,8 @@ class ReleaseArchives(unittest.TestCase):
                 ("desktop", "cordial-desktop-1.2.3-x64", "cordial-desktop"),
                 ("cli", "cordial-cli-1.2.3-linux-amd64", "cordial"),
             ):
-                for failure in (None, "version", "architecture", "executable", "escape", "duplicate", "link", "permissions"):
+                for failure in (None, "version", "architecture", "executable", "escape", "duplicate", "link", "permissions",
+                                "rules"):
                     with self.subTest(application=application, failure=failure):
                         with tarfile.open(path, "w:gz") as archive:
                             for name, data in (("VERSION", b"4.5.6\n" if failure == "version" else b"1.2.3\n"),
@@ -28,6 +29,11 @@ class ReleaseArchives(unittest.TestCase):
                                 if failure == "permissions":
                                     member.mode = 0o777
                                 archive.addfile(member, BytesIO(data))
+                            if failure != "rules":
+                                rules = b'TAG+="uaccess"\n'
+                                member = tarfile.TarInfo(f"{root}/50-cordial.rules")
+                                member.size, member.mtime, member.mode = len(rules), 123, 0o644
+                                archive.addfile(member, BytesIO(rules))
                             if failure in ("escape", "duplicate", "link"):
                                 member = tarfile.TarInfo(f"{root}/../outside" if failure == "escape" else f"{root}/VERSION")
                                 if failure == "link":

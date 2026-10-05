@@ -10,7 +10,10 @@ use std::{cell::RefCell, rc::Rc};
 struct Flash(Rc<RefCell<Vec<u8>>>);
 impl Flash {
     fn blank() -> Self {
-        Self(Rc::new(RefCell::new(vec![0xff; 128 * 1024])))
+        Self::sized(128 * 1024)
+    }
+    fn sized(bytes: usize) -> Self {
+        Self(Rc::new(RefCell::new(vec![0xff; bytes])))
     }
 }
 impl ErrorType for Flash {
@@ -94,7 +97,7 @@ fn files_span_sectors_and_atomic_replacement_preserves_exact_bytes() {
         let mut store = Storage::provision_blank(flash.clone(), 4096..128 * 1024, [1; 32])
             .await
             .unwrap();
-        let path = "/devices/0000000000000001/device.json";
+        let path = "/devices/1/device.json";
         let data: Vec<u8> = (0..9000).map(|n| (n % 251) as u8).collect();
         store.replace_file(path, &data).unwrap();
         let generation = store.generation();
@@ -125,7 +128,7 @@ fn files_span_sectors_and_atomic_replacement_preserves_exact_bytes() {
                 .unwrap()
                 .file_name()
                 .as_str(),
-            "0000000000000001"
+            "1"
         );
         assert!(store.entry("/devices", 1).unwrap().is_none());
         store.remove_file(path).unwrap();
@@ -178,12 +181,12 @@ fn preferences_share_one_json_file_and_have_no_512_byte_ceiling() {
         .unwrap();
         assert_eq!(
             store
-                .entry("/devices/0000000000000001", 0)
+                .entry("/devices/1", 0)
                 .unwrap()
                 .unwrap()
                 .file_name()
                 .as_str(),
-            "hidpp.json"
+            "settings.json"
         );
         Preferences {
             store: &mut store,
@@ -346,9 +349,9 @@ fn interrupted_device_deletion_never_restores_a_committed_device() {
         let mut fs = Storage::provision_blank(flash.clone(), 4096..128 * 1024, [1; 32])
             .await
             .unwrap();
-        let device = "/devices/0000000000000001/device.json";
+        let device = "/devices/1/device.json";
         fs.replace_file(device, b"device").unwrap();
-        fs.replace_file("/devices/0000000000000001/hidpp.json", b"preferences")
+        fs.replace_file("/devices/1/settings.json", b"preferences")
             .unwrap();
         let baseline = flash.0.borrow().clone();
         let mut completed = false;
@@ -417,8 +420,8 @@ fn device_documents_have_their_own_files_and_layouts_are_not_enumerated() {
         for kind in [5, 4, 2] {
             store.save(record_key(kind, 1), &[kind]).await.unwrap();
         }
-        for name in ["device.json", "hidpp.json", "layout.json"] {
-            let path = format!("/devices/0000000000000001/{name}");
+        for name in ["device.json", "settings.json", "layout.json"] {
+            let path = format!("/devices/1/{name}");
             assert_eq!(store.file_size(&path).unwrap(), Some(1), "{name}");
         }
         // Layouts are read by key and never enumerated.
@@ -428,17 +431,12 @@ fn device_documents_have_their_own_files_and_layouts_are_not_enumerated() {
         );
         // Mounting removes an interrupted replacement and keeps the saved file.
         store
-            .replace_file("/devices/0000000000000001/layout.json.tmp", b"partial")
+            .replace_file("/devices/1/layout.json.tmp", b"partial")
             .unwrap();
         let mut store = Storage::open(store.into_flash(), 4096..128 * 1024, [1; 32])
             .await
             .unwrap();
-        assert_eq!(
-            store
-                .file_size("/devices/0000000000000001/layout.json.tmp")
-                .unwrap(),
-            None
-        );
+        assert_eq!(store.file_size("/devices/1/layout.json.tmp").unwrap(), None);
         let mut bytes = [0; 4];
         assert_eq!(
             store.load(record_key(5, 1), &mut bytes).await.unwrap(),
@@ -450,11 +448,406 @@ fn device_documents_have_their_own_files_and_layouts_are_not_enumerated() {
             store.load(record_key(5, 1), &mut bytes).await.unwrap(),
             None
         );
+        assert_eq!(store.file_size("/devices/1/layout.json").unwrap(), None);
+    });
+}
+
+#[test]
+fn profile_records_survive_remount_and_enumerate_without_device_directories() {
+    use cordial_core::storage::{RecordStore, record_key};
+    block_on(async {
+        let flash = Flash::blank();
+        let range = 4096..128 * 1024;
+        let mut store = Storage::provision_blank(flash.clone(), range.clone(), [1; 32])
+            .await
+            .unwrap();
+        let key = record_key(8, 42);
+        let bytes = vec![b'x'; 2048];
+        store.save(key, &bytes).await.unwrap();
+        assert!(store.keys().await.unwrap().contains(&key));
+        drop(store);
+        let mut store = Storage::open(flash, range, [1; 32]).await.unwrap();
+        assert_eq!(store.load_owned(key).await.unwrap().unwrap(), bytes);
+        store.remove(key).await.unwrap();
+        assert!(!store.keys().await.unwrap().contains(&key));
+    });
+}
+
+#[test]
+fn mounting_reclaims_interrupted_profile_files() {
+    use cordial_core::storage::{RecordStore, record_key};
+    block_on(async {
+        let flash = Flash::blank();
+        let range = 4096..128 * 1024;
+        let mut store = Storage::provision_blank(flash.clone(), range.clone(), [1; 32])
+            .await
+            .unwrap();
+        store.save(record_key(8, 1), b"saved").await.unwrap();
+        store.save(record_key(9, 1), b"rules").await.unwrap();
+        store
+            .replace_file("/profiles/1/rules.json.tmp", b"partial")
+            .unwrap();
+        store
+            .replace_file("/profiles/1/profile.json.tmp", b"partial")
+            .unwrap();
+        // A copy interrupted before its profile.json commits leaves only its rules.
+        store.save(record_key(9, 2), &[b'x'; 8000]).await.unwrap();
+        store
+            .replace_file("/profiles/3/rules.json.tmp", &[b'x'; 8000])
+            .unwrap();
+        store
+            .replace_file("/profiles/4/profile.json/x", &[b'x'; 8000])
+            .unwrap();
+        let before = store.available().await.unwrap();
+        drop(store);
+        let mut store = Storage::open(flash, range, [1; 32]).await.unwrap();
+        assert!(store.available().await.unwrap() > before);
+        assert_eq!(
+            store.load_owned(record_key(8, 1)).await.unwrap(),
+            Some(b"saved".to_vec())
+        );
+        assert_eq!(
+            store.load_owned(record_key(9, 1)).await.unwrap(),
+            Some(b"rules".to_vec())
+        );
+        for temp in ["/profiles/1/rules.json.tmp", "/profiles/1/profile.json.tmp"] {
+            assert!(store.file_size(temp).unwrap().is_none(), "{temp}");
+        }
+        assert_eq!(store.load_owned(record_key(9, 2)).await.unwrap(), None);
         assert_eq!(
             store
-                .file_size("/devices/0000000000000001/layout.json")
-                .unwrap(),
-            None
+                .entry("/profiles", 0)
+                .unwrap()
+                .unwrap()
+                .file_name()
+                .as_str(),
+            "1"
         );
+        assert!(store.entry("/profiles", 1).unwrap().is_none());
+    });
+}
+
+#[test]
+fn profile_rules_have_their_own_file_and_are_not_enumerated() {
+    use cordial_core::storage::{Error, RecordStore, record_key};
+    block_on(async {
+        let mut store = Storage::provision_blank(Flash::blank(), 4096..128 * 1024, [1; 32])
+            .await
+            .unwrap();
+        store.save(record_key(9, 7), b"rules").await.unwrap();
+        store.save(record_key(8, 7), b"profile").await.unwrap();
+        assert_eq!(store.file_size("/profiles/7/rules.json").unwrap(), Some(5));
+        assert_eq!(
+            store.file_size("/profiles/7/profile.json").unwrap(),
+            Some(7)
+        );
+        assert_eq!(store.keys().await.unwrap(), [record_key(8, 7)]);
+        assert_eq!(
+            store.save(record_key(9, 0), b"rules").await,
+            Err(Error::Bounds)
+        );
+        store.remove(record_key(9, 7)).await.unwrap();
+        assert_eq!(store.load_owned(record_key(9, 7)).await.unwrap(), None);
+        assert_eq!(
+            store.load_owned(record_key(8, 7)).await.unwrap(),
+            Some(b"profile".to_vec())
+        );
+        // Removing the commit file of an otherwise empty profile removes its directory.
+        store.remove(record_key(8, 7)).await.unwrap();
+        assert!(store.entry("/profiles", 0).unwrap().is_none());
+    });
+}
+
+#[test]
+fn record_ids_page_record_directories_in_ascending_numeric_order() {
+    use cordial_core::storage::{Error, RecordStore, record_key};
+    block_on(async {
+        // Every directory takes a metadata pair, more than the small test filesystem holds.
+        let mut store = cordial_record_storage::Storage::<_, 126>::provision_blank(
+            Flash::sized(512 * 1024),
+            4096..512 * 1024,
+            [1; 32],
+        )
+        .await
+        .unwrap();
+        assert!(store.record_ids(2, 0, 4).await.unwrap().is_empty());
+        assert!(store.record_ids(8, 0, 4).await.unwrap().is_empty());
+        // Directory order differs from numeric order: "10" sorts before "2" by name.
+        for id in [11, 2, 10, 1, 3] {
+            store.save(record_key(2, id), b"device").await.unwrap();
+        }
+        for id in [20, 4, 100] {
+            store.save(record_key(8, id), b"profile").await.unwrap();
+        }
+        // Record directories without a record of the kind are listed; reading them finds nothing.
+        store.save(record_key(4, 5), b"settings").await.unwrap();
+        store.save(record_key(9, 6), b"rules").await.unwrap();
+        store
+            .replace_file("/devices/7/device.json/x", b"x")
+            .unwrap();
+        store
+            .replace_file("/profiles/8/profile.json/x", b"x")
+            .unwrap();
+        // Files and directories that are not record directories are not.
+        store.replace_file("/devices/9", b"file").unwrap();
+        for name in ["/devices/012/device.json", "/devices/abc/device.json"] {
+            store.replace_file(name, b"device").unwrap();
+        }
+        store
+            .replace_file("/profiles/04/profile.json", b"x")
+            .unwrap();
+
+        let mut pages = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = store.record_ids(2, after, 2).await.unwrap();
+            let Some(&last) = page.last() else { break };
+            after = last;
+            pages.push(page);
+        }
+        assert_eq!(pages, [vec![1, 2], vec![3, 5], vec![7, 10], vec![11]]);
+        assert_eq!(
+            store.record_ids(2, 0, 16).await.unwrap(),
+            [1, 2, 3, 5, 7, 10, 11]
+        );
+        assert_eq!(store.record_ids(2, 3, 1).await.unwrap(), [5]);
+        let mut bytes = [0; 16];
+        assert_eq!(store.load(record_key(2, 5), &mut bytes).await, Ok(None));
+        assert!(store.record_ids(2, 0, 0).await.unwrap().is_empty());
+
+        assert_eq!(store.record_ids(8, 0, 2).await.unwrap(), [4, 6]);
+        assert_eq!(store.record_ids(8, 20, 2).await.unwrap(), [100]);
+        assert!(store.record_ids(8, 100, 2).await.unwrap().is_empty());
+        assert_eq!(
+            store.record_ids(8, 0, 16).await.unwrap(),
+            [4, 6, 8, 20, 100]
+        );
+
+        for kind in [0, 4, 5, 9] {
+            assert_eq!(store.record_ids(kind, 0, 2).await, Err(Error::Bounds));
+        }
+    });
+}
+
+/// Counts reads, fails every access while `fail` is set and fails writes and
+/// erases while `fail_writes` is set.
+struct ProbeFlash {
+    flash: Flash,
+    reads: Rc<std::cell::Cell<usize>>,
+    fail: Rc<std::cell::Cell<bool>>,
+    fail_writes: Rc<std::cell::Cell<bool>>,
+}
+impl ErrorType for ProbeFlash {
+    type Error = NorFlashErrorKind;
+}
+impl ReadNorFlash for ProbeFlash {
+    const READ_SIZE: usize = 1;
+    fn capacity(&self) -> usize {
+        self.flash.capacity()
+    }
+    async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.reads.set(self.reads.get() + 1);
+        if self.fail.get() {
+            return Err(NorFlashErrorKind::Other);
+        }
+        self.flash.read(offset, bytes).await
+    }
+}
+impl NorFlash for ProbeFlash {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = 4096;
+    async fn write(&mut self, off: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        if self.fail.get() || self.fail_writes.get() {
+            return Err(NorFlashErrorKind::Other);
+        }
+        self.flash.write(off, bytes).await
+    }
+    async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        if self.fail.get() || self.fail_writes.get() {
+            return Err(NorFlashErrorKind::Other);
+        }
+        self.flash.erase(from, to).await
+    }
+}
+
+#[test]
+fn operations_reuse_the_mount_and_remount_after_a_failure() {
+    use cordial_core::storage::{RecordStore, record_key};
+    block_on(async {
+        let flash = Flash::sized(512 * 1024);
+        let range = 4096..512 * 1024;
+        let mut store = cordial_record_storage::Storage::<_, 126>::provision_blank(
+            flash.clone(),
+            range.clone(),
+            [1; 32],
+        )
+        .await
+        .unwrap();
+        for id in 1..=32 {
+            store.save(record_key(8, id), b"profile").await.unwrap();
+        }
+        drop(store);
+        let reads = Rc::new(std::cell::Cell::new(0));
+        let fail = Rc::new(std::cell::Cell::new(false));
+        let fail_writes = Rc::new(std::cell::Cell::new(false));
+        let driver = ProbeFlash {
+            flash,
+            reads: reads.clone(),
+            fail: fail.clone(),
+            fail_writes: fail_writes.clone(),
+        };
+        let mut store = cordial_record_storage::Storage::<_, 126>::open(driver, range, [1; 32])
+            .await
+            .unwrap();
+        let load = async |store: &mut cordial_record_storage::Storage<ProbeFlash, 126>| {
+            reads.set(0);
+            let mut bytes = [0; 16];
+            let result = store.load(record_key(8, 20), &mut bytes).await;
+            (result, reads.get())
+        };
+        let (result, mounted) = load(&mut store).await;
+        assert_eq!(result, Ok(Some(7)));
+
+        fail.set(true);
+        assert!(load(&mut store).await.0.is_err());
+        fail.set(false);
+        // A failed read leaves the next operation to mount again, which reads
+        // every metadata pair: at least one per profile directory.
+        let (result, remounted) = load(&mut store).await;
+        assert_eq!(result, Ok(Some(7)));
+        assert!(remounted > 3 * mounted, "{remounted} and {mounted} reads");
+        let (result, again) = load(&mut store).await;
+        assert_eq!(result, Ok(Some(7)));
+        assert!(again <= mounted, "{again} and {mounted} reads");
+
+        // A failed write is resolved against a fresh mount, which keeps the
+        // saved record, and the next free-space query counts again.
+        let free = store.available().await.unwrap();
+        fail_writes.set(true);
+        reads.set(0);
+        assert!(store.save(record_key(8, 20), b"changed").await.is_err());
+        assert!(
+            reads.get() > 3 * mounted,
+            "{} and {mounted} reads",
+            reads.get()
+        );
+        fail_writes.set(false);
+        let mut bytes = [0; 16];
+        assert_eq!(store.load(record_key(8, 20), &mut bytes).await, Ok(Some(7)));
+        assert_eq!(&bytes[..7], b"profile");
+        reads.set(0);
+        assert_eq!(store.available().await.unwrap(), free);
+        assert!(reads.get() > 0);
+
+        // Free space is counted once until the next write.
+        reads.set(0);
+        assert_eq!(store.available().await.unwrap(), free);
+        assert_eq!(reads.get(), 0);
+        store.save(record_key(8, 20), b"changed").await.unwrap();
+        reads.set(0);
+        store.available().await.unwrap();
+        assert!(reads.get() > 0);
+    });
+}
+
+#[test]
+fn free_space_follows_writes_and_loads_check_the_buffer() {
+    use cordial_core::storage::{Error, RecordStore, record_key};
+    block_on(async {
+        let mut store = Storage::provision_blank(Flash::blank(), 4096..128 * 1024, [1; 32])
+            .await
+            .unwrap();
+        let empty = store.available().await.unwrap();
+        store.save(record_key(8, 1), &[b'x'; 9000]).await.unwrap();
+        let used = store.available().await.unwrap();
+        assert!(used < empty);
+        assert_eq!(store.available().await.unwrap(), used);
+        let mut bytes = [0; 8999];
+        assert_eq!(
+            store.load(record_key(8, 1), &mut bytes).await,
+            Err(Error::TooLarge)
+        );
+        store.remove(record_key(8, 1)).await.unwrap();
+        assert!(store.available().await.unwrap() > used);
+        store
+            .replace_file("/profiles/2/profile.json/x", b"x")
+            .unwrap();
+        assert_eq!(
+            store.load(record_key(8, 2), &mut bytes).await,
+            Err(Error::Io)
+        );
+    });
+}
+
+/// Flash whose writes and erases fail, so every removal fails.
+struct RejectedWrites(Flash);
+impl ErrorType for RejectedWrites {
+    type Error = NorFlashErrorKind;
+}
+impl ReadNorFlash for RejectedWrites {
+    const READ_SIZE: usize = 1;
+    fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+    async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.0.read(offset, bytes).await
+    }
+}
+impl NorFlash for RejectedWrites {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = 4096;
+    async fn write(&mut self, _: u32, _: &[u8]) -> Result<(), Self::Error> {
+        Err(NorFlashErrorKind::Other)
+    }
+    async fn erase(&mut self, _: u32, _: u32) -> Result<(), Self::Error> {
+        Err(NorFlashErrorKind::Other)
+    }
+}
+
+#[test]
+fn mounting_opens_storage_when_cleanup_cannot_remove_files() {
+    use cordial_core::storage::{RecordStore, record_key};
+    block_on(async {
+        let flash = Flash::blank();
+        let range = 4096..128 * 1024;
+        let mut store = Storage::provision_blank(flash.clone(), range.clone(), [1; 32])
+            .await
+            .unwrap();
+        store.save(record_key(2, 1), b"device").await.unwrap();
+        store
+            .replace_file("/devices/1/device.json.tmp", b"partial")
+            .unwrap();
+        store
+            .replace_file("/devices/2/layout.json", b"orphan")
+            .unwrap();
+        store.replace_file("/adapter.json.tmp", b"partial").unwrap();
+        drop(store);
+        let baseline = flash.0.borrow().clone();
+        let mut store = cordial_record_storage::Storage::<_, 30>::open(
+            RejectedWrites(flash.clone()),
+            range.clone(),
+            [1; 32],
+        )
+        .await
+        .unwrap();
+        assert_eq!(*flash.0.borrow(), baseline);
+        // The directory without a record holds no record, and saved records still read.
+        assert_eq!(store.load_owned(record_key(2, 2)).await.unwrap(), None);
+        assert_eq!(store.keys().await.unwrap(), [record_key(2, 1)]);
+        assert_eq!(
+            store.load_owned(record_key(2, 1)).await.unwrap(),
+            Some(b"device".to_vec())
+        );
+        drop(store);
+        // A later mount that can write cleans up.
+        let mut store = Storage::open(flash, range, [1; 32]).await.unwrap();
+        assert!(store.entry("/devices", 1).unwrap().is_none());
+        assert!(
+            store
+                .file_size("/devices/1/device.json.tmp")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.file_size("/adapter.json.tmp").unwrap().is_none());
     });
 }

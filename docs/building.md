@@ -2,16 +2,20 @@
 
 ## Board presets
 
-| Board preset | Bluetooth support |
-| --- | --- |
-| `pico_w` | Classic HID and BLE through BTstack |
-| `pico2_w` | Classic HID and BLE through BTstack |
-| `waveshare_rp2350b_plus_w` | Classic HID and BLE through BTstack |
-| `xiao_esp32s3` | BLE through ESP-NimBLE or BTstack |
+| Board preset | Bluetooth support | Input profiles |
+| --- | --- | --- |
+| `pico_w` | Classic HID and BLE through BTstack | No |
+| `pico2_w` | Classic HID and BLE through BTstack | Yes |
+| `waveshare_rp2350b_plus_w` | Classic HID and BLE through BTstack | Yes |
+| `xiao_esp32s3` | BLE through ESP-NimBLE or BTstack | Yes |
 
-Board definitions live in `rust/boards/`. They specify pins, flash allocation,
-clock settings and backends. Pico presets use `pico-sdk-cyw43`; `embassy-cyw43`
-is also supported. The XIAO preset uses `esp-nimble` and `esp-idf`.
+Board definitions live in `rust/boards/`. They specify pins, flash allocation, clock settings,
+backends and `profile_memory_budget`: the bytes of RAM for loaded [input
+profiles](input-profiles.md), or `null` for a board without profile support. Without profile support
+the firmware omits profiles and configuration interfaces, so VIA and Vial are unavailable. The Pico
+W preset leaves profiles out to keep its limited RAM for connections; the other presets budget room
+for two fully remapped VIA profiles per connected device. Pico presets use `pico-sdk-cyw43`;
+`embassy-cyw43` is also supported. The XIAO preset uses `esp-nimble` and `esp-idf`.
 
 To use custom wiring or another backend, copy a preset, edit it and pass its path
 to `python3 rust/tools/build_firmware.py`. USB and Bluetooth identities are
@@ -234,8 +238,10 @@ npm --prefix desktop/packages/protocol run generate
 
 `make check` runs Rust tests and Clippy, native Bluetooth regression checks,
 Python tool tests, desktop type checks and tests, and the protocol checks:
-`tools/check_keys.py`, `buf lint`, and `buf breaking` against the last release tag
-(`PROTOCOL_BASE` overrides it). Rust code is generated from `proto/` at build time;
+`tools/check_keys.py`, `buf lint`, and `buf breaking` against the newest earlier release in the
+same series as `CORDIAL_VERSION`, or the newest release for a development build
+(`PROTOCOL_BASE` overrides it). A series is one minor version before 1.0 and one major version
+from 1.0; the first release of a series is not compared. Rust code is generated from `proto/` at build time;
 the second command regenerates the checked-in TypeScript messages and key constants
 after `proto/cordial.proto` or `proto/keys.toml` changes.
 Install Clippy with `(cd rust && rustup component add clippy)` before checking.
@@ -246,7 +252,8 @@ Linux CLI terminal checks additionally require `pyte` and a built CLI:
 CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py
 ```
 
-The ARM allocation check prepares Pico W development firmware and uses its linked
+The ARM allocation check prepares development firmware for each Pico board and runs the
+workloads with that board's configuration, such as its profile memory budget, against its linked
 heap bounds. It runs in the Pico firmware image, which includes QEMU:
 
 ```sh
@@ -270,7 +277,7 @@ npm --prefix desktop run simulate
 
 ## Adapter names
 
-Adapter names are stored on the adapter. Rename through adapter settings in the TUI or desktop app, or run `adapter set name "Desk"` in the shell. Each board configuration supplies `default_adapter_name`, baked into the firmware image and used until a custom name is saved. Use **Reset to default** in either rename dialog, or `adapter reset name` in the shell, to clear the custom name.
+Adapter names are stored on the adapter. Rename through adapter settings in the TUI or desktop app, or run `adapter set name "Desk"` in the shell. Each board configuration supplies `default_adapter_name`, baked into the firmware image and used until a custom name is saved. Use **Reset to Default** in either rename dialog, or `adapter reset name` in the shell, to clear the custom name.
 
 ## Repository layout
 

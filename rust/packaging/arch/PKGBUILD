@@ -17,4 +17,6 @@ package() {
   find "$pkgdir/usr/share/doc/cordial-cli" -type d -exec chmod 755 {} +
   find "$pkgdir/usr/share/doc/cordial-cli" -type f -exec chmod 644 {} +
   install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/cordial-cli/LICENSE"
+  # Each package names its own copy of the rules, so both packages can be installed.
+  install -Dm644 "$root/50-cordial.rules" "$pkgdir/usr/lib/udev/rules.d/50-cordial-cli.rules"
 }

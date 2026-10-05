@@ -13,6 +13,9 @@ PICO_TARGETS = {
     ("rp2350", "b"): ("rp235xb", "thumbv8m.main-none-eabihf", 47, 524288),
 }
 
+# Profile memory budgets stay below 1 MiB, above any supported chip's internal RAM.
+PROFILE_MEMORY_LIMIT = 1048576
+
 
 def integer(value, low, high, label, alignment=1):
     if type(value) is not int or not low <= value <= high or value % alignment:
@@ -40,7 +43,8 @@ def indicator(value, maximum, label):
 def load(path, profile):
     config = json.loads(Path(path).read_text(), object_pairs_hook=unique_object)
     fields = {"default_adapter_name", "name", "chip", "package", "flash_bytes", "xosc_hz", "radio", "mcu_led",
-              "bluetooth_backend", "radio_backend", "usb_backend", "storage_backend", "firmware_bytes"}
+              "bluetooth_backend", "radio_backend", "usb_backend", "storage_backend", "firmware_bytes",
+              "profile_memory_budget"}
     if not isinstance(config, dict) or set(config) != fields:
         raise ValueError(f"Board configuration requires exactly: {', '.join(sorted(fields))}")
     if profile not in ("production", "debug", "development"):
@@ -52,6 +56,9 @@ def load(path, profile):
             or len(name.encode("utf-8")) > 64
             or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in name)):
         raise ValueError("default_adapter_name must be a trimmed name of 1..64 UTF-8 bytes without controls")
+    budget = config["profile_memory_budget"]
+    if budget is not None and (type(budget) is not int or not 0 < budget < PROFILE_MEMORY_LIMIT):
+        raise ValueError(f"profile_memory_budget must be null or 1..{PROFILE_MEMORY_LIMIT - 1}")
     if config["chip"] == "esp32s3":
         from esp_config import normalize
         return normalize(config, profile)
@@ -106,6 +113,12 @@ def load(path, profile):
                      "storage_identity": marker, "sys_div1": sys_div1}
 
 
+def profile_memory_budget(config):
+    """The Rust expression for the board's profile memory budget."""
+    budget = config["profile_memory_budget"]
+    return "None" if budget is None else f"Some({budget})"
+
+
 def generate(config, out):
     from firmware_artifact import generate as generate_metadata
     Path(out).mkdir(parents=True, exist_ok=True)
@@ -151,6 +164,7 @@ pub const STORAGE_END: u32 = {config['storage_offset'] + config['storage_bytes']
 pub const STORAGE_IDENTITY: [u8; 32] = {list(config['storage_identity'])!r};
 pub const DEFAULT_ADAPTER_NAME: &str = {json.dumps(config["default_adapter_name"], ensure_ascii=False)};
 pub const HARDWARE: &str = {json.dumps(config['name'])};
+pub const PROFILE_MEMORY_BUDGET: Option<u32> = {profile_memory_budget(config)};
 pub fn clocks() -> embassy_rp::clocks::ClockConfig {{
     use embassy_rp::clocks::{{ClockConfig, PllConfig}};
     let mut clocks = ClockConfig::crystal({config['xosc_hz']});

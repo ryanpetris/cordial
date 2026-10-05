@@ -69,7 +69,7 @@ fn events_wait_for_a_free_output_and_never_split_a_frame() {
     s.session(true);
     assert!(s.idle());
     s.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved {
-        id: "d_1".into(),
+        id: 1_234_567,
     }));
     assert!(!s.idle());
     // A response queued behind a partly written event follows it whole.
@@ -89,7 +89,7 @@ fn events_wait_for_a_free_output_and_never_split_a_frame() {
         &p::Message {
             kind: Some(M::Event(p::Event {
                 kind: Some(p::event::Kind::DeviceRemoved(p::DeviceRemoved {
-                    id: "d_1".into(),
+                    id: 1_234_567,
                 })),
             })),
         },
@@ -111,7 +111,7 @@ fn completions_from_an_old_session_are_ignored() {
     let mut s = Session::new();
     s.session(true);
     s.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved {
-        id: "d_1".into(),
+        id: 1_234_567,
     }));
     let (token, _) = s.output(2).unwrap();
     assert!(s.session(true), "a new session ends the old one");

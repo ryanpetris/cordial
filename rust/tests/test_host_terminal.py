@@ -73,7 +73,7 @@ class Terminal(unittest.TestCase):
 
     def test_tui_ctrl_c_restores_terminal_after_failed_open(self):
         self.start(True)
-        self.wait_text("Choose an Adapter")
+        self.wait_text("Choose Adapter")
         os.write(self.master, b"\x03")
         self.exited(0)
         self.assertIn(b"\x1b[?1003h", self.transcript)
@@ -83,7 +83,7 @@ class Terminal(unittest.TestCase):
         for sig in (signal.SIGINT, signal.SIGTERM):
             with self.subTest(signal=sig):
                 self.start(True)
-                self.wait_text("Choose an Adapter")
+                self.wait_text("Choose Adapter")
                 self.process.send_signal(sig)
                 self.exited(0)
                 self.doCleanups()
@@ -92,7 +92,7 @@ class Terminal(unittest.TestCase):
         import fcntl
         import termios
         self.start(True)
-        self.wait_text("Choose an Adapter")
+        self.wait_text("Choose Adapter")
         os.write(self.master, b"?")
         self.wait_text("Help")
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 10, 40, 0, 0))

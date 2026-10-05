@@ -5,12 +5,13 @@ use crate::{
     controller::{Command, Notice, Outcome, State, Subject, Toggle},
     error::Error,
     model::{self, Prompt, Up},
+    profiles,
     ui::catalog,
 };
-use cordial_client::serial::PortInfo;
+use cordial_client::{paging::Page, serial::PortInfo};
 use cordial_protocol::{
-    self as p, CapacityReason, CodeKind, DeviceState, ErrorCode, InactiveReason, Platform,
-    ReportType, Role, Transport, WarningCode, event, keys, value::Value,
+    self as p, CapacityReason, CodeKind, DeviceState, ErrorCode, InactiveReason, Kind, Platform,
+    ReportType, Role, Transport, WarningCode, event, keys, profile_list_entry, value::Value,
 };
 use ratatui::buffer::CellWidth;
 use std::fmt::Write;
@@ -142,31 +143,34 @@ pub fn named(c: &p::Candidate) -> bool {
     !c.name.is_empty()
 }
 
-/// What an unnamed nearby device is called, by the kind it advertised.
-pub fn unnamed(kind: p::Kind) -> &'static str {
-    match kind {
-        p::Kind::Keyboard => "Unnamed Keyboard",
-        p::Kind::Mouse => "Unnamed Mouse",
-        p::Kind::KeyboardMouse => "Unnamed Keyboard/Mouse",
-        p::Kind::Unknown | p::Kind::Other => "Unnamed Device",
+/// What an unnamed nearby device is called, by the kinds it advertised.
+pub fn unnamed(kinds: &[Kind]) -> &'static str {
+    match (
+        kinds.contains(&Kind::Keyboard),
+        kinds.contains(&Kind::Mouse),
+    ) {
+        (true, true) => "Unnamed Keyboard/Mouse",
+        (true, false) => "Unnamed Keyboard",
+        (false, true) => "Unnamed Mouse",
+        (false, false) => "Unnamed Device",
     }
 }
 
-/// A nearby device's name for the shell, or its kind when unnamed.
+/// A nearby device's name for the shell, or its kinds when unnamed.
 pub fn candidate_name(c: &p::Candidate) -> String {
     if named(c) {
         name(Some(&c.name))
     } else {
-        unnamed(c.kind()).into()
+        unnamed(&model::known_kinds(&c.kinds)).into()
     }
 }
 
-/// A nearby device's name for the TUI, or its kind when unnamed.
+/// A nearby device's name for the TUI, or its kinds when unnamed.
 pub fn display_candidate_name(c: &p::Candidate) -> String {
     if named(c) {
         display_name(Some(&c.name))
     } else {
-        unnamed(c.kind()).into()
+        unnamed(&model::known_kinds(&c.kinds)).into()
     }
 }
 
@@ -232,8 +236,8 @@ pub fn role_names(roles: &[Role]) -> String {
         .filter_map(|r| match r {
             Role::Keyboard => Some("Keyboard"),
             Role::Mouse => Some("Mouse"),
-            Role::ConsumerControl => Some("Media keys"),
-            Role::SystemControl => Some("System keys"),
+            Role::ConsumerControl => Some("Media Keys"),
+            Role::SystemControl => Some("System Keys"),
             Role::Unknown => None,
         })
         .collect::<Vec<_>>()
@@ -375,6 +379,9 @@ fn general_text(code: ErrorCode) -> Option<&'static str> {
         NoPrompt => "that pairing prompt is no longer waiting for an answer",
         StorageFailed => "the adapter couldn't read or write its saved data",
         Internal => "the adapter hit an unexpected failure",
+        InUse => {
+            "this profile is still in use. Remove it from every device and interface before deleting it"
+        }
         CandidateExpired => "this device is no longer available. Scan again",
         AuthFailed => "Bluetooth authentication failed",
         Rejected => "authentication was rejected by the user or the device",
@@ -429,6 +436,19 @@ fn code_text(code: ErrorCode, command: Option<&str>) -> String {
         }
         (NotFound, Some("pair start")) => general_text(CandidateExpired),
         (NotFound, Some("file list" | "file get")) => Some("the adapter has no file at that path"),
+        (
+            NotFound,
+            Some(
+                "profile show"
+                | "profile copy"
+                | "profile delete"
+                | "profile rule"
+                | "profile rule list"
+                | "adapter interface"
+                | "adapter settings"
+                | "device set profiles",
+            ),
+        ) => Some("the adapter has no profile with that ID"),
         (Unsupported, Some("scan start" | "pair start")) => {
             Some("this build does not support the requested Bluetooth transport")
         }
@@ -454,6 +474,9 @@ pub fn capacity_words(reason: CapacityReason) -> &'static str {
             "the adapter's storage has no room for another paired device; remove unused devices or saved settings"
         }
         CapacityReason::Connections => "every connection is in use; disconnect a device first",
+        CapacityReason::ProfileMemory => {
+            "the adapter doesn't have enough profile memory for this change"
+        }
         CapacityReason::Unknown => "the adapter has no room for that right now",
     }
 }
@@ -509,7 +532,7 @@ pub fn enabled_word(on: bool) -> &'static str {
 /// Explains an adapter error without its code.
 pub fn wire_text(e: &p::Error, command: Option<&str>) -> String {
     match e.code() {
-        ErrorCode::NoCapacity => format!("the adapter has no room: {}", capacity_words(e.reason())),
+        ErrorCode::NoCapacity => capacity_words(e.reason()).into(),
         ErrorCode::StorageFailed if e.outcome_unknown => "save status unknown: the adapter couldn't confirm whether the change was saved, and didn't apply it; check the current state before trying again".into(),
         code => code_text(code, command),
     }
@@ -550,6 +573,12 @@ pub fn error_words(e: &Error) -> String {
 }
 
 /// Sentence-cases TUI activity text.
+/// Beside Save, when a save's reply was lost to the USB reconnect it caused and the returned
+/// adapter doesn't show what was sent.
+pub const SAVE_UNCONFIRMED: &str = "Cordial couldn't confirm whether the adapter saved the change. Check the current settings before trying again.";
+/// The activity line for the same case.
+pub const SAVE_UNCONFIRMED_LOG: &str = "Couldn't confirm whether the adapter saved its settings";
+
 pub fn capitalized(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -670,6 +699,15 @@ pub fn state_token(d: &p::Device) -> String {
     model::token(d.state().as_str_name())
 }
 
+/// Why a connected device's profiles aren't loaded, as sentences for its diagnostics.
+pub fn profile_error_words(code: ErrorCode) -> String {
+    match code {
+        ErrorCode::NoCapacity => "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.".into(),
+        ErrorCode::StorageFailed => "The adapter couldn't read one of this device's profiles.".into(),
+        code => sentence(&code_text(code, None)),
+    }
+}
+
 /// One saved device on a line for the shell.
 pub fn device_line(d: &p::Device, warnings: usize) -> String {
     let mut policy = String::from(if d.trusted { "trusted" } else { "untrusted" });
@@ -681,7 +719,7 @@ pub fn device_line(d: &p::Device, warnings: usize) -> String {
     }
     let mut line = format!(
         "{}  {}  {}  {}  {}",
-        safe(&d.id),
+        d.id,
         name(Some(&d.name)),
         transport_token(d.transport()),
         state_token(d),
@@ -720,13 +758,21 @@ pub fn device_line(d: &p::Device, warnings: usize) -> String {
     if let Some((major, minor)) = model::hidpp_version(d) {
         let _ = write!(line, " hidpp-protocol={major}.{minor}");
     }
+    let layers = profiles::layers(d);
+    if !layers.is_empty() {
+        let ids: Vec<String> = layers.iter().map(u32::to_string).collect();
+        let _ = write!(line, " profiles={}", ids.join(","));
+    }
+    if let Some(code) = model::profile_error(d) {
+        let _ = write!(line, " profile-error={}", model::code_token(code));
+    }
     line
 }
 
 pub fn candidate_line(c: &p::Candidate) -> String {
     format!(
         "{}  {}  {}  candidate",
-        safe(&c.id),
+        c.id,
         candidate_name(c),
         transport_token(c.transport())
     )
@@ -794,26 +840,9 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
     b
 }
 
-pub fn candidate_info(c: &p::Candidate) -> String {
-    let mut b = format!(
-        "Candidate {} ({})\n  Name: {}\n  State: discovered",
-        safe(&c.id),
-        transport_token(c.transport()),
-        candidate_name(c)
-    );
-    if let Some(rssi) = c.rssi {
-        let _ = write!(b, "\n  Signal: {rssi} dBm");
-    }
-    b
-}
-
 /// `device get` of a saved device, one field per line after bluetoothctl.
 pub fn device_info(d: &p::Device, warnings: &[p::DeviceWarning]) -> String {
-    let mut b = format!(
-        "Device {} ({})",
-        safe(&d.id),
-        transport_token(d.transport())
-    );
+    let mut b = format!("Device {} ({})", d.id, transport_token(d.transport()));
     let mut field = |key: &str, value: &str| {
         let _ = write!(b, "\n  {key}: {value}");
     };
@@ -860,6 +889,16 @@ pub fn device_info(d: &p::Device, warnings: &[p::DeviceWarning]) -> String {
             ..Default::default()
         };
         field("Last Error", &safe(&wire_line(&e, None)));
+    }
+    if let Some(code) = model::profile_error(d).filter(|_| model::connected(d)) {
+        field(
+            "Profiles",
+            &format!(
+                "Not Loaded ({}): {}",
+                model::code_token(code),
+                safe(&profile_error_words(code))
+            ),
+        );
     }
     for r in info_rows(&d.info) {
         field(&r.label, &r.value);
@@ -1042,13 +1081,16 @@ pub fn devices(st: &State, filter: Filter) -> String {
             Filter::Trusted => d.trusted,
         })
         .map(|d| {
-            let mut line = device_line(d, st.warnings_of(&d.id).len());
+            let mut line = device_line(d, st.warnings_of(d.id).len());
             if let Some(b) = battery_list(d) {
                 let _ = write!(line, " battery={b}");
             }
             line
         })
         .collect();
+    if matches!(filter, Filter::All | Filter::Saved) {
+        lines.extend(st.unreadable.iter().map(|id| format!("{id}  unreadable")));
+    }
     if filter == Filter::All {
         lines.extend(st.candidates.iter().map(candidate_line));
     }
@@ -1065,7 +1107,7 @@ pub fn ports(ports: &[PortInfo]) -> String {
     }
     ports
         .iter()
-        .map(|p| format!("{}  {}", safe(&p.port), safe(&p.id)))
+        .map(|p| format!("{}  {}", safe(&p.port), safe(p.id())))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1074,7 +1116,7 @@ pub fn ports(ports: &[PortInfo]) -> String {
 pub fn ports_json(ports: &[PortInfo]) -> String {
     let list: Vec<serde_json::Value> = ports
         .iter()
-        .map(|p| serde_json::json!({"port": p.port, "id": p.id}))
+        .map(|p| serde_json::json!({"port": p.port, "id": p.id()}))
         .collect();
     terminal_json(&serde_json::Value::Array(list).to_string())
 }
@@ -1082,7 +1124,7 @@ pub fn ports_json(ports: &[PortInfo]) -> String {
 /// A resolved device or candidate as a result names it.
 pub fn label(subject: &Subject) -> String {
     if subject.name.is_empty() {
-        safe(&subject.id)
+        subject.id.to_string()
     } else {
         safe(&subject.name)
     }
@@ -1126,8 +1168,31 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
         Outcome::Status(status) => {
             let (port, devices) =
                 state.map_or(("", &[][..]), |s| (s.port.as_str(), &s.devices[..]));
-            adapter_info(port, status, devices)
+            let mut b = adapter_info(port, status, devices);
+            b.push_str(&profile_fields(status, state));
+            b
         }
+        Outcome::Profiles { list, .. } => profiles_text(list),
+        Outcome::Profile(profile) => match command {
+            Command::ProfileCopy(..) => format!(
+                "Copied profile to {} ({}).",
+                display(&profile.name),
+                profile.id
+            ),
+            Command::ProfileCreate(..) => format!(
+                "Created profile {} ({}).",
+                display(&profile.name),
+                profile.id
+            ),
+            _ => profile_text(profile),
+        },
+        Outcome::ProfileDeleted(profile) => format!("Deleted profile {}.", display(&profile.name)),
+        Outcome::Rules { profile, rules } => match command {
+            Command::RuleChange(_, change) => rule_saved_text(profile, change, rules),
+            _ => rules_text(profile, rules),
+        },
+        Outcome::Interface(interface, status) => interface_text(*interface, status, state),
+        Outcome::AdapterSaved(_) => "Saved the adapter settings.".into(),
         Outcome::Files { entries, .. } => {
             entries.iter().map(file_line).collect::<Vec<_>>().join("\n")
         }
@@ -1136,10 +1201,10 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
             safe(path),
             safe(&local.display().to_string())
         ),
-        Outcome::Name(name) if matches!(command, Command::Name(None)) => {
+        Outcome::Name { name, reset: true } => {
             format!("Adapter name reset to {}.", display(name))
         }
-        Outcome::Name(name) => format!("Adapter renamed to {}.", display(name)),
+        Outcome::Name { name, reset: false } => format!("Adapter renamed to {}.", display(name)),
         Outcome::Platform(p) => format!("Platform set to {}.", platform_name(*p)),
         Outcome::Transport(t, on) => format!("{} {}.", transport_long(*t), enabled_word(*on)),
         Outcome::Bootloader => "The adapter is restarting into its bootloader.".into(),
@@ -1175,7 +1240,12 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
             let label = label(subject);
             match command {
                 Command::Get(_) => {
-                    device_info(device, state.map_or(&[][..], |s| s.warnings_of(&device.id)))
+                    let mut b =
+                        device_info(device, state.map_or(&[][..], |s| s.warnings_of(device.id)));
+                    if let Some(st) = state.filter(|st| profiles::available(&st.status)) {
+                        let _ = write!(b, "\n  Profiles: {}", layer_names(st, device));
+                    }
+                    b
                 }
                 Command::Connect(_) => format!("Connecting to {label}."),
                 Command::Disconnect(_) => format!("Disconnected {label}."),
@@ -1188,18 +1258,24 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
                 Command::Set(_, Toggle::Hidpp, on) => {
                     format!("HID++ turned {} for {label}.", on_off(*on))
                 }
+                Command::DeviceSave(..) => format!("Saved changes to {label}."),
+                Command::Layers(..) => {
+                    let words = match state {
+                        Some(st) => layer_names(st, device),
+                        None => id_list(profiles::layers(device)),
+                    };
+                    format!("Profiles of {label} set to {words}.")
+                }
                 _ => String::new(),
             }
         }
-        Outcome::Candidate(c) => candidate_info(c),
-        Outcome::Hidden(subject) => format!("Candidate hidden: {}", safe(&subject.id)),
         Outcome::Unpaired(subject) => format!("Forgot {}.", label(subject)),
         Outcome::Refreshing(subject) => {
             format!("Reading current information from {}.", label(subject))
         }
         Outcome::Warnings { subject, warnings } => warnings_text(subject, warnings),
         Outcome::Settings(subject) => catalog::subject_text(subject, state),
-        Outcome::Setting { subject, setting } => match state.and_then(|s| s.device(&subject.id)) {
+        Outcome::Setting { subject, setting } => match state.and_then(|s| s.device(subject.id)) {
             Some(d) => catalog::setting_detail(d, setting),
             None => String::new(),
         },
@@ -1209,12 +1285,174 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
             forget,
             settings,
         } => catalog::saved_text(subject, set, forget, settings, state),
-        Outcome::Features { subject, features } => {
-            match state.and_then(|s| s.device(&subject.id)) {
-                Some(d) => catalog::feature_list(d, features),
-                None => String::new(),
+        Outcome::Features { subject, features } => match state.and_then(|s| s.device(subject.id)) {
+            Some(d) => catalog::feature_list(d, features),
+            None => String::new(),
+        },
+    }
+}
+
+/// Profile IDs separated by commas, or `none`.
+fn id_list(ids: &[u32]) -> String {
+    if ids.is_empty() {
+        return "none".into();
+    }
+    ids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A device's layers for the shell: each profile's name and ID in order, or `none`.
+pub fn layer_names(st: &State, d: &p::Device) -> String {
+    let layers = profiles::layers(d);
+    if layers.is_empty() {
+        return "none".into();
+    }
+    layers
+        .iter()
+        .map(|id| match st.profile(*id) {
+            Some(profile) => format!("{} ({id})", safe(&profile.name)),
+            None => id.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A profile ID with its name when known, as `adapter status` names an interface's profile.
+fn profile_ref(state: Option<&State>, id: u32) -> String {
+    match state.and_then(|st| st.profile(id)) {
+        _ if id == 0 => "none".into(),
+        Some(profile) => format!("{} ({id})", safe(&profile.name)),
+        None => id.to_string(),
+    }
+}
+
+/// The adapter's profile support and configuration interfaces, as `adapter status` adds them.
+fn profile_fields(status: &p::Status, state: Option<&State>) -> String {
+    let Some(support) = profiles::support(status) else {
+        return String::new();
+    };
+    let mut b = format!(
+        "\n  Profile Memory: {} of {} in use\n  Profiles Per Device: {}",
+        bytes(support.memory_used.into()),
+        bytes(support.memory_budget.into()),
+        support.max_layers
+    );
+    for s in profiles::interfaces(status) {
+        let _ = write!(
+            b,
+            "\n  {}: {}, profile {}",
+            profiles::interface_label(s.interface()),
+            on_off(s.enabled),
+            profile_ref(state, s.profile)
+        );
+    }
+    b
+}
+
+/// A configuration interface's saved preferences after a change.
+fn interface_text(
+    interface: p::ConfigurationInterface,
+    status: &p::Status,
+    state: Option<&State>,
+) -> String {
+    let label = profiles::interface_label(interface);
+    match profiles::interface(status, interface) {
+        Some(s) => format!(
+            "{label} {}, profile {}.",
+            if s.enabled { "on" } else { "off" },
+            profile_ref(state, s.profile)
+        ),
+        None => format!("Saved {label}."),
+    }
+}
+
+/// A profile's roles as the shell lists them: lowercase tokens, or `none`.
+fn role_tokens(profile: &p::Profile) -> String {
+    let roles: Vec<String> = profiles::roles(profile)
+        .iter()
+        .map(|r| model::token(r.as_str_name()))
+        .collect();
+    if roles.is_empty() {
+        "none".into()
+    } else {
+        roles.join(",")
+    }
+}
+
+/// One profile as `profile list` shows it: ID, roles and name, tab-separated.
+pub fn profile_line(profile: &p::Profile) -> String {
+    format!(
+        "{}\t{}\t{}",
+        profile.id,
+        role_tokens(profile),
+        display(&profile.name)
+    )
+}
+
+/// `profile show`: a profile's name, ID and roles.
+fn profile_text(profile: &p::Profile) -> String {
+    let roles = role_names(&profiles::roles(profile));
+    format!(
+        "Profile {}\n  ID: {}\n  Roles: {}",
+        display(&profile.name),
+        profile.id,
+        if roles.is_empty() { "none" } else { &roles }
+    )
+}
+
+/// `profile list`: profiles and unreadable ones in ID order, and the command for the next page
+/// when the listing goes on.
+fn profiles_text(list: &p::ProfileList) -> String {
+    let mut b = "Profiles".to_owned();
+    if list.entries.is_empty() && list.end {
+        b.push_str("\n  No profiles.");
+    }
+    for entry in &list.entries {
+        match &entry.entry {
+            Some(profile_list_entry::Entry::Profile(profile)) => {
+                let _ = write!(b, "\n  {}", profile_line(profile));
             }
+            Some(profile_list_entry::Entry::Unreadable(id)) => {
+                let _ = write!(b, "\n  {id}\tunreadable");
+            }
+            None => {}
         }
+    }
+    if let Some(next) = list.next() {
+        let _ = write!(b, "\nNext page: profile list --after {next}");
+    }
+    b
+}
+
+/// `profile rule list`: every rule of a profile, in the form the commands take.
+fn rules_text(profile: &p::Profile, rules: &[p::ProfileRule]) -> String {
+    let mut b = format!("Rules of {}", display(&profile.name));
+    if rules.is_empty() {
+        b.push_str("\n  No rules.");
+    }
+    for rule in rules {
+        let _ = write!(b, "\n  {}", profiles::rule_words(rule));
+    }
+    b
+}
+
+/// The result of saving or forgetting a rule: the input's rule as saved, or that it has none.
+fn rule_saved_text(
+    profile: &p::Profile,
+    change: &p::ProfileRuleChange,
+    rules: &[p::ProfileRule],
+) -> String {
+    let input = profiles::change_target(change);
+    let name = display(&profile.name);
+    let saved = rules.iter().find(|r| r.input.as_ref() == input);
+    match (saved, input) {
+        (Some(rule), _) => format!("Saved in {name}: {}", profiles::rule_words(rule)),
+        (None, Some(input)) => {
+            format!("{name} has no rule for {}.", profiles::usage_words(input))
+        }
+        (None, None) => String::new(),
     }
 }
 
@@ -1262,16 +1500,16 @@ fn event_line(
     changed: &[String],
     state: Option<&State>,
 ) -> Option<String> {
-    let warnings = |id: &str| state.map_or(0, |s| s.warnings_of(id).len());
+    let warnings = |id: u32| state.map_or(0, |s| s.warnings_of(id).len());
     match kind {
         event::Kind::ScanFound(c) if first => Some(format!("[NEW] {}", candidate_line(c))),
         event::Kind::ScanFound(_) => None,
         event::Kind::ScanDone(done) => Some(scan_summary(done.count, done.truncated)),
         event::Kind::Device(d) if first => {
-            Some(format!("[NEW] {}", device_line(d, warnings(&d.id))))
+            Some(format!("[NEW] {}", device_line(d, warnings(d.id))))
         }
-        event::Kind::Device(d) => Some(format!("[CHG] {}", device_line(d, warnings(&d.id)))),
-        event::Kind::DeviceRemoved(r) => Some(format!("[DEL] {}", safe(&r.id))),
+        event::Kind::Device(d) => Some(format!("[CHG] {}", device_line(d, warnings(d.id)))),
+        event::Kind::DeviceRemoved(r) => Some(format!("[DEL] {}", r.id)),
         event::Kind::Adapter(a) => {
             let mut line = format!(
                 "[CHG] Adapter name={} platform={}",
@@ -1283,36 +1521,59 @@ fn event_line(
                     let _ = write!(line, " {}={}", transport_token(t), enabled_word(on));
                 }
             }
+            for s in profiles::interfaces(a) {
+                let _ = write!(
+                    line,
+                    " {}={},{}",
+                    profiles::interface_word(s.interface()),
+                    on_off(s.enabled),
+                    s.profile
+                );
+            }
             Some(line)
         }
-        event::Kind::Settings(s) => {
-            let d = state?.device(&s.device)?;
-            let lines: Vec<String> = catalog::presented(&s.settings)
+        event::Kind::SettingsChanged(s) => {
+            let d = state?.device(s.device)?;
+            let lines: Vec<String> = catalog::presented(&s.changed)
                 .into_iter()
                 .filter(|setting| changed.contains(&setting.key))
-                .map(|setting| {
-                    format!(
-                        "[CHG] {}{}",
-                        safe(&s.device),
-                        catalog::setting_line(d, setting)
-                    )
-                })
+                .map(|setting| format!("[CHG] {}{}", s.device, catalog::setting_line(d, setting)))
                 .collect();
             (!lines.is_empty()).then(|| lines.join("\n"))
         }
-        event::Kind::Warnings(w) if w.warnings.is_empty() => {
-            Some(format!("[CHG] {} warnings cleared", safe(&w.device)))
-        }
-        event::Kind::Warnings(w) => Some(
-            w.warnings
+        event::Kind::WarningsChanged(w) => {
+            let lines: Vec<String> = w
+                .added
                 .iter()
-                .map(|warning| format!("[CHG] {} {}", safe(&w.device), warning_line(warning)))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
+                .map(|warning| format!("[CHG] {} {}", w.device, warning_line(warning)))
+                .chain(
+                    w.removed
+                        .iter()
+                        .map(|warning| format!("[DEL] {} {}", w.device, warning_line(warning))),
+                )
+                .collect();
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        }
         event::Kind::Pairing(pairing) => {
             let prompt = model::prompt(pairing)?;
-            Some(prompt_line(&pairing.candidate, &prompt))
+            Some(prompt_line(pairing.candidate, &prompt))
+        }
+        event::Kind::Profile(profile) => Some(format!("[CHG] Profile {}", profile_line(profile))),
+        event::Kind::ProfileRemoved(r) => Some(format!("[DEL] Profile {}", r.id)),
+        event::Kind::ProfileRulesChanged(r) => {
+            let lines: Vec<String> = r
+                .changed
+                .iter()
+                .map(|rule| format!("[CHG] Profile {} {}", r.profile, profiles::rule_words(rule)))
+                .chain(r.removed.iter().map(|input| {
+                    format!(
+                        "[DEL] Profile {} {}",
+                        r.profile,
+                        profiles::usage_words(input)
+                    )
+                }))
+                .collect();
+            (!lines.is_empty()).then(|| lines.join("\n"))
         }
     }
 }
@@ -1338,7 +1599,7 @@ pub fn prompt_value(prompt: &Prompt) -> Option<&str> {
 
 /// A pairing prompt for the shell: what to enter or compare, where, and for
 /// which candidate.
-pub fn prompt_line(candidate: &str, prompt: &Prompt) -> String {
+pub fn prompt_line(candidate: u32, prompt: &Prompt) -> String {
     let place = match prompt {
         Prompt::ShowCode(..) => "Enter on the peripheral",
         Prompt::ConfirmCode(_) => "Compare with the peripheral; answer yes or no",
@@ -1348,7 +1609,7 @@ pub fn prompt_line(candidate: &str, prompt: &Prompt) -> String {
     if let Some(v) = prompt_value(prompt).filter(|v| !v.is_empty()) {
         let _ = write!(what, " {}", safe(v));
     }
-    format!("[pair {}] {place}: {what}", safe(candidate))
+    format!("[pair {candidate}] {place}: {what}")
 }
 
 #[cfg(test)]

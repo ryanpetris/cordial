@@ -2,10 +2,11 @@
 //! prints command results and notices for scripts and scrollback instead.
 use super::{Model, layout};
 use crate::{
-    controller::{Command, Notice, Outcome, Toggle},
+    controller::{Command, Notice, Outcome, Target},
     error::Error,
     model::{self, Up},
     ui::{Backend, catalog, text},
+    view::Item,
 };
 use cordial_protocol::{self as p, DeviceState, ErrorCode, SettingState, event};
 use ratatui::style::Style;
@@ -161,21 +162,26 @@ impl<B: Backend> Model<B> {
 
     /// Names a device or candidate, including ones that have since left the
     /// session state, such as a removed bond or a hidden candidate.
-    pub(super) fn label(&self, id: &str) -> String {
+    pub(super) fn label(&self, item: Item) -> String {
         if let Some(st) = self.state() {
-            match Self::find(&st, id) {
+            match Self::find(&st, Some(item)) {
                 (Some(d), _) => return text::display_name(Some(&d.name)),
                 (_, Some(c)) => return text::display_candidate_name(c),
                 _ => {}
             }
         }
-        if let Some(d) = self.known.get(id) {
-            return text::display_name(Some(&d.name));
-        }
-        if let Some(name) = self.names.get(id) {
-            return name.clone();
-        }
-        text::display(id)
+        let known = match item {
+            Item::Device(id) => self
+                .known
+                .get(&id)
+                .map(|d| text::display_name(Some(&d.name))),
+            Item::Candidate(id) => self.names.get(&id).cloned(),
+            Item::Adapter => self.state().map(|st| text::display(&st.status.name)),
+        };
+        known.unwrap_or_else(|| match item {
+            Item::Device(id) | Item::Candidate(id) => id.to_string(),
+            Item::Adapter => String::new(),
+        })
     }
 
     pub(super) fn reset_activity(&mut self) {
@@ -190,7 +196,7 @@ impl<B: Backend> Model<B> {
             return;
         };
         for d in st.devices {
-            self.known.entry(d.id.clone()).or_insert(d);
+            self.known.entry(d.id).or_insert(d);
         }
     }
 
@@ -224,7 +230,7 @@ impl<B: Backend> Model<B> {
             }
             event::Kind::Device(d) => {
                 let name = text::display_name(Some(&d.name));
-                let old = self.known.insert(d.id.clone(), d.clone());
+                let old = self.known.insert(d.id, d.clone());
                 match old {
                     Some(old) => {
                         for (kind, text) in device_changes(&old, d) {
@@ -236,10 +242,10 @@ impl<B: Backend> Model<B> {
                 }
             }
             event::Kind::DeviceRemoved(r) => {
-                let text = format!("Removed {}", self.label(&r.id));
+                let text = format!("Forgot {}", self.label(Item::Device(r.id)));
                 self.note(Kind::Info, text);
                 self.known.remove(&r.id);
-                self.forget_device(&r.id);
+                self.forget_device(r.id);
             }
             event::Kind::Adapter(a) => {
                 let text = format!(
@@ -249,14 +255,18 @@ impl<B: Backend> Model<B> {
                 );
                 self.note(Kind::Info, text);
             }
-            event::Kind::Settings(s) => {
-                for setting in &s.settings {
-                    self.setting_activity(&s.device, setting);
+            event::Kind::SettingsChanged(s) => {
+                for setting in &s.changed {
+                    self.setting_activity(s.device, setting);
                 }
             }
             // Warnings are shown in the device's Diagnostics; the pairing command reports how
-            // it ended.
-            event::Kind::Warnings(_) | event::Kind::Pairing(_) => {}
+            // it ended. Profiles are shown in the profile dialogs, and their rules never.
+            event::Kind::WarningsChanged(_)
+            | event::Kind::Pairing(_)
+            | event::Kind::Profile(_)
+            | event::Kind::ProfileRemoved(_)
+            | event::Kind::ProfileRulesChanged(_) => {}
         }
     }
 
@@ -268,15 +278,15 @@ impl<B: Backend> Model<B> {
             self.names.clear();
         }
         let name = text::display_candidate_name(c);
-        self.names.insert(c.id.clone(), name.clone());
+        self.names.insert(c.id, name.clone());
         // Names often arrive in a later advertisement; report devices once
         // named or of a known kind, again when a name follows a kind-only
         // report, and hidden unnamed ones not at all.
         let named = text::named(c);
-        let shown = named || !matches!(c.kind(), p::Kind::Unknown) || self.show_unnamed;
+        let shown = named || !model::known_kinds(&c.kinds).is_empty() || self.show_unnamed;
         let reported = self.found.get(&c.id).copied();
         if shown && (reported.is_none() || named && reported == Some(false)) {
-            self.found.insert(c.id.clone(), named);
+            self.found.insert(c.id, named);
             let transport = text::transport_name(c.transport());
             self.note(Kind::Info, format!("Found {name} ({transport})"));
         }
@@ -284,7 +294,7 @@ impl<B: Backend> Model<B> {
 
     /// Describes a setting's apply outcome when it changes: applied, changed
     /// on the device, or failing. Readings show only on the settings page.
-    fn setting_activity(&mut self, device: &str, s: &p::Setting) {
+    fn setting_activity(&mut self, device: u32, s: &p::Setting) {
         if catalog::info_for(&s.key).is_none() {
             return;
         }
@@ -297,7 +307,7 @@ impl<B: Backend> Model<B> {
         if old == Some(now) {
             return;
         }
-        let name = self.label(device);
+        let name = self.label(Item::Device(device));
         let label = text::display(&catalog::label(&s.key));
         match now {
             Some(Ok(SettingState::Applied)) if old == Some(Some(Ok(SettingState::Pending))) => {
@@ -325,7 +335,7 @@ impl<B: Backend> Model<B> {
 
     /// A saved device whose HID++ preference is off, so saved settings are
     /// kept but not applied.
-    pub(super) fn hidpp_off(&self, id: &str) -> bool {
+    pub(super) fn hidpp_off(&self, id: u32) -> bool {
         self.state()
             .and_then(|st| st.device(id).cloned())
             .is_some_and(|d| !model::hidpp_enabled(&d))
@@ -347,13 +357,13 @@ impl<B: Backend> Model<B> {
             return;
         }
         let target = match command {
-            Get(id)
-            | Refresh(id)
-            | Pair(id)
-            | Connect(id)
-            | Disconnect(id)
-            | Set(id, ..)
-            | Unpair(id) => self.label(id),
+            Get(Target::Id(id))
+            | Refresh(Target::Id(id))
+            | Connect(Target::Id(id))
+            | Disconnect(Target::Id(id))
+            | DeviceSave(id, _)
+            | Unpair(Target::Id(id)) => self.label(Item::Device(*id)),
+            Pair(Target::Id(id)) => self.label(Item::Candidate(*id)),
             _ => String::new(),
         };
         match result {
@@ -373,28 +383,18 @@ impl<B: Backend> Model<B> {
             Pair(_) => format!("pair {target}"),
             Connect(_) => format!("connect {target}"),
             Disconnect(_) => format!("disconnect {target}"),
-            Set(_, Toggle::Enabled, true) => format!("enable {target}"),
-            Set(_, Toggle::Enabled, false) => format!("disable {target}"),
-            Set(_, Toggle::Trusted, true) => format!("trust {target}"),
-            Set(_, Toggle::Trusted, false) => format!("untrust {target}"),
-            Set(_, Toggle::Blocked, true) => format!("block {target}"),
-            Set(_, Toggle::Blocked, false) => format!("unblock {target}"),
-            Set(_, Toggle::Hidpp, on) => {
-                format!("turn Logitech Features {} for {target}", text::on_off(*on))
-            }
-            Unpair(_) => format!("remove {target}"),
+            Unpair(_) => format!("forget {target}"),
             Scan { .. } | ScanStop => "change scanning".into(),
             Devices => "refresh devices".into(),
             Bootloader => "enter the bootloader".into(),
             CancelPairing => "cancel the pairing".into(),
-            Platform(_) => "set the platform".into(),
-            Transport(t, on) => format!(
-                "{} {}",
-                if *on { "enable" } else { "disable" },
-                text::transport_long(*t)
-            ),
             Name(_) => "rename the adapter".into(),
             Refresh(_) => format!("refresh the information of {target}"),
+            ProfileCreate(..) => "create the profile".into(),
+            ProfileCopy(..) => "copy the profile".into(),
+            ProfileDelete(_) => "delete the profile".into(),
+            AdapterSave(_) => "save the adapter settings".into(),
+            DeviceSave(..) => format!("save the changes to {target}"),
             other => command_name(other).into(),
         };
         self.note(Kind::Bad, format!("Couldn't {what}: {words}"));
@@ -435,13 +435,15 @@ impl<B: Backend> Model<B> {
                     "The adapter is restarting into its bootloader".into(),
                 );
             }
-            (Platform(p), _) => {
-                let text = format!("Platform set to {}", text::platform_name(*p));
-                self.note(Kind::Good, text);
-            }
-            (Transport(..), Outcome::Transport(t, on)) => {
-                let text = format!("{} {}", text::transport_long(*t), text::enabled_word(*on));
-                self.note(Kind::Good, text);
+            (
+                ProfileCreate(..) | ProfileCopy(..) | ProfileDelete(_) | AdapterSave(_)
+                | DeviceSave(..),
+                _,
+            ) => {
+                let st = self.state();
+                for line in text::outcome(command, outcome, st.as_ref()).lines() {
+                    self.note(Kind::Good, line.trim_end_matches('.').to_owned());
+                }
             }
             _ => {}
         }

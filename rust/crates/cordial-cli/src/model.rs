@@ -2,8 +2,8 @@
 //! integration status, the pairing step and setting types.
 use cordial_protocol::{
     self as p, CodeKind, DeviceState, ErrorCode, InactiveReason, IntegrationKind, IntegrationState,
-    Platform, Role, SettingState, Transport, integer_setting, integration, keys, pairing, setting,
-    value::Value,
+    Kind, Platform, Role, SettingState, Transport, integer_setting, integration, keys, pairing,
+    setting, setting_change, value::Value,
 };
 
 /// An enum value's name as the CLI spells it: lowercase, without the type prefix.
@@ -30,6 +30,7 @@ const PREFIXES: &[&str] = &[
     "KIND_",
     "ROLE_",
     "CODE_KIND_",
+    "CONFIGURATION_INTERFACE_",
 ];
 
 pub fn code_token(code: ErrorCode) -> String {
@@ -62,12 +63,31 @@ pub fn last_error(d: &p::Device) -> Option<ErrorCode> {
     d.error.map(code)
 }
 
-/// The roles this build knows, in the device's order.
-pub fn roles(d: &p::Device) -> Vec<Role> {
-    d.roles
+/// Why a connected device's profiles aren't loaded, while they aren't.
+pub fn profile_error(d: &p::Device) -> Option<ErrorCode> {
+    d.profile_error.map(code)
+}
+
+/// The roles this build knows, in the order given.
+pub fn known_roles(roles: &[i32]) -> Vec<Role> {
+    roles
         .iter()
         .filter_map(|n| Role::try_from(*n).ok())
         .filter(|r| *r != Role::Unknown)
+        .collect()
+}
+
+/// The device's roles this build knows, in the device's order.
+pub fn roles(d: &p::Device) -> Vec<Role> {
+    known_roles(&d.roles)
+}
+
+/// The kinds this build knows, in the order given.
+pub fn known_kinds(kinds: &[i32]) -> Vec<Kind> {
+    kinds
+        .iter()
+        .filter_map(|n| Kind::try_from(*n).ok())
+        .filter(|k| *k != Kind::Unknown)
         .collect()
 }
 
@@ -171,21 +191,13 @@ pub fn supports(st: &p::Status, t: Transport) -> bool {
     transports(st).contains(&t)
 }
 
-/// Whether a supported transport is enabled; `None` when the firmware doesn't support it.
-/// Firmware that predates the setting doesn't report it, and uses every transport it supports.
+/// Whether a supported transport is enabled; `None` when the firmware doesn't support it. A
+/// missing `enabled` means enabled.
 pub fn transport_enabled(st: &p::Status, t: Transport) -> Option<bool> {
     st.transports
         .iter()
         .find(|s| s.transport == t as i32)
         .map(|s| s.enabled != Some(false))
-}
-
-/// Whether the firmware can enable and disable a supported transport. Firmware that predates
-/// the setting uses every transport it supports and can't change that.
-pub fn transport_settable(st: &p::Status, t: Transport) -> bool {
-    st.transports
-        .iter()
-        .any(|s| s.transport == t as i32 && s.enabled.is_some())
 }
 
 /// The supported transports that are enabled, in the firmware's order.
@@ -353,11 +365,21 @@ pub fn key(key: &str) -> Option<(&'static keys::Key, Option<u32>)> {
     keys::lookup(key)
 }
 
-/// A setting's protocol reference.
-pub fn reference(s: &p::Setting) -> p::SettingRef {
-    p::SettingRef {
+/// A change that saves `v` as the setting's value.
+pub fn save_change(s: &p::Setting, v: Value) -> p::SettingChange {
+    p::SettingChange {
         integration: s.integration,
         key: s.key.clone(),
+        change: Some(setting_change::Change::Value(wire_value(v))),
+    }
+}
+
+/// A change that forgets the setting's saved value.
+pub fn forget_change(s: &p::Setting) -> p::SettingChange {
+    p::SettingChange {
+        integration: s.integration,
+        key: s.key.clone(),
+        change: Some(setting_change::Change::Forget(p::SettingForget {})),
     }
 }
 

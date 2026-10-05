@@ -8,8 +8,12 @@ publish = false
 
 [dependencies]
 cordial-btstack = { path = "../../adapters/btstack", features = ["ffi", "classic"] }
-cordial-core = { path = "../../crates/cordial-core" }
+# The development firmware enables the development commands.
+cordial-core = { path = "../../crates/cordial-core", features = ["development"] }
 cordial-protocol = { path = "../../crates/cordial-protocol" }
+cordial-record-storage = { path = "../../adapters/record-storage" }
+cordial-usb = { path = "../../adapters/usb" }
+embedded-storage-async = "=0.4.2"
 embassy-futures = "=0.1.2"
 talc = { version = "=5.1.1", features = ["counters"] }
 cortex-m-rt = "=0.7.7"

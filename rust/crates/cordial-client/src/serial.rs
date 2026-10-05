@@ -1,6 +1,6 @@
 //! USB serial ports: listing attached Dongles and opening a session on one.
 use crate::{Connection, Received};
-use cordial_protocol::{self as p, USB_MANUFACTURER, USB_PRODUCT_ID, USB_VENDOR_ID};
+use cordial_protocol::{self as p, USB_PRODUCT_ID, USB_VENDOR_ID};
 use std::{
     collections::BTreeSet,
     io::{self, Read, Write},
@@ -14,8 +14,28 @@ use std::{
 pub struct PortInfo {
     /// The serial port's path or name, to pass to [`open`].
     pub port: String,
-    /// The adapter ID, read from the USB serial number; empty when the port reports none.
-    pub id: String,
+    /// The USB serial number as the operating system reports it; empty when it reports none.
+    pub serial: String,
+}
+
+/// How many leading characters of the USB serial number identify the adapter.
+const ID_CHARS: usize = 16;
+
+impl PortInfo {
+    /// The adapter's identity before its port is opened: the first 16 characters of the USB
+    /// serial number. Once a session is open, `GetStatus` identifies the adapter instead.
+    pub fn id(&self) -> &str {
+        match self.serial.char_indices().nth(ID_CHARS) {
+            Some((end, _)) => &self.serial[..end],
+            None => &self.serial,
+        }
+    }
+
+    /// Whether the port belongs to the adapter with this identity, compared without regard to
+    /// case. An empty identity matches nothing.
+    pub fn is_adapter(&self, id: &str) -> bool {
+        !id.is_empty() && self.id().eq_ignore_ascii_case(id)
+    }
 }
 
 /// Lists attached Dongles from USB metadata, without opening any port.
@@ -25,7 +45,7 @@ pub fn ports() -> io::Result<Vec<PortInfo>> {
         .filter_map(|port| match port.port_type {
             serialport::SerialPortType::UsbPort(info) if is_cordial(&info) => Some(PortInfo {
                 port: port.port_name,
-                id: info.serial_number.unwrap_or_default(),
+                serial: info.serial_number.unwrap_or_default(),
             }),
             _ => None,
         })
@@ -34,9 +54,7 @@ pub fn ports() -> io::Result<Vec<PortInfo>> {
 }
 
 fn is_cordial(info: &serialport::UsbPortInfo) -> bool {
-    info.vid == USB_VENDOR_ID
-        && info.pid == USB_PRODUCT_ID
-        && info.manufacturer.as_deref() == Some(USB_MANUFACTURER)
+    info.vid == USB_VENDOR_ID && info.pid == USB_PRODUCT_ID
 }
 
 fn unique_ports(mut found: Vec<PortInfo>) -> Vec<PortInfo> {
@@ -120,7 +138,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovery_requires_cordial_usb_metadata() {
+    fn discovery_requires_only_cordial_usb_ids() {
         let expected = serialport::UsbPortInfo {
             vid: 0x1209,
             pid: 0xc0d1,
@@ -138,6 +156,10 @@ mod tests {
                 pid: 0x4001,
                 ..expected.clone()
             },
+        ] {
+            assert!(!is_cordial(&other), "{other:?}");
+        }
+        for other in [
             serialport::UsbPortInfo {
                 manufacturer: None,
                 ..expected.clone()
@@ -151,13 +173,28 @@ mod tests {
                 ..expected.clone()
             },
         ] {
-            assert!(!is_cordial(&other), "{other:?}");
+            assert!(is_cordial(&other), "{other:?}");
         }
         assert!(is_cordial(&serialport::UsbPortInfo {
             product: None,
             serial_number: None,
             ..expected
         }));
+    }
+
+    #[test]
+    fn the_adapter_id_is_the_serial_prefix_in_any_case() {
+        let port = |serial: &str| PortInfo {
+            port: "/dev/ttyACM0".into(),
+            serial: serial.into(),
+        };
+        let vial = port("0123456789ABCDEF-vial:f64c2b3c");
+        assert_eq!(vial.id(), "0123456789ABCDEF");
+        assert!(vial.is_adapter("0123456789abcdef"));
+        assert!(port("0123456789abcdef").is_adapter("0123456789ABCDEF"));
+        assert!(!vial.is_adapter("0123456789ABCDE0"));
+        assert_eq!(port("SHORT").id(), "SHORT");
+        assert!(!port("").is_adapter(""));
     }
 
     #[test]
@@ -172,7 +209,7 @@ mod tests {
         .into_iter()
         .map(|port| PortInfo {
             port: port.into(),
-            id: "same-or-missing-serial".into(),
+            serial: "same-or-missing-serial".into(),
         })
         .collect();
         let found = unique_ports(ports);

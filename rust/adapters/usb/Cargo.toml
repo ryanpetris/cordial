@@ -12,6 +12,8 @@ cordial-protocol.workspace = true
 embassy-usb = { version = "=0.6.0", default-features = false, features = ["max-handler-count-5"] }
 embassy-sync = "=0.8.0"
 embassy-futures = "=0.1.2"
+embassy-time = "=0.5.1"
 
 [dev-dependencies]
 critical-section = { version = "=1.2.0", features = ["std"] }
+prost = { version = "=0.14.4", default-features = false }

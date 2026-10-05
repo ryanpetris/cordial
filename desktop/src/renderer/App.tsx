@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import type { Navigation } from "../shared/state.ts";
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import type { AdapterChanges, DeviceChanges, Navigation } from "../shared/state.ts";
 import { api, setReporter, useAppState } from "./api.ts";
 import { AddDevice } from "./components/AddDevice.tsx";
 import { AdapterPage } from "./components/AdapterPage.tsx";
@@ -12,6 +12,17 @@ export type Selection = { page: "home" } | { page: "device"; key: string } | { p
 
 const HOME: Selection = { page: "home" };
 
+/** Updates the staged changes kept for `id`, forgetting them once none are left. */
+const stager = <T extends object>(set: Dispatch<SetStateAction<Record<string, T>>>, id: string) =>
+  (update: (draft: T) => T) =>
+    set((all) => {
+      const next = { ...all };
+      const draft = update(all[id] ?? ({} as T));
+      if (Object.keys(draft).length) next[id] = draft;
+      else delete next[id];
+      return next;
+    });
+
 export function App() {
   const state = useAppState();
   const [selection, setSelection] = useState<Selection>(HOME);
@@ -21,6 +32,10 @@ export function App() {
   const [toast, setToast] = useState<string | null>(null);
   // Staged setting changes by device and setting, kept across tabs and pages.
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
+  // Staged Details changes by device, kept across tabs and pages.
+  const [details, setDetails] = useState<Record<string, DeviceChanges>>({});
+  // Staged adapter settings by adapter, kept across tabs and pages.
+  const [adapterDrafts, setAdapterDrafts] = useState<Record<string, AdapterChanges>>({});
 
   useEffect(() => {
     setReporter(setToast);
@@ -100,6 +115,8 @@ export function App() {
             state={state}
             entry={devices.find((d) => d.key === shown.key)!}
             drafts={draftsFor(shown.key)}
+            details={details[shown.key] ?? {}}
+            onDetails={stager(setDetails, shown.key)}
           />
         ) : shown.page === "adapter" ? (
           <AdapterPage
@@ -107,6 +124,8 @@ export function App() {
             state={state}
             adapter={adapters.find((a) => a.id === shown.id)!}
             renaming={renaming === shown.id}
+            draft={adapterDrafts[shown.id] ?? {}}
+            onDraft={stager(setAdapterDrafts, shown.id)}
             onRenamed={() => setRenaming(null)}
             onSelect={setSelection}
           />

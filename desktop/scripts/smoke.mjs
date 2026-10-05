@@ -36,6 +36,7 @@ await page.getByRole("button", { name: /Example Keys/ }).first().waitFor();
 await shot("home");
 await page.getByRole("button", { name: /Example Keys/ }).first().click();
 await shot("device-details");
+await page.getByRole("button", { name: "Typing, Remove", exact: true }).waitFor();
 await page.getByRole("tab", { name: "Diagnostics" }).click();
 await shot("device-diagnostics");
 await page.getByRole("tab", { name: "Settings" }).click();
@@ -46,8 +47,64 @@ await page.getByRole("tab", { name: "Diagnostics" }).click();
 await shot("mouse-diagnostics");
 await page.getByRole("button", { name: /Old Mouse/ }).first().click();
 await shot("disabled");
-await page.getByRole("button", { name: /Pico W/ }).first().click();
+await page.getByRole("button", { name: /Pico 2 W/ }).first().click();
+const tabs = await page.getByRole("tab").allTextContents();
+if (tabs.join() !== "Details,Settings,Profiles,Diagnostics") throw new Error(`unexpected adapter tabs: ${tabs}`);
 await shot("adapter");
+await page.getByRole("tab", { name: "Settings" }).click();
+await page.getByRole("radiogroup", { name: "Platform" }).waitFor();
+await shot("adapter-settings");
+await page.getByRole("tab", { name: "Diagnostics" }).click();
+await page.getByText("Adapter ID").waitFor();
+await shot("adapter-diagnostics");
+await page.getByRole("tab", { name: "Profiles" }).click();
+const smokeAdapter = (await page.evaluate(() => window.cordial.state())).adapters.find((a) => a.name.startsWith("Pico 2 W") && a.status?.profileSupport);
+const viaEnabled = () => page.evaluate((id) => window.cordial.state().then((s) => s.adapters.find((a) => a.id === id)?.status?.interfaces.find((i) => i.interface === 1)?.enabled), smokeAdapter.id);
+const save = page.locator(".page-bar").getByRole("button", { name: "Save", exact: true });
+// Interface changes stage until Save; one that reconnects USB asks first.
+const via = page.getByRole("switch", { name: "VIA", exact: true });
+const before = await viaEnabled();
+if (!before) {
+  await page.getByRole("button", { name: "VIA Profile", exact: true }).click();
+  const picker = page.getByRole("dialog", { name: "VIA Profile" });
+  await picker.getByRole("radio").nth(1).check();
+  await picker.getByRole("button", { name: "Choose", exact: true }).click();
+  await picker.waitFor({ state: "hidden" });
+}
+await via.click();
+const confirm = page.getByRole("dialog", { name: "USB Reconnect Required" });
+await save.click();
+await confirm.getByText("The adapter will disconnect from this computer for a moment after it saves these changes.").waitFor();
+await shot("adapter-interface");
+await confirm.getByRole("button", { name: "Cancel" }).click();
+await confirm.waitFor({ state: "hidden" });
+if ((await viaEnabled()) !== before) throw new Error("the interface changed without confirmation");
+await save.click();
+await confirm.getByRole("button", { name: "Save" }).click();
+await confirm.waitFor({ state: "hidden" });
+// The adapter reconnects USB; its page and chosen tab stay through it.
+const profilesTab = page.getByRole("tab", { name: "Profiles" });
+await page.waitForFunction(async ([id, v]) => {
+  const a = (await window.cordial.state()).adapters.find((x) => x.id === id);
+  return a?.connection === "connected" && a.readiness === "ready" && a.profilePage && !a.profilePage.loading
+    && a.status?.interfaces.find((i) => i.interface === 1)?.enabled === v;
+}, [smokeAdapter.id, !before]);
+await page.waitForFunction(() => document.querySelector(".page-bar button.suggested")?.disabled);
+if ((await profilesTab.getAttribute("aria-selected")) !== "true") throw new Error("the adapter tab changed across a reconnect");
+// Creating and copying profiles act at once.
+await page.getByRole("button", { name: "New Profile" }).click();
+const created = page.getByRole("dialog", { name: "New Profile" });
+await created.getByRole("textbox", { name: "Profile name" }).fill("Travel");
+await created.getByRole("button", { name: "Create" }).click();
+await created.waitFor({ state: "hidden" });
+await page.getByRole("button", { name: "Travel, Options", exact: true }).click();
+await page.getByRole("menuitem", { name: "Copy" }).click();
+const copy = page.getByRole("dialog", { name: "Copy “Travel”" });
+await copy.getByRole("button", { name: "Copy" }).click();
+await copy.waitFor({ state: "hidden" });
+await page.getByRole("button", { name: "Travel Copy, Options", exact: true }).waitFor();
+await shot("adapter-profiles");
+await page.getByRole("tab", { name: "Details" }).click();
 await page.getByRole("button", { name: "Add Device" }).click();
 await page.getByText("Example Keys Mini").waitFor();
 await shot("add-device");

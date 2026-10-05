@@ -1,10 +1,5 @@
 //! Identifiers and states shared across the firmware.
-use alloc::string::String;
 use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct DeviceId(pub String);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

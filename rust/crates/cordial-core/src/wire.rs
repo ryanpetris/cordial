@@ -9,8 +9,8 @@ use cordial_protocol::{self as p, keys};
 
 use crate::{
     compact::{Observed, Record, scalar},
-    devices::Device,
-    manager::Manager,
+    devices::{Device, Policy},
+    manager::{Connection, Manager},
     model::{
         errors::{DeviceWarning, ErrorCode as E, HidReportType, WarningCode},
         hidpp::ProtocolState,
@@ -19,6 +19,7 @@ use crate::{
         link::{ConnectionSecurity, DeviceKind},
         settings::{SettingKey, SettingState, SettingType, SettingValue},
     },
+    settings::Catalog,
 };
 
 /// The wire code for an internal error.
@@ -51,6 +52,7 @@ pub fn error_code(code: E) -> p::ErrorCode {
         E::Timeout | E::HidppTimeout => W::Timeout,
         E::Cancelled => W::Cancelled,
         E::NotConnected => W::NotConnected,
+        E::InUse => W::InUse,
         E::FeatureSetUnavailable | E::HidppResetUnavailable | E::HidppControlsUnavailable => {
             W::FeatureUnavailable
         }
@@ -103,23 +105,54 @@ pub fn host_platform(platform: p::Platform) -> HostPlatform {
     }
 }
 
-pub fn kind(kind: DeviceKind) -> p::Kind {
+/// What a device that reports itself as `kind` is.
+pub fn kinds(kind: DeviceKind) -> Vec<i32> {
     match kind {
-        DeviceKind::Unknown => p::Kind::Unknown,
-        DeviceKind::Keyboard => p::Kind::Keyboard,
-        DeviceKind::Mouse => p::Kind::Mouse,
-        DeviceKind::KeyboardMouse => p::Kind::KeyboardMouse,
+        DeviceKind::Unknown => Vec::new(),
+        DeviceKind::Keyboard => alloc::vec![p::Kind::Keyboard as i32],
+        DeviceKind::Mouse => alloc::vec![p::Kind::Mouse as i32],
+        DeviceKind::KeyboardMouse => alloc::vec![p::Kind::Keyboard as i32, p::Kind::Mouse as i32],
     }
 }
 
-fn info_kind(value: &str) -> p::Kind {
+fn info_kinds(value: &str) -> Vec<i32> {
     match value {
-        "keyboard" => p::Kind::Keyboard,
-        "mouse" => p::Kind::Mouse,
-        "keyboard_mouse" => p::Kind::KeyboardMouse,
-        "other" => p::Kind::Other,
-        _ => p::Kind::Unknown,
+        "keyboard" => kinds(DeviceKind::Keyboard),
+        "mouse" => kinds(DeviceKind::Mouse),
+        "keyboard_mouse" => kinds(DeviceKind::KeyboardMouse),
+        "other" => alloc::vec![p::Kind::Other as i32],
+        _ => Vec::new(),
     }
+}
+
+/// What a device with HID descriptor `roles` is: a keyboard, a mouse or both, or other.
+fn role_kinds(roles: u8) -> Vec<i32> {
+    let mut list = Vec::new();
+    if roles & crate::hid::KEYBOARD != 0 {
+        list.push(p::Kind::Keyboard as i32);
+    }
+    if roles & crate::hid::MOUSE != 0 {
+        list.push(p::Kind::Mouse as i32);
+    }
+    if list.is_empty() && roles != 0 {
+        list.push(p::Kind::Other as i32);
+    }
+    list
+}
+
+/// The wire roles of `hid` role bits.
+pub fn roles(roles: u8) -> Vec<i32> {
+    [
+        p::Role::Keyboard,
+        p::Role::Mouse,
+        p::Role::ConsumerControl,
+        p::Role::SystemControl,
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(i, _)| roles & (1 << i) != 0)
+    .map(|(_, r)| r as i32)
+    .collect()
 }
 
 fn state(state: ConnectionState) -> p::DeviceState {
@@ -279,14 +312,15 @@ fn wheel_info(record: &Record) -> Vec<p::Info> {
     list
 }
 
-fn hidpp(manager: &Manager, slot: usize, d: &Device) -> Option<p::Integration> {
-    let runtime = manager
-        .connections
-        .iter()
-        .flatten()
-        .find(|c| c.device == Some(slot) && !c.closing)
+fn hidpp(
+    policy: &Policy,
+    d: Option<&Device>,
+    connection: Option<&Connection>,
+) -> Option<p::Integration> {
+    let enabled = policy.hidpp_enabled();
+    let runtime = connection
         .and_then(|c| c.runtime.as_deref())
-        .filter(|_| d.state == ConnectionState::Connected);
+        .filter(|_| d.is_some_and(|d| d.state == ConnectionState::Connected));
     let protocol = runtime.map_or(ProtocolState::Unknown, |r| r.client.protocol);
     let detected = match protocol {
         ProtocolState::Detected { major, minor } => Some(p::IntegrationDetection {
@@ -297,11 +331,15 @@ fn hidpp(manager: &Manager, slot: usize, d: &Device) -> Option<p::Integration> {
         }),
         _ => None,
     };
-    if !d.policy.hidpp_enabled && detected.is_none() {
+    let saved = policy
+        .integrations
+        .iter()
+        .any(|i| i.kind == crate::devices::IntegrationKind::Hidpp);
+    if !saved && detected.is_none() {
         return None;
     }
     use p::integration::Status;
-    let status = if !d.policy.hidpp_enabled {
+    let status = if !enabled {
         Status::State(p::IntegrationState::Off as i32)
     } else if let Some(runtime) = runtime {
         match protocol {
@@ -327,16 +365,26 @@ fn hidpp(manager: &Manager, slot: usize, d: &Device) -> Option<p::Integration> {
     };
     Some(p::Integration {
         kind: p::IntegrationKind::Hidpp as i32,
-        enabled: d.policy.hidpp_enabled,
+        enabled,
         detected,
         status: Some(status),
     })
 }
 
-/// The device record of saved device `slot`.
-pub fn device(manager: &Manager, slot: usize) -> Option<p::Device> {
-    let d = manager.devices.get(slot)?.as_ref()?;
-    let fields = d.catalog.info.snapshot();
+/// The device record of saved device `policy`. `slot` is its resident entry, if it has one; a
+/// connected device's own policy takes the place of `policy` once read.
+pub fn device(manager: &Manager, policy: &Policy, slot: Option<usize>) -> p::Device {
+    let d = slot.and_then(|slot| manager.devices.get(slot)?.as_ref());
+    let connection = slot.and_then(|slot| {
+        manager
+            .connections
+            .iter()
+            .flatten()
+            .find(|c| c.device == Some(slot) && !c.closing)
+    });
+    let live = d.and_then(|d| d.live.as_deref());
+    let policy = live.and_then(|l| l.policy.as_ref()).unwrap_or(policy);
+    let fields = live.map(|l| l.catalog.info.snapshot()).unwrap_or_default();
     let text = |key| {
         fields
             .iter()
@@ -346,54 +394,59 @@ pub fn device(manager: &Manager, slot: usize) -> Option<p::Device> {
                 _ => None,
             })
     };
-    let inactive = if !d.transport_supported {
+    let transport_disabled = !manager
+        .preference
+        .transports
+        .contains(policy.peer.transport);
+    let inactive = if !manager.supports(policy.peer.transport) {
         Some(p::InactiveReason::UnsupportedTransport)
-    } else if d.transport_disabled {
+    } else if transport_disabled {
         Some(p::InactiveReason::TransportDisabled)
-    } else if d.policy.blocked {
+    } else if policy.blocked {
         Some(p::InactiveReason::Blocked)
-    } else if !d.policy.enabled {
+    } else if !policy.enabled {
         Some(p::InactiveReason::Disabled)
-    } else if !d.effective_enabled {
+    } else if d.is_none_or(|d| d.retiring) {
         Some(p::InactiveReason::Capacity)
     } else {
         None
     };
-    let connection = manager
-        .connections
-        .iter()
-        .flatten()
-        .find(|c| c.device == Some(slot) && !c.closing);
-    Some(p::Device {
-        id: d.policy.device_id().0,
-        transport: transport(d.policy.peer.transport) as i32,
-        name: text(InfoKey::Name).unwrap_or_else(|| d.policy.name.to_string()),
-        kind: text(InfoKey::Kind).map_or(p::Kind::Unknown, |k| info_kind(&k)) as i32,
-        state: state(d.state) as i32,
-        enabled: d.policy.enabled,
-        trusted: d.policy.trusted,
-        blocked: d.policy.blocked,
-        paused: d.paused,
+    let role_bits = live.map_or(policy.roles.0, |l| l.roles);
+    let kinds = if role_bits != 0 {
+        role_kinds(role_bits)
+    } else {
+        text(InfoKey::Kind)
+            .map(|k| info_kinds(&k))
+            .unwrap_or_default()
+    };
+    p::Device {
+        id: policy.id as u32,
+        transport: transport(policy.peer.transport) as i32,
+        name: text(InfoKey::Name).unwrap_or_else(|| policy.name.to_string()),
+        kinds,
+        state: state(d.map_or(ConnectionState::Disconnected, |d| d.state)) as i32,
+        enabled: policy.enabled,
+        trusted: policy.trusted,
+        blocked: policy.blocked,
+        paused: d.is_some_and(|d| d.paused),
         inactive: inactive.map(|r| r as i32),
-        error: d.error.map(|e| error_code(e) as i32),
+        error: d.and_then(|d| d.error).map(|e| error_code(e) as i32),
         security: connection
-            .filter(|_| d.state == ConnectionState::Connected)
+            .filter(|_| d.is_some_and(|d| d.state == ConnectionState::Connected))
             .and_then(|c| c.security)
             .map(security),
-        integrations: hidpp(manager, slot, d).into_iter().collect(),
-        info: device_info(&fields, d.catalog.records()),
-        roles: [
-            p::Role::Keyboard,
-            p::Role::Mouse,
-            p::Role::ConsumerControl,
-            p::Role::SystemControl,
-        ]
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| d.roles & (1 << i) != 0)
-        .map(|(_, r)| r as i32)
-        .collect(),
-    })
+        integrations: hidpp(policy, d, connection).into_iter().collect(),
+        info: live
+            .map(|l| device_info(&fields, l.catalog.records()))
+            .unwrap_or_default(),
+        roles: roles(role_bits),
+        profiles: manager.profiles_supported().then(|| p::ProfileLayers {
+            profiles: policy.profiles.iter().map(|&id| id as u32).collect(),
+        }),
+        profile_error: live
+            .and_then(|l| l.profile_error)
+            .map(|e| error_code(e) as i32),
+    }
 }
 
 /// A setting record as a wire setting. `None` for read-only records, which are information.
@@ -487,13 +540,16 @@ pub fn setting(record: &Record) -> Option<p::Setting> {
     })
 }
 
-/// Every setting of saved device `slot`.
-pub fn settings(manager: &Manager, slot: usize) -> Option<p::DeviceSettings> {
-    let d = manager.devices.get(slot)?.as_ref()?;
-    Some(p::DeviceSettings {
-        device: d.policy.device_id().0,
-        settings: d.catalog.records().iter().filter_map(setting).collect(),
-    })
+/// Every setting `catalog` holds, in listing order: by integration, then key compared bytewise.
+pub fn settings(catalog: &Catalog) -> Vec<p::Setting> {
+    let mut settings: Vec<p::Setting> = catalog.records().iter().filter_map(setting).collect();
+    settings.sort_by(|a, b| setting_order(a).cmp(&setting_order(b)));
+    settings
+}
+
+/// Where a setting comes in a listing.
+pub fn setting_order(setting: &p::Setting) -> (i32, &[u8]) {
+    (setting.integration, setting.key.as_bytes())
 }
 
 fn warning_code(code: WarningCode) -> p::WarningCode {
@@ -519,7 +575,7 @@ fn warning_code(code: WarningCode) -> p::WarningCode {
     }
 }
 
-fn warning(w: &DeviceWarning) -> p::DeviceWarning {
+pub fn warning(w: &DeviceWarning) -> p::DeviceWarning {
     p::DeviceWarning {
         code: warning_code(w.code) as i32,
         service: w.service.into(),
@@ -536,11 +592,42 @@ fn warning(w: &DeviceWarning) -> p::DeviceWarning {
     }
 }
 
-/// The warnings of saved device `slot`.
-pub fn warnings(manager: &Manager, slot: usize) -> Option<p::DeviceWarnings> {
-    let d = manager.devices.get(slot)?.as_ref()?;
-    Some(p::DeviceWarnings {
-        device: d.policy.device_id().0,
-        warnings: d.warnings.iter().map(warning).collect(),
-    })
+/// One page of device `id`'s warnings; `end` is left for the caller.
+pub fn warnings(id: u64, warnings: &[DeviceWarning]) -> p::DeviceWarnings {
+    p::DeviceWarnings {
+        device: id as u32,
+        warnings: warnings.iter().map(warning).collect(),
+        end: false,
+    }
+}
+
+/// Where a warning comes in a listing: by service, report type, report ID, bit offset, usage page,
+/// usage and code, a missing field before any value.
+pub type WarningOrder = (
+    u32,
+    i32,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+    i32,
+);
+pub fn warning_order(w: &p::DeviceWarning) -> WarningOrder {
+    (
+        w.service,
+        w.report_type,
+        w.report_id,
+        w.bit_offset,
+        w.usage_page,
+        w.usage,
+        w.code,
+    )
+}
+
+/// `warnings` in listing order, each listed once.
+pub fn sorted_warnings(warnings: &[DeviceWarning]) -> Vec<DeviceWarning> {
+    let mut sorted = warnings.to_vec();
+    sorted.sort_by_cached_key(|w| warning_order(&warning(w)));
+    sorted.dedup();
+    sorted
 }

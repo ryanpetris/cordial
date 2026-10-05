@@ -4,14 +4,24 @@
 
 ## Discovery
 
-Automatic discovery selects USB devices with VID/PID `1209:c0d1` and manufacturer `Cordial`, read
-from the descriptors before the serial port is opened. An explicitly selected port bypasses this
-filter.
+Automatic discovery selects USB devices by VID/PID `1209:c0d1` alone, read from the descriptors
+before the serial port is opened. Manufacturer, product and interface strings are not discovery
+keys. An explicitly selected port bypasses this filter.
 
-CDC occupies interfaces 0 and 1; HID occupies interface 2. Endpoint numbers and interface strings
-are not discovery keys. The USB serial number is the adapter ID, 16 uppercase hexadecimal digits,
-so a host can recognize an adapter before opening its port; `GetStatus` confirms it. The product
-string is the firmware's default adapter name, independent of any name the user saved.
+CDC occupies interfaces 0 and 1; input HID occupies interface 2. Each enabled configuration
+interface adds one interface after them, in `ConfigurationInterface` order; the configuration
+descriptor holds no interface for a disabled one. VIA and Vial use Raw HID with usage page `0xff60`,
+usage `0x61` and 32-byte reports. Endpoint numbers are not discovery keys either. The adapter starts
+USB with its saved interfaces, so it enumerates once at power-up.
+
+The adapter ID is 16 uppercase hexadecimal digits, and the USB serial number always starts with it.
+While Vial is enabled, the serial is the ID followed by `-vial:f64c2b3c`, which Vial looks for to
+discover the adapter; otherwise it is the ID alone. Firmware derives both from the same hardware
+identity. A connected client takes the adapter's identity from `GetStatus` and never compares it
+with USB metadata. A client that needs to recognize an adapter before opening its port, such as one
+the user disconnected, uses the first 16 characters of the USB serial, compared without regard to
+case. The product string is the firmware's default adapter name, independent of any name the user
+saved.
 
 Pico W uses its flash unique ID, RP2350 boards their chip ID, and ESP32-S3 bits 0..63 of its factory
 `OPTIONAL_UNIQUE_ID` eFuse field read as a little-endian 64-bit integer. The USB identity is
@@ -46,7 +56,9 @@ requests back to back but never needs to match responses to requests.
   unset one.
 - A command with a missing required field, a value of the wrong type or a value out of range gets
   `ERROR_CODE_BAD_ARGS`.
-- A `Response` with no result set means success with nothing to return.
+- A `Response` with no result set means success with nothing to return. Commands that change saved
+  preferences, such as `SetAdapter`, `SetDevice`, `SetSettings` and `SetProfileRules`, respond this
+  way once the change is applied.
 
 Every command returns promptly. A command responds once it is accepted and any saved value is
 written; Bluetooth work that takes longer, such as connecting, pairing, scanning or disconnecting,
@@ -57,14 +69,24 @@ reports its progress through events.
 An event can arrive between any two frames, including between a request and its response; a
 `Message` holding a `Response` always answers the oldest unanswered request.
 
-Each event carries the complete current state of one thing: the adapter, a device, a device's
-settings, a device's warnings, a scan candidate, or the pairing. A client replaces what it had with
-the latest event. There are no deltas, so nothing needs ordering and there are no revisions.
+Most events carry the complete current state of one thing: the adapter, a device, a profile, a scan
+candidate, or the pairing. A client replaces what it had with the latest one.
+
+The lists that belong to a device or profile, its settings, its warnings and its rules, are listed
+in pages and change through change events instead: `settings_changed`, `warnings_changed` and
+`profile_rules_changed` carry only the entries that changed, appeared or went away. A changed
+setting or rule is carried whole, with its current state. A client applies these events to what it
+has listed, and lists again from the start when it needs a fresh view, such as in a new session or
+after losing track. Applying a change is idempotent: a client upserts settings by integration and
+key and rules by input, treats warnings as a set, and ignores the removal of an entry it does not
+hold. A change event can name an entry the client has not listed yet; one that a later page also
+holds is simply replaced. There are no revisions.
 
 The Dongle keeps one pending slot per thing. When a thing changes again before its event is
-written, the event that goes out carries the newer state, so events are never lost under output
-pressure; intermediate states can be skipped. Events are written only when no response is waiting,
-and a client that stops reading holds back only the serial port, never HID forwarding.
+written, the event that goes out carries the newer state, and a change event covers every change
+since the previous one, so events are never lost under output pressure; intermediate states can be
+skipped. Events are written only when no response is waiting, and a client that stops reading holds
+back only the serial port, never HID forwarding.
 
 ## Sessions
 
@@ -73,10 +95,11 @@ and a client that stops reading holds back only the serial port, never HID forwa
 - A client also writes a `0x00` before its first request, so a partial frame left by an earlier
   client cannot merge with it, and ignores everything up to the first `Response` after its first
   request.
-- Closing the port (DTR falling), USB reset or USB disconnection ends the session. Ending a session
-  stops a running scan and cancels a pairing that has not saved its bond; a new session starts with
-  no events waiting and no scan candidates. Saved devices, connections, automatic reconnection and
-  HID forwarding carry on without a client.
+- Closing the port (DTR falling), USB reset or USB disconnection ends the session, including the USB
+  reconnect that follows a configuration interface change. Ending a session stops a running scan and
+  cancels a pairing that has not saved its bond; a new session starts with no events waiting and no
+  scan candidates. Saved devices, connections, automatic reconnection and HID forwarding carry on
+  without a client.
 
 The CLI cycles DTR low then high when it opens a port. The desktop application opens the port from
 closed, which raises DTR, and its web version lowers DTR, waits 60 ms and raises it, because Web

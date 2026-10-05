@@ -21,5 +21,8 @@ package() {
   install -Dm644 "$root/cordial-desktop.desktop" "$pkgdir/usr/share/applications/cordial-desktop.desktop"
   install -Dm644 "$root/cordial-desktop.png" "$pkgdir/usr/share/icons/hicolor/512x512/apps/cordial-desktop.png"
   install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/cordial-desktop/LICENSE"
+  # Each package names its own copy of the rules, so both packages can be installed.
+  install -Dm644 "$root/50-cordial.rules" "$pkgdir/usr/lib/udev/rules.d/50-cordial-desktop.rules"
+  rm "$root/50-cordial.rules"
   chmod 4755 "$root/chrome-sandbox"
 }

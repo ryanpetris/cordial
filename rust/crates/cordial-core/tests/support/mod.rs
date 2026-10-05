@@ -1,6 +1,6 @@
 use cordial_core::model::{errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod};
 use cordial_core::{
-    bluetooth::{Bluetooth, Capabilities, Descriptor, Layout, ReportType},
+    bluetooth::{Bluetooth, Capabilities, Descriptor, Event, EventSource, Layout, ReportType},
     devices::{Peer, Policies, Policy},
     link::{LinkId, ServiceId, WriteId},
     manager::Manager,
@@ -15,7 +15,10 @@ pub struct Store {
     pub files: BTreeMap<String, Vec<u8>>,
     pub generation: u64,
     pub fail: bool,
+    pub unknown: Option<RecordKey>,
     pub fail_remove: Option<RecordKey>,
+    /// A record whose reads fail.
+    pub fail_load: Option<RecordKey>,
     pub fail_save: Option<(RecordKey, bool)>,
     pub available: Option<usize>,
     pub capacity: Option<usize>,
@@ -23,6 +26,10 @@ pub struct Store {
     pub block: Option<usize>,
     /// Record reads so far.
     pub loads: usize,
+    /// The keys of record reads, in order.
+    pub reads: Vec<RecordKey>,
+    /// The keys of record saves and removals, in order.
+    pub writes: Vec<RecordKey>,
 }
 impl RecordStore for Store {
     async fn generation(&mut self) -> Result<u64, storage::Error> {
@@ -89,7 +96,8 @@ impl RecordStore for Store {
         value: &mut [u8],
     ) -> Result<Option<usize>, storage::Error> {
         self.loads += 1;
-        if self.fail {
+        self.reads.push(key);
+        if self.fail || self.fail_load == Some(key) {
             return Err(storage::Error::Io);
         }
         if self
@@ -105,6 +113,7 @@ impl RecordStore for Store {
         }))
     }
     async fn save(&mut self, key: RecordKey, value: &[u8]) -> Result<(), storage::Error> {
+        self.writes.push(key);
         if self.fail {
             return Err(storage::Error::Io);
         }
@@ -113,15 +122,22 @@ impl RecordStore for Store {
         }
         self.generation += 1;
         self.records.insert(key, value.to_vec());
+        if self.unknown == Some(key) {
+            return Err(storage::Error::Unknown);
+        }
         // The store resolves a post-commit I/O failure against authoritative data.
         Ok(())
     }
     async fn remove(&mut self, key: RecordKey) -> Result<(), storage::Error> {
+        self.writes.push(key);
         if self.fail || self.fail_remove == Some(key) {
             return Err(storage::Error::Io);
         }
         self.generation += 1;
         self.records.remove(&key);
+        if self.unknown == Some(key) {
+            return Err(storage::Error::Unknown);
+        }
         Ok(())
     }
 }
@@ -149,6 +165,17 @@ pub struct Radio {
     /// Every transport enabled or disabled, in order.
     pub applied: Vec<(Transport, bool)>,
     pub reject_transport: Option<Error>,
+    /// Events for an owner loop to handle, in order.
+    pub events: std::collections::VecDeque<Event>,
+}
+impl EventSource for Radio {
+    async fn poll(&mut self) {}
+    fn next_event(&mut self) -> Option<Event> {
+        self.events.pop_front()
+    }
+    async fn changed(&self) {
+        core::future::pending().await
+    }
 }
 impl Bluetooth for Radio {
     fn refresh_info(&mut self, link: LinkId) -> Result<(), Error> {
@@ -308,7 +335,7 @@ pub fn setup() -> (Manager, Store, Radio) {
     all_transports(&mut store);
     // A saved device that finished setup with HID++ on.
     let mut policy = Policy::paired(77, peer(1), b"Keyboard");
-    policy.hidpp_enabled = true;
+    policy.set_hidpp(true);
     policy.setup_pending = false;
     policy.bond = 77;
     block_on(cordial_core::bonds::commit(
@@ -317,10 +344,11 @@ pub fn setup() -> (Manager, Store, Radio) {
         &bond(77, peer(1)),
     ))
     .unwrap();
-    block_on(Policies { store: &mut store }.save(0, &policy)).unwrap();
-    store
-        .records
-        .insert(storage::record_key(7, 0), b"77".to_vec());
+    block_on(Policies { store: &mut store }.save(&policy)).unwrap();
+    store.records.insert(
+        storage::record_key(7, 0),
+        br#"{"device":77,"profile":0}"#.to_vec(),
+    );
     let mut radio = Radio {
         bonds: vec![peer(1)],
         ..Radio::default()

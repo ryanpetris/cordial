@@ -2,7 +2,7 @@
 // into protocol values. Unknown enum values read as the enum's zero value,
 // unknown oneof cases as unset, and settings of a type this app doesn't know
 // are left out.
-import { create } from "@bufbuild/protobuf";
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import {
   CapacityReason,
   CodeKind,
@@ -24,6 +24,7 @@ import {
   type DeviceWarning as WireWarning,
   type Info,
   type Pairing,
+  type Profile as WireProfile,
   type Setting as WireSetting,
   type Status,
   type Value,
@@ -36,7 +37,10 @@ import type {
   DeviceWarning,
   InfoEntry,
   Integration,
+  KindName,
   PairingPrompt,
+  Profile,
+  RoleName,
   Scalar,
   Setting,
   ValueType,
@@ -44,7 +48,7 @@ import type {
 } from "../shared/state.ts";
 
 /** The lower-case name of an enum value; a value this app doesn't know reads as zero. */
-function name<E extends Record<string, string | number>>(e: E, value: number): Lowercase<Extract<keyof E, string>> {
+export function name<E extends Record<string, string | number>>(e: E, value: number): Lowercase<Extract<keyof E, string>> {
   const key = (e as Record<number, string>)[value] ?? (e as Record<number, string>)[0]!;
   return key.toLowerCase() as Lowercase<Extract<keyof E, string>>;
 }
@@ -96,6 +100,7 @@ export function info(list: Info[]): InfoEntry[] {
 }
 
 export function status(s: Status): AdapterStatus {
+  const p = s.profileSupport;
   return {
     id: s.id,
     name: s.name,
@@ -103,12 +108,28 @@ export function status(s: Status): AdapterStatus {
     ready: s.ready,
     transports: s.transports.flatMap((t) => {
       const kind = transport(t.transport);
-      // Firmware that predates the setting doesn't report it, and uses every transport it supports.
-      return kind ? [{ transport: kind, maxEnabled: optional(t.maxEnabled), enabled: t.enabled !== false, settable: t.enabled !== undefined }] : [];
+      // Missing means enabled.
+      return kind ? [{ transport: kind, maxEnabled: optional(t.maxEnabled), enabled: t.enabled !== false }] : [];
     }),
     info: info(s.info),
+    profileSupport: p ? { memoryBudget: p.memoryBudget, memoryUsed: p.memoryUsed, maxLayers: p.maxLayers } : null,
+    // Without profile support there are no interfaces, whatever the message carries.
+    interfaces: p
+      ? s.configurationInterfaces.flatMap((i) =>
+          i.interface ? [{ interface: i.interface, enabled: i.enabled, profile: i.profile, conflicts: [...i.conflicts] }] : [])
+      : [],
   };
 }
+
+/** Distinct known values of a repeated enum, by lower-case name. */
+function known<E extends Record<string, string | number>, N extends string>(e: E, values: number[]): N[] {
+  return [...new Set(values.filter((v) => v in e && v !== 0).map((v) => name(e, v)))] as unknown as N[];
+}
+
+const kinds = (list: Kind[]) => known<typeof Kind, KindName>(Kind, list);
+const roles = (list: Role[]) => known<typeof Role, RoleName>(Role, list);
+
+export const profile = (p: WireProfile): Profile => ({ id: p.id, name: p.name, roles: roles(p.roles) });
 
 function hidpp(d: Device): Integration | null {
   const i = d.integrations.find((x) => x.kind === IntegrationKind.HIDPP);
@@ -130,7 +151,7 @@ export function device(d: Device): DeviceRecord {
     id: d.id,
     transport: transport(d.transport),
     name: d.name,
-    kind: name(Kind, d.kind),
+    kinds: kinds(d.kinds),
     state: name(DeviceState, d.state),
     enabled: d.enabled,
     trusted: d.trusted,
@@ -148,7 +169,9 @@ export function device(d: Device): DeviceRecord {
       : null,
     hidpp: hidpp(d),
     info: info(d.info),
-    roles: [...new Set(d.roles.filter((r) => r in Role && r !== Role.UNKNOWN).map((r) => name(Role, r)))] as DeviceRecord["roles"],
+    roles: roles(d.roles),
+    profiles: d.profiles ? [...d.profiles.profiles] : null,
+    profileError: d.profileError === undefined ? null : errorCode(d.profileError),
   };
 }
 
@@ -206,14 +229,14 @@ export function setting(s: WireSetting): Setting | null {
 export const settings = (list: WireSetting[]) => list.flatMap((s) => setting(s) ?? []);
 
 export function candidate(c: WireCandidate): Candidate {
-  return { id: c.id, transport: transport(c.transport), name: c.name, kind: name(Kind, c.kind), rssi: optional(c.rssi) };
+  return { id: c.id, transport: transport(c.transport), name: c.name, kinds: kinds(c.kinds), rssi: optional(c.rssi) };
 }
 
 /** A pairing step: a prompt for the user, the saved device, or the failure. */
 export type PairingStep =
   | { kind: "progress" }
   | { kind: "prompt"; prompt: PairingPrompt }
-  | { kind: "done"; device: string }
+  | { kind: "done"; device: number }
   | { kind: "failed"; code: ReturnType<typeof errorCode> };
 
 export function pairingStep(p: Pairing): PairingStep {

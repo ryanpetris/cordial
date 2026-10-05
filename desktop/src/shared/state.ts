@@ -3,6 +3,7 @@
 // and the development server's JSON. Enum values are the protocol's names in
 // lower case; a value this app doesn't know reads as the enum's zero value.
 import type {
+  CapacityReason,
   CodeKind,
   DeviceState,
   ErrorCode,
@@ -22,8 +23,10 @@ type Name<E> = Lowercase<Extract<keyof E, string>>;
 export type Code = Name<typeof ErrorCode>;
 export type HostPlatform = Name<typeof Platform>;
 export type TransportName = Exclude<Name<typeof Transport>, "unspecified">;
-export type CandidateKind = Name<typeof Kind>;
-export type DeviceKind = Exclude<CandidateKind, "unknown">;
+/** What a device or candidate says it is; kinds this app doesn't know are skipped. */
+export type KindName = Exclude<Name<typeof Kind>, "unknown">;
+/** What the app shows a device or candidate as: one kind, or both a keyboard and a mouse. */
+export type DeviceKind = "keyboard" | "mouse" | "keyboard_mouse" | "other";
 export type ConnectionState = Name<typeof DeviceState>;
 export type Inactive = Name<typeof InactiveReason>;
 export type RoleName = Exclude<Name<typeof Role>, "unknown">;
@@ -40,7 +43,7 @@ export type ValueType = "bool" | "integer" | "enum" | "text" | "color";
 export interface WireError {
   code: Code;
   /** What ran out, for `no_capacity`. */
-  reason: "unknown" | "enabled" | "storage" | "connections" | null;
+  reason: Name<typeof CapacityReason> | null;
   /** For `storage_failed`: the save may or may not have happened. */
   outcomeUnknown: boolean;
 }
@@ -58,10 +61,54 @@ export interface AdapterStatus {
   platform: HostPlatform;
   ready: boolean;
   /** Transports the firmware supports and whether each is enabled; `maxEnabled` is null while
-   * unknown. `settable` is false on firmware that predates the setting: it uses every transport
-   * it supports and can't change that. */
-  transports: { transport: TransportName; maxEnabled: number | null; enabled: boolean; settable: boolean }[];
+   * unknown. */
+  transports: { transport: TransportName; maxEnabled: number | null; enabled: boolean }[];
   info: InfoEntry[];
+  /** Null on a board without profile support, which has no configuration interfaces either. */
+  profileSupport: ProfileSupport | null;
+  /** Every configuration interface the firmware supports, enabled or not. */
+  interfaces: InterfaceState[];
+}
+
+/** What the adapter supports for profiles. */
+export interface ProfileSupport {
+  /** Bytes of memory for loaded profiles, and how many are in use. */
+  memoryBudget: number;
+  memoryUsed: number;
+  /** The most profiles one device's layers can list. */
+  maxLayers: number;
+}
+
+/** A configuration interface's saved preferences. */
+export interface InterfaceState {
+  /** The protocol's ConfigurationInterface number, passed back unchanged. */
+  interface: number;
+  enabled: boolean;
+  /** The profile it edits; 0 when none is selected. */
+  profile: number;
+  /** Interfaces it can't be enabled alongside. */
+  conflicts: number[];
+}
+
+/** A saved profile. */
+export interface Profile {
+  id: number;
+  name: string;
+  /** The kinds of input its rules change. */
+  roles: RoleName[];
+}
+
+/** The shown page of the adapter's profiles. */
+export interface ProfilePage {
+  profiles: Profile[];
+  /** Profiles in the page's range whose record the adapter couldn't read. */
+  unreadable: number[];
+  /** Whether a previous or a following page exists. */
+  previous: boolean;
+  next: boolean;
+  loading: boolean;
+  /** Why the last read failed, in words. */
+  error: string | null;
 }
 
 export interface Security {
@@ -84,11 +131,12 @@ export interface Integration {
 }
 
 export interface DeviceRecord {
-  id: string;
+  id: number;
   transport: TransportName | null;
   /** The best known name: reported by the device, else seen at pairing. */
   name: string;
-  kind: CandidateKind;
+  /** What the device is; empty while unknown. */
+  kinds: KindName[];
   state: ConnectionState;
   enabled: boolean;
   trusted: boolean;
@@ -103,6 +151,10 @@ export interface DeviceRecord {
   hidpp: Integration | null;
   info: InfoEntry[];
   roles: RoleName[];
+  /** The device's layers: profile IDs in the order they apply. Null without profile support. */
+  profiles: number[] | null;
+  /** Why the connected device's profiles aren't loaded. */
+  profileError: Code | null;
 }
 
 export interface DeviceWarning {
@@ -154,7 +206,7 @@ export type SettingsChange =
 
 export interface SettingsSaveItem {
   change: SettingsChange;
-  status: "pending" | "saving" | "saved" | "not_saved" | "not_sent";
+  status: "saving" | "saved" | "not_saved";
   error: string | null;
 }
 
@@ -162,6 +214,32 @@ export interface SettingsSaveItem {
 export interface SettingsSave {
   running: boolean;
   items: SettingsSaveItem[];
+}
+
+/** Device settings to change; each omitted field stays as it is. */
+export interface DeviceChanges {
+  enabled?: boolean;
+  trusted?: boolean;
+  blocked?: boolean;
+  /** Whether HID++ is enabled. */
+  hidpp?: boolean;
+  /** The device's layers, in the order they apply. */
+  profiles?: number[];
+}
+
+/** Adapter settings to change; each omitted field stays as it is. */
+export interface AdapterChanges {
+  platform?: HostPlatform;
+  /** Whether each listed transport is enabled. */
+  transports?: Partial<Record<TransportName, boolean>>;
+  /** Configuration interface preferences by the protocol's ConfigurationInterface number; a
+   * profile of 0 clears it. */
+  interfaces?: Record<string, InterfaceChange>;
+}
+
+export interface InterfaceChange {
+  enabled?: boolean;
+  profile?: number;
 }
 
 export interface AdapterEntry {
@@ -175,6 +253,13 @@ export interface AdapterEntry {
   status: AdapterStatus | null;
   /** Problems worth the tray's attention badge. */
   attention: string[];
+  /** The Profiles list's page; null without profile support. */
+  profilePage: ProfilePage | null;
+  /** The profile picker's page, read separately so paging it leaves the list where it is; null
+   * without profile support or before the picker first opens. */
+  pickerPage: ProfilePage | null;
+  /** The profiles this session has seen, by ID, for naming layers and interface profiles. */
+  profileNames: Record<string, Profile>;
 }
 
 export interface DeviceEntry {
@@ -202,10 +287,11 @@ export interface DeviceEntry {
 }
 
 export interface Candidate {
-  id: string;
+  id: number;
   transport: TransportName | null;
   name: string;
-  kind: CandidateKind;
+  /** What the candidate says it is; empty while unknown. */
+  kinds: KindName[];
   rssi: number | null;
 }
 
@@ -227,7 +313,7 @@ export type PairingPrompt =
 
 export interface PairingState {
   adapterId: string;
-  candidateId: string;
+  candidateId: number;
   name: string;
   phase: "pairing" | "connecting" | "connected" | "saved" | "failed" | "cancelled";
   prompt: PairingPrompt | null;
@@ -235,6 +321,12 @@ export interface PairingState {
   /** Explanation for the saved-but-not-connected and failed phases. */
   message: string | null;
 }
+
+/** Profile problems worth a notification: the adapter's profile memory nearly full, or a connected
+ * device whose profiles aren't loaded. */
+export type ProfileAlert =
+  | { kind: "memory"; adapterId: string; name: string; percent: number }
+  | { kind: "device"; key: string; name: string; code: Code };
 
 export interface Preferences {
   startAtLogin: boolean;
@@ -267,28 +359,44 @@ export interface AppState {
   preferences: Preferences;
   /** The platform this app runs on, for the adapter platform hint. */
   hostPlatform: HostPlatform;
+  /** Counts the controller's publications, so an action's result can name the state that
+   * includes its effect. */
+  revision: number;
 }
 
 export type Action =
   /** `device.refresh` reads the connected device again; `device.reload` reads its warning and settings lists from the adapter again. */
   | { type: "device.connect" | "device.disconnect" | "device.unpair" | "device.refresh" | "device.reload"; key: string }
-  | { type: "device.enabled" | "device.trusted" | "device.blocked" | "device.hidpp"; key: string; value: boolean }
+  /** Changes the given device settings in one request; omitted ones stay as they are. */
+  | ({ type: "device.update"; key: string } & DeviceChanges)
   | { type: "settings.save"; key: string; changes: SettingsChange[] }
   | { type: "adapter.name"; adapterId: string; name: string | null }
-  | { type: "adapter.platform"; adapterId: string; platform: HostPlatform }
-  | { type: "adapter.transport"; adapterId: string; transport: TransportName; enabled: boolean }
-  | { type: "adapter.connect" | "adapter.disconnect" | "adapter.menu"; adapterId: string }
+  /** Changes the given adapter settings in one request; omitted ones stay as they are. */
+  | ({ type: "adapter.settings"; adapterId: string } & AdapterChanges)
+  /** Creates an empty profile. */
+  | { type: "profile.create"; adapterId: string; name: string }
+  | { type: "profile.copy"; adapterId: string; profile: number; name: string }
+  | { type: "profile.delete"; adapterId: string; profile: number }
+  /** Shows the first, next or previous page of profiles. */
+  | { type: "profiles.page"; adapterId: string; page: "first" | "next" | "previous"; picker?: boolean }
+  /** `adapter.reload` reads the shown profile page again. */
+  | { type: "adapter.connect" | "adapter.disconnect" | "adapter.menu" | "adapter.reload"; adapterId: string }
   | { type: "adapters.refresh" }
   /** Opens the window's app menu at a point in CSS pixels from the window's top left. */
   | { type: "app.menu"; x: number; y: number }
   | { type: "scan.start"; adapterId: string }
   | { type: "scan.stop" }
-  | { type: "pair.start"; adapterId: string; candidateId: string }
+  | { type: "pair.start"; adapterId: string; candidateId: number }
   | { type: "pair.reply"; accept: boolean; value?: string }
   | { type: "pair.cancel" | "pair.dismiss" }
   | { type: "preferences"; preferences: Partial<Preferences> };
 
-export type ActionResult = ({ ok: true } | { ok: false; message: string; inline?: boolean }) & { settingsSave?: SettingsSave };
+export type ActionResult = ({ ok: true } | { ok: false; message: string; inline?: boolean }) & {
+  settingsSave?: SettingsSave;
+  /** The published state that includes the action's effect; the window waits for it before it
+   * finishes the action, so controls never show the state from before the action. */
+  revision?: number;
+};
 
 /** Where the main process asks the window to go. */
 export type Navigation =

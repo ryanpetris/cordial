@@ -125,7 +125,7 @@ fn initialized_store_requires_the_monotonic_sequence_even_without_devices() {
     let mut store = support::Store::default();
     block_on(Identity::initialize(&mut store, [2; 6], || 42)).unwrap();
     let sequence = cordial_core::storage::record_key(7, 0);
-    assert_eq!(store.records[&sequence], b"0");
+    assert_eq!(store.records[&sequence], br#"{"device":0,"profile":0}"#);
     store.records.remove(&sequence);
     assert_eq!(
         block_on(Identity::initialize(&mut store, [2; 6], || 42)),

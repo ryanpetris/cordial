@@ -4,7 +4,7 @@ afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
 
 it("keeps chooser dismissal quiet and returns genuine chooser failures", async () => {
   const choosePort = vi.fn();
-  vi.stubGlobal("window", { cordial: { host: { choosePort } } });
+  vi.stubGlobal("window", { cordial: { host: { choosePort }, onState: vi.fn() } });
   const { chooseAdapter } = await import("../src/renderer/api.ts");
   choosePort.mockRejectedValueOnce(new DOMException("No port selected", "NotFoundError"));
   expect(await chooseAdapter()).toEqual({ ok: true });
@@ -27,11 +27,11 @@ it("propagates serial chooser failures through the web backend", async () => {
 });
 
 it("keeps transport failures in the action's feedback surface", async () => {
-  vi.stubGlobal("window", { cordial: { act: vi.fn().mockRejectedValue(new Error("IPC unavailable")) } });
+  vi.stubGlobal("window", { cordial: { act: vi.fn().mockRejectedValue(new Error("IPC unavailable")), onState: vi.fn() } });
   const { act, setReporter } = await import("../src/renderer/api.ts");
   const report = vi.fn();
   setReporter(report);
-  expect(await act({ type: "device.refresh", key: "A/d_1" }, true)).toMatchObject({ ok: false });
+  expect(await act({ type: "device.refresh", key: "A/1" }, true)).toMatchObject({ ok: false });
   expect(report).not.toHaveBeenCalled();
   expect(await act({ type: "adapters.refresh" })).toMatchObject({ ok: false });
   expect(report).toHaveBeenCalledExactlyOnceWith("Couldn't confirm that action.");

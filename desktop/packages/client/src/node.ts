@@ -7,7 +7,7 @@
 // issues a break request as well, which the Dongle's CDC interface doesn't
 // advertise or support.
 import { SerialPort } from "serialport";
-import { USB_MANUFACTURER, USB_PRODUCT_ID, USB_VENDOR_ID } from "@cordial/protocol";
+import { USB_PRODUCT_ID, USB_VENDOR_ID } from "@cordial/protocol";
 import type { ByteStream, PortInfo } from "./stream.ts";
 
 export * from "./index.ts";
@@ -15,13 +15,12 @@ export * from "./index.ts";
 const VENDOR_ID = USB_VENDOR_ID.toString(16);
 const PRODUCT_ID = USB_PRODUCT_ID.toString(16);
 
-/** Serial ports carrying the Dongle's USB IDs and manufacturer; opening them is left to the session. */
+/** Serial ports carrying the Dongle's USB IDs; opening them is left to the session. */
 export async function listPorts(): Promise<PortInfo[]> {
   const ports = await SerialPort.list();
   const found = ports
     .filter((p) => p.vendorId?.toLowerCase() === VENDOR_ID
-      && p.productId?.toLowerCase() === PRODUCT_ID
-      && p.manufacturer === USB_MANUFACTURER)
+      && p.productId?.toLowerCase() === PRODUCT_ID)
     .map((p) => ({ path: p.path, serial: p.serialNumber ?? "" }));
   // macOS lists both callout and dial-in nodes for one USB serial device.
   const callouts = new Set(found.flatMap((p) => (p.path.startsWith("/dev/cu.") ? [p.path.slice(8)] : [])));

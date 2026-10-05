@@ -23,7 +23,7 @@ try {
   // A device opens on Details, the first tab, whose bar holds Forget Device
   // and the connection button; the header holds no buttons.
   await tab("Details").waitFor();
-  assert.deepEqual(await page.getByRole("tab").allTextContents(), ["Details", "Settings", "Diagnostics"]);
+  assert.deepEqual(await page.getByRole("tab").allTextContents(), ["Details", "Settings", "Profiles", "Diagnostics"]);
   assert.equal(await tab("Details").getAttribute("aria-selected"), "true");
   await bar.getByRole("button", { name: "Forget Device", exact: true }).waitFor();
   await bar.getByRole("button", { name: "Disconnect", exact: true }).waitFor();
@@ -163,7 +163,7 @@ try {
   // A device with no settings to show has no Settings tab.
   await page.getByRole("button", { name: /Travel Keyboard/ }).first().click();
   await tab("Settings").waitFor({ state: "detached" });
-  assert.deepEqual(await page.getByRole("tab").allTextContents(), ["Details", "Diagnostics"]);
+  assert.deepEqual(await page.getByRole("tab").allTextContents(), ["Details", "Profiles", "Diagnostics"]);
   await bar.getByRole("button", { name: "Forget Device", exact: true }).waitFor();
   await bar.getByRole("button", { name: "Connect", exact: true }).waitFor();
   await page.getByRole("button", { name: /Example Keys/ }).first().click();
@@ -259,13 +259,12 @@ try {
     running: false,
     items: [
       { change: { type: "set", setting: "backlight.level", value: 5 }, status: "not_saved", error: "The adapter is busy" },
-      { change: { type: "forget", setting: "backlight.mode" }, status: "not_sent", error: "The adapter is busy" },
+      { change: { type: "forget", setting: "backlight.mode" }, status: "not_saved", error: "The adapter is busy" },
     ],
   };
   await publish();
-  await page.getByText("Couldn't Save: The adapter is busy", { exact: true }).waitFor();
-  await page.getByText("Not Sent: The adapter is busy", { exact: true }).waitFor();
-  await page.getByText("Couldn't Save 1 · Not Sent 1", { exact: true }).waitFor();
+  assert.equal(await page.getByText("Couldn't Save: The adapter is busy", { exact: true }).count(), 2);
+  await page.getByText("Couldn't Save 2", { exact: true }).waitFor();
   entry.settingsSave = null;
 
   // Logitech Features off still saves.
@@ -410,6 +409,25 @@ try {
   entry.device.inactive = null;
   await publish();
 
+  // Details changes stage until Save, which sends them in one request; a failed save keeps them.
+  const trust = page.getByRole("switch", { name: "Automatic Connections", exact: true });
+  const trusted = await trust.isChecked();
+  const sent = (await actions()).length;
+  await trust.click();
+  await page.getByRole("img", { name: "Automatic Connections, Changed", exact: true }).waitFor();
+  assert.equal((await actions()).length, sent);
+  await fail("device.update");
+  await bar.getByRole("button", { name: "Save", exact: true }).click();
+  await bar.getByText("Couldn't save this value.", { exact: true }).waitFor();
+  assert.equal(await trust.isChecked(), !trusted);
+  await fail(null);
+  await page.keyboard.press("Control+s");
+  await page.getByRole("img", { name: "Automatic Connections, Changed", exact: true }).waitFor({ state: "detached" });
+  assert.deepEqual((await actions()).slice(sent), [
+    { type: "device.update", key: entry.key, trusted: !trusted },
+    { type: "device.update", key: entry.key, trusted: !trusted },
+  ]);
+
   // A device without settings shows its details without a Settings tab, and
   // the tab chosen earlier returns with it. A focused control keeps its focus.
   await tab("Settings").click();
@@ -441,6 +459,43 @@ try {
   await page.getByRole("tab", { name: "Details", selected: true }).waitFor();
   assert.equal(await automatic.evaluate((e) => e === document.activeElement), true);
 
+  // The Profiles tab lists the device's layers in order; changes stage until its own Save.
+  const owner = state.adapters.find((a) => a.id === entry.adapterId);
+  owner.profileNames = { 1: { id: 1, name: "Typing", roles: ["keyboard"] }, 2: { id: 2, name: "Scrolling", roles: ["mouse"] } };
+  owner.profilePage = { profiles: Object.values(owner.profileNames), unreadable: [], previous: false, next: false, loading: false, error: null };
+  owner.pickerPage = owner.profilePage;
+  entry.device.state = "connected";
+  entry.device.profiles = [1];
+  await publish();
+  assert.deepEqual(await page.getByRole("tab").allTextContents(), ["Details", "Settings", "Profiles", "Diagnostics"]);
+  await tab("Profiles").click();
+  await page.getByRole("button", { name: "Typing, Remove", exact: true }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "Typing, Move Up", exact: true }).isDisabled(), true);
+  await page.getByRole("button", { name: "Add Profile", exact: true }).click();
+  const add = page.getByRole("dialog", { name: "Add Profile", exact: true });
+  await add.getByRole("radio", { name: "Scrolling", exact: true }).check();
+  await add.getByRole("button", { name: "Choose", exact: true }).click();
+  await add.waitFor({ state: "hidden" });
+  await page.getByRole("button", { name: "Scrolling, Move Up", exact: true }).click();
+  await page.getByRole("img", { name: "Profiles, Changed", exact: true }).waitFor();
+  // A staged layer change belongs to Profiles; Details has nothing to save.
+  await tab("Details").click();
+  assert.equal(await save.isDisabled(), true);
+  await tab("Profiles").click();
+  await save.click();
+  assert.deepEqual((await actions()).at(-1), { type: "device.update", key: entry.key, profiles: [2, 1] });
+  entry.device.profiles = [2, 1];
+  await publish();
+  await page.getByRole("img", { name: "Profiles, Changed", exact: true }).waitFor({ state: "detached" });
+  // A connected device whose profiles aren't loaded says why on Diagnostics.
+  entry.device.profileError = "no_capacity";
+  await publish();
+  await tab("Diagnostics").click();
+  await page.getByText("The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.", { exact: true }).waitFor();
+  await tab("Details").click();
+  entry.device.profileError = null;
+  await publish();
+
   state.scan = { adapterId: entry.adapterId, running: false, candidates: [], error: null };
   await publish();
   await page.getByRole("button", { name: "Add Device", exact: true }).click();
@@ -451,7 +506,7 @@ try {
   state.scan.error = "The search failed.";
   await publish();
   await pairing.getByRole("button", { name: "Retry", exact: true }).waitFor();
-  state.scan.candidates = [{ id: "nearby", name: "Nearby Keyboard", transport: "ble", kind: "keyboard", rssi: null }];
+  state.scan.candidates = [{ id: 7, name: "Nearby Keyboard", transport: "ble", kinds: ["keyboard"], rssi: null }];
   await publish();
   await pairing.getByRole("button", { name: "Pair", exact: true }).waitFor();
   state.scan.error = null;
@@ -472,7 +527,7 @@ try {
   status.info.pop();
   await publish();
   // Each prompt step asks for what it needs.
-  state.pairing = { adapterId: entry.adapterId, candidateId: "nearby", name: "Nearby Keyboard", phase: "pairing", prompt: null, deviceKey: null, message: null };
+  state.pairing = { adapterId: entry.adapterId, candidateId: 7, name: "Nearby Keyboard", phase: "pairing", prompt: null, deviceKey: null, message: null };
   await publish();
   await pairing.getByText("Pairing with Nearby Keyboard…", { exact: true }).waitFor();
   state.pairing.prompt = { kind: "show", code: "passkey", value: "042731" };

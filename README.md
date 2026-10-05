@@ -79,7 +79,6 @@ command-line tool. You can install either package or both.
 sudo pacman -U cordial-desktop-*-x86_64.pkg.tar.zst
 # Optional command-line tool:
 sudo pacman -U cordial-cli-*-x86_64.pkg.tar.zst
-sudo usermod -aG uucp "$USER"
 ```
 
 **Debian 13, Ubuntu 24.04 and Ubuntu 26.04**
@@ -88,15 +87,21 @@ sudo usermod -aG uucp "$USER"
 sudo apt install ./cordial-desktop_*_amd64.deb
 # Optional command-line tool:
 sudo apt install ./cordial-cli_*_amd64.deb
-sudo usermod -aG dialout "$USER"
 ```
 
 Choose the files marked `trixie` for Debian 13, `noble` for Ubuntu 24.04, or
-`resolute` for Ubuntu 26.04.
+`resolute` for Ubuntu 26.04. If the adapter was plugged in during installation, unplug it and plug
+it back in.
+
+The packages give the signed-in user access to the adapter. Over SSH or without a desktop session,
+add yourself to the group that owns `/dev/ttyACM*` instead: `uucp` on Arch Linux, `dialout` on
+Debian and Ubuntu.
 
 **Other distributions:** download `cordial-desktop-*-x86_64.AppImage` for the desktop
-app, or `cordial-cli-*-linux-amd64.tar.gz` for the command-line tool alone, and add
-yourself to the group that owns `/dev/ttyACM*`. Make the AppImage executable with
+app, or `cordial-cli-*-linux-amd64.tar.gz` for the command-line tool alone. To use the adapter
+without root, copy `50-cordial.rules` from a tar archive (or from `configs/` in this repository) to
+`/etc/udev/rules.d/` and reconnect the adapter, or add yourself to the group that owns
+`/dev/ttyACM*`. Make the AppImage executable with
 `chmod +x` before running it. A desktop tar archive is also available as
 `cordial-desktop-*-x64.tar.gz`; extract it and run the included `cordial-desktop`.
 

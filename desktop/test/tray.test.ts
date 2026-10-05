@@ -12,13 +12,16 @@ const adapter = (id: string, patch: Partial<AdapterEntry> = {}): AdapterEntry =>
   readiness: "ready",
   status: null,
   attention: [],
+  profilePage: null,
+  pickerPage: null,
+  profileNames: {},
   ...patch,
 });
 
 const entry = (adapterId: string, id: string, patch: Partial<DeviceEntry> = {}, state = "disconnected"): DeviceEntry => ({
   key: `${adapterId}/${id}`,
   adapterId,
-  device: record(id, { state: state as never }),
+  device: record(Number(id), { state: state as never }),
   name: id,
   kind: "keyboard",
   battery: null,
@@ -38,6 +41,7 @@ const app = (adapters: AdapterEntry[], devices: DeviceEntry[], alwaysShowTray = 
   pairing: null,
   preferences: { ...DEFAULT_PREFERENCES, alwaysShowTray },
   hostPlatform: "linux",
+  revision: 1,
 });
 
 describe("trayModel", () => {
@@ -48,24 +52,24 @@ describe("trayModel", () => {
   });
 
   it("fills when a device is connected and badges low battery first", () => {
-    const idle = trayModel(app([adapter("A")], [entry("A", "d_1")]));
+    const idle = trayModel(app([adapter("A")], [entry("A", "1")]));
     expect([idle.visible, idle.base, idle.badge]).toEqual([true, "idle", "none"]);
     const low = trayModel(
       app(
         [adapter("A", { attention: ["1 device needs pairing again"] })],
-        [entry("A", "d_1", { battery: { percent: 20, charging: false, percentFresh: true, chargingFresh: true } }, "connected")],
+        [entry("A", "1", { battery: { percent: 20, charging: false, percentFresh: true, chargingFresh: true } }, "connected")],
       ),
     );
     expect([low.base, low.badge]).toEqual(["connected", "low"]);
-    expect(low.groups[0]!.devices[0]!.label).toBe("d_1 — Connected · 20% (low)");
+    expect(low.groups[0]!.devices[0]!.label).toBe("1 — Connected · 20% (low)");
     expect(low.tooltip).toContain("1 device connected");
   });
 
   it("groups devices by adapter only with several adapters", () => {
-    const one = trayModel(app([adapter("A")], [entry("A", "d_1")]));
+    const one = trayModel(app([adapter("A")], [entry("A", "1")]));
     expect(one.groups.map((g) => g.title)).toEqual([null]);
-    expect(one.groups[0]!.devices[0]!.label).toBe("d_1 — Disconnected");
-    const two = trayModel(app([adapter("A"), adapter("B")], [entry("A", "d_1"), entry("B", "d_1")]));
+    expect(one.groups[0]!.devices[0]!.label).toBe("1 — Disconnected");
+    const two = trayModel(app([adapter("A"), adapter("B")], [entry("A", "1"), entry("B", "1")]));
     expect(two.groups.map((g) => [g.title, g.devices.length])).toEqual([
       ["Adapter A", 1],
       ["Adapter B", 1],
@@ -85,7 +89,7 @@ describe("battery", () => {
   it("alerts on entering low and critical once", () => {
     const alerts = new BatteryAlerts();
     const d = (percent: number | null, charging: boolean | null = false) => [
-      entry("A", "d_1", { battery: percent == null && charging == null ? null : { percent, charging, percentFresh: percent !== null, chargingFresh: charging !== null } }),
+      entry("A", "1", { battery: percent == null && charging == null ? null : { percent, charging, percentFresh: percent !== null, chargingFresh: charging !== null } }),
     ];
     expect(alerts.update(d(50), 20)).toEqual([]);
     expect(alerts.update(d(20), 20).map((a) => a.level)).toEqual(["low"]);

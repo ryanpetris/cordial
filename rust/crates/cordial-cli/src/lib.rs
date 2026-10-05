@@ -4,6 +4,7 @@ mod commands;
 pub mod controller;
 pub mod error;
 pub mod model;
+pub mod profiles;
 pub mod runner;
 pub mod storage;
 pub mod ui;

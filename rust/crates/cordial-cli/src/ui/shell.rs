@@ -12,6 +12,7 @@ use crate::{
         Backend, Interrupter, Live, Msg, UiError, UiOptions,
         command::{self, Line},
         field::Field,
+        reconnect::{self, Reconnect, Step},
         term::{self, Input, Modes},
         text::{self, Filter, safe},
     },
@@ -65,6 +66,8 @@ pub(crate) struct Model<B: Backend> {
     jobs: HashMap<Ticket, Job>,
     /// Text for scrollback, printed above the prompt before the next draw.
     pub(crate) output: Vec<String>,
+    /// A save that reconnects USB, and then the wait for the adapter to return.
+    reconnect: Option<Reconnect>,
 }
 
 impl<B: Backend> Model<B> {
@@ -87,6 +90,7 @@ impl<B: Backend> Model<B> {
             completion: None,
             jobs: HashMap::new(),
             output: Vec::new(),
+            reconnect: None,
         };
         match port {
             Some(port) => m.open(port),
@@ -117,7 +121,16 @@ impl<B: Backend> Model<B> {
         self.prompt_open().is_some()
     }
 
+    /// Opens a port the user chose.
     fn open(&mut self, port: String) {
+        if self.opening.is_some() || self.quitting {
+            return;
+        }
+        self.reconnect = None;
+        self.open_port(port);
+    }
+
+    fn open_port(&mut self, port: String) {
         if self.opening.is_some() || self.quitting {
             return;
         }
@@ -139,6 +152,11 @@ impl<B: Backend> Model<B> {
     fn run(&mut self, command: Command, filter: Option<Filter>) {
         let ticket = self.backend.run(command.clone());
         let session = self.session;
+        if reconnect::may_reconnect(&command)
+            && let (Some(session), Some(st)) = (session, self.state())
+        {
+            self.reconnect = Some(Reconnect::new(session, ticket, &st.status));
+        }
         self.jobs.insert(
             ticket,
             Job {
@@ -164,6 +182,42 @@ impl<B: Backend> Model<B> {
 
     pub(crate) fn tick(&mut self) {
         self.sync_auth();
+        self.sync_reconnect();
+    }
+
+    /// How long the shell waits for a message before a tick: shorter while the adapter is
+    /// expected back after a USB reconnect.
+    fn tick_interval(&self) -> Duration {
+        if self.reconnect.as_ref().is_some_and(Reconnect::waiting) {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        }
+    }
+
+    /// Lists the ports while waiting for the adapter to return after a USB reconnect, and
+    /// reports its loss if it doesn't return in time.
+    fn sync_reconnect(&mut self) {
+        let Some(r) = &mut self.reconnect else { return };
+        if r.lapsed() {
+            self.reconnect = None;
+            return;
+        }
+        // An open in progress finishes first.
+        if self.quitting || self.opening.is_some() {
+            return;
+        }
+        match r.step() {
+            Step::Wait => {}
+            Step::List => self.backend.list_ports(),
+            Step::GiveUp(error) => {
+                self.reconnect = None;
+                self.log(format!(
+                    "Adapter unavailable: {}",
+                    safe(&text::error_line(&error))
+                ));
+            }
+        }
     }
 
     pub(crate) fn update(&mut self, msg: Msg) {
@@ -181,9 +235,17 @@ impl<B: Backend> Model<B> {
             Msg::Controller(e) => self.controller(*e),
             Msg::Key(k) => self.key(k),
         }
+        self.sync_reconnect();
     }
 
     fn ports_listed(&mut self, result: Result<Vec<PortInfo>, String>) {
+        if let Some(r) = self.reconnect.as_mut().filter(|r| r.waiting()) {
+            // A failed listing is tried again.
+            if let Some(port) = r.listed(result.as_deref().unwrap_or_default()) {
+                self.open_port(port);
+            }
+            return;
+        }
         if !std::mem::take(&mut self.startup) {
             match result {
                 Ok(ports) => self.log(text::ports(&ports)),
@@ -217,6 +279,12 @@ impl<B: Backend> Model<B> {
                 }
             }
             Event::Done { ticket, result, .. } => {
+                let available = self.state().is_some_and(|st| st.available);
+                if let Some(r) = &mut self.reconnect
+                    && !r.done(ticket, &result, available)
+                {
+                    self.reconnect = None;
+                }
                 if let Some(job) = self.jobs.remove(&ticket)
                     && job.session == self.session
                 {
@@ -234,12 +302,25 @@ impl<B: Backend> Model<B> {
                 if self.quitting {
                     return;
                 }
+                self.reconnect = None;
                 self.session = Some(session);
                 self.preparing = true;
                 let port = safe(&self.port);
                 self.log(format!("Connected to {port}. Use help for commands."));
             }
             Phase::Ready if self.session == Some(session) => self.preparing = false,
+            Phase::Failed { open: false, .. }
+                if (self.opening == Some(session) || self.session == Some(session))
+                    && self.reconnect.as_ref().is_some_and(Reconnect::waiting) =>
+            {
+                // The returning adapter's port may not open at first.
+                self.opening = None;
+                self.session = None;
+                self.preparing = false;
+                if let Some(r) = &mut self.reconnect {
+                    r.retry();
+                }
+            }
             Phase::Failed { error, open } => {
                 if self.opening == Some(session) {
                     self.opening = None;
@@ -257,6 +338,18 @@ impl<B: Backend> Model<B> {
                     self.session = None;
                     self.log(format!("Open failed: {line}"));
                 }
+            }
+            // The expected loss after a save that reconnects USB: the adapter is reopened once
+            // it returns.
+            Phase::Lost(error)
+                if self.session == Some(session)
+                    && !self.quitting
+                    && self
+                        .reconnect
+                        .as_mut()
+                        .is_some_and(|r| r.lost(session, &error)) =>
+            {
+                self.preparing = false;
             }
             Phase::Lost(error) if self.session == Some(session) && !self.quitting => {
                 self.preparing = false;
@@ -430,7 +523,7 @@ impl<B: Backend> Model<B> {
             Some(open) => {
                 lines.push(format!(
                     "Pair {} {} {}. /COMMAND runs another command.",
-                    safe(&candidate),
+                    candidate,
                     text::prompt_token(&open),
                     safe(text::prompt_value(&open).unwrap_or(""))
                 ));
@@ -525,7 +618,7 @@ impl Shell {
                     break;
                 }
             }
-            match self.rx.recv_timeout(Duration::from_secs(1)) {
+            match self.rx.recv_timeout(model.tick_interval()) {
                 Ok(msg) => {
                     model.update(msg);
                     while let Ok(msg) = self.rx.try_recv() {
@@ -605,7 +698,7 @@ mod tests {
         }
         fn pairing(&mut self, step: p::pairing::Step) {
             self.fake.state.borrow_mut().as_mut().unwrap().pairing = Some(p::Pairing {
-                candidate: "c_2".into(),
+                candidate: 2,
                 step: Some(step),
             });
             self.m.tick();
@@ -621,17 +714,22 @@ mod tests {
         app.done(Ok(Outcome::Devices));
         assert_eq!(app.m.output.len(), 2, "{:?}", app.m.output);
         assert!(
-            app.m.output[1].starts_with("d_1  Keyboard  ble  connected  trusted"),
+            app.m.output[1].starts_with("1  Keyboard  ble  connected  trusted"),
             "{}",
             app.m.output[1]
         );
-        assert!(!app.m.output[1].contains("d_2"), "only connected devices");
+        assert!(
+            !app.m.output[1]
+                .lines()
+                .any(|l| l.trim_start().starts_with("2  ")),
+            "only connected devices"
+        );
         app.typed("scan start up");
         assert_eq!(
             app.m.output.last().unwrap(),
             "Error: invalid arguments for scan start; use help"
         );
-        app.typed("device connect d_1");
+        app.typed("device connect 1");
         app.done(Err(Error::code(ErrorCode::Busy, Some("device connect"))));
         assert!(
             app.m
@@ -648,10 +746,10 @@ mod tests {
     fn history_and_completion() {
         let mut app = App::new();
         app.typed("adapter status");
-        app.typed("device get d_2");
+        app.typed("device get 2");
         app.m.update(Msg::Paste("pair ".into()));
         app.key(KeyCode::Up, KeyModifiers::NONE);
-        assert_eq!(app.m.input.value(), "device get d_2");
+        assert_eq!(app.m.input.value(), "device get 2");
         app.key(KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(app.m.input.value(), "adapter status");
         app.key(KeyCode::Down, KeyModifiers::NONE);
@@ -690,7 +788,7 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "Pair c_2 enter_passkey . /COMMAND runs another command.",
+                "Pair 2 enter_passkey . /COMMAND runs another command.",
                 "> "
             ]
         );
@@ -765,5 +863,75 @@ mod tests {
         assert!(m.output.last().unwrap().ends_with(
             "adapter status, file list, file get and adapter bootloader still work; use adapter select to retry."
         ));
+    }
+
+    impl App {
+        fn connection(&mut self, session: SessionId, phase: Phase) {
+            self.m.update(Msg::Controller(Box::new(Event::Connection {
+                session,
+                port: "/dev/ttyACM0".into(),
+                phase,
+            })));
+        }
+        fn calls(&self) -> Vec<Call> {
+            self.fake.calls.borrow().clone()
+        }
+        /// Turns VIA on with profile 2, then drops the connection as the adapter does when it
+        /// reconnects USB.
+        fn save_and_lose_usb(&mut self) {
+            self.fake.state.borrow_mut().as_mut().unwrap().status.id = "0123456789ABCDEF".into();
+            fixture::with_profiles(&mut self.fake.state.borrow_mut().as_mut().unwrap().status);
+            self.typed("adapter set interface via on 2");
+            assert_eq!(self.runs().len(), 1, "{:?}", self.m.output);
+            let mut saved = self.fake.state.borrow().as_ref().unwrap().status.clone();
+            saved.configuration_interfaces[0].enabled = true;
+            saved.configuration_interfaces[0].profile = 2;
+            self.done(Ok(Outcome::Interface(
+                p::ConfigurationInterface::Via,
+                saved,
+            )));
+            self.fake.state.borrow_mut().as_mut().unwrap().available = false;
+            self.fake.calls.borrow_mut().clear();
+            self.m.output.clear();
+            let session = self.m.session.unwrap();
+            self.connection(session, Phase::Lost(Error::new("unplugged")));
+        }
+    }
+
+    #[test]
+    fn a_save_that_reconnects_usb_reopens_the_adapter_when_it_returns() {
+        let mut app = App::new();
+        app.save_and_lose_usb();
+        assert!(app.m.output.is_empty(), "{:?}", app.m.output);
+        assert_eq!(app.calls(), [Call::List]);
+        // A listing without it isn't printed, and is tried again.
+        app.m.update(Msg::Ports(Ok(Vec::new())));
+        assert!(app.m.output.is_empty(), "{:?}", app.m.output);
+        app.m.reconnect.as_mut().unwrap().hurry();
+        app.m.tick();
+        assert_eq!(app.calls(), [Call::List, Call::List]);
+        app.m.update(Msg::Ports(Ok(vec![PortInfo {
+            port: "/dev/ttyACM1".into(),
+            serial: "0123456789ABCDEF-vial:f64c2b3c".into(),
+        }])));
+        assert_eq!(app.calls().last(), Some(&Call::Open("/dev/ttyACM1".into())));
+        let session = app.fake.next.get();
+        app.connection(session, Phase::Opened);
+        assert!(app.m.reconnect.is_none());
+        assert_eq!(app.m.session, Some(session));
+        assert_eq!(
+            app.m.output,
+            ["Connected to /dev/ttyACM1. Use help for commands."]
+        );
+    }
+
+    #[test]
+    fn an_adapter_that_doesnt_return_is_reported_unavailable() {
+        let mut app = App::new();
+        app.save_and_lose_usb();
+        app.m.reconnect.as_mut().unwrap().expire();
+        app.m.tick();
+        assert_eq!(app.m.output, ["Adapter unavailable: unplugged"]);
+        assert!(app.m.reconnect.is_none());
     }
 }

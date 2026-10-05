@@ -1,8 +1,7 @@
 // Dongle serial ports through the browser's Web Serial API (Chromium only).
 //
-// Web Serial reads neither the USB serial number nor the manufacturer, so
-// ports are filtered by vendor and product ID and the Dongle's status
-// identifies it. It changes DTR without a break request, so opening cycles
+// Web Serial doesn't read the USB serial number, so ports are filtered by
+// vendor and product ID and the Dongle's status identifies it. It changes DTR without a break request, so opening cycles
 // DTR low then high: a new session starts even if the port was left open with
 // DTR high. Input from an earlier session is ignored until the first response.
 // Closing lowers DTR.

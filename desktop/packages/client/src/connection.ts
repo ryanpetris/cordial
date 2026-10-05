@@ -13,20 +13,34 @@ import {
   RequestSchema,
   encodeFrame,
   type Device,
+  type DeviceList,
+  type DeviceListEntry,
   type DeviceSettings,
+  type DeviceWarning,
   type DeviceWarnings,
   type Event,
   type Feature,
+  type FeatureList,
   type FileEntry,
-  type ForgetSettingsSchema,
+  type FileList,
+  type Profile,
+  type ProfileList,
+  type ProfileListEntry,
+  type ProfileRule,
+  type ProfileRules,
   type Request,
   type Response,
   type SetAdapterSchema,
   type SetDeviceSchema,
+  type SetProfileRulesSchema,
   type SetSettingsSchema,
+  type Setting,
+  type SettingRefSchema,
   type Status,
   type Transport,
+  type UsageSchema,
 } from "@cordial/protocol";
+import { featureRef, ruleInput, settingRef } from "./order.ts";
 import type { ByteStream } from "./stream.ts";
 
 /** A request, as the command it carries. */
@@ -62,6 +76,34 @@ export class UnexpectedResponseError extends Error {
     this.command = command;
   }
 }
+
+/** One page of a listing: its entries in the listing's order, and whether nothing follows them. */
+export interface Page<E> {
+  entries: E[];
+  end: boolean;
+}
+
+/**
+ * Reads a listing to its end. Each request passes the key of the last entry received as `after`,
+ * undefined for the first; the Dongle chooses how many entries each page holds. A page without
+ * entries that does not end the listing breaks the protocol and rejects with
+ * UnexpectedResponseError.
+ */
+export async function readAll<E, K>(command: string, read: (after: K | undefined) => Promise<Page<E>>, key: (entry: E) => K): Promise<E[]> {
+  const all: E[] = [];
+  let after: K | undefined;
+  for (;;) {
+    const page = await read(after);
+    all.push(...page.entries);
+    if (page.end) return all;
+    const last = page.entries.at(-1);
+    if (last === undefined) throw new UnexpectedResponseError(command);
+    after = key(last);
+  }
+}
+
+/** The ID a device or profile listing entry is listed by. */
+const entryId = (e: DeviceListEntry | ProfileListEntry) => (e.entry.case === "device" || e.entry.case === "profile" ? e.entry.value.id : e.entry.value ?? 0);
 
 /** The session ended before a request was answered. */
 export class ConnectionClosedError extends Error {
@@ -192,9 +234,11 @@ export class Connection {
   getStatus(): Promise<Status> {
     return this.#call({ case: "getStatus", value: {} }, "status");
   }
-  /** Changes any of the name, the platform and the enabled transports. An empty name restores the default name. */
-  setAdapter(update: MessageInitShape<typeof SetAdapterSchema>): Promise<Status> {
-    return this.#call({ case: "setAdapter", value: update }, "status");
+  /** Changes any of the name, the platform, the enabled transports and the configuration
+   * interfaces. An empty name restores the default name. Success means the Dongle saved exactly
+   * what was sent; an adapter event follows when anything changed. */
+  setAdapter(update: MessageInitShape<typeof SetAdapterSchema>): Promise<void> {
+    return this.#void({ case: "setAdapter", value: update });
   }
   enterBootloader(): Promise<void> {
     return this.#void({ case: "enterBootloader", value: {} });
@@ -207,7 +251,7 @@ export class Connection {
     return this.#void({ case: "stopScan", value: {} });
   }
   /** Progress follows as pairing events. */
-  startPairing(candidate: string): Promise<void> {
+  startPairing(candidate: number): Promise<void> {
     return this.#void({ case: "startPairing", value: { candidate } });
   }
   /** Answers the open prompt; `value` is the code the user typed, if it asked for one. */
@@ -220,46 +264,118 @@ export class Connection {
   cancelPairing(): Promise<void> {
     return this.#void({ case: "cancelPairing", value: {} });
   }
-  async listDevices(): Promise<Device[]> {
-    return (await this.#call({ case: "listDevices", value: {} }, "devices")).devices;
+  /** One page of saved devices with IDs above `after`, the ID of the last entry received. */
+  listDevices(after = 0): Promise<DeviceList> {
+    return this.#call({ case: "listDevices", value: { after } }, "devices");
   }
-  getDevice(device: string): Promise<Device> {
+  /** Every saved device, and the IDs of those whose record could not be read. */
+  listAllDevices(): Promise<DeviceListEntry[]> {
+    return readAll("listDevices", (after = 0) => this.listDevices(after), entryId);
+  }
+  getDevice(device: number): Promise<Device> {
     return this.#call({ case: "getDevice", value: { device } }, "device");
   }
-  /** Changes only the fields set in `update`. */
-  setDevice(update: MessageInitShape<typeof SetDeviceSchema>): Promise<Device> {
-    return this.#call({ case: "setDevice", value: update }, "device");
+  /** Changes only the fields set in `update`. Success means the Dongle saved exactly what was
+   * sent; a device event follows when anything changed. */
+  setDevice(update: MessageInitShape<typeof SetDeviceSchema>): Promise<void> {
+    return this.#void({ case: "setDevice", value: update });
   }
-  connectDevice(device: string): Promise<Device> {
+  connectDevice(device: number): Promise<Device> {
     return this.#call({ case: "connectDevice", value: { device } }, "device");
   }
-  disconnectDevice(device: string): Promise<Device> {
+  disconnectDevice(device: number): Promise<Device> {
     return this.#call({ case: "disconnectDevice", value: { device } }, "device");
   }
   /** device_removed follows once the device is gone. */
-  unpairDevice(device: string): Promise<void> {
+  unpairDevice(device: number): Promise<void> {
     return this.#void({ case: "unpairDevice", value: { device } });
   }
-  refreshDevice(device: string): Promise<void> {
+  refreshDevice(device: number): Promise<void> {
     return this.#void({ case: "refreshDevice", value: { device } });
   }
-  listWarnings(device: string): Promise<DeviceWarnings> {
-    return this.#call({ case: "listWarnings", value: { device } }, "warnings");
+  /** One page of a device's warnings following `after`, the last warning received. */
+  listWarnings(device: number, after?: DeviceWarning): Promise<DeviceWarnings> {
+    return this.#call({ case: "listWarnings", value: { device, after } }, "warnings");
   }
-  listSettings(device: string): Promise<DeviceSettings> {
-    return this.#call({ case: "listSettings", value: { device } }, "settings");
+  listAllWarnings(device: number): Promise<DeviceWarning[]> {
+    return readAll("listWarnings", async (after: DeviceWarning | undefined) => {
+      const page = await this.listWarnings(device, after);
+      return { entries: page.warnings, end: page.end };
+    }, (w) => w);
   }
-  setSettings(update: MessageInitShape<typeof SetSettingsSchema>): Promise<DeviceSettings> {
-    return this.#call({ case: "setSettings", value: update }, "settings");
+  /** One page of a device's settings following `after`, the last setting received. */
+  listSettings(device: number, after?: MessageInitShape<typeof SettingRefSchema>): Promise<DeviceSettings> {
+    return this.#call({ case: "listSettings", value: { device, after } }, "settings");
   }
-  forgetSettings(update: MessageInitShape<typeof ForgetSettingsSchema>): Promise<DeviceSettings> {
-    return this.#call({ case: "forgetSettings", value: update }, "settings");
+  listAllSettings(device: number): Promise<Setting[]> {
+    return readAll("listSettings", async (after: MessageInitShape<typeof SettingRefSchema> | undefined) => {
+      const page = await this.listSettings(device, after);
+      return { entries: page.settings, end: page.end };
+    }, settingRef);
   }
-  async listFeatures(device: string): Promise<Feature[]> {
-    return (await this.#call({ case: "listFeatures", value: { device } }, "features")).features;
+  /** Saves and forgets settings in one write, applied in order. Success means the Dongle saved
+   * exactly what was sent; a settings_changed event follows. */
+  setSettings(update: MessageInitShape<typeof SetSettingsSchema>): Promise<void> {
+    return this.#void({ case: "setSettings", value: update });
   }
-  async listFiles(path: string): Promise<FileEntry[]> {
-    return (await this.#call({ case: "listFiles", value: { path } }, "files")).entries;
+  /** One page of saved profiles with IDs above `after`, the ID of the last entry received. */
+  listProfiles(after = 0): Promise<ProfileList> {
+    return this.#call({ case: "listProfiles", value: { after } }, "profiles");
+  }
+  /** Every saved profile, and the IDs of those whose record could not be read. */
+  listAllProfiles(): Promise<ProfileListEntry[]> {
+    return readAll("listProfiles", (after = 0) => this.listProfiles(after), entryId);
+  }
+  getProfile(profile: number): Promise<Profile> {
+    return this.#call({ case: "getProfile", value: { profile } }, "profile");
+  }
+  /** Saves a new, empty profile named `name` and resolves with its ID; a profile event follows. */
+  async createProfile(name: string): Promise<number> {
+    return (await this.#call({ case: "createProfile", value: { name } }, "profileCreated")).profile;
+  }
+  /** Saves a new profile named `name` with a copy of the source's rules and resolves with its ID;
+   * a profile event follows. */
+  async copyProfile(profile: number, name: string): Promise<number> {
+    return (await this.#call({ case: "copyProfile", value: { profile, name } }, "profileCreated")).profile;
+  }
+  /** profile_removed follows. */
+  deleteProfile(profile: number): Promise<void> {
+    return this.#void({ case: "deleteProfile", value: { profile } });
+  }
+  /** One page of a profile's rules whose inputs follow `after`, the input of the last rule received. */
+  listProfileRules(profile: number, after?: MessageInitShape<typeof UsageSchema>): Promise<ProfileRules> {
+    return this.#call({ case: "listProfileRules", value: { profile, after } }, "profileRules");
+  }
+  listAllProfileRules(profile: number): Promise<ProfileRule[]> {
+    return readAll("listProfileRules", async (after: MessageInitShape<typeof UsageSchema> | undefined) => {
+      const page = await this.listProfileRules(profile, after);
+      return { entries: page.rules, end: page.end };
+    }, ruleInput);
+  }
+  /** Saves and forgets rules in one write, applied in order. Success means the Dongle saved exactly
+   * what was sent; a profile_rules_changed event follows when any rule changed. */
+  setProfileRules(update: MessageInitShape<typeof SetProfileRulesSchema>): Promise<void> {
+    return this.#void({ case: "setProfileRules", value: update });
+  }
+  /** One page of a device's features following `after`, the last feature received. */
+  listFeatures(device: number, after?: ReturnType<typeof featureRef>): Promise<FeatureList> {
+    return this.#call({ case: "listFeatures", value: { device, after } }, "features");
+  }
+  listAllFeatures(device: number): Promise<Feature[]> {
+    return readAll("listFeatures", async (after: ReturnType<typeof featureRef> | undefined) => {
+      const page = await this.listFeatures(device, after);
+      return { entries: page.features, end: page.end };
+    }, featureRef);
+  }
+  /** One page of a directory's entries whose names follow `after`, the last name received. */
+  listFiles(path: string, after = ""): Promise<FileList> {
+    return this.#call({ case: "listFiles", value: { path, after } }, "files");
+  }
+  listAllFiles(path: string): Promise<FileEntry[]> {
+    return readAll("listFiles", async (after: string | undefined) => {
+      const page = await this.listFiles(path, after);
+      return { entries: page.entries, end: page.end };
+    }, (e) => e.name);
   }
   async readFile(path: string): Promise<Uint8Array> {
     return (await this.#call({ case: "readFile", value: { path } }, "file")).data;

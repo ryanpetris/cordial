@@ -1,5 +1,5 @@
 // Inline symbolic icons drawn with currentColor.
-import type { DeviceEntry } from "../../shared/state.ts";
+import type { DeviceKind } from "../../shared/state.ts";
 
 type Props = { size?: number };
 const svg = (size: number, body: React.ReactNode) => (
@@ -35,6 +35,13 @@ export const ComboIcon = ({ size = 24 }: Props) =>
       <rect x="16.5" y="6.5" width="6" height="11" rx="3" />
     </>,
   );
+
+/** Media and volume keys. */
+export const MediaIcon = ({ size = 24 }: Props) =>
+  svg(size, <path d="M4 9.5h3.5L12 6v12l-4.5-3.5H4zM15.5 9.5a3.5 3.5 0 0 1 0 5M18 7a7 7 0 0 1 0 10" />);
+
+/** Power, sleep and wake keys. */
+export const PowerIcon = ({ size = 24 }: Props) => svg(size, <path d="M12 3.5v8M7.2 6.5a7 7 0 1 0 9.6 0" />);
 
 export const UnknownDeviceIcon = ({ size = 24 }: Props) =>
   svg(
@@ -92,6 +99,9 @@ export const GearIcon = ({ size = 16 }: Props) =>
 export const MenuIcon = ({ size = 16 }: Props) => svg(size, <path d="M4 7h16M4 12h16M4 17h16" />);
 export const ChevronIcon = ({ size = 16 }: Props) => svg(size, <path d="M9 6l6 6-6 6" />);
 export const PlusIcon = ({ size = 16 }: Props) => svg(size, <path d="M12 5v14M5 12h14" />);
+export const CopyIcon = ({ size = 16 }: Props) => svg(size, <path d="M9 9h11v11H9zM5 15H4V4h11v1" />);
+export const ArrowUpIcon = ({ size = 16 }: Props) => svg(size, <path d="M12 19V5M6 11l6-6 6 6" />);
+export const ArrowDownIcon = ({ size = 16 }: Props) => svg(size, <path d="M12 5v14M6 13l6 6 6-6" />);
 export const CheckIcon = ({ size = 16 }: Props) => svg(size, <path d="M5 12.5l4.5 4.5L19 7.5" />);
 export const CloseIcon = ({ size = 16 }: Props) => svg(size, <path d="M7 7l10 10M17 7 7 17" />);
 export const UndoIcon = ({ size = 16 }: Props) => svg(size, <path d="M9 14 4 9l5-5M4 9h10.5a5.5 5.5 0 0 1 0 11H11" />);
@@ -101,6 +111,7 @@ export const PlugIcon = ({ size = 16 }: Props) => svg(size, <path d="M9 3v4M15 3
 export const UnplugIcon = ({ size = 16 }: Props) => svg(size, <path d="M9 3v4M15 3v4M7 7h10v3a5 5 0 0 1-10 0zM12 15v6M3 3l18 18" />);
 export const LinkIcon = ({ size = 16 }: Props) =>
   svg(size, <path d="M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1.2 1.2M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1.2-1.2" />);
+export const MoreIcon = ({ size = 16 }: Props) => svg(size, <path d="M5.5 12h.01M12 12h.01M18.5 12h.01" strokeWidth={3} />);
 export const SwapIcon = ({ size = 16 }: Props) => svg(size, <path d="M4 8h15M15 4l4 4-4 4M20 16H5M9 12l-4 4 4 4" />);
 export const WarningIcon = ({ size = 16 }: Props) =>
   svg(size, <path d="M12 3.5l9.5 16.5h-19zM12 10v4.5M12 17.2h.01" />);
@@ -123,7 +134,7 @@ export function StateMark({ shape, size = 14 }: { shape: MarkShape; size?: numbe
   }
 }
 
-export function DeviceIcon({ kind, size = 24 }: { kind: DeviceEntry["kind"]; size?: number }) {
+export function DeviceIcon({ kind, size = 24 }: { kind: DeviceKind; size?: number }) {
   switch (kind) {
     case "keyboard":
       return <KeyboardIcon size={size} />;

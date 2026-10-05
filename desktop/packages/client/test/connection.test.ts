@@ -1,7 +1,7 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { ErrorCode, FrameDecoder, MessageSchema, RequestSchema, Transport, encodeFrame, type Request } from "@cordial/protocol";
 import { describe, expect, it, vi } from "vitest";
-import { Connection, ConnectionClosedError, CordialError, type ByteStream } from "../src/index.ts";
+import { Connection, ConnectionClosedError, CordialError, UnexpectedResponseError, type ByteStream } from "../src/index.ts";
 
 /** A stream whose far end the test plays: it records requests and sends messages. */
 class Peer implements ByteStream {
@@ -48,7 +48,7 @@ class Peer implements ByteStream {
 
 const status = { kind: { case: "response", value: { result: { case: "status", value: { id: "A1", name: "Desk" } } } } } as const;
 const ok = { kind: { case: "response", value: {} } } as const;
-const removed = (id: string) => ({ kind: { case: "event", value: { kind: { case: "deviceRemoved", value: { id } } } } }) as const;
+const removed = (id: number) => ({ kind: { case: "event", value: { kind: { case: "deviceRemoved", value: { id } } } } }) as const;
 
 async function open(options = {}) {
   const peer = new Peer();
@@ -65,7 +65,7 @@ describe("Connection", () => {
     peer.onRequest = () =>
       queueMicrotask(() => {
         peer.raw(new Uint8Array([0x41, 0x42, 0]));
-        peer.send(removed("stale"), status);
+        peer.send(removed(99), status);
       });
     const connection = await Connection.open(peer, { onEvent: events });
     expect(peer.written[0]![0]).toBe(0);
@@ -96,7 +96,7 @@ describe("Connection", () => {
     });
     const listed = connection.listDevices().then(() => order.push("resolved"));
     await Promise.resolve();
-    peer.send(removed("x"), { kind: { case: "response", value: { result: { case: "devices", value: { devices: [{ id: "d1" }] } } } } }, removed("y"));
+    peer.send(removed(2), { kind: { case: "response", value: { result: { case: "devices", value: { entries: [{ entry: { case: "device", value: { id: 1 } } }], end: true } } } } }, removed(3));
     expect(order).toEqual(["response:getStatus", "event:deviceRemoved", "response:listDevices", "event:deviceRemoved"]);
     await listed;
     expect(order.at(-1)).toBe("resolved");
@@ -104,7 +104,7 @@ describe("Connection", () => {
 
   it("rejects an error response with its code and reason and keeps going", async () => {
     const { peer, connection } = await open();
-    const failing = connection.setDevice({ device: "d1", enabled: true });
+    const failing = connection.setDevice({ device: 1, enabled: true });
     await Promise.resolve();
     peer.send({ kind: { case: "response", value: { result: { case: "error", value: { code: ErrorCode.NO_CAPACITY, reason: 1 } } } } });
     const error = await failing.catch((e: unknown) => e);
@@ -114,6 +114,58 @@ describe("Connection", () => {
     await Promise.resolve();
     peer.send(status);
     expect((await next).name).toBe("Desk");
+  });
+
+  it("sends page cursors, numeric IDs and setting changes as given", async () => {
+    const { peer, connection } = await open();
+    const page = connection.listProfiles(7);
+    await Promise.resolve();
+    peer.send({ kind: { case: "response", value: { result: { case: "profiles", value: { entries: [{ entry: { case: "profile", value: { id: 8, name: "Work" } } }] } } } } });
+    expect(await page).toMatchObject({ entries: [{ entry: { case: "profile", value: { id: 8, name: "Work" } } }], end: false });
+    const saved = connection.setSettings({
+      device: 4,
+      changes: [
+        { integration: 1, key: "wheel.invert", change: { case: "value", value: { value: { case: "bool", value: true } } } },
+        { integration: 1, key: "wheel.invert", change: { case: "forget", value: {} } },
+      ],
+    });
+    await Promise.resolve();
+    peer.send({ kind: { case: "response", value: {} } });
+    await saved;
+    const [list, set] = peer.requests.slice(1);
+    expect(list!.command).toMatchObject({ case: "listProfiles", value: { after: 7 } });
+    expect(set!.command.case === "setSettings" && set!.command.value.changes.map((c) => c.change.case)).toEqual(["value", "forget"]);
+  });
+
+  it("reads a listing page by page, passing the key of the last entry received", async () => {
+    const { peer, connection } = await open();
+    const all = connection.listAllSettings(4);
+    const setting = (key: string) => ({ integration: 1, key, type: { case: "bool" as const, value: {} } });
+    await Promise.resolve();
+    peer.send({ kind: { case: "response", value: { result: { case: "settings", value: { device: 4, settings: [setting("a"), setting("b")] } } } } });
+    await new Promise((r) => setTimeout(r, 0));
+    peer.send({ kind: { case: "response", value: { result: { case: "settings", value: { device: 4, settings: [setting("c")], end: true } } } } });
+    expect((await all).map((s) => s.key)).toEqual(["a", "b", "c"]);
+    const [first, second] = peer.requests.slice(1);
+    expect(first!.command).toMatchObject({ case: "listSettings", value: { device: 4 } });
+    expect(first!.command.case === "listSettings" && first!.command.value.after).toBeUndefined();
+    expect(second!.command).toMatchObject({ case: "listSettings", value: { device: 4, after: { integration: 1, key: "b" } } });
+  });
+
+  it("rejects an empty page that does not end the listing", async () => {
+    const { peer, connection } = await open();
+    const all = connection.listAllDevices();
+    await Promise.resolve();
+    peer.send({ kind: { case: "response", value: { result: { case: "devices", value: { entries: [] } } } } });
+    await expect(all).rejects.toBeInstanceOf(UnexpectedResponseError);
+  });
+
+  it("answers profile creation with the new ID", async () => {
+    const { peer, connection } = await open();
+    const created = connection.createProfile("Work");
+    await Promise.resolve();
+    peer.send({ kind: { case: "response", value: { result: { case: "profileCreated", value: { profile: 9 } } } } });
+    expect(await created).toBe(9);
   });
 
   it("reads unknown error codes as unknown", () => {
@@ -143,7 +195,7 @@ describe("Connection", () => {
     try {
       const closed = vi.fn();
       const { connection } = await open({ onClose: closed, timeoutMs: 100 });
-      const pending = connection.refreshDevice("d1").catch((e: unknown) => e);
+      const pending = connection.refreshDevice(1).catch((e: unknown) => e);
       await vi.advanceTimersByTimeAsync(150);
       expect(await pending).toBeInstanceOf(ConnectionClosedError);
       expect(closed.mock.calls[0]![0].message).toBe("refreshDevice got no response");
@@ -155,8 +207,8 @@ describe("Connection", () => {
   it("rejects pending requests when the port goes away", async () => {
     const closed = vi.fn();
     const { peer, connection } = await open({ onClose: closed });
-    const pending = connection.listSettings("d1").catch((e: unknown) => e);
-    const queued = connection.listWarnings("d1").catch((e: unknown) => e);
+    const pending = connection.listSettings(1).catch((e: unknown) => e);
+    const queued = connection.listWarnings(1).catch((e: unknown) => e);
     peer.unplug();
     expect(await pending).toBeInstanceOf(ConnectionClosedError);
     expect(await queued).toBeInstanceOf(ConnectionClosedError);

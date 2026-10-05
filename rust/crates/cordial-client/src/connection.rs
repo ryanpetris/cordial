@@ -1,4 +1,7 @@
-use crate::{Error, Result};
+use crate::{
+    Error, Result,
+    paging::{Page, read_pages},
+};
 use cordial_protocol::{
     self as p, MAX_REQUEST_BYTES,
     frame::{self, Decoder},
@@ -227,11 +230,10 @@ impl Connection {
         })
     }
 
-    pub fn set_adapter(&self, update: p::SetAdapter) -> Result<p::Status> {
-        self.call(Command::SetAdapter(update), |r| match r {
-            response::Result::Status(s) => Some(s),
-            _ => None,
-        })
+    /// Saves adapter preferences. Success carries no result: the Dongle holds what was sent,
+    /// and an adapter event follows when anything changed.
+    pub fn set_adapter(&self, update: p::SetAdapter) -> Result<()> {
+        self.done(Command::SetAdapter(update))
     }
 
     /// Development firmware only. The Dongle reboots after responding, which ends the session.
@@ -250,10 +252,8 @@ impl Connection {
         self.done(Command::StopScan(p::StopScan {}))
     }
 
-    pub fn start_pairing(&self, candidate: &str) -> Result<()> {
-        self.done(Command::StartPairing(p::StartPairing {
-            candidate: candidate.into(),
-        }))
+    pub fn start_pairing(&self, candidate: u32) -> Result<()> {
+        self.done(Command::StartPairing(p::StartPairing { candidate }))
     }
 
     pub fn accept_prompt(&self, value: &str) -> Result<()> {
@@ -270,127 +270,235 @@ impl Connection {
         self.done(Command::CancelPairing(p::CancelPairing {}))
     }
 
-    pub fn list_devices(&self) -> Result<Vec<p::Device>> {
-        self.call(Command::ListDevices(p::ListDevices {}), |r| match r {
-            response::Result::Devices(list) => Some(list.devices),
-            _ => None,
+    /// Reads one page of a listing.
+    fn page<P: Page>(&self, command: Command) -> Result<P> {
+        self.call(command, P::from_result)
+    }
+
+    /// Reads every page of a listing from the start; `command` builds the request for the page
+    /// after a key.
+    fn pages<P: Page>(
+        &self,
+        command: impl Fn(Option<&P::Key>) -> Command,
+    ) -> Result<Vec<P::Entry>> {
+        read_pages(
+            |after| self.page::<P>(command(after)),
+            || Error::UnexpectedResponse,
+        )
+    }
+
+    /// One page of saved devices with IDs above `after`; 0 starts the listing.
+    pub fn list_devices(&self, after: u32) -> Result<p::DeviceList> {
+        self.page(Command::ListDevices(p::ListDevices { after }))
+    }
+
+    /// Every saved device, read page by page.
+    pub fn all_devices(&self) -> Result<Vec<p::DeviceListEntry>> {
+        self.pages::<p::DeviceList>(|after| {
+            Command::ListDevices(p::ListDevices {
+                after: after.copied().unwrap_or(0),
+            })
         })
     }
 
-    pub fn get_device(&self, device: &str) -> Result<p::Device> {
+    pub fn get_device(&self, device: u32) -> Result<p::Device> {
+        self.call(Command::GetDevice(p::GetDevice { device }), device_result)
+    }
+
+    /// Saves device preferences. Success carries no result: the Dongle holds what was sent, and
+    /// a device event follows when anything changed.
+    pub fn set_device(&self, update: p::SetDevice) -> Result<()> {
+        self.done(Command::SetDevice(update))
+    }
+
+    pub fn connect_device(&self, device: u32) -> Result<p::Device> {
         self.call(
-            Command::GetDevice(p::GetDevice {
-                device: device.into(),
-            }),
+            Command::ConnectDevice(p::ConnectDevice { device }),
             device_result,
         )
     }
 
-    pub fn set_device(&self, update: p::SetDevice) -> Result<p::Device> {
-        self.call(Command::SetDevice(update), device_result)
-    }
-
-    pub fn connect_device(&self, device: &str) -> Result<p::Device> {
+    pub fn disconnect_device(&self, device: u32) -> Result<p::Device> {
         self.call(
-            Command::ConnectDevice(p::ConnectDevice {
-                device: device.into(),
-            }),
+            Command::DisconnectDevice(p::DisconnectDevice { device }),
             device_result,
         )
     }
 
-    pub fn disconnect_device(&self, device: &str) -> Result<p::Device> {
-        self.call(
-            Command::DisconnectDevice(p::DisconnectDevice {
-                device: device.into(),
-            }),
-            device_result,
-        )
+    pub fn unpair_device(&self, device: u32) -> Result<()> {
+        self.done(Command::UnpairDevice(p::UnpairDevice { device }))
     }
 
-    pub fn unpair_device(&self, device: &str) -> Result<()> {
-        self.done(Command::UnpairDevice(p::UnpairDevice {
-            device: device.into(),
-        }))
+    pub fn refresh_device(&self, device: u32) -> Result<()> {
+        self.done(Command::RefreshDevice(p::RefreshDevice { device }))
     }
 
-    pub fn refresh_device(&self, device: &str) -> Result<()> {
-        self.done(Command::RefreshDevice(p::RefreshDevice {
-            device: device.into(),
-        }))
+    /// One page of a device's warnings after `after`; `None` starts the listing.
+    pub fn list_warnings(
+        &self,
+        device: u32,
+        after: Option<p::DeviceWarning>,
+    ) -> Result<p::DeviceWarnings> {
+        self.page(Command::ListWarnings(p::ListWarnings { device, after }))
     }
 
-    pub fn list_warnings(&self, device: &str) -> Result<p::DeviceWarnings> {
-        self.call(
+    /// Every warning of a device, read page by page.
+    pub fn all_warnings(&self, device: u32) -> Result<Vec<p::DeviceWarning>> {
+        self.pages::<p::DeviceWarnings>(|after| {
             Command::ListWarnings(p::ListWarnings {
-                device: device.into(),
-            }),
-            |r| match r {
-                response::Result::Warnings(w) => Some(w),
-                _ => None,
-            },
-        )
+                device,
+                after: after.copied(),
+            })
+        })
     }
 
-    pub fn list_settings(&self, device: &str) -> Result<p::DeviceSettings> {
-        self.call(
+    /// One page of a device's settings after `after`; `None` starts the listing.
+    pub fn list_settings(
+        &self,
+        device: u32,
+        after: Option<p::SettingRef>,
+    ) -> Result<p::DeviceSettings> {
+        self.page(Command::ListSettings(p::ListSettings { device, after }))
+    }
+
+    /// Every setting of a device, read page by page.
+    pub fn all_settings(&self, device: u32) -> Result<Vec<p::Setting>> {
+        self.pages::<p::DeviceSettings>(|after| {
             Command::ListSettings(p::ListSettings {
-                device: device.into(),
-            }),
-            settings_result,
+                device,
+                after: after.cloned(),
+            })
+        })
+    }
+
+    /// Saves and forgets settings in one request; the changes apply in order. Success carries no
+    /// result: the Dongle holds what was sent, and a settings_changed event follows.
+    pub fn set_settings(&self, device: u32, changes: Vec<p::SettingChange>) -> Result<()> {
+        self.done(Command::SetSettings(p::SetSettings { device, changes }))
+    }
+
+    /// One page of saved profiles with IDs above `after`; 0 starts the listing.
+    pub fn list_profiles(&self, after: u32) -> Result<p::ProfileList> {
+        self.page(Command::ListProfiles(p::ListProfiles { after }))
+    }
+
+    /// Every saved profile, read page by page.
+    pub fn all_profiles(&self) -> Result<Vec<p::ProfileListEntry>> {
+        self.pages::<p::ProfileList>(|after| {
+            Command::ListProfiles(p::ListProfiles {
+                after: after.copied().unwrap_or(0),
+            })
+        })
+    }
+
+    pub fn get_profile(&self, profile: u32) -> Result<p::Profile> {
+        self.call(
+            Command::GetProfile(p::GetProfile { profile }),
+            |r| match r {
+                response::Result::Profile(profile) => Some(profile),
+                _ => None,
+            },
         )
     }
 
-    pub fn set_settings(
+    /// Creates an empty profile and returns its ID. A profile event follows.
+    pub fn create_profile(&self, name: &str) -> Result<u32> {
+        self.call(
+            Command::CreateProfile(p::CreateProfile { name: name.into() }),
+            created_result,
+        )
+    }
+
+    /// Copies a saved profile's rules into a new profile and returns its ID. A profile event
+    /// follows.
+    pub fn copy_profile(&self, profile: u32, name: &str) -> Result<u32> {
+        self.call(
+            Command::CopyProfile(p::CopyProfile {
+                profile,
+                name: name.into(),
+            }),
+            created_result,
+        )
+    }
+
+    /// A profile_removed event follows.
+    pub fn delete_profile(&self, profile: u32) -> Result<()> {
+        self.done(Command::DeleteProfile(p::DeleteProfile { profile }))
+    }
+
+    /// One page of a profile's rules after the rule for `after`; `None` starts the listing.
+    pub fn list_profile_rules(
         &self,
-        device: &str,
-        changes: Vec<p::SettingChange>,
-    ) -> Result<p::DeviceSettings> {
-        self.call(
-            Command::SetSettings(p::SetSettings {
-                device: device.into(),
-                changes,
-            }),
-            settings_result,
-        )
+        profile: u32,
+        after: Option<p::Usage>,
+    ) -> Result<p::ProfileRules> {
+        self.page(Command::ListProfileRules(p::ListProfileRules {
+            profile,
+            after,
+        }))
     }
 
-    pub fn forget_settings(
+    /// Every rule of a profile, read page by page.
+    pub fn all_profile_rules(&self, profile: u32) -> Result<Vec<p::ProfileRule>> {
+        self.pages::<p::ProfileRules>(|after| {
+            Command::ListProfileRules(p::ListProfileRules {
+                profile,
+                after: after.copied(),
+            })
+        })
+    }
+
+    /// Saves and forgets rules in one request; the changes apply in order. Success carries no
+    /// result: the Dongle holds what was sent, and a profile_rules_changed event follows when any
+    /// rule changed.
+    pub fn set_profile_rules(
         &self,
-        device: &str,
-        settings: Vec<p::SettingRef>,
-    ) -> Result<p::DeviceSettings> {
-        self.call(
-            Command::ForgetSettings(p::ForgetSettings {
-                device: device.into(),
-                settings,
-            }),
-            settings_result,
-        )
+        profile: u32,
+        changes: Vec<p::ProfileRuleChange>,
+    ) -> Result<()> {
+        self.done(Command::SetProfileRules(p::SetProfileRules {
+            profile,
+            changes,
+        }))
     }
 
-    /// Development firmware only.
-    pub fn list_features(&self, device: &str) -> Result<Vec<p::Feature>> {
-        self.call(
+    /// One page of a device's features after `after`; `None` starts the listing. Development
+    /// firmware only.
+    pub fn list_features(
+        &self,
+        device: u32,
+        after: Option<p::FeatureRef>,
+    ) -> Result<p::FeatureList> {
+        self.page(Command::ListFeatures(p::ListFeatures { device, after }))
+    }
+
+    /// Every feature of a device, read page by page. Development firmware only.
+    pub fn all_features(&self, device: u32) -> Result<Vec<p::Feature>> {
+        self.pages::<p::FeatureList>(|after| {
             Command::ListFeatures(p::ListFeatures {
-                device: device.into(),
-            }),
-            |r| match r {
-                response::Result::Features(list) => Some(list.features),
-                _ => None,
-            },
-        )
+                device,
+                after: after.copied(),
+            })
+        })
     }
 
+    /// One page of a directory's entries after the one named `after`; "" starts the listing.
     /// Development firmware only.
-    pub fn list_files(&self, path: &str) -> Result<Vec<p::FileEntry>> {
-        self.call(
-            Command::ListFiles(p::ListFiles { path: path.into() }),
-            |r| match r {
-                response::Result::Files(list) => Some(list.entries),
-                _ => None,
-            },
-        )
+    pub fn list_files(&self, path: &str, after: &str) -> Result<p::FileList> {
+        self.page(Command::ListFiles(p::ListFiles {
+            path: path.into(),
+            after: after.into(),
+        }))
+    }
+
+    /// Every entry of a directory, read page by page. Development firmware only.
+    pub fn all_files(&self, path: &str) -> Result<Vec<p::FileEntry>> {
+        self.pages::<p::FileList>(|after| {
+            Command::ListFiles(p::ListFiles {
+                path: path.into(),
+                after: after.cloned().unwrap_or_default(),
+            })
+        })
     }
 
     /// Development firmware only.
@@ -411,16 +519,16 @@ impl Drop for Connection {
     }
 }
 
-fn device_result(r: response::Result) -> Option<p::Device> {
+fn created_result(r: response::Result) -> Option<u32> {
     match r {
-        response::Result::Device(d) => Some(d),
+        response::Result::ProfileCreated(created) => Some(created.profile),
         _ => None,
     }
 }
 
-fn settings_result(r: response::Result) -> Option<p::DeviceSettings> {
+fn device_result(r: response::Result) -> Option<p::Device> {
     match r {
-        response::Result::Settings(s) => Some(s),
+        response::Result::Device(d) => Some(d),
         _ => None,
     }
 }

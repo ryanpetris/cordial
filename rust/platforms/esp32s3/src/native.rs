@@ -22,6 +22,10 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 static BOND_RESULT: Signal<Raw, (u32, Result<Vec<u8>, Error>)> = Signal::new();
 static FORGOTTEN: Signal<Raw, (u32, Result<(), Error>)> = Signal::new();
 static CHANGED: Signal<Raw, ()> = Signal::new();
+/// Returns when the native host has queued an event.
+pub async fn changed() {
+    CHANGED.wait().await;
+}
 // Identities only, not a mirror of opaque keys. Updated by native store owners
 // before Ready, after bonding and after explicit removal.
 type BondIdentities = ([ffi::cordial_ble_peer; 8], usize);
@@ -250,7 +254,7 @@ impl Host for Native {
         ))
     }
     async fn changed(&self) {
-        CHANGED.wait().await;
+        changed().await;
     }
     fn start(&mut self) -> Result<(), Error> {
         result(unsafe { ffi::cordial_ble_start(Some(receive)) })

@@ -13,7 +13,7 @@ pub enum Call {
     Open(String),
     Close,
     Run(String),
-    Hide(String),
+    Hide(u32),
     List,
 }
 
@@ -42,8 +42,8 @@ impl Backend for Fake {
     fn state(&self) -> Option<State> {
         self.state.borrow().clone()
     }
-    fn hide_candidate(&self, id: &str) {
-        self.calls.borrow_mut().push(Call::Hide(id.to_owned()));
+    fn hide_candidate(&self, id: u32) {
+        self.calls.borrow_mut().push(Call::Hide(id));
     }
     fn list_ports(&self) {
         self.calls.borrow_mut().push(Call::List);

@@ -2,8 +2,8 @@
 //! device shortcuts act only when the selected device offers that action.
 //! The pointer and Tab share one highlight: moving the pointer highlights the
 //! control under it, or none, until a key is pressed.
-use super::{Action, Dialog, Hit, MIN_HEIGHT, MIN_WIDTH, Menu, Model, scan_choices};
-use crate::{controller::State, model::Prompt, ui::Backend};
+use super::{Action, Area, Dialog, Hit, MIN_HEIGHT, MIN_WIDTH, Model, scan_choices};
+use crate::{controller::State, model::Prompt, ui::Backend, view::Item};
 use cordial_protocol::value::Value;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -60,9 +60,23 @@ impl<B: Backend> Model<B> {
     }
 
     fn move_focus(&mut self, delta: isize) {
+        self.move_focus_in(None, delta);
+    }
+
+    /// Moves the highlight through the controls drawn in `area`'s pane, or through every
+    /// control when `None`.
+    fn move_focus_in(&mut self, area: Option<Area>, delta: isize) {
+        let inside = |h: &Hit| {
+            area.is_none_or(|area| {
+                self.hits.iter().any(|p| {
+                    p.action == Action::Wheel(area) && p.y == h.y && h.x >= p.x && h.x < p.x + p.w
+                })
+            })
+        };
         let controls: Vec<&Action> = self
             .hits
             .iter()
+            .filter(|h| inside(h))
             .map(|h| &h.action)
             .filter(|a| !matches!(a, Action::Wheel(_)))
             .collect();
@@ -86,10 +100,11 @@ impl<B: Backend> Model<B> {
     /// What the highlighted control belongs to. The highlight names an
     /// action, and actions such as Confirm recur in different dialogs.
     pub(super) fn focus_context(&self) -> String {
-        let selected = if matches!(self.focus, Some(Action::Device(_))) {
-            "" // Selecting the highlighted row keeps the Tab position.
-        } else {
-            &self.selected
+        let selected = match self.selected {
+            // Selecting the highlighted row keeps the Tab position.
+            _ if matches!(self.focus, Some(Action::Select(_))) => String::new(),
+            Some(item) => format!("{item:?}"),
+            None => String::new(),
         };
         let setting = match (&self.focus, &self.page.key) {
             (Some(Action::Setting(_) | Action::Category(_)), _) | (_, None) => String::new(),
@@ -101,11 +116,12 @@ impl<B: Backend> Model<B> {
             ""
         };
         format!(
-            "{}|{:?}|{:?}|{:?}|{selected}|{}|{setting}|{files}",
+            "{}|{:?}|{:?}|{:?}|{selected}|{:?}|{}|{setting}|{files}",
             self.auth_key,
             self.dialog,
             self.menu,
             self.gate(),
+            self.profiles_open,
             self.page.device
         )
     }
@@ -157,29 +173,34 @@ impl<B: Backend> Model<B> {
         }
     }
 
-    /// Moves the selection through the rows as listed: saved, then nearby.
+    /// Moves the selection through the rows as listed: saved, then nearby, then the adapter.
     fn move_selection(&mut self, delta: isize) {
         let Some(st) = self.state() else {
             return;
         };
-        let ids: Vec<String> = st
+        let ids: Vec<Item> = st
             .devices
             .iter()
-            .map(|d| d.id.clone())
-            .chain(st.candidates.iter().map(|c| c.id.clone()))
+            .map(|d| Item::Device(d.id))
+            .chain(st.candidates.iter().map(|c| Item::Candidate(c.id)))
+            .chain([Item::Adapter])
             .collect();
-        if ids.is_empty() {
-            return;
-        }
-        let i = match ids.iter().position(|id| *id == self.selected) {
+        let i = match ids.iter().position(|id| Some(*id) == self.selected) {
             None if delta < 0 => ids.len() - 1,
             None => 0,
             Some(i) => i.saturating_add_signed(delta).min(ids.len() - 1),
         };
-        self.selected = ids[i].clone();
-        self.detail_scroll = 0;
+        self.select(ids[i]);
         self.reveal = true;
         self.focus = None;
+    }
+
+    /// Selects the adapter, which shows its page.
+    fn select_adapter(&mut self) {
+        if self.state().is_some() {
+            self.select(Item::Adapter);
+            self.focus = None;
+        }
     }
 
     /// Handles a key in the full-screen view; false leaves it to the focused
@@ -214,6 +235,14 @@ impl<B: Backend> Model<B> {
                 self.files.editing = false;
                 return true;
             }
+            // The Save on screen, from any control or field. Every staged value is already in
+            // its draft, so nothing typed is left behind.
+            "ctrl+s" => {
+                if let Some(save) = self.visible_save() {
+                    self.action(save);
+                }
+                return true;
+            }
             _ => {}
         }
         // Space also chooses a focused option, outside text entry.
@@ -240,6 +269,10 @@ impl<B: Backend> Model<B> {
             self.focus = None; // Typing returns the keys to the field.
             if key == "enter" && self.dialog == Some(Dialog::Rename) {
                 self.action(Action::SaveName);
+                return true;
+            }
+            if key == "enter" && matches!(self.dialog, Some(Dialog::ProfileName(_))) {
+                self.action(Action::SaveProfileName);
                 return true;
             }
             if key == "enter" && self.auth().is_some() {
@@ -284,7 +317,7 @@ impl<B: Backend> Model<B> {
         match self.dialog {
             Some(Dialog::Help | Dialog::Diagnostics) => {
                 if key == "r" && self.dialog == Some(Dialog::Diagnostics) {
-                    // Like the dialog's Refresh Info button, only for a connected device.
+                    // Like the Diagnostics dialog's Refresh button, only for a connected device.
                     if self.diagnosed_connected() {
                         self.action(Action::RefreshInfo);
                     }
@@ -300,7 +333,13 @@ impl<B: Backend> Model<B> {
                 self.dialog_scroll = self.dialog_scroll.saturating_add_signed(delta);
                 return true;
             }
-            Some(Dialog::Remove(_) | Dialog::Bootloader | Dialog::Replace(_)) => {
+            Some(
+                Dialog::Remove(_)
+                | Dialog::Bootloader
+                | Dialog::Replace(_)
+                | Dialog::ProfileDelete(_)
+                | Dialog::SaveAdapter,
+            ) => {
                 match key {
                     "y" => self.action(Action::Confirm),
                     "n" => self.action(Action::CancelDialog),
@@ -308,7 +347,7 @@ impl<B: Backend> Model<B> {
                 }
                 return true;
             }
-            Some(Dialog::Settings | Dialog::Rename) => {
+            Some(Dialog::Rename | Dialog::ProfileName(_) | Dialog::ProfilePick(_)) => {
                 match key {
                     "up" | "k" | "left" => self.move_focus(-1),
                     "down" | "j" | "right" => self.move_focus(1),
@@ -336,7 +375,10 @@ impl<B: Backend> Model<B> {
                 "d" => self.action(Action::FilesDownload),
                 "pgup" => self.event_scroll += 5,
                 "pgdown" => self.event_scroll = self.event_scroll.saturating_sub(5),
-                "a" => self.action(Action::Menu(Menu::Adapter)),
+                "a" => {
+                    self.close_files();
+                    self.select_adapter();
+                }
                 _ => {}
             }
             return true;
@@ -358,9 +400,22 @@ impl<B: Backend> Model<B> {
                 }
                 "pgup" => self.event_scroll += 5,
                 "pgdown" => self.event_scroll = self.event_scroll.saturating_sub(5),
-                "s" => self.action(Action::SaveAll),
                 "r" => self.action(Action::SettingsRefresh),
-                "a" => self.action(Action::Menu(Menu::Adapter)),
+                "a" => {
+                    self.close_settings();
+                    self.select_adapter();
+                }
+                _ => {}
+            }
+            return true;
+        }
+        if self.profiles_shown(&st) {
+            // Only the Profiles view's own controls and the keys of every page apply.
+            match key {
+                _ if up || key == "left" => self.move_focus_in(Some(Area::Details), -1),
+                _ if down || key == "right" => self.move_focus_in(Some(Area::Details), 1),
+                "pgup" => self.event_scroll += 5,
+                "pgdown" => self.event_scroll = self.event_scroll.saturating_sub(5),
                 _ => {}
             }
             return true;
@@ -368,7 +423,7 @@ impl<B: Backend> Model<B> {
         match key {
             _ if up || down => self.move_selection(step),
             "home" | "end" => {
-                self.selected.clear();
+                self.selected = None;
                 self.move_selection(if key == "home" { 1 } else { -1 });
             }
             "pgup" => self.event_scroll += 5,
@@ -383,7 +438,7 @@ impl<B: Backend> Model<B> {
                     self.action(Action::Scan(*t));
                 }
             }
-            "a" => self.action(Action::Menu(Menu::Adapter)),
+            "a" => self.select_adapter(),
             "r" if st.available => self.action(Action::Refresh),
             "o" => self.shortcut(&[Action::DeviceSettings]),
             "i" => self.shortcut(&[Action::Diagnostics]),
@@ -400,11 +455,36 @@ impl<B: Backend> Model<B> {
         true
     }
 
+    /// Whether the adapter's or the selected device's Profiles view is shown.
+    pub(super) fn profiles_shown(&self, st: &State) -> bool {
+        self.adapter_profiles_open(st) || self.layers_open(st).is_some()
+    }
+
+    /// The Save drawn on screen, which Ctrl+S presses: the adapter's, a device's, a settings
+    /// page's or a profile's, never one that isn't shown.
+    pub(super) fn visible_save(&self) -> Option<Action> {
+        self.hits
+            .iter()
+            .map(|h| &h.action)
+            .find(|a| {
+                matches!(
+                    a,
+                    Action::AdapterSave | Action::DeviceSave | Action::LayersSave | Action::SaveAll
+                )
+            })
+            .cloned()
+    }
+
     /// The keys that apply to what is on screen. Enter presses the
     /// highlighted control first, on every screen.
     pub(super) fn hints(&self, st: Option<&State>) -> String {
         let enter = if self.focus_hit().is_some() {
             "⏎ press highlighted · "
+        } else {
+            ""
+        };
+        let save = if self.visible_save().is_some() {
+            "ctrl+s save · "
         } else {
             ""
         };
@@ -442,11 +522,20 @@ impl<B: Backend> Model<B> {
                 return format!("↑↓ scroll · {enter}r refresh · esc close");
             }
             (Some(Dialog::Diagnostics), _) => return format!("↑↓ scroll · {enter}esc close"),
-            (Some(Dialog::Remove(_) | Dialog::Bootloader | Dialog::Replace(_)), _) => {
+            (
+                Some(
+                    Dialog::Remove(_)
+                    | Dialog::Bootloader
+                    | Dialog::Replace(_)
+                    | Dialog::ProfileDelete(_)
+                    | Dialog::SaveAdapter,
+                ),
+                _,
+            ) => {
                 return format!("y confirm · {enter}n or esc cancel");
             }
-            (Some(Dialog::Settings | Dialog::Rename), _) => {
-                return format!("←→ move · {enter}esc close");
+            (Some(Dialog::Rename | Dialog::ProfileName(_) | Dialog::ProfilePick(_)), _) => {
+                return format!("←→ move · {enter}{save}esc close");
             }
             (None, Some("chooser")) => return format!("↑↓ tab move · {enter}r refresh · q quit"),
             (None, Some(_)) => return format!("tab move · {enter}? help · q quit"),
@@ -464,9 +553,12 @@ impl<B: Backend> Model<B> {
             && self.settings_open(st)
         {
             let _ = st;
-            return format!(
-                "↑↓ select · ←→ change · {enter}s save · ⌫ undo · r refresh · esc back"
-            );
+            return format!("↑↓ select · ←→ change · {enter}{save}⌫ undo · r refresh · esc back");
+        }
+        if let Some(st) = st
+            && self.profiles_shown(st)
+        {
+            return format!("↑↓ move · {enter}{save}esc back");
         }
         let primary = if !enter.is_empty() {
             " · ⏎ press highlighted"
@@ -482,6 +574,11 @@ impl<B: Backend> Model<B> {
             Some(st) if !scan_choices(st).is_empty() => " · s scan",
             _ => "",
         };
-        format!("↑↓ select{primary}{scan} · a adapter · ? help · q quit")
+        let save = if save.is_empty() {
+            ""
+        } else {
+            " · ctrl+s save"
+        };
+        format!("↑↓ select{primary}{scan}{save} · a adapter · ? help · q quit")
     }
 }

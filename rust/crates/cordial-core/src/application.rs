@@ -1,25 +1,40 @@
 //! Serial command handling and asynchronous Bluetooth operations.
 //!
-//! Every command validates, acts and responds at once. Work that outlives a command (scanning,
-//! pairing, an unpair waiting for its link to close, settings jobs) lives here and reports its
-//! progress through events. Each event carries the complete current state of one thing; changed
-//! things are marked dirty and written one frame at a time when the serial output is free.
-use alloc::{boxed::Box, collections::VecDeque, format, string::String, vec::Vec};
+//! The application is driven by two loops that take turns. The priority loop handles what input
+//! needs right now: radio events, connection setup with its profile loads, link timers and output,
+//! and HID forwarding (`event`, `operate`). The secondary loop handles everything that can wait:
+//! client commands, events, configuration editors and background storage work (`begin`,
+//! `proceed`, `work`). Each call the secondary loop makes reads or writes about one record, and
+//! one that writes may count free space again, so the priority loop waits for at most that.
+//!
+//! A command that reads many records, such as a listing, proceeds one record per `proceed`, and no
+//! other secondary work runs until it has responded. A listing answers one page; a page of a list
+//! held in memory is answered in one step. Every other command validates, acts and responds at
+//! once. Work that outlives a command (scanning, pairing, matching a pairing's bond with a saved
+//! device, an unpair waiting for its link to close, settings jobs) lives here and reports its
+//! progress through events. Adapter, device, profile, scan and pairing events carry the complete
+//! current state of one thing; settings, warnings and rules events carry what changed since the
+//! client last listed or was told. Changed things are marked dirty and written one frame at a
+//! time when the serial output is free.
+use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
 
 use cordial_protocol::{self as p, event::Kind as Ev, request::Command, response::Result as R};
 
 use crate::{
     bluetooth::{Bluetooth, Event},
     control::Session,
-    devices::{self, Peer},
+    devices::{self, Backoff, Peer, Policies, Policy},
+    interfaces::{self, Interface},
     link::LinkId,
     manager::Manager,
     model::{
-        errors::ErrorCode as Error,
+        errors::{DeviceWarning, ErrorCode as Error},
         identifiers::{ConnectionState, Transport},
         link::{DeviceKind, PromptMethod},
+        settings::SettingKey,
     },
-    settings::Change,
+    profiles,
+    settings::{Catalog, Change},
     storage::{Preferences, RecordStore},
     wire,
 };
@@ -32,6 +47,8 @@ pub struct Build {
     pub board: &'static str,
     pub default_adapter_name: &'static str,
     pub adapter_id: String,
+    /// Bytes of memory for loaded profiles, or `None` on a board without profile support.
+    pub profile_memory_budget: Option<u32>,
     /// Production composition supplies None and does not link the entry function.
     pub bootloader: Option<Bootloader>,
 }
@@ -40,7 +57,7 @@ pub struct Bootloader {
 }
 
 struct Candidate {
-    id: String,
+    id: u32,
     peer: Peer,
     address: Peer,
     kind: DeviceKind,
@@ -63,7 +80,7 @@ struct Prompt {
 }
 
 struct Pair {
-    candidate: String,
+    candidate: u32,
     link: Option<LinkId>,
     address: Peer,
     expected: Option<Peer>,
@@ -76,6 +93,173 @@ struct Pair {
     prompt: Option<Prompt>,
     /// The session that started the attempt has ended, so its remaining events go nowhere.
     quiet: bool,
+    /// The stack's bonds have been synced since the attempt started, so its link can open.
+    synced: bool,
+    /// The saved device with the candidate's identity, found when the attempt started.
+    saved: Option<u64>,
+    /// The bond the stack has saved for the attempt, waiting to be matched with a saved device.
+    bonding: Option<Bonding>,
+}
+
+/// A pairing's new bond. Saved device records are read one per step in the secondary loop to find
+/// the device with its identity, such as a device that paired again from a private address.
+struct Bonding {
+    identity: Peer,
+    scan: Records,
+    /// A resident device or the saved device the attempt started with has been looked up.
+    direct: bool,
+}
+
+/// Saved records of one kind, visited in ascending ID order one step at a time.
+struct Records {
+    kind: u8,
+    after: u64,
+    page: VecDeque<u64>,
+    end: bool,
+}
+/// What one step of a scan did.
+enum Visit {
+    /// The next saved ID, to read in the same step.
+    Record(u64),
+    /// Read the next page of IDs.
+    Page,
+    /// Every record has been visited.
+    Done,
+}
+/// Saved IDs a scan reads from the record directory at a time.
+const SCAN_PAGE: usize = 16;
+impl Records {
+    fn new(kind: u8) -> Self {
+        Self {
+            kind,
+            after: 0,
+            page: VecDeque::new(),
+            end: false,
+        }
+    }
+    async fn next<S: RecordStore>(&mut self, store: &mut S) -> Result<Visit, Error> {
+        if let Some(id) = self.page.pop_front() {
+            self.after = id;
+            return Ok(Visit::Record(id));
+        }
+        if self.end {
+            return Ok(Visit::Done);
+        }
+        let ids = store
+            .record_ids(self.kind, self.after, SCAN_PAGE)
+            .await
+            .map_err(|_| Error::StorageFailed)?;
+        self.end = ids.len() < SCAN_PAGE;
+        self.page = ids.into();
+        Ok(Visit::Page)
+    }
+}
+
+/// One page of a device or profile listing, read one record per step.
+struct Listing {
+    /// The last ID the listing has passed.
+    cursor: u64,
+    /// IDs of the current page still to read.
+    ids: VecDeque<u64>,
+    /// IDs remain after the current page.
+    more: bool,
+    /// A page has been read.
+    read: bool,
+}
+enum Turn {
+    Read(u64),
+    Paged,
+    /// The response is complete; whether nothing follows it.
+    Finished(bool),
+}
+impl Listing {
+    fn new(after: u32) -> Self {
+        Self {
+            cursor: after.into(),
+            ids: VecDeque::new(),
+            more: false,
+            read: false,
+        }
+    }
+    /// The next step of the listing. Pages that hold nothing to list are passed over until one
+    /// does or the records end; `found` says whether the response holds anything yet.
+    async fn turn<S: RecordStore>(
+        &mut self,
+        kind: u8,
+        size: usize,
+        found: bool,
+        store: &mut S,
+    ) -> Result<Turn, Error> {
+        if let Some(id) = self.ids.pop_front() {
+            self.cursor = id;
+            return Ok(Turn::Read(id));
+        }
+        if self.read && (found || !self.more) {
+            return Ok(Turn::Finished(!self.more));
+        }
+        let mut ids = store
+            .record_ids(kind, self.cursor, size + 1)
+            .await
+            .map_err(|_| Error::StorageFailed)?;
+        self.more = ids.len() > size;
+        ids.truncate(size);
+        self.ids = ids.into();
+        self.read = true;
+        Ok(Turn::Paged)
+    }
+}
+
+/// A command that reads many records, waiting for its next step.
+enum Pending {
+    Devices(Listing, p::DeviceList),
+    Profiles(Listing, p::ProfileList),
+    /// A page of a disconnected device's saved settings, once its policy has been read.
+    Settings(Policy, Option<p::SettingRef>),
+    /// A page of a profile's rules, once its record has been read.
+    Rules(u32, Option<profiles::Usage>),
+    Files(FileListing),
+    /// Deleting a profile once no saved device refers to it.
+    DeleteProfile(u64, Records),
+    /// Starting a pairing once the saved device with the candidate's identity, if any, is found.
+    Pairing(PairingStart, Records),
+}
+struct PairingStart {
+    candidate: u32,
+    peer: Peer,
+    address: Peer,
+    name: Box<str>,
+}
+
+/// A page of a directory listing. Entries are read one per step, keeping the first ones by name
+/// after `after`, whatever order the store gives them in.
+struct FileListing {
+    path: String,
+    after: String,
+    index: usize,
+    /// At most one more entry than a page holds, in ascending name order.
+    page: Vec<p::FileEntry>,
+}
+
+/// Background storage work that takes several steps.
+enum Work {
+    /// Making enabled devices that fit in the stack resident, then syncing the stack's bonds when
+    /// the resident set changed.
+    Fill {
+        scan: Records,
+        changed: bool,
+    },
+    Bonds(BondSync),
+    /// Removing the references to a lost profile, then deleting it.
+    LostProfile(u64, Option<Records>),
+}
+/// Syncing the stack's bonds with the resident entries.
+enum BondSync {
+    /// Reading which bonds the stack holds.
+    Inventory,
+    /// Removing those no resident entry or link uses.
+    Forget(Vec<Peer>),
+    /// Loading each resident entry's saved bond, from this slot on.
+    Import(usize),
 }
 
 /// Background settings work a device is waiting for.
@@ -88,9 +272,57 @@ struct Jobs {
     apply: bool,
 }
 
+/// The settings and warnings of one device that a client may hold.
+#[derive(Default)]
+struct Reported {
+    id: u64,
+    /// Settings, as [`key_bit`]s.
+    keys: u32,
+    warnings: Vec<DeviceWarning>,
+}
+
+/// A pending event that reads records, by its kind and its device or profile ID. Each backs off
+/// on its own, so one event's success never shortens another's grown backoff.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventRead {
+    Device(u64),
+    Settings(u64),
+    Profile(u64),
+    Rules(u64),
+}
+
+/// The bit standing for setting `key` in a set of settings.
+fn key_bit(key: SettingKey) -> u32 {
+    SettingKey::ALL
+        .iter()
+        .position(|k| *k == key)
+        .map_or(0, |i| 1 << i)
+}
+/// Every setting.
+const ALL_KEYS: u32 = u32::MAX;
+const _: () = assert!(SettingKey::ALL.len() <= 32);
+
+/// The profile a configuration interface's editor uses, loaded while the editor sends packets.
+pub(crate) struct Editor {
+    pub interface: Interface,
+    pub profile: u64,
+    pub map: profiles::Map,
+    pub last: u64,
+}
+
 const DEVICE: u8 = 1;
 const SETTINGS: u8 = 2;
 const WARNINGS: u8 = 4;
+const PROFILE: u8 = 1;
+const RULES: u8 = 2;
+
+/// Entries in one page of a list held in memory. Pages of records read from flash use the
+/// page sizes of their records.
+const SETTINGS_PAGE: usize = 8;
+const WARNINGS_PAGE: usize = 16;
+const RULES_PAGE: usize = 32;
+const FEATURES_PAGE: usize = 32;
+const FILES_PAGE: usize = 16;
 
 const PAIR_TIMEOUT_MS: u64 = 120_000;
 const PROMPT_TIMEOUT_MS: u64 = 30_000;
@@ -98,13 +330,15 @@ const CONNECT_TIMEOUT_MS: u64 = 30_000;
 const PAGE_BUSY_MS: u64 = 1000;
 const SCAN_DEFAULT_SECONDS: u32 = 10;
 const SCAN_MAX_SECONDS: u32 = 60;
+/// An editor's profile is released after this long without a packet.
+const EDITOR_IDLE_MS: u64 = 5000;
 
 pub struct Application {
     pub manager: Manager,
     pub serial: Session,
     build: Build,
     candidates: Vec<Candidate>,
-    candidate_seq: u64,
+    candidate_seq: u32,
     scan: Option<Scan>,
     scan_seq: u64,
     radio_scan: Option<(u64, bool, bool)>,
@@ -113,19 +347,60 @@ pub struct Application {
     pairing: Option<p::Pairing>,
     pairing_dirty: bool,
     scan_done: Option<p::ScanDone>,
-    /// Devices whose unpair waits for their link to close, by policy ID.
+    /// Devices whose unpair waits for their link to close.
     unpairing: Vec<u64>,
     jobs: Vec<(u64, Jobs)>,
-    dirty: Vec<u8>,
-    removed: VecDeque<String>,
+    /// Pending device, settings and warnings events, by device ID.
+    dirty: Vec<(u64, u8)>,
+    /// Settings whose state may have changed since the last settings event, by device ID, as
+    /// [`key_bit`]s.
+    touched: Vec<(u64, u32)>,
+    /// What the client may hold of the settings and warnings of each device with a connection,
+    /// from listings and events since the session started. An entry stays until the events that
+    /// follow the end of the connection have been written, so it is bounded by the connections
+    /// and nothing is kept for other devices.
+    reported: Vec<Reported>,
+    removed: VecDeque<u64>,
     adapter_dirty: bool,
+    /// Pending profile record and rules events, by profile ID.
+    profile_dirty: Vec<(u64, u8)>,
+    /// Rule inputs that may have changed since the last rules event, by profile ID.
+    touched_rules: Vec<(u64, Vec<profiles::Usage>)>,
+    profile_removed: VecDeque<u64>,
+    pub(crate) editor: Option<Editor>,
+    pub usb_reconnect: bool,
     /// The readiness last reported, so any change sends an adapter event.
     reported_ready: bool,
-    /// The device slot whose events go first next time, so devices take turns.
-    next_slot: usize,
+    /// The profile memory in use last reported.
+    reported_memory: usize,
+    /// Loaded profiles were released since devices that did not fit last tried again.
+    profiles_released: bool,
+    /// The dirty entry whose events go first next time, so devices take turns.
+    next_dirty: usize,
+    /// The dirty profile entry whose events go first next time, so profiles take turns.
+    next_profile: usize,
     /// Scan results go before device events next time, so neither starves the other.
     scan_turn: bool,
     reboot_at: Option<u64>,
+    /// Profiles whose saved roles summary may not match their saved rules.
+    roles_pending: Vec<u64>,
+    roles_retry: Backoff,
+    lost_retry: Backoff,
+    /// Pending events whose reads failed, each with its own backoff. An entry stays only while
+    /// its event is pending.
+    event_retries: Vec<(EventRead, Backoff)>,
+    /// Filling the resident set and syncing the stack's bonds.
+    bonds_retry: Backoff,
+    /// The command waiting for its next step.
+    pending: Option<Pending>,
+    /// Background work in progress. It pauses while commands run.
+    work: Option<Work>,
+    /// The slot the next profile load retry starts from.
+    retry_from: usize,
+    /// Memory was released before the current pass of profile load retries started.
+    retry_released: bool,
+    /// Background work goes before the next event.
+    maintenance_turn: bool,
 }
 
 fn failure(code: Error) -> p::Error {
@@ -140,10 +415,101 @@ fn capacity(reason: p::CapacityReason) -> p::Error {
     wire::error(Error::Capacity, Some(reason), false)
 }
 
+fn wire_usage(usage: profiles::Usage) -> p::Usage {
+    p::Usage {
+        usage_page: profiles::page(usage).into(),
+        usage: profiles::id(usage).into(),
+    }
+}
+/// The internal form of a wire usage; `None` when it is not a 16-bit page and usage.
+fn usage(usage: &p::Usage) -> Option<profiles::Usage> {
+    Some(profiles::usage(
+        u16::try_from(usage.usage_page).ok()?,
+        u16::try_from(usage.usage).ok()?,
+    ))
+    .filter(|u| *u != 0)
+}
+fn ranges(ranges: &[profiles::Range]) -> Vec<p::UsageRange> {
+    ranges
+        .iter()
+        .map(|r| p::UsageRange {
+            collection: (r.collection != 0).then(|| wire_usage(r.collection)),
+            usage_page: r.page.into(),
+            min: r.min.into(),
+            max: r.max.into(),
+        })
+        .collect()
+}
+fn wire_rule(rule: profiles::Rule) -> p::ProfileRule {
+    use p::profile_rule::{Effect, Output, Remap, Scale};
+    p::ProfileRule {
+        input: Some(wire_usage(rule.input)),
+        effect: Some(match rule.effect {
+            profiles::Effect::Remap(outputs) => Effect::Remap(Remap {
+                outputs: outputs
+                    .into_iter()
+                    .map(|o| Output {
+                        usage: Some(wire_usage(o.usage)),
+                        collection: Some(wire_usage(o.collection)),
+                    })
+                    .collect(),
+            }),
+            profiles::Effect::Scale(numerator, denominator) => Effect::Scale(Scale {
+                numerator,
+                denominator,
+            }),
+        }),
+    }
+}
+/// The internal form of a wire rule, before it is normalized.
+fn rule(value: &p::ProfileRule) -> Option<profiles::Rule> {
+    use p::profile_rule::Effect;
+    let input = usage(value.input.as_ref()?)?;
+    let effect = match value.effect.as_ref()? {
+        Effect::Remap(remap) => profiles::Effect::Remap(
+            remap
+                .outputs
+                .iter()
+                .map(|o| {
+                    Some(profiles::Output {
+                        usage: usage(o.usage.as_ref()?)?,
+                        collection: match &o.collection {
+                            Some(c) => usage(c)?,
+                            None => 0,
+                        },
+                    })
+                })
+                .collect::<Option<_>>()?,
+        ),
+        Effect::Scale(scale) => profiles::Effect::Scale(scale.numerator, scale.denominator),
+    };
+    Some(profiles::Rule { input, effect })
+}
+/// One page of the settings `catalog` holds, after `after`, and whether nothing follows it.
+fn settings_page(catalog: &Catalog, after: Option<&p::SettingRef>) -> (Vec<p::Setting>, bool) {
+    let mut settings = wire::settings(catalog);
+    if let Some(after) = after {
+        let after = (after.integration, after.key.as_bytes());
+        settings.retain(|s| wire::setting_order(s) > after);
+    }
+    let end = settings.len() <= SETTINGS_PAGE;
+    settings.truncate(SETTINGS_PAGE);
+    (settings, end)
+}
+
+fn wire_interface(interface: Interface) -> p::ConfigurationInterface {
+    match interface {
+        Interface::Via => p::ConfigurationInterface::Via,
+        Interface::Vial => p::ConfigurationInterface::Vial,
+    }
+}
+
 impl Application {
     pub fn new(build: Build) -> Self {
+        let mut manager = Manager::default();
+        manager.profile_budget = build.profile_memory_budget.map(|b| b as usize);
         Self {
-            manager: Manager::default(),
+            manager,
             serial: Session::new(),
             build,
             candidates: Vec::new(),
@@ -159,12 +525,32 @@ impl Application {
             unpairing: Vec::new(),
             jobs: Vec::new(),
             dirty: Vec::new(),
+            touched: Vec::new(),
+            reported: Vec::new(),
             removed: VecDeque::new(),
             adapter_dirty: false,
+            profile_dirty: Vec::new(),
+            touched_rules: Vec::new(),
+            profile_removed: VecDeque::new(),
+            editor: None,
+            usb_reconnect: false,
             reported_ready: false,
-            next_slot: 0,
+            reported_memory: 0,
+            profiles_released: false,
+            next_dirty: 0,
+            next_profile: 0,
             scan_turn: false,
             reboot_at: None,
+            roles_pending: Vec::new(),
+            roles_retry: Backoff::default(),
+            lost_retry: Backoff::default(),
+            event_retries: Vec::new(),
+            bonds_retry: Backoff::default(),
+            pending: None,
+            work: None,
+            retry_from: 0,
+            retry_released: false,
+            maintenance_turn: false,
         }
     }
 
@@ -200,6 +586,38 @@ impl Application {
         if self.manager.storage_ready && self.manager.storage_full() {
             fact(p::keys::STORAGE_FULL, p::value::Value::Bool(true));
         }
+        let profile_support = self.manager.profile_budget.map(|budget| p::ProfileSupport {
+            remap_inputs: ranges(&profiles::REMAP_INPUTS),
+            scale_inputs: ranges(&profiles::SCALE_INPUTS),
+            remap_outputs: ranges(&profiles::REMAP_OUTPUTS),
+            memory_budget: budget as u32,
+            max_remap_outputs: profiles::MAX_REMAP_OUTPUTS as u32,
+            max_layers: profiles::MAX_LAYERS as u32,
+            memory_used: self.manager.profiles.used() as u32,
+        });
+        let configuration_interfaces = if self.manager.profiles_supported() {
+            Interface::ALL
+                .into_iter()
+                .map(|interface| {
+                    let saved = interfaces::preference(
+                        &self.manager.preference.configuration_interfaces,
+                        interface,
+                    );
+                    p::ConfigurationInterfaceSupport {
+                        interface: wire_interface(interface) as i32,
+                        enabled: saved.enabled,
+                        profile: saved.profile.unwrap_or(0) as u32,
+                        conflicts: interface
+                            .conflicts()
+                            .iter()
+                            .map(|c| wire_interface(*c) as i32)
+                            .collect(),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         p::Status {
             id: self.build.adapter_id.clone(),
             name: self.adapter_name().into(),
@@ -218,6 +636,8 @@ impl Application {
                 })
                 .collect(),
             info,
+            profile_support,
+            configuration_interfaces,
         }
     }
 
@@ -225,11 +645,118 @@ impl Application {
         cfg!(feature = "development") && self.build.development
     }
 
-    fn mark(&mut self, slot: usize, bits: u8) {
-        if self.dirty.len() <= slot {
-            self.dirty.resize(slot + 1, 0);
+    /// Marks events to send for device `id`. A settings event covers every setting.
+    fn mark(&mut self, id: u64, bits: u8) {
+        if bits & SETTINGS != 0 {
+            self.touch(id, ALL_KEYS);
         }
-        self.dirty[slot] |= bits;
+        match self.dirty.iter_mut().find(|(d, _)| *d == id) {
+            Some((_, b)) => *b |= bits,
+            None => self.dirty.push((id, bits)),
+        }
+    }
+
+    /// Marks a settings event for the settings `keys` of device `id`.
+    fn touch(&mut self, id: u64, keys: u32) {
+        match self.touched.iter_mut().find(|(d, _)| *d == id) {
+            Some((_, k)) => *k |= keys,
+            None => self.touched.push((id, keys)),
+        }
+        match self.dirty.iter_mut().find(|(d, _)| *d == id) {
+            Some((_, b)) => *b |= SETTINGS,
+            None => self.dirty.push((id, SETTINGS)),
+        }
+    }
+
+    /// Whether resident device `id` has a connection.
+    fn live(&self, id: u64) -> bool {
+        self.manager
+            .find(id)
+            .and_then(|s| self.manager.devices[s].as_ref())
+            .is_some_and(|d| d.live.is_some())
+    }
+
+    /// What the client may hold of device `id`, while it is tracked. Tracking starts only for a
+    /// device with a connection.
+    fn reported(&mut self, id: u64) -> Option<&mut Reported> {
+        let index = match self.reported.iter().position(|r| r.id == id) {
+            Some(index) => index,
+            None if self.live(id) => {
+                self.reported.push(Reported {
+                    id,
+                    ..Reported::default()
+                });
+                self.reported.len() - 1
+            }
+            None => return None,
+        };
+        Some(&mut self.reported[index])
+    }
+
+    /// The devices whose settings and warnings are tracked for change events.
+    pub fn tracked_devices(&self) -> usize {
+        self.reported.len()
+    }
+
+    /// Stops tracking devices that have no connection and no pending events.
+    fn release_reported(&mut self) {
+        let mut i = 0;
+        while i < self.reported.len() {
+            let id = self.reported[i].id;
+            if self.live(id) || self.dirty.iter().any(|(d, _)| *d == id) {
+                i += 1;
+            } else {
+                self.reported.swap_remove(i);
+            }
+        }
+    }
+
+    /// Forgets the pending events of a device that is gone.
+    fn forget_device(&mut self, id: u64) {
+        self.dirty.retain(|(d, _)| *d != id);
+        self.event_retries
+            .retain(|(r, _)| *r != EventRead::Device(id) && *r != EventRead::Settings(id));
+        self.touched.retain(|(d, _)| *d != id);
+        self.reported.retain(|r| r.id != id);
+    }
+
+    fn mark_slot(&mut self, slot: usize, bits: u8) {
+        if let Some(id) = self
+            .manager
+            .devices
+            .get(slot)
+            .and_then(|d| d.as_ref())
+            .map(|d| d.id)
+        {
+            self.mark(id, bits);
+        }
+    }
+
+    pub(crate) fn mark_profile(&mut self, id: u64, bits: u8) {
+        match self.profile_dirty.iter_mut().find(|(p, _)| *p == id) {
+            Some((_, b)) => *b |= bits,
+            None => self.profile_dirty.push((id, bits)),
+        }
+    }
+
+    /// Marks a rules event for the rules of profile `id` whose inputs are `inputs`.
+    fn touch_rules(&mut self, id: u64, inputs: impl IntoIterator<Item = profiles::Usage>) {
+        let mut inputs = inputs.into_iter().peekable();
+        if inputs.peek().is_none() {
+            return;
+        }
+        let index = match self.touched_rules.iter().position(|(p, _)| *p == id) {
+            Some(index) => index,
+            None => {
+                self.touched_rules.push((id, Vec::new()));
+                self.touched_rules.len() - 1
+            }
+        };
+        let touched = &mut self.touched_rules[index].1;
+        touched.extend(inputs);
+        touched.sort_unstable();
+        touched.dedup();
+        self.mark_profile(id, RULES);
     }
 
     fn reply(&mut self, result: Option<R>) {
@@ -240,43 +767,188 @@ impl Application {
         self.serial.fail(error);
     }
 
-    fn device_result(&mut self, slot: usize) {
-        let device = wire::device(&self.manager, slot);
-        self.reply(device.map(R::Device));
+    pub(crate) fn storage_error(&mut self, error: crate::storage::Error) -> p::Error {
+        if error == crate::storage::Error::Unknown {
+            self.manager.storage_ready = false;
+            self.manager.write_uncertain = true;
+            self.adapter_dirty = true;
+        }
+        match error {
+            crate::storage::Error::Full => capacity(p::CapacityReason::Storage),
+            crate::storage::Error::Missing => failure(Error::NotFound),
+            error => wire::error(
+                Error::StorageFailed,
+                None,
+                error == crate::storage::Error::Unknown,
+            ),
+        }
     }
 
-    /// Saves first-connection setup progress for connected devices. A failed
-    /// save leaves the remaining steps to the device's next connection.
-    /// `write_uncertain` describes the last requested write, so these
-    /// background saves leave it as they found it.
-    async fn setup<S: RecordStore>(&mut self, store: &mut S) {
-        if !self.manager.storage_ready {
-            return;
+    /// The saved policy of device `id` and its resident slot. A connected device's own policy is
+    /// used once read. A device whose record turns out to be lost is deleted.
+    async fn policy_of<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u32,
+        store: &mut S,
+        radio: &mut B,
+    ) -> Result<(Policy, Option<usize>), p::Error> {
+        let id = u64::from(id);
+        if id == 0 {
+            return Err(failure(Error::NotFound));
         }
-        while let Some((index, slot, policy, setup)) = self.manager.setup() {
+        let slot = self.manager.find(id);
+        if let Some(policy) = slot
+            .and_then(|s| self.manager.devices[s].as_ref())
+            .and_then(|d| d.live.as_ref())
+            .and_then(|l| l.policy.clone())
+        {
+            return Ok((policy, slot));
+        }
+        if !self.manager.storage_ready {
+            return Err(failure(Error::RadioUnavailable));
+        }
+        match (Policies { store }).load(id).await {
+            Ok(policy) => Ok((policy, slot)),
+            Err(crate::storage::Error::Missing) => Err(failure(Error::NotFound)),
+            Err(crate::storage::Error::Corrupt) => {
+                let _ = self.manager.lose(id, store, radio).await;
+                Err(failure(Error::NotFound))
+            }
+            Err(_) => Err(failure(Error::StorageFailed)),
+        }
+    }
+
+    async fn device_result<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u32,
+        store: &mut S,
+        radio: &mut B,
+    ) {
+        match self.policy_of(id, store, radio).await {
+            Ok((policy, slot)) => {
+                let device = wire::device(&self.manager, &policy, slot);
+                self.reply(Some(R::Device(device)));
+            }
+            Err(e) => self.fail(e),
+        }
+    }
+
+    /// Saves one connected device's first-connection setup progress, not while a connection
+    /// waits for its first input. A failed save leaves the remaining steps to the device's next
+    /// connection. `write_uncertain` describes the last requested write, so these background
+    /// saves leave it as they found it. Returns whether it saved.
+    async fn setup<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> bool {
+        if !self.manager.storage_ready || self.manager.starting(now) {
+            return false;
+        }
+        if let Some((index, slot, policy, setup)) = self.manager.setup() {
             let uncertain = self.manager.write_uncertain;
-            let saved = self.manager.policy(slot, policy, store).await;
+            let saved = self.manager.save_policy(policy, store, radio).await;
             self.manager.write_uncertain = uncertain;
             if saved.is_ok() {
-                self.manager.devices[slot].as_mut().unwrap().setup = setup;
-                self.mark(slot, DEVICE);
+                if let Some(live) = self.manager.devices[slot]
+                    .as_mut()
+                    .and_then(|d| d.live.as_mut())
+                {
+                    live.setup = setup;
+                }
+                self.mark_slot(slot, DEVICE);
             } else if let Some(c) = &mut self.manager.connections[index] {
                 c.setup_failed = true;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Answers one request completely, taking every step of a command that reads many records.
+    /// For an owner that runs the application from one loop.
+    pub async fn dispatch<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        request: p::Request,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
+        self.begin(request, store, radio, now).await;
+        while self.command_pending() {
+            self.proceed(store, radio, now).await;
+        }
+    }
+
+    /// Whether a command is waiting for its next step. No other request is read, and no other
+    /// secondary work runs, until it has responded.
+    pub fn command_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Takes the next step of the command in progress: reads one record, or responds.
+    pub async fn proceed<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
+        // Storage can stop being ready between steps, such as after a write in the priority loop
+        // fails. The command then fails as it would have at its start, instead of answering with
+        // records left out.
+        if self.pending.is_some() && !self.manager.storage_ready {
+            self.pending = None;
+            return self.fail(failure(Error::RadioUnavailable));
+        }
+        match self.pending.take() {
+            None => {}
+            Some(Pending::Devices(listing, list)) => {
+                self.list_devices(listing, list, store, radio).await
+            }
+            Some(Pending::Profiles(listing, list)) => {
+                self.list_profiles(listing, list, store, radio).await
+            }
+            Some(Pending::Settings(policy, after)) => {
+                match self.saved_catalog(&policy, store).await {
+                    Ok(catalog) => {
+                        let page = settings_page(&catalog, after.as_ref());
+                        self.reply_settings(policy.id, page);
+                    }
+                    Err(e) => self.fail(e),
+                }
+            }
+            Some(Pending::Rules(id, after)) => match self.rules(id.into(), store).await {
+                Ok(rules) => {
+                    let mut page: Vec<p::ProfileRule> = rules
+                        .iter()
+                        .filter(|r| after.is_none_or(|after| r.input > after))
+                        .take(RULES_PAGE + 1)
+                        .map(wire_rule)
+                        .collect();
+                    let end = page.len() <= RULES_PAGE;
+                    page.truncate(RULES_PAGE);
+                    self.reply(Some(R::ProfileRules(p::ProfileRules {
+                        profile: id,
+                        rules: page,
+                        end,
+                    })));
+                }
+                Err(e) => self.fail(e),
+            },
+            Some(Pending::Files(listing)) => self.list_files(listing, store).await,
+            Some(Pending::DeleteProfile(id, scan)) => self.delete_profile(id, scan, store).await,
+            Some(Pending::Pairing(start, scan)) => {
+                self.find_pairing_device(start, scan, store, radio, now)
+                    .await
             }
         }
     }
 
-    fn find(&self, id: &str) -> Result<usize, p::Error> {
-        self.manager
-            .devices
-            .iter()
-            .position(|d| d.as_ref().is_some_and(|d| d.policy.device_id().0 == id))
-            .ok_or_else(|| failure(Error::NotFound))
-    }
-
-    /// Answers one request. The session reads the next request only after this response has been
-    /// written.
-    pub async fn dispatch<S: RecordStore, B: Bluetooth>(
+    /// Starts answering one request. A command that reads many records answers after its further
+    /// steps (`proceed`); every other command answers now. The session reads the next request only
+    /// after this response has been written.
+    pub async fn begin<S: RecordStore, B: Bluetooth>(
         &mut self,
         request: p::Request,
         store: &mut S,
@@ -287,6 +959,7 @@ impl Application {
             return self.fail(failure(Error::UnknownCommand));
         };
         let development = self.development();
+        let profiles = self.manager.profiles_supported();
         match command {
             Command::GetStatus(_) => {
                 if self.manager.storage_ready {
@@ -298,6 +971,54 @@ impl Application {
                 let status = self.status(radio);
                 self.reply(Some(R::Status(status)));
             }
+            Command::ListProfiles(args) if profiles => {
+                if !self.manager.storage_ready {
+                    return self.fail(failure(Error::RadioUnavailable));
+                }
+                self.pending = Some(Pending::Profiles(
+                    Listing::new(args.after),
+                    p::ProfileList::default(),
+                ));
+            }
+            Command::GetProfile(args) if profiles => {
+                match self.profile_record(args.profile, store, radio).await {
+                    Ok(profile) => self.reply(Some(R::Profile(profile))),
+                    Err(e) => self.fail(e),
+                }
+            }
+            Command::CreateProfile(args) if profiles => {
+                self.create_profile(&args.name, None, store, radio).await
+            }
+            Command::CopyProfile(args) if profiles => {
+                self.create_profile(&args.name, Some(args.profile), store, radio)
+                    .await
+            }
+            Command::DeleteProfile(args) if profiles => {
+                self.start_delete_profile(args.profile, store, radio).await
+            }
+            Command::ListProfileRules(args) if profiles => {
+                let after = match &args.after {
+                    None => None,
+                    Some(after) => match usage(after) {
+                        Some(after) => Some(after),
+                        None => return self.fail(bad_args()),
+                    },
+                };
+                match self.profile_record(args.profile, store, radio).await {
+                    Ok(_) => self.pending = Some(Pending::Rules(args.profile, after)),
+                    Err(e) => self.fail(e),
+                }
+            }
+            Command::SetProfileRules(args) if profiles => {
+                self.set_profile_rules(args, store, radio).await
+            }
+            Command::ListProfiles(_)
+            | Command::GetProfile(_)
+            | Command::CreateProfile(_)
+            | Command::CopyProfile(_)
+            | Command::DeleteProfile(_)
+            | Command::ListProfileRules(_)
+            | Command::SetProfileRules(_) => self.fail(failure(Error::UnknownCommand)),
             Command::SetAdapter(args) => self.set_adapter(args, store, radio, now).await,
             Command::EnterBootloader(_) => self.bootloader(now),
             Command::StartScan(args) => self.start_scan(args, radio, now),
@@ -305,95 +1026,697 @@ impl Application {
                 self.stop_scan(radio);
                 self.reply(None);
             }
-            Command::StartPairing(args) => self.start_pairing(args, store, radio, now).await,
+            Command::StartPairing(args) => self.start_pairing(args, radio),
             Command::AcceptPrompt(args) => self.answer(true, Some(args.value), radio, now),
             Command::RejectPrompt(_) => self.answer(false, None, radio, now),
             Command::CancelPairing(_) => {
                 self.stop_pairing(Error::Cancelled, radio);
                 self.reply(None);
             }
-            Command::ListDevices(_) => {
-                let devices = (0..self.manager.devices.len())
-                    .filter_map(|slot| wire::device(&self.manager, slot))
-                    .collect();
-                self.reply(Some(R::Devices(p::DeviceList { devices })));
+            Command::ListDevices(args) => {
+                if !self.manager.storage_ready {
+                    return self.fail(failure(Error::RadioUnavailable));
+                }
+                self.pending = Some(Pending::Devices(
+                    Listing::new(args.after),
+                    p::DeviceList::default(),
+                ));
             }
-            Command::GetDevice(args) => match self.find(&args.device) {
-                Ok(slot) => self.device_result(slot),
-                Err(e) => self.fail(e),
-            },
+            Command::GetDevice(args) => self.device_result(args.device, store, radio).await,
             Command::SetDevice(args) => self.set_device(args, store, radio).await,
-            Command::ConnectDevice(args) => self.connect(&args.device, store, radio, now).await,
-            Command::DisconnectDevice(args) => match self.find(&args.device) {
-                Ok(slot) => {
+            Command::ConnectDevice(args) => self.connect(args.device, store, radio, now).await,
+            Command::DisconnectDevice(args) => {
+                if let Some(slot) = self.manager.find(args.device.into()) {
                     self.manager.disconnect(slot, radio).ok();
-                    self.mark(slot, DEVICE);
-                    self.device_result(slot);
+                    self.mark(args.device.into(), DEVICE);
                 }
-                Err(e) => self.fail(e),
-            },
-            Command::UnpairDevice(args) => self.unpair(&args.device, store, radio).await,
-            Command::RefreshDevice(args) => self.refresh(&args.device, radio, now),
-            Command::ListWarnings(args) => match self.find(&args.device) {
-                Ok(slot) => {
-                    let warnings = wire::warnings(&self.manager, slot);
-                    self.reply(warnings.map(R::Warnings));
-                }
-                Err(e) => self.fail(e),
-            },
-            Command::ListSettings(args) => match self.find(&args.device) {
-                Ok(slot) => {
-                    let settings = wire::settings(&self.manager, slot);
-                    self.reply(settings.map(R::Settings));
-                }
-                Err(e) => self.fail(e),
-            },
-            Command::SetSettings(args) => {
-                let changes = args
-                    .changes
-                    .iter()
-                    .map(|c| (c.integration, c.key.as_str(), Some(c.value.as_ref())))
-                    .collect();
-                self.change_settings(&args.device, changes, store).await
+                self.device_result(args.device, store, radio).await
             }
-            Command::ForgetSettings(args) => {
-                let changes = args
-                    .settings
-                    .iter()
-                    .map(|s| (s.integration, s.key.as_str(), None))
-                    .collect();
-                self.change_settings(&args.device, changes, store).await
-            }
-            Command::ListFeatures(args) if development => match self.find(&args.device) {
-                Ok(slot) => {
-                    let features = self.manager.devices[slot]
-                        .as_ref()
-                        .unwrap()
-                        .catalog
-                        .features()
-                        .iter()
-                        .enumerate()
-                        .map(|(index, f)| p::Feature {
-                            integration: p::IntegrationKind::Hidpp as i32,
-                            supported: f.supported(),
-                            detail: Some(p::feature::Detail::Hidpp(p::HidppFeature {
-                                index: index as u32,
-                                id: f.id.0.into(),
-                                version: f.version.0.into(),
-                                flags: f.flags.0.into(),
-                            })),
-                        })
-                        .collect();
-                    self.reply(Some(R::Features(p::FeatureList { features })));
+            Command::UnpairDevice(args) => self.unpair(args.device, store, radio).await,
+            Command::RefreshDevice(args) => self.refresh(args.device, store, radio, now).await,
+            Command::ListWarnings(args) => match self.policy_of(args.device, store, radio).await {
+                Ok((policy, slot)) => {
+                    let mut warnings = self.warnings_of(slot);
+                    if let Some(after) = &args.after {
+                        let after = wire::warning_order(after);
+                        warnings.retain(|w| wire::warning_order(&wire::warning(w)) > after);
+                    }
+                    let end = warnings.len() <= WARNINGS_PAGE;
+                    warnings.truncate(WARNINGS_PAGE);
+                    if let Some(reported) = self.reported(policy.id) {
+                        for w in &warnings {
+                            if !reported.warnings.contains(w) {
+                                reported.warnings.push(*w);
+                            }
+                        }
+                    }
+                    let mut list = wire::warnings(policy.id, &warnings);
+                    list.end = end;
+                    self.reply(Some(R::Warnings(list)));
                 }
                 Err(e) => self.fail(e),
             },
-            Command::ListFiles(args) if development => self.list_files(&args.path, store).await,
+            Command::ListSettings(args) => {
+                let (policy, slot) = match self.policy_of(args.device, store, radio).await {
+                    Ok(found) => found,
+                    Err(e) => return self.fail(e),
+                };
+                match self.live_catalog(slot) {
+                    Some(catalog) => {
+                        // The catalog is borrowed from the device; the page is built from it.
+                        let page = settings_page(catalog, args.after.as_ref());
+                        self.reply_settings(policy.id, page);
+                    }
+                    None => self.pending = Some(Pending::Settings(policy, args.after)),
+                }
+            }
+            Command::SetSettings(args) => self.change_settings(args, store, radio).await,
+            Command::ListFeatures(args) if development => {
+                let after = args
+                    .after
+                    .as_ref()
+                    .map(|a| (a.integration, a.index))
+                    .unwrap_or_default();
+                let features = self
+                    .manager
+                    .find(args.device.into())
+                    .and_then(|s| self.manager.devices[s].as_ref())
+                    .and_then(|d| d.live.as_ref())
+                    .map(|live| {
+                        live.catalog
+                            .features()
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| {
+                                args.after.is_none()
+                                    || (p::IntegrationKind::Hidpp as i32, *index as u32) > after
+                            })
+                            .take(FEATURES_PAGE + 1)
+                            .map(|(index, f)| p::Feature {
+                                integration: p::IntegrationKind::Hidpp as i32,
+                                supported: f.supported(),
+                                detail: Some(p::feature::Detail::Hidpp(p::HidppFeature {
+                                    index: index as u32,
+                                    id: f.id.0.into(),
+                                    version: f.version.0.into(),
+                                    flags: f.flags.0.into(),
+                                })),
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                match features {
+                    Some(mut features) => {
+                        let end = features.len() <= FEATURES_PAGE;
+                        features.truncate(FEATURES_PAGE);
+                        self.reply(Some(R::Features(p::FeatureList { features, end })))
+                    }
+                    None => match self.policy_of(args.device, store, radio).await {
+                        Ok(_) => self.reply(Some(R::Features(p::FeatureList {
+                            features: Vec::new(),
+                            end: true,
+                        }))),
+                        Err(e) => self.fail(e),
+                    },
+                }
+            }
+            Command::ListFiles(args) if development => {
+                if !crate::model::storage_path(&args.path) {
+                    return self.fail(bad_args());
+                }
+                self.pending = Some(Pending::Files(FileListing {
+                    path: args.path,
+                    after: args.after,
+                    index: 0,
+                    page: Vec::new(),
+                }));
+            }
             Command::ReadFile(args) if development => self.read_file(&args.path, store).await,
             Command::ListFeatures(_) | Command::ListFiles(_) | Command::ReadFile(_) => {
                 self.fail(failure(Error::UnknownCommand))
             }
         }
+    }
+
+    /// One step of a page of saved devices in ascending ID order.
+    async fn list_devices<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        mut listing: Listing,
+        mut list: p::DeviceList,
+        store: &mut S,
+        radio: &mut B,
+    ) {
+        use p::device_list_entry::Entry;
+        let found = !list.entries.is_empty();
+        match listing.turn(2, devices::PAGE_SIZE, found, store).await {
+            Err(code) => return self.fail(failure(code)),
+            Ok(Turn::Finished(end)) => {
+                list.end = end;
+                return self.reply(Some(R::Devices(list)));
+            }
+            Ok(Turn::Paged) => {}
+            Ok(Turn::Read(id)) => match self.policy_of(id as u32, store, radio).await {
+                Ok((policy, slot)) => list.entries.push(p::DeviceListEntry {
+                    entry: Some(Entry::Device(wire::device(&self.manager, &policy, slot))),
+                }),
+                Err(e) if e.code == p::ErrorCode::StorageFailed as i32 => {
+                    list.entries.push(p::DeviceListEntry {
+                        entry: Some(Entry::Unreadable(id as u32)),
+                    })
+                }
+                // A lost record is removed and left out.
+                Err(_) => {}
+            },
+        }
+        self.pending = Some(Pending::Devices(listing, list));
+    }
+
+    /// The settings of device `id`: the readings of its connection and its saved values, or the
+    /// saved values alone while it is not connected.
+    async fn device_settings<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u32,
+        store: &mut S,
+        radio: &mut B,
+    ) -> Result<Vec<p::Setting>, p::Error> {
+        let (policy, slot) = self.policy_of(id, store, radio).await?;
+        if let Some(catalog) = self.live_catalog(slot) {
+            return Ok(wire::settings(catalog));
+        }
+        let catalog = self.saved_catalog(&policy, store).await?;
+        Ok(wire::settings(&catalog))
+    }
+
+    /// The settings catalog of the connection of the device in `slot`, once it has read the
+    /// device's policy.
+    fn live_catalog(&self, slot: Option<usize>) -> Option<&Catalog> {
+        slot.and_then(|s| self.manager.devices[s].as_ref())
+            .and_then(|d| d.live.as_ref())
+            .filter(|l| l.policy.is_some())
+            .map(|l| &l.catalog)
+    }
+
+    /// The current warnings of the device in `slot`, in listing order.
+    fn warnings_of(&self, slot: Option<usize>) -> Vec<DeviceWarning> {
+        let warnings = slot
+            .and_then(|s| self.manager.devices[s].as_ref())
+            .and_then(|d| d.live.as_ref())
+            .map_or(&[][..], |l| l.warnings.as_slice());
+        wire::sorted_warnings(warnings)
+    }
+
+    /// Responds with a page of device `id`'s settings, which the client then holds.
+    fn reply_settings(&mut self, id: u64, (settings, end): (Vec<p::Setting>, bool)) {
+        let keys = settings
+            .iter()
+            .filter_map(|s| wire::parse_setting_key(&s.key))
+            .fold(0, |keys, key| keys | key_bit(key));
+        if let Some(reported) = self.reported(id) {
+            reported.keys |= keys;
+        }
+        self.reply(Some(R::Settings(p::DeviceSettings {
+            device: id as u32,
+            settings,
+            end,
+        })));
+    }
+
+    /// A catalog holding a disconnected device's saved settings.
+    async fn saved_catalog<S: RecordStore>(
+        &mut self,
+        policy: &Policy,
+        store: &mut S,
+    ) -> Result<Catalog, p::Error> {
+        let preferences = match (Preferences {
+            store,
+            device: policy.id,
+        })
+        .load_all()
+        .await
+        {
+            Ok(preferences) => preferences,
+            Err(crate::storage::Error::Corrupt) => Vec::new(),
+            Err(_) => return Err(failure(Error::StorageFailed)),
+        };
+        let mut catalog = Catalog::default();
+        // Saved settings that no longer decode are left out; the next connection removes them.
+        let _ = catalog.restore_preferences(preferences);
+        catalog.connection(false, policy.hidpp_enabled());
+        Ok(catalog)
+    }
+
+    async fn profile_record<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u32,
+        store: &mut S,
+        _radio: &mut B,
+    ) -> Result<p::Profile, p::Error> {
+        let id = u64::from(id);
+        if id == 0 {
+            return Err(failure(Error::NotFound));
+        }
+        if !self.manager.storage_ready {
+            return Err(failure(Error::RadioUnavailable));
+        }
+        match profiles::metadata(store, id).await {
+            Ok(meta) => Ok(p::Profile {
+                id: id as u32,
+                name: meta.name,
+                roles: wire::roles(meta.roles.0),
+            }),
+            Err(crate::storage::Error::Corrupt) => {
+                self.lost_profile(id);
+                Err(failure(Error::NotFound))
+            }
+            Err(error) => Err(self.storage_error(error)),
+        }
+    }
+
+    /// Queues the cleanup of a profile whose saved files are undecodable.
+    fn lost_profile(&mut self, id: u64) {
+        let cleaning = matches!(self.work, Some(Work::LostProfile(lost, _)) if lost == id);
+        if !cleaning && !self.manager.lost_profiles.contains(&id) {
+            self.manager.lost_profiles.push(id);
+        }
+    }
+
+    /// One step of a page of saved profiles in ascending ID order.
+    async fn list_profiles<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        mut listing: Listing,
+        mut list: p::ProfileList,
+        store: &mut S,
+        radio: &mut B,
+    ) {
+        use p::profile_list_entry::Entry;
+        let found = !list.entries.is_empty();
+        match listing
+            .turn(profiles::METADATA, profiles::PAGE_SIZE, found, store)
+            .await
+        {
+            Err(code) => return self.fail(failure(code)),
+            Ok(Turn::Finished(end)) => {
+                list.end = end;
+                return self.reply(Some(R::Profiles(list)));
+            }
+            Ok(Turn::Paged) => {}
+            Ok(Turn::Read(id)) => match self.profile_record(id as u32, store, radio).await {
+                Ok(profile) => list.entries.push(p::ProfileListEntry {
+                    entry: Some(Entry::Profile(profile)),
+                }),
+                Err(e) if e.code == p::ErrorCode::StorageFailed as i32 => {
+                    list.entries.push(p::ProfileListEntry {
+                        entry: Some(Entry::Unreadable(id as u32)),
+                    })
+                }
+                Err(_) => {}
+            },
+        }
+        self.pending = Some(Pending::Profiles(listing, list));
+    }
+
+    /// The rules of profile `id`: the loaded table when a device or editor uses it, otherwise
+    /// the saved one.
+    async fn rules<S: RecordStore>(
+        &mut self,
+        id: u64,
+        store: &mut S,
+    ) -> Result<profiles::Rules, p::Error> {
+        if let Some(map) = self.manager.profiles.get(id) {
+            return Ok(map.borrow().clone());
+        }
+        match profiles::rules(store, id).await {
+            Ok(rules) => Ok(rules),
+            Err(crate::storage::Error::Corrupt) => {
+                self.lost_profile(id);
+                Err(failure(Error::StorageFailed))
+            }
+            Err(error) => Err(self.storage_error(error)),
+        }
+    }
+
+    async fn create_profile<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        name: &str,
+        source: Option<u32>,
+        store: &mut S,
+        radio: &mut B,
+    ) {
+        if !profiles::name_valid(name) {
+            return self.fail(bad_args());
+        }
+        let rules = match source {
+            None => profiles::Rules::default(),
+            Some(source) => {
+                if let Err(e) = self.profile_record(source, store, radio).await {
+                    return self.fail(e);
+                }
+                match self.rules(source.into(), store).await {
+                    Ok(rules) => rules,
+                    Err(e) => return self.fail(e),
+                }
+            }
+        };
+        if !self.manager.storage_ready {
+            return self.fail(failure(Error::RadioUnavailable));
+        }
+        match profiles::create(store, name, &rules).await {
+            Ok((id, _)) => {
+                self.mark_profile(id, PROFILE);
+                let _ = self.refresh_available(store).await;
+                self.reply(Some(R::ProfileCreated(p::ProfileCreated {
+                    profile: id as u32,
+                })));
+            }
+            Err(error) => {
+                let error = self.storage_error(error);
+                self.fail(error)
+            }
+        }
+    }
+
+    /// Starts deleting profile `id`: refused while a configuration interface refers to it, then
+    /// each saved device's layers are checked, one per step, before it is deleted.
+    async fn start_delete_profile<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u32,
+        store: &mut S,
+        radio: &mut B,
+    ) {
+        if let Err(e) = self.profile_record(id, store, radio).await {
+            return self.fail(e);
+        }
+        let id = u64::from(id);
+        if self
+            .manager
+            .preference
+            .configuration_interfaces
+            .iter()
+            .any(|p| p.profile == Some(id))
+        {
+            return self.fail(failure(Error::InUse));
+        }
+        self.pending = Some(Pending::DeleteProfile(id, Records::new(2)));
+    }
+
+    /// One step of deleting profile `id`: checks one saved device's layers, enabled or not, or
+    /// deletes the profile once none refers to it.
+    ///
+    /// The check stays valid across steps. No other request is read and no background work runs
+    /// until this command responds, and the priority loop never adds a reference: pairing saves a
+    /// new device without layers and keeps a re-paired device's saved layers. Background work
+    /// paused between its own steps, such as cleaning up a lost profile, only removes references.
+    async fn delete_profile<S: RecordStore>(&mut self, id: u64, mut scan: Records, store: &mut S) {
+        match scan.next(store).await {
+            Err(code) => return self.fail(failure(code)),
+            Ok(Visit::Page) => {}
+            Ok(Visit::Record(device)) => match (Policies { store }).load(device).await {
+                Ok(policy) if policy.profiles.contains(&id) => {
+                    return self.fail(failure(Error::InUse));
+                }
+                Ok(_) | Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {}
+                Err(_) => return self.fail(failure(Error::StorageFailed)),
+            },
+            Ok(Visit::Done) => {
+                if let Err(error) = profiles::remove(store, id).await {
+                    let error = self.storage_error(error);
+                    return self.fail(error);
+                }
+                self.removed_profile(id);
+                let _ = self.refresh_available(store).await;
+                return self.reply(None);
+            }
+        }
+        self.pending = Some(Pending::DeleteProfile(id, scan));
+    }
+
+    fn removed_profile(&mut self, id: u64) {
+        self.manager.profiles.forget(id);
+        self.profile_dirty.retain(|(p, _)| *p != id);
+        self.event_retries
+            .retain(|(r, _)| *r != EventRead::Profile(id) && *r != EventRead::Rules(id));
+        self.touched_rules.retain(|(p, _)| *p != id);
+        if !self.profile_removed.contains(&id) {
+            self.profile_removed.push_back(id);
+        }
+    }
+
+    /// Applies rule changes to profile `id`, saves them and publishes them to every user of the
+    /// profile. Returns the profile's rules.
+    pub(crate) async fn change_rules<S: RecordStore>(
+        &mut self,
+        id: u64,
+        changes: Vec<profiles::Change>,
+        store: &mut S,
+    ) -> Result<profiles::Rules, p::Error> {
+        let Some(budget) = self.manager.profile_budget else {
+            return Err(failure(Error::UnknownCommand));
+        };
+        if !self.manager.storage_ready {
+            return Err(failure(Error::RadioUnavailable));
+        }
+        let mut meta = match profiles::metadata(store, id).await {
+            Ok(meta) => meta,
+            Err(crate::storage::Error::Corrupt) => {
+                self.lost_profile(id);
+                return Err(failure(Error::NotFound));
+            }
+            Err(error) => return Err(self.storage_error(error)),
+        };
+        let current = self.rules(id, store).await?;
+        let rules = current
+            .changed(changes)
+            .map_err(|_| failure(Error::Capacity))?;
+        if rules == current {
+            return Ok(current);
+        }
+        let memory = rules.memory();
+        if memory > budget || !self.manager.profiles.fits(id, memory, budget) {
+            return Err(capacity(p::CapacityReason::ProfileMemory));
+        }
+        if let Err(error) = profiles::save_rules(store, id, &rules).await {
+            return Err(self.storage_error(error));
+        }
+        // The saved rules are the edit; the roles summary follows them.
+        self.manager.profiles.publish(id, &rules);
+        self.retry_users(id);
+        self.touch_rules(id, profiles::differences(&current, &rules));
+        self.save_roles(id, &mut meta, &rules, store).await;
+        self.refresh_available(store).await;
+        Ok(rules)
+    }
+
+    /// Saves profile `id`'s roles summary for its saved `rules` when it changed. A failed save is
+    /// repaired in the background.
+    async fn save_roles<S: RecordStore>(
+        &mut self,
+        id: u64,
+        meta: &mut profiles::Metadata,
+        rules: &profiles::Rules,
+        store: &mut S,
+    ) {
+        let roles = devices::Roles(rules.roles());
+        if roles == meta.roles {
+            return;
+        }
+        meta.roles = roles;
+        match profiles::save_metadata(store, id, meta).await {
+            Ok(()) => self.mark_profile(id, PROFILE),
+            Err(error) => {
+                if error == crate::storage::Error::Unknown {
+                    let _ = self.storage_error(error);
+                }
+                if !self.roles_pending.contains(&id) {
+                    self.roles_pending.push(id);
+                }
+            }
+        }
+    }
+
+    /// Brings profile `id`'s saved roles summary in line with its saved rules. A profile that no
+    /// longer exists needs nothing; one whose files are undecodable is queued as lost.
+    async fn repair_roles<S: RecordStore>(&mut self, id: u64, store: &mut S) -> Result<(), ()> {
+        let mut meta = match profiles::metadata(store, id).await {
+            Ok(meta) => meta,
+            Err(crate::storage::Error::Missing) => return Ok(()),
+            Err(crate::storage::Error::Corrupt) => {
+                self.lost_profile(id);
+                return Ok(());
+            }
+            Err(_) => return Err(()),
+        };
+        let rules = match self.manager.profiles.get(id) {
+            Some(map) => map.borrow().clone(),
+            None => match profiles::rules(store, id).await {
+                Ok(rules) => rules,
+                Err(crate::storage::Error::Corrupt) => {
+                    self.lost_profile(id);
+                    return Ok(());
+                }
+                Err(_) => return Err(()),
+            },
+        };
+        let roles = devices::Roles(rules.roles());
+        if roles == meta.roles {
+            return Ok(());
+        }
+        meta.roles = roles;
+        profiles::save_metadata(store, id, &meta)
+            .await
+            .map_err(|_| ())?;
+        self.mark_profile(id, PROFILE);
+        Ok(())
+    }
+
+    /// Connected devices whose profiles are not loaded and whose layers include profile `id`
+    /// try loading them again at the next background step.
+    fn retry_users(&mut self, id: u64) {
+        for d in self.manager.devices.iter_mut().flatten() {
+            if d.layers.contains(&id)
+                && let Some(live) = d.live.as_mut()
+                && live.profile_error.is_some()
+            {
+                live.profile_retry = Some((0, devices::RETRY_DELAY_MS));
+                self.profiles_released = true;
+            }
+        }
+    }
+
+    async fn set_profile_rules<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        args: p::SetProfileRules,
+        store: &mut S,
+        radio: &mut B,
+    ) {
+        if args.changes.is_empty() {
+            return self.fail(bad_args());
+        }
+        let mut changes = Vec::new();
+        for change in &args.changes {
+            use p::profile_rule_change::Change as C;
+            let change = match &change.change {
+                Some(C::Rule(value)) => {
+                    let Some(rule) = rule(value) else {
+                        return self.fail(bad_args());
+                    };
+                    match rule.normalized() {
+                        Ok(rule) => profiles::Change::Set(rule),
+                        Err(_) => return self.fail(bad_args()),
+                    }
+                }
+                Some(C::Forget(reference)) => {
+                    let Some(input) = reference.input.as_ref().and_then(usage) else {
+                        return self.fail(bad_args());
+                    };
+                    profiles::Change::Forget(input)
+                }
+                None => return self.fail(bad_args()),
+            };
+            changes.push(change);
+        }
+        if let Err(e) = self.profile_record(args.profile, store, radio).await {
+            return self.fail(e);
+        }
+        match self.change_rules(args.profile.into(), changes, store).await {
+            Ok(_) => self.reply(None),
+            Err(e) => self.fail(e),
+        }
+    }
+
+    /// One step of cleaning up lost profile `id`; `scan` is `None` at the first step. When only
+    /// its rules file is undecodable, the file is removed and the profile stays, empty. Otherwise
+    /// every reference to it is removed and it is deleted: a configuration interface that refers
+    /// to it is cleared and disabled, then each saved device's layers lose it, one device per step.
+    /// Returns the scan to continue with, or `None` once the cleanup is complete.
+    ///
+    /// Commands can run between steps, but none can add a reference meanwhile: the profile record
+    /// is missing or undecodable, so every command that would refer to it fails. Each device's
+    /// policy is read, changed and saved in one step, so a save between steps is not undone.
+    async fn clean_lost_profile<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u64,
+        scan: Option<Records>,
+        store: &mut S,
+        radio: &mut B,
+    ) -> Result<Option<Records>, Error> {
+        let Some(mut scan) = scan else {
+            match profiles::metadata(store, id).await {
+                Ok(mut meta) => {
+                    let empty = profiles::Rules::default();
+                    profiles::save_rules(store, id, &empty)
+                        .await
+                        .map_err(|_| Error::StorageFailed)?;
+                    // A loaded table holds the rules a client may have listed.
+                    let loaded = self
+                        .manager
+                        .profiles
+                        .get(id)
+                        .map(|map| map.borrow().clone());
+                    self.manager.profiles.publish(id, &empty);
+                    self.retry_users(id);
+                    if let Some(loaded) = loaded {
+                        self.touch_rules(id, loaded.iter().map(|r| r.input));
+                    }
+                    self.save_roles(id, &mut meta, &empty, store).await;
+                    self.refresh_available(store).await;
+                    return Ok(None);
+                }
+                Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {}
+                Err(_) => return Err(Error::StorageFailed),
+            }
+            let mut preference = self.manager.preference.clone();
+            let enabled = interfaces::enabled(&preference.configuration_interfaces);
+            for entry in &mut preference.configuration_interfaces {
+                if entry.profile == Some(id) {
+                    entry.profile = None;
+                    entry.enabled = false;
+                }
+            }
+            preference
+                .configuration_interfaces
+                .retain(|p| p.enabled || p.profile.is_some());
+            if preference != self.manager.preference {
+                self.manager.adapter(preference, store).await?;
+                self.usb_reconnect |=
+                    interfaces::enabled(&self.manager.preference.configuration_interfaces)
+                        != enabled;
+                self.adapter_dirty = true;
+            }
+            return Ok(Some(Records::new(2)));
+        };
+        match scan.next(store).await? {
+            Visit::Page => {}
+            Visit::Record(device) => {
+                let mut policy = match (Policies { store }).load(device).await {
+                    Ok(policy) => policy,
+                    Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
+                        return Ok(Some(scan));
+                    }
+                    Err(_) => return Err(Error::StorageFailed),
+                };
+                if policy.profiles.contains(&id) {
+                    policy.profiles.retain(|p| *p != id);
+                    if self.manager.find(device).is_some() {
+                        self.manager.save_policy(policy, store, radio).await?;
+                    } else {
+                        // Nothing is resident for this device, so only its record changes. It
+                        // takes no room in the stack, whether or not it is enabled.
+                        match (Policies { store }).save(&policy).await {
+                            Ok(()) | Err(crate::storage::Error::Missing) => {}
+                            Err(_) => return Err(Error::StorageFailed),
+                        }
+                    }
+                    self.mark(device, DEVICE);
+                }
+            }
+            Visit::Done => {
+                profiles::remove(store, id)
+                    .await
+                    .map_err(|_| Error::StorageFailed)?;
+                self.removed_profile(id);
+                return Ok(None);
+            }
+        }
+        Ok(Some(scan))
     }
 
     async fn set_adapter<S: RecordStore, B: Bluetooth>(
@@ -403,6 +1726,10 @@ impl Application {
         radio: &mut B,
         now: u64,
     ) {
+        if !self.manager.storage_ready {
+            return self.fail(failure(Error::RadioUnavailable));
+        }
+        let mut preference = self.manager.preference.clone();
         let name = match args.name.as_deref() {
             None => self.manager.preference.name.clone(),
             Some("") => None,
@@ -431,6 +1758,45 @@ impl Application {
                 transports.set(transport, enabled);
             }
         }
+        for update in &args.configuration_interfaces {
+            let interface = match p::ConfigurationInterface::try_from(update.interface) {
+                Ok(p::ConfigurationInterface::Via) => Interface::Via,
+                Ok(p::ConfigurationInterface::Vial) => Interface::Vial,
+                Ok(p::ConfigurationInterface::Unspecified) => return self.fail(bad_args()),
+                Err(_) => return self.fail(failure(Error::UnsupportedTransport)),
+            };
+            if !self.manager.profiles_supported() {
+                return self.fail(failure(Error::UnsupportedTransport));
+            }
+            let mut entry = interfaces::preference(&preference.configuration_interfaces, interface);
+            if let Some(enabled) = update.enabled {
+                entry.enabled = enabled;
+            }
+            match update.profile {
+                None => {}
+                Some(0) => entry.profile = None,
+                Some(id) => {
+                    if let Err(e) = self.profile_record(id, store, radio).await {
+                        return self.fail(e);
+                    }
+                    entry.profile = Some(id.into());
+                }
+            }
+            interfaces::set(&mut preference.configuration_interfaces, entry);
+        }
+        let saved = &preference.configuration_interfaces;
+        if saved.iter().any(|p| p.enabled && p.profile.is_none()) {
+            return self.fail(bad_args());
+        }
+        if !interfaces::valid(saved) {
+            return self.fail(failure(Error::UnsupportedTransport));
+        }
+        let before = &self.manager.preference.configuration_interfaces;
+        let reconnect = interfaces::enabled(saved) != interfaces::enabled(before)
+            || saved
+                .iter()
+                .filter(|p| p.enabled)
+                .any(|p| interfaces::preference(before, p.interface).profile != p.profile);
         if !self.manager.storage_ready {
             return self.fail(failure(Error::RadioUnavailable));
         }
@@ -439,48 +1805,43 @@ impl Application {
             .into_iter()
             .filter(|t| transports.contains(*t) != self.manager.preference.transports.contains(*t))
             .collect();
-        if name != self.manager.preference.name || platform_changed || !changed.is_empty() {
-            let preference = devices::AdapterPreference {
-                name,
-                host_platform: platform,
-                transports,
-            };
+        preference.name = name;
+        preference.host_platform = platform;
+        preference.transports = transports;
+        if preference != self.manager.preference {
             if let Err(code) = self.manager.adapter(preference, store).await {
                 let uncertain = self.manager.write_uncertain;
                 return self.fail(wire::error(code, None, uncertain));
             }
             self.adapter_dirty = true;
+            self.usb_reconnect |= reconnect;
+            if reconnect {
+                self.editor = None;
+            }
             if platform_changed {
                 for slot in 0..self.manager.devices.len() {
-                    if self.manager.devices[slot].as_ref().is_some_and(|d| {
-                        d.state == ConnectionState::Connected && d.policy.hidpp_enabled
-                    }) {
-                        self.mark(slot, DEVICE | SETTINGS);
+                    if self.manager.devices[slot]
+                        .as_ref()
+                        .is_some_and(|d| d.state == ConnectionState::Connected && d.hidpp_enabled)
+                    {
+                        self.mark_slot(slot, DEVICE | SETTINGS);
                     }
                 }
             }
-            if !changed.is_empty()
-                && let Err(code) = self.apply_transports(&changed, store, radio, now).await
-            {
-                return self.fail(failure(code));
+            if !changed.is_empty() {
+                self.apply_transports(&changed, radio, now);
             }
         }
-        let status = self.status(radio);
-        self.reply(Some(R::Status(status)));
+        self.reply(None);
     }
 
     /// Applies saved changes to the enabled transports, all supported by the
     /// radio. Disabling a transport closes its links, ends a pairing over it as
     /// an unsupported transport would, and drops it from a running scan, ending
     /// the scan when nothing is left. Saved devices of a disabled transport
-    /// become inactive, and eligible again once it is enabled.
-    async fn apply_transports<S: RecordStore, B: Bluetooth>(
-        &mut self,
-        changed: &[Transport],
-        store: &mut S,
-        radio: &mut B,
-        now: u64,
-    ) -> Result<(), Error> {
+    /// become inactive, and eligible again once it is enabled: the background
+    /// fill reads their records one per step.
+    fn apply_transports<B: Bluetooth>(&mut self, changed: &[Transport], radio: &mut B, now: u64) {
         let enabled = self.manager.preference.transports;
         for &transport in changed.iter().filter(|t| !enabled.contains(**t)) {
             if self
@@ -511,29 +1872,23 @@ impl Application {
                 }
             }
         }
-        self.manager.refresh_enabled();
+        self.manager.retire_disabled_transports();
         for slot in 0..self.manager.devices.len() {
             if self.manager.devices[slot]
                 .as_ref()
-                .is_some_and(|d| changed.contains(&d.policy.peer.transport))
+                .is_some_and(|d| changed.contains(&d.peer.transport))
             {
-                self.mark(slot, DEVICE);
+                self.mark_slot(slot, DEVICE);
             }
         }
+        // The fill follows the request at once, whatever earlier failures delayed.
+        self.manager.vacated = true;
+        self.bonds_retry.succeeded();
         for &transport in changed {
             if let Err(error) = radio.set_transport(transport, enabled.contains(transport)) {
-                self.event(Event::Failed(error), store, radio, now).await;
-                return Ok(());
+                self.radio_failed(error, now);
+                return;
             }
-        }
-        // A pairing syncs once it ends. A radio failure here is retried at the next sync; a
-        // storage read failure fails the command, with the saved change kept.
-        if self.pair.is_some() {
-            return Ok(());
-        }
-        match self.manager.sync_bonds(store, radio).await {
-            Err(Error::StorageFailed) => Err(Error::StorageFailed),
-            _ => Ok(()),
         }
     }
 
@@ -593,8 +1948,8 @@ impl Application {
         self.scan_seq = token;
         self.radio_scan = Some((token, classic, ble));
         // A new scan invalidates earlier candidates, except one a pairing already captured.
-        let pairing = self.pair.as_ref().map(|p| p.candidate.clone());
-        self.candidates.retain(|c| Some(&c.id) == pairing.as_ref());
+        let pairing = self.pair.as_ref().map(|p| p.candidate);
+        self.candidates.retain(|c| Some(c.id) == pairing);
         self.truncated = false;
         self.scan_done = None;
         self.scan = Some(Scan {
@@ -617,34 +1972,82 @@ impl Application {
         }
     }
 
-    async fn start_pairing<S: RecordStore, B: Bluetooth>(
-        &mut self,
-        args: p::StartPairing,
-        store: &mut S,
-        radio: &mut B,
-        now: u64,
-    ) {
+    /// Starts a pairing with scan candidate `args.candidate`. Saved device records are read one
+    /// per step to find whether the candidate is a saved device.
+    fn start_pairing<B: Bluetooth>(&mut self, args: p::StartPairing, radio: &mut B) {
         if self.pair.is_some() {
             return self.fail(failure(Error::Busy));
         }
         let Some(c) = self.candidates.iter().find(|c| c.id == args.candidate) else {
             return self.fail(failure(Error::NotFound));
         };
-        let (peer, address, name) = (c.peer, c.address, c.name.clone());
+        let start = PairingStart {
+            candidate: args.candidate,
+            peer: c.peer,
+            address: c.address,
+            name: c.name.clone(),
+        };
         if !self.manager.storage_ready || !self.manager.radio_ready {
             return self.fail(failure(Error::RadioUnavailable));
         }
-        if !self.manager.capabilities(radio).supports(peer.transport)
-            || radio.bond_capacity(peer.transport) == 0
+        if !self
+            .manager
+            .capabilities(radio)
+            .supports(start.peer.transport)
+            || radio.bond_capacity(start.peer.transport) == 0
         {
             return self.fail(failure(Error::UnsupportedTransport));
         }
-        let slot = self.manager.peer(peer);
-        if let Some(slot) = slot
-            && self.manager.devices[slot].as_ref().unwrap().policy.blocked
-        {
-            return self.fail(failure(Error::Blocked));
+        self.pending = Some(Pending::Pairing(start, Records::new(2)));
+    }
+
+    /// One step of starting a pairing: reads one saved device record, or starts the attempt once
+    /// the saved device with the candidate's identity is found or every record has been read.
+    async fn find_pairing_device<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        start: PairingStart,
+        mut scan: Records,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
+        // A candidate whose address is a saved identity is that device. A blocked device is not
+        // in the stack, so it is recognized from its saved identity.
+        let saved = match scan.next(store).await {
+            Err(code) => return self.fail(failure(code)),
+            Ok(Visit::Page) => None,
+            Ok(Visit::Record(id)) => match (Policies { store }).load(id).await {
+                Ok(policy) if policy.peer == start.peer && policy.blocked => {
+                    return self.fail(failure(Error::Blocked));
+                }
+                Ok(policy) if policy.peer == start.peer => Some(Some(policy.id)),
+                Ok(_) | Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
+                    None
+                }
+                Err(_) => return self.fail(failure(Error::StorageFailed)),
+            },
+            Ok(Visit::Done) => Some(None),
+        };
+        match saved {
+            Some(saved) => self.pair_with(start, saved, store, radio, now).await,
+            None => self.pending = Some(Pending::Pairing(start, scan)),
         }
+    }
+
+    async fn pair_with<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        start: PairingStart,
+        saved: Option<u64>,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
+        // Readiness can change between steps; nothing else that matters here can.
+        if !self.manager.storage_ready || !self.manager.radio_ready {
+            return self.fail(failure(Error::RadioUnavailable));
+        }
+
+        let slot = self.manager.peer(start.peer);
         match store.available().await {
             Ok(bytes) => self.manager.available_bytes = bytes,
             Err(_) => return self.fail(failure(Error::StorageFailed)),
@@ -670,19 +2073,22 @@ impl Application {
             self.close(link, None, radio);
         }
         self.pair = Some(Pair {
-            candidate: args.candidate.clone(),
+            candidate: start.candidate,
             link: None,
-            address,
-            expected: slot.map(|_| peer),
+            address: start.address,
+            expected: saved.is_some().then_some(start.peer),
             cleanup: None,
             deadline: now.saturating_add(PAIR_TIMEOUT_MS),
-            name,
+            name: start.name,
             cancelling: None,
             prompt: None,
             quiet: false,
+            synced: false,
+            saved,
+            bonding: None,
         });
         self.set_pairing(
-            &args.candidate,
+            start.candidate,
             p::pairing::Step::Connecting(p::PairingConnecting {}),
         );
         self.reply(None);
@@ -691,16 +2097,16 @@ impl Application {
     /// Reports how a finished attempt ended, unless its session has ended.
     fn pairing_ended(&mut self, pair: &Pair, step: p::pairing::Step) {
         if !pair.quiet {
-            self.set_pairing(&pair.candidate, step);
+            self.set_pairing(pair.candidate, step);
         }
     }
 
-    fn set_pairing(&mut self, candidate: &str, step: p::pairing::Step) {
+    fn set_pairing(&mut self, candidate: u32, step: p::pairing::Step) {
         if self.pair.as_ref().is_some_and(|p| p.quiet) {
             return;
         }
         self.pairing = Some(p::Pairing {
-            candidate: candidate.into(),
+            candidate,
             step: Some(step),
         });
         self.pairing_dirty = true;
@@ -774,27 +2180,45 @@ impl Application {
         store: &mut S,
         radio: &mut B,
     ) {
-        let slot = match self.find(&args.device) {
-            Ok(slot) => slot,
+        if !self.manager.storage_ready {
+            return self.fail(failure(Error::RadioUnavailable));
+        }
+        let (original, slot) = match self.policy_of(args.device, store, radio).await {
+            Ok(found) => found,
             Err(e) => return self.fail(e),
         };
-        let d = self.manager.devices[slot].as_ref().unwrap();
-        let mut policy = d.policy.clone();
-        let mut setup = d.setup;
-        let mut seen = Vec::new();
-        for update in &args.integrations {
-            if seen.contains(&update.kind) {
+        let mut policy = original.clone();
+        let mut setup = slot
+            .and_then(|s| self.manager.devices[s].as_ref())
+            .and_then(|d| d.live.as_ref())
+            .map(|l| l.setup);
+        if let Some(layers) = &args.profiles {
+            if !self.manager.profiles_supported() {
+                return self.fail(failure(Error::UnsupportedTransport));
+            }
+            if layers.profiles.len() > profiles::MAX_LAYERS || layers.profiles.contains(&0) {
                 return self.fail(bad_args());
             }
-            seen.push(update.kind);
-            if update.kind != p::IntegrationKind::Hidpp as i32 {
-                return self.fail(failure(Error::UnsupportedTransport));
+            for &id in &layers.profiles {
+                if let Err(e) = self.profile_record(id, store, radio).await {
+                    return self.fail(e);
+                }
+            }
+            policy.profiles = layers.profiles.iter().map(|&id| id.into()).collect();
+        }
+        for update in &args.integrations {
+            match p::IntegrationKind::try_from(update.kind) {
+                Ok(p::IntegrationKind::Hidpp) => {}
+                Ok(p::IntegrationKind::Unspecified) => return self.fail(bad_args()),
+                Err(_) => return self.fail(failure(Error::UnsupportedTransport)),
             }
             if let Some(enabled) = update.enabled {
                 // A user choice settles setup's HID++ detection.
-                policy.hidpp_enabled = enabled;
-                setup.hidpp = true;
-                policy.setup_pending &= !setup.complete();
+                policy.set_hidpp(enabled);
+                if let Some(setup) = &mut setup {
+                    setup.hidpp = true;
+                }
+                policy.setup_pending &= !setup.is_some_and(|s| s.complete());
             }
         }
         if let Some(enabled) = args.enabled {
@@ -809,15 +2233,20 @@ impl Application {
         if !self.manager.storage_ready {
             return self.fail(failure(Error::RadioUnavailable));
         }
-        if self.pair.is_some() && policy != d.policy {
+        if policy == original {
+            return self.reply(None);
+        }
+        if self.pair.is_some() {
             // An unresolved pairing may still reveal this identity after native
             // bonding; its storage reservation must not be spent meanwhile.
             return self.fail(failure(Error::Busy));
         }
-        if let Err(code) = self.manager.policy(slot, policy, store).await {
+        let id = policy.id;
+        let hidpp = policy.hidpp_enabled();
+        if let Err(code) = self.manager.save_policy(policy, store, radio).await {
             if code == Error::NotFound {
                 // The device's record was lost; it is deleted as at startup.
-                let _ = self.manager.lose(slot, store, radio).await;
+                let _ = self.manager.lose(id, store, radio).await;
             }
             let error = if code == Error::Capacity {
                 capacity(p::CapacityReason::Enabled)
@@ -826,37 +2255,37 @@ impl Application {
             };
             return self.fail(error);
         }
-        self.manager.devices[slot].as_mut().unwrap().setup = setup;
-        let d = self.manager.devices[slot].as_ref().unwrap();
-        if (d.policy.blocked || !d.policy.enabled)
-            && let Some(link) = self.manager.link_for(slot)
+        if let Some(setup) = setup
+            && let Some(live) = self
+                .manager
+                .find(id)
+                .and_then(|s| self.manager.devices[s].as_mut())
+                .and_then(|d| d.live.as_mut())
         {
-            self.close(link, None, radio);
+            live.setup = setup;
         }
-        // A radio failure here is retried at the next sync; a storage read failure fails the
-        // command, with the saved change kept.
-        let synced = self.manager.sync_bonds(store, radio).await;
-        if self.manager.devices.get(slot).is_some_and(Option::is_some) {
-            self.mark(slot, DEVICE | SETTINGS);
-        }
-        match synced {
-            Err(Error::StorageFailed) => self.fail(failure(Error::StorageFailed)),
-            _ if self.manager.devices.get(slot).is_some_and(Option::is_some) => {
-                self.device_result(slot)
-            }
-            _ => self.fail(failure(Error::NotFound)),
-        }
+        // Without the integration, a disconnected device's settings show no saved state.
+        let integration = original.hidpp_enabled() != hidpp;
+        self.mark(
+            id,
+            if integration {
+                DEVICE | SETTINGS
+            } else {
+                DEVICE
+            },
+        );
+        self.reply(None);
     }
 
     async fn connect<S: RecordStore, B: Bluetooth>(
         &mut self,
-        id: &str,
+        id: u32,
         store: &mut S,
         radio: &mut B,
         now: u64,
     ) {
-        let slot = match self.find(id) {
-            Ok(slot) => slot,
+        let (policy, slot) = match self.policy_of(id, store, radio).await {
+            Ok(found) => found,
             Err(e) => return self.fail(e),
         };
         if !self.manager.storage_ready || !self.manager.radio_ready {
@@ -865,9 +2294,25 @@ impl Application {
         if self.pair.is_some() {
             return self.fail(failure(Error::Busy));
         }
+        let Some(slot) = slot else {
+            // Only resident devices connect; say why this one is not.
+            return self.fail(if policy.blocked {
+                failure(Error::Blocked)
+            } else if !policy.enabled {
+                failure(Error::Disabled)
+            } else if !self
+                .manager
+                .capabilities(radio)
+                .supports(policy.peer.transport)
+            {
+                failure(Error::UnsupportedTransport)
+            } else {
+                capacity(p::CapacityReason::Enabled)
+            });
+        };
         let d = self.manager.devices[slot].as_ref().unwrap();
         let layout = if d.state == ConnectionState::Disconnected {
-            crate::layouts::load(store, d.policy.id, d.policy.peer.transport).await
+            crate::layouts::load(store, d.id, d.peer.transport).await
         } else {
             None
         };
@@ -879,32 +2324,22 @@ impl Application {
             radio,
         ) {
             Ok(_) => {
-                self.mark(slot, DEVICE);
-                self.device_result(slot);
+                self.mark(id.into(), DEVICE);
+                self.device_result(id, store, radio).await;
             }
-            Err(Error::Capacity) => {
-                let effective = self.manager.devices[slot]
-                    .as_ref()
-                    .unwrap()
-                    .effective_enabled;
-                self.fail(capacity(if effective {
-                    p::CapacityReason::Connections
-                } else {
-                    p::CapacityReason::Enabled
-                }));
-            }
+            Err(Error::Capacity) => self.fail(capacity(p::CapacityReason::Connections)),
             Err(e) => self.fail(failure(e)),
         }
     }
 
     async fn unpair<S: RecordStore, B: Bluetooth>(
         &mut self,
-        id: &str,
+        id: u32,
         store: &mut S,
         radio: &mut B,
     ) {
-        let slot = match self.find(id) {
-            Ok(slot) => slot,
+        let (policy, slot) = match self.policy_of(id, store, radio).await {
+            Ok(found) => found,
             Err(e) => return self.fail(e),
         };
         if self.pair.is_some() {
@@ -913,16 +2348,18 @@ impl Application {
         if !self.manager.storage_ready {
             return self.fail(failure(Error::RadioUnavailable));
         }
-        self.manager.disconnect(slot, radio).ok();
-        if self.manager.link_for(slot).is_some() {
-            let id = self.manager.devices[slot].as_ref().unwrap().policy.id;
-            if !self.unpairing.contains(&id) {
-                self.unpairing.push(id);
+        if let Some(slot) = slot {
+            self.manager.disconnect(slot, radio).ok();
+            if self.manager.link_for(slot).is_some() {
+                self.manager.devices[slot].as_mut().unwrap().deleting = true;
+                if !self.unpairing.contains(&policy.id) {
+                    self.unpairing.push(policy.id);
+                }
+                self.mark(policy.id, DEVICE);
+                return self.reply(None);
             }
-            self.mark(slot, DEVICE);
-            return self.reply(None);
         }
-        match self.remove(slot, store, radio).await {
+        match self.remove(policy.id, policy.peer, store, radio).await {
             Ok(()) => self.reply(None),
             Err(code) => {
                 let uncertain = self.manager.write_uncertain;
@@ -933,28 +2370,30 @@ impl Application {
 
     async fn remove<S: RecordStore, B: Bluetooth>(
         &mut self,
-        slot: usize,
+        id: u64,
+        peer: Peer,
         store: &mut S,
         radio: &mut B,
     ) -> Result<(), Error> {
-        let id = self.manager.devices[slot]
-            .as_ref()
-            .ok_or(Error::NotFound)?
-            .policy
-            .device_id();
-        self.manager.unpair(slot, store, radio).await?;
-        if let Some(bits) = self.dirty.get_mut(slot) {
-            *bits = 0;
-        }
-        self.removed.push_back(id.0);
+        self.manager.unpair(id, peer, store, radio).await?;
+        self.forget_device(id);
+        self.removed.push_back(id);
         self.adapter_dirty = true;
         Ok(())
     }
 
-    fn refresh<B: Bluetooth>(&mut self, id: &str, radio: &mut B, now: u64) {
-        let slot = match self.find(id) {
-            Ok(slot) => slot,
-            Err(e) => return self.fail(e),
+    async fn refresh<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u32,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
+        if let Err(e) = self.policy_of(id, store, radio).await {
+            return self.fail(e);
+        }
+        let Some(slot) = self.manager.find(id.into()) else {
+            return self.fail(failure(Error::NotConnected));
         };
         let Some(link) = self.manager.link_for(slot).filter(|_| {
             self.manager.devices[slot].as_ref().unwrap().state == ConnectionState::Connected
@@ -962,8 +2401,7 @@ impl Application {
             return self.fail(failure(Error::NotConnected));
         };
         radio.refresh_info(link).ok();
-        let id = self.manager.devices[slot].as_ref().unwrap().policy.id;
-        let job = self.job(id);
+        let job = self.job(id.into());
         job.information = true;
         job.read = true;
         self.start_jobs(now);
@@ -987,12 +2425,7 @@ impl Application {
         let mut i = 0;
         while i < self.jobs.len() {
             let id = self.jobs[i].0;
-            let Some(slot) = self
-                .manager
-                .devices
-                .iter()
-                .position(|d| d.as_ref().is_some_and(|d| d.policy.id == id))
-            else {
+            let Some(slot) = self.manager.find(id) else {
                 self.jobs.swap_remove(i);
                 continue;
             };
@@ -1004,7 +2437,11 @@ impl Application {
                 .as_mut()
                 .unwrap();
             let d = self.manager.devices[slot].as_mut().unwrap();
-            let Some(runtime) = c.runtime.as_mut().filter(|_| !c.closing) else {
+            let hidpp = d.hidpp_enabled;
+            let (Some(runtime), Some(live)) = (
+                c.runtime.as_mut().filter(|_| !c.closing),
+                d.live.as_mut().filter(|l| l.policy.is_some()),
+            ) else {
                 i += 1;
                 continue;
             };
@@ -1014,21 +2451,21 @@ impl Application {
             }
             let jobs = &mut self.jobs[i].1;
             if jobs.information {
-                if d.policy.hidpp_enabled {
-                    runtime.start_information(&mut d.catalog, now).ok();
+                if hidpp {
+                    runtime.start_information(&mut live.catalog, now).ok();
                 }
                 jobs.information = false;
             }
             if !runtime.busy() {
                 if jobs.read {
                     runtime
-                        .start_settings(&mut d.catalog, false, None, false, now)
+                        .start_settings(&mut live.catalog, false, None, false, now)
                         .ok();
                     jobs.read = false;
                 } else if jobs.apply {
-                    if d.policy.hidpp_enabled {
+                    if hidpp {
                         runtime
-                            .start_settings(&mut d.catalog, true, None, false, now)
+                            .start_settings(&mut live.catalog, true, None, false, now)
                             .ok();
                     }
                     jobs.apply = false;
@@ -1042,48 +2479,66 @@ impl Application {
         }
     }
 
-    async fn change_settings<S: RecordStore>(
+    async fn change_settings<S: RecordStore, B: Bluetooth>(
         &mut self,
-        id: &str,
-        changes: Vec<(i32, &str, Option<Option<&p::Value>>)>,
+        args: p::SetSettings,
         store: &mut S,
+        radio: &mut B,
     ) {
-        let slot = match self.find(id) {
-            Ok(slot) => slot,
+        let (policy, slot) = match self.policy_of(args.device, store, radio).await {
+            Ok(found) => found,
             Err(e) => return self.fail(e),
         };
-        if changes.is_empty() {
+        if args.changes.is_empty() {
             return self.fail(bad_args());
         }
-        let mut parsed = Vec::new();
-        for (integration, key, value) in changes {
-            if integration != p::IntegrationKind::Hidpp as i32 {
+        let mut parsed: Vec<Change> = Vec::new();
+        for change in &args.changes {
+            if change.integration != p::IntegrationKind::Hidpp as i32 {
                 return self.fail(failure(Error::NotFound));
             }
-            let Some(key) = wire::parse_setting_key(key) else {
+            let Some(key) = wire::parse_setting_key(&change.key) else {
                 return self.fail(failure(Error::NotFound));
             };
-            if parsed.iter().any(|c: &Change| c.key == key) {
-                return self.fail(bad_args());
-            }
-            let value = match value {
-                None => None,
-                Some(value) => match value.and_then(|v| wire::setting_value(key.kind(), v)) {
+            use p::setting_change::Change as C;
+            let value = match &change.change {
+                Some(C::Value(value)) => match wire::setting_value(key.kind(), value) {
                     Some(value) => Some(value),
                     None => return self.fail(bad_args()),
                 },
+                Some(C::Forget(_)) => None,
+                None => return self.fail(bad_args()),
             };
+            // Changes apply in order; a later change to the same setting replaces an earlier one.
+            parsed.retain(|c| c.key != key);
             parsed.push(Change { key, value });
         }
         if !self.manager.storage_ready {
             return self.fail(failure(Error::RadioUnavailable));
         }
-        let d = self.manager.devices[slot].as_mut().unwrap();
         let mut prefs = Preferences {
             store,
-            device: d.policy.id,
+            device: policy.id,
         };
-        if let Err(error) = d.catalog.change(&parsed, &mut prefs).await {
+        let live = slot
+            .and_then(|s| self.manager.devices[s].as_mut())
+            .and_then(|d| d.live.as_mut())
+            .filter(|l| l.policy.is_some());
+        let result = match live {
+            Some(live) => live.catalog.change(&parsed, &mut prefs).await,
+            None => {
+                let mut catalog = match self.saved_catalog(&policy, prefs.store).await {
+                    Ok(catalog) => catalog,
+                    Err(e) => return self.fail(e),
+                };
+                let mut prefs = Preferences {
+                    store,
+                    device: policy.id,
+                };
+                catalog.change(&parsed, &mut prefs).await
+            }
+        };
+        if let Err(error) = result {
             if error == crate::settings::Error::StorageUnknown {
                 self.manager.storage_ready = false;
                 self.adapter_dirty = true;
@@ -1094,31 +2549,41 @@ impl Application {
                 error == crate::settings::Error::StorageUnknown,
             ));
         }
-        let id = d.policy.id;
-        self.mark(slot, SETTINGS);
-        self.job(id).apply = true;
-        let settings = wire::settings(&self.manager, slot);
-        self.reply(settings.map(R::Settings));
+        let keys = parsed.iter().fold(0, |keys, c| keys | key_bit(c.key));
+        self.touch(policy.id, keys);
+        self.job(policy.id).apply = true;
+        self.reply(None);
     }
 
-    async fn list_files<S: RecordStore>(&mut self, path: &str, store: &mut S) {
-        if !crate::model::storage_path(path) {
-            return self.fail(bad_args());
-        }
-        let mut entries = Vec::new();
-        loop {
-            match store.file_entry(path, entries.len()).await {
-                Ok(Some(entry)) => entries.push(p::FileEntry {
-                    name: entry.name,
-                    directory: entry.kind == crate::storage::FileType::Directory,
-                    size: entry.size as u64,
-                }),
-                Ok(None) => break,
-                Err(crate::storage::Error::Missing) => return self.fail(failure(Error::NotFound)),
-                Err(_) => return self.fail(failure(Error::StorageFailed)),
+    /// One step of a page of a directory's entries in ascending name order: reads one entry, or
+    /// responds once every entry has been read.
+    async fn list_files<S: RecordStore>(&mut self, mut listing: FileListing, store: &mut S) {
+        match store.file_entry(&listing.path, listing.index).await {
+            Ok(Some(entry)) => {
+                listing.index += 1;
+                if entry.name > listing.after {
+                    let at = listing.page.partition_point(|e| e.name < entry.name);
+                    listing.page.insert(
+                        at,
+                        p::FileEntry {
+                            name: entry.name,
+                            directory: entry.kind == crate::storage::FileType::Directory,
+                            size: entry.size as u64,
+                        },
+                    );
+                    listing.page.truncate(FILES_PAGE + 1);
+                }
+                self.pending = Some(Pending::Files(listing));
             }
+            Ok(None) => {
+                let mut entries = listing.page;
+                let end = entries.len() <= FILES_PAGE;
+                entries.truncate(FILES_PAGE);
+                self.reply(Some(R::Files(p::FileList { entries, end })));
+            }
+            Err(crate::storage::Error::Missing) => self.fail(failure(Error::NotFound)),
+            Err(_) => self.fail(failure(Error::StorageFailed)),
         }
-        self.reply(Some(R::Files(p::FileList { entries })));
     }
 
     async fn read_file<S: RecordStore>(&mut self, path: &str, store: &mut S) {
@@ -1142,7 +2607,7 @@ impl Application {
         let slot = self.manager.connection(link).and_then(|c| c.device);
         self.manager.close(link, error, radio);
         if let Some(slot) = slot {
-            self.mark(slot, DEVICE | SETTINGS);
+            self.mark_slot(slot, DEVICE | SETTINGS);
         }
     }
 
@@ -1162,7 +2627,13 @@ impl Application {
             self.end_session(radio);
         }
         self.dirty.clear();
+        self.event_retries.clear();
+        self.touched.clear();
+        self.reported.clear();
         self.removed.clear();
+        self.profile_dirty.clear();
+        self.touched_rules.clear();
+        self.profile_removed.clear();
         self.adapter_dirty = false;
         self.pairing_dirty = false;
         self.pairing = None;
@@ -1182,44 +2653,18 @@ impl Application {
         if self.reboot_at.is_some() {
             return;
         }
+        // Input and the other frequent events are handled without waiting. Connection and
+        // pairing changes read or write records; their state lives on the heap while they run, so
+        // the priority loop's task does not keep room for it.
+        if let Some(event) = self.event_now(event, radio, now) {
+            Box::pin(self.event_later(event, store, radio, now)).await;
+        }
+    }
+
+    /// Handles an event that needs no storage. Returns any other event.
+    fn event_now<B: Bluetooth>(&mut self, event: Event, radio: &mut B, now: u64) -> Option<Event> {
         match event {
-            Event::Ready => {
-                self.manager.radio_ready = true;
-                // A change the backend could not apply before it restarted is applied now.
-                let ready = if self.manager.storage_ready {
-                    match self.manager.apply_transports(radio) {
-                        Ok(()) => self.manager.sync_bonds(store, radio).await,
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    self.manager.load(store, radio).await
-                };
-                match ready {
-                    Ok(()) => {}
-                    Err(Error::StorageFailed) => self.manager.storage_ready = false,
-                    Err(_) => self.manager.radio_ready = false,
-                }
-                self.adapter_dirty = true;
-            }
-            Event::Failed(error) | Event::Restarting(error) => {
-                if self.scan.take().is_some() {
-                    self.radio_scan = None;
-                    self.scan_done = Some(p::ScanDone {
-                        count: self.candidates.len() as u32,
-                        truncated: self.truncated,
-                    });
-                }
-                for slot in 0..devices::ACTIVE_CONNECTIONS {
-                    if let Some(id) = self.manager.connections[slot].as_ref().map(|c| c.id) {
-                        self.dropped(id, Some(error), now);
-                    }
-                }
-                self.manager.radio_ready = false;
-                if error == Error::StorageFailed {
-                    self.manager.storage_ready = false;
-                }
-                self.adapter_dirty = true;
-            }
+            Event::Failed(error) | Event::Restarting(error) => self.radio_failed(error, now),
             Event::Found {
                 scan,
                 peer,
@@ -1235,7 +2680,7 @@ impl Application {
                 {
                     self.manager.devices[slot].as_mut().unwrap().seen(now);
                 }
-                let Some(address) = address else { return };
+                let address = address?;
                 let scanning = self.scan.as_ref().is_some_and(|s| {
                     s.token == scan
                         && if peer.transport == Transport::Classic {
@@ -1245,7 +2690,7 @@ impl Application {
                         }
                 });
                 if !scanning {
-                    return;
+                    return None;
                 }
                 let name = devices::display_name(name.as_bytes());
                 let rssi = rssi.filter(|r| (-127..=20).contains(r)).map(i32::from);
@@ -1268,11 +2713,11 @@ impl Application {
                 } else {
                     let Some(seq) = self.candidate_seq.checked_add(1) else {
                         self.truncated = true;
-                        return;
+                        return None;
                     };
                     self.candidate_seq = seq;
                     self.candidates.push(Candidate {
-                        id: format!("c_{seq}"),
+                        id: seq,
                         peer,
                         address,
                         kind,
@@ -1280,25 +2725,6 @@ impl Application {
                         rssi,
                         dirty: true,
                     });
-                }
-            }
-            Event::Incoming { attempt, peer } => {
-                if self.pair.is_some() {
-                    let _ = radio.incoming(attempt, None, None);
-                    return;
-                }
-                let layout = match self.manager.admits(peer, now) {
-                    Some(slot) => {
-                        let id = self.manager.devices[slot].as_ref().unwrap().policy.id;
-                        crate::layouts::load(store, id, peer.transport).await
-                    }
-                    None => None,
-                };
-                if let Ok(Some(slot)) =
-                    self.manager
-                        .incoming(attempt, peer, now, layout.as_ref(), radio)
-                {
-                    self.mark(slot, DEVICE);
                 }
             }
             Event::Prompt {
@@ -1313,7 +2739,7 @@ impl Application {
                 if !current {
                     self.manager
                         .close(link, Some(Error::AuthenticationFailed), radio);
-                    return;
+                    return None;
                 }
                 let pair = self.pair.as_ref().unwrap();
                 let numeric = matches!(
@@ -1334,10 +2760,10 @@ impl Application {
                     || !valid
                 {
                     self.stop_pairing(Error::AuthenticationFailed, radio);
-                    return;
+                    return None;
                 }
                 let deadline = pair.deadline.min(now.saturating_add(PROMPT_TIMEOUT_MS));
-                let candidate = pair.candidate.clone();
+                let candidate = pair.candidate;
                 let step = match method {
                     PromptMethod::EnterPasskey | PromptMethod::EnterPin => {
                         p::pairing::Step::EnterCode(p::EnterCode {
@@ -1367,11 +2793,115 @@ impl Application {
                     deadline,
                     answered: method.display(),
                 });
-                self.set_pairing(&candidate, step);
+                self.set_pairing(candidate, step);
             }
-            Event::Bonded { link, identity } => {
-                self.bonded(link, identity, store, radio, now).await
+            Event::Security { link, security } => {
+                if let Some(slot) = self.manager.security(link, security) {
+                    self.mark_slot(slot, DEVICE);
+                }
             }
+            Event::Input(report) => {
+                let slot = self.manager.connection(report.link).and_then(|c| c.device);
+                match self.manager.input(&report, now) {
+                    Ok(true) => {
+                        if let Some(slot) = slot {
+                            self.mark_slot(slot, DEVICE);
+                        }
+                    }
+                    Err(e) => self.close(report.link, Some(e), radio),
+                    _ => {}
+                }
+            }
+            Event::Written { id, result } => match self.manager.written(id, result, now) {
+                Ok(Some(slot)) => self.mark_slot(slot, DEVICE),
+                Err(e) => self.close(id.link, Some(e), radio),
+                _ => {}
+            },
+            Event::Information {
+                link,
+                uuid,
+                instance,
+                success,
+                bytes,
+            } => {
+                if let Some(slot) = self
+                    .manager
+                    .connection(link)
+                    .filter(|c| !c.closing && c.runtime.is_some())
+                    .and_then(|c| c.device)
+                    && let Some(live) = self.manager.devices[slot]
+                        .as_mut()
+                        .and_then(|d| d.live.as_mut())
+                {
+                    let info = &mut live.catalog.info;
+                    if success {
+                        crate::info::standard(info, uuid, instance, &bytes);
+                    } else {
+                        crate::info::standard_failed(info, uuid, instance);
+                    }
+                }
+            }
+            Event::Read {
+                id,
+                report_type,
+                result,
+            } => {
+                if let Some(c) = self
+                    .manager
+                    .connections
+                    .get_mut(id.link.slot as usize)
+                    .and_then(Option::as_mut)
+                    .filter(|c| c.id == id.link && !c.closing)
+                    && let Some(slot) = c.device
+                    && let Some(link) = &mut c.runtime
+                    && let Some(live) = self.manager.devices[slot]
+                        .as_mut()
+                        .and_then(|d| d.live.as_mut())
+                {
+                    link.report_read_complete(
+                        id,
+                        report_type,
+                        result.as_ref().map_err(|e| *e),
+                        &mut live.catalog,
+                        now,
+                    );
+                }
+            }
+            event => return Some(event),
+        }
+        None
+    }
+
+    /// Handles an event that reads or writes records.
+    async fn event_later<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        event: Event,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
+        match event {
+            Event::Ready => self.ready(store, radio).await,
+            Event::Incoming { attempt, peer } => {
+                if self.pair.is_some() {
+                    let _ = radio.incoming(attempt, None, None);
+                    return;
+                }
+                let layout = match self.manager.admits(peer, now) {
+                    Some(slot) => {
+                        let id = self.manager.devices[slot].as_ref().unwrap().id;
+                        crate::layouts::load(store, id, peer.transport).await
+                    }
+                    None => None,
+                };
+                if let Ok(Some(slot)) =
+                    self.manager
+                        .incoming(attempt, peer, now, layout.as_ref(), radio)
+                {
+                    self.mark_slot(slot, DEVICE);
+                }
+            }
+            Event::Bonded { link, identity } => self.bonded(link, identity, radio, now),
             Event::Connected {
                 link,
                 descriptors,
@@ -1379,11 +2909,13 @@ impl Application {
                 layout,
             } => match self.manager.connected(link, descriptors, max_output, now) {
                 Ok(Some(slot)) => {
-                    self.mark(slot, DEVICE | SETTINGS | WARNINGS);
+                    // The device's profiles load before its first input; nothing else does.
+                    self.manager.load_profiles(slot, store).await;
+                    self.mark_slot(slot, DEVICE | SETTINGS | WARNINGS);
                     if let Some(layout) = layout {
-                        self.manager.connection_mut(link).unwrap().maps =
-                            Some(crate::layouts::maps(&layout));
-                        self.save_layout(slot, &layout, store).await;
+                        let c = self.manager.connection_mut(link).unwrap();
+                        c.maps = Some(crate::layouts::maps(&layout));
+                        c.layout = Some(layout);
                     }
                 }
                 Ok(None) => {}
@@ -1411,26 +2943,25 @@ impl Application {
                 else {
                     return;
                 };
-                // Changed report characteristics alone leave the parsed maps as they are.
+                // Changed report characteristics alone leave the parsed maps as they are. The
+                // layout is saved in the background.
                 if unchanged {
-                    return self.save_layout(slot, &layout, store).await;
+                    self.manager.connection_mut(link).unwrap().layout = Some(layout);
+                    return;
                 }
                 match self.manager.relayout(link, descriptors) {
                     Ok(Some(slot)) => {
-                        self.manager.connection_mut(link).unwrap().maps = Some(maps);
-                        self.mark(slot, DEVICE | SETTINGS | WARNINGS);
-                        self.save_layout(slot, &layout, store).await;
+                        self.manager.load_profiles(slot, store).await;
+                        let c = self.manager.connection_mut(link).unwrap();
+                        c.maps = Some(maps);
+                        c.layout = Some(layout);
+                        self.mark_slot(slot, DEVICE | SETTINGS | WARNINGS);
                     }
                     Ok(None) => {}
                     Err(e) => {
                         self.remove_layout(slot, store).await;
                         self.close(link, Some(e), radio);
                     }
-                }
-            }
-            Event::Security { link, security } => {
-                if let Some(slot) = self.manager.security(link, security) {
-                    self.mark(slot, DEVICE);
                 }
             }
             Event::Disconnected { link, error } => {
@@ -1443,73 +2974,56 @@ impl Application {
                 if let Some((slot, Some(Error::UnsupportedHid))) = ended {
                     self.remove_layout(slot, store).await;
                 }
-                // A failed sync is retried at the next one.
-                if self.pair.is_none() && self.manager.storage_ready {
-                    let _ = self.manager.sync_bonds(store, radio).await;
-                }
+                // The stack's bonds are synced in the background.
+                self.manager.bonds_pending = true;
             }
-            Event::Input(report) => {
-                let slot = self.manager.connection(report.link).and_then(|c| c.device);
-                match self.manager.input(&report, now) {
-                    Ok(true) => {
-                        if let Some(slot) = slot {
-                            self.mark(slot, DEVICE);
-                        }
-                    }
-                    Err(e) => self.close(report.link, Some(e), radio),
-                    _ => {}
-                }
+            _ => {}
+        }
+    }
+
+    /// The radio has started: loads every saved record, or brings the restarted radio in line
+    /// with the loaded ones.
+    async fn ready<S: RecordStore, B: Bluetooth>(&mut self, store: &mut S, radio: &mut B) {
+        self.manager.radio_ready = true;
+        // A change the backend could not apply before it restarted is applied now.
+        let ready = if self.manager.storage_ready {
+            match self.manager.apply_transports(radio) {
+                Ok(()) => self.manager.sync_bonds(store, radio).await,
+                Err(error) => Err(error),
             }
-            Event::Written { id, result } => match self.manager.written(id, result, now) {
-                Ok(Some(slot)) => self.mark(slot, DEVICE),
-                Err(e) => self.close(id.link, Some(e), radio),
-                _ => {}
-            },
-            Event::Information {
-                link,
-                uuid,
-                instance,
-                success,
-                bytes,
-            } => {
-                if let Some(slot) = self
-                    .manager
-                    .connection(link)
-                    .filter(|c| !c.closing && c.runtime.is_some())
-                    .and_then(|c| c.device)
-                {
-                    let info = &mut self.manager.devices[slot].as_mut().unwrap().catalog.info;
-                    if success {
-                        crate::info::standard(info, uuid, instance, &bytes);
-                    } else {
-                        crate::info::standard_failed(info, uuid, instance);
-                    }
-                }
-            }
-            Event::Read {
-                id,
-                report_type,
-                result,
-            } => {
-                if let Some(c) = self
-                    .manager
-                    .connections
-                    .get_mut(id.link.slot as usize)
-                    .and_then(Option::as_mut)
-                    .filter(|c| c.id == id.link && !c.closing)
-                    && let Some(slot) = c.device
-                    && let Some(link) = &mut c.runtime
-                {
-                    link.report_read_complete(
-                        id,
-                        report_type,
-                        result.as_ref().map_err(|e| *e),
-                        &mut self.manager.devices[slot].as_mut().unwrap().catalog,
-                        now,
-                    );
-                }
+        } else {
+            self.manager.load(store, radio).await
+        };
+        match ready {
+            Ok(()) => {}
+            Err(Error::StorageFailed) => self.manager.storage_ready = false,
+            Err(_) => self.manager.radio_ready = false,
+        }
+        self.adapter_dirty = true;
+    }
+
+    /// The radio failed or is restarting: ends the scan and every link, and reports readiness.
+    fn radio_failed(&mut self, error: Error, now: u64) {
+        if self.reboot_at.is_some() {
+            return;
+        }
+        if self.scan.take().is_some() {
+            self.radio_scan = None;
+            self.scan_done = Some(p::ScanDone {
+                count: self.candidates.len() as u32,
+                truncated: self.truncated,
+            });
+        }
+        for slot in 0..devices::ACTIVE_CONNECTIONS {
+            if let Some(id) = self.manager.connections[slot].as_ref().map(|c| c.id) {
+                self.dropped(id, Some(error), now);
             }
         }
+        self.manager.radio_ready = false;
+        if error == Error::StorageFailed {
+            self.manager.storage_ready = false;
+        }
+        self.adapter_dirty = true;
     }
 
     /// A failed save leaves the next connection to discover the device again.
@@ -1522,8 +3036,10 @@ impl Application {
         if !self.manager.storage_ready {
             return;
         }
-        let policy = &self.manager.devices[slot].as_ref().unwrap().policy;
-        let (id, transport) = (policy.id, policy.peer.transport);
+        let Some(d) = self.manager.devices[slot].as_ref() else {
+            return;
+        };
+        let (id, transport) = (d.id, d.peer.transport);
         let full = self.manager.storage_full();
         let saved = crate::layouts::save(store, id, transport, layout).await;
         self.refresh_available(store).await;
@@ -1538,9 +3054,11 @@ impl Application {
 
     /// A failed read keeps the last estimate.
     async fn refresh_available<S: RecordStore>(&mut self, store: &mut S) {
+        let full = self.manager.storage_full();
         if let Ok(bytes) = store.available().await {
             self.manager.available_bytes = bytes;
         }
+        self.adapter_dirty |= full != self.manager.storage_full();
     }
 
     /// Removes a saved layout that no longer describes the device.
@@ -1552,18 +3070,13 @@ impl Application {
             .and_then(Option::as_ref)
             .filter(|_| self.manager.storage_ready)
         {
-            crate::layouts::remove(store, d.policy.id).await;
+            crate::layouts::remove(store, d.id).await;
         }
     }
 
-    async fn bonded<S: RecordStore, B: Bluetooth>(
-        &mut self,
-        link: LinkId,
-        identity: Peer,
-        store: &mut S,
-        radio: &mut B,
-        now: u64,
-    ) {
+    /// The stack has saved the pairing attempt's bond. The saved device with its identity is
+    /// found in the secondary loop before the bond is saved and the link admitted.
+    fn bonded<B: Bluetooth>(&mut self, link: LinkId, identity: Peer, radio: &mut B, now: u64) {
         // Stale callbacks cannot delete a newer connection's native bond.
         // Backends finish rejected-pair cleanup before Disconnected.
         if self
@@ -1579,66 +3092,145 @@ impl Application {
                 .close(link, Some(Error::AuthenticationRejected), radio);
             return;
         }
-        let retained = self.manager.peer(identity);
-        let pair = self.pair.as_ref().unwrap();
-        let result = if pair.cancelling.is_some() || now >= pair.deadline || !self.serial.active() {
-            Err(Error::AuthenticationRejected)
-        } else {
-            let name = pair.name.clone();
-            self.manager
-                .bonded(link, identity, name.as_bytes(), store, radio)
-                .await
-        };
-        match result {
-            Ok(slot) => {
-                self.manager.connection_mut(link).unwrap().deadline =
-                    now.saturating_add(CONNECT_TIMEOUT_MS);
-                let pair = self.pair.take().unwrap();
-                for c in &mut self.candidates {
-                    if c.id == pair.candidate {
-                        c.peer = identity;
-                    }
-                }
-                if !self.manager.devices[slot]
-                    .as_ref()
-                    .unwrap()
-                    .effective_enabled
-                {
-                    self.close(link, None, radio);
-                }
-                self.mark(slot, DEVICE | SETTINGS | WARNINGS);
-                self.adapter_dirty = true;
-                let device = self.manager.devices[slot]
-                    .as_ref()
-                    .unwrap()
-                    .policy
-                    .device_id()
-                    .0;
-                self.pairing_ended(&pair, p::pairing::Step::Done(p::PairingDone { device }));
-            }
-            Err(error) => {
-                let protected = retained.is_some();
-                if let Some(pair) = &mut self.pair
-                    && !protected
-                {
-                    // Adopt may already have succeeded before the record write
-                    // failed. Explicit cleanup waits for disconnection.
-                    pair.cleanup = Some(identity);
-                }
-                self.stop_pairing(error, radio);
-            }
+        let active = self.serial.active();
+        let link_peer = self.manager.connection(link).unwrap().peer;
+        let pair = self.pair.as_mut().unwrap();
+        if pair.bonding.is_some() {
+            return;
         }
+        if pair.cancelling.is_some() || now >= pair.deadline || !active {
+            return self.bond_failed(identity, Error::AuthenticationRejected, radio);
+        }
+        // A Classic bond keeps the address it paired with, and no bond changes transport.
+        if identity.transport != link_peer.transport
+            || (identity.transport == Transport::Classic && identity != link_peer)
+        {
+            return self.bond_failed(identity, Error::AuthenticationFailed, radio);
+        }
+        pair.bonding = Some(Bonding {
+            identity,
+            scan: Records::new(2),
+            direct: false,
+        });
     }
 
-    /// Advances the pairing attempt: opens its link once other setup links have closed, and
-    /// finishes a cancelled attempt once its link is gone.
-    async fn advance_pair<S: RecordStore, B: Bluetooth>(
+    /// Ends the attempt whose bond could not be saved.
+    fn bond_failed<B: Bluetooth>(&mut self, identity: Peer, error: Error, radio: &mut B) {
+        if let Some(pair) = &mut self.pair
+            && pair.expected.is_none()
+        {
+            // Adopt may already have succeeded before the record write
+            // failed. Explicit cleanup waits for disconnection.
+            pair.cleanup = Some(identity);
+        }
+        self.stop_pairing(error, radio);
+    }
+
+    /// One step of matching the attempt's new bond with a saved device: looks up a resident device
+    /// or the saved device the attempt started with, or reads one saved device record, and saves
+    /// the bond once the device with its identity is found or every record has been read.
+    async fn match_bond<S: RecordStore, B: Bluetooth>(
         &mut self,
         store: &mut S,
         radio: &mut B,
         now: u64,
     ) {
         let Some(pair) = &self.pair else { return };
+        let (Some(link), Some(bonding)) = (pair.link, &pair.bonding) else {
+            return;
+        };
+        let identity = bonding.identity;
+        if !bonding.direct {
+            let known = self
+                .manager
+                .peer(identity)
+                .and_then(|slot| self.manager.devices[slot].as_ref())
+                .map(|d| d.id)
+                .or(pair.saved.filter(|_| pair.expected == Some(identity)));
+            self.pair.as_mut().unwrap().bonding.as_mut().unwrap().direct = true;
+            if let Some(id) = known {
+                match (Policies { store }).load(id).await {
+                    Ok(policy) if policy.peer == identity => {
+                        return self
+                            .finish_bond(link, identity, Some(policy), store, radio, now)
+                            .await;
+                    }
+                    Ok(_)
+                    | Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {}
+                    Err(_) => return self.bond_failed(identity, Error::StorageFailed, radio),
+                }
+                return;
+            }
+        }
+        let scan = &mut self.pair.as_mut().unwrap().bonding.as_mut().unwrap().scan;
+        let saved = match scan.next(store).await {
+            Err(error) => return self.bond_failed(identity, error, radio),
+            Ok(Visit::Page) => return,
+            Ok(Visit::Record(id)) => match (Policies { store }).load(id).await {
+                Ok(policy) if policy.peer == identity => Some(policy),
+                Ok(_) | Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
+                    return;
+                }
+                Err(_) => return self.bond_failed(identity, Error::StorageFailed, radio),
+            },
+            Ok(Visit::Done) => None,
+        };
+        self.finish_bond(link, identity, saved, store, radio, now)
+            .await
+    }
+
+    /// Saves the attempt's bond for `saved`, the saved device with its identity, or for a new
+    /// device, and admits the link.
+    async fn finish_bond<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        link: LinkId,
+        identity: Peer,
+        saved: Option<Policy>,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
+        let name = self.pair.as_ref().unwrap().name.clone();
+        let result = self
+            .manager
+            .bonded(link, identity, saved, name.as_bytes(), store, radio)
+            .await;
+        match result {
+            Ok((id, slot)) => {
+                if let Some(c) = self.manager.connection_mut(link) {
+                    c.deadline = now.saturating_add(CONNECT_TIMEOUT_MS);
+                }
+                let pair = self.pair.take().unwrap();
+                for c in &mut self.candidates {
+                    if c.id == pair.candidate {
+                        c.peer = identity;
+                    }
+                }
+                // A device that is disabled, or has no room in the stack, connects once enabled.
+                if slot.is_none() {
+                    self.close(link, None, radio);
+                }
+                self.mark(id, DEVICE | SETTINGS | WARNINGS);
+                self.adapter_dirty = true;
+                self.pairing_ended(
+                    &pair,
+                    p::pairing::Step::Done(p::PairingDone { device: id as u32 }),
+                );
+            }
+            Err(error) => self.bond_failed(identity, error, radio),
+        }
+    }
+
+    /// Advances the pairing attempt: opens its link once other setup links have closed and the
+    /// stack's bonds have been synced, and finishes a cancelled attempt once its link is gone.
+    /// Returns whether it used storage.
+    async fn advance_pair<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> bool {
+        let Some(pair) = &self.pair else { return false };
         if pair.link.is_some() {
             let prompt_expired = pair
                 .prompt
@@ -1646,8 +3238,18 @@ impl Application {
                 .is_some_and(|p| !p.answered && now >= p.deadline);
             if (pair.cancelling.is_none() && now >= pair.deadline) || prompt_expired {
                 self.stop_pairing(Error::Timeout, radio);
+                return false;
             }
-            return;
+            // A link the priority loop is closing reports its own error once it is gone.
+            let open = pair
+                .link
+                .and_then(|link| self.manager.connection(link))
+                .is_some_and(|c| !c.closing);
+            if pair.cancelling.is_none() && pair.bonding.is_some() && open {
+                self.match_bond(store, radio, now).await;
+                return true;
+            }
+            return false;
         }
         if let Some(error) = pair.cancelling {
             let cleanup = self.pair.as_mut().unwrap().cleanup.take();
@@ -1656,48 +3258,43 @@ impl Application {
             } else {
                 Ok(())
             };
-            let restored = self.manager.finish_pair(store, radio).await;
+            let restored = self.manager.finish_pair(store).await;
             let code = result.err().or(restored.err()).unwrap_or(error);
             let pair = self.pair.take().unwrap();
             self.pairing_ended(
                 &pair,
                 p::pairing::Step::Failed(wire::error_code(code) as i32),
             );
-            return;
+            return true;
         }
         if now >= pair.deadline {
             self.stop_pairing(Error::Timeout, radio);
-            return;
+            return false;
         }
-        if self
-            .manager
-            .connections
-            .iter()
-            .flatten()
-            .any(|c| c.closing || c.runtime.is_none())
-        {
-            return;
+        if !self.links_settled() {
+            return false;
+        }
+        if !self.manager.radio_ready || !self.manager.storage_ready {
+            self.stop_pairing(Error::RadioUnavailable, radio);
+            return false;
+        }
+        // Background work syncs the stack's bonds first, one record per step.
+        if !pair.synced {
+            return false;
         }
         let (address, expected, deadline) = (pair.address, pair.expected, pair.deadline);
-        let result = async {
-            if !self.manager.radio_ready || !self.manager.storage_ready {
-                return Err(Error::RadioUnavailable);
-            }
-            self.manager
-                .prepare_pair(address, expected, store, radio)
-                .await?;
-            self.manager.pair(address, deadline, radio)
-        }
-        .await;
+        let result = match self
+            .manager
+            .prepare_pair(address, expected, store, radio)
+            .await
+        {
+            Ok(()) => self.manager.pair(address, deadline, radio),
+            Err(error) => Err(error),
+        };
         match result {
             Ok(id) => self.pair.as_mut().unwrap().link = Some(id),
             Err(error) => {
-                let error = self
-                    .manager
-                    .finish_pair(store, radio)
-                    .await
-                    .err()
-                    .unwrap_or(error);
+                let error = self.manager.finish_pair(store).await.err().unwrap_or(error);
                 let pair = self.pair.take().unwrap();
                 self.pairing_ended(
                     &pair,
@@ -1705,6 +3302,38 @@ impl Application {
                 );
             }
         }
+        true
+    }
+
+    /// Whether the stack's bonds should be synced: they may differ from the resident entries and
+    /// no pairing attempt is under way, or an attempt waits for them before opening its link,
+    /// once no other link is being set up or closing.
+    fn sync_wanted(&self) -> bool {
+        match &self.pair {
+            None => self.manager.bonds_pending,
+            Some(pair) => {
+                pair.link.is_none()
+                    && pair.cancelling.is_none()
+                    && !pair.synced
+                    && self.links_settled()
+            }
+        }
+    }
+
+    /// Whether no link is being set up or closing.
+    fn links_settled(&self) -> bool {
+        !self
+            .manager
+            .connections
+            .iter()
+            .flatten()
+            .any(|c| c.closing || c.runtime.is_none())
+    }
+
+    /// Whether syncing the stack's bonds can go ahead: not while a pairing attempt's link holds
+    /// its provisional bond.
+    fn sync_allowed(&self) -> bool {
+        self.pair.as_ref().is_none_or(|p| p.link.is_none())
     }
 
     fn update_scan<B: Bluetooth>(&mut self, radio: &mut B, reconnecting: bool, now: u64) {
@@ -1728,17 +3357,21 @@ impl Application {
         }
     }
 
-    /// Finishes unpairs whose link has now closed.
-    async fn finish_unpairs<S: RecordStore, B: Bluetooth>(&mut self, store: &mut S, radio: &mut B) {
+    /// Finishes one unpair whose link has now closed, not while a connection waits for its first
+    /// input. Returns whether it used storage.
+    async fn finish_unpairs<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> bool {
+        if self.manager.starting(now) {
+            return false;
+        }
         let mut i = 0;
         while i < self.unpairing.len() {
             let id = self.unpairing[i];
-            let Some(slot) = self
-                .manager
-                .devices
-                .iter()
-                .position(|d| d.as_ref().is_some_and(|d| d.policy.id == id))
-            else {
+            let Some(slot) = self.manager.find(id) else {
                 self.unpairing.swap_remove(i);
                 continue;
             };
@@ -1747,12 +3380,307 @@ impl Application {
                 continue;
             }
             self.unpairing.swap_remove(i);
-            if let Err(code) = self.remove(slot, store, radio).await
+            let peer = self.manager.devices[slot].as_ref().unwrap().peer;
+            if let Err(code) = self.remove(id, peer, store, radio).await
                 && let Some(d) = self.manager.devices[slot].as_mut()
             {
+                d.deleting = false;
                 d.error = Some(code);
-                self.mark(slot, DEVICE);
+                self.mark(id, DEVICE);
             }
+            return true;
+        }
+        false
+    }
+
+    /// One step of background work: continues the setup, pairing, unpair or storage work in
+    /// progress, or starts the next. All but the pairing the user is waiting on wait while a
+    /// connection waits for its first input. Returns whether it did anything.
+    async fn maintain<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> bool {
+        // A pairing's bond is matched before other work, so the device connects promptly.
+        self.advance_pair(store, radio, now).await
+            || self.continue_work(store, radio, now).await
+            || self.setup(store, radio, now).await
+            || self.finish_unpairs(store, radio, now).await
+            || self.background(store, radio, now).await
+    }
+
+    /// Background storage work: reading connected devices' policies, saving their layouts,
+    /// cleaning up lost device records and profiles, filling the stack, syncing its bonds,
+    /// repairing profile roles and retrying profile loads. One step at a time, none while a
+    /// connection waits for its first input. Failed work is tried again after a backoff, and work
+    /// waiting for its backoff does not hold up the rest. Returns whether it did anything.
+    async fn background<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> bool {
+        if !self.manager.storage_ready || self.manager.starting(now) {
+            return false;
+        }
+        match self.manager.hydrate(store, now).await {
+            Ok(Some(slot)) => {
+                self.mark_slot(slot, DEVICE | SETTINGS);
+                if let Some(id) = self.manager.devices[slot].as_ref().map(|d| d.id) {
+                    self.job(id).apply = true;
+                }
+                return true;
+            }
+            Ok(None) => {}
+            Err((id, Error::NotFound)) => {
+                // The connected device's record was lost.
+                let _ = self.manager.lose(id, store, radio).await;
+                return true;
+            }
+            Err(_) => return true,
+        }
+        let pending = (0..devices::ACTIVE_CONNECTIONS).find_map(|index| {
+            let c = self.manager.connections[index].as_mut()?;
+            let layout = c.layout.take()?;
+            Some((c.device?, layout))
+        });
+        if let Some((slot, layout)) = pending {
+            self.save_layout(slot, &layout, store).await;
+            return true;
+        }
+        if let Some(&id) = self.manager.lost_devices.first()
+            && self.lost_retry.due(now)
+        {
+            if (Policies { store }).remove(id).await.is_ok() {
+                self.manager.lost_devices.remove(0);
+                self.lost_retry.succeeded();
+            } else {
+                // Kept, behind any others, until a cleanup succeeds.
+                self.manager.lost_devices.rotate_left(1);
+                self.lost_retry.failed(now);
+            }
+            return true;
+        }
+        // Work that takes several steps starts once the previous one has finished.
+        if self.work.is_none() {
+            if let Some(&id) = self.manager.lost_profiles.first()
+                && self.lost_retry.due(now)
+            {
+                self.manager.lost_profiles.remove(0);
+                self.work = Some(Work::LostProfile(id, None));
+                return self.continue_work(store, radio, now).await;
+            }
+            // A pairing attempt waiting for the sync does not wait out the backoff.
+            let pairing = self.pair.is_some() && self.sync_wanted();
+            if (self.manager.vacated || (self.sync_wanted() && self.sync_allowed()))
+                && (self.bonds_retry.due(now) || pairing)
+            {
+                if self.manager.vacated {
+                    let changed = self.manager.retire();
+                    if self.manager.has_room() {
+                        self.work = Some(Work::Fill {
+                            scan: Records::new(2),
+                            changed,
+                        });
+                    } else {
+                        self.filled(Ok(changed), radio, now);
+                    }
+                } else {
+                    self.work = Some(Work::Bonds(BondSync::Inventory));
+                }
+                return self.continue_work(store, radio, now).await;
+            }
+        }
+        if let Some(&id) = self.roles_pending.first()
+            && self.roles_retry.due(now)
+        {
+            self.roles_pending.remove(0);
+            if self.repair_roles(id, store).await.is_ok() {
+                self.roles_retry.succeeded();
+            } else {
+                if !self.roles_pending.contains(&id) {
+                    self.roles_pending.push(id);
+                }
+                self.roles_retry.failed(now);
+            }
+            return true;
+        }
+        // Released memory lets each device that did not fit try again, in turn, in a pass over
+        // the devices. A release during a pass is left to the next one.
+        if self.retry_from == 0 {
+            self.retry_released = core::mem::take(&mut self.profiles_released)
+                || self.manager.profiles.used() < self.reported_memory;
+        }
+        match self
+            .manager
+            .retry_profiles(store, self.retry_released, self.retry_from, now)
+            .await
+        {
+            Some((slot, changed)) => {
+                self.retry_from = slot + 1;
+                if changed {
+                    self.mark_slot(slot, DEVICE);
+                }
+                true
+            }
+            None => {
+                self.retry_from = 0;
+                false
+            }
+        }
+    }
+
+    /// One step of the background work in progress, unless it is paused. Returns whether it did
+    /// anything.
+    async fn continue_work<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> bool {
+        if !self.manager.storage_ready || self.manager.starting(now) {
+            return false;
+        }
+        let Some(work) = self.work.take() else {
+            return false;
+        };
+        match work {
+            Work::Fill { mut scan, changed } => match scan.next(store).await {
+                Err(error) => self.filled(Err(error), radio, now),
+                Ok(Visit::Done) => self.filled(Ok(changed), radio, now),
+                Ok(Visit::Page) => self.work = Some(Work::Fill { scan, changed }),
+                Ok(Visit::Record(id)) => match self.manager.fill_record(id, store).await {
+                    Ok(added) => {
+                        self.work = Some(Work::Fill {
+                            scan,
+                            changed: changed || added,
+                        })
+                    }
+                    Err(error) => self.filled(Err(error), radio, now),
+                },
+            },
+            Work::Bonds(sync) => {
+                if !self.sync_allowed() {
+                    self.work = Some(Work::Bonds(sync));
+                    return false;
+                }
+                self.sync_bonds(sync, store, radio, now).await;
+            }
+            Work::LostProfile(id, scan) => {
+                match self.clean_lost_profile(id, scan, store, radio).await {
+                    Ok(Some(scan)) => self.work = Some(Work::LostProfile(id, Some(scan))),
+                    Ok(None) => {
+                        // A connection that found it lost meanwhile queued it again.
+                        self.manager.lost_profiles.retain(|p| *p != id);
+                        self.lost_retry.succeeded();
+                    }
+                    Err(_) => {
+                        // Kept, behind any others, until a cleanup succeeds.
+                        if !self.manager.lost_profiles.contains(&id) {
+                            self.manager.lost_profiles.push(id);
+                        }
+                        self.lost_retry.failed(now);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Ends a fill: syncs the stack's bonds next when the resident set changed.
+    fn filled<B: Bluetooth>(&mut self, result: Result<bool, Error>, radio: &mut B, now: u64) {
+        match result {
+            Ok(changed) => {
+                self.manager.bonds_pending |= changed;
+                if self.sync_wanted() && self.sync_allowed() {
+                    self.work = Some(Work::Bonds(BondSync::Inventory));
+                } else {
+                    self.bonds_retry.succeeded();
+                }
+            }
+            Err(error) => {
+                // A failure leaves the work to the next fill. An attempt waiting for the sync
+                // that follows fails with it.
+                if self.pair.is_some() && self.sync_wanted() {
+                    self.stop_pairing(error, radio);
+                }
+                self.manager.vacated = true;
+                self.bonds_retry.failed(now);
+            }
+        }
+    }
+
+    /// One step of syncing the stack's bonds with the resident entries: reads the stack's bonds,
+    /// removes one that no resident entry or link uses, or loads one entry's saved bond. Each
+    /// step checks the entries as they are then, so changes between steps are followed.
+    async fn sync_bonds<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        sync: BondSync,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
+        let result = match sync {
+            BondSync::Inventory => {
+                // A change during the sync, such as a link closing after its bond was kept, asks
+                // for another one.
+                self.manager.bonds_pending = false;
+                radio
+                    .bonds()
+                    .await
+                    .map(|peers| Some(BondSync::Forget(peers)))
+            }
+            BondSync::Forget(mut peers) => match peers.pop() {
+                Some(peer) => self
+                    .manager
+                    .forget_stale(peer, radio)
+                    .await
+                    .map(|()| Some(BondSync::Forget(peers))),
+                None => Ok(Some(BondSync::Import(0))),
+            },
+            BondSync::Import(slot) => match self.manager.next_resident(slot) {
+                Some(slot) => self
+                    .manager
+                    .import(slot, store, radio)
+                    .await
+                    .map(|()| Some(BondSync::Import(slot + 1))),
+                None => Ok(None),
+            },
+        };
+        match result {
+            Ok(Some(next)) => self.work = Some(Work::Bonds(next)),
+            Ok(None) => {
+                self.bonds_retry.succeeded();
+                // A link still closing kept its bond; the attempt waits for another sync.
+                let synced = self.links_settled() && !self.manager.bonds_pending;
+                if let Some(pair) = &mut self.pair {
+                    pair.synced |= synced;
+                }
+            }
+            Err(error) => {
+                self.manager.bonds_pending = true;
+                self.bonds_retry.failed(now);
+                // An attempt waiting for the sync fails with it.
+                if self.pair.is_some() && self.sync_wanted() {
+                    self.stop_pairing(error, radio);
+                }
+            }
+        }
+    }
+
+    /// Releases an editor's profile once the editor has gone quiet or its interface changed.
+    fn release_editor(&mut self, now: u64) {
+        let Some(editor) = &self.editor else { return };
+        let saved = interfaces::preference(
+            &self.manager.preference.configuration_interfaces,
+            editor.interface,
+        );
+        if now.saturating_sub(editor.last) >= EDITOR_IDLE_MS
+            || !saved.enabled
+            || saved.profile != Some(editor.profile)
+        {
+            self.editor = None;
         }
     }
 
@@ -1762,87 +3690,371 @@ impl Application {
             let Some(d) = self.manager.devices[slot].as_mut() else {
                 continue;
             };
+            let id = d.id;
+            let Some(live) = d.live.as_mut() else {
+                continue;
+            };
             let mut bits = 0;
-            if core::mem::take(&mut d.catalog.catalog_changed)
-                | (d.catalog.take_changed().count() != 0)
-            {
-                bits |= SETTINGS;
+            let mut keys = if core::mem::take(&mut live.catalog.catalog_changed) {
+                ALL_KEYS
+            } else {
+                0
+            };
+            keys |= live
+                .catalog
+                .take_changed()
+                .fold(0, |keys, r| keys | key_bit(r.metadata.key));
+            if keys != 0 {
                 // Read-only records are information on the device record.
                 bits |= DEVICE;
             }
-            if !d.catalog.info.changes().is_empty() {
+            if !live.catalog.info.changes().is_empty() {
                 bits |= DEVICE;
             }
-            if core::mem::take(&mut d.warnings_changed) {
+            if core::mem::take(&mut live.warnings_changed) {
                 bits |= WARNINGS;
             }
+            if keys != 0 {
+                self.touch(id, keys);
+            }
             if bits != 0 {
-                self.mark(slot, bits);
+                self.mark(id, bits);
             }
         }
         while let Some(id) = self.manager.removed.pop() {
-            self.removed.push_back(id.0);
+            self.forget_device(id);
+            self.removed.push_back(id);
             self.adapter_dirty = true;
+        }
+        while let Some(id) = self.manager.changed.pop() {
+            self.mark(id, DEVICE);
         }
         let ready = self.manager.radio_ready && self.manager.storage_ready;
         if self.reported_ready != ready {
             self.reported_ready = ready;
             self.adapter_dirty = true;
         }
+        let memory = self.manager.profiles.used();
+        // A release is remembered until the background step that retries loading runs.
+        self.profiles_released |= memory < self.reported_memory;
+        if self.reported_memory != memory {
+            self.reported_memory = memory;
+            self.adapter_dirty |= self.manager.profiles_supported();
+        }
+        self.release_reported();
     }
 
-    /// Writes at most one pending event, when the serial output is free.
-    fn flush<B: Bluetooth>(&mut self, radio: &B) {
+    /// Writes at most one pending event, when the serial output is free. Returns whether it
+    /// wrote one.
+    async fn flush<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> bool {
         if !self.serial.idle() {
-            return;
+            return false;
         }
-        if core::mem::take(&mut self.adapter_dirty) {
-            let status = self.status(radio);
-            return self.serial.event(Ev::Adapter(status));
-        }
-        if let Some(id) = self.removed.pop_front() {
-            return self
-                .serial
-                .event(Ev::DeviceRemoved(p::DeviceRemoved { id }));
-        }
-        if core::mem::take(&mut self.pairing_dirty)
+        let event = if core::mem::take(&mut self.adapter_dirty) {
+            Some(Ev::Adapter(self.status(radio)))
+        } else if let Some(id) = self.profile_removed.pop_front() {
+            Some(Ev::ProfileRemoved(p::ProfileRemoved { id: id as u32 }))
+        } else if let Some(event) = self.profile_event(store, radio, now).await {
+            Some(event)
+        } else if let Some(id) = self.removed.pop_front() {
+            Some(Ev::DeviceRemoved(p::DeviceRemoved { id: id as u32 }))
+        } else if core::mem::take(&mut self.pairing_dirty)
             && let Some(pairing) = self.pairing.clone()
         {
-            return self.serial.event(Ev::Pairing(pairing));
-        }
-        let event = if self.scan_turn {
-            self.scan_event().or_else(|| self.device_event())
+            Some(Ev::Pairing(pairing))
         } else {
-            self.device_event().or_else(|| self.scan_event())
+            let event = if self.scan_turn {
+                match self.scan_event() {
+                    Some(event) => Some(event),
+                    None => self.device_event(store, radio, now).await,
+                }
+            } else {
+                match self.device_event(store, radio, now).await {
+                    Some(event) => Some(event),
+                    None => self.scan_event(),
+                }
+            };
+            if event.is_some() {
+                self.scan_turn = !self.scan_turn;
+            }
+            event
         };
-        if let Some(event) = event {
-            self.scan_turn = !self.scan_turn;
-            self.serial.event(event);
+        match event {
+            Some(event) => {
+                self.serial.event(event);
+                true
+            }
+            None => false,
         }
     }
 
-    /// The next device, settings or warnings event, starting from the slot after the last one
-    /// sent.
-    fn device_event(&mut self) -> Option<Ev> {
-        let n = self.dirty.len();
-        for k in 0..n {
-            let slot = (self.next_slot + k) % n;
-            let bits = self.dirty[slot];
-            if bits == 0 {
-                continue;
+    /// Whether event `read` may read its records: it is not backing off after a failed read.
+    fn event_due(&self, read: EventRead, now: u64) -> bool {
+        self.event_retries
+            .iter()
+            .find(|(r, _)| *r == read)
+            .is_none_or(|(_, retry)| retry.due(now))
+    }
+
+    /// Records the outcome of event `read`. Returns whether the event is settled: its read
+    /// succeeded, or its record is gone and the record's own removal event follows. Any other
+    /// failure keeps the event pending and grows its backoff, without holding up other events.
+    /// Only the event's own outcome ends its backoff.
+    fn event_settled(&mut self, read: EventRead, error: Option<&p::Error>, now: u64) -> bool {
+        let index = self.event_retries.iter().position(|(r, _)| *r == read);
+        match (error, index) {
+            (Some(error), index) if error.code != p::ErrorCode::NotFound as i32 => {
+                let index = index.unwrap_or_else(|| {
+                    self.event_retries.push((read, Backoff::default()));
+                    self.event_retries.len() - 1
+                });
+                self.event_retries[index].1.failed(now);
+                false
             }
-            let event = if bits & DEVICE != 0 {
-                self.dirty[slot] &= !DEVICE;
-                wire::device(&self.manager, slot).map(Ev::Device)
-            } else if bits & SETTINGS != 0 {
-                self.dirty[slot] &= !SETTINGS;
-                wire::settings(&self.manager, slot).map(Ev::Settings)
+            (_, Some(index)) => {
+                self.event_retries.swap_remove(index);
+                true
+            }
+            (_, None) => true,
+        }
+    }
+
+    /// Whether device `id`'s connection holds its policy, so its events read no record.
+    fn policy_loaded(&self, id: u64) -> bool {
+        self.manager
+            .find(id)
+            .and_then(|s| self.manager.devices[s].as_ref())
+            .and_then(|d| d.live.as_ref())
+            .is_some_and(|l| l.policy.is_some())
+    }
+
+    /// The next profile record or rules event, starting from the entry after the last one sent.
+    /// A read that fails keeps its event pending, and that event waits for its own backoff while
+    /// other events go ahead. Rules a connection or configuration
+    /// interface has loaded need no read.
+    async fn profile_event<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> Option<Ev> {
+        let mut waiting = 0;
+        while waiting < self.profile_dirty.len() {
+            let index = self.next_profile % self.profile_dirty.len();
+            let (id, bits) = self.profile_dirty[index];
+            let (profile, rules) = (EventRead::Profile(id), EventRead::Rules(id));
+            let event = if bits & PROFILE != 0 && self.event_due(profile, now) {
+                let result = self.profile_record(id as u32, store, radio).await;
+                if self.event_settled(profile, result.as_ref().err(), now) {
+                    self.profile_dirty[index].1 &= !PROFILE;
+                }
+                result.ok().map(Ev::Profile)
+            } else if bits & RULES != 0
+                && (self.manager.profiles.get(id).is_some() || self.event_due(rules, now))
+            {
+                let result = self.rules_event(id, store).await;
+                if self.event_settled(rules, result.as_ref().err(), now) {
+                    self.profile_dirty[index].1 &= !RULES;
+                }
+                result.ok().flatten()
+            } else if bits == 0 {
+                self.profile_dirty.remove(index);
+                continue;
             } else {
-                self.dirty[slot] = 0;
-                wire::warnings(&self.manager, slot).map(Ev::Warnings)
+                // Only events whose reads back off are left here.
+                waiting += 1;
+                self.next_profile = index + 1;
+                continue;
             };
+            if self.profile_dirty.get(index).is_some_and(|(_, b)| *b == 0) {
+                self.profile_dirty.remove(index);
+                self.next_profile = index;
+            } else {
+                self.next_profile = index + 1;
+            }
             if event.is_some() {
-                self.next_slot = slot + 1;
+                return event;
+            }
+        }
+        None
+    }
+
+    /// The changes to the rules of profile `id` whose inputs were touched: the current rule for
+    /// each that has one, and the input of each that does not. `None` when there is nothing to
+    /// send. Touched inputs stay touched when the rules cannot be read, so the next rules event
+    /// of the profile carries them.
+    async fn rules_event<S: RecordStore>(
+        &mut self,
+        id: u64,
+        store: &mut S,
+    ) -> Result<Option<Ev>, p::Error> {
+        if !self.touched_rules.iter().any(|(p, _)| *p == id) {
+            return Ok(None);
+        }
+        let rules = self.rules(id, store).await?;
+        let Some(index) = self.touched_rules.iter().position(|(p, _)| *p == id) else {
+            return Ok(None);
+        };
+        let (_, inputs) = self.touched_rules.swap_remove(index);
+        let mut changed = Vec::new();
+        let mut removed = Vec::new();
+        let mut current = rules.iter().peekable();
+        for input in inputs {
+            while current.next_if(|r| r.input < input).is_some() {}
+            match current.next_if(|r| r.input == input) {
+                Some(rule) => changed.push(wire_rule(rule)),
+                None => removed.push(wire_usage(input)),
+            }
+        }
+        Ok(
+            (!changed.is_empty() || !removed.is_empty()).then_some(Ev::ProfileRulesChanged(
+                p::ProfileRulesChanged {
+                    profile: id as u32,
+                    changed,
+                    removed,
+                },
+            )),
+        )
+    }
+
+    /// The changes to device `id`'s settings since the client last saw them: each touched
+    /// setting it has now, and each setting the client may hold that it no longer has. For a
+    /// device that is not tracked, the client may hold any touched setting. Touched settings
+    /// stay touched when the settings cannot be read, so the next settings event of the device
+    /// carries them.
+    async fn settings_event<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u64,
+        store: &mut S,
+        radio: &mut B,
+    ) -> Result<Option<Ev>, p::Error> {
+        let settings = self.device_settings(id as u32, store, radio).await?;
+        let touched = match self.touched.iter().position(|(d, _)| *d == id) {
+            Some(index) => self.touched.swap_remove(index).1,
+            None => ALL_KEYS,
+        };
+        let present = settings
+            .iter()
+            .filter_map(|s| wire::parse_setting_key(&s.key))
+            .fold(0, |keys, key| keys | key_bit(key));
+        let changed: Vec<p::Setting> = settings
+            .into_iter()
+            .filter(|s| wire::parse_setting_key(&s.key).is_some_and(|k| key_bit(k) & touched != 0))
+            .collect();
+        let sent = changed
+            .iter()
+            .filter_map(|s| wire::parse_setting_key(&s.key))
+            .fold(0, |keys, key| keys | key_bit(key));
+        let (gone, held) = match self.reported.iter().find(|r| r.id == id) {
+            Some(reported) => (reported.keys & !present, reported.keys),
+            None => (touched & !present, ALL_KEYS),
+        };
+        if let Some(reported) = self.reported(id) {
+            reported.keys = (held & present) | sent;
+        }
+        let removed: Vec<p::SettingRef> = SettingKey::ALL
+            .into_iter()
+            .filter(|k| key_bit(*k) & gone != 0)
+            .map(|k| p::SettingRef {
+                integration: p::IntegrationKind::Hidpp as i32,
+                key: wire::setting_key(k),
+            })
+            .collect();
+        Ok(
+            (!changed.is_empty() || !removed.is_empty()).then_some(Ev::SettingsChanged(
+                p::SettingsChanged {
+                    device: id as u32,
+                    changed,
+                    removed,
+                },
+            )),
+        )
+    }
+
+    /// The changes to device `id`'s warnings since the client last saw them. Warnings exist only
+    /// while a device is connected, and a device stays tracked until the events that follow its
+    /// disconnection have been written, so the client holds none of an untracked device's.
+    fn warnings_event(&mut self, id: u64) -> Option<Ev> {
+        let current = self.warnings_of(self.manager.find(id));
+        let held = match self.reported(id) {
+            Some(reported) => core::mem::replace(&mut reported.warnings, current.clone()),
+            None => Vec::new(),
+        };
+        let added: Vec<DeviceWarning> = current
+            .iter()
+            .filter(|w| !held.contains(w))
+            .copied()
+            .collect();
+        let removed: Vec<DeviceWarning> = wire::sorted_warnings(&held)
+            .into_iter()
+            .filter(|w| !current.contains(w))
+            .collect();
+        (!added.is_empty() || !removed.is_empty()).then_some(Ev::WarningsChanged(
+            p::WarningsChanged {
+                device: id as u32,
+                added: added.iter().map(wire::warning).collect(),
+                removed: removed.iter().map(wire::warning).collect(),
+            },
+        ))
+    }
+
+    /// The next device, settings or warnings event, starting from the entry after the last one
+    /// sent. Device and settings events read the device's saved policy until its connection has
+    /// read it, so for a connection that is starting they wait until it has forwarded input or
+    /// waited for it; other devices' events go ahead meanwhile. A read that fails keeps its event
+    /// pending, and that event waits for its own backoff while other events go ahead. Events of a connection that holds its policy read nothing.
+    async fn device_event<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> Option<Ev> {
+        let mut waiting = 0;
+        while waiting < self.dirty.len() {
+            let index = self.next_dirty % self.dirty.len();
+            let (id, bits) = self.dirty[index];
+            let (device, settings) = (EventRead::Device(id), EventRead::Settings(id));
+            let ready = !self.manager.waiting_for_input(id, now);
+            let loaded = self.policy_loaded(id);
+            let event = if bits & DEVICE != 0 && ready && (loaded || self.event_due(device, now)) {
+                let result = self.policy_of(id as u32, store, radio).await;
+                if self.event_settled(device, result.as_ref().err(), now) {
+                    self.dirty[index].1 &= !DEVICE;
+                }
+                result
+                    .ok()
+                    .map(|(policy, slot)| Ev::Device(wire::device(&self.manager, &policy, slot)))
+            } else if bits & SETTINGS != 0 && ready && (loaded || self.event_due(settings, now)) {
+                let result = self.settings_event(id, store, radio).await;
+                if self.event_settled(settings, result.as_ref().err(), now) {
+                    self.dirty[index].1 &= !SETTINGS;
+                }
+                result.ok().flatten()
+            } else if bits & WARNINGS != 0 {
+                self.dirty[index].1 &= !WARNINGS;
+                self.warnings_event(id)
+            } else if bits == 0 {
+                self.dirty.remove(index);
+                continue;
+            } else {
+                // Only events that wait for the connection's first input or for a read's backoff
+                // are left here.
+                waiting += 1;
+                self.next_dirty = index + 1;
+                continue;
+            };
+            if self.dirty.get(index).is_some_and(|(_, b)| *b == 0) {
+                self.dirty.remove(index);
+                self.next_dirty = index;
+            } else {
+                self.next_dirty = index + 1;
+            }
+            if event.is_some() {
                 return event;
             }
         }
@@ -1853,16 +4065,18 @@ impl Application {
         if let Some(c) = self.candidates.iter_mut().find(|c| c.dirty) {
             c.dirty = false;
             return Some(Ev::ScanFound(p::Candidate {
-                id: c.id.clone(),
+                id: c.id,
                 transport: wire::transport(c.peer.transport) as i32,
                 name: c.name.clone().into(),
-                kind: wire::kind(c.kind) as i32,
+                kinds: wire::kinds(c.kind),
                 rssi: c.rssi,
             }));
         }
         self.scan_done.take().map(Ev::ScanDone)
     }
 
+    /// Runs the priority loop's work once, then the secondary loop's work until it has nothing
+    /// more to do, for an owner that runs the application from one loop.
     pub async fn poll<S: RecordStore, B: Bluetooth>(
         &mut self,
         store: &mut S,
@@ -1870,6 +4084,21 @@ impl Application {
         leds: u8,
         now: u64,
     ) {
+        self.operate(store, radio, leds, now).await;
+        while self.work(store, radio, now).await {}
+    }
+
+    /// The secondary loop's application work after serial input: releases an idle editor, starts
+    /// settings jobs, then writes one event when the serial output is free, or else takes one
+    /// step of background work. Returns whether it wrote an event or took a step. Once the
+    /// bootloader has been requested, it enters it when output and input have been sent.
+    pub async fn work<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> bool {
+        self.release_editor(now);
         if let Some(deadline) = self.reboot_at {
             if ((self.serial.queued() == 0 && self.manager.forward.pending() == 0)
                 || now >= deadline)
@@ -1877,6 +4106,32 @@ impl Application {
             {
                 (boot.enter)();
             }
+            return false;
+        }
+        self.start_jobs(now);
+        self.collect_changes();
+        // Events and background work take turns, so a stream of events cannot hold up pairing
+        // deadlines or storage work.
+        if core::mem::take(&mut self.maintenance_turn) && self.maintain(store, radio, now).await {
+            return true;
+        }
+        if self.serial.active() && self.flush(store, radio, now).await {
+            self.maintenance_turn = true;
+            return true;
+        }
+        self.maintain(store, radio, now).await
+    }
+
+    /// The priority loop's work after radio events: link timers and output to devices,
+    /// reconnecting saved devices and the scan.
+    pub async fn operate<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        leds: u8,
+        now: u64,
+    ) {
+        if self.reboot_at.is_some() {
             return;
         }
         if self.scan.as_ref().is_some_and(|s| now >= s.deadline) {
@@ -1885,7 +4140,7 @@ impl Application {
         for index in 0..devices::ACTIVE_CONNECTIONS {
             let id = self.manager.connections[index].as_ref().map(|c| c.id);
             match self.manager.poll_link(index, leds, now, radio) {
-                Ok(Some(slot)) => self.mark(slot, DEVICE),
+                Ok(Some(slot)) => self.mark_slot(slot, DEVICE),
                 Err(e) => {
                     if let Some(id) = id {
                         self.close(id, Some(e), radio);
@@ -1894,10 +4149,6 @@ impl Application {
                 _ => {}
             }
         }
-        self.setup(store).await;
-        self.advance_pair(store, radio, now).await;
-        self.finish_unpairs(store, radio).await;
-        self.start_jobs(now);
         if self.pair.is_none() && self.manager.storage_ready && self.manager.radio_ready {
             for slot in 0..self.manager.devices.len() {
                 if self.manager.connections.iter().flatten().count()
@@ -1913,11 +4164,11 @@ impl Application {
                 }
                 let Some(d) = self.manager.devices[slot]
                     .as_ref()
-                    .filter(|d| d.policy.peer.transport == Transport::Classic && d.page_due(now))
+                    .filter(|d| d.peer.transport == Transport::Classic && d.page_due(now))
                 else {
                     continue;
                 };
-                let id = d.policy.id;
+                let id = d.id;
                 let layout = crate::layouts::load(store, id, Transport::Classic).await;
                 match self.manager.connect(
                     slot,
@@ -1926,7 +4177,7 @@ impl Application {
                     layout.as_ref(),
                     radio,
                 ) {
-                    Ok(_) => self.mark(slot, DEVICE),
+                    Ok(_) => self.mark(id, DEVICE),
                     // A radio busy with other link setup takes the page shortly, without
                     // reading the saved layout on every poll meanwhile.
                     Err(Error::Busy | Error::Capacity) => self.manager.devices[slot]
@@ -1939,7 +4190,7 @@ impl Application {
                             Some(e),
                             now,
                         );
-                        self.mark(slot, DEVICE);
+                        self.mark(id, DEVICE);
                     }
                 }
             }
@@ -1954,32 +4205,23 @@ impl Application {
             .iter()
             .filter_map(|device| {
                 let d = device.as_ref()?;
-                (available && d.policy.peer.transport == Transport::Ble && d.admit_due(now))
-                    .then_some(d.policy.peer)
+                (available && d.peer.transport == Transport::Ble && d.admit_due(now))
+                    .then_some(d.peer)
             })
             .collect();
         if self.manager.radio_ready
             && let Err(error) = radio.reconnect(&peers)
             && error != Error::Busy
         {
-            self.event(Event::Failed(error), store, radio, now).await;
+            self.radio_failed(error, now);
         }
         self.update_scan(radio, !peers.is_empty(), now);
-        self.collect_changes();
-        if self.serial.active() {
-            self.flush(radio);
-        }
     }
 
     fn dropped(&mut self, link: LinkId, error: Option<Error>, now: u64) {
-        if let Some((slot, runtime)) = self.manager.disconnected(link, error, now) {
+        if let Some(slot) = self.manager.disconnected(link, error, now) {
             if let Some(slot) = slot {
-                self.mark(slot, DEVICE | SETTINGS);
-                if let Some(mut runtime) = runtime {
-                    runtime
-                        .settings
-                        .release(&mut self.manager.devices[slot].as_mut().unwrap().catalog);
-                }
+                self.mark_slot(slot, DEVICE | SETTINGS | WARNINGS);
             }
             if let Some(pair) = &mut self.pair
                 && pair.link == Some(link)

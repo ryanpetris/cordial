@@ -17,8 +17,18 @@ export interface ByteStream {
 export interface PortInfo {
   path: string;
   /**
-   * USB serial number, which is the Dongle's adapter ID. Null when the host
-   * can't read it (Web Serial): the Dongle's status then identifies it.
+   * The USB serial number as the port reports it; empty when it reports none, and null when the
+   * host can't read it (Web Serial). Only the status of an open session identifies the adapter.
    */
   serial: string | null;
 }
+
+/** The characters of the adapter ID that begin every Dongle's USB serial number. */
+const ADAPTER_ID_LENGTH = 16;
+
+/**
+ * Whether a port's USB serial number begins with the adapter ID `id`, compared without regard to
+ * case, so an adapter can be recognized before its port is opened. Anything after the ID, such as
+ * the marker Vial looks for, is ignored.
+ */
+export const serialMatches = (serial: string, id: string) => serial.slice(0, ADAPTER_ID_LENGTH).toUpperCase() === id.toUpperCase();

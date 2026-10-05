@@ -2,14 +2,15 @@
 //! protocol's commands, pairing answers and completion.
 use crate::{
     commands::{self, MAX_SCAN_SECONDS},
-    controller::{Command, SettingInput, State, Toggle},
+    controller::{Command, Pick, SettingInput, State, Target, Toggle},
     model::{self, Prompt, Type},
+    profiles,
     ui::{
         catalog::{self, value_string},
         text::{Filter, quote},
     },
 };
-use cordial_protocol::{self as p, Platform, Transport};
+use cordial_protocol::{self as p, Platform, Transport, profile_rule};
 use std::path::PathBuf;
 
 /// A shell command: its words, argument syntax and description, in help order.
@@ -27,6 +28,28 @@ const SCAN: &str = "scan start";
 
 /// The transport row's arguments follow the supported transports.
 const TRANSPORT_SET: &str = "adapter set transport";
+
+/// The interface rows' arguments follow the supported interfaces.
+const INTERFACE_SET: &str = "adapter set interface";
+const INTERFACE_RESET: &str = "adapter reset interface";
+
+/// Followed by a row for its profile form on adapters with profiles.
+const DEVICE_SET: &str = "device set";
+
+/// Commands offered only by adapters with profiles.
+const PROFILE_COMMANDS: &[&str] = &[
+    INTERFACE_SET,
+    INTERFACE_RESET,
+    "profile list",
+    "profile show",
+    "profile create",
+    "profile copy",
+    "profile delete",
+    "profile rule list",
+    "profile rule remap",
+    "profile rule scale",
+    "profile rule forget",
+];
 
 const SPECS: &[Spec] = &[
     spec("adapter list", "", "List attached adapters"),
@@ -53,6 +76,12 @@ const SPECS: &[Spec] = &[
         "Enable or disable a Bluetooth transport (saved on the adapter)",
     ),
     spec(
+        INTERFACE_SET,
+        "",
+        "Enable or disable a configuration interface, optionally selecting its profile",
+    ),
+    spec(INTERFACE_RESET, "", "Clear a disabled interface's profile"),
+    spec(
         "adapter bootloader",
         "",
         "Development only; HID stops while in BOOTSEL",
@@ -68,7 +97,7 @@ const SPECS: &[Spec] = &[
     spec(
         "pair start",
         "CANDIDATE",
-        "Pair a Nearby device by candidate ID or a name only one Nearby device has; one already saved pairs again, keeping its settings; saved disabled when no enabled place is free; then connect",
+        "Pair a candidate by ID or a name only one candidate has; one already saved pairs again, keeping its settings; saved disabled when no enabled place is free; then connect",
     ),
     spec("pair accept", "[VALUE]", "Answer a pairing prompt"),
     spec("pair reject", "", "Reject a pairing prompt"),
@@ -86,7 +115,7 @@ const SPECS: &[Spec] = &[
     spec(
         "device unpair",
         "DEV",
-        "Disconnect and remove the saved bond; a Nearby entry is hidden",
+        "Disconnect and remove the saved bond",
     ),
     spec(
         "device refresh",
@@ -94,9 +123,34 @@ const SPECS: &[Spec] = &[
         "Ask a connected device for current information and settings",
     ),
     spec(
-        "device set",
+        DEVICE_SET,
         "DEV enabled | trusted | blocked | hidpp on | off",
         "enabled uses a saved device for connections and needs a free enabled place; trusted allows automatic connections; blocked refuses connections; hidpp lets the adapter use HID++ for special keys and saved settings",
+    ),
+    spec(
+        "profile list",
+        "[--after ID]",
+        "List profiles, with their roles; --after ID lists one page after that profile",
+    ),
+    spec("profile show", "PROFILE", "Show a profile's name and roles"),
+    spec("profile create", "NAME", "Create an empty profile"),
+    spec("profile copy", "PROFILE NAME", "Copy on the adapter"),
+    spec("profile delete", "PROFILE", "Delete an unused profile"),
+    spec("profile rule list", "PROFILE", "Show every rule"),
+    spec(
+        "profile rule remap",
+        "PROFILE INPUT OUTPUTS",
+        "Remap an on/off input to the outputs, held together",
+    ),
+    spec(
+        "profile rule scale",
+        "PROFILE INPUT N/D",
+        "Multiply a value input by N/D; a negative N inverts it",
+    ),
+    spec(
+        "profile rule forget",
+        "PROFILE INPUT",
+        "Forget a rule so the input passes through unchanged",
     ),
     spec(
         "warning list",
@@ -153,7 +207,19 @@ const NOTES: &[(&[&str], &str)] = &[
             "setting",
             "feature",
         ],
-        "DEV is an opaque ID or an unambiguous name. Quote names containing spaces.",
+        "DEV is a device ID shown in output, or an unambiguous name. A number is always taken as an ID. Quote names containing spaces.",
+    ),
+    (
+        &["pair start"],
+        "CANDIDATE is a candidate ID shown in scan output, or an unambiguous name. Candidate and device IDs are separate.",
+    ),
+    (
+        &["profile", INTERFACE_SET],
+        "PROFILE is a profile ID or a unique name. LAYERS is one or more profile arguments in the order they apply, or none for an empty list.",
+    ),
+    (
+        &["profile rule"],
+        "A USAGE is PAGE:USAGE in hexadecimal, such as 07:39 for Caps Lock or 01:38 for the wheel. An INPUT is a USAGE. OUTPUTS is disabled or a comma-separated list of USAGEs, each optionally followed by @PAGE:USAGE naming the report's collection.",
     ),
     (
         &["pair accept"],
@@ -179,7 +245,7 @@ another computer meanwhile.
 Changes made on the device are shown but never saved or corrected. A setting's
 values come from the device: see setting get. With HID++ off, setting set only
 saves the value on the adapter without applying it. While disconnected,
-setting list shows what the adapter last knew, and setting forget still
+setting list shows what the adapter has saved, and setting forget still
 returns a setting to Default. Only settings this version of Cordial recognizes can be
 shown or changed.",
     ),
@@ -213,6 +279,20 @@ pub fn help(st: Option<&State>) -> String {
                 ),
                 r.text.to_owned(),
             ),
+            INTERFACE_SET => (
+                format!(
+                    "{INTERFACE_SET} {} on | off [PROFILE]",
+                    interface_words(st).join(" | ")
+                ),
+                r.text.to_owned(),
+            ),
+            INTERFACE_RESET => (
+                format!(
+                    "{INTERFACE_RESET} {} profile",
+                    interface_words(st).join(" | ")
+                ),
+                r.text.to_owned(),
+            ),
             "quit" => ("quit | exit".to_owned(), r.text.to_owned()),
             _ => (
                 format!("{} {}", r.words, r.args).trim_end().to_owned(),
@@ -220,6 +300,21 @@ pub fn help(st: Option<&State>) -> String {
             ),
         };
         out.push(format!("{syntax:<32} {text}"));
+        if r.words == INTERFACE_SET {
+            out.push(format!(
+                "{:<32} Select the profile a configuration interface edits",
+                format!(
+                    "{INTERFACE_SET} {} profile PROFILE",
+                    interface_words(st).join(" | ")
+                )
+            ));
+        }
+        if r.words == DEVICE_SET && profiles_offered(st) {
+            out.push(format!(
+                "{:<32} Set a device's layers",
+                "device set DEV profiles LAYERS"
+            ));
+        }
     }
     out.push(String::new());
     for (words, text) in NOTES {
@@ -286,16 +381,10 @@ fn scan_words(st: Option<&State>) -> Vec<&'static str> {
     }
 }
 
-/// The transports that can be enabled or disabled: those supported, on firmware with the
-/// setting.
+/// The transports that can be enabled or disabled: those supported.
 fn transport_words(st: Option<&State>) -> Vec<&'static str> {
     match st {
-        Some(st) => words_of(
-            model::transports(&st.status)
-                .into_iter()
-                .filter(|t| model::transport_settable(&st.status, *t))
-                .collect(),
-        ),
+        Some(st) => words_of(model::transports(&st.status)),
         None => vec!["classic", "ble"],
     }
 }
@@ -311,10 +400,35 @@ fn words_of(transports: Vec<Transport>) -> Vec<&'static str> {
         .collect()
 }
 
+/// The interfaces that can be named: those the adapter supports, or every one this build knows
+/// without an adapter to describe.
+fn interface_words(st: Option<&State>) -> Vec<&'static str> {
+    match st {
+        Some(st) => profiles::INTERFACES
+            .into_iter()
+            .filter(|i| profiles::interface(&st.status, *i).is_some())
+            .map(profiles::interface_word)
+            .collect(),
+        None => profiles::INTERFACES
+            .into_iter()
+            .map(profiles::interface_word)
+            .collect(),
+    }
+}
+
+/// Whether profile commands are offered: always without an adapter to describe.
+fn profiles_offered(st: Option<&State>) -> bool {
+    st.is_none_or(|st| profiles::available(&st.status))
+}
+
 /// Whether the connected adapter offers a shell command. Local commands are
 /// always offered.
 fn offered(words: &str, st: &State) -> bool {
     let development = model::development(&st.status);
+    if PROFILE_COMMANDS.contains(&words) {
+        return profiles_offered(Some(st))
+            && (!words.contains("interface") || !interface_words(Some(st)).is_empty());
+    }
     match words {
         SCAN | "scan stop" => !scan_words(Some(st)).is_empty(),
         "adapter bootloader" | "feature list" | "file list" | "file get" => development,
@@ -464,6 +578,28 @@ fn find(words: &[&str]) -> Result<(&'static Spec, usize), String> {
     })
 }
 
+/// Takes `--NAME VALUE` or `--NAME=VALUE` out of `words`, wherever it is.
+fn take_option<'a>(words: &mut Vec<&'a str>, name: &str) -> Result<Option<&'a str>, ()> {
+    let flag = format!("--{name}");
+    let prefix = format!("{flag}=");
+    let Some(i) = words
+        .iter()
+        .position(|w| *w == flag || w.starts_with(&prefix))
+    else {
+        return Ok(None);
+    };
+    let word = words.remove(i);
+    let value = match word.strip_prefix(&prefix) {
+        Some(value) => value,
+        None if i < words.len() => words.remove(i),
+        None => return Err(()),
+    };
+    if value.is_empty() || words.iter().any(|w| *w == flag || w.starts_with(&prefix)) {
+        return Err(());
+    }
+    Ok(Some(value))
+}
+
 /// Parses split words. Errors are complete messages.
 pub fn parse(args: &[String]) -> Result<Line, String> {
     let all: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -475,6 +611,7 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
     let words = &all[n..];
     let usage = || Err(format!("invalid arguments for {cmd}; use help"));
     let arg = |i: usize| words[i].to_owned();
+    let target = |i: usize| Target::parse(words[i]);
     let line = match (cmd, words.len()) {
         ("help", 0) => Line::Help(None),
         ("help", _) if listed_prefix(&words.join(" "), None) => Line::Help(Some(words.join(" "))),
@@ -495,6 +632,85 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
             (Some(t), "enabled", Some(on)) => Line::Run(Command::Transport(t, on)),
             _ => return usage(),
         },
+        (INTERFACE_SET, 2 | 3) => {
+            let Some(interface) = profiles::interface_from_word(words[0]) else {
+                return usage();
+            };
+            let (enabled, profile) = match (words[1], words.get(2)) {
+                ("profile", Some(word)) => (None, Some(Pick::Profile(Target::parse(word)?))),
+                (word, rest) => match on_off(word) {
+                    Some(on) => (
+                        Some(on),
+                        rest.map(|w| Target::parse(w).map(Pick::Profile))
+                            .transpose()?,
+                    ),
+                    None => return usage(),
+                },
+            };
+            Line::Run(Command::Interface {
+                interface,
+                enabled,
+                profile,
+            })
+        }
+        (INTERFACE_RESET, 2) if words[1] == "profile" => {
+            match profiles::interface_from_word(words[0]) {
+                Some(interface) => Line::Run(Command::Interface {
+                    interface,
+                    enabled: None,
+                    profile: Some(Pick::Clear),
+                }),
+                None => return usage(),
+            }
+        }
+        ("profile list", 0) => Line::Run(Command::AllProfiles),
+        ("profile list", 1 | 2) => {
+            let mut rest = words.to_vec();
+            let after = match take_option(&mut rest, "after") {
+                Ok(Some(word)) if rest.is_empty() => word
+                    .parse()
+                    .map_err(|_| format!("{} is not a profile ID", quote(word)))?,
+                _ => return usage(),
+            };
+            Line::Run(Command::Profiles { after })
+        }
+        ("profile show", 1) => Line::Run(Command::ProfileShow(target(0)?)),
+        ("profile create", 1) => Line::Run(Command::ProfileCreate(arg(0))),
+        ("profile copy", 2) => Line::Run(Command::ProfileCopy(target(0)?, arg(1))),
+        ("profile delete", 1) => Line::Run(Command::ProfileDelete(target(0)?)),
+        ("profile rule list", 1) => Line::Run(Command::Rules(target(0)?)),
+        ("profile rule remap", 3) => {
+            let rule = p::ProfileRule {
+                input: Some(profiles::parse_usage(words[1])?),
+                effect: Some(profile_rule::Effect::Remap(profile_rule::Remap {
+                    outputs: profiles::parse_outputs(words[2])?,
+                })),
+            };
+            Line::Run(Command::RuleChange(target(0)?, profiles::save_rule(rule)))
+        }
+        ("profile rule scale", 3) => {
+            let rule = p::ProfileRule {
+                input: Some(profiles::parse_usage(words[1])?),
+                effect: Some(profile_rule::Effect::Scale(profiles::parse_ratio(
+                    words[2],
+                )?)),
+            };
+            Line::Run(Command::RuleChange(target(0)?, profiles::save_rule(rule)))
+        }
+        ("profile rule forget", 2) => Line::Run(Command::RuleChange(
+            target(0)?,
+            profiles::forget_rule(profiles::parse_usage(words[1])?),
+        )),
+        (DEVICE_SET, 3..) if words[1] == "profiles" => {
+            let layers = match &words[2..] {
+                ["none"] => Vec::new(),
+                list => list
+                    .iter()
+                    .map(|w| Target::parse(w))
+                    .collect::<Result<_, _>>()?,
+            };
+            Line::Run(Command::Layers(target(0)?, layers))
+        }
         ("adapter bootloader", 0) => Line::Run(Command::Bootloader),
         (SCAN, 0..=2) => {
             let mut transports = Vec::new();
@@ -520,30 +736,32 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
             "trusted" => Filter::Trusted,
             _ => return usage(),
         }),
-        ("pair start", 1) => Line::Run(Command::Pair(arg(0))),
+        ("pair start", 1) => Line::Run(Command::Pair(target(0)?)),
         ("pair accept", 0) => Line::Run(Command::Accept(None)),
         ("pair accept", 1) if !words[0].is_empty() => Line::Run(Command::Accept(Some(arg(0)))),
         ("pair reject", 0) => Line::Run(Command::Reject),
         ("pair cancel", 0) => Line::Run(Command::CancelPairing),
-        ("device get", 1) => Line::Run(Command::Get(arg(0))),
-        ("device connect", 1) => Line::Run(Command::Connect(arg(0))),
-        ("device disconnect", 1) => Line::Run(Command::Disconnect(arg(0))),
-        ("device unpair", 1) => Line::Run(Command::Unpair(arg(0))),
-        ("device refresh", 1) => Line::Run(Command::Refresh(arg(0))),
+        ("device get", 1) => Line::Run(Command::Get(target(0)?)),
+        ("device connect", 1) => Line::Run(Command::Connect(target(0)?)),
+        ("device disconnect", 1) => Line::Run(Command::Disconnect(target(0)?)),
+        ("device unpair", 1) => Line::Run(Command::Unpair(target(0)?)),
+        ("device refresh", 1) => Line::Run(Command::Refresh(target(0)?)),
         ("device set", 3) => match (toggle(words[1]), on_off(words[2])) {
-            (Some(t), Some(on)) => Line::Run(Command::Set(arg(0), t, on)),
+            (Some(t), Some(on)) => Line::Run(Command::Set(target(0)?, t, on)),
             _ => return usage(),
         },
-        ("warning list", 1) => Line::Run(Command::Warnings(arg(0))),
-        ("setting list", 1) => Line::Run(Command::Settings(arg(0))),
-        ("setting get", 2) => Line::Run(Command::SettingGet(arg(0), setting_key(words[1])?)),
-        ("setting forget", 2) => Line::Run(Command::SettingForget(arg(0), setting_key(words[1])?)),
+        ("warning list", 1) => Line::Run(Command::Warnings(target(0)?)),
+        ("setting list", 1) => Line::Run(Command::Settings(target(0)?)),
+        ("setting get", 2) => Line::Run(Command::SettingGet(target(0)?, setting_key(words[1])?)),
+        ("setting forget", 2) => {
+            Line::Run(Command::SettingForget(target(0)?, setting_key(words[1])?))
+        }
         ("setting set", 3) => Line::Run(Command::SettingSet(
-            arg(0),
+            target(0)?,
             setting_key(words[1])?,
             SettingInput::Text(arg(2)),
         )),
-        ("feature list", 1) => Line::Run(Command::Features(arg(0))),
+        ("feature list", 1) => Line::Run(Command::Features(target(0)?)),
         ("file list", 1) => Line::Run(Command::Files(arg(0))),
         ("file get", 2) if !words[1].is_empty() => Line::Run(Command::FileGet {
             path: arg(0),
@@ -588,44 +806,28 @@ pub fn answerable(st: &State) -> Option<Prompt> {
         .and_then(model::prompt)
 }
 
-/// Resolves a device word as the controller does: an ID, else a name that
-/// identifies exactly one saved device or candidate. Returns the ID and
-/// whether it is saved.
-pub fn resolve(word: &str, st: &State) -> Option<(String, bool)> {
-    if let Some(d) = st.device(word) {
-        return Some((d.id.clone(), true));
-    }
-    if let Some(c) = st.candidate(word) {
-        return Some((c.id.clone(), false));
-    }
-    let mut matches: Vec<(String, bool)> = Vec::new();
-    let mut add = |m: (String, bool)| {
-        if !matches.iter().any(|(id, _)| *id == m.0) {
-            matches.push(m);
-        }
+/// Resolves a device word as the controller does: an ID, else a name exactly one saved device
+/// has.
+pub fn resolve(word: &str, st: &State) -> Option<u32> {
+    let mut named = match Target::parse(word).ok()? {
+        Target::Id(id) => return st.device(id).map(|d| d.id),
+        Target::Name(name) => st.devices.iter().filter(move |d| d.name == name),
     };
-    for d in st.devices.iter().filter(|d| d.name == word) {
-        add((d.id.clone(), true));
-    }
-    for c in st.candidates.iter().filter(|c| c.name == word) {
-        add((c.id.clone(), false));
-    }
-    if matches.len() == 1 {
-        matches.pop()
-    } else {
-        None
+    match (named.next(), named.next()) {
+        (Some(d), None) => Some(d.id),
+        _ => None,
     }
 }
 
-/// Resolves a pair target as the controller does: a candidate ID, else a
-/// name that exactly one Nearby candidate has.
-pub fn resolve_candidate(word: &str, st: &State) -> Option<String> {
-    if let Some(c) = st.candidate(word) {
-        return Some(c.id.clone());
-    }
-    let mut named = st.candidates.iter().filter(|c| c.name == word);
+/// Resolves a pair target as the controller does: a candidate ID, else a name exactly one
+/// candidate has.
+pub fn resolve_candidate(word: &str, st: &State) -> Option<u32> {
+    let mut named = match Target::parse(word).ok()? {
+        Target::Id(id) => return st.candidate(id).map(|c| c.id),
+        Target::Name(name) => st.candidates.iter().filter(move |c| c.name == name),
+    };
     match (named.next(), named.next()) {
-        (Some(c), None) => Some(c.id.clone()),
+        (Some(c), None) => Some(c.id),
         _ => None,
     }
 }
@@ -696,55 +898,58 @@ fn value_words(s: &p::Setting) -> Vec<String> {
     Vec::new()
 }
 
-/// Device and candidate IDs, and quoted names that identify exactly one,
-/// for those whose ID `accepts`.
-fn device_words(st: &State, cmd: &str, accepts: impl Fn(&str) -> bool) -> Vec<String> {
+/// IDs, and quoted names that identify exactly one, of the candidates `pair start` takes or the
+/// saved devices other commands take, for those `accepts`. A name that is a number is reached
+/// by its ID.
+fn device_words(st: &State, cmd: &str, accepts: impl Fn(u32) -> bool) -> Vec<String> {
+    let pairing = cmd == "pair start";
+    let names: Vec<(u32, &str)> = if pairing {
+        st.candidates
+            .iter()
+            .map(|c| (c.id, c.name.as_str()))
+            .collect()
+    } else {
+        st.devices.iter().map(|d| (d.id, d.name.as_str())).collect()
+    };
     let mut words: Vec<String> = Vec::new();
-    let names = st
-        .devices
-        .iter()
-        .map(|d| (d.id.clone(), d.name.clone()))
-        .chain(st.candidates.iter().map(|c| (c.id.clone(), c.name.clone())));
     for (id, name) in names {
-        if !accepts(&id) {
+        if !accepts(id) {
             continue;
         }
-        // Pair names resolve among candidates only, as the controller does.
-        let names_id = match cmd {
-            "pair start" => resolve_candidate(&name, st).is_some_and(|r| r == id),
-            _ => resolve(&name, st).is_some_and(|(r, _)| r == id),
+        let names_id = if pairing {
+            resolve_candidate(name, st) == Some(id)
+        } else {
+            resolve(name, st) == Some(id)
         };
-        if !name.is_empty() && names_id {
-            words.push(quote(&name));
+        if !name.is_empty() && names_id && matches!(Target::parse(name), Ok(Target::Name(_))) {
+            words.push(shell_word(name.to_owned()));
         }
-        words.push(id);
+        words.push(id.to_string());
     }
     words.sort();
     words.dedup();
     words
 }
 
-/// Whether a device's state allows the command: only scanned candidates
-/// pair, a disabled or blocked device can't be connected, devices of a
-/// disabled transport neither pair nor connect, and the remaining device
-/// commands need a saved device.
-fn usable(cmd: &str, id: &str, st: &State) -> bool {
-    let saved = st.device(id);
+/// Whether a device's state allows the command: a candidate of a disabled transport doesn't
+/// pair, a disabled or blocked device or one of a disabled transport can't be connected, and
+/// refreshing needs a connected device.
+fn usable(cmd: &str, id: u32, st: &State) -> bool {
     let disabled = |transport: Transport| model::transport_disabled(&st.status, transport);
+    if cmd == "pair start" {
+        return st.candidate(id).is_some_and(|c| !disabled(c.transport()));
+    }
+    let Some(d) = st.device(id) else {
+        return false;
+    };
     match cmd {
-        "pair start" => {
-            saved.is_none() && st.candidate(id).is_none_or(|c| !disabled(c.transport()))
-        }
-        "device get" | "device unpair" => true,
-        "device connect" => {
-            saved.is_some_and(|d| d.enabled && !d.blocked && !disabled(d.transport()))
-        }
-        "device refresh" | "feature list" => saved.is_some_and(model::connected),
-        _ => saved.is_some(),
+        "device connect" => d.enabled && !d.blocked && !disabled(d.transport()),
+        "device refresh" | "feature list" => model::connected(d),
+        _ => true,
     }
 }
 
-/// Commands whose first argument is a device word.
+/// Commands whose first argument is a device or candidate word.
 const DEVICE_COMMANDS: &[&str] = &[
     "device get",
     "pair start",
@@ -761,11 +966,21 @@ const DEVICE_COMMANDS: &[&str] = &[
     "feature list",
 ];
 
+/// Commands whose first argument is a profile word.
+const PROFILE_TARGETS: &[&str] = &[
+    "profile show",
+    "profile copy",
+    "profile delete",
+    "profile rule list",
+    "profile rule remap",
+    "profile rule scale",
+    "profile rule forget",
+];
+
 /// The value that changes a saved device's preference, or both without one.
 fn policy_words(word: &str, field: &str, st: &State) -> Vec<String> {
     let current = resolve(word, st)
-        .filter(|(_, saved)| *saved)
-        .and_then(|(id, _)| st.device(&id))
+        .and_then(|id| st.device(id))
         .and_then(|d| {
             Some(match toggle(field)? {
                 Toggle::Enabled => d.enabled,
@@ -781,13 +996,37 @@ fn policy_words(word: &str, field: &str, st: &State) -> Vec<String> {
     }
 }
 
+/// Each known profile's ID, and its name when the name identifies it. Completion knows only the
+/// profiles this session has seen.
+fn profile_words(st: &State) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for profile in st.profiles.values() {
+        let unique = st
+            .profiles
+            .values()
+            .filter(|p| p.name == profile.name)
+            .count()
+            == 1;
+        let named = !profile.name.is_empty()
+            && profile.name != "none"
+            && matches!(Target::parse(&profile.name), Ok(Target::Name(_)));
+        if unique && named {
+            words.push(shell_word(profile.name.clone()));
+        }
+        words.push(profile.id.to_string());
+    }
+    words.sort();
+    words.dedup();
+    words
+}
+
 /// The cached settings of a saved device named in a command line. Completion
 /// never reads from the adapter.
 fn known_settings<'a>(word: &str, st: &'a State) -> Vec<&'a p::Setting> {
-    let Some((id, true)) = resolve(word, st) else {
+    let Some(id) = resolve(word, st) else {
         return Vec::new();
     };
-    catalog::presented(st.settings_of(&id))
+    catalog::presented(st.settings_of(id))
 }
 
 /// The words that can follow `words`. Connected, only what the adapter
@@ -819,6 +1058,7 @@ fn completions(words: &[String], st: Option<&State>) -> Vec<String> {
         return next;
     }
     let args = &words[n..];
+    let profiles = || st.map(profile_words).unwrap_or_default();
     let arguments = match (cmd, args.len()) {
         ("adapter set platform", 0) => owned(&["linux", "windows", "mac"]),
         (TRANSPORT_SET, 0) => owned(&transport_words(st)),
@@ -833,13 +1073,31 @@ fn completions(words: &[String], st: Option<&State>) -> Vec<String> {
                 None => owned(&["on", "off"]),
             }
         }
+        (INTERFACE_SET | INTERFACE_RESET, 0) => owned(&interface_words(st)),
+        (INTERFACE_SET, 1) => owned(&["on", "off", "profile"]),
+        (INTERFACE_RESET, 1) => owned(&["profile"]),
+        (INTERFACE_SET, 2) => profiles(),
         (SCAN, 0) => owned(&scan_words(st)),
         ("device list", 0) => owned(&["Saved", "Enabled", "Connected", "Trusted"]),
         ("help", 0) => heads(st).into_iter().map(str::to_owned).collect(),
-        ("device set", 1) => owned(&["enabled", "trusted", "blocked", "hidpp"]),
-        ("device set", 2) => st
+        (DEVICE_SET, 1) => {
+            let mut words = owned(&["enabled", "trusted", "blocked", "hidpp"]);
+            if profiles_offered(st) {
+                words.push("profiles".into());
+            }
+            words
+        }
+        (DEVICE_SET, 2) if args[1] == "profiles" => {
+            let mut words = owned(&["none"]);
+            words.extend(profiles());
+            words
+        }
+        (DEVICE_SET, 3..) if args[1] == "profiles" && args[2] != "none" => profiles(),
+        (DEVICE_SET, 2) => st
             .map(|st| policy_words(&args[0], &args[1], st))
             .unwrap_or_else(|| owned(&["on", "off"])),
+        (_, 0) if PROFILE_TARGETS.contains(&cmd) => profiles(),
+        ("profile list", 0) => owned(&["--after"]),
         ("setting get" | "setting set" | "setting forget", 1) => st
             .map(|st| known_settings(&args[0], st))
             .unwrap_or_default()
@@ -901,18 +1159,25 @@ pub fn complete(base: &str, st: Option<&State>) -> Vec<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use cordial_protocol::{CodeKind, DeviceState, keys};
+    use cordial_protocol::{CodeKind, ConfigurationInterface, DeviceState, keys};
 
     fn words(line: &str) -> Vec<String> {
         split(line).unwrap()
     }
 
-    pub fn device(id: &str, name: &str) -> p::Device {
+    fn run(line: &str) -> Command {
+        match parse(&words(line)).unwrap() {
+            Line::Run(c) => c,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    pub fn device(id: u32, name: &str) -> p::Device {
         p::Device {
-            id: id.into(),
+            id,
             transport: Transport::Ble as i32,
             name: name.into(),
-            kind: p::Kind::Keyboard as i32,
+            kinds: vec![p::Kind::Keyboard as i32],
             state: DeviceState::Connected as i32,
             enabled: true,
             trusted: true,
@@ -920,12 +1185,12 @@ pub(crate) mod tests {
         }
     }
 
-    pub fn candidate(id: &str, name: &str) -> p::Candidate {
+    pub fn candidate(id: u32, name: &str) -> p::Candidate {
         p::Candidate {
-            id: id.into(),
+            id,
             transport: Transport::Ble as i32,
             name: name.into(),
-            kind: p::Kind::Keyboard as i32,
+            kinds: vec![p::Kind::Keyboard as i32],
             rssi: Some(-50),
         }
     }
@@ -952,7 +1217,37 @@ pub(crate) mod tests {
                 key: keys::BUILD_DEVELOPMENT.into(),
                 value: Some(model::wire_value(p::value::Value::Bool(true))),
             }],
+            profile_support: None,
+            configuration_interfaces: Vec::new(),
         }
+    }
+
+    /// Profile support with VIA and Vial, which conflict, both disabled.
+    pub fn with_profiles(status: &mut p::Status) {
+        status.profile_support = Some(p::ProfileSupport {
+            remap_inputs: vec![p::UsageRange {
+                collection: None,
+                usage_page: 7,
+                min: 4,
+                max: 0xe7,
+            }],
+            max_remap_outputs: 4,
+            max_layers: 4,
+            memory_budget: 4096,
+            ..Default::default()
+        });
+        status.configuration_interfaces = [
+            (ConfigurationInterface::Via, ConfigurationInterface::Vial),
+            (ConfigurationInterface::Vial, ConfigurationInterface::Via),
+        ]
+        .into_iter()
+        .map(|(i, other)| p::ConfigurationInterfaceSupport {
+            interface: i as i32,
+            enabled: false,
+            profile: 0,
+            conflicts: vec![other as i32],
+        })
+        .collect();
     }
 
     pub fn state() -> State {
@@ -961,16 +1256,13 @@ pub(crate) mod tests {
             port: "/dev/ttyACM0".into(),
             status: status(),
             devices: vec![
-                device("d_1", "Keyboard"),
+                device(1, "Keyboard"),
                 p::Device {
                     state: DeviceState::Disconnected as i32,
-                    ..device("d_2", "Mouse")
+                    ..device(2, "Mouse")
                 },
             ],
-            candidates: vec![
-                candidate("c_1", "New Keyboard"),
-                candidate("c_2", "Keyboard"),
-            ],
+            candidates: vec![candidate(1, "New Keyboard"), candidate(2, "Keyboard")],
             available: true,
             loaded: true,
             ..State::default()
@@ -989,10 +1281,6 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_resource_actions_and_usage() {
-        let run = |line: &str| match parse(&words(line)).unwrap() {
-            Line::Run(c) => c,
-            other => panic!("{other:?}"),
-        };
         assert_eq!(run("adapter status"), Command::Status);
         assert_eq!(
             run("adapter set name Desk"),
@@ -1026,7 +1314,11 @@ pub(crate) mod tests {
         );
         assert!(parse(&words("scan start 61")).is_err());
         assert!(parse(&words("scan start 5 ble")).is_err());
-        assert_eq!(run("pair start c_1"), Command::Pair("c_1".into()));
+        assert_eq!(run("pair start 12"), Command::Pair(Target::Id(12)));
+        assert_eq!(
+            run("pair start 'New Keyboard'"),
+            Command::Pair(Target::Name("New Keyboard".into()))
+        );
         assert_eq!(
             run("pair accept 123456"),
             Command::Accept(Some("123456".into()))
@@ -1035,26 +1327,26 @@ pub(crate) mod tests {
         assert_eq!(run("pair reject"), Command::Reject);
         assert_eq!(run("pair cancel"), Command::CancelPairing);
         assert_eq!(
-            run("device set d_1 enabled off"),
-            Command::Set("d_1".into(), Toggle::Enabled, false)
+            run("device set 1 enabled off"),
+            Command::Set(Target::Id(1), Toggle::Enabled, false)
         );
         assert_eq!(
             run("device set 'My Mouse' hidpp on"),
-            Command::Set("My Mouse".into(), Toggle::Hidpp, true)
+            Command::Set(Target::Name("My Mouse".into()), Toggle::Hidpp, true)
         );
-        assert!(parse(&words("device set d_1 enabled maybe")).is_err());
-        assert_eq!(run("device refresh d_1"), Command::Refresh("d_1".into()));
-        assert_eq!(run("warning list d_1"), Command::Warnings("d_1".into()));
+        assert!(parse(&words("device set 1 enabled maybe")).is_err());
+        assert_eq!(run("device refresh 1"), Command::Refresh(Target::Id(1)));
+        assert_eq!(run("warning list 1"), Command::Warnings(Target::Id(1)));
         assert_eq!(
-            run("setting set d_1 pointer.sensor.0.dpi 1600"),
+            run("setting set 1 pointer.sensor.0.dpi 1600"),
             Command::SettingSet(
-                "d_1".into(),
+                Target::Id(1),
                 "pointer.sensor.0.dpi".into(),
                 SettingInput::Text("1600".into())
             )
         );
         assert_eq!(
-            parse(&words("setting get d_1 future.key")).unwrap_err(),
+            parse(&words("setting get 1 future.key")).unwrap_err(),
             "Cordial doesn't recognize the setting future.key; a newer version may support it"
         );
         assert_eq!(
@@ -1076,16 +1368,36 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn names_resolve_only_when_unique() {
-        let st = state();
-        assert_eq!(resolve("Mouse", &st), Some(("d_2".into(), true)));
+    fn numbers_are_always_ids() {
+        assert_eq!(Target::parse("007"), Ok(Target::Id(7)));
+        assert_eq!(Target::parse("7a"), Ok(Target::Name("7a".into())));
+        assert_eq!(Target::parse(""), Ok(Target::Name(String::new())));
+        assert!(Target::parse("99999999999").is_err());
+        assert!(parse(&words("device get 99999999999")).is_err());
+        let mut st = state();
+        // A device named with a number is reached by its ID, never by the name.
+        st.devices[1].name = "1".into();
+        assert_eq!(resolve("1", &st), Some(1));
+        assert_eq!(resolve("2", &st), Some(2));
+        assert_eq!(resolve("3", &st), None);
+        let devices = complete("device get ", Some(&st));
         assert_eq!(
-            resolve("Keyboard", &st),
-            None,
-            "a device and a candidate share it"
+            devices,
+            ["device get 1", "device get 2", "device get Keyboard"]
         );
-        assert_eq!(resolve_candidate("Keyboard", &st), Some("c_2".into()));
-        assert_eq!(resolve("c_1", &st), Some(("c_1".into(), false)));
+    }
+
+    #[test]
+    fn names_resolve_only_when_unique_among_their_kind() {
+        let mut st = state();
+        // A device and a candidate may share a name; each command takes only one kind.
+        assert_eq!(resolve("Keyboard", &st), Some(1));
+        assert_eq!(resolve_candidate("Keyboard", &st), Some(2));
+        assert_eq!(resolve("New Keyboard", &st), None);
+        // Candidate 1 and device 1 are different things.
+        assert_eq!(resolve_candidate("1", &st), Some(1));
+        st.devices.push(device(5, "Keyboard"));
+        assert_eq!(resolve("Keyboard", &st), None);
     }
 
     #[test]
@@ -1094,21 +1406,24 @@ pub(crate) mod tests {
         assert!(complete("dev", Some(&st)).contains(&"device ".to_owned()));
         assert!(complete("device s", Some(&st)).contains(&"device set ".to_owned()));
         assert_eq!(
-            complete("device set d_1 ", Some(&st)),
+            complete("device set 1 ", Some(&st)),
             [
-                "device set d_1 enabled",
-                "device set d_1 trusted",
-                "device set d_1 blocked",
-                "device set d_1 hidpp"
+                "device set 1 enabled",
+                "device set 1 trusted",
+                "device set 1 blocked",
+                "device set 1 hidpp"
             ]
         );
         assert_eq!(
-            complete("device set d_1 enabled ", Some(&st)),
-            ["device set d_1 enabled off"]
+            complete("device set 1 enabled ", Some(&st)),
+            ["device set 1 enabled off"]
         );
         let connect = complete("device connect ", Some(&st));
-        assert!(connect.contains(&"device connect d_1".to_owned()));
-        assert!(!connect.iter().any(|c| c.ends_with("c_1")));
+        assert!(connect.contains(&"device connect 1".to_owned()));
+        assert!(!connect.iter().any(|c| c.contains("New Keyboard")));
+        let pair = complete("pair start ", Some(&st));
+        assert!(pair.contains(&"pair start \"New Keyboard\"".to_owned()));
+        assert!(pair.contains(&"pair start 2".to_owned()));
         assert_eq!(
             complete("scan start ", Some(&st)),
             ["scan start classic", "scan start ble"]
@@ -1128,10 +1443,6 @@ pub(crate) mod tests {
 
     #[test]
     fn transports_are_enabled_and_disabled_only_when_supported() {
-        let run = |line: &str| match parse(&words(line)).unwrap() {
-            Line::Run(c) => c,
-            other => panic!("{other:?}"),
-        };
         assert_eq!(
             run("adapter set transport classic enabled on"),
             Command::Transport(Transport::Classic, true)
@@ -1170,11 +1481,11 @@ pub(crate) mod tests {
             ["adapter set transport classic enabled on"]
         );
         let connect = complete("device connect ", Some(&st));
-        assert!(connect.contains(&"device connect d_1".to_owned()));
-        assert!(!connect.iter().any(|c| c.ends_with("d_2")));
+        assert!(connect.contains(&"device connect 1".to_owned()));
+        assert!(!connect.iter().any(|c| c.ends_with(" 2")));
         let pair = complete("pair start ", Some(&st));
-        assert!(pair.contains(&"pair start c_2".to_owned()));
-        assert!(!pair.iter().any(|c| c.ends_with("c_1")));
+        assert!(pair.contains(&"pair start 2".to_owned()));
+        assert!(!pair.iter().any(|c| c.ends_with(" 1")));
         assert_eq!(complete("scan start ", Some(&st)), ["scan start ble"]);
         let scan = |named: Vec<Transport>| Command::Scan {
             transports: named,
@@ -1192,15 +1503,9 @@ pub(crate) mod tests {
         );
         assert!(!help(Some(&st)).contains("scan start"));
 
-        // Firmware that predates the setting uses every transport it supports, and the
-        // setting isn't offered for it.
+        // A transport without its enabled field is enabled.
         st.status.transports[0].enabled = None;
         assert_eq!(model::enabled_transports(&st.status), [Transport::Classic]);
-        assert_eq!(
-            complete("adapter set transport ", Some(&st)),
-            ["adapter set transport ble"]
-        );
-        st.status.transports[0].enabled = Some(true);
 
         // A BLE-only adapter lists only BLE.
         st.status
@@ -1216,6 +1521,177 @@ pub(crate) mod tests {
             ["adapter set transport ble"]
         );
         assert!(help(None).contains("adapter set transport classic | ble enabled on | off"));
+    }
+
+    #[test]
+    fn profile_commands_parse() {
+        assert_eq!(
+            run("profile list --after 16"),
+            Command::Profiles { after: 16 }
+        );
+        assert_eq!(
+            run("profile list --after=3"),
+            Command::Profiles { after: 3 }
+        );
+        assert_eq!(run("profile list"), Command::AllProfiles);
+        assert!(parse(&words("profile list --after")).is_err());
+        assert!(parse(&words("profile list --after x")).is_err());
+        assert_eq!(
+            run("profile create 'Work Keys'"),
+            Command::ProfileCreate("Work Keys".into())
+        );
+        assert!(parse(&words("profile create")).is_err());
+        assert_eq!(
+            run("profile copy 3 Games"),
+            Command::ProfileCopy(Target::Id(3), "Games".into())
+        );
+        assert_eq!(
+            run("profile delete Work"),
+            Command::ProfileDelete(Target::Name("Work".into()))
+        );
+        assert_eq!(run("profile show 4"), Command::ProfileShow(Target::Id(4)));
+        assert_eq!(
+            run("adapter set interface via on 2"),
+            Command::Interface {
+                interface: ConfigurationInterface::Via,
+                enabled: Some(true),
+                profile: Some(Pick::Profile(Target::Id(2)))
+            }
+        );
+        assert_eq!(
+            run("adapter set interface vial off"),
+            Command::Interface {
+                interface: ConfigurationInterface::Vial,
+                enabled: Some(false),
+                profile: None
+            }
+        );
+        assert_eq!(
+            run("adapter set interface vial profile Work"),
+            Command::Interface {
+                interface: ConfigurationInterface::Vial,
+                enabled: None,
+                profile: Some(Pick::Profile(Target::Name("Work".into())))
+            }
+        );
+        assert_eq!(
+            run("adapter reset interface via profile"),
+            Command::Interface {
+                interface: ConfigurationInterface::Via,
+                enabled: None,
+                profile: Some(Pick::Clear)
+            }
+        );
+        assert!(parse(&words("adapter set interface none on")).is_err());
+        assert!(parse(&words("adapter set interface via profile")).is_err());
+        assert_eq!(
+            run("device set 1 profiles Work 4"),
+            Command::Layers(
+                Target::Id(1),
+                vec![Target::Name("Work".into()), Target::Id(4)]
+            )
+        );
+        assert_eq!(
+            run("device set Mouse profiles none"),
+            Command::Layers(Target::Name("Mouse".into()), Vec::new())
+        );
+        assert!(parse(&words("device set 1 profiles")).is_err());
+        for gone in [
+            "adapter set default-profile Work",
+            "adapter set keyboard-profile Work",
+            "adapter set editing-profile Work",
+            "profile set 3 pointer 3/2",
+            "device set 1 keyboard-profile default",
+            "profile create keyboard Work",
+        ] {
+            assert!(parse(&words(gone)).is_err(), "{gone}");
+        }
+    }
+
+    #[test]
+    fn rule_commands_parse_usages() {
+        let usage = |usage_page, usage| p::Usage { usage_page, usage };
+        let Command::RuleChange(Target::Name(name), change) =
+            run("profile rule remap Work 07:39 07:e0,07:04@01:06")
+        else {
+            panic!()
+        };
+        assert_eq!(name, "Work");
+        let Some(p::profile_rule_change::Change::Rule(rule)) = change.change else {
+            panic!()
+        };
+        assert_eq!(rule.input, Some(usage(7, 0x39)));
+        assert_eq!(profiles::rule_words(&rule), "07:39 remap 07:e0,07:04@01:06");
+        let Command::RuleChange(_, change) = run("profile rule scale 2 01:38 -1/1") else {
+            panic!()
+        };
+        let Some(p::profile_rule_change::Change::Rule(rule)) = change.change else {
+            panic!()
+        };
+        assert_eq!(profiles::rule_words(&rule), "01:38 scale -1/1");
+        let Command::RuleChange(_, change) = run("profile rule forget 2 09:01") else {
+            panic!()
+        };
+        assert_eq!(profiles::change_target(&change), Some(&usage(9, 1)));
+        assert_eq!(
+            run("profile rule list Work"),
+            Command::Rules(Target::Name("Work".into()))
+        );
+        for bad in [
+            "profile rule remap 2 07:39",
+            "profile rule remap 2 7x:39 07:04",
+            "profile rule scale 2 01:38 0/1",
+            "profile rule forget 2 09:01 --collection 01:02",
+            "profile rule list 2 --collection 01:02",
+        ] {
+            assert!(parse(&words(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn profile_commands_follow_the_adapter() {
+        let mut st = state();
+        assert!(!help(Some(&st)).contains("profile list"));
+        assert_eq!(
+            offer(Command::ProfileCreate("Work".into()), &st),
+            Err("this adapter doesn't support profiles".into())
+        );
+        assert!(!complete("device set 1 ", Some(&st)).contains(&"device set 1 profiles".into()));
+        with_profiles(&mut st.status);
+        let shown = help(Some(&st));
+        assert!(shown.contains("profile rule remap"), "{shown}");
+        assert!(
+            shown.contains("adapter set interface via | vial on | off [PROFILE]"),
+            "{shown}"
+        );
+        assert!(shown.contains("device set DEV profiles LAYERS"), "{shown}");
+        assert_eq!(
+            complete("device set 1 p", Some(&st)),
+            ["device set 1 profiles"]
+        );
+        st.profiles.insert(
+            3,
+            p::Profile {
+                id: 3,
+                name: "Work Keys".into(),
+                roles: Vec::new(),
+            },
+        );
+        assert_eq!(
+            complete("device set 1 profiles ", Some(&st)),
+            [
+                "device set 1 profiles none",
+                "device set 1 profiles \"Work Keys\"",
+                "device set 1 profiles 3"
+            ]
+        );
+        assert_eq!(
+            complete("adapter set interface ", Some(&st)),
+            ["adapter set interface via", "adapter set interface vial"]
+        );
+        // Without interfaces, the interface commands aren't offered.
+        st.status.configuration_interfaces.clear();
+        assert!(!help(Some(&st)).contains("adapter set interface"));
     }
 
     #[test]

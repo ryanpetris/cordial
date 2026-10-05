@@ -413,7 +413,7 @@ pub fn setting_line(d: &p::Device, s: &p::Setting) -> String {
 /// not being applied.
 fn cached_note(d: &p::Device) -> &'static str {
     if !model::connected(d) {
-        " (disconnected; last known values)"
+        " (disconnected)"
     } else if !model::hidpp_enabled(d) {
         " (HID++ off; last known values)"
     } else {
@@ -521,10 +521,10 @@ pub fn subject_text(subject: &Subject, state: Option<&State>) -> String {
     let Some(st) = state else {
         return String::new();
     };
-    let Some(d) = st.device(&subject.id) else {
+    let Some(d) = st.device(subject.id) else {
         return String::new();
     };
-    setting_list(d, st.settings_of(&d.id))
+    setting_list(d, st.settings_of(d.id))
 }
 
 /// The result of saving or forgetting settings.
@@ -536,7 +536,7 @@ pub fn saved_text(
     state: Option<&State>,
 ) -> String {
     let hidpp_on = state
-        .and_then(|st| st.device(&subject.id))
+        .and_then(|st| st.device(subject.id))
         .is_none_or(model::hidpp_enabled);
     let mut lines = Vec::new();
     for key in set {

@@ -179,6 +179,17 @@ impl<S: RecordStore> RecordStore for Handle<'_, S> {
             .next_key(after)
             .await
     }
+    async fn record_ids(&mut self, kind: u8, after: u64, limit: usize) -> Result<Vec<u64>, Error> {
+        if let Some(error) = self.0.error() {
+            return Err(error);
+        }
+        self.0
+            .store
+            .try_lock()
+            .map_err(|_| Error::Unavailable)?
+            .record_ids(kind, after, limit)
+            .await
+    }
     async fn keys(&mut self) -> Result<Vec<RecordKey>, Error> {
         if let Some(error) = self.0.error() {
             return Err(error);

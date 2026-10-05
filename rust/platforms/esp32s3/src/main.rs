@@ -2,14 +2,18 @@ include!(concat!(env!("OUT_DIR"), "/metadata.rs"));
 
 use cordial_core::{
     application::{Application, Build},
-    bluetooth::{Event, EventSource},
+    bluetooth::Event,
 };
 use cordial_esp32s3::{board, runtime, storage, usb};
-use cordial_usb::{Buffers, Usb, owner::Owner};
+use cordial_usb::{
+    Buffers, Usb,
+    owner::{Owner, Shared},
+};
 use embassy_time::{Instant, Timer};
 use esp_idf_sys as sys;
 
 type Store = Result<storage::Storage, cordial_core::storage::Error>;
+type App = Owner<'static, radio::Records, radio::Radio>;
 static USB_IO: cordial_usb::Io = cordial_usb::Io::new();
 #[cfg(feature = "btstack")]
 #[path = "radio/btstack.rs"]
@@ -34,67 +38,61 @@ fn bootloader() -> ! {
 }
 
 #[embassy_executor::task]
-async fn usb_task(serial: &'static str) {
+async fn usb_task(serial: &'static str, interfaces: u8) {
     let mut out = [0; 256];
     let mut buffers = Buffers::new(&USB_IO);
     Usb::new(
         usb::driver(&mut out).expect("USB peripheral"),
         serial,
         board::DEFAULT_ADAPTER_NAME,
+        interfaces,
         &USB_IO,
         &mut buffers,
     )
     .run()
     .await;
 }
+/// Starts the radio, then runs the priority loop.
 #[embassy_executor::task]
-async fn owner_task(store: Store, serial: &'static str) {
-    let available = store.is_ok();
-    let (mut radio, mut handle) = radio::new(store);
-    let mut app = Application::new(Build {
-        development: cfg!(feature = "development"),
-        version: FIRMWARE_VERSION,
-        board: board::HARDWARE,
-        default_adapter_name: board::DEFAULT_ADAPTER_NAME,
-        adapter_id: serial.into(),
-        #[cfg(feature = "development")]
-        bootloader: Some(cordial_core::application::Bootloader { enter: bootloader }),
-        #[cfg(feature = "production")]
-        bootloader: None,
-    });
-    let started = if available {
-        let mut address = [0; 6];
-        let read =
-            unsafe { sys::esp_read_mac(address.as_mut_ptr(), sys::esp_mac_type_t_ESP_MAC_BT) };
-        if read != sys::ESP_OK {
-            Err(cordial_core::model::errors::ErrorCode::RadioUnavailable)
+async fn priority_task(owner: &'static App, wake: radio::Wake, available: bool) {
+    {
+        let mut shared = owner.lock().await;
+        let Shared { app, store, radio } = &mut *shared;
+        let started = if available {
+            let mut address = [0; 6];
+            let read =
+                unsafe { sys::esp_read_mac(address.as_mut_ptr(), sys::esp_mac_type_t_ESP_MAC_BT) };
+            if read != sys::ESP_OK {
+                Err(cordial_core::model::errors::ErrorCode::RadioUnavailable)
+            } else {
+                cordial_core::identity::Identity::initialize(store, address, random)
+                    .await
+                    .map_err(|_| cordial_core::model::errors::ErrorCode::StorageFailed)
+                    .and_then(|_| radio::start(radio, store))
+            }
         } else {
-            cordial_core::identity::Identity::initialize(&mut handle, address, random)
-                .await
-                .map_err(|_| cordial_core::model::errors::ErrorCode::StorageFailed)
-                .and_then(|_| radio::start(&mut radio, &mut handle))
+            Err(cordial_core::model::errors::ErrorCode::StorageFailed)
+        };
+        if let Err(error) = started {
+            app.event(Event::Failed(error), store, radio, now()).await;
         }
-    } else {
-        Err(cordial_core::model::errors::ErrorCode::StorageFailed)
-    };
-    if let Err(error) = started {
-        app.event(Event::Failed(error), &mut handle, &mut radio, now())
-            .await;
     }
-    let mut owner = Owner::new(&USB_IO);
     let mut indicator = cordial_esp32s3::indicator::Indicator::new(board::MCU_LED);
-    loop {
-        EventSource::poll(&mut radio).await;
-        while let Some(event) = radio.next_event() {
-            app.event(event, &mut handle, &mut radio, now()).await;
-        }
-        owner.poll(&mut app, &mut handle, &mut radio, now()).await;
-        app.poll(&mut handle, &mut radio, USB_IO.status().leds, now())
-            .await;
-        indicator.set(app.manager.radio_ready && app.manager.storage_ready);
-        embassy_futures::select::select3(USB_IO.changed(), radio.changed(), Timer::after_millis(1))
-            .await;
-    }
+    owner
+        .priority(
+            async |shared: &mut Shared<radio::Records, radio::Radio>| {
+                indicator.set(shared.app.manager.radio_ready && shared.app.manager.storage_ready);
+            },
+            async || {
+                embassy_futures::select::select(radio::changed(wake), Timer::after_millis(1)).await;
+            },
+            now,
+        )
+        .await
+}
+#[embassy_executor::task]
+async fn secondary_task(owner: &'static App, interfaces: u8) {
+    owner.secondary(interfaces, now).await
 }
 
 fn main() {
@@ -111,13 +109,35 @@ fn main() {
         sys::ESP_OK
     );
     let serial = Box::leak(format!("{:016X}", u64::from_le_bytes(unique)).into_boxed_str());
-    let store = storage::open(
+    let mut store = storage::open(
         board::STORAGE_IDENTITY,
         board::STORAGE_START..board::STORAGE_END,
     );
+    // USB enumerates once, with the saved configuration interfaces. Flash reads complete
+    // synchronously, so no executor is needed yet.
+    let interfaces = embassy_futures::block_on(cordial_usb::saved_interfaces(
+        &mut store,
+        board::PROFILE_MEMORY_BUDGET.is_some(),
+    ));
+    let available = store.is_ok();
+    let (radio, handle, wake) = radio::new(store);
+    let app = Application::new(Build {
+        development: cfg!(feature = "development"),
+        version: FIRMWARE_VERSION,
+        board: board::HARDWARE,
+        default_adapter_name: board::DEFAULT_ADAPTER_NAME,
+        adapter_id: serial.into(),
+        profile_memory_budget: board::PROFILE_MEMORY_BUDGET,
+        #[cfg(feature = "development")]
+        bootloader: Some(cordial_core::application::Bootloader { enter: bootloader }),
+        #[cfg(feature = "production")]
+        bootloader: None,
+    });
+    let owner: &'static App = Box::leak(Box::new(Owner::new(&USB_IO, app, handle, radio)));
     runtime::run(|spawner| {
-        spawner.spawn(usb_task(serial).unwrap());
+        spawner.spawn(usb_task(serial, interfaces).unwrap());
         radio::spawn(spawner);
-        spawner.spawn(owner_task(store, serial).unwrap());
+        spawner.spawn(priority_task(owner, wake, available).unwrap());
+        spawner.spawn(secondary_task(owner, interfaces).unwrap());
     });
 }

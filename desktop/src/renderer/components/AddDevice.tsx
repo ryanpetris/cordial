@@ -1,11 +1,10 @@
 import { useEffect, useState } from "react";
 import type { AppState, Candidate, PairingPrompt } from "../../shared/state.ts";
-import { STORAGE_FULL, TRANSPORTS, clean, storageFull, transportDisabledText } from "../../shared/text.ts";
+import { STORAGE_FULL, TRANSPORTS, clean, displayKind, storageFull, transportDisabledText } from "../../shared/text.ts";
 import { act, useAction } from "../api.ts";
 import { Banner, Dialog, Spinner, Switch } from "./common.tsx";
 import { CheckIcon, CloseIcon, DeviceIcon, LinkIcon, PlusIcon, RefreshIcon, WarningIcon } from "./icons.tsx";
 
-const kindOf = (c: Candidate) => (c.kind === "unknown" ? "other" : c.kind);
 
 function Signal({ rssi }: { rssi: number | null }) {
   if (rssi == null) return null;
@@ -149,7 +148,7 @@ export function AddDevice({
     void act({ type: "pair.cancel" }, true);
   };
 
-  const candidates = (scan?.adapterId === chosen?.id ? (scan?.candidates ?? []) : []).filter((c) => unnamed || clean(c.name ?? "") || c.kind !== "unknown");
+  const candidates = (scan?.adapterId === chosen?.id ? (scan?.candidates ?? []) : []).filter((c) => unnamed || clean(c.name ?? "") || c.kinds.length);
   const hiddenCount = (scan?.candidates.length ?? 0) - candidates.length;
   const full = storageFull(chosen?.status ?? null);
   const disabled = (c: Candidate) => !!c.transport && !!chosen?.status?.transports.some((t) => t.transport === c.transport && !t.enabled);
@@ -265,7 +264,7 @@ export function AddDevice({
           {candidates.map((c) => {
             return (
               <li key={c.id} className="candidate">
-                <DeviceIcon kind={kindOf(c)} />
+                <DeviceIcon kind={displayKind(c.kinds)} />
                 <span className="side-text">
                   <span className="side-title">{clean(c.name ?? "") || "Unnamed Device"}</span>
                   <span className="side-subtitle">{c.transport ? TRANSPORTS[c.transport] : null}</span>

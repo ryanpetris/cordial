@@ -19,18 +19,23 @@ import {
   type InfoEntry,
   type PairingState,
   type Preferences,
+  type ProfileAlert,
   type ScanState,
   type SettingsChange,
   type SettingsSave,
   type TransportName,
 } from "../shared/state.ts";
 import { enabledFull } from "../shared/capacity.ts";
+import { interfaceProblem, profileInUse, profileName, stagedInterfaces } from "../shared/profiles.ts";
 import { settingsBusy } from "../shared/settings.ts";
-import { TRANSPORTS, clean, codeText, errorText, inactiveText, infoOf, storageFull, transportDisabledText } from "../shared/text.ts";
+import { PLATFORMS, TRANSPORTS, clean, codeText, displayKind, errorText, inactiveText, infoOf, storageFull, transportDisabledText } from "../shared/text.ts";
 import { BatteryAlerts, CRITICAL_PERCENT, type Alert } from "./battery.ts";
 import * as convert from "./convert.ts";
 import { AdapterManager, type ManagerDeps } from "./manager.ts";
-import { failure, type AdapterSession } from "./session.ts";
+import { AdapterSession, failure } from "./session.ts";
+
+/** The share of profile memory in use, in percent, from which the adapter is nearly full. */
+export const MEMORY_ALERT_PERCENT = 85;
 
 export interface ControllerDeps extends Omit<ManagerDeps, "changed" | "event"> {
   preferences: Preferences;
@@ -40,6 +45,7 @@ export interface ControllerDeps extends Omit<ManagerDeps, "changed" | "event"> {
   published(state: AppState): void;
   lowBattery(alert: Alert): void;
   connection(name: string, connected: boolean): void;
+  profileAlert(alert: ProfileAlert): void;
 }
 
 const PUBLISH_MS = 30;
@@ -74,13 +80,6 @@ export function batteryOf(info: InfoEntry[], current = true): Battery | null {
   return b.percent == null && b.charging == null ? null : b;
 }
 
-function kindOf(device: DeviceRecord): DeviceEntry["kind"] {
-  if (device.kind !== "unknown") return device.kind;
-  const keyboard = device.roles.includes("keyboard");
-  const mouse = device.roles.includes("mouse");
-  return keyboard && mouse ? "keyboard_mouse" : keyboard ? "keyboard" : mouse ? "mouse" : "other";
-}
-
 type Scan = ScanState & { session: AdapterSession };
 type Pairing = PairingState & { session: AdapterSession; dismissed: boolean; transport: TransportName | null };
 
@@ -95,8 +94,13 @@ export class Controller {
   #starts: { scan: Scan; stopped: boolean }[] = [];
   #pairing: Pairing | null = null;
   #timer: ReturnType<typeof setTimeout> | undefined;
+  #revision = 0;
   readonly #alerts = new BatteryAlerts();
   #states = new Map<string, DeviceRecord["state"]>();
+  /** Adapters notified of nearly full profile memory, and devices notified of unloaded profiles,
+   * until the condition clears. */
+  readonly #memoryAlerted = new Set<string>();
+  readonly #profileAlerted = new Set<string>();
 
   constructor(deps: ControllerDeps) {
     this.#deps = deps;
@@ -122,6 +126,7 @@ export class Controller {
   }
 
   #publish() {
+    this.#revision++;
     const state = this.state();
     if (this.#preferences.notifyLowBattery)
       for (const alert of this.#alerts.update(state.devices, this.#preferences.lowBatteryPercent))
@@ -134,7 +139,32 @@ export class Controller {
           this.#deps.connection(d.name, d.device.state === "connected");
       }
     this.#states = states;
+    this.#profileAlerts(state);
     this.#deps.published(state);
+  }
+
+  /** Notifies once when an adapter's profile memory reaches MEMORY_ALERT_PERCENT and once when a
+   * connected device's profiles aren't loaded, again only after the condition has cleared. Adapters
+   * and devices that are absent keep their state. */
+  #profileAlerts(state: AppState) {
+    for (const a of state.adapters) {
+      const p = a.connection === "connected" ? a.status?.profileSupport : undefined;
+      if (p === undefined) continue;
+      const full = !!p && p.memoryBudget > 0 && p.memoryUsed * 100 >= p.memoryBudget * MEMORY_ALERT_PERCENT;
+      if (!full) this.#memoryAlerted.delete(a.id);
+      else if (!this.#memoryAlerted.has(a.id)) {
+        this.#memoryAlerted.add(a.id);
+        this.#deps.profileAlert({ kind: "memory", adapterId: a.id, name: a.name, percent: Math.round((p.memoryUsed / p.memoryBudget) * 100) });
+      }
+    }
+    for (const d of state.devices) {
+      const code = d.device.state === "connected" ? d.device.profileError : null;
+      if (!code) this.#profileAlerted.delete(d.key);
+      else if (!this.#profileAlerted.has(d.key)) {
+        this.#profileAlerted.add(d.key);
+        this.#deps.profileAlert({ kind: "device", key: d.key, name: d.name, code });
+      }
+    }
   }
 
   // ---- State -------------------------------------------------------------
@@ -156,8 +186,25 @@ export class Controller {
         readiness: status.ready ? "ready" : "waiting",
         status,
         attention,
+        profilePage: session.profilePage,
+        pickerPage: session.pickerPage,
+        profileNames: Object.fromEntries(session.profileNames),
       });
       devices.push(...entries);
+    }
+    for (const [id, retained] of this.manager.reconnecting) {
+      adapters.push({
+        id,
+        name: retained.status.name,
+        connection: "connecting",
+        connectError: null,
+        readiness: "waiting",
+        status: retained.status,
+        attention: [],
+        profilePage: retained.profilePage,
+        pickerPage: retained.pickerPage,
+        profileNames: retained.profileNames,
+      });
     }
     for (const d of this.manager.disconnected.values()) {
       if (!d.path) continue;
@@ -169,6 +216,9 @@ export class Controller {
         readiness: "waiting",
         status: null,
         attention: [],
+        profilePage: null,
+        pickerPage: null,
+        profileNames: {},
       });
     }
     adapters.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
@@ -204,7 +254,19 @@ export class Controller {
       },
       preferences: this.#preferences,
       hostPlatform: this.#deps.hostPlatform,
+      revision: this.#revision,
     };
+  }
+
+  /** Runs a window's action and publishes the state it leaves at once. The result names that
+   * state's revision: the result and the state can reach the window by separate channels, and
+   * the window waits for the state before it finishes the action. */
+  async request(action: Action): Promise<ActionResult> {
+    const result = await this.act(action);
+    clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#publish();
+    return { ...result, revision: this.#revision };
   }
 
   #device(adapterId: string, session: AdapterSession, device: DeviceRecord): DeviceEntry {
@@ -215,7 +277,7 @@ export class Controller {
       adapterId,
       device,
       name: clean(device.name) || "Unnamed device",
-      kind: kindOf(device),
+      kind: displayKind(device.kinds, device.roles),
       battery: batteryOf(device.info, device.state === "connected"),
       pending: session.pendingFor(device.id),
       warnings: session.warnings.get(device.id) ?? null,
@@ -230,7 +292,7 @@ export class Controller {
   #follow() {
     const p = this.#pairing;
     if (!p || p.phase !== "connecting" || !p.deviceKey) return;
-    const d = p.session.devices.get(p.deviceKey.slice(p.adapterId.length + 1));
+    const d = p.session.devices.get(Number(p.deviceKey.slice(p.adapterId.length + 1)));
     if (!d) return;
     p.name = clean(d.name) || p.name;
     if (d.state === "connected") p.phase = "connected";
@@ -252,10 +314,10 @@ export class Controller {
     return this.manager.connected.get(adapterId)?.session ?? null;
   }
 
-  #target(key: string): { session: AdapterSession; id: string; device: DeviceRecord } | null {
+  #target(key: string): { session: AdapterSession; id: number; device: DeviceRecord } | null {
     const slash = key.indexOf("/");
     const session = this.#session(key.slice(0, slash));
-    const id = key.slice(slash + 1);
+    const id = Number(key.slice(slash + 1));
     const device = session?.devices.get(id);
     return session && device ? { session, id, device } : null;
   }
@@ -266,50 +328,115 @@ export class Controller {
     const { session, id } = target;
     const entry = this.#device(session.adapterId, session, target.device);
     if (settingsBusy(entry)) return { ok: false, message: codeText("busy") };
-    if (!changes.length || new Set(changes.map((c) => c.setting)).size !== changes.length)
-      return { ok: false, message: "There are no distinct settings changes to save." };
+    if (!changes.length) return { ok: true };
     const known = new Map((entry.settings ?? []).map((s) => [s.key, s]));
     if (changes.some((c) => !known.has(c.setting))) return { ok: false, message: codeText("not_found") };
-    const items: SettingsSave["items"] = changes.map((change) => ({ change, status: "pending", error: null }));
+    const items: SettingsSave["items"] = changes.map((change) => ({ change, status: "saving", error: null }));
     const save: SettingsSave = { running: true, items };
     this.#settingsSaves.set(key, { save, session });
     this.#publish();
-    // Values are saved in one write and forgetting in another, each all or nothing.
-    const groups = [items.filter((i) => i.change.type === "set"), items.filter((i) => i.change.type === "forget")];
-    let stopped: string | null = null;
+    // Saved values and forgotten ones go in one write, all or nothing.
     try {
-      for (const group of groups) {
-        if (!group.length) continue;
-        if (stopped) {
-          for (const item of group) Object.assign(item, { status: "not_sent", error: stopped });
-          continue;
-        }
-        for (const item of group) item.status = "saving";
-        this.#publish();
-        try {
-          await session.perform(id, "settings", (c) => {
-            const refs = group.map((i) => ({ integration: known.get(i.change.setting)!.integration, key: i.change.setting }));
-            return group[0]!.change.type === "set"
-              ? c.setSettings({
-                  device: id,
-                  changes: group.map((i, n) => ({ ...refs[n]!, value: convert.value(known.get(i.change.setting)!.type, (i.change as Extract<SettingsChange, { type: "set" }>).value) })),
-                })
-              : c.forgetSettings({ device: id, settings: refs });
-          });
-          for (const item of group) item.status = "saved";
-        } catch (error) {
-          stopped = failure(error);
-          for (const item of group) Object.assign(item, { status: "not_saved", error: stopped });
-        }
-      }
+      await session.perform(id, "settings", (c) =>
+        c.setSettings({
+          device: id,
+          changes: changes.map((change) => {
+            const s = known.get(change.setting)!;
+            return {
+              integration: s.integration,
+              key: change.setting,
+              change: change.type === "set" ? { case: "value", value: convert.value(s.type, change.value) } : { case: "forget", value: {} },
+            };
+          }),
+        }),
+      );
+      for (const item of items) item.status = "saved";
+    } catch (error) {
+      const reason = failure(error);
+      for (const item of items) Object.assign(item, { status: "not_saved", error: reason });
     } finally {
       save.running = false;
       this.#publish();
     }
-    const incomplete = save.items.find((i) => i.status !== "saved");
-    return incomplete
-      ? { ok: false, message: incomplete.error ?? "The adapter couldn't save some settings.", inline: true, settingsSave: save }
-      : { ok: true, settingsSave: save };
+    const failed = items.find((i) => i.status !== "saved");
+    return failed ? { ok: false, message: failed.error ?? "The adapter couldn't save the settings.", inline: true, settingsSave: save } : { ok: true, settingsSave: save };
+  }
+
+  /** The adapter's session when it can change profiles, else why not. */
+  #profiles(adapterId: string): AdapterSession | ActionResult {
+    const session = this.#session(adapterId);
+    if (!session) return GONE;
+    if (!session.status.profileSupport) return { ok: false, message: codeText("unsupported") };
+    if (!session.status.ready) return { ok: false, message: codeText("not_ready") };
+    return session;
+  }
+
+  async #setAdapter(action: Extract<Action, { type: "adapter.settings" }>): Promise<ActionResult> {
+    const session = this.#session(action.adapterId);
+    if (!session) return GONE;
+    if (!session.status.ready) return { ok: false, message: codeText("not_ready") };
+    const { platform } = action;
+    const status = session.status;
+    const transports = Object.entries(action.transports ?? {}) as [TransportName, boolean][];
+    const interfaces = Object.entries(action.interfaces ?? {}).map(([i, change]) => ({ interface: Number(i), ...change }));
+    if (platform === undefined && !transports.length && !interfaces.length) return { ok: true };
+    if (platform !== undefined && !Object.hasOwn(PLATFORMS, platform)) return { ok: false, message: codeText("unsupported") };
+    if (transports.some(([t]) => !Object.hasOwn(TRANSPORTS, t) || !status.transports.some((s) => s.transport === t)))
+      return { ok: false, message: codeText("unsupported") };
+    if (interfaces.some((u) => !status.interfaces.some((i) => i.interface === u.interface))) return { ok: false, message: codeText("unsupported") };
+    const problem = interfaces.length ? interfaceProblem(stagedInterfaces(status, { interfaces: action.interfaces })) : null;
+    if (problem) return { ok: false, message: problem };
+    await session.connection.setAdapter({
+      platform: platform === undefined ? undefined : convert.wire(Platform, platform),
+      transports: transports.map(([t, enabled]) => ({ transport: convert.wire(Transport, t), enabled })),
+      configurationInterfaces: interfaces,
+    });
+    return { ok: true };
+  }
+
+  async #updateDevice(action: Extract<Action, { type: "device.update" }>): Promise<ActionResult> {
+    const t = this.#target(action.key);
+    if (!t) return GONE;
+    const { session, id, device } = t;
+    const { enabled, trusted, blocked, hidpp, profiles } = action;
+    if (enabled === undefined && trusted === undefined && blocked === undefined && hidpp === undefined && profiles === undefined) return { ok: true };
+    if (enabled && !device.enabled && enabledFull(session.status, [...session.devices.values()], device))
+      return { ok: false, message: errorText({ code: "no_capacity", reason: "enabled", outcomeUnknown: false }) };
+    if (hidpp !== undefined && settingsBusy(this.#device(session.adapterId, session, device))) return { ok: false, message: codeText("busy") };
+    if (profiles !== undefined) {
+      const support = session.status.profileSupport;
+      if (!support) return { ok: false, message: codeText("unsupported") };
+      if (profiles.length > support.maxLayers || profiles.includes(0)) return { ok: false, message: codeText("bad_args") };
+    }
+    // A change to HID++ is tracked as such, so the settings it starts or stops wait for it.
+    await session.perform(id, hidpp === undefined ? "device" : "hidpp", (c) =>
+      c.setDevice({
+        device: id,
+        enabled,
+        trusted,
+        blocked,
+        integrations: hidpp === undefined ? [] : [{ kind: device.hidpp?.kind ?? IntegrationKind.HIDPP, enabled: hidpp }],
+        profiles: profiles === undefined ? undefined : { profiles },
+      }),
+    );
+    return { ok: true };
+  }
+
+  async #changeProfile(action: Extract<Action, { type: "profile.create" | "profile.copy" | "profile.delete" }>): Promise<ActionResult> {
+    const session = this.#profiles(action.adapterId);
+    if (!(session instanceof AdapterSession)) return session;
+    if (action.type === "profile.delete") {
+      const devices = [...session.devices.values()].map((d) => this.#device(action.adapterId, session, d));
+      const used = profileInUse(session.status, devices, action.profile);
+      if (used) return { ok: false, message: used };
+      await session.connection.deleteProfile(action.profile);
+      return { ok: true };
+    }
+    const name = profileName(action.name);
+    if (name === null) return { ok: false, message: "Enter a profile name of up to 64 bytes." };
+    if (action.type === "profile.copy") await session.connection.copyProfile(action.profile, name);
+    else await session.connection.createProfile(name);
+    return { ok: true };
   }
 
   async act(action: Action): Promise<ActionResult> {
@@ -341,45 +468,35 @@ export class Controller {
           else await session.perform(id, "refresh", (c) => c.refreshDevice(id));
           return { ok: true };
         }
-        case "device.enabled":
-        case "device.trusted":
-        case "device.blocked":
-        case "device.hidpp": {
-          const t = this.#target(action.key);
-          if (!t) return GONE;
-          const { session, id, device } = t;
-          if (action.type === "device.enabled" && action.value && !device.enabled && enabledFull(session.status, [...session.devices.values()], device))
-            return { ok: false, message: errorText({ code: "no_capacity", reason: "enabled", outcomeUnknown: false }) };
-          if (action.type === "device.hidpp" && settingsBusy(this.#device(session.adapterId, session, device)))
-            return { ok: false, message: codeText("busy") };
-          const field = action.type.slice("device.".length) as "enabled" | "trusted" | "blocked" | "hidpp";
-          await session.perform(id, field, (c) =>
-            c.setDevice(
-              field === "hidpp"
-                ? { device: id, integrations: [{ kind: device.hidpp?.kind ?? IntegrationKind.HIDPP, enabled: action.value }] }
-                : { device: id, [field]: action.value },
-            ),
-          );
-          return { ok: true };
-        }
+        case "device.update":
+          return await this.#updateDevice(action);
         case "settings.save":
           return await this.#saveSettings(action.key, action.changes);
-        case "adapter.name":
-        case "adapter.platform":
-        case "adapter.transport": {
+        case "adapter.settings":
+          return await this.#setAdapter(action);
+        case "profiles.page": {
+          const session = this.#profiles(action.adapterId);
+          if (!(session instanceof AdapterSession)) return session;
+          await session.readPage(action.page, action.picker ? "picker" : "list");
+          return { ok: true };
+        }
+        case "profile.create":
+        case "profile.copy":
+        case "profile.delete":
+          return await this.#changeProfile(action);
+        case "adapter.reload": {
+          const session = this.#session(action.adapterId);
+          if (!session) return GONE;
+          session.reloadProfiles();
+          return { ok: true };
+        }
+        case "adapter.name": {
           const session = this.#session(action.adapterId);
           if (!session) return GONE;
           if (!session.status.ready) return { ok: false, message: codeText("not_ready") };
-          if (action.type === "adapter.name") {
-            const name = action.name === null ? "" : adapterName(action.name);
-            if (name === null) return { ok: false, message: "Invalid adapter name" };
-            await session.connection.setAdapter({ name });
-          } else if (action.type === "adapter.platform") await session.connection.setAdapter({ platform: convert.wire(Platform, action.platform) });
-          else {
-            if (!(action.transport in TRANSPORTS) || !session.status.transports.some((t) => t.transport === action.transport && t.settable))
-              return { ok: false, message: codeText("unsupported") };
-            await session.connection.setAdapter({ transports: [{ transport: convert.wire(Transport, action.transport), enabled: action.enabled }] });
-          }
+          const name = action.name === null ? "" : adapterName(action.name);
+          if (name === null) return { ok: false, message: "Enter an adapter name of up to 64 bytes." };
+          await session.connection.setAdapter({ name });
           return { ok: true };
         }
         case "adapter.disconnect":
@@ -520,7 +637,7 @@ export class Controller {
     for (const session of sessions) await session.connection.stopScan().catch(() => {});
   }
 
-  async #pair(adapterId: string, candidateId: string): Promise<ActionResult> {
+  async #pair(adapterId: string, candidateId: number): Promise<ActionResult> {
     const session = this.#session(adapterId);
     if (!session) return { ok: false, message: "This adapter is no longer available." };
     if (this.#pairing?.phase === "pairing" && !this.#pairing.dismissed) return { ok: false, message: "Another device is being added." };

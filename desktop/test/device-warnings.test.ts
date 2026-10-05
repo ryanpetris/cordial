@@ -14,25 +14,52 @@ describe("device warnings", () => {
   it("reads every device's list and follows its warnings events", async () => {
     const { fake, session } = await openSession();
     await until(() => session.listed && session.warnings.size === fake.devices.length);
-    expect(session.warnings.get("d_1")).toEqual([]);
+    expect(session.warnings.get(1)).toEqual([]);
     const selectors = [field, { ...field, usage: 0x239 }, { ...field, usagePage: 1 }];
-    fake.changeWarnings("d_1", selectors);
-    await until(() => session.warnings.get("d_1")!.length === 3);
-    expect(session.warnings.get("d_1")).toEqual(selectors);
-    fake.changeWarnings("d_1", []);
-    await until(() => session.warnings.get("d_1")!.length === 0);
+    fake.changeWarnings(1, selectors);
+    await until(() => session.warnings.get(1)!.length === 3);
+    // In the adapter's order: service, report type, report ID, bit offset, usage page, usage, code.
+    expect(session.warnings.get(1)).toEqual([selectors[2], selectors[0], selectors[1]]);
+    // Events carry only what was added and removed.
+    fake.changeWarnings(1, [selectors[0]!, { ...field, bitOffset: 8 }]);
+    await until(() => session.warnings.get(1)!.length === 2);
+    expect(session.warnings.get(1)).toEqual([{ ...field, bitOffset: 8 }, field]);
+    const event = fake.events.findLast((e) => e.case === "warningsChanged");
+    expect(event?.case === "warningsChanged" && [event.value.added?.length, event.value.removed?.length]).toEqual([1, 2]);
+    fake.changeWarnings(1, []);
+    await until(() => session.warnings.get(1)!.length === 0);
+    // A disconnected device has none.
+    fake.changeWarnings(1, selectors);
+    await until(() => session.warnings.get(1)!.length === 3);
+    fake.changeDevice(1, { state: "disconnected" });
+    await until(() => session.warnings.get(1)!.length === 0);
     await session.close();
   });
 
-  it("reads a list sent without warnings as having none", async () => {
-    const bytes = toBinary(DeviceWarningsSchema, create(DeviceWarningsSchema, { device: "d_1" }));
+  it("reads every page of a device's warnings", async () => {
+    const { fake, session } = await openSession({ pageSize: 2 });
+    await until(() => session.listed && session.warnings.size === fake.devices.length);
+    const many = [1, 2, 3, 4, 5].map((bit) => ({ ...field, bitOffset: bit }));
+    fake.changeWarnings(1, many);
+    await until(() => session.warnings.get(1)!.length === 5);
+    const sent = fake.received.length;
+    session.reload(1);
+    await until(() => fake.received.slice(sent).some((r) => r.command.case === "listSettings"));
+    expect(session.warnings.get(1)).toEqual(many);
+    const reads = fake.received.slice(sent).filter((r) => r.command.case === "listWarnings");
+    expect(reads.map((r) => r.command.case === "listWarnings" && r.command.value.after?.bitOffset)).toEqual([undefined, 2, 4]);
+    await session.close();
+  });
+
+    it("reads a list sent without warnings as having none", async () => {
+    const bytes = toBinary(DeviceWarningsSchema, create(DeviceWarningsSchema, { device: 1 }));
     expect(fromBinary(DeviceWarningsSchema, bytes).warnings.map(warning)).toEqual([]);
     const { fake, session } = await openSession();
     await until(() => session.listed && session.warnings.size === fake.devices.length);
-    fake.changeWarnings("d_1", [field]);
-    await until(() => session.warnings.get("d_1")!.length === 1);
-    fake.changeWarnings("d_1", []);
-    await until(() => session.warnings.get("d_1")!.length === 0);
+    fake.changeWarnings(1, [field]);
+    await until(() => session.warnings.get(1)!.length === 1);
+    fake.changeWarnings(1, []);
+    await until(() => session.warnings.get(1)!.length === 0);
     await session.close();
   });
 

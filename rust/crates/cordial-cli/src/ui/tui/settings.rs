@@ -16,7 +16,7 @@ use super::{
     view::{device_status, hidpp_status, spinner},
 };
 use crate::{
-    controller::{Command, Outcome, State},
+    controller::{Command, Outcome, State, Target},
     error::Error,
     model::{self, Type, Up},
     ui::{
@@ -49,18 +49,18 @@ pub enum Change {
 
 #[derive(Default)]
 pub struct Page {
-    /// The saved device whose page is open, or empty.
-    pub device: String,
+    /// The saved device whose page is open, or 0.
+    pub device: u32,
     pub key: Option<String>,
     pub collapsed: HashSet<&'static str>,
     /// Staged changes by device and key, kept until saved, discarded or the
     /// session ends.
-    pub drafts: HashMap<String, HashMap<String, Change>>,
+    pub drafts: HashMap<u32, HashMap<String, Change>>,
     pub list_scroll: usize,
     pub editor_scroll: usize,
     pub reveal: bool,
     /// Devices whose settings list is being read.
-    pub loading: HashSet<String>,
+    pub loading: HashSet<u32>,
     /// Why the open page's last read failed.
     pub load_err: Option<Error>,
     /// Why the last Save failed.
@@ -94,7 +94,7 @@ pub(super) fn settings_busy(st: &State, d: &p::Device, saving: bool) -> &'static
         ("device refresh", "Reading Settings…"),
         ("device set hidpp", "Saving Logitech Features…"),
     ] {
-        if pending_for(st, command, &d.id) {
+        if pending_for(st, command, d.id) {
             return text;
         }
     }
@@ -236,7 +236,7 @@ fn step_value(b: Bounds, from: Option<&Value>, delta: i64) -> Value {
 }
 
 /// A button, or the same label disabled in its place.
-fn button_if(b: &mut Layout, label: &str, action: Action, tone: Tone, enabled: bool) {
+pub(super) fn button_if(b: &mut Layout, label: &str, action: Action, tone: Tone, enabled: bool) {
     if enabled {
         b.button(label, action, tone);
     } else {
@@ -247,12 +247,10 @@ fn button_if(b: &mut Layout, label: &str, action: Action, tone: Tone, enabled: b
 impl<B: Backend> Model<B> {
     /// Whether a saved device's settings page is shown.
     pub(super) fn settings_open(&self, st: &State) -> bool {
-        !self.page.device.is_empty()
-            && self.session.is_some()
-            && Self::find(st, &self.page.device).0.is_some()
+        self.page.device != 0 && self.session.is_some() && st.device(self.page.device).is_some()
     }
 
-    pub(super) fn open_settings(&mut self, id: String) {
+    pub(super) fn open_settings(&mut self, id: u32) {
         self.close_files();
         self.page.device = id;
         self.page.key = None;
@@ -261,13 +259,12 @@ impl<B: Backend> Model<B> {
         self.page.load_err = None;
         self.page.job_note.clear();
         self.focus = None;
-        let id = self.page.device.clone();
-        self.load_settings(&id);
+        self.load_settings(id);
     }
 
     /// Leaves the settings page. Staged changes are kept.
     pub(super) fn close_settings(&mut self) {
-        self.page.device.clear();
+        self.page.device = 0;
         self.page.key = None;
         self.page.load_err = None;
         self.page.job_note.clear();
@@ -275,8 +272,8 @@ impl<B: Backend> Model<B> {
     }
 
     /// Discards everything the page kept for a device's bond.
-    pub(super) fn forget_device(&mut self, id: &str) {
-        self.page.drafts.remove(id);
+    pub(super) fn forget_device(&mut self, id: u32) {
+        self.page.drafts.remove(&id);
         let prefix = format!("{id}/");
         self.page
             .setting_states
@@ -284,10 +281,10 @@ impl<B: Backend> Model<B> {
     }
 
     /// Whether a Save of the device's settings is running.
-    pub(super) fn saving(&self, id: &str) -> bool {
+    pub(super) fn saving(&self, id: u32) -> bool {
         self.jobs.values().any(|j| {
             j.save.is_some()
-                && matches!(&j.command, Command::SettingsSave { device, .. } if device == id)
+                && matches!(&j.command, Command::SettingsSave { device, .. } if *device == id)
         })
     }
 
@@ -296,31 +293,31 @@ impl<B: Backend> Model<B> {
         let Some(st) = self.state() else {
             return;
         };
-        if !self.page.device.is_empty() && Self::find(&st, &self.page.device).0.is_none() {
+        if self.page.device != 0 && st.device(self.page.device).is_none() {
             self.close_settings();
         }
     }
 
     /// Reads a device's settings list, unless a read is under way. Events
     /// keep it current afterwards.
-    fn load_settings(&mut self, id: &str) {
-        if !self.page.loading.insert(id.to_owned()) {
+    fn load_settings(&mut self, id: u32) {
+        if !self.page.loading.insert(id) {
             return;
         }
-        let mut job = Job::new(Command::Settings(id.to_owned()));
+        let mut job = Job::new(Command::Settings(Target::Id(id)));
         job.load = true;
         self.execute_job(job);
     }
 
-    fn draft(&self, id: &str, key: &str) -> Option<&Change> {
-        self.page.drafts.get(id)?.get(key)
+    fn draft(&self, id: u32, key: &str) -> Option<&Change> {
+        self.page.drafts.get(&id)?.get(key)
     }
 
     /// The value the controls show: the staged value, else the saved value,
     /// else a legal current reading. A reading that cannot be set, such as a
     /// temporary mode, is never offered as chosen.
     fn edit_value(&self, s: &p::Setting) -> Option<Value> {
-        match self.draft(&self.page.device, &s.key) {
+        match self.draft(self.page.device, &s.key) {
             Some(Change::Set { value, .. }) => return Some(value.clone()),
             Some(Change::Forget) => {}
             None => {
@@ -339,11 +336,7 @@ impl<B: Backend> Model<B> {
         if !model::accepts(s, &v) {
             return;
         }
-        let drafts = self
-            .page
-            .drafts
-            .entry(self.page.device.clone())
-            .or_default();
+        let drafts = self.page.drafts.entry(self.page.device).or_default();
         let policy = model::saved(s).is_none()
             && matches!(drafts.get(&s.key), Some(Change::Set { policy: true, .. }));
         if !policy && Some(&v) == base(s).as_ref() {
@@ -354,7 +347,7 @@ impl<B: Backend> Model<B> {
     }
 
     /// The staged changes that would change something, in display order.
-    fn changes(&self, id: &str, settings: &[p::Setting]) -> Vec<(String, Change)> {
+    fn changes(&self, id: u32, settings: &[p::Setting]) -> Vec<(String, Change)> {
         catalog::presented(settings)
             .into_iter()
             .filter_map(|s| Some((s.key.clone(), effective(s, self.draft(id, &s.key))?)))
@@ -381,9 +374,9 @@ impl<B: Backend> Model<B> {
 
     /// A setting row's tag: a staged change, else its saved state.
     fn row_tag(&self, d: &p::Device, s: &p::Setting) -> (&'static str, Style) {
-        let staged = effective(s, self.draft(&d.id, &s.key)).is_some();
+        let staged = effective(s, self.draft(d.id, &s.key)).is_some();
         match model::applied(s) {
-            _ if staged && self.saving(&d.id) => ("◌ Sending", warn()),
+            _ if staged && self.saving(d.id) => ("◌ Sending", warn()),
             _ if staged => ("✎ Changed", layout::accent()),
             None => ("○ Not Saved", dim()),
             Some(Err(_)) => ("✕ Failed", err()),
@@ -399,9 +392,9 @@ impl<B: Backend> Model<B> {
     }
 
     pub(super) fn settings_pane(&mut self, st: &State, w: usize, h: usize) -> Layout {
-        let d = Self::find(st, &self.page.device).0.unwrap().clone();
-        let id = d.id.clone();
-        let settings = st.settings_of(&id).to_vec();
+        let d = st.device(self.page.device).unwrap().clone();
+        let id = d.id;
+        let settings = st.settings_of(id).to_vec();
         let loaded = st.settings.contains_key(&id);
         let mut b = Layout::new(w.saturating_sub(4));
         let mut pinned = Layout::new(w.saturating_sub(4));
@@ -429,7 +422,7 @@ impl<B: Backend> Model<B> {
         if loaded && self.page.load_err.is_none() && known.is_empty() {
             b.para("No Settings", dim());
         }
-        let busy = settings_busy(st, &d, self.saving(&id));
+        let busy = settings_busy(st, &d, self.saving(id));
         let inner = b.width;
         let tag_w = if inner >= 64 { 20 } else { 14 };
         let value_w = (inner.saturating_sub(2 + tag_w) * 2 / 5).max(6);
@@ -461,7 +454,7 @@ impl<B: Backend> Model<B> {
                     (layout::plain(), layout::plain(), "  ")
                 };
                 // The form value: what is staged, else saved, else read.
-                let shown = match self.draft(&id, &s.key) {
+                let shown = match self.draft(id, &s.key) {
                     Some(Change::Set { value, .. }) => Some(value.clone()),
                     _ => model::saved(s).or_else(|| model::current(s)),
                 };
@@ -508,7 +501,7 @@ impl<B: Backend> Model<B> {
         }
         pinned.row();
         let idle = busy.is_empty();
-        let can_save = idle && !self.changes(&id, &settings).is_empty();
+        let can_save = idle && !self.changes(id, &settings).is_empty();
         button_if(
             &mut pinned,
             "Save",
@@ -546,8 +539,8 @@ impl<B: Backend> Model<B> {
     pub(super) fn editor(&self, st: &State, w: usize) -> (String, Layout, Layout) {
         let mut b = Layout::new(w.saturating_sub(4));
         let mut actions = Layout::new(w.saturating_sub(4));
-        let d = Self::find(st, &self.page.device).0.unwrap();
-        let id = &d.id;
+        let d = st.device(self.page.device).unwrap();
+        let id = d.id;
         let Some(s) = self
             .page
             .key
@@ -709,28 +702,28 @@ impl<B: Backend> Model<B> {
         let Some(st) = self.state() else {
             return;
         };
-        if self.page.device.is_empty() {
+        if self.page.device == 0 {
             return;
         }
-        let Some(d) = Self::find(&st, &self.page.device).0.cloned() else {
+        let Some(d) = st.device(self.page.device).cloned() else {
             return;
         };
-        let id = d.id.clone();
-        let settings = st.settings_of(&id).to_vec();
+        let id = d.id;
+        let settings = st.settings_of(id).to_vec();
         let setting = |key: &str| settings.iter().find(|s| s.key == key).cloned();
-        let busy = !settings_busy(&st, &d, self.saving(&id)).is_empty();
+        let busy = !settings_busy(&st, &d, self.saving(id)).is_empty();
         match action {
             Action::SettingsBack => self.close_settings(),
             Action::SettingsReload => {
                 self.page.load_err = None;
-                self.load_settings(&id);
+                self.load_settings(id);
             }
             Action::SettingsRefresh => {
                 if busy || !connected(&d) {
                     return;
                 }
                 self.page.job_note.clear();
-                self.execute(Command::Refresh(id));
+                self.execute(Command::Refresh(Target::Id(id)));
             }
             Action::Category(category) => {
                 if !self.page.collapsed.remove(category) {
@@ -799,7 +792,7 @@ impl<B: Backend> Model<B> {
                 }
             }
             Action::SaveAll => {
-                let changes = self.changes(&id, &settings);
+                let changes = self.changes(id, &settings);
                 if changes.is_empty() {
                     return;
                 }
@@ -857,7 +850,7 @@ impl<B: Backend> Model<B> {
             }
             Err(e) => {
                 let words = text::error_words(e);
-                let name = self.label(device);
+                let name = self.label(crate::view::Item::Device(*device));
                 self.note(
                     super::activity::Kind::Bad,
                     format!("Couldn't save the settings of {name}: {words}"),
@@ -875,7 +868,7 @@ impl<B: Backend> Model<B> {
         let Some(st) = self.state() else {
             return;
         };
-        let keys = self.visible_keys(st.settings_of(&self.page.device));
+        let keys = self.visible_keys(st.settings_of(self.page.device));
         if keys.is_empty() {
             return;
         }
@@ -906,7 +899,7 @@ impl<B: Backend> Model<B> {
             .key
             .as_ref()
             .and_then(|k| {
-                st.settings_of(&self.page.device)
+                st.settings_of(self.page.device)
                     .iter()
                     .find(|s| s.key == *k)
             })

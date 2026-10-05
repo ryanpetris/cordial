@@ -1,6 +1,5 @@
 //! Source-neutral, volatile device observations. Null explicitly clears a field.
-use crate::model::{identifiers::DeviceId, settings::SettingValue};
-use alloc::vec::Vec;
+use crate::model::settings::SettingValue;
 use serde::{Deserialize, Serialize};
 
 pub const MAX_FIRMWARE: u8 = 2;
@@ -90,12 +89,4 @@ impl InfoField {
             _ => false,
         }
     }
-}
-/// Full snapshot for responses; only changed fields for device.info.changed.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceInfo {
-    pub revision: u64,
-    pub device_id: DeviceId,
-    pub fields: Vec<InfoField>,
 }

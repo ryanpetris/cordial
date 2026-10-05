@@ -1,7 +1,8 @@
 // The Cordial serial API. A client sends one Request per frame and receives one Response for each,
-// in order; the Dongle also sends an Event whenever a device, its settings, its warnings, the
-// adapter, a scan or a pairing changes. Each frame is one protobuf message, COBS-encoded and
-// followed by a zero byte. docs/protocol describes framing, sessions and the compatibility rules.
+// in order; the Dongle also sends an Event whenever a device, its settings, its warnings, a
+// profile, the adapter, a scan or a pairing changes. Each frame is one protobuf message,
+// COBS-encoded and followed by a zero byte. docs/protocol describes framing, sessions and the
+// compatibility rules.
 syntax = "proto3";
 
 package cordial;
@@ -35,7 +36,14 @@ message Request {
 
     ListSettings list_settings = 30;
     SetSettings set_settings = 31;
-    ForgetSettings forget_settings = 32;
+
+    ListProfiles list_profiles = 50;
+    GetProfile get_profile = 51;
+    CreateProfile create_profile = 52;
+    CopyProfile copy_profile = 53;
+    DeleteProfile delete_profile = 54;
+    ListProfileRules list_profile_rules = 55;
+    SetProfileRules set_profile_rules = 56;
 
     // Development firmware only.
     ListFeatures list_features = 40;
@@ -64,27 +72,41 @@ message Response {
     FileList files = 8;
     FileData file = 9;
     DeviceWarnings warnings = 10;
+    Profile profile = 11;
+    ProfileList profiles = 12;
+    ProfileRules profile_rules = 13;
+    ProfileCreated profile_created = 14;
   }
 }
 
+// Change events carry only what changed. A client applies them to what it has listed, and lists
+// again from the start when it needs a fresh view, such as in a new session.
 message Event {
+  reserved 4, 8, 11;
+  reserved "settings", "warnings", "profile_rules";
   oneof kind {
-    // Name, platform, readiness or an adapter info value changed.
+    // An adapter preference, readiness or an adapter info value changed.
     Status adapter = 1;
     // Anything in a device record changed, including a newly paired device.
     Device device = 2;
     // A device has been unpaired.
     DeviceRemoved device_removed = 3;
-    // Any of a device's settings changed. Carries the device's full list.
-    DeviceSettings settings = 4;
     // A scan found a candidate, or a candidate's name or signal changed.
     Candidate scan_found = 5;
     // A scan ended, by timeout or StopScan.
     ScanDone scan_done = 6;
     // The pairing changed state.
     Pairing pairing = 7;
-    // A device's warnings changed. Carries the device's full list.
-    DeviceWarnings warnings = 8;
+    // A profile was created or copied, or its roles changed.
+    Profile profile = 9;
+    // A profile has been deleted.
+    ProfileRemoved profile_removed = 10;
+    // Some of a device's settings changed, appeared or went away.
+    SettingsChanged settings_changed = 12;
+    // A device's warnings changed.
+    WarningsChanged warnings_changed = 13;
+    // Some of a profile's rules changed, appeared or went away.
+    ProfileRulesChanged profile_rules_changed = 14;
   }
 }
 
@@ -94,14 +116,33 @@ message Event {
 
 message GetStatus {}
 
-// Partial update: missing fields are left unchanged. Responds with Status once saved.
+// Partial update: missing fields are left unchanged. Responds with no result once saved; an adapter
+// event follows when anything changed.
 message SetAdapter {
   // 1..64 bytes, no control characters. "" restores the firmware default name.
   optional string name = 1;
   optional Platform platform = 2;
-  // Transport preferences to change. Transports not listed are left unchanged. A transport this
-  // firmware does not support returns ERROR_CODE_UNSUPPORTED.
+  // Transport preferences to change, applied in order. Transports not listed are left
+  // unchanged. A transport this firmware does not support returns ERROR_CODE_UNSUPPORTED.
   repeated TransportUpdate transports = 3;
+  // Configuration interface preferences to change, applied in order. Interfaces not listed are
+  // left unchanged. An interface this firmware does not support returns ERROR_CODE_UNSUPPORTED.
+  repeated ConfigurationInterfaceUpdate configuration_interfaces = 5;
+}
+
+// Partial update of one configuration interface's preferences. Enabling or disabling an interface,
+// or changing the profile of an enabled one, reconnects USB after the response has been written.
+message ConfigurationInterfaceUpdate {
+  // Required.
+  ConfigurationInterface interface = 1;
+  // Whether the Dongle exposes this interface over USB. An enabled interface needs a profile in
+  // the resulting configuration, or the request returns ERROR_CODE_BAD_ARGS. A resulting
+  // configuration that enables it together with an interface listed in its conflicts returns
+  // ERROR_CODE_UNSUPPORTED.
+  optional bool enabled = 2;
+  // The profile the interface reads and changes. 0 clears it. A profile that does not exist
+  // returns ERROR_CODE_NOT_FOUND.
+  optional uint32 profile = 3;
 }
 
 // Partial update of one transport's preferences.
@@ -116,7 +157,8 @@ message TransportUpdate {
 message EnterBootloader {}
 
 message Status {
-  // Required. Adapter ID; the same string as the USB serial number. Stable across boots.
+  // Required. Adapter ID: 16 uppercase hexadecimal digits, which also begin the USB serial
+  // number. Stable across boots.
   string id = 1;
   // Effective adapter name.
   string name = 2;
@@ -130,6 +172,12 @@ message Status {
   repeated TransportSupport transports = 5;
   // Facts about the Dongle itself, with keys from the same catalog as Device.info.
   repeated Info info = 6;
+  // Missing when the board has no profile support, which also leaves configuration_interfaces
+  // empty.
+  ProfileSupport profile_support = 7;
+  // One entry per configuration interface this firmware supports, whether enabled or not. An
+  // interface that is not listed is not supported.
+  repeated ConfigurationInterfaceSupport configuration_interfaces = 8;
 }
 
 // What the Dongle supports for one transport. Per-transport limits and capabilities are added here
@@ -151,6 +199,31 @@ enum Platform {
   PLATFORM_LINUX = 0;
   PLATFORM_WINDOWS = 1;
   PLATFORM_MAC = 2;
+}
+
+// An external editing protocol the Dongle can expose over USB, letting a Host editor read and
+// change one profile. The serial API is available whatever is enabled, and profiles map input
+// whether or not any interface is enabled.
+enum ConfigurationInterface {
+  CONFIGURATION_INTERFACE_UNSPECIFIED = 0;
+  // VIA protocol; also used by compatible Remap clients.
+  CONFIGURATION_INTERFACE_VIA = 1;
+  CONFIGURATION_INTERFACE_VIAL = 2;
+}
+
+// What the Dongle supports for one configuration interface, with its saved preferences.
+// Per-interface limits and capabilities are added here as fields, never as per-interface fields on
+// Status.
+message ConfigurationInterfaceSupport {
+  // Required. A client keeps an interface it does not know and passes it back unchanged.
+  ConfigurationInterface interface = 1;
+  // The interface is exposed over USB.
+  bool enabled = 2;
+  // The profile the interface reads and changes, kept while the interface is disabled. 0 when
+  // none is selected.
+  uint32 profile = 3;
+  // Interfaces this firmware cannot expose at the same time as this one.
+  repeated ConfigurationInterface conflicts = 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +248,7 @@ message StopScan {}
 // ERROR_CODE_BUSY.
 message StartPairing {
   // Required.
-  string candidate = 1;
+  uint32 candidate = 1;
 }
 
 // Answers the open prompt. Returns ERROR_CODE_NO_PROMPT when none is open.
@@ -191,13 +264,15 @@ message RejectPrompt {}
 message CancelPairing {}
 
 message Candidate {
-  // Required. Valid until the next scan starts or the session ends.
-  string id = 1;
+  // Required. Positive. Valid until the next scan starts or the session ends. Candidate IDs are
+  // separate from device IDs.
+  uint32 id = 1;
   // Required.
   Transport transport = 2;
   // Advertised name, or "" when none.
   string name = 3;
-  Kind kind = 4;
+  // What the candidate says it is. Empty when unknown. A client skips kinds it does not know.
+  repeated Kind kinds = 4;
   // Signal strength in dBm.
   optional sint32 rssi = 5;
 }
@@ -210,7 +285,7 @@ message ScanDone {
 
 message Pairing {
   // Required.
-  string candidate = 1;
+  uint32 candidate = 1;
   // Required. Where the pairing is. A client that sees no step set treats the pairing as still in
   // progress.
   oneof step {
@@ -246,10 +321,10 @@ message ShowCode {
   string value = 2;
 }
 
-// The bond is saved. The device's connection progress follows as device events.
+// The bond is saved. An enabled device's connection progress follows as device events.
 message PairingDone {
   // Required. The saved device ID.
-  string device = 1;
+  uint32 device = 1;
 }
 
 enum CodeKind {
@@ -264,22 +339,46 @@ enum CodeKind {
 // Devices
 // ---------------------------------------------------------------------------
 
-message ListDevices {}
+// One page of saved devices, in ascending ID order. Responds with DeviceList.
+message ListDevices {
+  // The ID of the last entry received. 0 starts from the beginning.
+  uint32 after = 1;
+}
 
+// One page of a listing. Every List command pages the same way: the reply holds the entries that
+// follow `after` in the listing's order, and `end` is set when nothing follows the last of them.
+// The Dongle chooses how many entries a page holds, and a page holds at least one entry unless
+// `end` is set. A client passes the key of the last entry it received as the next request's
+// `after`.
 message DeviceList {
-  repeated Device devices = 1;
+  reserved 1, 2, 3;
+  reserved "devices", "next", "unreadable";
+  repeated DeviceListEntry entries = 4;
+  // Nothing follows the last entry.
+  bool end = 5;
+}
+
+message DeviceListEntry {
+  // Required.
+  oneof entry {
+    Device device = 1;
+    // The ID of a device whose saved record could not be read from flash. The listing continues
+    // past it. An undecodable record is removed as lost and is not listed.
+    uint32 unreadable = 2;
+  }
 }
 
 message GetDevice {
   // Required.
-  string device = 1;
+  uint32 device = 1;
 }
 
-// Partial update: missing fields are left unchanged. Responds with Device once saved. Effects that
-// need the radio (disconnecting, starting an integration) follow as device events.
+// Partial update: missing fields are left unchanged. Responds with no result once saved; a device
+// event follows when anything changed. Effects that need the radio (disconnecting, starting an
+// integration) follow as further device events.
 message SetDevice {
   // Required.
-  string device = 1;
+  uint32 device = 1;
   // Whether the device is loaded into the Bluetooth stack so it can connect. False unloads and
   // disconnects it; it stays saved. True returns ERROR_CODE_NO_CAPACITY with
   // CAPACITY_REASON_ENABLED when the device's transport already has max_enabled devices enabled.
@@ -288,9 +387,12 @@ message SetDevice {
   optional bool trusted = 3;
   // Whether the device is refused all connections. True disconnects it.
   optional bool blocked = 4;
-  // Integration preferences to change. Integrations not listed are left unchanged. A kind this
-  // firmware does not know returns ERROR_CODE_UNSUPPORTED.
+  // Integration preferences to change, applied in order. Integrations not listed are left
+  // unchanged. A kind this firmware does not know returns ERROR_CODE_UNSUPPORTED.
   repeated IntegrationUpdate integrations = 5;
+  // The device's profile layers. Missing leaves them unchanged. Without profile support it returns
+  // ERROR_CODE_UNSUPPORTED. A connected device uses the new layers from its next input.
+  ProfileLayers profiles = 6;
 }
 
 // Partial update of one integration's preferences.
@@ -305,42 +407,44 @@ message IntegrationUpdate {
 // DEVICE_STATE_DISCONNECTED with error set.
 message ConnectDevice {
   // Required.
-  string device = 1;
+  uint32 device = 1;
 }
 
 // Disconnects and pauses reconnection until ConnectDevice or the Dongle restarts. Responds with
 // Device.
 message DisconnectDevice {
   // Required.
-  string device = 1;
+  uint32 device = 1;
 }
 
 // Deletes the bond and the device's settings. device_removed follows once it is gone.
 message UnpairDevice {
   // Required.
-  string device = 1;
+  uint32 device = 1;
 }
 
 // Re-reads device information and settings from a connected device. Changes arrive as
-// device and settings events.
+// device and settings_changed events.
 message RefreshDevice {
   // Required.
-  string device = 1;
+  uint32 device = 1;
 }
 
 message DeviceRemoved {
   // Required.
-  string id = 1;
+  uint32 id = 1;
 }
 
 message Device {
-  // Required. Opaque saved-device ID. Stable for the life of the bond.
-  string id = 1;
+  // Required. Positive. Stable for the life of the bond and never reused.
+  uint32 id = 1;
   // Required.
   Transport transport = 2;
   // Best known name: the device-reported name, otherwise the name seen at pairing.
   string name = 3;
-  Kind kind = 4;
+  // What the device is, such as both a keyboard and a mouse. Empty when unknown. A client skips
+  // kinds it does not know.
+  repeated Kind kinds = 4;
   DeviceState state = 5;
   // The saved preferences set with SetDevice.
   bool enabled = 6;
@@ -350,17 +454,28 @@ message Device {
   bool paused = 9;
   // Missing when the Dongle will use this device. Otherwise why not.
   optional InactiveReason inactive = 10;
-  // The last failed connection attempt. Cleared by a successful connection.
+  // The last failed connection attempt while the device is enabled. Cleared by a successful
+  // connection, and missing once the device is disabled or the Dongle restarts.
   optional ErrorCode error = 11;
   // Link security while connected.
   Security security = 13;
-  // Every integration the device has been detected with or has a saved preference for.
+  // Every integration the device has a saved preference for or is detected with on the current
+  // link.
   repeated Integration integrations = 14;
-  // What the device reports about itself. A key whose value is unknown is left out.
+  // What the device reports about itself on the current connection. Empty while disconnected. A
+  // key whose value is unknown is left out.
   repeated Info info = 15;
-  // The kinds of input the device produces, learned from its HID descriptor. Empty until the
-  // descriptor has been read. A client skips roles it does not know.
+  // The kinds of input the device produces, learned from its HID descriptor and saved. Empty until
+  // the descriptor has first been read. A client skips roles it does not know.
   repeated Role roles = 16;
+  // The device's saved profile layers. A new device has none. Missing when the board has no
+  // profile support.
+  ProfileLayers profiles = 17;
+  // Set while the device is connected and its profiles are not loaded, so its input passes through
+  // unchanged: ERROR_CODE_NO_CAPACITY when they do not fit in what is left of
+  // ProfileSupport.memory_budget, or ERROR_CODE_STORAGE_FAILED when one could not be read or
+  // decoded.
+  optional ErrorCode profile_error = 18;
 }
 
 enum Role {
@@ -383,11 +498,12 @@ enum Transport {
 }
 
 enum Kind {
+  // A kind this client does not know.
   KIND_UNKNOWN = 0;
   KIND_KEYBOARD = 1;
   KIND_MOUSE = 2;
-  KIND_KEYBOARD_MOUSE = 3;
-  KIND_OTHER = 4;
+  // Known, and neither a keyboard nor a mouse.
+  KIND_OTHER = 3;
 }
 
 enum DeviceState {
@@ -412,17 +528,32 @@ enum InactiveReason {
   INACTIVE_REASON_TRANSPORT_DISABLED = 5;
 }
 
-// The device's current warnings. Responds with DeviceWarnings.
+// One page of the device's current warnings, in ascending order of service, report type, report
+// ID, bit offset, usage page, usage and code, a missing field ordering before any value. Responds
+// with DeviceWarnings.
 message ListWarnings {
   // Required.
-  string device = 1;
+  uint32 device = 1;
+  // The last warning received. Missing starts from the beginning.
+  DeviceWarning after = 2;
 }
 
+// One page of a device's warnings, paged as DeviceList.
 message DeviceWarnings {
   // Required.
-  string device = 1;
-  // Empty when the device has none. A reconnect replaces the previous connection's warnings.
+  uint32 device = 1;
+  // Empty when the device has none or is not connected.
   repeated DeviceWarning warnings = 2;
+  // Nothing follows the last warning.
+  bool end = 3;
+}
+
+// Changes to a device's warnings since they were last listed or reported.
+message WarningsChanged {
+  // Required.
+  uint32 device = 1;
+  repeated DeviceWarning added = 2;
+  repeated DeviceWarning removed = 3;
 }
 
 // One HID input or output the Dongle cannot translate or update. The device keeps working; only
@@ -521,8 +652,8 @@ message Version {
 }
 
 // Whether an integration is up on the device. Settings never report their own availability:
-// ListSettings shows what is known, and a settings event follows whenever an integration coming up
-// or going down changes that.
+// ListSettings shows what is known, and a settings_changed event follows whenever an integration
+// coming up or going down changes that.
 enum IntegrationState {
   // Turned off with SetDevice. Unknown states also read as this.
   INTEGRATION_STATE_OFF = 0;
@@ -552,24 +683,37 @@ message Info {
 // Settings
 // ---------------------------------------------------------------------------
 
-// Every setting the Dongle knows for the device, across all integrations: those read from the
-// device this boot, plus every saved value. Sends nothing to the device. The list grows or changes
-// as integrations come up, and a settings event follows each change. Responds with DeviceSettings.
+// One page of every setting the Dongle knows for the device, across all integrations: those read
+// from the device on the current connection, plus every saved value. In ascending order of
+// integration, then key compared bytewise. Sends nothing to the device. The list grows or changes
+// as integrations come up, and a settings_changed event follows each change. Responds with
+// DeviceSettings.
 message ListSettings {
   // Required.
-  string device = 1;
+  uint32 device = 1;
+  // The last setting received. Missing starts from the beginning.
+  SettingRef after = 2;
 }
 
-// Saves one or more values on the Dongle in one storage write, responds with the device's full
-// DeviceSettings, then re-applies every saved setting of each integration named in the request, as
-// it does when the device connects. If any change is
-// invalid or the save fails, nothing is saved and nothing is applied. A valid value is always
-// saved, whatever the device's current state; it stays SETTING_STATE_PENDING until an apply
-// writes it.
+// Identifies one setting of a device.
+message SettingRef {
+  // Required.
+  IntegrationKind integration = 1;
+  // Required.
+  string key = 2;
+}
+
+// Saves and forgets values on the Dongle in one storage write, responds with no result, then
+// re-applies every saved setting of each integration named in the request, as it does when the
+// device connects. A settings_changed event follows any change. If any change is invalid or the
+// save fails, nothing is saved and nothing is applied. A valid value is always saved, whatever the
+// device's current state; it stays SETTING_STATE_PENDING until an apply writes it. A forgotten
+// setting is never written to the device again; the device keeps whatever value it has.
 message SetSettings {
   // Required.
-  string device = 1;
-  // Required, at least one. Each setting appears at most once.
+  uint32 device = 1;
+  // Required, at least one. Applied in order; a later change to the same setting replaces an
+  // earlier one.
   repeated SettingChange changes = 2;
 }
 
@@ -578,32 +722,34 @@ message SettingChange {
   IntegrationKind integration = 1;
   // Required.
   string key = 2;
-  // Required. Must match the setting's type: bool, integer, text for enum and text settings, or
-  // color.
-  Value value = 3;
+  // Required.
+  oneof change {
+    // Save this value. Must match the setting's type: bool, integer, text for enum and text
+    // settings, or color.
+    Value value = 3;
+    // Remove the saved value. Forgetting a setting with no saved value is accepted.
+    SettingForget forget = 4;
+  }
 }
 
-// Removes one or more saved values in one storage write, responds with the device's full
-// DeviceSettings, then applies the remaining saved settings. A forgotten setting is never
-// written to the device again; the device keeps whatever value it has.
-message ForgetSettings {
-  // Required.
-  string device = 1;
-  // Required, at least one.
-  repeated SettingRef settings = 2;
-}
+message SettingForget {}
 
-message SettingRef {
-  // Required.
-  IntegrationKind integration = 1;
-  // Required.
-  string key = 2;
-}
-
+// One page of a device's settings, paged as DeviceList.
 message DeviceSettings {
   // Required.
-  string device = 1;
+  uint32 device = 1;
   repeated Setting settings = 2;
+  // Nothing follows the last setting.
+  bool end = 3;
+}
+
+// Changes to a device's settings: each setting that changed or appeared, with its current state,
+// and each one that went away.
+message SettingsChanged {
+  // Required.
+  uint32 device = 1;
+  repeated Setting changed = 2;
+  repeated SettingRef removed = 3;
 }
 
 // A value the Dongle can change on the device and save. Values the device only reports are Info.
@@ -625,9 +771,9 @@ message Setting {
   // missing when the Dongle leaves the setting alone. A client ignores a setting whose type it does
   // not know, which it sees as no type set.
   //
-  // value is current while the setting's integration is INTEGRATION_STATE_ACTIVE. In any other
-  // state it is the last reading, which a client shows as possibly out of date. It is missing when
-  // the Dongle has not read the setting since it started.
+  // value is current while the setting's integration is INTEGRATION_STATE_ACTIVE. While the
+  // device is connected in any other state it is the last reading, which a client shows as possibly
+  // out of date. It is missing when the setting has not been read on the current connection.
   oneof type {
     BoolSetting bool = 10;
     IntegerSetting integer = 11;
@@ -712,16 +858,274 @@ enum SettingState {
 }
 
 // ---------------------------------------------------------------------------
+// Profiles
+// ---------------------------------------------------------------------------
+
+// What the Dongle supports for profiles. Profile limits and capabilities are added here as
+// fields, never as profile fields on Status.
+message ProfileSupport {
+  // The inputs a remap rule can name: on/off controls such as keys, buttons and media keys.
+  repeated UsageRange remap_inputs = 1;
+  // The inputs a scale rule can name: relative values such as pointer motion and wheels, in the
+  // same form. No usage is in both remap_inputs and scale_inputs, or in both remap_outputs and
+  // scale_inputs.
+  repeated UsageRange scale_inputs = 2;
+  // The outputs a remap can produce. Each range names the application collection of the Dongle's
+  // USB report that carries it.
+  repeated UsageRange remap_outputs = 3;
+  // Bytes of memory for loaded profiles, shared by every connected device and configuration
+  // interface. A device whose layers do not fit in what is left loads none of them; see
+  // Device.profile_error. A profile larger than the whole budget cannot be saved.
+  uint32 memory_budget = 4;
+  // The most outputs one remap can hold, and the most outputs one held input produces after every
+  // layer has applied.
+  uint32 max_remap_outputs = 5;
+  // The most profiles one ProfileLayers can list, which bounds the layers each enabled device keeps
+  // in its resident reconnection entry.
+  uint32 max_layers = 6;
+  // Bytes of memory_budget in use by loaded profiles.
+  uint32 memory_used = 7;
+}
+
+// A contiguous range of HID usages on one usage page.
+message UsageRange {
+  // The HID application collection of the Dongle's USB report that carries the range, such as
+  // Generic Desktop Mouse. Set in ProfileSupport.remap_outputs and missing in input ranges.
+  Usage collection = 1;
+  // Required.
+  uint32 usage_page = 2;
+  // Inclusive.
+  uint32 min = 3;
+  // Required. Inclusive.
+  uint32 max = 4;
+}
+
+// One HID usage.
+message Usage {
+  // Required.
+  uint32 usage_page = 1;
+  // Required.
+  uint32 usage = 2;
+}
+
+// Profiles applied to input in order. Each profile sees the input as the profile before it left it:
+// an input another profile remapped arrives as each of its outputs. An empty list passes all input
+// through unchanged. A profile that does not exist returns ERROR_CODE_NOT_FOUND, and more than
+// ProfileSupport.max_layers profiles returns ERROR_CODE_BAD_ARGS. A profile may appear more than
+// once. A saved reference to a profile that no longer exists is skipped until it is changed or the
+// Dongle next starts and removes it.
+message ProfileLayers {
+  repeated uint32 profiles = 1;
+}
+
+// One page of saved profiles in ascending ID order. Responds with ProfileList.
+message ListProfiles {
+  // The ID of the last entry received. 0 starts from the beginning.
+  uint32 after = 1;
+}
+
+// One page of saved profiles, paged as DeviceList.
+message ProfileList {
+  reserved 1, 2, 3;
+  reserved "profiles", "next", "unreadable";
+  repeated ProfileListEntry entries = 4;
+  // Nothing follows the last entry.
+  bool end = 5;
+}
+
+message ProfileListEntry {
+  // Required.
+  oneof entry {
+    Profile profile = 1;
+    // The ID of a profile whose saved record could not be read from flash. The listing continues
+    // past it. An undecodable record is removed as lost and is not listed.
+    uint32 unreadable = 2;
+  }
+}
+
+// Responds with Profile.
+message GetProfile {
+  // Required.
+  uint32 profile = 1;
+}
+
+// Creates an empty profile: it passes every input through unchanged. Responds with ProfileCreated
+// once saved; a profile event follows. The profile is not used by any device or configuration
+// interface.
+message CreateProfile {
+  // Required. 1..64 UTF-8 bytes without control characters.
+  string name = 1;
+}
+
+// Copies a profile's rules into a new, independent profile. Responds with ProfileCreated once
+// saved; a profile event follows. The copy is not used by any device or configuration
+// interface.
+message CopyProfile {
+  // Required. The source profile.
+  uint32 profile = 1;
+  // Required. 1..64 UTF-8 bytes without control characters.
+  string name = 2;
+}
+
+// Deletes a profile with its rules. Responds with no result; profile_removed follows. A profile
+// in any saved device's layers, or selected by a configuration interface, enabled or not, returns
+// ERROR_CODE_IN_USE.
+message DeleteProfile {
+  // Required.
+  uint32 profile = 1;
+}
+
+// The profile CreateProfile or CopyProfile saved.
+message ProfileCreated {
+  // Required. The new profile's ID.
+  uint32 profile = 1;
+}
+
+message ProfileRemoved {
+  // Required.
+  uint32 id = 1;
+}
+
+message Profile {
+  // Required. Positive. Never reused. Profile IDs are separate from device IDs.
+  uint32 id = 1;
+  // Required. 1..64 UTF-8 bytes without control characters.
+  string name = 2;
+  // The kinds of input the profile's rules change, worked out by the Dongle whenever the rules
+  // change, so a client can label the profile without reading its rules. A client skips roles it
+  // does not know.
+  repeated Role roles = 3;
+}
+
+// One page of the profile's rules, in ascending usage page and usage order of their inputs.
+// Responds with ProfileRules.
+message ListProfileRules {
+  // Required.
+  uint32 profile = 1;
+  // The input of the last rule received. Missing starts from the beginning.
+  Usage after = 2;
+}
+
+// Saves and forgets rules in one storage write and responds with no result; a profile_rules_changed
+// event follows when any rule changed. A saved rule replaces the profile's rule for the same input.
+// A rule that remaps the input to only itself, in the collection of the report that carries it, or
+// scales it by a ratio equal to 1 is forgotten instead. Every device using the profile uses the new
+// rules from its next input; a held input keeps the outputs it was pressed with until it is
+// released. If any change is invalid or the save fails, nothing is saved. A save that would make
+// the profile larger than ProfileSupport.memory_budget, or grow a loaded profile beyond what is
+// left of it, returns ERROR_CODE_NO_CAPACITY with CAPACITY_REASON_PROFILE_MEMORY.
+message SetProfileRules {
+  // Required.
+  uint32 profile = 1;
+  // Required, at least one. Applied in order; a later change for the same input replaces an earlier
+  // one.
+  repeated ProfileRuleChange changes = 2;
+}
+
+message ProfileRuleChange {
+  // Required.
+  oneof change {
+    // Save this rule.
+    ProfileRule rule = 1;
+    // Remove the rule for this input, so the input passes through unchanged. Forgetting a rule that
+    // does not exist is accepted.
+    ProfileRuleRef forget = 2;
+  }
+}
+
+message ProfileRuleRef {
+  reserved 2;
+  reserved "collection";
+  // Required.
+  Usage input = 1;
+}
+
+// One page of a profile's rules, paged as DeviceList.
+message ProfileRules {
+  // Required.
+  uint32 profile = 1;
+  // In ascending usage page and usage order of their inputs.
+  repeated ProfileRule rules = 2;
+  // Nothing follows the last rule.
+  bool end = 3;
+}
+
+// Changes to a profile's rules: each rule that changed or appeared, and the input of each one that
+// went away.
+message ProfileRulesChanged {
+  // Required.
+  uint32 profile = 1;
+  repeated ProfileRule changed = 2;
+  repeated Usage removed = 3;
+}
+
+// What one input does while the profile is applied. A profile has at most one rule for each input.
+message ProfileRule {
+  reserved 2;
+  reserved "collection";
+  // Required. Within ProfileSupport.remap_inputs for a remap or scale_inputs for a scale.
+  Usage input = 1;
+  // Required.
+  oneof effect {
+    Remap remap = 3;
+    Scale scale = 4;
+  }
+
+  // Fixed outputs, all held together for as long as the input is held. No outputs disables the
+  // input. A keyboard modifier is an output like any other key. A remap applies when the device
+  // reports the input as a held control; other forms of the same usage keep their usual behavior.
+  message Remap {
+    // Each within ProfileSupport.remap_outputs, at most max_remap_outputs, each at most once.
+    repeated Output outputs = 1;
+  }
+
+  message Output {
+    // Required.
+    Usage usage = 1;
+    // The application collection of the Dongle's USB report that carries the output. Missing in a
+    // request selects the only report that carries the usage; when several do, it returns
+    // ERROR_CODE_BAD_ARGS. The Dongle saves and reports the selected collection.
+    Usage collection = 2;
+  }
+
+  // Multiplies a relative value by numerator / denominator. A negative numerator inverts it.
+  // Scales from several layers multiply into one ratio, applied once. The Dongle keeps the
+  // fractional remainder per connection and input, resets it when the ratio changes, and limits a
+  // result too large for the USB report to the largest value it carries.
+  message Scale {
+    // Required. Nonzero.
+    sint32 numerator = 1;
+    // Required. Positive.
+    uint32 denominator = 2;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Development only. Production firmware answers these with ERROR_CODE_UNKNOWN_COMMAND.
 // ---------------------------------------------------------------------------
 
+// One page of the device's feature tables, in ascending order of integration, then index within
+// the integration's table. Responds with FeatureList.
 message ListFeatures {
   // Required.
-  string device = 1;
+  uint32 device = 1;
+  // The last feature received. Missing starts from the beginning.
+  FeatureRef after = 2;
 }
 
+// Identifies one entry in a device's feature table.
+message FeatureRef {
+  // Required.
+  IntegrationKind integration = 1;
+  // The entry's index in the integration's table.
+  uint32 index = 2;
+}
+
+// One page of a device's features, paged as DeviceList.
 message FeatureList {
   repeated Feature features = 1;
+  // Nothing follows the last feature.
+  bool end = 2;
 }
 
 // One entry in a device's feature table, for any integration.
@@ -744,13 +1148,20 @@ message HidppFeature {
   uint32 flags = 4;
 }
 
+// One page of a directory's entries, in ascending order of name compared bytewise. Responds with
+// FileList.
 message ListFiles {
   // Required. Absolute path.
   string path = 1;
+  // The name of the last entry received. "" starts from the beginning.
+  string after = 2;
 }
 
+// One page of a directory's entries, paged as DeviceList.
 message FileList {
   repeated FileEntry entries = 1;
+  // Nothing follows the last entry.
+  bool end = 2;
 }
 
 message FileEntry {
@@ -790,16 +1201,17 @@ enum ErrorCode {
   ERROR_CODE_BAD_ARGS = 3;         // Missing Required field, wrong value type, or out of range.
   ERROR_CODE_TOO_LONG = 4;         // The frame exceeded 1024 bytes.
   ERROR_CODE_NOT_READY = 5;        // Bluetooth or storage has not started, or failed to start.
-  ERROR_CODE_NOT_FOUND = 6;        // No device, candidate, setting or file with that ID or key.
+  ERROR_CODE_NOT_FOUND = 6;        // No such device, candidate, profile, setting or file.
   ERROR_CODE_NOT_CONNECTED = 7;    // The command needs a connected device.
   ERROR_CODE_BUSY = 8;             // A pairing is running, or the device is doing something that conflicts.
   ERROR_CODE_DISABLED = 9;
   ERROR_CODE_BLOCKED = 10;
-  ERROR_CODE_UNSUPPORTED = 11;     // Transport, setting or value not supported by this firmware or device.
+  ERROR_CODE_UNSUPPORTED = 11;     // Transport, interface, setting or value not supported.
   ERROR_CODE_NO_CAPACITY = 12;     // See Error.reason.
   ERROR_CODE_NO_PROMPT = 13;       // AcceptPrompt or RejectPrompt with no open prompt.
   ERROR_CODE_STORAGE_FAILED = 14;  // Reading or writing saved data failed. See Error.outcome_unknown.
   ERROR_CODE_INTERNAL = 15;
+  ERROR_CODE_IN_USE = 16;          // A saved preference refers to the profile.
 
   // Pairing and connection failures.
   ERROR_CODE_CANDIDATE_EXPIRED = 30;
@@ -827,4 +1239,6 @@ enum CapacityReason {
   CAPACITY_REASON_STORAGE = 2;
   // The connection table is full.
   CAPACITY_REASON_CONNECTIONS = 3;
+  // The profile would be larger than ProfileSupport.memory_budget.
+  CAPACITY_REASON_PROFILE_MEMORY = 4;
 }

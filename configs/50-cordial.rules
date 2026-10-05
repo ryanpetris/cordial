@@ -1,0 +1,4 @@
+# Gives the signed-in local user access to Cordial adapters: the serial port used by Cordial and
+# the Raw HID interface used by VIA and Vial.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="c0d1", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="c0d1", TAG+="uaccess"

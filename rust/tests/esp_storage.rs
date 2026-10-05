@@ -87,15 +87,12 @@ fn open() -> Result<adapter::Storage, Error> {
 fn common_filesystem_uses_only_application_partitions() {
     FLASH.with_borrow_mut(|f| f[..4096].fill(0x42));
     let mut fs = open().unwrap();
-    fs.replace_file(
-        "/devices/0000000000000001/device.json",
-        b"{\"name\":\"keyboard\"}",
-    )
-    .unwrap();
+    fs.replace_file("/devices/1/device.json", b"{\"name\":\"keyboard\"}")
+        .unwrap();
     let mut fs = open().unwrap();
     let mut bytes = [0; 100];
     let n = fs
-        .read_file("/devices/0000000000000001/device.json", 0, &mut bytes)
+        .read_file("/devices/1/device.json", 0, &mut bytes)
         .unwrap();
     assert_eq!(&bytes[..n], b"{\"name\":\"keyboard\"}");
     FLASH.with_borrow(|f| assert!(f[..4096].iter().all(|b| *b == 0x42)));

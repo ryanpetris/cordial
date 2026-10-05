@@ -1,16 +1,22 @@
 //! Application-owned policy and live links. Bluetooth adapters own security and
 //! vendor procedures; this module owns admission, persistence and HID forwarding.
+//!
+//! Only enabled devices the Bluetooth stack has room for are resident, as reconnection entries.
+//! A connected device's policy, settings, readings and warnings live with its connection. Every
+//! other saved device is read from flash when a command needs it.
 use crate::model::{
     errors::ErrorCode as Error,
-    identifiers::{ConnectionState as State, DeviceId, HostPlatform, Transport},
+    identifiers::{ConnectionState as State, HostPlatform, Transport},
 };
 use crate::{
     bluetooth::{Bluetooth, Capabilities, ConnectionSecurity, Descriptor, Layout},
     devices::{
-        ACTIVE_CONNECTIONS, AdapterPreference, Device, Peer, Policies, Policy, Setup, Transports,
+        ACTIVE_CONNECTIONS, AdapterPreference, Device, Live, Peer, Policies, Policy, Setup,
+        Transports,
     },
     forward::Forwarder,
     link::{Link, LinkId, Profile},
+    profiles::{self, LoadError},
     storage::{Preferences, RecordStore},
 };
 use alloc::{boxed::Box, vec::Vec};
@@ -28,12 +34,27 @@ pub struct Connection {
     pub setup_failed: bool,
     /// The `layouts::maps` fingerprint of the layout the link uses, when known.
     pub maps: Option<u64>,
+    /// A discovered layout to save once the connection forwards input.
+    pub layout: Option<Layout>,
+    /// While a connected link has forwarded no input: when background storage work goes ahead
+    /// anyway.
+    pub starting: Option<u64>,
 }
 
+/// Saved device IDs read from flash one page at a time.
+const SCAN_PAGE: usize = 16;
+/// How long background storage work, including reading a connected device's policy and
+/// preferences, waits for a new connection's first input before going ahead.
+pub const FIRST_INPUT_WAIT_MS: u64 = 1000;
+
 pub struct Manager {
+    /// Resident reconnection entries.
     pub devices: Vec<Option<Device>>,
     pub connections: [Option<Connection>; ACTIVE_CONNECTIONS],
     pub forward: Forwarder,
+    pub profiles: profiles::Cache,
+    /// Bytes of memory for loaded profiles, or `None` on a board without profile support.
+    pub profile_budget: Option<usize>,
     pub preference: AdapterPreference,
     pub storage_ready: bool,
     pub write_uncertain: bool,
@@ -45,7 +66,18 @@ pub struct Manager {
     native_limits: [usize; 2],
     pending_device: Option<u64>,
     /// Devices deleted because their saved record was lost, not yet reported.
-    pub removed: Vec<DeviceId>,
+    pub removed: Vec<u64>,
+    /// Devices whose record changed without a command, such as becoming resident, not yet
+    /// reported.
+    pub changed: Vec<u64>,
+    /// Profiles found undecodable, to delete once no connection is starting.
+    pub lost_profiles: Vec<u64>,
+    /// Undecodable device records startup could not remove, to remove in the background.
+    pub lost_devices: Vec<u64>,
+    /// A resident entry left, so another enabled device may now fit in the stack.
+    pub vacated: bool,
+    /// The stack's bonds may differ from the resident entries until they are synced again.
+    pub bonds_pending: bool,
 }
 impl Default for Manager {
     fn default() -> Self {
@@ -53,6 +85,8 @@ impl Default for Manager {
             devices: Vec::new(),
             connections: core::array::from_fn(|_| None),
             forward: Forwarder::default(),
+            profiles: profiles::Cache::default(),
+            profile_budget: None,
             preference: AdapterPreference::default(),
             storage_ready: false,
             write_uncertain: false,
@@ -67,12 +101,62 @@ impl Default for Manager {
             native_limits: [0; 2],
             pending_device: None,
             removed: Vec::new(),
+            changed: Vec::new(),
+            lost_profiles: Vec::new(),
+            lost_devices: Vec::new(),
+            vacated: false,
+            bonds_pending: false,
+        }
+    }
+}
+fn kind(transport: Transport) -> usize {
+    usize::from(transport == Transport::Ble)
+}
+/// Every saved profile ID.
+async fn profile_ids<S: RecordStore>(store: &mut S) -> Result<Vec<u64>, Error> {
+    let mut ids = Vec::new();
+    loop {
+        let page = store
+            .record_ids(
+                profiles::METADATA,
+                ids.last().copied().unwrap_or(0),
+                SCAN_PAGE,
+            )
+            .await
+            .map_err(|_| Error::StorageFailed)?;
+        let done = page.len() < SCAN_PAGE;
+        ids.try_reserve(page.len()).map_err(|_| Error::Capacity)?;
+        ids.extend(page);
+        if done {
+            return Ok(ids);
         }
     }
 }
 impl Manager {
+    /// Whether the board supports profiles.
+    pub fn profiles_supported(&self) -> bool {
+        self.profile_budget.is_some()
+    }
+    /// Whether a saved device belongs in the resident set, given room in the stack.
+    pub fn eligible(&self, policy: &Policy) -> bool {
+        self.effective(self.caps).supports(policy.peer.transport)
+            && policy.enabled
+            && !policy.blocked
+    }
+    fn resident(&self, transport: Transport) -> usize {
+        self.devices
+            .iter()
+            .flatten()
+            .filter(|d| d.peer.transport == transport && !d.retiring)
+            .count()
+    }
+    /// Whether another device of `transport` fits in the stack.
+    pub fn room(&self, transport: Transport) -> bool {
+        self.resident(transport) < self.max_enabled(transport)
+    }
+
     /// Load complete records before publishing readiness or admitting a peer.
-    /// Load each document separately; never format a failed store here. A
+    /// Read each document separately; never format a failed store here. A
     /// device whose record is missing, undecodable or does not match its bond
     /// is deleted; a read error fails the load and deletes nothing.
     pub async fn load<S: RecordStore, B: Bluetooth>(
@@ -85,97 +169,212 @@ impl Manager {
         }
         self.storage_ready = false;
         self.write_uncertain = false;
+        self.removed.clear();
+        self.changed.clear();
+        self.lost_profiles.clear();
+        self.lost_devices.clear();
         crate::storage::open(store)
             .await
             .map_err(|_| Error::StorageFailed)?;
-        let preference = Policies { store }
+        self.preference = Policies { store }
             .load_adapter()
             .await
             .map_err(|_| Error::StorageFailed)?;
-        let mut devices: Vec<Option<Device>> = Vec::new();
         self.caps = radio.capabilities();
         self.native_limits = [
             radio.bond_capacity(Transport::Classic),
             radio.bond_capacity(Transport::Ble),
         ];
+        let existing = profile_ids(store).await?;
+        self.clear_interfaces(store, &existing).await;
+        self.devices = Vec::new();
+        self.profiles = profiles::Cache::default();
+        // Startup reads every saved policy once: it deletes lost records, removes references to
+        // profiles that no longer exist, and keeps entries for the devices that fit.
+        let mut peers: Vec<Peer> = Vec::new();
         let mut lost = Vec::new();
-        let mut stale_preferences = Vec::new();
-        let mut previous = None;
-        while let Some(key) = store
-            .next_key(previous)
-            .await
-            .map_err(|_| Error::StorageFailed)?
-        {
-            previous = Some(key);
-            let id = u64::from_be_bytes(key[1..].try_into().unwrap());
-            // Keys come in order, so every device record is read before any preferences.
-            // Preferences whose device is gone are what an interrupted delete left.
-            if key[0] == 4
-                && !lost.contains(&id)
-                && !devices.iter().flatten().any(|d| d.policy.id == id)
-            {
-                stale_preferences.push(id);
-            }
-            if key[0] != 2 {
-                continue;
-            }
-            let Some(bytes) = store
-                .load_owned(key)
-                .await
-                .map_err(|_| Error::StorageFailed)?
-            else {
-                continue;
-            };
-            let Some(policy) = crate::bonds::decode(id, &bytes) else {
-                lost.push(id);
-                continue;
-            };
-            // Records load in ID order; a later record for the same peer is the
-            // corrupt one.
-            if devices
-                .iter()
-                .flatten()
-                .any(|d| d.policy.peer == policy.peer)
-            {
-                lost.push(id);
-                continue;
-            }
-            let preferences = match (Preferences { store, device: id }).load_all().await {
-                Ok(p) => p,
-                Err(crate::storage::Error::Corrupt) => {
-                    stale_preferences.push(id);
-                    Vec::new()
-                }
-                Err(_) => return Err(Error::StorageFailed),
-            };
-            let mut device = Device::new(policy);
-            if device.catalog.restore_preferences(preferences).is_err() {
-                stale_preferences.push(id);
-            }
-            devices.try_reserve(1).map_err(|_| Error::Capacity)?;
-            devices.push(Some(device));
-        }
-        for id in lost {
-            Policies { store }
-                .remove(0, id)
+        let mut after = 0;
+        loop {
+            let ids = store
+                .record_ids(2, after, SCAN_PAGE)
                 .await
                 .map_err(|_| Error::StorageFailed)?;
+            for &id in &ids {
+                after = id;
+                let Some(bytes) = store
+                    .load_owned(crate::storage::record_key(2, id))
+                    .await
+                    .map_err(|_| Error::StorageFailed)?
+                else {
+                    continue;
+                };
+                let Some(mut policy) = crate::bonds::decode(id, &bytes) else {
+                    lost.push(id);
+                    continue;
+                };
+                // Records load in ID order; a later record for the same peer is the corrupt one.
+                if peers.contains(&policy.peer) {
+                    lost.push(id);
+                    continue;
+                }
+                peers.try_reserve(1).map_err(|_| Error::Capacity)?;
+                peers.push(policy.peer);
+                // A reference that cannot be removed now is skipped, and removed again at the
+                // next startup.
+                if policy.profiles.iter().any(|p| !existing.contains(p)) {
+                    policy.profiles.retain(|p| existing.contains(p));
+                    let _ = Policies { store }.save(&policy).await;
+                }
+                if self.eligible(&policy) && self.room(policy.peer.transport) {
+                    self.add(&policy)?;
+                }
+            }
+            if ids.len() < SCAN_PAGE {
+                break;
+            }
         }
-        // Stale preferences are ignored, so a failed removal is retried at the next start.
-        for id in stale_preferences {
-            let _ = store.remove(crate::storage::record_key(4, id)).await;
+        // A lost record that cannot be removed now stays out of the model and is removed again in
+        // the background.
+        for id in lost {
+            if (Policies { store }).remove(id).await.is_err() {
+                self.lost_devices.push(id);
+            }
         }
         // The transports in use follow the saved preference. A failure leaves storage not
         // ready, so the next Ready loads and applies it again.
-        self.preference = preference;
         self.apply_transports(radio)?;
-        self.devices = devices;
-        self.refresh_enabled();
         self.sync_bonds(store, radio).await?;
         self.pending_device = None;
         self.available_bytes = store.available().await.map_err(|_| Error::StorageFailed)?;
         self.storage_ready = true;
         Ok(())
+    }
+    /// Clears and disables every configuration interface whose profile no longer exists. When the
+    /// change cannot be saved, it applies until the next startup removes the reference again.
+    async fn clear_interfaces<S: RecordStore>(&mut self, store: &mut S, existing: &[u64]) {
+        let mut preference = self.preference.clone();
+        for entry in &mut preference.configuration_interfaces {
+            if entry.profile.is_some_and(|id| !existing.contains(&id)) {
+                entry.profile = None;
+                entry.enabled = false;
+            }
+        }
+        preference
+            .configuration_interfaces
+            .retain(|p| p.enabled || p.profile.is_some());
+        if preference != self.preference {
+            let _ = Policies { store }.save_adapter(&preference).await;
+            self.preference = preference;
+        }
+    }
+    fn add(&mut self, policy: &Policy) -> Result<usize, Error> {
+        let device = Device::new(policy);
+        if let Some(slot) = self.devices.iter().position(Option::is_none) {
+            self.devices[slot] = Some(device);
+            return Ok(slot);
+        }
+        self.devices.try_reserve(1).map_err(|_| Error::Capacity)?;
+        self.devices.push(Some(device));
+        Ok(self.devices.len() - 1)
+    }
+    /// Removes a resident entry without a link.
+    fn drop_entry(&mut self, slot: usize) {
+        if self.devices.get_mut(slot).and_then(Option::take).is_some() {
+            self.vacated = true;
+        }
+    }
+    /// Makes resident the enabled devices that now fit in the stack, lowest IDs first, and
+    /// retires entries whose link has closed. Returns whether the resident set changed.
+    /// A failure leaves the work to the next fill.
+    pub async fn fill<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+    ) -> Result<bool, Error> {
+        let result = self.fill_entries(store, radio).await;
+        if result.is_err() {
+            self.vacated = true;
+        }
+        result
+    }
+    async fn fill_entries<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+    ) -> Result<bool, Error> {
+        let mut changed = self.retire();
+        if self.has_room() {
+            let mut after = 0;
+            loop {
+                let ids = store
+                    .record_ids(2, after, SCAN_PAGE)
+                    .await
+                    .map_err(|_| Error::StorageFailed)?;
+                for &id in &ids {
+                    after = id;
+                    changed |= self.fill_record(id, store).await?;
+                }
+                if ids.len() < SCAN_PAGE {
+                    break;
+                }
+            }
+        }
+        if changed {
+            self.bonds_pending = true;
+            self.sync_bonds(store, radio).await?;
+        }
+        Ok(changed)
+    }
+    /// Drops the entries of retiring devices whose link has closed, the first part of a fill.
+    /// Returns whether any left.
+    pub fn retire(&mut self) -> bool {
+        let mut changed = false;
+        for slot in 0..self.devices.len() {
+            if self.devices[slot]
+                .as_ref()
+                .is_some_and(|d| d.retiring && self.link_for(slot).is_none())
+            {
+                let id = self.devices[slot].as_ref().unwrap().id;
+                self.drop_entry(slot);
+                self.changed.push(id);
+                changed = true;
+            }
+        }
+        self.vacated = false;
+        changed
+    }
+    /// Whether the stack has room for another device of a transport in use.
+    pub fn has_room(&self) -> bool {
+        Transports::ALL
+            .into_iter()
+            .any(|t| self.effective(self.caps).supports(t) && self.room(t))
+    }
+    /// Reads saved device `id` and makes it resident when it is enabled and fits. Returns whether
+    /// it became resident.
+    pub async fn fill_record<S: RecordStore>(
+        &mut self,
+        id: u64,
+        store: &mut S,
+    ) -> Result<bool, Error> {
+        if self.find(id).is_some() {
+            return Ok(false);
+        }
+        let policy = match (Policies { store }).load(id).await {
+            Ok(policy) => policy,
+            Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
+                return Ok(false);
+            }
+            Err(_) => return Err(Error::StorageFailed),
+        };
+        if self.eligible(&policy)
+            && self.room(policy.peer.transport)
+            && self.peer(policy.peer).is_none()
+        {
+            self.add(&policy)?;
+            self.changed.push(id);
+            return Ok(true);
+        }
+        Ok(false)
     }
     /// Applies the saved enabled transports to every transport the radio supports.
     pub fn apply_transports<B: Bluetooth>(&self, radio: &mut B) -> Result<(), Error> {
@@ -198,74 +397,42 @@ impl Manager {
             ..caps
         }
     }
-    pub fn refresh_enabled(&mut self) {
+    /// Whether the radio supports `transport`, enabled or not.
+    pub fn supports(&self, transport: Transport) -> bool {
+        self.caps.supports(transport)
+    }
+    /// Retires the entries of devices whose transport is now disabled. Their links close first.
+    pub fn retire_disabled_transports(&mut self) {
         let caps = self.effective(self.caps);
-        let eligible = |d: &Device| {
-            caps.supports(d.policy.peer.transport)
-                && d.policy.enabled
-                && !d.policy.blocked
-                && !d.policy.deleting
-        };
-        // Keep current selections; repairing another preferred record must not
-        // evict a working device. Startup records are sorted by stable ID.
-        let mut used = [0usize; 2];
-        for d in self.devices.iter_mut().flatten() {
-            let kind =
-                usize::from(d.policy.peer.transport == crate::model::identifiers::Transport::Ble);
-            d.transport_supported = self.caps.supports(d.policy.peer.transport);
-            d.transport_disabled = d.transport_supported && !caps.supports(d.policy.peer.transport);
-            d.effective_enabled = d.effective_enabled
-                && eligible(d)
-                && used[kind] < self.native_limits[kind].saturating_sub(1);
-            used[kind] += usize::from(d.effective_enabled);
-        }
-        loop {
-            let next = self
-                .devices
-                .iter()
-                .enumerate()
-                .filter_map(|(slot, d)| d.as_ref().map(|d| (slot, d)))
-                .filter(|(_, d)| {
-                    !d.effective_enabled
-                        && eligible(d)
-                        && used[usize::from(
-                            d.policy.peer.transport == crate::model::identifiers::Transport::Ble,
-                        )] < self.native_limits[usize::from(
-                            d.policy.peer.transport == crate::model::identifiers::Transport::Ble,
-                        )]
-                        .saturating_sub(1)
-                })
-                .min_by_key(|(_, d)| d.policy.id)
-                .map(|(slot, _)| slot);
-            let Some(slot) = next else {
-                break;
+        for slot in 0..self.devices.len() {
+            let Some(d) = self.devices[slot].as_mut() else {
+                continue;
             };
-            let d = self.devices[slot].as_mut().unwrap();
-            d.effective_enabled = true;
-            used[usize::from(
-                d.policy.peer.transport == crate::model::identifiers::Transport::Ble,
-            )] += 1;
+            if !caps.supports(d.peer.transport) {
+                d.retiring = true;
+                self.vacated = true;
+            }
         }
     }
     /// How many devices of `transport` can be enabled at once: the native bond
     /// table less the entry kept free for pairing.
     pub fn max_enabled(&self, transport: Transport) -> usize {
-        self.native_limits[usize::from(transport == Transport::Ble)].saturating_sub(1)
+        self.native_limits[kind(transport)].saturating_sub(1)
     }
     /// No room to save another device.
     pub fn storage_full(&self) -> bool {
         self.available_bytes < crate::bonds::MAINTENANCE_BYTES + crate::bonds::PAIR_BYTES
     }
-    pub fn find(&self, id: &DeviceId) -> Result<usize, Error> {
+    /// The slot of resident device `id`.
+    pub fn find(&self, id: u64) -> Option<usize> {
         self.devices
             .iter()
-            .position(|d| d.as_ref().is_some_and(|d| d.policy.device_id() == *id))
-            .ok_or(Error::NotFound)
+            .position(|d| d.as_ref().is_some_and(|d| d.id == id))
     }
     pub fn peer(&self, peer: Peer) -> Option<usize> {
         self.devices
             .iter()
-            .position(|d| d.as_ref().is_some_and(|d| d.policy.peer == peer))
+            .position(|d| d.as_ref().is_some_and(|d| d.peer == peer))
     }
     pub fn connection(&self, id: LinkId) -> Option<&Connection> {
         self.connections
@@ -316,6 +483,8 @@ impl Manager {
             deadline,
             setup_failed: false,
             maps: None,
+            layout: None,
+            starting: None,
         });
         Ok(id)
     }
@@ -340,20 +509,14 @@ impl Manager {
             .get_mut(device)
             .and_then(Option::as_mut)
             .ok_or(Error::NotFound)?;
-        if !caps.supports(d.policy.peer.transport) {
+        if !caps.supports(d.peer.transport) {
             return Err(Error::UnsupportedTransport);
         }
-        if !d.policy.enabled {
+        if d.retiring || d.deleting {
             return Err(Error::Disabled);
         }
-        if d.policy.blocked {
-            return Err(Error::Blocked);
-        }
-        if !d.effective_enabled {
-            return Err(Error::Capacity);
-        }
         if explicit {
-            d.explicit_connect()?;
+            d.explicit_connect();
         }
         if d.state == State::Connected {
             return Ok(None);
@@ -364,7 +527,7 @@ impl Manager {
         if d.state != State::Disconnected {
             return Err(Error::Busy);
         }
-        let peer = d.policy.peer;
+        let peer = d.peer;
         let id = self.allocate(peer, Some(device), deadline)?;
         if let Err(error) = radio.connect(id, peer, false, layout) {
             self.connections[id.slot as usize] = None;
@@ -389,24 +552,11 @@ impl Manager {
         if !self.capabilities(radio).supports(peer.transport) {
             return Err(Error::UnsupportedTransport);
         }
-        if self.native_limits
-            [usize::from(peer.transport == crate::model::identifiers::Transport::Ble)]
-            == 0
-        {
+        if self.native_limits[kind(peer.transport)] == 0 {
             return Err(Error::UnsupportedTransport);
         }
         if self.storage_full() {
             return Err(Error::StorageFull);
-        }
-        if self.devices.iter().all(Option::is_some) {
-            self.devices.try_reserve(1).map_err(|_| Error::Capacity)?;
-            self.devices.push(None);
-        }
-        if let Some(slot) = self.peer(peer) {
-            let d = self.devices[slot].as_ref().unwrap();
-            if d.policy.blocked {
-                return Err(Error::Blocked);
-            }
         }
         if self
             .connections
@@ -432,74 +582,88 @@ impl Manager {
         radio: &mut B,
     ) -> Result<(), Error> {
         for peer in radio.bonds().await? {
-            if !self
-                .devices
-                .iter()
-                .flatten()
-                .any(|d| d.effective_enabled && d.policy.peer == peer)
-                && !self.connections.iter().flatten().any(|c| c.peer == peer)
-            {
-                radio.forget(peer).await?;
-            }
+            self.forget_stale(peer, radio).await?;
         }
         let mut slot = 0;
-        while slot < self.devices.len() {
-            let Some(d) = self.devices[slot].as_ref().filter(|d| d.effective_enabled) else {
-                slot += 1;
-                continue;
-            };
-            let id = d.policy.id;
-            match crate::bonds::load(store, d.policy.bond).await {
-                Ok(Some(bond))
-                    if bond.valid() && bond.owner == id && bond.identity == d.policy.peer =>
-                {
-                    radio.import_bond(&bond).await?;
-                }
-                Ok(_) | Err(crate::storage::Error::Corrupt) => {
-                    self.lose(slot, store, radio).await?;
-                    // Losing a device can promote one at an earlier slot; import it too.
-                    slot = 0;
-                    continue;
-                }
-                Err(_) => return Err(Error::StorageFailed),
-            }
-            slot += 1;
+        while let Some(next) = self.next_resident(slot) {
+            self.import(next, store, radio).await?;
+            slot = next + 1;
         }
+        self.bonds_pending = false;
         Ok(())
     }
-    /// Deletes a device whose saved record was lost, as an unpair would, and
-    /// queues its removal for the client.
-    pub async fn lose<S: RecordStore, B: Bluetooth>(
+    /// Removes `peer`'s bond from the stack unless a resident entry or a link uses it.
+    pub async fn forget_stale<B: Bluetooth>(&self, peer: Peer, radio: &mut B) -> Result<(), Error> {
+        if self
+            .devices
+            .iter()
+            .flatten()
+            .any(|d| !d.retiring && d.peer == peer)
+            || self.connections.iter().flatten().any(|c| c.peer == peer)
+        {
+            return Ok(());
+        }
+        radio.forget(peer).await
+    }
+    /// The first slot from `slot` on that holds a resident entry that is not retiring.
+    pub fn next_resident(&self, slot: usize) -> Option<usize> {
+        (slot..self.devices.len()).find(|&s| self.devices[s].as_ref().is_some_and(|d| !d.retiring))
+    }
+    /// Loads the saved bond of the resident entry in `slot` into the stack. A device whose record
+    /// turns out to be lost is deleted.
+    pub async fn import<S: RecordStore, B: Bluetooth>(
         &mut self,
         slot: usize,
         store: &mut S,
         radio: &mut B,
     ) -> Result<(), Error> {
-        let Some(d) = self.devices[slot].take() else {
+        let Some((id, peer)) = self.devices[slot].as_ref().map(|d| (d.id, d.peer)) else {
             return Ok(());
         };
-        if let Some(id) = self.link_for(slot) {
-            self.forward.remove(id.slot as usize);
-            radio.disconnect(id);
-            if let Some(c) = self.connection_mut(id) {
-                c.device = None;
-                c.closing = true;
+        match crate::bonds::load(store, id).await {
+            Ok(Some(bond)) if bond.valid() && bond.owner == id && bond.identity == peer => {
+                radio.import_bond(&bond).await
             }
+            Ok(_) | Err(crate::storage::Error::Corrupt) => self.lose(id, store, radio).await,
+            Err(_) => Err(Error::StorageFailed),
+        }
+    }
+    /// Deletes a device whose saved record was lost, as an unpair would, and
+    /// queues its removal for the client.
+    pub async fn lose<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u64,
+        store: &mut S,
+        radio: &mut B,
+    ) -> Result<(), Error> {
+        let mut peer = None;
+        if let Some(slot) = self.find(id) {
+            if let Some(link) = self.link_for(slot) {
+                self.forward.remove(link.slot as usize);
+                radio.disconnect(link);
+                if let Some(c) = self.connection_mut(link) {
+                    c.device = None;
+                    c.closing = true;
+                }
+            }
+            peer = self.devices[slot].as_ref().map(|d| d.peer);
+            self.drop_entry(slot);
         }
         // The device leaves the model whether or not cleanup succeeds; a record left on flash is
         // deleted again at the next startup.
-        let removal = Policies { store }.remove(slot, d.policy.id).await;
-        let result = match removal {
-            Err(_) => Err(Error::StorageFailed),
-            Ok(()) if radio.capabilities().supports(d.policy.peer.transport) => {
-                radio.forget(d.policy.peer).await
+        let removal = Policies { store }.remove(id).await;
+        let result = match (removal, peer) {
+            (Err(_), _) => Err(Error::StorageFailed),
+            (Ok(()), Some(peer)) if radio.capabilities().supports(peer.transport) => {
+                radio.forget(peer).await
             }
-            Ok(()) => Ok(()),
+            (Ok(()), _) => Ok(()),
         };
-        self.removed.push(d.policy.device_id());
-        self.refresh_enabled();
+        self.removed.push(id);
         result
     }
+    /// Reserves storage and an ID for a pairing, and removes any bond the stack holds for the
+    /// device. The caller syncs the stack's bonds first, so it has room for the new one.
     pub async fn prepare_pair<S: RecordStore, B: Bluetooth>(
         &mut self,
         peer: Peer,
@@ -507,52 +671,28 @@ impl Manager {
         store: &mut S,
         radio: &mut B,
     ) -> Result<(), Error> {
-        if self.native_limits
-            [usize::from(peer.transport == crate::model::identifiers::Transport::Ble)]
-            == 0
-        {
+        if self.native_limits[kind(peer.transport)] == 0 {
             return Err(Error::Capacity);
         }
-        self.sync_bonds(store, radio).await?;
         self.available_bytes = store.available().await.map_err(|_| Error::StorageFailed)?;
         if self.available_bytes < crate::bonds::MAINTENANCE_BYTES + crate::bonds::PAIR_BYTES {
             return Err(Error::StorageFull);
         }
         // IDs are never reused, including after deleting the highest saved ID.
-        let counter_key = crate::storage::record_key(7, 0);
-        let previous: u64 = match store
-            .load_owned(counter_key)
-            .await
-            .map_err(|_| Error::StorageFailed)?
-        {
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(|_| Error::StorageFailed)?,
-            None => return Err(Error::StorageFailed),
-        };
-        let nonce = previous.checked_add(1).ok_or(Error::Capacity)?;
-        store
-            .save(
-                counter_key,
-                &crate::storage::json(&nonce).map_err(|_| Error::StorageFailed)?,
-            )
+        let nonce = crate::storage::allocate(store, false)
             .await
             .map_err(|_| Error::StorageFailed)?;
-        if self.devices.iter().all(Option::is_some) {
-            self.devices.try_reserve(1).map_err(|_| Error::Capacity)?;
-            self.devices.push(None);
-        }
         self.pending_device = Some(nonce);
         radio.forget(identity.unwrap_or(peer)).await?;
         Ok(())
     }
-    pub async fn finish_pair<S: RecordStore, B: Bluetooth>(
-        &mut self,
-        store: &mut S,
-        radio: &mut B,
-    ) -> Result<(), Error> {
+    /// Ends a pairing's reservation. The stack's bonds are synced in the background, which removes
+    /// a bond the pairing left behind.
+    pub async fn finish_pair<S: RecordStore>(&mut self, store: &mut S) -> Result<(), Error> {
         if !self.storage_ready {
             return Err(Error::StorageFailed);
         }
-        self.sync_bonds(store, radio).await?;
+        self.bonds_pending = true;
         self.pending_device = None;
         self.available_bytes = store.available().await.map_err(|_| Error::StorageFailed)?;
         Ok(())
@@ -570,7 +710,7 @@ impl Manager {
                         && (c.peer.transport == Transport::Ble || c.device.is_none()))
             })
     }
-    /// The saved device an incoming link from `peer` would be admitted for.
+    /// The resident device an incoming link from `peer` would be admitted for.
     pub fn admits(&self, peer: Peer, now: u64) -> Option<usize> {
         self.peer(peer).filter(|&slot| {
             self.storage_ready
@@ -628,7 +768,10 @@ impl Manager {
         if let Some(slot) = device {
             let d = self.devices[slot].as_mut().unwrap();
             d.state = State::Disconnecting;
-            d.catalog.connection(false, d.policy.hidpp_enabled);
+            let hidpp = d.hidpp_enabled;
+            if let Some(live) = &mut d.live {
+                live.catalog.connection(false, hidpp);
+            }
         }
     }
     pub fn disconnect<B: Bluetooth>(&mut self, slot: usize, radio: &mut B) -> Result<(), Error> {
@@ -643,55 +786,48 @@ impl Manager {
         }
         Ok(())
     }
-    /// Caller verifies the live pairing request, heartbeat and deadline first.
-    /// New native keys remain provisional until the device record is committed.
+    /// Saves the bond of pairing link `id` for `saved`, the saved device with `identity`, or for a
+    /// new device when there is none. Returns the device's ID and, when it is resident, its slot.
+    ///
+    /// The caller verifies the live pairing attempt and its deadline first. New native keys remain
+    /// provisional until the device record is committed.
     pub async fn bonded<S: RecordStore, B: Bluetooth>(
         &mut self,
         id: LinkId,
         identity: Peer,
+        saved: Option<Policy>,
         name: &[u8],
         store: &mut S,
         radio: &mut B,
-    ) -> Result<usize, Error> {
+    ) -> Result<(u64, Option<usize>), Error> {
         let c = self.connection(id).ok_or(Error::NotConnected)?;
         if c.closing || c.device.is_some() {
             return Err(Error::NotPending);
         }
         if identity.transport != c.peer.transport
-            || (identity.transport == crate::model::identifiers::Transport::Classic
-                && identity != c.peer)
+            || (identity.transport == Transport::Classic && identity != c.peer)
         {
             return Err(Error::AuthenticationFailed);
         }
         let pending = self.pending_device.ok_or(Error::NotPending)?;
-        let retained = self.peer(identity);
-        if retained.is_some_and(|slot| self.devices[slot].as_ref().unwrap().policy.blocked) {
-            return Err(Error::Blocked);
-        }
-        if let Some(slot) = retained
+        let resident = self.peer(identity);
+        if let Some(slot) = resident
             && self.link_for(slot).is_some_and(|other| other != id)
         {
             return Err(Error::Busy);
         }
-        let slot = retained
-            .or_else(|| self.devices.iter().position(Option::is_none))
-            .ok_or(Error::Capacity)?;
-        let mut policy = if let Some(slot) = retained {
-            self.devices[slot].as_ref().unwrap().policy.clone()
-        } else {
-            let mut policy = Policy::paired(pending, identity, name);
-            let used = self
-                .devices
-                .iter()
-                .flatten()
-                .filter(|d| d.effective_enabled && d.policy.peer.transport == identity.transport)
-                .count();
-            policy.enabled = used
-                < self.native_limits
-                    [usize::from(identity.transport == crate::model::identifiers::Transport::Ble)]
-                .saturating_sub(1);
-            policy
+        // Renewing a saved device's bond keeps its ID and preferences, including whether it is
+        // enabled. A blocked device is never renewed.
+        let mut policy = match saved.filter(|p| p.peer == identity) {
+            Some(policy) if policy.blocked => return Err(Error::Blocked),
+            Some(policy) => policy,
+            None => {
+                let mut policy = Policy::paired(pending, identity, name);
+                policy.enabled = self.room(identity.transport);
+                policy
+            }
         };
+        let retained = policy.id != pending;
         let mut bond = radio.export_bond(identity).await?;
         bond.owner = policy.id;
         bond.identity = identity;
@@ -711,25 +847,31 @@ impl Manager {
                 Error::StorageFailed
             });
         }
-        if retained.is_none() {
-            self.devices[slot] = Some(Device::new(policy.clone()));
-        } else {
+        if retained {
             // The new bond's connection discovers the device and saves its layout again.
             crate::layouts::remove(store, policy.id).await;
         }
-        let d = self.devices[slot].as_mut().unwrap();
-        d.policy = policy;
-        d.paused = false;
-        d.error = None;
-        d.state = State::Connecting;
-        let c = self.connection_mut(id).unwrap();
-        c.peer = identity;
-        c.device = Some(slot);
-        self.refresh_enabled();
-        if self.finish_pair(store, radio).await.is_err() {
+        let slot = match resident {
+            Some(slot) => Some(slot),
+            None if self.eligible(&policy) && self.room(identity.transport) => {
+                Some(self.add(&policy)?)
+            }
+            None => None,
+        };
+        if let Some(slot) = slot {
+            let d = self.devices[slot].as_mut().unwrap();
+            d.update(&policy);
+            d.paused = false;
+            d.error = None;
+            d.state = State::Connecting;
+            let c = self.connection_mut(id).unwrap();
+            c.peer = identity;
+            c.device = Some(slot);
+        }
+        if self.finish_pair(store).await.is_err() {
             self.storage_ready = false;
         }
-        Ok(slot)
+        Ok((policy.id, slot))
     }
     pub fn security(&mut self, id: LinkId, security: ConnectionSecurity) -> Option<usize> {
         let c = self.connection_mut(id)?;
@@ -761,16 +903,26 @@ impl Manager {
             return Err(Error::ConnectionFailed);
         }
         let slot = c.device.ok_or(Error::AuthenticationFailed)?;
-        let profiles = profiles(descriptors)?;
+        let profiles = parsed(descriptors)?;
         let d = self.devices[slot].as_mut().ok_or(Error::NotFound)?;
-        if !d.effective_enabled {
+        if d.retiring || d.deleting {
             return Err(Error::Disabled);
         }
-        let runtime = runtime(id, d, profiles, max_output, self.preference.host_platform)?;
+        let mut live = Box::new(Live::new(d.peer.transport, d.hidpp_enabled));
+        let runtime = runtime(
+            id,
+            d.hidpp_enabled,
+            &mut live,
+            profiles,
+            max_output,
+            self.preference.host_platform,
+        )?;
+        d.live = Some(live);
         d.connection(State::Connected, None, now);
         let c = self.connections[id.slot as usize].as_mut().unwrap();
         c.runtime = Some(runtime);
         c.deadline = 0;
+        c.starting = Some(now.saturating_add(FIRST_INPUT_WAIT_MS));
         Ok(Some(slot))
     }
     /// Moves a connected link to the layout its backend now routes reports by.
@@ -788,39 +940,42 @@ impl Manager {
         let (Some(slot), Some(_), false) = (c.device, &c.runtime, c.closing) else {
             return Ok(None);
         };
-        let profiles = profiles(descriptors)?;
+        let profiles = parsed(descriptors)?;
         let c = self.connections[id.slot as usize].as_mut().unwrap();
         let d = self.devices[slot].as_mut().ok_or(Error::NotFound)?;
+        let live = d.live.as_mut().ok_or(Error::NotConnected)?;
         let mut old = c.runtime.take().unwrap();
-        old.disconnected(&mut d.catalog, &mut self.forward);
-        old.settings.release(&mut d.catalog);
+        old.disconnected(&mut live.catalog, &mut self.forward);
+        old.settings.release(&mut live.catalog);
         let mut runtime = runtime(
             id,
-            d,
+            d.hidpp_enabled,
+            live,
             profiles,
             old.max_output(),
             self.preference.host_platform,
         )?;
         runtime.continue_sequence(&old);
         // Reconnecting the catalog cleared its standard information and battery readings.
-        runtime.info_refresh_pending = d.policy.peer.transport == Transport::Ble;
+        runtime.info_refresh_pending = d.peer.transport == Transport::Ble;
         c.runtime = Some(runtime);
         Ok(Some(slot))
     }
-    /// The caller drains explicit settings results before dropping this returned
-    /// runtime, or releases them if the serial session no longer owns the job.
+    /// Ends a connection: releases its runtime's held input and settings work, and drops what
+    /// the device kept for the connection. Returns the device slot, if any.
     pub fn disconnected(
         &mut self,
         id: LinkId,
         error: Option<Error>,
         now: u64,
-    ) -> Option<(Option<usize>, Option<Box<Link>>)> {
+    ) -> Option<Option<usize>> {
         self.connection(id)?;
         let mut c = self.connections[id.slot as usize].take().unwrap();
         if let Some(slot) = c.device {
             let d = self.devices[slot].as_mut().unwrap();
-            if let Some(link) = &mut c.runtime {
-                link.disconnected(&mut d.catalog, &mut self.forward);
+            if let (Some(link), Some(live)) = (&mut c.runtime, &mut d.live) {
+                link.disconnected(&mut live.catalog, &mut self.forward);
+                link.settings.release(&mut live.catalog);
             }
             // A connected device going away, such as being switched off, is not a failure. Other
             // errors, such as authentication after a virtual cable unplug, still count.
@@ -832,10 +987,12 @@ impl Manager {
             } else {
                 d.connection(State::Disconnected, c.error.or(error), now);
             }
-        } else {
-            self.forward.remove(id.slot as usize);
+            if d.retiring {
+                self.vacated = true;
+            }
         }
-        Some((c.device, c.runtime))
+        self.forward.remove(id.slot as usize);
+        Some(c.device)
     }
     pub fn input(
         &mut self,
@@ -849,25 +1006,49 @@ impl Manager {
             return Ok(false);
         }
         let slot = c.device.ok_or(Error::NotConnected)?;
-        if !self.devices[slot]
-            .as_ref()
-            .is_some_and(|d| d.effective_enabled)
-        {
-            return Ok(false);
-        }
         let c = self.connections[report.link.slot as usize]
             .as_mut()
             .unwrap();
-        let d = self.devices[slot].as_mut().unwrap();
-        let changed = c.runtime.as_mut().unwrap().input(
+        let Some(live) = self.devices[slot].as_mut().and_then(|d| d.live.as_mut()) else {
+            return Ok(false);
+        };
+        let link = c.runtime.as_mut().unwrap();
+        let changed = link.input(
             report.service,
             report.report_id,
             report.payload(),
-            &mut d.catalog,
+            &mut live.catalog,
             &mut self.forward,
             now,
         )?;
+        // The first-input wait ends with input that reached the forwarder.
+        if link.take_input_forwarded() {
+            c.starting = None;
+        }
         Ok(changed)
+    }
+    /// Whether a connected link has forwarded no input yet and its wait for it has not passed.
+    /// Background storage work waits meanwhile.
+    pub fn starting(&self, now: u64) -> bool {
+        self.connections.iter().flatten().any(|c| {
+            !c.closing && c.runtime.is_some() && c.starting.is_some_and(|until| now < until)
+        })
+    }
+    /// Whether resident device `id`'s connection is starting and its policy has not been read.
+    /// Reading its record waits until then.
+    pub fn waiting_for_input(&self, id: u64, now: u64) -> bool {
+        self.find(id).is_some_and(|slot| {
+            self.devices[slot]
+                .as_ref()
+                .and_then(|d| d.live.as_ref())
+                .is_some_and(|live| live.policy.is_none())
+                && self.connections.iter().flatten().any(|c| {
+                    c.device == Some(slot)
+                        && !c.closing
+                        && c.runtime.is_some()
+                        && c.starting.is_some_and(|until| now < until)
+                })
+        })
     }
     pub fn poll_link<B: Bluetooth>(
         &mut self,
@@ -889,8 +1070,10 @@ impl Manager {
             return Ok(None);
         };
         let slot = c.device.unwrap();
-        let d = self.devices[slot].as_mut().unwrap();
-        let mut changed = link.poll(&mut d.catalog, &mut self.forward, now)?;
+        let Some(live) = self.devices[slot].as_mut().and_then(|d| d.live.as_mut()) else {
+            return Ok(None);
+        };
+        let mut changed = link.poll(&mut live.catalog, &mut self.forward, now)?;
         if link.info_refresh_pending && radio.refresh_info(c.id).is_ok() {
             link.info_refresh_pending = false;
         }
@@ -899,17 +1082,22 @@ impl Manager {
         {
             let id = out.id;
             if let Err(error) = radio.write(id, out.service, out.kind, out.report_id, out.payload) {
-                changed |=
-                    link.output_complete(id, Err(error), &mut d.catalog, &mut self.forward, now)?;
+                changed |= link.output_complete(
+                    id,
+                    Err(error),
+                    &mut live.catalog,
+                    &mut self.forward,
+                    now,
+                )?;
             }
         }
         if radio.can_write(c.id)
-            && let Some(read) = link.report_read(&d.catalog, now)
+            && let Some(read) = link.report_read(&live.catalog, now)
             && let Err(e) = radio.read(read.id, read.service, read.kind, read.report_id)
         {
-            link.report_read_complete(read.id, read.kind, Err(e), &mut d.catalog, now);
+            link.report_read_complete(read.id, read.kind, Err(e), &mut live.catalog, now);
         }
-        changed |= d.update_warnings(&link.warnings)?;
+        changed |= live.update_warnings(&link.warnings)?;
         Ok(changed.then_some(slot))
     }
     pub fn written(
@@ -931,11 +1119,77 @@ impl Manager {
         let Some(link) = &mut c.runtime else {
             return Ok(None);
         };
-        let d = self.devices[slot].as_mut().unwrap();
+        let Some(live) = self.devices[slot].as_mut().and_then(|d| d.live.as_mut()) else {
+            return Ok(None);
+        };
         let mut changed =
-            link.output_complete(id, result, &mut d.catalog, &mut self.forward, now)?;
-        changed |= d.update_warnings(&link.warnings)?;
+            link.output_complete(id, result, &mut live.catalog, &mut self.forward, now)?;
+        changed |= live.update_warnings(&link.warnings)?;
         Ok(changed.then_some(slot))
+    }
+    /// Reads a connected device's saved policy and preferences once its connection has forwarded
+    /// input, or once it has waited `FIRST_INPUT_WAIT_MS` for it. Saves the roles its descriptor
+    /// reported when they changed. Returns the slot of a device it read. On an error, returns the
+    /// ID of the device it failed on: `NotFound` when its record is lost, and `StorageFailed` when
+    /// the read failed, which is tried again after a backoff.
+    pub async fn hydrate<S: RecordStore>(
+        &mut self,
+        store: &mut S,
+        now: u64,
+    ) -> Result<Option<usize>, (u64, Error)> {
+        let Some((slot, id)) = self
+            .connections
+            .iter()
+            .flatten()
+            .filter(|c| {
+                !c.closing && c.runtime.is_some() && c.starting.is_none_or(|until| now >= until)
+            })
+            .filter_map(|c| c.device)
+            .find_map(|slot| {
+                let d = self.devices[slot].as_ref()?;
+                d.live
+                    .as_ref()
+                    .filter(|live| live.policy.is_none() && live.hydrate_retry.due(now))
+                    .map(|_| (slot, d.id))
+            })
+        else {
+            return Ok(None);
+        };
+        let failed = |manager: &mut Self| {
+            if let Some(live) = manager.devices[slot].as_mut().and_then(|d| d.live.as_mut()) {
+                live.hydrate_retry.failed(now);
+            }
+            Err((id, Error::StorageFailed))
+        };
+        let mut policy = match (Policies { store }).load(id).await {
+            Ok(policy) => policy,
+            Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
+                return Err((id, Error::NotFound));
+            }
+            Err(_) => return failed(self),
+        };
+        let preferences = match (Preferences { store, device: id }).load_all().await {
+            Ok(p) => p,
+            Err(crate::storage::Error::Corrupt) => {
+                // Unusable preferences are removed; the device keeps its own values.
+                let _ = store.remove(crate::storage::record_key(4, id)).await;
+                Vec::new()
+            }
+            Err(_) => return failed(self),
+        };
+        let d = self.devices[slot].as_mut().unwrap();
+        let live = d.live.as_mut().unwrap();
+        if live.catalog.restore_preferences(preferences).is_err() {
+            let _ = store.remove(crate::storage::record_key(4, id)).await;
+        }
+        live.catalog.connection(true, d.hidpp_enabled);
+        if policy.roles.0 != live.roles && live.roles != 0 {
+            policy.roles.0 = live.roles;
+            // A failed save keeps the roles the device last saved; the next connection retries.
+            let _ = Policies { store }.save(&policy).await;
+        }
+        live.policy = Some(policy);
+        Ok(Some(slot))
     }
     /// The next first-connection setup progress to save: the connection and
     /// device slot of a connected device with `setup_pending`, the policy
@@ -947,11 +1201,13 @@ impl Manager {
             let link = c.runtime.as_ref()?;
             let slot = c.device?;
             let d = self.devices[slot].as_ref()?;
+            let live = d.live.as_ref()?;
+            let saved = live.policy.as_ref()?;
             // A requested settings job finishes before setup reconfigures the link.
-            if c.closing || c.setup_failed || !d.policy.setup_pending || link.settings.explicit() {
+            if c.closing || c.setup_failed || !saved.setup_pending || link.settings.explicit() {
                 return None;
             }
-            let mut setup = d.setup;
+            let mut setup = live.setup;
             let mut hidpp = false;
             if !setup.hidpp
                 && let Some(found) = link.hidpp_found()
@@ -959,100 +1215,197 @@ impl Manager {
                 setup.hidpp = true;
                 hidpp = found;
             }
-            if setup == d.setup {
+            if setup == live.setup {
                 return None;
             }
-            let mut policy = d.policy.clone();
-            policy.hidpp_enabled |= hidpp;
+            let mut policy = saved.clone();
+            if hidpp {
+                policy.set_hidpp(true);
+            }
             policy.setup_pending = !setup.complete();
             Some((index, slot, policy, setup))
         })
     }
-    pub async fn policy<S: RecordStore>(
+    /// Saves a device's policy, resident or not, and brings the resident set, the stack and the
+    /// device's connection in line with it. Turning a connected device off or blocking it closes
+    /// its link; its entry leaves once the link has closed.
+    pub async fn save_policy<S: RecordStore, B: Bluetooth>(
         &mut self,
-        slot: usize,
         policy: Policy,
         store: &mut S,
+        radio: &mut B,
     ) -> Result<(), Error> {
         self.write_uncertain = false;
         if !self.storage_ready {
             return Err(Error::StorageFailed);
         }
-        let current = self
-            .devices
-            .get(slot)
-            .and_then(Option::as_ref)
-            .ok_or(Error::NotFound)?;
-        if (!current.policy.enabled || current.policy.blocked)
-            && policy.enabled
-            && !policy.blocked
-            && self.effective(self.caps).supports(policy.peer.transport)
-        {
-            let used = self
-                .devices
-                .iter()
-                .flatten()
-                .filter(|d| d.effective_enabled && d.policy.peer.transport == policy.peer.transport)
-                .count();
-            if used
-                >= self.native_limits[usize::from(
-                    policy.peer.transport == crate::model::identifiers::Transport::Ble,
-                )]
-                .saturating_sub(1)
-            {
-                return Err(Error::Capacity);
-            }
+        let slot = self.find(policy.id);
+        let eligible = self.eligible(&policy);
+        if eligible && slot.is_none() && !self.room(policy.peer.transport) {
+            return Err(Error::Capacity);
         }
-        let d = self.devices[slot].as_mut().unwrap();
-        if d.policy.deleting {
+        if slot.is_some_and(|s| self.devices[s].as_ref().unwrap().deleting) {
             return Err(Error::Busy);
         }
-        if policy.id != d.policy.id || policy.peer != d.policy.peer || policy.name != d.policy.name
-        {
-            return Err(Error::InvalidArgs);
-        }
-        if d.policy == policy {
-            return Ok(());
-        }
-        Policies { store }
-            .save(slot, &policy)
-            .await
-            .map_err(|error| {
-                self.write_uncertain = error == crate::storage::Error::Unknown;
-                if self.write_uncertain {
-                    self.storage_ready = false;
+        Policies { store }.save(&policy).await.map_err(|error| {
+            self.write_uncertain = error == crate::storage::Error::Unknown;
+            if self.write_uncertain {
+                self.storage_ready = false;
+            }
+            match error {
+                crate::storage::Error::Full => Error::StorageFull,
+                // The saved record is missing, undecodable or holds another device's bond.
+                crate::storage::Error::Missing => Error::NotFound,
+                _ => Error::StorageFailed,
+            }
+        })?;
+        match slot {
+            None if eligible => {
+                let slot = self.add(&policy)?;
+                // Only this entry is new; the stack's other bonds are as they were.
+                if let Err(error) = self.import(slot, store, radio).await {
+                    self.bonds_pending = true;
+                    return Err(error);
                 }
-                match error {
-                    crate::storage::Error::Full => Error::StorageFull,
-                    // The saved record is missing, undecodable or holds another device's bond.
-                    crate::storage::Error::Missing => Error::NotFound,
-                    _ => Error::StorageFailed,
+            }
+            None => {}
+            Some(slot) if !eligible => match self.link_for(slot) {
+                Some(link) => {
+                    self.devices[slot].as_mut().unwrap().retiring = true;
+                    self.close(link, None, radio);
                 }
-            })?;
-        let was_vendor = d.catalog.info.battery.vendor();
-        d.policy = policy;
-        d.catalog
-            .connection(d.state == State::Connected, d.policy.hidpp_enabled);
-        if let Some(c) = self
-            .connections
-            .iter_mut()
-            .flatten()
-            .find(|c| c.device == Some(slot) && !c.closing)
-            && let Some(link) = &mut c.runtime
-            && link.enabled() != d.policy.hidpp_enabled
-        {
-            // Subscribed BAS values may not notify again until the battery changes.
-            link.info_refresh_pending = d.policy.peer.transport == Transport::Ble
-                && was_vendor
-                && !d.catalog.info.battery.vendor();
-            link.reconfigure(
-                d.policy.hidpp_enabled,
-                self.preference.host_platform,
-                &mut d.catalog,
-            );
+                None => {
+                    let peer = self.devices[slot].as_ref().unwrap().peer;
+                    self.drop_entry(slot);
+                    if radio.capabilities().supports(peer.transport) {
+                        radio.forget(peer).await?;
+                    }
+                }
+            },
+            Some(slot) => {
+                let d = self.devices[slot].as_mut().unwrap();
+                let hidpp = d.hidpp_enabled;
+                let layers = d.layers.clone();
+                // Enabled again before its link closed: the entry stays.
+                d.retiring = false;
+                d.update(&policy);
+                if hidpp != d.hidpp_enabled
+                    && let Some(link) = self.link_for(slot)
+                {
+                    let platform = self.preference.host_platform;
+                    let d = self.devices[slot].as_mut().unwrap();
+                    if let Some(c) = self.connections[link.slot as usize]
+                        .as_mut()
+                        .filter(|c| c.id == link)
+                        && let Some(runtime) = &mut c.runtime
+                        && let Some(live) = &mut d.live
+                    {
+                        let was_vendor = live.catalog.info.battery.vendor();
+                        live.catalog.connection(true, d.hidpp_enabled);
+                        // Subscribed BAS values may not notify again until the battery changes.
+                        runtime.info_refresh_pending = d.peer.transport == Transport::Ble
+                            && was_vendor
+                            && !live.catalog.info.battery.vendor();
+                        runtime.reconfigure(d.hidpp_enabled, platform, &mut live.catalog);
+                    }
+                }
+                if layers != policy.profiles {
+                    self.load_profiles(slot, store).await;
+                }
+            }
         }
-        self.refresh_enabled();
         Ok(())
+    }
+    /// Loads a connected device's layers, all or none, within the profile memory budget, and
+    /// applies them to its input. When they cannot be loaded, its input passes through unchanged
+    /// and its `profile_error` says why. Returns whether the device's state changed.
+    pub async fn load_profiles<S: RecordStore>(&mut self, slot: usize, store: &mut S) -> bool {
+        let Some(budget) = self.profile_budget else {
+            return false;
+        };
+        let Some(link) = self.link_for(slot) else {
+            return false;
+        };
+        if self
+            .connection(link)
+            .is_none_or(|c| c.closing || c.runtime.is_none())
+        {
+            return false;
+        }
+        let source = link.slot as usize;
+        let d = self.devices[slot].as_ref().unwrap();
+        let ids: Vec<u64> = d
+            .layers
+            .iter()
+            .copied()
+            .take(profiles::MAX_LAYERS)
+            .collect();
+        // The forwarder's own references, so a profile only this device holds counts as released.
+        let releasing = self.forward.layers(source);
+        let result = self.profiles.load(store, &ids, budget, releasing).await;
+        let (layers, error) = match result {
+            Ok(layers) => (layers, None),
+            Err(LoadError::Capacity) => (Vec::new(), Some(Error::Capacity)),
+            Err(LoadError::Storage) => (Vec::new(), Some(Error::StorageFailed)),
+            Err(LoadError::Lost(id)) => {
+                if !self.lost_profiles.contains(&id) {
+                    self.lost_profiles.push(id);
+                }
+                (Vec::new(), Some(Error::StorageFailed))
+            }
+        };
+        // Preparing allocates press-time state first, so a failure leaves the old layers in use.
+        let Ok(update) = self.forward.prepare_maps(source, layers) else {
+            return false;
+        };
+        self.forward.apply_maps(update);
+        let live = self.devices[slot].as_mut().unwrap().live.as_mut().unwrap();
+        let changed = live.profile_error != error;
+        live.profile_error = error;
+        live.profile_retry = None;
+        changed
+    }
+    /// Retries loading the layers of one connected device whose profiles are not loaded: one that
+    /// did not fit, when memory may have been released, or one that could not be read, once its
+    /// backoff has passed. Only slots from `from` on are considered. Returns the slot it tried
+    /// and whether its state changed.
+    pub async fn retry_profiles<S: RecordStore>(
+        &mut self,
+        store: &mut S,
+        released: bool,
+        from: usize,
+        now: u64,
+    ) -> Option<(usize, bool)> {
+        use crate::devices::{RETRY_DELAY_MAX_MS, RETRY_DELAY_MS};
+        for slot in from..self.devices.len() {
+            let Some(live) = self.devices[slot].as_mut().and_then(|d| d.live.as_mut()) else {
+                continue;
+            };
+            let (due, next) = match (live.profile_error, live.profile_retry) {
+                (Some(Error::Capacity), _) => (released, None),
+                (Some(_), None) => {
+                    live.profile_retry =
+                        Some((now.saturating_add(RETRY_DELAY_MS.into()), RETRY_DELAY_MS));
+                    (false, None)
+                }
+                (Some(_), Some((at, delay))) if now >= at => {
+                    (true, Some(delay.saturating_mul(2).min(RETRY_DELAY_MAX_MS)))
+                }
+                _ => (false, None),
+            };
+            if !due {
+                continue;
+            }
+            let changed = self.load_profiles(slot, store).await;
+            if let Some(delay) = next
+                && let Some(live) = self.devices[slot].as_mut().and_then(|d| d.live.as_mut())
+                && live.profile_error.is_some_and(|e| e != Error::Capacity)
+            {
+                live.profile_retry = Some((now.saturating_add(delay.into()), delay));
+            }
+            return Some((slot, changed));
+        }
+        None
     }
     /// Saves the adapter preference. On a platform change, every ready
     /// HID++-enabled connection reconfigures for the new platform. The caller
@@ -1075,32 +1428,15 @@ impl Manager {
                     continue;
                 };
                 let d = self.devices[slot].as_mut().unwrap();
-                if d.policy.hidpp_enabled
+                if d.hidpp_enabled
                     && let Some(link) = &mut c.runtime
+                    && let Some(live) = &mut d.live
                 {
-                    link.reconfigure(true, platform, &mut d.catalog);
+                    link.reconfigure(true, platform, &mut live.catalog);
                 }
             }
         }
         Ok(())
-    }
-    pub async fn name<S: RecordStore>(
-        &mut self,
-        name: Option<&str>,
-        store: &mut S,
-    ) -> Result<(), Error> {
-        self.write_uncertain = false;
-        if !self.storage_ready {
-            return Err(Error::StorageFailed);
-        }
-        self.save_preference(
-            AdapterPreference {
-                name: name.map(Into::into),
-                ..self.preference.clone()
-            },
-            store,
-        )
-        .await
     }
     async fn save_preference<S: RecordStore>(
         &mut self,
@@ -1129,34 +1465,18 @@ impl Manager {
         platform: HostPlatform,
         store: &mut S,
     ) -> Result<(), Error> {
-        self.write_uncertain = false;
-        if !self.storage_ready {
-            return Err(Error::StorageFailed);
-        }
-        if self.preference.host_platform == platform {
-            return Ok(());
-        }
         let preference = AdapterPreference {
             host_platform: platform,
             ..self.preference.clone()
         };
-        self.save_preference(preference, store).await?;
-        for c in self.connections.iter_mut().flatten().filter(|c| !c.closing) {
-            let Some(slot) = c.device else {
-                continue;
-            };
-            let d = self.devices[slot].as_mut().unwrap();
-            if d.policy.hidpp_enabled
-                && let Some(link) = &mut c.runtime
-            {
-                link.reconfigure(true, platform, &mut d.catalog);
-            }
-        }
-        Ok(())
+        self.adapter(preference, store).await
     }
+    /// Deletes a saved device that has no link: its bond in the stack, its resident entry and its
+    /// files.
     pub async fn unpair<S: RecordStore, B: Bluetooth>(
         &mut self,
-        slot: usize,
+        id: u64,
+        peer: Peer,
         store: &mut S,
         radio: &mut B,
     ) -> Result<(), Error> {
@@ -1164,37 +1484,32 @@ impl Manager {
         if !self.storage_ready {
             return Err(Error::StorageFailed);
         }
-        if self.link_for(slot).is_some() {
+        let slot = self.find(id);
+        if slot.is_some_and(|slot| self.link_for(slot).is_some()) {
             return Err(Error::Busy);
         }
-        let d = self
-            .devices
-            .get(slot)
-            .and_then(Option::as_ref)
-            .ok_or(Error::NotFound)?;
-        let previous_policy = d.policy.clone();
-        let mut policy = previous_policy.clone();
-        policy.deleting = true;
-        policy.enabled = false;
-        self.devices[slot].as_mut().unwrap().policy = policy.clone();
-        self.refresh_enabled();
-        if radio.capabilities().supports(policy.peer.transport)
-            && let Err(error) = radio.forget(policy.peer).await
+        if let Some(slot) = slot {
+            self.devices[slot].as_mut().unwrap().deleting = true;
+        }
+        if radio.capabilities().supports(peer.transport)
+            && let Err(error) = radio.forget(peer).await
         {
             // Nothing was saved; the device stays as it was, and its bond is loaded again if the
             // stack lost it.
-            self.devices[slot].as_mut().unwrap().policy = previous_policy;
-            self.refresh_enabled();
+            if let Some(slot) = slot {
+                self.devices[slot].as_mut().unwrap().deleting = false;
+            }
             let _ = self.sync_bonds(store, radio).await;
             return Err(error);
         }
-        if let Err(error) = (Policies { store }).remove(slot, policy.id).await {
+        if let Err(error) = (Policies { store }).remove(id).await {
             self.write_uncertain = error == crate::storage::Error::Unknown;
             if self.write_uncertain {
                 self.storage_ready = false;
             } else {
-                self.devices[slot].as_mut().unwrap().policy = previous_policy;
-                self.refresh_enabled();
+                if let Some(slot) = slot {
+                    self.devices[slot].as_mut().unwrap().deleting = false;
+                }
                 if self.sync_bonds(store, radio).await.is_err() {
                     self.storage_ready = false;
                 }
@@ -1205,10 +1520,10 @@ impl Manager {
                 Error::StorageFailed
             });
         }
-        self.devices[slot] = None;
-        self.refresh_enabled();
+        if let Some(slot) = slot {
+            self.drop_entry(slot);
+        }
         // Deletion is committed. Reclamation failure cannot turn it into a failed removal.
-
         match store.available().await {
             Ok(bytes) => self.available_bytes = bytes,
             Err(_) => {
@@ -1220,7 +1535,7 @@ impl Manager {
     }
 }
 
-fn profiles(descriptors: Vec<Descriptor>) -> Result<Vec<Profile>, Error> {
+fn parsed(descriptors: Vec<Descriptor>) -> Result<Vec<Profile>, Error> {
     descriptors
         .into_iter()
         .map(|d| Profile::from_map(d.service, d.map))
@@ -1229,7 +1544,8 @@ fn profiles(descriptors: Vec<Descriptor>) -> Result<Vec<Profile>, Error> {
 /// Builds a link's runtime and records the roles, kind and warnings it reports.
 fn runtime(
     id: LinkId,
-    d: &mut Device,
+    hidpp_enabled: bool,
+    live: &mut Live,
     profiles: Vec<Profile>,
     max_output: usize,
     platform: HostPlatform,
@@ -1238,15 +1554,15 @@ fn runtime(
         id,
         profiles,
         max_output,
-        d.policy.hidpp_enabled,
+        hidpp_enabled,
         platform,
-        &mut d.catalog,
+        &mut live.catalog,
     )?;
-    d.roles = runtime.roles;
-    d.catalog.info.kind_hint(
+    live.roles = runtime.roles;
+    live.catalog.info.kind_hint(
         match (
-            d.roles & crate::hid::KEYBOARD != 0,
-            d.roles & crate::hid::MOUSE != 0,
+            live.roles & crate::hid::KEYBOARD != 0,
+            live.roles & crate::hid::MOUSE != 0,
         ) {
             (true, true) => crate::model::link::DeviceKind::KeyboardMouse,
             (true, false) => crate::model::link::DeviceKind::Keyboard,
@@ -1254,6 +1570,6 @@ fn runtime(
             _ => crate::model::link::DeviceKind::Unknown,
         },
     );
-    d.update_warnings(&runtime.warnings)?;
+    live.update_warnings(&runtime.warnings)?;
     Ok(Box::new(runtime))
 }

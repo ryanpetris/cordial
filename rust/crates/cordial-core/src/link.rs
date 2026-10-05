@@ -141,6 +141,8 @@ pub struct Link {
     configure_pending: bool,
     activate_pending: bool,
     forward_pending: bool,
+    /// An input report reached the forwarder since [`Link::take_input_forwarded`] last asked.
+    input_forwarded: bool,
     normalization: NormalizationState,
     protocol: ProtocolState,
     sequence: u32,
@@ -293,6 +295,7 @@ impl Link {
             configure_pending: true,
             activate_pending: false,
             forward_pending: false,
+            input_forwarded: false,
             normalization: NormalizationState::Pending,
             protocol: ProtocolState::Unknown,
             sequence: 0,
@@ -475,6 +478,7 @@ impl Link {
                 !self.configure_pending && self.settings.receive(catalog, report_id, payload, now);
             if self.client.receive(report_id, payload, now) {
                 self.forward(Input::default(), forward)?;
+                self.input_forwarded = true;
             }
             changed |= self.hidpp_changed(catalog);
             return Ok(changed);
@@ -531,7 +535,13 @@ impl Link {
         }
         profile.held = input.held;
         self.forward(input, forward)?;
+        self.input_forwarded = true;
         Ok(false)
+    }
+    /// Whether an input report reached the forwarder since the last call. Rollover reports,
+    /// vendor reports of other services and HID++ responses forward nothing.
+    pub fn take_input_forwarded(&mut self) -> bool {
+        core::mem::take(&mut self.input_forwarded)
     }
     /// Poll even while a transport write is outstanding, so HID++ timeouts and
     /// cancellation progress without confusing a reply with write completion.

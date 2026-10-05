@@ -6,16 +6,26 @@
 extern crate std;
 
 pub mod completion;
+mod configuration;
 mod descriptor;
 pub mod owner;
 mod serial;
 #[cfg(test)]
 mod tests;
 
-use cordial_core::control::OutputToken;
-use core::cell::RefCell;
+use cordial_core::{
+    control::OutputToken,
+    devices::Policies,
+    interfaces::Interface,
+    profiles,
+    storage::{self as records, RecordStore},
+};
+use core::{
+    cell::RefCell,
+    sync::atomic::{AtomicU8, Ordering},
+};
 use embassy_futures::{
-    join::join4,
+    join::{join, join_array, join4},
     select::{Either, select},
 };
 use embassy_sync::{
@@ -47,6 +57,63 @@ impl Status {
     pub fn serial_open(self) -> bool {
         self.configured && self.dtr
     }
+}
+/// One 32-byte Raw HID report and the configuration interface it belongs to.
+struct RawPacket {
+    generation: u64,
+    interface: Interface,
+    bytes: [u8; 32],
+}
+/// Raw HID interfaces allocated after input HID: the most configuration interfaces that can be
+/// enabled together. Each enabled interface takes the next slot in `Interface::ALL` order, and
+/// configuration descriptors omit the unused trailing slots.
+const SLOTS: usize = 1;
+/// The enabled interface at `slot` for an enabled set, if that slot is in use.
+fn slot_interface(set: u8, slot: usize) -> Option<Interface> {
+    Interface::ALL
+        .into_iter()
+        .filter(|i| set & i.bit() != 0)
+        .nth(slot)
+}
+/// The number of slots an enabled set uses.
+fn used_slots(set: u8) -> usize {
+    Interface::ALL
+        .into_iter()
+        .filter(|i| set & i.bit() != 0)
+        .count()
+        .min(SLOTS)
+}
+/// Requests and replies of one Raw HID slot.
+struct RawQueue {
+    rx: Channel<CS, RawPacket, 1>,
+    tx: Channel<CS, RawPacket, 1>,
+}
+
+/// The configuration interfaces USB starts with: the saved enabled set, without interfaces whose
+/// profile no longer exists. A board without profiles, or unreadable preferences, start with none.
+pub async fn saved_interfaces<S: RecordStore>(store: &mut S, profiles_supported: bool) -> u8 {
+    if !profiles_supported {
+        return 0;
+    }
+    let Ok(preference) = Policies { store: &mut *store }.load_adapter().await else {
+        return 0;
+    };
+    let mut set = 0;
+    for entry in preference
+        .configuration_interfaces
+        .iter()
+        .filter(|p| p.enabled)
+    {
+        if let Some(id) = entry.profile
+            && !matches!(
+                profiles::metadata(store, id).await,
+                Err(records::Error::Missing)
+            )
+        {
+            set |= entry.interface.bit();
+        }
+    }
+    set
 }
 struct HidTx {
     generation: u64,
@@ -93,7 +160,8 @@ const fn idle_reports() -> [[u8; 68]; 10] {
 
 /// USB tasks exchange bounded owned packets with the application owner.
 pub struct Io {
-    status: Watch<CS, Status, 3>,
+    // Receivers: input HID, serial transmit, serial receive and one per Raw HID slot.
+    status: Watch<CS, Status, { 3 + SLOTS }>,
     reports: Mutex<CS, RefCell<[[u8; 68]; 10]>>,
     changed: Signal<CS, ()>,
     hid_tx: Channel<CS, HidTx, 1>,
@@ -102,6 +170,10 @@ pub struct Io {
     serial_done: Channel<CS, SerialDone, 1>,
     serial_rx: Channel<CS, SerialRx, 1>,
     rx_drained: Watch<CS, u64, 1>,
+    raw: [RawQueue; SLOTS],
+    /// The enabled configuration interfaces the current enumeration exposes.
+    interfaces: AtomicU8,
+    reconnect: Signal<CS, u8>,
 }
 impl Default for Io {
     fn default() -> Self {
@@ -127,7 +199,25 @@ impl Io {
             serial_done: Channel::new(),
             serial_rx: Channel::new(),
             rx_drained: Watch::new_with(0),
+            raw: [const {
+                RawQueue {
+                    rx: Channel::new(),
+                    tx: Channel::new(),
+                }
+            }; SLOTS],
+            interfaces: AtomicU8::new(0),
+            reconnect: Signal::new(),
         }
+    }
+    fn interfaces(&self) -> u8 {
+        self.interfaces.load(Ordering::Relaxed)
+    }
+    fn set_interfaces(&self, set: u8) {
+        self.interfaces.store(set, Ordering::Relaxed);
+    }
+    /// The configuration interface the current enumeration exposes at `slot`.
+    fn slot(&self, slot: usize) -> Option<Interface> {
+        slot_interface(self.interfaces(), slot)
     }
     pub fn status(&self) -> Status {
         self.status.try_get().unwrap()
@@ -235,8 +325,11 @@ pub struct Buffers<'a> {
     pub control: [u8; 256],
     pub cdc: cdc_acm::State<'a>,
     pub hid: hid::State<'a>,
+    raw: [hid::State<'a>; SLOTS],
     pub bus_handler: BusHandler<'a>,
     pub report_handler: ReportHandler<'a>,
+    raw_report_handlers: [configuration::ReportHandler<'a>; SLOTS],
+    serial_number: configuration::SerialNumber<'a>,
 }
 impl<'a> Buffers<'a> {
     pub fn new(io: &'a Io) -> Self {
@@ -246,8 +339,14 @@ impl<'a> Buffers<'a> {
             control: [0; 256],
             cdc: cdc_acm::State::new(),
             hid: hid::State::new(),
+            raw: core::array::from_fn(|_| hid::State::new()),
             bus_handler: BusHandler(io),
             report_handler: ReportHandler(io),
+            raw_report_handlers: core::array::from_fn(|slot| configuration::ReportHandler {
+                io,
+                slot,
+            }),
+            serial_number: configuration::SerialNumber { io, bytes: [0; 30] },
         }
     }
 }
@@ -257,14 +356,17 @@ pub struct Usb<'d, D: Driver<'d>> {
     tx: cdc_acm::Sender<'d, serial::SessionDriver<'d, D>>,
     rx: cdc_acm::Receiver<'d, serial::SessionDriver<'d, D>>,
     io: &'d Io,
+    raw: [hid::HidReaderWriter<'d, serial::SessionDriver<'d, D>, 32, 32>; SLOTS],
 }
 impl<'d, D: Driver<'d>> Usb<'d, D> {
     /// D's IN writes must await physical completion, using CompleteDriver when
     /// needed. This preserves output deadlines and the last completed HID report.
+    /// `interfaces` is the enabled configuration interface set to enumerate with.
     pub fn new(
         driver: D,
         serial: &'d str,
         default_adapter_name: &'d str,
+        interfaces: u8,
         io: &'d Io,
         buffers: &'d mut Buffers<'d>,
     ) -> Self {
@@ -278,6 +380,9 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         config.device_protocol = 0x01;
         config.composite_with_iads = true;
         config.max_power = 100;
+        buffers.serial_number.bytes[..16].copy_from_slice(serial.as_bytes());
+        buffers.serial_number.bytes[16..].copy_from_slice(configuration::VIAL_SERIAL_SUFFIX);
+        io.set_interfaces(interfaces);
         let mut builder = Builder::new(
             serial::SessionDriver { driver, io },
             config,
@@ -286,6 +391,8 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
             &mut [],
             &mut buffers.control,
         );
+        assert_eq!(u8::from(builder.string()), configuration::SERIAL_INDEX);
+        builder.handler(&mut buffers.serial_number);
         builder.handler(&mut buffers.bus_handler);
         let cdc = cdc_acm::CdcAcmClass::new(&mut builder, &mut buffers.cdc, 64);
         let hid = hid::HidWriter::new(
@@ -300,8 +407,25 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
                 hid_boot_protocol: hid::HidBootProtocol::None,
             },
         );
+        let mut slots = buffers.raw.iter_mut().zip(&mut buffers.raw_report_handlers);
+        let raw = core::array::from_fn(|_| {
+            let (state, handler) = slots.next().unwrap();
+            hid::HidReaderWriter::new(
+                &mut builder,
+                state,
+                hid::Config {
+                    report_descriptor: configuration::REPORT_DESCRIPTOR,
+                    request_handler: Some(handler),
+                    poll_ms: 1,
+                    max_packet_size: 32,
+                    hid_subclass: hid::HidSubclass::No,
+                    hid_boot_protocol: hid::HidBootProtocol::None,
+                },
+            )
+        });
         let (tx, rx) = cdc.split();
         Self {
+            raw,
             device: builder.build(),
             hid,
             tx,
@@ -312,6 +436,7 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
     pub async fn run(self) -> ! {
         let Self {
             mut device,
+            raw,
             mut hid,
             mut tx,
             rx,
@@ -320,7 +445,26 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         let mut hid_status = io.status.receiver().unwrap();
         let mut tx_status = io.status.receiver().unwrap();
         join4(
-            device.run(),
+            join(
+                async {
+                    loop {
+                        let set = match select(device.run(), io.reconnect.wait()).await {
+                            Either::Second(set) => set,
+                            Either::First(_) => unreachable!(),
+                        };
+                        device.disable().await;
+                        io.set_interfaces(set);
+                        embassy_time::Timer::after_millis(250).await;
+                    }
+                },
+                {
+                    let mut slot = 0;
+                    join_array(raw.map(|raw| {
+                        slot += 1;
+                        configuration::run(raw, io, slot - 1)
+                    }))
+                },
+            ),
             async {
                 loop {
                     let packet = io.hid_tx.receive().await;

@@ -8,9 +8,10 @@ CLI_TARGET ?= $(shell uname -m)-unknown-linux-musl
 DESKTOP_TARGETS ?= AppImage tar.gz
 BOARD ?= pico_w
 PROFILE ?= development
-PROTOCOL_BASE ?= $(shell git describe --tags --abbrev=0 HEAD^ 2>/dev/null)
+PROTOCOL_BASE ?= $(shell $(PYTHON) tools/version.py --protocol-base 2>/dev/null)
 BOARDS := pico_w pico2_w waveshare_rp2350b_plus_w xiao_esp32s3
 ESP_BOARDS := xiao_esp32s3
+PICO_BOARDS := $(filter-out $(ESP_BOARDS),$(BOARDS))
 DOCKER ?= docker
 DEB_DISTRIBUTION ?= trixie
 DEB_BASE_trixie := debian:13
@@ -129,7 +130,7 @@ local-package-cli:
 	trap 'rm -r "$$temporary"' EXIT
 	mkdir "$$temporary/$$name"
 	install -m 755 rust/target/$(CLI_TARGET)/release/cordial "$$temporary/$$name/cordial"
-	cp -r LICENSE docs proto "$$temporary/$$name/"
+	cp -r LICENSE docs proto configs/50-cordial.rules "$$temporary/$$name/"
 	printf '%s\n' "$$version" > "$$temporary/$$name/VERSION"
 	$(PYTHON) rust/tools/dependency_notices.py --target $(CLI_TARGET) --output "$$temporary/$$name"
 	(cd "$$temporary/$$name" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
@@ -154,9 +155,10 @@ check-firmware: image-$(FIRMWARE_PLATFORM)
 	$(call build,$(FIRMWARE_PLATFORM),python3 rust/tools/build_firmware.py rust/boards/$(BOARD).json --profile $(PROFILE) --clippy)
 check-firmware-all:
 	@set -e; for board in $(BOARDS); do for profile in production debug; do $(MAKE) check-firmware BOARD=$$board PROFILE=$$profile; done; done
-# The allocation check builds Pico W development firmware and runs it under QEMU in the Pico image.
+# The allocation check builds each Pico board's development firmware and runs the workloads with
+# that board's configuration and heap under QEMU in the Pico image.
 check-memory: image-pico
-	$(call build,pico,python3 rust/tools/build_firmware.py rust/boards/pico_w.json --profile development; python3 rust/tools/check_memory.py build/firmware/$$CORDIAL_VERSION-dev/pico_w-btstack-pico-sdk-cyw43/cordial-pico_w-btstack-pico-sdk-cyw43.elf)
+	$(call build,pico,for board in $(PICO_BOARDS); do python3 rust/tools/build_firmware.py rust/boards/$$board.json --profile development; python3 rust/tools/check_memory.py build/firmware/$$CORDIAL_VERSION-dev/$$board-btstack-pico-sdk-cyw43/cordial-$$board-btstack-pico-sdk-cyw43.elf; done)
 check-rust:
 	$(PYTHON) rust/tools/firmware_dependencies.py --btstack
 	cd rust

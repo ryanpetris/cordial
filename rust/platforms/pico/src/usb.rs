@@ -39,6 +39,9 @@ pub unsafe extern "C" fn __wrap_memcpy(dst: *mut u8, src: *const u8, len: usize)
 #[derive(Clone, Copy)]
 pub struct TransferCompletion;
 impl Completion for TransferCompletion {
+    fn disconnect(&self, disconnected: bool) {
+        pac::USB.sie_ctrl().modify(|r| r.set_pullup_en(!disconnected));
+    }
     async fn wait(&self, endpoint: EndpointAddress) -> Result<(), EndpointError> {
         let index = endpoint.index();
         loop {

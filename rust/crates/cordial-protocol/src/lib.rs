@@ -23,7 +23,5 @@ pub mod keys;
 pub const USB_VENDOR_ID: u16 = 0x1209;
 /// USB product ID of every Dongle.
 pub const USB_PRODUCT_ID: u16 = 0xc0d1;
-/// USB manufacturer string of every Dongle.
-pub const USB_MANUFACTURER: &str = "Cordial";
 /// The longest request a Dongle accepts, before frame encoding.
 pub const MAX_REQUEST_BYTES: usize = 1024;

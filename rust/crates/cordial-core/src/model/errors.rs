@@ -28,6 +28,8 @@ pub enum ErrorCode {
     NotPending,
     InternalError,
     NotConnected,
+    /// A saved preference refers to the profile.
+    InUse,
     ReadOnly,
     HidppDisabled,
     SettingsUnavailable,

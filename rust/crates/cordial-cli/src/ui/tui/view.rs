@@ -7,12 +7,16 @@ use super::{
         self, Choice, Hit, Layout, Styled, Tone, accent, beside, bold, dim, err, inherit, join,
         line_width, ok, pad, pad_str, span, spread, strip, styled, title, truncate, warn,
     },
-    pair_blocked, pending_for, scan_choices, scan_name, scanning_name,
+    pair_blocked, pending_for,
+    profiles::layered,
+    scan_choices, scan_name, scanning_name,
     settings::settings_busy,
 };
+use crate::view::Item;
 use crate::{
-    controller::State,
+    controller::{DeviceUpdate, State},
     model::{self, Prompt, Up},
+    profiles,
     ui::{
         Backend,
         text::{
@@ -31,6 +35,9 @@ use ratatui::{
     text::Line,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+/// The shortest pane that shows a line between its borders.
+const PANE_MIN: usize = 3;
 
 pub(super) fn spinner() -> char {
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -109,14 +116,9 @@ impl Column {
         }
         b.hang(prefix, value, look);
     }
-    /// On and Off options that take effect at once; `actions` choose On
-    /// and Off. Drawn as a plain value when the adapter doesn't offer
-    /// changing it.
-    fn on_off(self, b: &mut Layout, label: &str, on: bool, actions: Option<(Action, Action)>) {
-        self.on_off_if(b, label, on, actions, true);
-    }
-    /// On and Off options that stay in place, dim and without targets,
-    /// while `enabled` is false.
+    /// On and Off options; `actions` choose On and Off. They stay in place, dim and without
+    /// targets, while `enabled` is false, and are drawn as a plain value when the adapter
+    /// doesn't offer changing it.
     fn on_off_if(
         self,
         b: &mut Layout,
@@ -192,7 +194,7 @@ fn battery_tag(d: &p::Device) -> Option<(String, Style)> {
 
 /// The device's own report: battery, identity and firmware.
 fn info_section(b: &mut Layout, c: Column, st: &State, d: &p::Device, rows: Vec<text::InfoRow>) {
-    let busy = pending_for(st, "device refresh", &d.id);
+    let busy = pending_for(st, "device refresh", d.id);
     if rows.is_empty() && !busy {
         return;
     }
@@ -212,12 +214,12 @@ fn diagnostics(b: &mut Layout, st: &State, d: &p::Device) {
         .into_iter()
         .filter(|r| text::IDENTIFIER_KEYS.contains(&r.key.as_str()))
         .collect();
-    let warnings = st.warnings_of(&d.id);
+    let warnings = st.warnings_of(d.id);
     let labels = warnings
         .iter()
         .map(|w| warning_label(w.code()))
         .chain(ids.iter().map(|r| r.label.as_str()))
-        .chain(["HID++ Protocol", "Security", "ID", "Last Error"]);
+        .chain(["HID++ Protocol", "Security", "ID", "Last Error", "Status"]);
     let c = Column::new(b.width, labels);
     // Sections are separated by a blank row; a section with nothing to show is left out.
     let mut started = false;
@@ -248,6 +250,12 @@ fn diagnostics(b: &mut Layout, st: &State, d: &p::Device) {
         };
         c.field(b, "Last Error", &text::wire_text(&e, None), err());
     }
+    if let Some(code) = model::profile_error(d).filter(|_| connected(d)) {
+        section(b);
+        b.line(styled("Profiles", title()));
+        c.field(b, "Status", "Not Loaded", err());
+        c.more(b, None, &text::profile_error_words(code), dim());
+    }
     let hidpp = [protocol_status(d), hidpp_status(d)];
     if hidpp.iter().any(Option::is_some) {
         section(b);
@@ -265,7 +273,7 @@ fn diagnostics(b: &mut Layout, st: &State, d: &p::Device) {
     for r in ids {
         c.field(b, &r.label, &r.value, layout::plain());
     }
-    c.field(b, "ID", &display(&d.id), dim());
+    c.field(b, "ID", &d.id.to_string(), dim());
 }
 
 /// A short tag for a device's current link security in the device list, or
@@ -274,8 +282,8 @@ fn security_tag(d: &p::Device) -> Option<(&'static str, Style)> {
     let s = text::link_security(d)?;
     Some(match s.map(|s| (s.encrypted, s.authenticated)) {
         Some((Some(false), _)) => ("Unencrypted", warn()),
-        Some((Some(true), Some(true))) => ("Enc · auth", layout::plain()),
-        Some((Some(true), Some(false))) => ("Enc · unauth", layout::plain()),
+        Some((Some(true), Some(true))) => ("Enc · Auth", layout::plain()),
+        Some((Some(true), Some(false))) => ("Enc · Unauth", layout::plain()),
         Some((Some(true), None)) => ("Encrypted", layout::plain()),
         Some((None, _)) | None => ("Unreported", dim()),
     })
@@ -366,17 +374,11 @@ pub(super) fn hidpp_status(d: &p::Device) -> Option<(String, Style)> {
 /// preference is saved per device, so it stays changeable while the device
 /// is disconnected. Its options are dim and have no targets while `idle` is
 /// false.
-fn hidpp_section(b: &mut Layout, c: Column, st: &State, d: &p::Device, idle: bool) {
+fn hidpp_section(b: &mut Layout, c: Column, on: bool, staged: bool, idle: bool) {
     let actions = Some((Action::Hidpp(true), Action::Hidpp(false)));
-    c.on_off_if(
-        b,
-        "Logitech Features",
-        model::hidpp_enabled(d),
-        actions,
-        idle,
-    );
-    if pending_for(st, "device set hidpp", &d.id) {
-        c.more(b, None, &format!("{} Saving…", spinner()), warn());
+    c.on_off_if(b, "Logitech Features", on, actions, idle);
+    if staged {
+        c.more(b, None, "✎ Changed", accent());
     }
 }
 
@@ -483,7 +485,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "Allow connections from the device again.",
             ),
             (
-                "Remove",
+                "Forget Device",
                 "Disconnect and delete the saved bond. The device may also need its old pairing cleared before it is used again.",
             ),
             (
@@ -495,26 +497,25 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
                 "On lets the adapter use Logitech HID++ for special keys and to apply saved device settings while the device is connected. Saved for each device, and can be changed while it is disconnected.",
             ),
             (
-                "Refresh Info",
-                "Ask a connected device for its current battery charge, model, firmware and other information. The adapter keeps this information only in memory; it is never saved.",
-            ),
-            (
                 "Settings…",
                 "Open a saved device's settings. Opening and browsing them never changes the device or what is saved.",
+            ),
+            (
+                "Profiles…",
+                "Show and change the profiles a saved device uses, in the order they apply.",
             ),
             (
                 "Diagnostics…",
                 "Show the selected saved device's warnings, HID++ status, link security and identifiers.",
             ),
-            (
-                "Files",
-                "Browse the adapter's filesystem from Adapter ▾ › Files… and download a file to this computer. Click a directory to open it, or a file to choose where to save it. The download is kept only when every byte arrives, and an existing local file is replaced only after you confirm. Files work even when the adapter's Bluetooth isn't ready. In Files: ↑↓ select, Enter opens or downloads, Backspace goes up, r refreshes, Esc closes.",
-            ),
-            (
-                "Platform",
-                "The computer's system: Linux, Windows or macOS. Special keys on every device using HID++ send its standard shortcuts. Choose it in Adapter ▾ › Adapter settings; it is saved on the adapter, even with no devices paired.",
-            ),
         ],
+    ),
+    (
+        "Diagnostics",
+        &[(
+            "Refresh",
+            "Ask a connected device for its current battery charge, model, firmware and other information. The adapter keeps this information only in memory; it is never saved.",
+        )],
     ),
     (
         "Device Settings",
@@ -546,6 +547,23 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Adapter",
+        &[
+            (
+                "Files…",
+                "Browse the adapter's filesystem from Adapters › Files… and download a file to this computer. Click a directory to open it, or a file to choose where to save it. The download is kept only when every byte arrives, and an existing local file is replaced only after you confirm. Files work even when the adapter's Bluetooth isn't ready. In Files: ↑↓ select, Enter opens or downloads, Backspace goes up, r refreshes, Esc closes.",
+            ),
+            (
+                "Platform",
+                "The computer's system: Linux, Windows or macOS. Special keys on devices that use HID++ send that system's standard shortcuts. To change the platform, select the adapter in Adapters. The adapter saves the platform, even when no devices are paired.",
+            ),
+            (
+                "Profiles…",
+                "Create, copy and delete profiles, and choose the profiles VIA and Vial edit.",
+            ),
+        ],
+    ),
+    (
         "Mouse and Keyboard",
         &[
             (
@@ -570,14 +588,14 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
             ("e", "Enable or disable the selected saved device."),
             ("t", "Trust or untrust the selected device."),
             ("b", "Block or unblock the selected device."),
-            ("x", "Remove the selected saved device."),
+            ("x", "Forget the selected saved device."),
             ("h", "Hide the selected nearby device."),
             (
                 "o",
                 "Open the selected saved device's settings; Esc goes back.",
             ),
             ("i", "Open the selected saved device's diagnostics."),
-            ("a", "Open the Adapter menu."),
+            ("a", "Select the adapter."),
             ("r", "Refresh the device list."),
             (
                 "Tab",
@@ -621,14 +639,15 @@ fn help_text(st: &State, section: &str, key: &str, text: &str) -> Option<String>
         }
         ("Devices", "Nearby") | ("Actions", "Hide") | (_, "h") => hide,
         ("Actions", "Pair") | (_, "p") => !scans.is_empty() || !st.candidates.is_empty(),
-        ("Actions", "Files") => model::development(&st.status),
+        ("Adapter", "Files…") => model::development(&st.status),
+        (_, "Profiles…") => profiles::available(&st.status),
         _ => true,
     };
     shown.then(|| text.to_owned())
 }
 
 /// Whether the running pairing is with this candidate.
-pub(super) fn pairing_with(st: &State, candidate: &str) -> bool {
+pub(super) fn pairing_with(st: &State, candidate: u32) -> bool {
     st.available
         && st
             .pairing
@@ -793,6 +812,9 @@ impl<B: Backend> Model<B> {
                 });
             }
         }
+        // A box with no room for both borders is cut to its height.
+        out.lines.truncate(h);
+        out.hits.retain(|hh| hh.y < h);
         out
     }
 
@@ -988,9 +1010,6 @@ impl<B: Backend> Model<B> {
         let mut bar = Layout::new(l.width.saturating_sub(2));
         let mut right = Layout::new(bar.width);
         let prepared = st.is_some() && !self.preparing;
-        if prepared {
-            right.button("Adapter ▾", Action::Menu(Menu::Adapter), Tone::Normal);
-        }
         right.button("Help", Action::Help, Tone::Normal);
         right.button("Quit", Action::Quit, Tone::Normal);
         match st {
@@ -1043,7 +1062,7 @@ impl<B: Backend> Model<B> {
             .iter()
             .filter(|d| d.enabled && model::inactive(d).is_none())
             .count();
-        let count = format!(" · {} saved · {enabled} enabled", st.devices.len());
+        let count = format!(" · {} Saved · {enabled} Enabled", st.devices.len());
         join(s, styled(count, dim()))
     }
 
@@ -1055,10 +1074,10 @@ impl<B: Backend> Model<B> {
             let mut banner = Layout::new(w.saturating_sub(2));
             let (mut text, mut choose) = (
                 "✕ Cordial lost its connection to the adapter. The displayed information may be out of date.",
-                "Choose adapter",
+                "Choose Adapter…",
             );
             if text::width(text) + 30 > banner.width {
-                (text, choose) = ("✕ Adapter lost", "Adapters"); // One line when narrow.
+                (text, choose) = ("✕ Adapter Lost", "Adapters"); // One line when narrow.
             }
             banner.line(styled(text, err().add_modifier(Modifier::BOLD)));
             banner.button("Reconnect", Action::Reopen, Tone::Primary);
@@ -1075,10 +1094,10 @@ impl<B: Backend> Model<B> {
                 warn().add_modifier(Modifier::BOLD),
             );
             if !self.files.open && self.offers(st, &Action::FilesOpen) {
-                banner.button("Files", Action::FilesOpen, Tone::Primary);
+                banner.button("Files…", Action::FilesOpen, Tone::Primary);
             }
             banner.button("Reconnect", Action::Reopen, Tone::Normal);
-            banner.button("Choose adapter", Action::Adapters, Tone::Normal);
+            banner.button("Choose Adapter…", Action::Adapters, Tone::Normal);
             banner.indent();
             h = h.saturating_sub(banner.lines.len());
             l.add(banner);
@@ -1108,7 +1127,7 @@ impl<B: Backend> Model<B> {
                 )
             } else {
                 (
-                    self.devices_pane(st, list, h - act),
+                    self.list_column(st, list, h - act),
                     self.details_pane(st, w - list, h - act),
                 )
             };
@@ -1129,7 +1148,7 @@ impl<B: Backend> Model<B> {
             } else if page {
                 self.settings_pane(st, w, rest)
             } else {
-                self.devices_pane(st, w, rest)
+                self.list_column(st, w, rest)
             };
             l.add(pane);
             return false;
@@ -1148,7 +1167,13 @@ impl<B: Backend> Model<B> {
             need += 1;
             floor = actions.lines.len() + 3;
         }
-        let details = need.min(rest / 2).max(floor).min(rest - 3);
+        // The list keeps room for its Devices and Adapters panes when the details still fit.
+        let list = if !files && !page && rest >= 3 * PANE_MIN {
+            2 * PANE_MIN
+        } else {
+            PANE_MIN
+        };
+        let details = need.min(rest / 2).max(floor).min(rest - list);
         let (a, b) = if files {
             (
                 self.files_pane(st, w, rest - details),
@@ -1161,7 +1186,7 @@ impl<B: Backend> Model<B> {
             )
         } else {
             (
-                self.devices_pane(st, w, rest - details),
+                self.list_column(st, w, rest - details),
                 self.details_pane(st, w, details),
             )
         };
@@ -1174,7 +1199,66 @@ impl<B: Backend> Model<B> {
         act > 0
     }
 
+    /// The Devices pane above the Adapters pane, together exactly `h` lines tall. The Devices
+    /// pane keeps at least half of them. A column too short for both boxes shows one Devices
+    /// pane that lists the adapter and its actions after the devices, so they stay reachable.
+    fn list_column(&mut self, st: &State, w: usize, h: usize) -> Layout {
+        if h < 2 * PANE_MIN {
+            let (mut b, mut selected_line) = self.devices_body(st, w);
+            b.row();
+            b.line(styled("Adapters", dim()));
+            if self.selected == Some(Item::Adapter) {
+                selected_line = Some(b.lines.len());
+            }
+            let (row, pinned) = self.adapters_body(st, w);
+            b.add(row);
+            b.add(pinned);
+            self.reveal_selection(selected_line, h);
+            return self.frame(
+                "Devices",
+                b,
+                Layout::default(),
+                Some(Area::Devices),
+                false,
+                w,
+                h,
+            );
+        }
+        let adapters = self.adapters_pane(st, w, h - h.div_ceil(2));
+        let mut column = self.devices_pane(st, w, h - adapters.lines.len());
+        column.add(adapters);
+        column
+    }
+
+    /// Scrolls the device list to the selected row once after the selection moves.
+    fn reveal_selection(&mut self, selected_line: Option<usize>, h: usize) {
+        if self.reveal
+            && let Some(line) = selected_line
+        {
+            self.reveal = false;
+            self.device_scroll = self
+                .device_scroll
+                .max(line.saturating_sub(h.saturating_sub(3)))
+                .min(line);
+        }
+    }
+
     fn devices_pane(&mut self, st: &State, w: usize, h: usize) -> Layout {
+        let (b, selected_line) = self.devices_body(st, w);
+        self.reveal_selection(selected_line, h);
+        self.frame(
+            "Devices",
+            b,
+            Layout::default(),
+            Some(Area::Devices),
+            false,
+            w,
+            h,
+        )
+    }
+
+    /// The device list's rows, and the line of the selected one.
+    fn devices_body(&mut self, st: &State, w: usize) -> (Layout, Option<usize>) {
         self.drop_hidden_selection();
         let mut b = Layout::new(w.saturating_sub(4));
         let transport_w = if b.width < 36 { 0 } else { 9 };
@@ -1196,24 +1280,24 @@ impl<B: Backend> Model<B> {
             .width
             .saturating_sub(2 + transport_w + status_w + battery_w + security_w)
             .max(4);
-        let mut shown: Vec<String> = Vec::new();
+        let mut shown: Vec<Item> = Vec::new();
         let mut selected_line = None;
         // Each column is drawn on the row's base so the selection spans it.
         let mut row = |m: &Self,
                        b: &mut Layout,
-                       id: &str,
+                       id: Item,
                        name: &str,
                        transport: &str,
                        status: Vec<ratatui::text::Span<'static>>,
                        base: Style| {
-            shown.push(id.to_owned());
-            let look = if id == m.selected {
+            shown.push(id);
+            let look = if Some(id) == m.selected {
                 selected_line = Some(b.lines.len());
                 inherit(bold(), base)
             } else {
                 base
             };
-            let marker = if id == m.selected { "▌ " } else { "  " };
+            let marker = if Some(id) == m.selected { "▌ " } else { "  " };
             let mut text = Line::from(vec![
                 span(marker, inherit(accent(), base)),
                 span(
@@ -1228,33 +1312,28 @@ impl<B: Backend> Model<B> {
             text.spans.extend(status);
             let fill = b.width.saturating_sub(line_width(&text));
             text.spans.push(span(" ".repeat(fill), base));
-            b.control(text, Action::Device(id.to_owned()));
+            b.control(text, Action::Select(id));
         };
         let busy = |text: &str, base: Style| {
             let text = format!("{} {text}", spinner());
             vec![span(pad_str(&text, status_w), inherit(warn(), base))]
         };
-        let base_of = |m: &Self, id: &str| {
-            if id == m.selected {
+        let base_of = |m: &Self, id: Item| {
+            if Some(id) == m.selected {
                 layout::selected()
             } else {
                 layout::plain()
             }
         };
-        b.line(styled(
-            if st.devices.is_empty() {
-                "SAVED · none"
-            } else {
-                "SAVED"
-            },
-            dim(),
-        ));
+        if !st.devices.is_empty() {
+            b.line(styled("Saved", dim()));
+        }
         for d in &st.devices {
-            let id = &d.id;
+            let id = Item::Device(d.id);
             let base = base_of(self, id);
-            let status = if pending_for(st, "device connect", id) {
+            let status = if pending_for(st, "device connect", d.id) {
                 busy("Connecting…", base)
-            } else if pending_for(st, "device disconnect", id) {
+            } else if pending_for(st, "device disconnect", d.id) {
                 busy("Disconnecting…", base)
             } else {
                 let (text, look) = device_status(d);
@@ -1283,8 +1362,10 @@ impl<B: Backend> Model<B> {
                 base,
             );
         }
-        b.row();
-        b.line(styled("NEARBY", dim()));
+        if !st.devices.is_empty() {
+            b.row();
+        }
+        b.line(styled("Nearby", dim()));
         let hidden = self.unnamed_hidden();
         if !scan_choices(st).is_empty() || !st.candidates.is_empty() || hidden > 0 {
             b.choice(
@@ -1301,9 +1382,9 @@ impl<B: Backend> Model<B> {
         // Every listed candidate stays here and offers Pair.
         for c in &st.candidates {
             nearby += 1;
-            let id = &c.id;
+            let id = Item::Candidate(c.id);
             let base = base_of(self, id);
-            let status = if pairing_with(st, id) {
+            let status = if pairing_with(st, c.id) {
                 busy("Pairing…", base)
             } else {
                 signal(c.rssi, base)
@@ -1345,32 +1426,19 @@ impl<B: Backend> Model<B> {
             .pairing
             .as_ref()
             .filter(|p| st.available && model::pairing_running(p))
-            && !shown.contains(&pairing.candidate)
+            && !shown.contains(&Item::Candidate(pairing.candidate))
         {
             b.line(styled(
-                format!("{} Pairing {}…", spinner(), self.label(&pairing.candidate)),
+                format!(
+                    "{} Pairing {}…",
+                    spinner(),
+                    self.label(Item::Candidate(pairing.candidate))
+                ),
                 warn(),
             ));
-            b.button("Cancel", Action::CancelPairing, Tone::Normal);
+            b.button("Cancel Pairing", Action::CancelPairing, Tone::Normal);
         }
-        if self.reveal
-            && let Some(line) = selected_line
-        {
-            self.reveal = false;
-            self.device_scroll = self
-                .device_scroll
-                .max(line.saturating_sub(h.saturating_sub(3)))
-                .min(line);
-        }
-        self.frame(
-            "Devices",
-            b,
-            Layout::default(),
-            Some(Area::Devices),
-            false,
-            w,
-            h,
-        )
+        (b, selected_line)
     }
 
     fn details_pane(&mut self, st: &State, w: usize, h: usize) -> Layout {
@@ -1378,12 +1446,22 @@ impl<B: Backend> Model<B> {
         self.frame(&heading, b, actions, Some(Area::Details), false, w, h)
     }
 
-    /// The selected device's field card and its actions.
+    /// The right pane's content for the selection: the adapter's page or its Profiles view, a
+    /// device's Profiles view, or the selected device's field card and its actions.
     fn details(&self, st: &State, w: usize) -> (String, Layout, Layout) {
+        if self.selected == Some(Item::Adapter) {
+            if self.adapter_profiles_open(st) {
+                return self.adapter_profiles(st, w);
+            }
+            return self.adapter_page(st, w);
+        }
+        if let Some(d) = self.layers_open(st) {
+            return self.device_layers(st, d, w);
+        }
         let mut b = Layout::new(w.saturating_sub(4));
         let mut actions = Layout::new(w.saturating_sub(4));
         let mut heading = "Details".to_string();
-        match Self::find(st, &self.selected) {
+        match Self::find(st, self.selected) {
             (Some(d), _) => {
                 heading = display_name(Some(&d.name));
                 let rows: Vec<_> = text::info_rows(&d.info)
@@ -1400,23 +1478,36 @@ impl<B: Backend> Model<B> {
                     kind = format!("{roles} · {kind}");
                 }
                 c.field(&mut b, "Type", &kind, layout::plain());
-                c.on_off(
+                // Choices stage until Save; nothing changes while a save runs.
+                let values = self.device_values(st, d);
+                let draft = self.device_draft(st, d);
+                let saving = self.device_saving(d.id);
+                let policy = |b: &mut Layout, label, on, actions, staged: bool| {
+                    c.on_off_if(b, label, on, Some(actions), !saving);
+                    if staged {
+                        c.more(b, None, "✎ Changed", accent());
+                    }
+                };
+                policy(
                     &mut b,
                     "Use This Device",
-                    d.enabled,
-                    Some((Action::Enable, Action::Disable)),
+                    values.enabled == Some(true),
+                    (Action::Enable, Action::Disable),
+                    draft.enabled.is_some(),
                 );
-                c.on_off(
+                policy(
                     &mut b,
                     "Automatic Connections",
-                    d.trusted,
-                    Some((Action::Trust, Action::Untrust)),
+                    values.trusted == Some(true),
+                    (Action::Trust, Action::Untrust),
+                    draft.trusted.is_some(),
                 );
-                c.on_off(
+                policy(
                     &mut b,
                     "Block Connections",
-                    d.blocked,
-                    Some((Action::Block, Action::Unblock)),
+                    values.blocked == Some(true),
+                    (Action::Block, Action::Unblock),
+                    draft.blocked.is_some(),
                 );
                 if model::inactive(d).is_some() {
                     c.field(&mut b, "Reconnect", "Not While Inactive", dim());
@@ -1426,14 +1517,25 @@ impl<B: Backend> Model<B> {
                     c.field(&mut b, "Reconnect", "Automatic", layout::plain());
                 }
                 // Logitech Features wait while the device's settings work runs.
-                let idle = settings_busy(st, d, self.saving(&d.id)).is_empty();
-                hidpp_section(&mut b, c, st, d, idle);
+                let idle = settings_busy(st, d, self.saving(d.id)).is_empty() && !saving;
+                hidpp_section(
+                    &mut b,
+                    c,
+                    values.hidpp == Some(true),
+                    draft.hidpp.is_some(),
+                    idle,
+                );
+                if saving {
+                    c.more(&mut b, None, &format!("{} Saving…", spinner()), warn());
+                } else if let Some(e) = self.details_error(st, d) {
+                    c.more(&mut b, None, &format!("✕ Couldn't Save: {e}"), err());
+                }
                 info_section(&mut b, c, st, d, rows);
             }
             (_, Some(c)) => {
                 heading = display_candidate_name(c);
                 b.field("Status", "Nearby", layout::plain());
-                if !pairing_with(st, &c.id) {
+                if !pairing_with(st, c.id) {
                     if model::storage_full(&st.status) {
                         b.field("Pair", "Storage Full", warn());
                     } else if model::transport_disabled(&st.status, c.transport()) {
@@ -1455,7 +1557,7 @@ impl<B: Backend> Model<B> {
                         .push(span(format!(" {rssi} dBm"), Style::new()));
                 }
                 b.line(join(styled(pad_str("Signal", 11), dim()), strength));
-                b.field("ID", &display(&c.id), dim());
+                b.field("ID", &c.id.to_string(), dim());
             }
             _ => b.para("Select a device to see its details and actions.", dim()),
         }
@@ -1475,6 +1577,160 @@ impl<B: Backend> Model<B> {
         (heading, b, actions)
     }
 
+    /// The adapter's page: its name, platform and transports, staged until Save, and the use of
+    /// its enabled-device places, with Profiles… to show its Profiles view.
+    fn adapter_page(&self, st: &State, w: usize) -> (String, Layout, Layout) {
+        let mut body = Layout::new(w.saturating_sub(4));
+        let mut pinned = Layout::new(w.saturating_sub(4));
+        body.field("Name", &display(&st.status.name), layout::plain());
+        if can_set_platform(st) && !self.renaming() {
+            body.button("Rename", Action::Rename, Tone::Normal);
+        }
+        body.row();
+        let draft = self.adapter_draft(st);
+        let idle = can_set_platform(st) && !self.adapter_saving();
+        let changed = |b: &mut Layout, kw: usize| {
+            b.hang(Line::from(pad_str("", kw)), "✎ Changed", accent());
+        };
+        let platform = draft.platform.unwrap_or(st.status.platform());
+        if !st.status.ready {
+            body.field(
+                "Platform",
+                "Unavailable until adapter storage is ready",
+                warn(),
+            );
+        } else if can_set_platform(st) {
+            let options = [Platform::Linux, Platform::Windows, Platform::Mac]
+                .into_iter()
+                .map(|p| Choice {
+                    label: platform_name(p).into(),
+                    action: Action::Platform(p),
+                    chosen: platform == p,
+                })
+                .collect();
+            body.choice_if("Platform", 11, options, idle);
+        } else {
+            body.field("Platform", platform_name(platform), layout::plain());
+        }
+        if draft.platform.is_some() {
+            changed(&mut body, 11);
+        }
+        body.row();
+        body.para("The computer's system. Special keys on every device using HID++ send its standard shortcuts. Saved on the adapter for all devices, including ones paired later.", dim());
+        // One On and Off choice per transport the firmware can enable and disable, labelled by
+        // its name.
+        const KW: usize = "Bluetooth Classic".len() + 2;
+        for t in model::transports(&st.status) {
+            let Some(saved) = model::transport_enabled(&st.status, t) else {
+                continue;
+            };
+            let staged = draft
+                .transports
+                .iter()
+                .find(|(r, _)| *r == t)
+                .map(|(_, on)| *on);
+            let on = staged.unwrap_or(saved);
+            let label = transport_long(t);
+            body.row();
+            if !st.status.ready {
+                body.field_at(
+                    label,
+                    KW,
+                    "Unavailable until adapter storage is ready",
+                    warn(),
+                );
+            } else if can_set_platform(st) {
+                let options = layout::on_off(
+                    Some(on),
+                    Action::Transport(t, true),
+                    Action::Transport(t, false),
+                );
+                body.choice_if(label, KW, options, idle);
+            } else {
+                body.field_at(label, KW, if on { "On" } else { "Off" }, layout::plain());
+            }
+            if staged.is_some() {
+                changed(&mut body, KW);
+            }
+        }
+        body.row();
+        if self.adapter_saving() {
+            body.para(&format!("{} Saving…", spinner()), warn());
+        } else if let Some(e) = self.adapter_error(st) {
+            body.para(&format!("✕ {e}"), err());
+        } else {
+            self.refusal_hint(st, &mut body);
+        }
+        capacity_section(&mut body, st);
+        self.adapter_buttons(st, &mut pinned);
+        if profiles::available(&st.status) {
+            pinned.button("Profiles…", Action::Profiles, Tone::Normal);
+        }
+        (display(&st.status.name), body, pinned)
+    }
+
+    /// The Adapters pane: the connected adapter, which selects its page, and the adapter's own
+    /// actions. It is at most `max` lines tall, and at least [`PANE_MIN`]; its actions scroll
+    /// into view when they don't fit.
+    fn adapters_pane(&mut self, st: &State, w: usize, max: usize) -> Layout {
+        let (b, pinned) = self.adapters_body(st, w);
+        let h = (b.lines.len() + pinned.lines.len() + 3)
+            .min(max)
+            .max(PANE_MIN);
+        self.frame("Adapters", b, pinned, Some(Area::Adapters), false, w, h)
+    }
+
+    /// The connected adapter's row, and its actions.
+    fn adapters_body(&self, st: &State, w: usize) -> (Layout, Layout) {
+        let mut b = Layout::new(w.saturating_sub(4));
+        let selected = self.selected == Some(Item::Adapter);
+        let base = if selected {
+            layout::selected()
+        } else {
+            layout::plain()
+        };
+        let look = if selected {
+            inherit(bold(), base)
+        } else {
+            base
+        };
+        let (status, status_look) = match () {
+            _ if !st.available => ("✕ Disconnected", err()),
+            _ if self.unready.is_some() || !st.status.ready => ("! Not Ready", warn()),
+            _ => ("● Ready", ok()),
+        };
+        let marker = if selected { "▌ " } else { "  " };
+        let name_w = b.width.saturating_sub(2 + 15).max(4);
+        let mut row = Line::from(vec![
+            span(marker, inherit(accent(), base)),
+            span(
+                pad_str(
+                    &layout::truncate_str(&display(&st.status.name), name_w - 1),
+                    name_w,
+                ),
+                look,
+            ),
+            span(status, inherit(status_look, base)),
+        ]);
+        let fill = b.width.saturating_sub(line_width(&row));
+        row.spans.push(span(" ".repeat(fill), base));
+        b.control(row, Action::Select(Item::Adapter));
+        let mut pinned = Layout::new(b.width);
+        let actions = [
+            ("Disconnect", Action::AdapterDisconnect, Tone::Normal),
+            ("Choose Adapter…", Action::Adapters, Tone::Normal),
+            ("Refresh", Action::Refresh, Tone::Normal),
+            ("Files…", Action::FilesOpen, Tone::Normal),
+            ("Enter Bootloader…", Action::Bootloader, Tone::Danger),
+        ];
+        for (label, action, tone) in actions {
+            if self.offers(st, &action) {
+                pinned.button(label, action, tone);
+            }
+        }
+        (b, pinned)
+    }
+
     /// The controls for the selected device in its current state. The
     /// details card draws them and keyboard shortcuts consult them directly,
     /// so a key never acts on an older frame's buttons.
@@ -1490,7 +1746,7 @@ impl<B: Backend> Model<B> {
                 })
             }
         };
-        match Self::find(st, &self.selected) {
+        match Self::find(st, self.selected) {
             (Some(d), _) => {
                 match d.state() {
                     DeviceState::Connected | DeviceState::Connecting => {
@@ -1501,28 +1757,42 @@ impl<B: Backend> Model<B> {
                     }
                     _ => {}
                 }
-                if d.enabled {
+                // The policy actions stage the opposite of the staged or saved value.
+                let values = self.device_values(st, d);
+                if values.enabled == Some(true) {
                     add("Disable", Action::Disable, Tone::Normal, false);
                 } else {
                     add("Enable", Action::Enable, Tone::Normal, false);
                 }
                 // Saved devices never offer pairing; it starts from Nearby.
-                if d.trusted {
+                if values.trusted == Some(true) {
                     add("Untrust", Action::Untrust, Tone::Normal, false);
                 } else {
                     add("Trust", Action::Trust, Tone::Normal, false);
                 }
-                if d.blocked {
+                if values.blocked == Some(true) {
                     add("Unblock", Action::Unblock, Tone::Normal, false);
                 } else {
                     add("Block", Action::Block, Tone::Normal, false);
                 }
+                let draft = self.device_draft(st, d);
+                let details = DeviceUpdate {
+                    layers: None,
+                    ..draft
+                };
+                if !details.is_empty() && !self.device_saving(d.id) {
+                    add("Save", Action::DeviceSave, Tone::Primary, false);
+                    add("Discard", Action::DeviceDiscard, Tone::Normal, false);
+                }
                 add("Settings…", Action::DeviceSettings, Tone::Normal, false);
+                if layered(st, d) {
+                    add("Profiles…", Action::DeviceProfiles, Tone::Normal, false);
+                }
                 add("Diagnostics…", Action::Diagnostics, Tone::Normal, false);
-                add("Remove", Action::Remove, Tone::Danger, true);
+                add("Forget Device", Action::Remove, Tone::Danger, true);
             }
             (_, Some(c)) => {
-                if pairing_with(st, &c.id) {
+                if pairing_with(st, c.id) {
                     add("Cancel Pairing", Action::CancelPairing, Tone::Normal, false);
                 } else if pair_blocked(st, c).is_none() {
                     // The details card says why Pair is unavailable.
@@ -1573,23 +1843,12 @@ impl<B: Backend> Model<B> {
                 .map(|t| {
                     let label = match t {
                         None => "Bluetooth LE and Classic",
-                        Some(Transport::Ble) => "Bluetooth LE only",
-                        Some(_) => "Classic only",
+                        Some(Transport::Ble) => "Bluetooth LE Only",
+                        Some(_) => "Classic Only",
                     };
                     (label, Action::Scan(t), Tone::Normal)
                 })
                 .collect(),
-            Menu::Adapter => {
-                let mut items = vec![
-                    ("Switch adapter…", Action::Adapters, Tone::Normal),
-                    ("Refresh device list", Action::Refresh, Tone::Normal),
-                ];
-                items.push(("Adapter settings…", Action::AdapterSettings, Tone::Normal));
-                items.push(("Files…", Action::FilesOpen, Tone::Normal));
-                items.push(("Enter bootloader…", Action::Bootloader, Tone::Danger));
-                items.retain(|(_, action, _)| self.offers(st, action));
-                items
-            }
         };
         let w = items
             .iter()
@@ -1608,11 +1867,7 @@ impl<B: Backend> Model<B> {
             body.control(styled(label, look), action);
         }
         let b = self.frame("", body, Layout::default(), None, false, w, count + 2);
-        let x = if menu == Menu::Adapter {
-            (anchor.x + anchor.w).saturating_sub(w)
-        } else {
-            anchor.x
-        };
+        let x = anchor.x;
         Some((b, x.min(self.width.saturating_sub(w)), anchor.y + 1))
     }
 
@@ -1624,7 +1879,7 @@ impl<B: Backend> Model<B> {
         let mut pinned = Layout::new(w - 4);
         let mut heading = String::new();
         if let Some((candidate, prompt)) = &a {
-            let name = self.label(candidate);
+            let name = self.label(Item::Candidate(*candidate));
             heading = format!("Pair With {name}");
             let code = |body: &mut Layout, value: &str| {
                 let value = spaced(value);
@@ -1647,8 +1902,8 @@ impl<B: Backend> Model<B> {
                         layout::plain(),
                     );
                     code(&mut body, value);
-                    pinned.button("Codes match", Action::Accept, Tone::Primary);
-                    pinned.button("Codes differ", Action::Reject, Tone::Danger);
+                    pinned.button("Codes Match", Action::Accept, Tone::Primary);
+                    pinned.button("Codes Differ", Action::Reject, Tone::Danger);
                 }
                 Prompt::EnterCode(_) => {
                     let prompt = if code_kind(prompt) == CodeKind::Pin {
@@ -1659,8 +1914,8 @@ impl<B: Backend> Model<B> {
                     body.para(&prompt, layout::plain());
                     let field = self.field_line(body.width.saturating_sub(3));
                     body.control(field, Action::Input);
-                    pinned.button("Submit", Action::Accept, Tone::Primary);
-                    pinned.button("Cancel", Action::CancelDialog, Tone::Normal);
+                    pinned.button("Pair", Action::Accept, Tone::Primary);
+                    pinned.button("Reject", Action::CancelDialog, Tone::Normal);
                 }
             }
             if !self.form_err.is_empty() {
@@ -1671,14 +1926,14 @@ impl<B: Backend> Model<B> {
                 Some(Dialog::Diagnostics) => {
                     let st = st?;
                     heading = "Diagnostics".into();
-                    if let (Some(d), _) = Self::find(st, &self.selected) {
+                    if let (Some(d), _) = Self::find(st, self.selected) {
                         heading = format!("Diagnostics · {}", display_name(Some(&d.name)));
-                        if pending_for(st, "device refresh", &d.id) {
+                        if pending_for(st, "device refresh", d.id) {
                             body.para(&format!("{} Reading…", spinner()), warn());
                         }
                         diagnostics(&mut body, st, d);
                         if connected(d) {
-                            pinned.button("Refresh Info", Action::RefreshInfo, Tone::Normal);
+                            pinned.button("Refresh", Action::RefreshInfo, Tone::Normal);
                         }
                     } else {
                         body.para("Select a saved device to see its diagnostics.", dim());
@@ -1726,107 +1981,31 @@ impl<B: Backend> Model<B> {
                     let field = self.field_line(body.width.saturating_sub(3));
                     body.control(field, Action::Input);
                     if !self.form_err.is_empty() {
-                        body.para(&self.form_err, err());
+                        body.para(&format!("✕ {}", self.form_err), err());
                     }
                     if self.renaming() {
                         body.para("Saving…", warn());
                     } else if st.is_some_and(can_set_platform) {
                         pinned.button("Rename", Action::SaveName, Tone::Primary);
-                        pinned.button("Reset to default", Action::ResetName, Tone::Normal);
+                        pinned.button("Reset to Default", Action::ResetName, Tone::Normal);
                     }
                     pinned.button("Cancel", Action::CancelDialog, Tone::Normal);
                 }
-                Some(Dialog::Settings) => {
-                    heading = "Adapter Settings".into();
+                Some(
+                    Dialog::ProfileName(_)
+                    | Dialog::ProfileDelete(_)
+                    | Dialog::SaveAdapter
+                    | Dialog::ProfilePick(_),
+                ) => {
                     let st = st?;
-                    body.field("Name", &display(&st.status.name), layout::plain());
-                    if can_set_platform(st) && self.offers(st, &Action::Rename) && !self.renaming()
-                    {
-                        body.button("Rename adapter", Action::Rename, Tone::Normal);
-                    }
-                    body.row();
-                    let platform = st.status.platform();
-                    if !st.status.ready {
-                        body.field(
-                            "Platform",
-                            "Unavailable until adapter storage is ready",
-                            warn(),
-                        );
-                    } else if can_set_platform(st) {
-                        let options = [Platform::Linux, Platform::Windows, Platform::Mac]
-                            .into_iter()
-                            .map(|p| Choice {
-                                label: platform_name(p).into(),
-                                action: Action::Platform(p),
-                                chosen: platform == p,
-                            })
-                            .collect();
-                        body.choice("Platform", 11, options);
-                    } else {
-                        body.field("Platform", platform_name(platform), layout::plain());
-                    }
-                    let indent = || Line::from(pad_str("", 11));
-                    if self.running(|c| matches!(c, crate::controller::Command::Platform(_))) {
-                        body.hang(indent(), &format!("{} Saving…", spinner()), warn());
-                    } else if !self.form_err.is_empty() {
-                        body.hang(indent(), &format!("✕ {}", self.form_err), err());
-                    }
-                    body.row();
-                    body.para("The computer's system. Special keys on every device using HID++ send its standard shortcuts. Saved on the adapter for all devices, including ones paired later.", dim());
-                    // One On and Off choice per transport the firmware can enable and disable,
-                    // labelled by its name.
-                    const KW: usize = "Bluetooth Classic".len() + 2;
-                    let indent = || Line::from(pad_str("", KW));
-                    for t in model::transports(&st.status) {
-                        let Some(on) = model::transport_enabled(&st.status, t)
-                            .filter(|_| model::transport_settable(&st.status, t))
-                        else {
-                            continue;
-                        };
-                        let label = transport_long(t);
-                        body.row();
-                        if !st.status.ready {
-                            body.field_at(
-                                label,
-                                KW,
-                                "Unavailable until adapter storage is ready",
-                                warn(),
-                            );
-                        } else if can_set_platform(st) {
-                            let options = layout::on_off(
-                                Some(on),
-                                Action::Transport(t, true),
-                                Action::Transport(t, false),
-                            );
-                            body.choice(label, KW, options);
-                        } else {
-                            body.field_at(
-                                label,
-                                KW,
-                                if on { "On" } else { "Off" },
-                                layout::plain(),
-                            );
-                        }
-                        let running = self.running(
-                            |c| matches!(c, crate::controller::Command::Transport(r, _) if *r == t),
-                        );
-                        if running {
-                            body.hang(indent(), &format!("{} Saving…", spinner()), warn());
-                        } else if let Some((_, e)) =
-                            self.transport_err.as_ref().filter(|(r, _)| *r == t)
-                        {
-                            body.hang(indent(), &format!("✕ {e}"), err());
-                        }
-                    }
-                    capacity_section(&mut body, st);
-                    pinned.button("Close", Action::CancelDialog, Tone::Normal);
+                    self.profiles_dialog(st, &mut heading, &mut body, &mut pinned);
                 }
                 Some(Dialog::Bootloader) => {
                     heading = "Enter Bootloader".into();
                     body.para("Restart the adapter into USB programming mode?", bold());
                     body.row();
                     body.para("Keyboard and mouse input stops until the adapter restarts. Saved bonds are kept and no firmware is installed.", layout::plain());
-                    pinned.button("Enter bootloader", Action::Confirm, Tone::Danger);
+                    pinned.button("Enter Bootloader", Action::Confirm, Tone::Danger);
                     pinned.button("Cancel", Action::CancelDialog, Tone::Normal);
                 }
                 Some(Dialog::Replace(target)) => {
@@ -1842,11 +2021,12 @@ impl<B: Backend> Model<B> {
                     pinned.button("Cancel", Action::CancelDialog, Tone::Normal);
                 }
                 Some(Dialog::Remove(id)) => {
-                    heading = "Remove Device".into();
-                    body.para(&format!("Remove {}?", self.label(&id)), bold());
-                    body.row();
-                    body.para("It disconnects, and its saved bond and settings are deleted. To use it again, scan and pair it as a new device.", layout::plain());
-                    pinned.button("Remove", Action::Confirm, Tone::Danger);
+                    heading = format!("Forget “{}”?", self.label(Item::Device(id)));
+                    body.para(
+                        "Forgetting this device deletes its pairing and saved settings from the adapter.",
+                        layout::plain(),
+                    );
+                    pinned.button("Forget", Action::Confirm, Tone::Danger);
                     pinned.button("Cancel", Action::CancelDialog, Tone::Normal);
                 }
                 None => {
@@ -1864,7 +2044,7 @@ impl<B: Backend> Model<B> {
                                 warn(),
                             );
                             body.row();
-                            let detail = if self.opening.is_some() {
+                            let detail = if self.opening.is_some() || self.reconnecting() {
                                 "Opening the port and checking the adapter.".to_string()
                             } else if st.is_some_and(|s| !s.status.ready) {
                                 "Waiting for adapter… Its radio and saved devices are starting."
@@ -1879,7 +2059,7 @@ impl<B: Backend> Model<B> {
                             body.width = w - 4;
                             pinned.width = w - 4;
                             right.width = w - 4;
-                            heading = "Choose an Adapter".into();
+                            heading = "Choose Adapter".into();
                             if let Some(e) = &self.last_err {
                                 body.para(
                                     &format!("Couldn't open {}: {e}", display(&self.port)),
@@ -1909,7 +2089,7 @@ impl<B: Backend> Model<B> {
                                                 &layout::truncate_str(&display(&p.port), port_w),
                                                 port_w
                                             ),
-                                            display(&p.id)
+                                            display(p.id())
                                         ),
                                         Style::new(),
                                     ),
@@ -1948,7 +2128,7 @@ impl<B: Backend> Model<B> {
 
     /// The pairing-code field: its prompt, the visible text and a cursor
     /// while it has focus.
-    fn field_line(&mut self, w: usize) -> Styled {
+    pub(super) fn field_line(&mut self, w: usize) -> Styled {
         edit_line(&mut self.form, self.form_focused, w)
     }
 }
@@ -2020,5 +2200,25 @@ mod tests {
         let tab = keys.iter().find(|(k, _)| *k == "Tab").unwrap().1;
         let shown = help_text(&st, "Mouse and Keyboard", "Tab", tab).unwrap();
         assert!(shown.contains("Enter or Space chooses"), "{shown}");
+    }
+
+    #[test]
+    fn help_describes_profiles_only_with_profile_support() {
+        let mut st = crate::ui::command::tests::state();
+        let entries = || {
+            HELP.iter().flat_map(|(section, rows)| {
+                rows.iter()
+                    .filter(|(key, _)| *key == "Profiles…")
+                    .map(move |(key, text)| (*section, *key, *text))
+            })
+        };
+        assert_eq!(entries().count(), 2);
+        for (section, key, text) in entries() {
+            assert!(help_text(&st, section, key, text).is_none(), "{section}");
+        }
+        crate::ui::command::tests::with_profiles(&mut st.status);
+        for (section, key, text) in entries() {
+            assert!(help_text(&st, section, key, text).is_some(), "{section}");
+        }
     }
 }

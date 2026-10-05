@@ -4,6 +4,7 @@ import icon from "../../assets/icons/app.png";
 import { Controller } from "../core/controller.ts";
 import { PORT_FILTERS, listPorts, openWebSerial } from "@cordial/client/web";
 import { preferencesFrom, type AppState, type DesktopApi, type HostPlatform, type Preferences } from "../shared/state.ts";
+import { profileAlertText } from "../shared/text.ts";
 
 const PREFERENCES_KEY = "cordial.preferences";
 const log = (message: string) => console.log(`[cordial] ${message}`);
@@ -36,18 +37,16 @@ function allowNotifications() {
   if (typeof Notification !== "undefined" && Notification.permission === "default") void Notification.requestPermission();
 }
 
-function notify(title: string, body: string) {
+function notify(title: string, body: string | null) {
   if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
-  new Notification(title, { body, icon }).addEventListener("click", () => window.focus());
+  new Notification(title, { ...(body === null ? {} : { body }), icon }).addEventListener("click", () => window.focus());
 }
 
 /** Starts the controller; `simulate` adapters replace Web Serial when above zero. */
 export async function startWebBackend(simulate: number): Promise<DesktopApi> {
   const serial = navigator.serial;
-  const ports =
-    simulate > 0 || !serial
-      ? (await import("../fake/ports.ts")).simulatedPorts(simulate)
-      : { listPorts: () => listPorts(serial), openTransport: openWebSerial };
+  const simulated = simulate > 0 || !serial ? (await import("../fake/ports.ts")).simulatedPorts(simulate) : null;
+  const ports = simulated ?? { listPorts: () => listPorts(serial!), openTransport: openWebSerial };
   const listeners = new Set<(state: AppState) => void>();
   const controller = new Controller({
     ...ports,
@@ -61,7 +60,12 @@ export async function startWebBackend(simulate: number): Promise<DesktopApi> {
     lowBattery: (alert) =>
       notify(alert.level === "critical" ? `${alert.name}'s battery is critically low.` : `${alert.name} has a low battery.`, `The battery is at ${alert.percent}%. Charge it soon.`),
     connection: (name, connected) => notify(name, connected ? "Connected" : "Disconnected"),
+    profileAlert: (alert) => {
+      const { title, body } = profileAlertText(alert);
+      notify(title, body);
+    },
   });
+  simulated?.onHotplug(() => controller.manager.burst());
   if (serial && !simulate) {
     serial.addEventListener("connect", () => controller.manager.burst());
     serial.addEventListener("disconnect", () => controller.manager.burst());
@@ -97,7 +101,7 @@ export async function startWebBackend(simulate: number): Promise<DesktopApi> {
     act: (action) => {
       // Still inside the click that turned a notification on.
       if (action.type === "preferences" && notifying({ ...controller.preferences, ...action.preferences })) allowNotifications();
-      return controller.act(action);
+      return controller.request(action);
     },
   };
 }

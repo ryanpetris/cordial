@@ -14,12 +14,12 @@ export const until = async (check: () => boolean, ms = 3000) => {
 };
 
 /** A device record as the app keeps it. */
-export function record(id: string, patch: Partial<DeviceRecord> = {}): DeviceRecord {
+export function record(id: number, patch: Partial<DeviceRecord> = {}): DeviceRecord {
   return {
     id,
     transport: "ble",
-    name: id,
-    kind: "keyboard",
+    name: String(id),
+    kinds: ["keyboard"],
     state: "disconnected",
     enabled: true,
     trusted: true,
@@ -31,6 +31,8 @@ export function record(id: string, patch: Partial<DeviceRecord> = {}): DeviceRec
     hidpp: null,
     info: [],
     roles: [],
+    profiles: [],
+    profileError: null,
     ...patch,
   };
 }
@@ -55,9 +57,10 @@ export function controller(fakes: Record<string, FakeAdapter>) {
     published: vi.fn((s: AppState) => (state = s)),
     lowBattery: vi.fn(),
     connection: vi.fn(),
+    profileAlert: vi.fn(),
     log: vi.fn(),
     ports: fakes,
-    listPorts: async () => (ports.list ? ports.list() : Object.entries(deps.ports).map(([path, f]) => ({ path, serial: f.id }))),
+    listPorts: async () => (ports.list ? ports.list() : Object.entries(deps.ports).filter(([, f]) => f.present).map(([path, f]) => ({ path, serial: f.serial }))),
     openTransport: async (path: string) => {
       ports.opened++;
       const f = deps.ports[path];

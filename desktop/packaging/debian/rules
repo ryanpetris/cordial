@@ -7,6 +7,9 @@ execute_after_dh_install:
 	install -Dm644 payload/cordial-desktop.desktop debian/cordial-desktop/usr/share/applications/cordial-desktop.desktop
 	install -Dm644 payload/cordial-desktop.png debian/cordial-desktop/usr/share/icons/hicolor/512x512/apps/cordial-desktop.png
 	install -Dm644 debian/cordial-desktop.apparmor debian/cordial-desktop/etc/apparmor.d/cordial-desktop
+	# Each package names its own copy of the rules, so both packages can be installed.
+	install -Dm644 payload/50-cordial.rules debian/cordial-desktop/usr/lib/udev/rules.d/50-cordial-desktop.rules
+	rm debian/cordial-desktop/opt/cordial-desktop/50-cordial.rules
 	dh_apparmor --profile-name=cordial-desktop
 
 # Preserve the supplied Electron and native module binaries.

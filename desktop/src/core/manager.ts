@@ -1,9 +1,9 @@
 // Finds Cordial adapters and keeps one session open to each. A USB serial
 // port with the Cordial ID is only a candidate: it becomes an adapter once
 // the adapter answers its first request. Removal is silent.
-import type { ByteStream, PortInfo } from "@cordial/client";
+import { serialMatches, type ByteStream, type PortInfo } from "@cordial/client";
 import type { Event, Request, Response } from "@cordial/protocol";
-import type { AdapterStatus } from "../shared/state.ts";
+import type { AdapterStatus, Profile, ProfilePage } from "../shared/state.ts";
 import { AdapterSession } from "./session.ts";
 
 export interface ManagerDeps {
@@ -38,10 +38,21 @@ export interface Disconnected {
 const BURST_MS = [0, 300, 1000, 3000];
 /** A session that fails this soon after opening isn't reopened automatically. */
 const UNSTABLE_MS = 10000;
+/** Keeps configuration pages mounted while USB re-enumerates. */
+const RECONNECT_MS = 15000;
+
+interface Reconnecting {
+  status: AdapterStatus;
+  profilePage: ProfilePage | null;
+  pickerPage: ProfilePage | null;
+  profileNames: Record<string, Profile>;
+  timer: ReturnType<typeof setTimeout>;
+}
 
 export class AdapterManager {
   readonly connected = new Map<string, Connected>();
   readonly disconnected = new Map<string, Disconnected>();
+  readonly reconnecting = new Map<string, Reconnecting>();
   readonly #deps: ManagerDeps;
   readonly #probing = new Set<string>();
   readonly #opened = new WeakMap<AdapterSession, number>();
@@ -90,11 +101,13 @@ export class AdapterManager {
     for (const [id, c] of this.connected)
       if (!paths.has(c.path)) {
         this.connected.delete(id);
+        this.#retain(c);
         c.session.close().catch(() => {});
         changed = true;
       }
-    // Without serial numbers (Web Serial), a disconnected adapter is known by its port.
-    const holds = (d: Disconnected, p: PortInfo) => (p.serial === null ? p.path === d.path : p.serial === d.id);
+    // A disconnected adapter is known by the adapter ID that begins its USB serial number, or by
+    // its port where serial numbers can't be read (Web Serial).
+    const holds = (d: Disconnected, p: PortInfo) => (p.serial === null ? p.path === d.path : serialMatches(p.serial, d.id));
     for (const d of this.disconnected.values()) {
       const path = ports.find((p) => holds(d, p))?.path ?? null;
       if (path !== d.path) {
@@ -130,13 +143,6 @@ export class AdapterManager {
         }
         return;
       }
-      // The USB serial number is the adapter ID; it is how a
-      // disconnected adapter is recognized without opening its port.
-      if (port.serial !== null && port.serial !== id) {
-        this.#deps.log(`${port.path}: adapter ${id} reports USB serial ${port.serial || "(none)"}; ignoring it`);
-        await session.close();
-        return;
-      }
       this.#register(id, port.path, session);
     } finally {
       this.#probing.delete(port.path);
@@ -168,6 +174,7 @@ export class AdapterManager {
   }
 
   #register(id: string, path: string, session: AdapterSession) {
+    this.#forgetRetained(id);
     this.connected.set(id, { id, path, session });
     this.#opened.set(session, Date.now());
     session.run();
@@ -182,10 +189,31 @@ export class AdapterManager {
     this.#opened.delete(session);
     if (!entry) return;
     this.connected.delete(entry.id);
+    this.#retain(entry);
     this.#deps.log(`${entry.path}: session ended: ${error.message}`);
     this.#deps.changed();
     if (Date.now() - opened >= UNSTABLE_MS && !this.#stopped)
       this.#timers.push(setTimeout(() => void this.rescan(), 500));
+  }
+
+  #forgetRetained(id: string) {
+    const retained = this.reconnecting.get(id);
+    if (retained) clearTimeout(retained.timer);
+    this.reconnecting.delete(id);
+  }
+
+  #retain(entry: Connected) {
+    this.#forgetRetained(entry.id);
+    this.reconnecting.set(entry.id, {
+      status: entry.session.status,
+      profilePage: entry.session.profilePage,
+      pickerPage: entry.session.pickerPage,
+      profileNames: Object.fromEntries(entry.session.profileNames),
+      timer: setTimeout(() => {
+        this.reconnecting.delete(entry.id);
+        this.#deps.changed();
+      }, RECONNECT_MS),
+    });
   }
 
   /** Closes an adapter's session and keeps it listed as disconnected. */
@@ -243,6 +271,7 @@ export class AdapterManager {
   async stop() {
     this.#stopped = true;
     for (const t of this.#timers) clearTimeout(t);
+    for (const id of this.reconnecting.keys()) this.#forgetRetained(id);
     const sessions = [...this.connected.values()].map((c) => c.session);
     this.connected.clear();
     await Promise.all([...this.#closing.values(), ...sessions.map((s) => s.close().catch(() => {}))]);

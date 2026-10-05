@@ -7,7 +7,7 @@ import type {
   AdapterStatus,
   Battery,
   Code,
-  DeviceEntry,
+  DeviceKind,
   DeviceRecord,
   DeviceWarning,
   HostPlatform,
@@ -15,6 +15,8 @@ import type {
   Inactive,
   IntegrationStateName,
   Integration,
+  KindName,
+  ProfileAlert,
   ReportTypeName,
   RoleName,
   Scalar,
@@ -34,7 +36,7 @@ const ERRORS: Record<Code, string> = {
   bad_args: "the adapter rejected the command's arguments",
   too_long: "the request was too large for the adapter",
   not_ready: "the adapter's Bluetooth or storage isn't ready. Try again in a moment",
-  not_found: "the adapter couldn't find this device or setting",
+  not_found: "the adapter couldn't find this device, setting or profile",
   not_connected: "the device isn't connected. Connect it first",
   busy: "the adapter is busy. Try again when the current operation finishes",
   disabled: "the device is turned off in Cordial; turn on “Use This Device” first",
@@ -44,6 +46,7 @@ const ERRORS: Record<Code, string> = {
   no_prompt: "that pairing prompt is no longer waiting for an answer",
   storage_failed: "the adapter couldn't save the change. Your saved data hasn't changed",
   internal: "the adapter hit an unexpected failure",
+  in_use: "this profile is still in use. Remove it from every device and interface before deleting it",
   candidate_expired: "this device is no longer available. Search again",
   auth_failed: "Bluetooth authentication failed",
   rejected: "authentication was rejected by you or the device",
@@ -64,6 +67,7 @@ const CAPACITY: Record<NonNullable<WireError["reason"]>, string> = {
   enabled: "every enabled-device place is in use; turn off another device first",
   storage: "the adapter's storage is full. Remove an unused device or forget a saved setting, then try again",
   connections: "every connection is in use; disconnect a device first",
+  profile_memory: "the adapter doesn't have enough profile memory for this change",
 };
 
 /** An adapter error as a sentence for the window or a notification. */
@@ -190,14 +194,40 @@ export const INFO_LABELS: Record<string, string> = {
   "product.version": "Product Version",
 };
 
-const KINDS: Record<DeviceEntry["kind"], string> = {
+const KINDS: Record<DeviceKind, string> = {
   keyboard: "Keyboard",
   mouse: "Mouse",
   keyboard_mouse: "Keyboard and Mouse",
   other: "Other",
 };
 
-export const kindText = (kind: DeviceEntry["kind"]) => KINDS[kind];
+export const kindText = (kind: DeviceKind) => KINDS[kind];
+
+/** What the app shows a device or candidate as, from what it says it is, else from the input its
+ * HID descriptor produces. */
+export function displayKind(kinds: KindName[], roles: RoleName[] = []): DeviceKind {
+  const keyboard = kinds.includes("keyboard") || (!kinds.length && roles.includes("keyboard"));
+  const mouse = kinds.includes("mouse") || (!kinds.length && roles.includes("mouse"));
+  return keyboard && mouse ? "keyboard_mouse" : keyboard ? "keyboard" : mouse ? "mouse" : "other";
+}
+
+/** Why a connected device's profiles aren't loaded. */
+export function profileErrorText(code: Code): string {
+  if (code === "no_capacity") return "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.";
+  if (code === "storage_failed") return "The adapter couldn't read one of this device's profiles.";
+  return codeText(code);
+}
+
+/** A profile alert's notification; a memory alert has no body. */
+export function profileAlertText(alert: ProfileAlert): { title: string; body: string | null } {
+  return alert.kind === "memory"
+    ? { title: `${alert.name} is almost out of profile memory.`, body: null }
+    : { title: `${alert.name} connected without its profiles.`, body: profileErrorText(alert.code) };
+}
+
+/** How full the adapter's profile memory is, as a whole percentage; null without a budget. */
+export const memoryPercent = (s: AdapterStatus | null) =>
+  s?.profileSupport?.memoryBudget ? Math.round((s.profileSupport.memoryUsed / s.profileSupport.memoryBudget) * 100) : null;
 
 export function infoValue(f: InfoEntry): string {
   const v = f.value;

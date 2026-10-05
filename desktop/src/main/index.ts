@@ -20,6 +20,7 @@ import { Controller } from "../core/controller.ts";
 import { listPorts, openSerial } from "@cordial/client/node";
 import { hostPlatform, watchHotplug } from "../node/host.ts";
 import { preferencesFrom, type Action, type AppState, type Navigation, type Preferences } from "../shared/state.ts";
+import { profileAlertText } from "../shared/text.ts";
 import { trayModel, type TrayModel } from "./tray-model.ts";
 import { closeNotifications, showNotification } from "./notifications.ts";
 
@@ -247,9 +248,9 @@ function updateTray(state: AppState) {
 const plain = (s: string) =>
   process.platform === "linux" ? s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : s;
 
-function notify(title: string, body: string, to?: Navigation) {
+function notify(title: string, body: string | null, to?: Navigation) {
   showNotification(
-    { title, body: plain(body), icon: nativeImage.createFromPath(join(icons, "app.png")) },
+    { title, ...(body === null ? {} : { body: plain(body) }), icon: nativeImage.createFromPath(join(icons, "app.png")) },
     to ? () => showWindow(to) : undefined,
   );
 }
@@ -257,7 +258,7 @@ function notify(title: string, body: string, to?: Navigation) {
 // ---- Actions ---------------------------------------------------------------
 
 async function act(action: Action) {
-  const result = await controller.act(action);
+  const result = await controller.request(action);
   if (!result.ok && !window?.isVisible()) notify("Cordial", result.message);
   return result;
 }
@@ -320,7 +321,8 @@ void app.whenReady().then(async () => {
   const preferences = loadPreferences();
   savedAutostart = preferences.startAtLogin;
   const fake = Number(process.env.CORDIAL_DESKTOP_SIMULATE ?? 0);
-  const ports = fake > 0 ? (await import("../fake/ports.ts")).simulatedPorts(fake) : { listPorts, openTransport: openSerial };
+  const simulated = fake > 0 ? (await import("../fake/ports.ts")).simulatedPorts(fake) : null;
+  const ports = simulated ?? { listPorts, openTransport: openSerial };
   controller = new Controller({
     ...ports,
     log,
@@ -338,6 +340,10 @@ void app.whenReady().then(async () => {
         { page: "device", key: alert.key },
       ),
     connection: (name, connected) => notify(name, connected ? "Connected" : "Disconnected"),
+    profileAlert: (alert) => {
+      const { title, body } = profileAlertText(alert);
+      notify(title, body, alert.kind === "memory" ? { page: "adapter", id: alert.adapterId } : { page: "device", key: alert.key });
+    },
   });
 
   ipcMain.handle("state", (event) => {
@@ -364,7 +370,8 @@ void app.whenReady().then(async () => {
   });
 
   Menu.setApplicationMenu(null);
-  if (!fake) stopHotplug = await watchHotplug(() => controller.manager.burst(), log);
+  if (simulated) simulated.onHotplug(() => controller.manager.burst());
+  else stopHotplug = await watchHotplug(() => controller.manager.burst(), log);
   controller.changed();
   await controller.manager.rescan();
   if (!hidden) showWindow();

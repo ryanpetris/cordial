@@ -1,35 +1,51 @@
 //! Execute real 32-bit core allocations under QEMU, without radio/USB hardware.
+//!
+//! The workloads run with one Pico board's configuration, against the heap span of its linked
+//! development firmware. Saved records live in LittleFS over a static flash array outside the
+//! measured heap, as they live in flash on the board. The heap holds what the firmware keeps in
+//! RAM: its platform and Bluetooth state, the mounted filesystem, resident reconnection entries,
+//! the state of connected devices, loaded profiles, and the transient buffers of reading and
+//! writing records.
 #![no_std]
 #![no_main]
 extern crate alloc;
 mod discovery;
-use alloc::{boxed::Box, vec, vec::Vec};
+use alloc::{boxed::Box, format, vec, vec::Vec};
+use cordial_core::model::{
+    errors::ErrorCode as Error, hidpp::*, identifiers::Transport, link::PromptMethod, settings::*,
+};
+use cordial_core::{
+    application::{Application, Build},
+    bluetooth::{
+        Bluetooth, Capabilities, Descriptor, Event, InputReport, Layout as HidLayout, LayoutReport,
+        ReportMap, ReportType,
+    },
+    bonds::{Bond, Keys, Security},
+    compact::{Metadata, Observed, Range, Record, scalar},
+    devices::{AdapterPreference, Device, Live, Peer, Policies, Policy, Transports},
+    interfaces::{Interface, InterfacePreference},
+    link::{Link, LinkId, Profile, ServiceId, WriteId},
+    manager::Connection,
+    profiles::{self, Effect, KEYBOARD, KEYBOARD_PAGE, Output as RuleOutput, Rule, Rules},
+    storage::{self, Preferences},
+};
+use cordial_protocol::{frame, request::Command};
 use core::{
     alloc::{GlobalAlloc, Layout},
     cell::UnsafeCell,
     fmt::{self, Write},
 };
 use embassy_futures::block_on;
-use cordial_core::{
-    application::{Application, Build},
-    bluetooth::{Bluetooth, Capabilities, Descriptor, Event, Layout as HidLayout, ReportType},
-    compact::{Metadata, Observed, Range, Record, scalar},
-    devices::{Device, Peer, Policy},
-    link::{Link, LinkId, Profile, ServiceId, WriteId},
-    manager::Connection,
-    storage::{self, Preferences, RecordKey, RecordStore},
-};
-use cordial_core::model::{
-    errors::ErrorCode as Error, hidpp::*, identifiers::Transport, link::PromptMethod,
-    settings::*,
-};
-use cordial_protocol::{frame, request::Command};
+use embedded_storage_async::nor_flash::{ErrorType, NorFlash, NorFlashErrorKind, ReadNorFlash};
 use prost::Message;
 use talc::{TalcCell, source::Manual};
 struct Heap {
     talc: TalcCell<Manual>,
     peak: usize,
     reject_after: usize,
+    /// The host's side of the serial session, outside the measured heap.
+    host: TalcCell<Manual>,
+    hosting: bool,
 }
 struct Allocator(UnsafeCell<Heap>);
 // This executable has one thread, interrupts disabled, and no asynchronous IRQs.
@@ -39,12 +55,33 @@ static HEAP: Allocator = Allocator(UnsafeCell::new(Heap {
     talc: TalcCell::new(Manual),
     peak: 0,
     reject_after: 0,
+    host: TalcCell::new(Manual),
+    hosting: false,
 }));
-const ARENA_BYTES: usize = include!(concat!(env!("OUT_DIR"), "/budget.rs"));
+const ARENA_BYTES: usize = board::HEAP_BYTES;
 static mut ARENA: [u8; ARENA_BYTES] = [0; ARENA_BYTES];
+const HOST_BYTES: usize = 64 * 1024;
+static mut HOST: [u8; HOST_BYTES] = [0; HOST_BYTES];
+fn hosted(p: *mut u8) -> bool {
+    let start = core::ptr::addr_of!(HOST).addr();
+    (start..start + HOST_BYTES).contains(&p.addr())
+}
+/// Runs `f` as the host: what it allocates is outside the measured heap.
+fn host<R>(f: impl FnOnce() -> R) -> R {
+    // Each write ends before `f` reaches the allocator.
+    unsafe { (*HEAP.0.get()).hosting = true };
+    let result = f();
+    unsafe { (*HEAP.0.get()).hosting = false };
+    result
+}
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let h = unsafe { &mut *self.0.get() };
+        if h.hosting {
+            let p = unsafe { h.host.alloc(layout) };
+            assert!(!p.is_null(), "the host arena is full");
+            return p;
+        }
         if h.reject_after != 0 {
             h.reject_after -= 1;
             if h.reject_after == 0 {
@@ -70,10 +107,20 @@ unsafe impl GlobalAlloc for Allocator {
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-        unsafe { (*self.0.get()).talc.dealloc(p, layout) };
+        let h = unsafe { &mut *self.0.get() };
+        if hosted(p) {
+            unsafe { h.host.dealloc(p, layout) };
+        } else {
+            unsafe { h.talc.dealloc(p, layout) };
+        }
     }
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, n: usize) -> *mut u8 {
         let h = unsafe { &mut *self.0.get() };
+        if hosted(p) {
+            let next = unsafe { h.host.realloc(p, layout, n) };
+            assert!(!next.is_null(), "the host arena is full");
+            return next;
+        }
         let next = unsafe { h.talc.realloc(p, layout, n) };
         if next.is_null() {
             writeln!(
@@ -160,27 +207,123 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     writeln!(Output, "{info}").ok();
     exit(1)
 }
-struct Store;
-impl RecordStore for Store {
-    async fn keys(&mut self) -> Result<alloc::vec::Vec<RecordKey>, storage::Error> {
-        Ok(alloc::vec::Vec::new())
-    }
-    async fn available(&mut self) -> Result<usize, storage::Error> {
-        Ok(65536)
-    }
 
-    async fn load(&mut self, _: RecordKey, _: &mut [u8]) -> Result<Option<usize>, storage::Error> {
-        Ok(None)
+/// The board under test, from its generated configuration: `BOARD`, `HEAP_BYTES` and
+/// `PROFILE_MEMORY_BUDGET`.
+mod board {
+    include!(concat!(env!("OUT_DIR"), "/board.rs"));
+}
+/// Saved devices: IDs 1..=8 are BLE and 9..=16 Classic. Each transport's stack holds eight bonds,
+/// one kept free for pairing, so 1..=7 and 9..=15 are resident and 8 and 16 are not.
+const DEVICES: u64 = 16;
+const RESIDENT: usize = 14;
+/// Saved profiles on a board with profiles, each a full VIA keymap: one remap rule for every
+/// input the editor's matrix selects.
+const PROFILES: u64 = 12;
+/// Connected devices and their layers on a board with profiles; the VIA editor uses profile 1.
+/// Together they load profiles 1..=7, within the budget. `OVER_BUDGET` gives device 9 layers that
+/// need all twelve, which do not fit.
+const CONNECTED: [(u64, [u64; 2]); 4] = [(1, [1, 2]), (2, [2, 3]), (3, [4, 5]), (9, [6, 7])];
+const OVER_BUDGET: core::ops::RangeInclusive<u32> = 6..=12;
+const EDITOR_PROFILE: u64 = 1;
+
+/// The board's record storage: LittleFS over flash. The flash is a static array outside the
+/// measured heap; the mounted filesystem's state and every transient buffer of reading and
+/// writing records are on the heap, as on the board. A filesystem's heap use does not depend on
+/// its size, so every board uses the Pico W's 1 MiB.
+const STORAGE_BLOCKS: usize = 255;
+const STORAGE_BYTES: usize = (STORAGE_BLOCKS + 1) * 4096;
+static mut FLASH: [u8; STORAGE_BYTES] = [0; STORAGE_BYTES];
+struct RamFlash;
+impl RamFlash {
+    fn bytes(&mut self) -> &'static mut [u8; STORAGE_BYTES] {
+        // One thread, and each access ends before the next begins.
+        unsafe { &mut *core::ptr::addr_of_mut!(FLASH) }
     }
-    async fn save(&mut self, _: RecordKey, bytes: &[u8]) -> Result<(), storage::Error> {
-        core::hint::black_box(bytes);
+}
+impl ErrorType for RamFlash {
+    type Error = NorFlashErrorKind;
+}
+impl ReadNorFlash for RamFlash {
+    const READ_SIZE: usize = 1;
+    async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        let at = offset as usize;
+        bytes.copy_from_slice(&self.bytes()[at..at + bytes.len()]);
         Ok(())
     }
-    async fn remove(&mut self, _: RecordKey) -> Result<(), storage::Error> {
+    fn capacity(&self) -> usize {
+        STORAGE_BYTES
+    }
+}
+impl NorFlash for RamFlash {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = 4096;
+    async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+        self.bytes()[from as usize..to as usize].fill(0xff);
+        Ok(())
+    }
+    async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+        let at = offset as usize;
+        for (to, from) in self.bytes()[at..at + bytes.len()].iter_mut().zip(bytes) {
+            *to &= *from;
+        }
         Ok(())
     }
 }
-struct Radio;
+/// The board's store: a bad layout leaves storage unavailable.
+type Store = Result<cordial_record_storage::Storage<RamFlash, STORAGE_BLOCKS>, storage::Error>;
+/// The application reaches storage through the BTstack adapter's handle, as on the board.
+type Disk = cordial_btstack::storage::Handle<'static, Store>;
+
+#[derive(Default)]
+struct Radio {
+    /// The link the last incoming connection was admitted as.
+    accepted: Option<LinkId>,
+    /// Whether that connection was given a saved layout.
+    supplied: bool,
+    scan: u64,
+    /// Links whose Disconnected event the backend has yet to deliver.
+    ended: [Option<(LinkId, Option<Error>)>; 8],
+    /// The copy of its saved layout the backend keeps for each link, until it has verified the
+    /// layout against the device or the link ends.
+    layouts: [Option<HidLayout>; cordial_core::devices::ACTIVE_CONNECTIONS],
+}
+impl Radio {
+    /// The backend keeps a copy of a saved layout it starts a link with.
+    fn keep(&mut self, link: LinkId, layout: Option<&HidLayout>) {
+        self.layouts[usize::from(link.slot)] = layout.cloned();
+    }
+    /// The backend verifies a link's saved layout: it reads each report map and the report table
+    /// again, compares them with its copy and releases both. BLE links verify one at a time.
+    fn verify(&mut self, link: LinkId) {
+        let Some(supplied) = self.layouts[usize::from(link.slot)].take() else {
+            return;
+        };
+        let mut read: [Option<Vec<u8>>; cordial_core::bluetooth::LAYOUT_SERVICES] =
+            Default::default();
+        for (to, map) in read.iter_mut().zip(&supplied.maps) {
+            *to = Some(map.0.clone());
+        }
+        let layout = HidLayout {
+            maps: read
+                .iter_mut()
+                .map_while(Option::take)
+                .map(ReportMap)
+                .collect(),
+            reports: supplied.reports.clone(),
+            hash: supplied.hash,
+        };
+        assert!(layout == supplied);
+    }
+    fn end(&mut self, link: LinkId, error: Option<Error>) {
+        let free = self
+            .ended
+            .iter_mut()
+            .find(|e| e.is_none())
+            .expect("ended links");
+        *free = Some((link, error));
+    }
+}
 impl Bluetooth for Radio {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -189,17 +332,45 @@ impl Bluetooth for Radio {
             ble_scan_and_connect: false,
         }
     }
-    fn scan(&mut self, _: u64, _: bool, _: bool) -> Result<(), Error> {
+    /// The Pico BTstack configuration's eight Classic link keys and eight LE device entries.
+    fn bond_capacity(&self, _: Transport) -> usize {
+        8
+    }
+    fn scan(&mut self, id: u64, _: bool, _: bool) -> Result<(), Error> {
+        self.scan = id;
         Ok(())
     }
-    fn reconnect(&mut self, _: &[Peer]) -> Result<(), Error> { Ok(()) }
-    fn connect(&mut self, _: LinkId, _: Peer, _: bool, _: Option<&HidLayout>) -> Result<(), Error> {
+    fn reconnect(&mut self, _: &[Peer]) -> Result<(), Error> {
         Ok(())
     }
-    fn incoming(&mut self, _: u32, _: Option<LinkId>, _: Option<&HidLayout>) -> Result<(), Error> {
+    /// Background paging finds no device: the page fails.
+    fn connect(
+        &mut self,
+        link: LinkId,
+        _: Peer,
+        pairing: bool,
+        layout: Option<&HidLayout>,
+    ) -> Result<(), Error> {
+        self.keep(link, layout.filter(|_| !pairing));
+        self.end(link, Some(Error::ConnectionFailed));
         Ok(())
     }
-    fn disconnect(&mut self, _: LinkId) {}
+    fn incoming(
+        &mut self,
+        _: u32,
+        accept: Option<LinkId>,
+        layout: Option<&HidLayout>,
+    ) -> Result<(), Error> {
+        self.accepted = accept;
+        self.supplied = layout.is_some();
+        if let Some(link) = accept {
+            self.keep(link, layout);
+        }
+        Ok(())
+    }
+    fn disconnect(&mut self, link: LinkId) {
+        self.end(link, None);
+    }
     fn adopt(&mut self, _: LinkId) -> Result<(), Error> {
         Ok(())
     }
@@ -234,6 +405,9 @@ impl Bluetooth for Radio {
     ) -> Result<(), Error> {
         Ok(())
     }
+    async fn import_bond(&mut self, _: &Bond) -> Result<(), Error> {
+        Ok(())
+    }
     async fn bonds(&mut self) -> Result<Vec<Peer>, Error> {
         Ok(Vec::new())
     }
@@ -241,7 +415,122 @@ impl Bluetooth for Radio {
         Ok(())
     }
 }
-fn records(maximum: bool) -> Vec<Record> {
+
+fn peer(id: u64) -> Peer {
+    let ble = id <= DEVICES / 2;
+    Peer {
+        address: [if ble { id as u8 } else { 0x80 | id as u8 }; 6],
+        random: false,
+        transport: if ble {
+            Transport::Ble
+        } else {
+            Transport::Classic
+        },
+    }
+}
+fn bond(id: u64) -> Bond {
+    let identity = peer(id);
+    Bond {
+        owner: id,
+        identity,
+        complete: true,
+        keys: if identity.transport == Transport::Classic {
+            Keys::Classic {
+                key: [42; 16],
+                kind: 4,
+            }
+        } else {
+            Keys::Ble {
+                local: Security::default(),
+                peer: Security {
+                    flags: 7,
+                    key_size: 16,
+                    ltk: [42; 16],
+                    irk: [43; 16],
+                    csrk: [44; 16],
+                    ..Security::default()
+                },
+            }
+        },
+    }
+}
+/// Whether the board supports profiles.
+const PROFILES_SUPPORTED: bool = board::PROFILE_MEMORY_BUDGET.is_some();
+/// The rules of a full VIA keymap: every input the editor's matrix selects remapped to a key,
+/// every fourth with Left Control held too. The matrix's unused positions select no input.
+fn via_rules(profile: u64) -> Rules {
+    let key = |id: u16| RuleOutput {
+        usage: profiles::usage(KEYBOARD_PAGE, id),
+        collection: KEYBOARD,
+    };
+    let rules = (0..cordial_core::configurator::KEYS)
+        .filter_map(cordial_core::configurator::input)
+        .enumerate()
+        .map(|(index, input)| {
+            let mut outputs = vec![key(4 + ((index as u16 + profile as u16) % 161))];
+            if index % 4 == 0 {
+                outputs.push(key(0xe0));
+            }
+            Rule {
+                input,
+                effect: Effect::Remap(outputs),
+            }
+            .normalized()
+            .unwrap()
+        })
+        .collect();
+    Rules::new(rules).unwrap()
+}
+/// Saves what a long-used adapter holds: devices and, on a board with profiles, profiles the
+/// devices use and the VIA interface's preference.
+fn provision(store: &mut Disk) {
+    block_on(storage::open(store)).unwrap();
+    block_on(storage::initialized(store)).unwrap();
+    if PROFILES_SUPPORTED {
+        for profile in 1..=PROFILES {
+            let (id, _) = block_on(profiles::create(
+                store,
+                &format!("VIA keymap {profile}"),
+                &via_rules(profile),
+            ))
+            .unwrap();
+            assert_eq!(id, profile);
+        }
+    }
+    let mut transports = Transports::NONE;
+    for transport in Transports::ALL {
+        transports.set(transport, true);
+    }
+    block_on(Policies { store }.save_adapter(&AdapterPreference {
+        transports,
+        configuration_interfaces: if PROFILES_SUPPORTED {
+            vec![InterfacePreference {
+                interface: Interface::Via,
+                enabled: true,
+                profile: Some(EDITOR_PROFILE),
+            }]
+        } else {
+            Vec::new()
+        },
+        ..AdapterPreference::default()
+    }))
+    .unwrap();
+    for id in 1..=DEVICES {
+        let mut policy = Policy::paired(id, peer(id), &[b'x'; 128]);
+        policy.setup_pending = false;
+        policy.bond = id;
+        // Devices that stay disconnected hold the most layers a device can have.
+        if PROFILES_SUPPORTED {
+            policy.profiles = match CONNECTED.iter().find(|(device, _)| *device == id) {
+                Some((_, layers)) => layers.to_vec(),
+                None => (1..=profiles::MAX_LAYERS as u64).collect(),
+            };
+        }
+        block_on(cordial_core::bonds::commit(store, &policy, &bond(id))).unwrap();
+    }
+}
+
+fn records_for(maximum: bool) -> Vec<Record> {
     let keys: &[SettingKey] = if maximum {
         &SettingKey::ALL
     } else {
@@ -320,115 +609,6 @@ fn features(maximum: bool) -> Vec<Feature> {
         })
         .collect()
 }
-fn populate(app: &mut Application, devices: usize, saved: usize, maximum: bool) {
-    for n in 0..devices {
-        let peer = Peer {
-            address: [n as u8; 6],
-            random: false,
-            transport: Transport::Ble,
-        };
-        let mut d = Device::new(Policy::paired(n as u64 + 1, peer, &[b'x'; 128]));
-        d.catalog.connection(true, true);
-        if maximum {
-            discovery::run(&mut d.catalog);
-        } else {
-            d.catalog
-                .replace_discovery(records(false), features(false))
-                .unwrap();
-        }
-        let mut writable: Vec<_> = d.catalog.records().iter().filter(|r| r.writable).collect();
-        writable.sort_by_key(|r| core::cmp::Reverse(r.metadata.choices.len()));
-        let chosen: Vec<_> = writable
-            .into_iter()
-            .take(saved)
-            .map(|r| {
-                (
-                    r.metadata.key,
-                    r.metadata
-                        .choices
-                        .first()
-                        .copied()
-                        .unwrap_or_else(|| r.metadata.range.map_or(1, |v| v.min)),
-                )
-            })
-            .collect();
-        assert_eq!(chosen.len(), saved);
-        for (key, value) in chosen {
-            block_on(d.catalog.set(
-                key,
-                scalar(key, value),
-                &mut Preferences {
-                    store: &mut Store,
-                    device: n as u64 + 1,
-                },
-            ))
-            .unwrap();
-        }
-        if app.manager.devices.len() <= n {
-            app.manager.devices.resize_with(n + 1, || None);
-        }
-        app.manager.devices[n] = Some(d);
-    }
-}
-fn refresh(app: &mut Application, maximum: bool) {
-    for d in app.manager.devices.iter_mut().flatten() {
-        if maximum {
-            discovery::run(&mut d.catalog);
-        } else {
-            d.catalog
-                .replace_discovery(records(false), features(false))
-                .unwrap();
-        }
-    }
-}
-fn observations(app: &mut Application, maximum: bool) {
-    // Real read/event handlers mutate individual rows in the live catalog.
-    // They do not rebuild every disconnected device's inventory at once.
-    for d in app.manager.devices.iter_mut().take(4).flatten() {
-        d.catalog.invalidate();
-        if maximum {
-            use cordial_core::model::info::InfoKey as I;
-            d.catalog.info.battery.configure(cordial_core::model::identifiers::Transport::Ble, false);
-            for instance in 0..4 {
-                d.catalog.info.battery.gatt(0x2a19, instance, &[50]);
-                d.catalog.info.battery.gatt(0x2bed, instance, &[0,0x21,0]);
-                d.catalog.info.battery.gatt(0x2bf0, instance, &[0]);
-                d.catalog.info.battery.gatt(0x2be9, instance, &[1]);
-            }
-            for key in I::ALL {
-                for instance in 0..key.instances() {
-                    let value = match key {
-                        I::BatteryPercent => SettingValue::Integer(50),
-                        I::BatteryCharging => SettingValue::Bool(true),
-                        I::VendorIdNamespace => SettingValue::Text("usb".into()),
-                        I::VendorId | I::ProductId | I::ProductVersion => SettingValue::Integer(65535),
-                        I::Kind => SettingValue::Text("keyboard".into()),
-                        _ => SettingValue::Text("\\".repeat(64)),
-                    };
-                    d.catalog.info.observe(false,key,instance,value.clone());
-                    d.catalog.info.observe(true,key,instance,value);
-                }
-            }
-            d.catalog.info.changes();
-        }
-        for key in if maximum {
-            &SettingKey::ALL[..]
-        } else {
-            &[SettingKey::FnRowDefault, SettingKey::BacklightEnabled]
-        } {
-            let row = d
-                .catalog
-                .records()
-                .iter()
-                .find(|r| r.metadata.key == *key)
-                .unwrap();
-            let value = row.observed.wire(*key);
-            d.catalog
-                .observe(*key, value, 4, ObservationSource::Read)
-                .unwrap();
-        }
-    }
-}
 fn descriptor(maximum: bool, reports: usize) -> Vec<u8> {
     let mut descriptor = vec![
         5, 1, 9, 6, 0xa1, 1, 5, 7, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 1,
@@ -460,209 +640,497 @@ fn descriptor(maximum: bool, reports: usize) -> Vec<u8> {
     descriptor.push(0xc0);
     descriptor
 }
-fn reports(app: &mut Application, count: usize, maximum: bool) {
-    for n in 0..count {
-        let id = LinkId {
-            slot: n as u8,
-            generation: 1,
-        };
-        app.manager.connections[n] = Some(Connection {
-            security: Some(cordial_core::bluetooth::ConnectionSecurity {
-                encrypted: Some(true),
-                authenticated: Some(false),
-                secure_connections: Some(true),
-                key_size: Some(16),
-                bonded: Some(true),
-            }),
-            id,
-            peer: app.manager.devices[n].as_ref().unwrap().policy.peer,
-            device: Some(n),
-            runtime: None,
-            closing: false,
-            setup_failed: false,
-            maps: None,
-            error: None,
-            deadline: 0,
-        });
-        let raw = descriptor(maximum, 16);
-        let mut parsed: [Option<Descriptor>; 3] = core::array::from_fn(|_| None);
-        for (service, entry) in parsed.iter_mut().enumerate().take(if maximum { 3 } else { 1 }) {
-            *entry = Some(Descriptor::from_slice(ServiceId(service as u16), &raw).unwrap());
-        }
-        let descriptors = parsed.into_iter().flatten().collect();
-        drop(raw);
-        app.manager.connected(id, descriptors, 512, 0).unwrap();
-    }
-    for d in app.manager.devices.iter_mut().skip(count).flatten() {
-        d.catalog.connection(false, true);
-    }
-    for _ in 0..8 {
-        block_on(app.poll(&mut Store, &mut Radio, 0, 0));
-    }
+static mut MAX_DESCRIPTOR: [u8; 2048] = [0; 2048];
+/// The real C callback supplies its descriptors from static storage.
+fn max_descriptor() -> &'static [u8] {
+    unsafe { &*core::ptr::addr_of!(MAX_DESCRIPTOR) }
 }
-fn send(app: &mut Application, command: Command) {
-    let mut bytes = alloc::vec::Vec::new();
-    frame::encode(
-        &cordial_protocol::Request {
-            command: Some(command),
+/// The services of a device: BLE devices expose three HID services, Classic devices one.
+fn services(transport: Transport) -> u16 {
+    if transport == Transport::Ble { 3 } else { 1 }
+}
+/// The layout a backend discovers, the largest a saved layout file holds.
+fn discovered(transport: Transport) -> HidLayout {
+    let services = services(transport);
+    HidLayout {
+        maps: (0..services)
+            .map(|_| ReportMap(max_descriptor().to_vec()))
+            .collect(),
+        reports: if transport == Transport::Ble {
+            (0..services)
+                .flat_map(|service| {
+                    (1..=10u8).map(move |id| LayoutReport {
+                        service,
+                        kind: ReportType::Input,
+                        id,
+                        value: 0x100 * (service + 1) + u16::from(id) * 4,
+                        properties: 0x12,
+                        cccd: 0x100 * (service + 1) + u16::from(id) * 4 + 1,
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
         },
-        &mut bytes,
-    );
-    let (_, request) = app.serial.feed(&bytes);
-    block_on(app.dispatch(request.unwrap(), &mut Store, &mut Radio, 1));
-}
-/// Writes out everything queued, returning the number of scan candidates reported.
-fn drain(app: &mut Application) -> usize {
-    let mut decoder = frame::Decoder::new(None);
-    let mut candidates = 0;
-    while let Some((token, bytes)) = app.serial.output(64) {
-        let len = bytes.len();
-        for &b in bytes {
-            if let Some(frame) = decoder.push(b) {
-                let message = cordial_protocol::Message::decode(frame.unwrap()).unwrap();
-                candidates += usize::from(matches!(
-                    message.kind,
-                    Some(cordial_protocol::message::Kind::Event(cordial_protocol::Event {
-                        kind: Some(cordial_protocol::event::Kind::ScanFound(_))
-                    }))
-                ));
-            }
-        }
-        app.serial.output_complete(token, len);
+        hash: (transport == Transport::Ble)
+            .then_some(cordial_core::bluetooth::DatabaseHash([7; 16])),
     }
-    candidates
-}
-fn candidates(app: &mut Application, scan: u64) {
-    send(
-        app,
-        Command::StartScan(cordial_protocol::StartScan {
-            transports: alloc::vec![cordial_protocol::Transport::Ble as i32],
-            seconds: 60,
-        }),
-    );
-    drain(app);
-    for n in 0..32 {
-        block_on(app.event(
-            Event::Found {
-                kind: cordial_core::model::link::DeviceKind::Unknown,
-                connectable: true,
-                scan,
-                address: Some(Peer {
-                    address: [n; 6],
-                    random: false,
-                    transport: Transport::Ble,
-                }),
-                peer: Peer {
-                    address: [n; 6],
-                    random: false,
-                    transport: Transport::Ble,
-                },
-                name: "\\".repeat(128).into(),
-                rssi: Some(-127),
-            },
-            &mut Store,
-            &mut Radio,
-            1,
-        ));
-    }
-    // One event goes out per poll, and saved devices may still have events waiting.
-    let mut found = 0;
-    for _ in 0..96 {
-        block_on(app.poll(&mut Store, &mut Radio, 0, 2));
-        found += drain(app);
-    }
-    assert_eq!(found, 32);
-    send(app, Command::StopScan(cordial_protocol::StopScan {}));
-    drain(app);
 }
 
-fn reconnect(app: &mut Application, maximum: bool, slot: usize) {
-    if !maximum {
-        return;
-    }
-    // The real C callback supplies its descriptor from static storage.
-    let raw = unsafe { &*core::ptr::addr_of!(MAX_DESCRIPTOR) };
-    let peer = app.manager.devices[slot].as_ref().unwrap().policy.peer;
-    let id = LinkId {
-        slot: slot as u8,
-        generation: 2,
-    };
-    app.manager.connections[slot] = Some(Connection {
-        security: Some(cordial_core::bluetooth::ConnectionSecurity {
-            encrypted: Some(true),
-            authenticated: Some(false),
-            secure_connections: Some(true),
-            key_size: Some(16),
-            bonded: Some(true),
-        }),
-        id,
-        peer,
-        device: Some(slot),
-        runtime: None,
-        closing: false,
-        setup_failed: false,
-        maps: None,
-        error: None,
-        deadline: 0,
-    });
-    // The callback retains maps inline before forming the Connected event.
-    let parsed: [Descriptor; 3] = core::array::from_fn(|service| {
-        Descriptor::from_slice(ServiceId(service as u16), raw).unwrap()
-    });
-    let descriptors = parsed.into_iter().collect();
-    app.manager.connected(id, descriptors, 512, 0).unwrap();
+struct Fixture {
+    /// The firmware allocates the application, shared by its two loops, on the heap.
+    app: Box<Application>,
+    store: Disk,
+    radio: Radio,
+    now: u64,
+    /// The request for the next page of the last list the host read.
+    next: Option<Command>,
 }
-fn commands(app: &mut Application, devices: usize, maximum: bool, scan: u64) {
-    reconnect(app, maximum, scan as usize % 4);
-    if maximum {
-        for _ in 0..8 {
-            block_on(app.poll(&mut Store, &mut Radio, 0, 0));
-        }
-        refresh(app, maximum);
-    }
-    app.session(true, &mut Radio);
-    send(app, Command::GetStatus(cordial_protocol::GetStatus {}));
-    drain(app);
-    // A frame that is not a request is answered without reaching the application.
-    let invalid = [3, 0xff, 0xff, 0];
-    assert_eq!(app.serial.feed(&invalid), (invalid.len(), None));
-    drain(app);
-    if maximum {
-        candidates(app, scan);
-    }
-    for n in 0..devices.min(4) {
-        send(
-            app,
-            Command::ListSettings(cordial_protocol::ListSettings {
-                device: alloc::format!("d_{:016x}", n + 1),
-            }),
+impl Fixture {
+    fn event(&mut self, event: Event) {
+        block_on(
+            self.app
+                .event(event, &mut self.store, &mut self.radio, self.now),
         );
-        drain(app);
     }
-    for _ in 0..3 {
-        send(app, Command::GetStatus(cordial_protocol::GetStatus {}));
-        drain(app);
+    fn poll(&mut self, count: usize) {
+        for _ in 0..count {
+            block_on(self.app.poll(&mut self.store, &mut self.radio, 0, self.now));
+            self.ended();
+            self.usb();
+            self.drain();
+        }
     }
-    observations(app, maximum);
-    // Retain a full output queue while observations change live records.
-    block_on(app.poll(&mut Store, &mut Radio, 0, 2));
-    observations(app, maximum);
-    unsafe {
-        (*HEAP.0.get()).reject_after = 1;
+    /// The USB host takes every HID report the adapter has ready.
+    fn usb(&mut self) {
+        while self.app.manager.forward.packet().is_some() {
+            self.app.manager.forward.complete();
+        }
     }
-    assert!(matches!(
-        Descriptor::from_slice(ServiceId(0), unsafe { &*core::ptr::addr_of!(MAX_DESCRIPTOR) }),
-        Err(Error::Capacity)
-    ));
-    reconnect(app, maximum, (scan as usize + 1) % 4);
-    for _ in 0..128 {
-        block_on(app.poll(&mut Store, &mut Radio, 0, 2));
-        drain(app);
+    /// The device sends a key press and its release on its first service.
+    fn type_key(&mut self, id: u64) {
+        let slot = self.slot(id);
+        let link = self.app.manager.link_for(slot).expect("connected device");
+        for payload in [[1, 0], [0, 0]] {
+            let report = InputReport::new(link, ServiceId(0), 1, &payload).unwrap();
+            self.event(Event::Input(report));
+        }
+        assert!(
+            self.app.manager.link_for(slot).is_some(),
+            "device {id} kept its link"
+        );
     }
-    assert!(Descriptor::from_slice(ServiceId(0), unsafe { &*core::ptr::addr_of!(MAX_DESCRIPTOR) }).is_ok());
-    app.session(false, &mut Radio);
+    /// Delivers the Disconnected events of links the backend has ended.
+    fn ended(&mut self) {
+        while let Some((link, error)) = self.radio.ended.iter_mut().find_map(Option::take) {
+            self.radio.layouts[usize::from(link.slot)] = None;
+            self.event(Event::Disconnected { link, error });
+        }
+    }
+    /// The host sends one request; the adapter reads and answers it.
+    fn send(&mut self, command: Command) {
+        let bytes = host(|| {
+            let mut bytes = Vec::new();
+            frame::encode(
+                &cordial_protocol::Request {
+                    command: Some(command),
+                },
+                &mut bytes,
+            );
+            bytes
+        });
+        let (_, request) = self.app.serial.feed(&bytes);
+        drop(bytes);
+        block_on(
+            self.app
+                .dispatch(request.unwrap(), &mut self.store, &mut self.radio, self.now),
+        );
+        self.drain();
+    }
+    /// The host sends a list request and then one for each further page.
+    fn list(&mut self, command: Command) {
+        self.send(command);
+        while let Some(next) = self.next.take() {
+            self.send(next);
+        }
+    }
+    /// Writes out everything queued, returning the number of scan candidates reported. The host
+    /// notes the request for the next page of a list response that does not end.
+    fn drain(&mut self) -> usize {
+        use cordial_protocol::{event, message::Kind, response};
+        let mut decoder = host(|| frame::Decoder::new(None));
+        let mut candidates = 0;
+        let next = &mut self.next;
+        while let Some((token, bytes)) = self.app.serial.output(64) {
+            let len = bytes.len();
+            host(|| {
+                for &b in bytes {
+                    let Some(frame) = decoder.push(b) else {
+                        continue;
+                    };
+                    let message = cordial_protocol::Message::decode(frame.unwrap()).unwrap();
+                    match message.kind {
+                        Some(Kind::Event(cordial_protocol::Event {
+                            kind: Some(event::Kind::ScanFound(_)),
+                        })) => candidates += 1,
+                        Some(Kind::Response(cordial_protocol::Response {
+                            result: Some(response::Result::Settings(page)),
+                        })) if !page.end => {
+                            let last = page.settings.last().expect("a page that ends early");
+                            *next = Some(Command::ListSettings(cordial_protocol::ListSettings {
+                                device: page.device,
+                                after: Some(cordial_protocol::SettingRef {
+                                    integration: last.integration,
+                                    key: last.key.clone(),
+                                }),
+                            }));
+                        }
+                        Some(Kind::Response(cordial_protocol::Response {
+                            result: Some(response::Result::ProfileRules(page)),
+                        })) if !page.end => {
+                            let last = page.rules.last().expect("a page that ends early");
+                            *next = Some(Command::ListProfileRules(
+                                cordial_protocol::ListProfileRules {
+                                    profile: page.profile,
+                                    after: Some(last.input.expect("a rule's input")),
+                                },
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            self.app.serial.output_complete(token, len);
+        }
+        candidates
+    }
+    fn slot(&self, id: u64) -> usize {
+        self.app.manager.find(id).expect("resident device")
+    }
+    fn live(&mut self, id: u64) -> &mut Live {
+        let slot = self.slot(id);
+        self.app.manager.devices[slot]
+            .as_mut()
+            .unwrap()
+            .live
+            .as_deref_mut()
+            .expect("connected device")
+    }
+    /// The device connects to the adapter, which admits it with its saved layout when it has
+    /// one. Its profiles load before its first input. A device that is `typing` sends input at
+    /// once; another sends none before the adapter stops waiting for it.
+    fn connect(&mut self, id: u64, typing: bool) {
+        let peer = peer(id);
+        self.radio.accepted = None;
+        self.event(Event::Incoming {
+            attempt: id as u32,
+            peer,
+        });
+        let link = self.radio.accepted.take().expect("admitted connection");
+        let descriptors = (0..services(peer.transport))
+            .map(|service| Descriptor::from_slice(ServiceId(service), max_descriptor()).unwrap())
+            .collect();
+        let layout = (!self.radio.supplied).then(|| discovered(peer.transport));
+        self.event(Event::Connected {
+            link,
+            descriptors,
+            max_output: 512,
+            layout,
+        });
+        assert!(self.live(id).profile_error.is_none());
+        // Background storage work waits for the connection's first input, which forwards at
+        // once; then the connection reads the policy and saved preferences.
+        self.poll(2);
+        assert!(self.live(id).policy.is_none());
+        if typing {
+            self.type_key(id);
+        } else {
+            self.now += cordial_core::manager::FIRST_INPUT_WAIT_MS;
+        }
+        self.poll(8);
+        assert!(self.live(id).policy.is_some());
+    }
+    fn disconnect(&mut self, id: u64) {
+        let slot = self.slot(id);
+        let link = self.app.manager.link_for(slot).expect("connected device");
+        self.radio.layouts[usize::from(link.slot)] = None;
+        self.event(Event::Disconnected { link, error: None });
+        assert!(
+            self.app.manager.devices[slot]
+                .as_ref()
+                .unwrap()
+                .live
+                .is_none()
+        );
+    }
+    /// The backend verifies the saved layouts of connected devices, after their connections
+    /// have started up.
+    fn verify(&mut self, ids: &[u64]) {
+        for &id in ids {
+            let slot = self.slot(id);
+            let link = self.app.manager.link_for(slot).expect("connected device");
+            self.radio.verify(link);
+        }
+    }
+    /// One VIA packet; returns the reply.
+    fn via(&mut self, packet: &[u8]) -> [u8; 32] {
+        let mut data = [0; 32];
+        data[..packet.len()].copy_from_slice(packet);
+        block_on(
+            self.app
+                .configure(Interface::Via, data, &mut self.store, self.now),
+        )
+    }
+    fn discover(&mut self, ids: &[u64], maximum: bool) {
+        for &id in ids {
+            let catalog = &mut self.live(id).catalog;
+            if maximum {
+                discovery::run(catalog);
+            } else {
+                catalog
+                    .replace_discovery(records_for(false), features(false))
+                    .unwrap();
+            }
+        }
+    }
+    /// Saves `saved` preferences of each connected device, as SetSettings does.
+    fn save_preferences(&mut self, ids: &[u64], saved: usize) {
+        for &id in ids {
+            let live = self.live(id);
+            let mut writable: Vec<_> = live
+                .catalog
+                .records()
+                .iter()
+                .filter(|r| r.writable)
+                .collect();
+            writable.sort_by_key(|r| core::cmp::Reverse(r.metadata.choices.len()));
+            let chosen: Vec<_> = writable
+                .into_iter()
+                .take(saved)
+                .map(|r| {
+                    (
+                        r.metadata.key,
+                        r.metadata
+                            .choices
+                            .first()
+                            .copied()
+                            .unwrap_or_else(|| r.metadata.range.map_or(1, |v| v.min)),
+                    )
+                })
+                .collect();
+            assert_eq!(chosen.len(), saved);
+            for (key, value) in chosen {
+                let slot = self.slot(id);
+                let live = self.app.manager.devices[slot]
+                    .as_mut()
+                    .unwrap()
+                    .live
+                    .as_deref_mut()
+                    .unwrap();
+                block_on(live.catalog.set(
+                    key,
+                    scalar(key, value),
+                    &mut Preferences {
+                        store: &mut self.store,
+                        device: id,
+                    },
+                ))
+                .unwrap();
+            }
+        }
+    }
+    fn observations(&mut self, ids: &[u64], maximum: bool) {
+        // Real read/event handlers mutate individual rows in the live catalog.
+        for &id in ids {
+            let catalog = &mut self.live(id).catalog;
+            catalog.invalidate();
+            if maximum {
+                use cordial_core::model::info::InfoKey as I;
+                catalog.info.battery.configure(Transport::Ble, false);
+                for instance in 0..4 {
+                    catalog.info.battery.gatt(0x2a19, instance, &[50]);
+                    catalog.info.battery.gatt(0x2bed, instance, &[0, 0x21, 0]);
+                    catalog.info.battery.gatt(0x2bf0, instance, &[0]);
+                    catalog.info.battery.gatt(0x2be9, instance, &[1]);
+                }
+                for key in I::ALL {
+                    for instance in 0..key.instances() {
+                        let value = match key {
+                            I::BatteryPercent => SettingValue::Integer(50),
+                            I::BatteryCharging => SettingValue::Bool(true),
+                            I::VendorIdNamespace => SettingValue::Text("usb".into()),
+                            I::VendorId | I::ProductId | I::ProductVersion => {
+                                SettingValue::Integer(65535)
+                            }
+                            I::Kind => SettingValue::Text("keyboard".into()),
+                            _ => SettingValue::Text("\\".repeat(64)),
+                        };
+                        catalog.info.observe(false, key, instance, value.clone());
+                        catalog.info.observe(true, key, instance, value);
+                    }
+                }
+                catalog.info.changes();
+            }
+            for key in if maximum {
+                &SettingKey::ALL[..]
+            } else {
+                &[SettingKey::FnRowDefault, SettingKey::BacklightEnabled]
+            } {
+                let row = catalog
+                    .records()
+                    .iter()
+                    .find(|r| r.metadata.key == *key)
+                    .unwrap();
+                let value = row.observed.wire(*key);
+                catalog
+                    .observe(*key, value, 4, ObservationSource::Read)
+                    .unwrap();
+            }
+        }
+    }
+    fn candidates(&mut self) {
+        self.send(Command::StartScan(cordial_protocol::StartScan {
+            transports: vec![cordial_protocol::Transport::Ble as i32],
+            seconds: 60,
+        }));
+        for n in 0..32 {
+            let peer = Peer {
+                address: [0x40 | n; 6],
+                random: false,
+                transport: Transport::Ble,
+            };
+            self.event(Event::Found {
+                kind: cordial_core::model::link::DeviceKind::Unknown,
+                connectable: true,
+                scan: self.radio.scan,
+                address: Some(peer),
+                peer,
+                name: "\\".repeat(128).into(),
+                rssi: Some(-127),
+            });
+        }
+        // One event goes out per poll, and saved devices may still have events waiting.
+        let mut found = 0;
+        for _ in 0..96 {
+            block_on(self.app.poll(&mut self.store, &mut self.radio, 0, self.now));
+            self.ended();
+            found += self.drain();
+        }
+        assert_eq!(found, 32);
+        self.send(Command::StopScan(cordial_protocol::StopScan {}));
+    }
+    fn layers(&mut self, id: u64, profiles: impl IntoIterator<Item = u32>) {
+        self.send(Command::SetDevice(cordial_protocol::SetDevice {
+            device: id as u32,
+            profiles: Some(cordial_protocol::ProfileLayers {
+                profiles: profiles.into_iter().collect(),
+            }),
+            ..Default::default()
+        }));
+    }
+    /// Loaded profiles stay within the budget, and a device whose layers do not fit passes its
+    /// input through until they do.
+    fn budget(&mut self) {
+        let budget = board::PROFILE_MEMORY_BUDGET.unwrap() as usize;
+        assert!(self.app.manager.profiles.used() <= budget);
+        self.app.session(true, &mut self.radio);
+        self.layers(9, OVER_BUDGET);
+        assert_eq!(self.live(9).profile_error, Some(Error::Capacity));
+        assert!(self.app.manager.profiles.used() <= budget);
+        stats("layers over budget");
+        self.layers(9, CONNECTED[3].1.map(|id| id as u32));
+        assert_eq!(self.live(9).profile_error, None);
+        assert!(self.app.manager.profiles.used() <= budget);
+        self.app.session(false, &mut self.radio);
+    }
+    /// Reconnects connected devices: Classic device 9 and one BLE device in turn. A BLE link
+    /// starts only while one connection stays free for pairing, so device 9 leaves first.
+    fn cycle(&mut self, ids: &[u64], turn: usize) {
+        let ble = ids[turn % ids.len().min(3)];
+        let classic = ids.contains(&9);
+        if classic {
+            self.disconnect(9);
+        }
+        self.disconnect(ble);
+        self.connect(ble, true);
+        if classic {
+            self.connect(9, false);
+        }
+    }
+    fn commands(&mut self, ids: &[u64], maximum: bool, turn: usize) {
+        // Long enough for the idle editor to release its profile, and for no drop to be rapid.
+        self.now += 10_000;
+        self.poll(4);
+        self.cycle(ids, turn);
+        // A reconnected catalog holds only its saved preferences until discovery runs again.
+        self.discover(ids, maximum);
+        self.app.session(true, &mut self.radio);
+        self.send(Command::GetStatus(cordial_protocol::GetStatus {}));
+        // A frame that is not a request is answered without reaching the application.
+        let invalid = [3, 0xff, 0xff, 0];
+        assert_eq!(self.app.serial.feed(&invalid), (invalid.len(), None));
+        self.drain();
+        if maximum {
+            self.candidates();
+        }
+        for after in [0, 8] {
+            self.send(Command::ListDevices(cordial_protocol::ListDevices {
+                after,
+            }));
+        }
+        self.send(Command::GetDevice(cordial_protocol::GetDevice {
+            device: DEVICES as u32,
+        }));
+        for &id in ids.iter().chain(&[4]) {
+            self.list(Command::ListSettings(cordial_protocol::ListSettings {
+                device: id as u32,
+                after: None,
+            }));
+        }
+        if PROFILES_SUPPORTED {
+            self.send(Command::ListProfiles(cordial_protocol::ListProfiles {
+                after: 0,
+            }));
+            self.send(Command::GetProfile(cordial_protocol::GetProfile {
+                profile: 1,
+            }));
+            self.list(Command::ListProfileRules(
+                cordial_protocol::ListProfileRules {
+                    profile: PROFILES as u32,
+                    after: None,
+                },
+            ));
+            // The VIA editor reads a key, changes one and reads a block of the keymap.
+            assert_ne!(self.via(&[0x04, 0, 0, 0])[0], 0xff);
+            let code = 4 + (turn % 2) as u8;
+            assert_ne!(self.via(&[0x05, 0, 0, 1, 0, code])[0], 0xff);
+            assert_ne!(self.via(&[0x12, 0, 0, 28])[0], 0xff);
+        } else {
+            // Without profiles, the configuration interfaces answer nothing.
+            assert_eq!(self.via(&[0x04, 0, 0, 0])[0], 0xff);
+        }
+        for _ in 0..3 {
+            self.send(Command::GetStatus(cordial_protocol::GetStatus {}));
+        }
+        self.observations(ids, maximum);
+        // Retain a full output queue while observations change live records.
+        block_on(self.app.poll(&mut self.store, &mut self.radio, 0, self.now));
+        self.ended();
+        self.observations(ids, maximum);
+        unsafe {
+            (*HEAP.0.get()).reject_after = 1;
+        }
+        assert!(matches!(
+            Descriptor::from_slice(ServiceId(0), max_descriptor()),
+            Err(Error::Capacity)
+        ));
+        self.poll(128);
+        assert!(Descriptor::from_slice(ServiceId(0), max_descriptor()).is_ok());
+        self.verify(ids);
+        self.app.session(false, &mut self.radio);
+    }
 }
-static mut MAX_DESCRIPTOR: [u8; 2048] = [0; 2048];
+
 #[cortex_m_rt::entry]
 fn main() -> ! {
     unsafe {
@@ -673,15 +1141,22 @@ fn main() -> ! {
                 .claim(core::ptr::addr_of_mut!(ARENA).cast(), ARENA_BYTES)
                 .is_some()
         );
+        assert!(
+            (*HEAP.0.get())
+                .host
+                .claim(core::ptr::addr_of_mut!(HOST).cast(), HOST_BYTES)
+                .is_some()
+        );
     }
     let template = descriptor(true, 16);
     unsafe {
         (*core::ptr::addr_of_mut!(MAX_DESCRIPTOR)).copy_from_slice(&template);
     }
     drop(template);
+    let profile = via_rules(1).memory();
     writeln!(
         Output,
-        "sizes record={} metadata={} preference={} feature={} profile={} link={} application={} device={} policy={}",
+        "sizes record={} metadata={} preference={} feature={} profile={} link={} application={} device={} live={} policy={} connection={} via_profile={profile}",
         size_of::<Record>(),
         size_of::<Metadata>(),
         size_of::<cordial_core::compact::Preference>(),
@@ -690,62 +1165,172 @@ fn main() -> ! {
         size_of::<Link>(),
         size_of::<Application>(),
         size_of::<Device>(),
-        size_of::<Policy>()
+        size_of::<Live>(),
+        size_of::<Policy>(),
+        size_of::<Connection>(),
     )
     .unwrap();
+    writeln!(
+        Output,
+        "board {} heap={ARENA_BYTES} profile budget {:?}",
+        board::BOARD,
+        board::PROFILE_MEMORY_BUDGET
+    )
+    .unwrap();
+    if let Some(budget) = board::PROFILE_MEMORY_BUDGET {
+        // Profiles 1..=7 fit in the budget together and all twelve do not.
+        let budget = budget as usize;
+        assert!(
+            7 * profile <= budget && budget < PROFILES as usize * profile,
+            "a full VIA profile takes {profile} bytes; the budget scenario needs another layout"
+        );
+    }
+    // What the firmware allocates at startup and keeps: the USB serial number, the mounted
+    // filesystem, the storage and Bluetooth state, the chipset and the application's owner.
+    let serial: *mut str = Box::into_raw("E6613008E35A4733".into());
+    unsafe {
+        core::ptr::addr_of_mut!(FLASH)
+            .cast::<u8>()
+            .write_bytes(0xff, STORAGE_BYTES);
+    }
+    let records = block_on(cordial_record_storage::Storage::open_or_provision_blank(
+        RamFlash,
+        0..STORAGE_BYTES as u32,
+        [0x5a; cordial_record_storage::MARKER_BYTES],
+    ));
+    let storage = Box::into_raw(Box::new(cordial_btstack::storage::Storage::new(records)));
+    // The firmware never frees its storage; the fixture frees it once nothing uses it.
+    let mut store = unsafe { &*storage }.handle();
+    // The records a long-used adapter boots with.
+    provision(&mut store);
     static RADIO_IO: cordial_btstack::transport::Io = cordial_btstack::transport::Io::new();
-    let store = Box::leak(Box::new(cordial_btstack::storage::Storage::new(Store)));
     let backend =
-        cordial_btstack::backend::State::new(store, &RADIO_IO, || 0, || exit(1)).unwrap();
+        cordial_btstack::backend::State::new(unsafe { &*storage }, &RADIO_IO, || 0, || exit(1))
+            .unwrap();
     let backend = Box::new(backend);
-    // Reserve more than the Pico's record-storage scratch/driver state plus
-    // leaked chipset and USB identity. BTstack event storage above is real.
-    let platform_storage = Box::new([0u8; 2048]);
-    core::hint::black_box(&platform_storage);
-    stats("backend and platform reserve");
-    let mut app = Application::new(Build {
-        development: true,
-        version: "0.0.0",
-        board: "pico_w",
-        default_adapter_name: "Test adapter",
-        adapter_id: "E6613008E35A4733".into(),
-        bootloader: None,
+    let chipset = Box::new(cordial_btstack::ffi::Chipset {
+        name: core::ptr::null(),
+        init: None,
+        next_command: None,
+        set_baudrate: None,
+        set_address: None,
     });
-    block_on(app.event(Event::Ready, &mut Store, &mut Radio, 0));
-    stats("empty core");
-    for (label, devices, saved, maximum) in [
-        ("one no preferences", 1, 0, false),
-        ("one two preferences", 1, 2, false),
-        ("eight with sixteen preferences", 8, 16, true),
+    core::hint::black_box(&chipset);
+    let mut fixture = Fixture {
+        app: Box::new(Application::new(Build {
+            development: true,
+            version: "0.0.0",
+            board: board::BOARD,
+            default_adapter_name: "Test adapter",
+            adapter_id: unsafe { &*serial }.into(),
+            profile_memory_budget: board::PROFILE_MEMORY_BUDGET,
+            bootloader: None,
+        })),
+        store,
+        radio: Radio::default(),
+        now: 1,
+        next: None,
+    };
+    // The firmware's two loops share the application, its store and the Bluetooth backend in one
+    // heap allocation; this holds the rest of it beside the application's own.
+    type Owner = cordial_usb::owner::Owner<'static, Disk, cordial_btstack::backend::Backend<Store>>;
+    let owner = vec![0u8; size_of::<Owner>() - size_of::<Application>()];
+    core::hint::black_box(&owner);
+    stats("platform, storage, Bluetooth state and application");
+    // USB is configured and the host reads its input reports.
+    fixture.app.manager.forward.enable(true);
+    fixture.event(Event::Ready);
+    assert!(fixture.app.manager.storage_ready && fixture.app.manager.radio_ready);
+    let resident: Vec<u64> = fixture
+        .app
+        .manager
+        .devices
+        .iter()
+        .flatten()
+        .map(|d| d.id)
+        .collect();
+    assert_eq!(resident.len(), RESIDENT);
+    assert!(!resident.contains(&(DEVICES / 2)) && !resident.contains(&DEVICES));
+    drop(resident);
+    assert!(
+        fixture
+            .app
+            .manager
+            .devices
+            .iter()
+            .flatten()
+            .all(|d| d.live.is_none())
+    );
+    assert_eq!(fixture.app.manager.profiles.used(), 0);
+    stats("resident entries");
+    for (label, count, saved, maximum) in [
+        ("one device, no preferences", 1, 0, false),
+        ("one device, two preferences", 1, 2, false),
+        ("four devices, sixteen preferences", 4, 16, true),
     ] {
-        populate(&mut app, devices, saved, maximum);
+        let ids: Vec<u64> = CONNECTED[..count].iter().map(|(id, _)| *id).collect();
+        for &id in &ids {
+            fixture.connect(id, true);
+        }
+        stats("connected");
+        fixture.discover(&ids, maximum);
+        fixture.save_preferences(&ids, saved);
+        if maximum {
+            // Every device reconnects at once, as after the adapter restarts: each starts with its
+            // saved layout, which the backend keeps until it verifies it.
+            for &id in &ids {
+                fixture.disconnect(id);
+            }
+            for &id in &ids {
+                fixture.connect(id, true);
+            }
+            fixture.discover(&ids, maximum);
+        }
         stats("catalogs");
-        reports(&mut app, devices.min(4), maximum);
+        if let Some(budget) = board::PROFILE_MEMORY_BUDGET {
+            assert_ne!(fixture.via(&[0x04, 0, 0, 0])[0], 0xff);
+            for (index, &id) in ids.iter().enumerate() {
+                let slot = fixture.slot(id);
+                let link = fixture.app.manager.link_for(slot).unwrap();
+                assert_eq!(
+                    fixture.app.manager.forward.layers(link.slot as usize).len(),
+                    2
+                );
+                assert_eq!(fixture.live(id).profile_error, None, "device {index}");
+            }
+            assert!(fixture.app.manager.profiles.used() <= budget as usize);
+            stats("profiles loaded");
+            if maximum {
+                fixture.budget();
+            }
+        }
+        fixture.verify(&ids);
+        // Reconnecting reads the saved layout, policy, preferences and profiles back.
+        fixture.commands(&ids, maximum, 0);
         stats(label);
-        refresh(&mut app, maximum);
-        commands(&mut app, devices, maximum, 1);
+        fixture.commands(&ids, maximum, 1);
         let steady = stats("warm steady state");
-        for scan in 2..=101 {
-            refresh(&mut app, maximum);
-            commands(&mut app, devices, maximum, scan);
+        for turn in 2..=101 {
+            fixture.commands(&ids, maximum, turn);
         }
         assert_eq!(stats("after refresh/commands"), steady);
         assert!(largest_block(unsafe { &*HEAP.0.get() }) >= 4096);
-        for link in &mut app.manager.connections {
-            *link = None;
+        for &id in &ids {
+            fixture.disconnect(id);
         }
-        for d in &mut app.manager.devices {
-            *d = None;
-        }
-        stats("after disconnect/forget");
+        // The idle editor releases its profile; nothing else holds one.
+        fixture.now += 10_000;
+        fixture.poll(4);
+        assert_eq!(fixture.app.manager.profiles.used(), 0);
+        stats("after disconnect");
     }
-    drop(app);
+    drop(fixture);
+    drop(owner);
+    drop(chipset);
     drop(backend);
-    drop(platform_storage);
     unsafe {
-        drop(Box::from_raw(
-            store as *const _ as *mut cordial_btstack::storage::Storage<Store>,
-        ));
+        drop(Box::from_raw(storage));
+        drop(Box::from_raw(serial));
     }
     assert_eq!(stats("all allocations dropped"), 0);
     exit(0)

@@ -90,8 +90,16 @@ impl Packet {
     }
 }
 
-/// Queues source transitions without allocating in the input or USB paths.
+/// New profile layers for a source, with any new press-time state allocated before they apply.
+pub struct MappingUpdate {
+    source: usize,
+    layers: alloc::vec::Vec<crate::profiles::Map>,
+    mapper: Option<alloc::boxed::Box<crate::profiles::Mapper>>,
+}
+
+/// Queues source transitions and retains actions for held mapped inputs.
 pub struct Forwarder {
+    mappings: [Option<alloc::boxed::Box<crate::profiles::Mapper>>; SOURCES],
     received: [Held; SOURCES],
     applied: [Held; SOURCES],
     sent: Held,
@@ -114,6 +122,7 @@ pub struct Forwarder {
 impl Default for Forwarder {
     fn default() -> Self {
         Self {
+            mappings: core::array::from_fn(|_| None),
             received: [Held::default(); SOURCES],
             applied: [Held::default(); SOURCES],
             sent: Held::default(),
@@ -158,7 +167,55 @@ impl Forwarder {
             }
         }
     }
-    pub fn input(&mut self, source: usize, input: Input) -> Result<(), Error> {
+    /// The layers `source` applies now.
+    pub fn layers(&self, source: usize) -> &[crate::profiles::Map] {
+        self.mappings
+            .get(source)
+            .and_then(Option::as_ref)
+            .map_or(&[], |mapper| mapper.layers.as_slice())
+    }
+    pub fn prepare_maps(
+        &self,
+        source: usize,
+        layers: alloc::vec::Vec<crate::profiles::Map>,
+    ) -> Result<MappingUpdate, Error> {
+        let mut mapper = None;
+        if self.mappings[source].is_none() && !layers.is_empty() {
+            // Inputs already held keep their unmapped outputs until released.
+            let mut prepared = crate::profiles::Mapper::new();
+            prepared.held(self.received[source])?;
+            mapper = Some(alloc::boxed::Box::new(prepared));
+        }
+        Ok(MappingUpdate {
+            source,
+            layers,
+            mapper,
+        })
+    }
+    pub fn apply_maps(&mut self, update: MappingUpdate) {
+        let MappingUpdate {
+            source,
+            layers,
+            mapper,
+        } = update;
+        if let Some(mapper) = mapper {
+            self.mappings[source] = Some(mapper);
+        }
+        if let Some(mapper) = &mut self.mappings[source] {
+            mapper.layers = layers;
+        }
+    }
+    pub fn input(&mut self, source: usize, mut input: Input) -> Result<(), Error> {
+        if source >= SOURCES {
+            return Err(Error::Invalid);
+        }
+        if let Some(mapper) = &mut self.mappings[source] {
+            input.held = mapper.held(input.held)?;
+            mapper.motion(&mut input);
+        }
+        self.mapped_input(source, input)
+    }
+    fn mapped_input(&mut self, source: usize, input: Input) -> Result<(), Error> {
         if source >= SOURCES {
             return Err(Error::Invalid);
         }
@@ -193,7 +250,7 @@ impl Forwarder {
         if repetitions > 0 {
             let mut first = input;
             first.pulse_repetition_count = 0;
-            self.input(source, first)?;
+            self.mapped_input(source, first)?;
             if self.enabled {
                 for &usage in &input.pulse_repetitions[..repetitions] {
                     let mut repeat = Input {
@@ -201,7 +258,7 @@ impl Forwarder {
                         ..Input::default()
                     };
                     repeat.pulse(usage)?;
-                    self.input(source, repeat)?;
+                    self.mapped_input(source, repeat)?;
                 }
             }
             return Ok(());
@@ -319,6 +376,7 @@ impl Forwarder {
         if source >= SOURCES {
             return;
         }
+        self.mappings[source] = None;
         self.received[source] = Held::default();
         for state in self
             .received_sliders

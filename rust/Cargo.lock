@@ -325,7 +325,9 @@ dependencies = [
  "critical-section",
  "embassy-futures",
  "embassy-sync",
+ "embassy-time",
  "embassy-usb",
+ "prost",
 ]
 
 [[package]]

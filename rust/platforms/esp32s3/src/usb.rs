@@ -24,6 +24,9 @@ pub struct Driver<'d>(otg::Driver<'d>);
 #[derive(Clone, Copy)]
 pub struct TransferCompletion;
 impl Completion for TransferCompletion {
+    fn disconnect(&self, disconnected: bool) {
+        registers().dctl().modify(|r| r.set_sdis(disconnected));
+    }
     async fn wait(&self, endpoint: EndpointAddress) -> Result<(), EndpointError> {
         loop {
             let r = registers();

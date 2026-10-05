@@ -1,11 +1,11 @@
 //! The foreground session with one adapter, shared by the shell, scripts and the TUI. It keeps
 //! the view current from the Dongle's events and runs each command on its own thread.
 pub use crate::view::{SessionId, State};
-use crate::{error::Error, view::Pending};
+use crate::{error::Error, profiles::InterfaceUpdate, view::Pending};
 use cordial_client::{Connection, Received};
 use cordial_protocol::{self as p, request};
 use std::{
-    io,
+    fmt, io,
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
@@ -59,7 +59,7 @@ pub enum Phase {
 #[allow(clippy::large_enum_variant)]
 pub enum Notice {
     /// An event, already applied to the view. `first` marks a candidate or device the view
-    /// didn't hold before; `changed` lists the setting keys a settings event changed.
+    /// didn't hold before; `changed` lists the setting keys a settings_changed event changed.
     Event {
         event: p::Event,
         first: bool,
@@ -126,11 +126,80 @@ pub enum Toggle {
     Hidpp,
 }
 
+/// A device, candidate or profile as a command names it: an ID, or a name to look up.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Target {
+    Id(u32),
+    Name(String),
+}
+
+impl Target {
+    /// A typed word: a number is always an ID, and anything else is a name.
+    pub fn parse(word: &str) -> Result<Self, String> {
+        if word.is_empty() || !word.bytes().all(|b| b.is_ascii_digit()) {
+            return Ok(Self::Name(word.to_owned()));
+        }
+        word.parse()
+            .map(Self::Id)
+            .map_err(|_| format!("{word} is not a valid ID"))
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Id(id) => write!(f, "{id}"),
+            Self::Name(name) => f.write_str(name),
+        }
+    }
+}
+
+/// Adapter settings saved together in one request; `None` and an empty list leave a setting
+/// unchanged. Lists apply in order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AdapterUpdate {
+    pub platform: Option<p::Platform>,
+    /// Whether each listed transport is enabled.
+    pub transports: Vec<(p::Transport, bool)>,
+    pub interfaces: Vec<InterfaceUpdate>,
+}
+
+impl AdapterUpdate {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Device preferences saved together in one request; `None` leaves a preference unchanged.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeviceUpdate {
+    pub enabled: Option<bool>,
+    pub trusted: Option<bool>,
+    pub blocked: Option<bool>,
+    pub hidpp: Option<bool>,
+    /// The device's layers: profile IDs in the order they apply.
+    pub layers: Option<Vec<u32>>,
+}
+
+impl DeviceUpdate {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum SettingInput {
     /// Text typed in the shell, typed by the setting.
     Text(String),
     Value(p::value::Value),
+}
+
+/// A profile chosen for a configuration interface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Pick {
+    /// No profile.
+    Clear,
+    Profile(Target),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -141,6 +210,12 @@ pub enum Command {
     Platform(p::Platform),
     /// Enables or disables a transport.
     Transport(p::Transport, bool),
+    /// Changes one configuration interface's preferences.
+    Interface {
+        interface: p::ConfigurationInterface,
+        enabled: Option<bool>,
+        profile: Option<Pick>,
+    },
     Bootloader,
     /// Scans the transports, or every supported one when empty, for `seconds` (0 means the
     /// adapter's default).
@@ -149,31 +224,56 @@ pub enum Command {
         seconds: u32,
     },
     ScanStop,
-    Pair(String),
+    /// Pairs a candidate.
+    Pair(Target),
     /// Answers the open pairing prompt, with the code it asks for.
     Accept(Option<String>),
     Reject,
     CancelPairing,
     Devices,
-    Get(String),
-    Connect(String),
-    Disconnect(String),
-    Unpair(String),
-    Refresh(String),
-    Set(String, Toggle, bool),
-    Warnings(String),
-    Settings(String),
-    SettingGet(String, String),
-    SettingSet(String, String, SettingInput),
-    SettingForget(String, String),
-    /// Saves and forgets several settings of one device: values in one write, then forgets in
-    /// one write.
+    Get(Target),
+    Connect(Target),
+    Disconnect(Target),
+    Unpair(Target),
+    Refresh(Target),
+    Set(Target, Toggle, bool),
+    /// Sets a device's layers: profiles in the order they apply, or none.
+    Layers(Target, Vec<Target>),
+    Warnings(Target),
+    Settings(Target),
+    SettingGet(Target, String),
+    SettingSet(Target, String, SettingInput),
+    SettingForget(Target, String),
+    /// Saves and forgets several settings of one device in one request.
     SettingsSave {
-        device: String,
+        device: u32,
         set: Vec<(String, p::value::Value)>,
         forget: Vec<String>,
     },
-    Features(String),
+    Features(Target),
+    /// One page of saved profiles with IDs above `after`.
+    Profiles {
+        after: u32,
+    },
+    /// Every saved profile, read page by page.
+    AllProfiles,
+    /// A profile's name and roles.
+    ProfileShow(Target),
+    /// Reads a profile's name, for showing where it is used.
+    ProfileLookup(u32),
+    /// Creates an empty profile.
+    ProfileCreate(String),
+    /// Copies a profile under a new name.
+    ProfileCopy(Target, String),
+    ProfileDelete(Target),
+    /// Every rule of a profile.
+    Rules(Target),
+    /// Saves or forgets one rule of a profile.
+    RuleChange(Target, p::ProfileRuleChange),
+    /// Saves several adapter settings in one request.
+    AdapterSave(AdapterUpdate),
+    /// Saves several preferences of one device in one request.
+    DeviceSave(u32, DeviceUpdate),
     Files(String),
     /// Downloads an adapter file; an existing destination is replaced only with `overwrite`.
     FileGet {
@@ -197,7 +297,7 @@ impl Command {
 /// A device or candidate as a result names it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Subject {
-    pub id: String,
+    pub id: u32,
     pub name: String,
 }
 
@@ -205,10 +305,16 @@ pub struct Subject {
 #[allow(clippy::large_enum_variant)] // One result per command.
 pub enum Outcome {
     Status(p::Status),
-    Name(String),
+    /// The adapter's new name; `reset` when it is the adapter's default name.
+    Name {
+        name: String,
+        reset: bool,
+    },
     Platform(p::Platform),
     /// Whether a transport is enabled, as the adapter saved it.
     Transport(p::Transport, bool),
+    /// A configuration interface's preferences, as the adapter saved them.
+    Interface(p::ConfigurationInterface, p::Status),
     Bootloader,
     ScanStarted(Vec<p::Transport>),
     ScanFinished {
@@ -230,8 +336,6 @@ pub enum Outcome {
         subject: Subject,
         device: p::Device,
     },
-    Candidate(p::Candidate),
-    Hidden(Subject),
     Unpaired(Subject),
     Refreshing(Subject),
     Warnings {
@@ -254,6 +358,23 @@ pub enum Outcome {
         subject: Subject,
         features: Vec<p::Feature>,
     },
+    /// A page of profiles and the cursor it was read after, or every profile as one page that
+    /// ends the listing.
+    Profiles {
+        after: u32,
+        list: p::ProfileList,
+    },
+    /// A created, copied, shown or looked up profile.
+    Profile(p::Profile),
+    ProfileDeleted(p::Profile),
+    /// A profile and its rules: every rule as listed, or the input's rule as a change saved it,
+    /// none when the change forgot it.
+    Rules {
+        profile: p::Profile,
+        rules: Vec<p::ProfileRule>,
+    },
+    /// The adapter's status after an `AdapterSave`.
+    AdapterSaved(p::Status),
     Files {
         path: String,
         entries: Vec<p::FileEntry>,
@@ -364,15 +485,28 @@ impl Session {
         Ok(response)
     }
 
-    /// Lists the saved devices and their warnings.
+    /// Reads every page of saved devices and the warnings of each connected one, and the
+    /// names of the profiles devices and configuration interfaces use.
     fn load(&self) -> Result<(), Error> {
         let devices = self
             .connection
-            .list_devices()
+            .all_devices()
             .map_err(|e| Error::from_client(e, "device list"))?;
-        for d in &devices {
+        for id in crate::profiles::unnamed(&self.state()) {
+            // A name that can't be read is shown as the profile's ID.
+            let _ = self.connection.get_profile(id);
+        }
+        // A device has warnings only while it has a link.
+        for d in devices.iter().filter_map(|e| match &e.entry {
+            Some(p::device_list_entry::Entry::Device(d))
+                if d.state() != p::DeviceState::Disconnected =>
+            {
+                Some(d)
+            }
+            _ => None,
+        }) {
             self.connection
-                .list_warnings(&d.id)
+                .all_warnings(d.id)
                 .map_err(|e| Error::from_client(e, "warning list"))?;
         }
         self.cell.update(|st| st.loaded = true);
@@ -384,12 +518,9 @@ impl Session {
         self.connection.close();
     }
 
-    /// Marks a running command for progress shown beside its target.
-    pub fn pending(&self, command: &'static str, target: Option<&str>) -> PendingGuard<'_> {
-        let pending = Pending {
-            command,
-            target: target.map(str::to_owned),
-        };
+    /// Marks a running command for progress shown beside its target; 0 for none.
+    pub fn pending(&self, command: &'static str, target: u32) -> PendingGuard<'_> {
+        let pending = Pending { command, target };
         self.cell.update(|st| st.pending.push(pending.clone()));
         PendingGuard {
             session: self,
@@ -533,10 +664,10 @@ impl Controller {
     }
 
     /// Hides a candidate until the next scan.
-    pub fn hide_candidate(&self, id: &str) {
+    pub fn hide_candidate(&self, id: u32) {
         let session = self.inner.active.lock().unwrap().session.clone();
         if let Some(session) = session {
-            session.cell.update(|st| st.hidden.insert(id.to_owned()));
+            session.cell.update(|st| st.hidden.insert(id));
         }
     }
 }
@@ -583,14 +714,14 @@ fn open(inner: &Arc<Shared>, id: SessionId, port: String, old: Option<Arc<Sessio
                 let Some(kind) = &event.kind else { return };
                 let (first, changed) = cell.update(|st| {
                     let first = match kind {
-                        p::event::Kind::ScanFound(c) => st.candidate(&c.id).is_none(),
-                        p::event::Kind::Device(d) => st.device(&d.id).is_none(),
+                        p::event::Kind::ScanFound(c) => st.candidate(c.id).is_none(),
+                        p::event::Kind::Device(d) => st.device(d.id).is_none(),
                         _ => false,
                     };
                     let changed = match kind {
-                        p::event::Kind::Settings(s) => {
-                            let old = st.settings_of(&s.device);
-                            s.settings
+                        p::event::Kind::SettingsChanged(s) => {
+                            let old = st.settings_of(s.device);
+                            s.changed
                                 .iter()
                                 .filter(|n| !old.contains(n))
                                 .map(|n| n.key.clone())

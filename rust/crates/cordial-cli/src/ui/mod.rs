@@ -5,6 +5,7 @@ pub mod command;
 #[cfg(test)]
 mod fake;
 pub mod field;
+mod reconnect;
 mod shell;
 mod term;
 pub mod text;
@@ -81,7 +82,7 @@ pub(crate) trait Backend {
     fn close(&self);
     fn run(&self, command: Command) -> Ticket;
     fn state(&self) -> Option<State>;
-    fn hide_candidate(&self, id: &str);
+    fn hide_candidate(&self, id: u32);
     /// Lists adapters off the interface thread; the result arrives as Msg::Ports.
     fn list_ports(&self);
 }
@@ -115,7 +116,7 @@ impl Backend for Live {
     fn state(&self) -> Option<State> {
         self.controller.state()
     }
-    fn hide_candidate(&self, id: &str) {
+    fn hide_candidate(&self, id: u32) {
         self.controller.hide_candidate(id);
     }
     fn list_ports(&self) {

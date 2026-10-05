@@ -94,12 +94,12 @@ fn piped_commands_wait_for_readiness_and_end_at_eof() {
     );
     result.unwrap();
     assert!(
-        out.contains("d_1  Office Mouse  ble  disconnected  trusted bluetooth=enabled"),
+        out.contains("1  Office Mouse  ble  disconnected  trusted bluetooth=enabled"),
         "{out}"
     );
-    assert!(!out.contains("d_2  Old Keyboard"), "{out}");
+    assert!(!out.contains("2  Old Keyboard"), "{out}");
     assert!(
-        out.contains("Device d_1 (ble)\n  Name: Office Mouse"),
+        out.contains("Device 1 (ble)\n  Name: Office Mouse"),
         "{out}"
     );
     assert!(out.contains("  HID++ Status: Waiting to Connect"), "{out}");
@@ -117,7 +117,7 @@ fn one_shot_scan_prints_one_summary() {
         "{out}"
     );
     assert!(
-        out.contains("[NEW] c_1  New Keyboard  ble  candidate"),
+        out.contains("[NEW] 1  New Keyboard  ble  candidate"),
         "{out}"
     );
     let sim = dongle.0.lock().unwrap();
@@ -139,7 +139,7 @@ fn one_shot_pair_scans_for_its_device_and_takes_the_passkey_from_input() {
     );
     result.unwrap();
     assert!(
-        out.contains("[pair c_1] Enter on this computer: enter_passkey"),
+        out.contains("[pair 1] Enter on this computer: enter_passkey"),
         "{out}"
     );
     assert!(out.contains("Paired and saved New Keyboard."), "{out}");
@@ -260,9 +260,27 @@ fn transports_are_shown_and_set_per_transport() {
 }
 
 #[test]
+fn renaming_and_resetting_the_adapter_name_the_result() {
+    let dongle = Dongle::default();
+    let (result, out, _) = script(&dongle, &["adapter", "set", "name", "Office"], false, b"");
+    result.unwrap();
+    assert!(out.contains("Adapter renamed to Office."), "{out}");
+    // The adapter saves the name trimmed, and no adapter event follows an unchanged name.
+    let (result, out, _) = script(&dongle, &["adapter", "set", "name", " Office "], false, b"");
+    result.unwrap();
+    assert!(out.contains("Adapter renamed to Office."), "{out}");
+    let (result, _, _) = script(&dongle, &["adapter", "set", "name", "  "], false, b"");
+    assert_eq!(result.unwrap_err().message, "invalid adapter name");
+    // The default name is known only from the adapter event that follows the reset.
+    let (result, out, _) = script(&dongle, &["adapter", "reset", "name"], false, b"");
+    result.unwrap();
+    assert!(out.contains("Adapter name reset to Cordial."), "{out}");
+}
+
+#[test]
 fn work_on_a_disabled_transport_names_it() {
     let dongle = Dongle::with(|sim| {
-        let d = sim.devices.iter_mut().find(|d| d.id == "d_2").unwrap();
+        let d = sim.devices.iter_mut().find(|d| d.id == 2).unwrap();
         d.enabled = true;
         d.inactive = None;
         sim.set_transport(p::Transport::Classic, false);
@@ -299,7 +317,7 @@ fn work_on_a_disabled_transport_names_it() {
     // A refusal the view couldn't predict is worded the same.
     let dongle = Dongle::with(|sim| {
         sim.status.transports[0].enabled = Some(false);
-        let d = sim.devices.iter_mut().find(|d| d.id == "d_2").unwrap();
+        let d = sim.devices.iter_mut().find(|d| d.id == 2).unwrap();
         d.enabled = true;
         d.inactive = None;
         sim.refuse.insert("connect_device", ErrorCode::Unsupported);
@@ -322,9 +340,9 @@ fn pairing_on_a_disabled_transport_names_it() {
         &dongle,
         &[],
         false,
-        b"scan start\nadapter set transport classic enabled off\npair start c_1\n",
+        b"scan start\nadapter set transport classic enabled off\npair start 1\n",
     );
-    assert!(out.contains("[NEW] c_1"), "{out}");
+    assert!(out.contains("[NEW] 1  New Keyboard"), "{out}");
     assert_eq!(
         result.unwrap_err().message,
         "Bluetooth Classic is disabled on the adapter"
@@ -333,7 +351,7 @@ fn pairing_on_a_disabled_transport_names_it() {
 }
 
 #[test]
-fn firmware_without_the_setting_uses_every_transport_and_offers_no_change() {
+fn a_transport_without_its_enabled_field_is_enabled() {
     let dongle = Dongle::with(|sim| {
         for t in &mut sim.status.transports {
             t.enabled = None;
@@ -341,15 +359,211 @@ fn firmware_without_the_setting_uses_every_transport_and_offers_no_change() {
     });
     let (result, _, _) = script(&dongle, &["scan", "start", "classic"], false, b"");
     result.unwrap();
-    let (result, _, _) = script(
+    let (result, out, _) = script(
         &dongle,
         &["adapter", "set", "transport", "ble", "enabled", "off"],
         false,
         b"",
     );
+    result.unwrap();
+    assert!(out.contains("Bluetooth LE disabled."), "{out}");
+}
+
+fn with_profiles(sim: &mut common::Sim) {
+    common::enable_profiles(&mut sim.status);
+}
+
+#[test]
+fn profiles_layers_and_interfaces_from_the_shell() {
+    let dongle = Dongle::with(with_profiles);
+    let (result, out, err) = script(
+        &dongle,
+        &[],
+        false,
+        b"profile create Work\n\
+profile copy Work 'Mouse Fix'\n\
+profile create Games\n\
+profile rule remap 'Mouse Fix' 09:04 09:01\n\
+profile rule scale 'Mouse Fix' 01:38 -1/1\n\
+profile rule list 'Mouse Fix'\n\
+profile list\n\
+profile list --after 0\n\
+profile list --after 2\n\
+device set 'Office Mouse' profiles Work 'Mouse Fix'\n\
+adapter set interface via on Games\n\
+device get 1\n\
+adapter status\n\
+profile rule forget 2 01:38\n\
+profile show 2\n",
+    );
+    result.unwrap();
+    assert!(err.is_empty(), "{err}");
+    for line in [
+        "Created profile Work (1).",
+        "Copied profile to Mouse Fix (2).",
+        "Created profile Games (3).",
+        "Saved in Mouse Fix: 09:04 remap 09:01@01:02\n",
+        "Saved in Mouse Fix: 01:38 scale -1/1",
+        "Rules of Mouse Fix\n  01:38 scale -1/1\n  09:04 remap 09:01@01:02\n",
+        "Profiles\n  1\tnone\tWork\n  2\tmouse\tMouse Fix\n  3\tnone\tGames\n",
+        "Profiles\n  1\tnone\tWork\n  2\tmouse\tMouse Fix\nNext page: profile list --after 2\n",
+        "Profiles\n  3\tnone\tGames\n",
+        "Profiles of Office Mouse set to Work (1), Mouse Fix (2).",
+        "VIA on, profile Games (3).",
+        "  Profiles: Work (1), Mouse Fix (2)",
+        "  Profile Memory: 1.0 KiB of 8.0 KiB in use\n  Profiles Per Device: 3\n  VIA: on, profile Games (3)\n  Vial: off, profile none",
+        "Profile Mouse Fix\n  ID: 2\n  Roles: Mouse",
+        "Mouse Fix has no rule for 01:38.",
+    ] {
+        assert!(out.contains(line), "{line}\n{out}");
+    }
+    assert!(
+        out.contains("[CHG] Profile 2 09:04 remap 09:01@01:02"),
+        "{out}"
+    );
+    assert!(out.contains("[DEL] Profile 2 01:38"), "{out}");
+    let sim = dongle.0.lock().unwrap();
+    assert_eq!(
+        sim.devices[0].profiles,
+        Some(p::ProfileLayers {
+            profiles: vec![1, 2]
+        })
+    );
+    // An interface change and its profile go out together in one request.
+    assert!(sim.log.iter().any(|c| matches!(c,
+        p::request::Command::SetAdapter(s)
+            if s.configuration_interfaces == [p::ConfigurationInterfaceUpdate {
+                interface: p::ConfigurationInterface::Via as i32,
+                enabled: Some(true),
+                profile: Some(3),
+            }] && s.name.is_none() && s.transports.is_empty())));
+}
+
+#[test]
+fn json_prints_every_page_of_a_listing() {
+    let dongle = Dongle::with(|sim| {
+        sim.devices
+            .push(common::device(5, "Pad", p::Transport::Ble));
+    });
+    let (result, out, _) = script(&dongle, &["device", "list"], true, b"");
+    result.unwrap();
+    let pages: Vec<Value> = out
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| !v["response"]["devices"].is_null())
+        .collect();
+    assert_eq!(pages.len(), 2, "{out}");
+    let entries = |page: &Value| {
+        page["response"]["devices"]["entries"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(entries(&pages[0]), 2);
+    assert_eq!(entries(&pages[1]), 1);
+    assert_eq!(pages[1]["response"]["devices"]["end"], true);
+}
+
+#[test]
+fn deleting_a_profile_in_use_is_refused_before_sending() {
+    let dongle = Dongle::with(|sim| {
+        with_profiles(sim);
+        let work = sim.add_profile("Work", Vec::new());
+        let games = sim.add_profile("Games", Vec::new());
+        sim.status.configuration_interfaces[1].profile = games;
+        sim.devices[0].profiles = Some(p::ProfileLayers {
+            profiles: vec![work],
+        });
+    });
+    let (result, _, _) = script(&dongle, &["profile", "delete", "Work"], false, b"");
     assert_eq!(
         result.unwrap_err().message,
-        "unsupported: the adapter or device doesn't support this"
+        "Office Mouse is using this profile. Remove it from Office Mouse's profiles first"
     );
-    assert!(!dongle.sent().contains(&"set_adapter"));
+    let (result, _, _) = script(&dongle, &["profile", "delete", "2"], false, b"");
+    assert_eq!(
+        result.unwrap_err().message,
+        "Vial is using this profile. Pick a different profile for Vial first"
+    );
+    assert!(!dongle.sent().contains(&"delete_profile"));
+    // An enabled interface can't lose its profile; a disabled one can.
+    let (result, _, _) = script(
+        &dongle,
+        &[],
+        false,
+        b"adapter set interface vial on\nadapter reset interface vial profile\n",
+    );
+    assert_eq!(
+        result.unwrap_err().message,
+        "choose a profile for Vial before turning it on"
+    );
+    let (result, out, _) = script(
+        &dongle,
+        &[],
+        false,
+        b"adapter set interface vial off\nadapter reset interface vial profile\n\
+device set 1 profiles none\nprofile delete Games\nprofile delete 1\n",
+    );
+    result.unwrap();
+    for line in [
+        "Vial off, profile none.",
+        "Profiles of Office Mouse set to none.",
+        "Deleted profile Games.",
+        "Deleted profile Work.",
+    ] {
+        assert!(out.contains(line), "{line}\n{out}");
+    }
+}
+
+#[test]
+fn ambiguous_names_and_unsupported_rules_are_refused() {
+    let dongle = Dongle::with(|sim| {
+        with_profiles(sim);
+        sim.add_profile("Work", Vec::new());
+        sim.add_profile("Work", Vec::new());
+    });
+    let (result, _, _) = script(&dongle, &["profile", "delete", "Work"], false, b"");
+    assert!(result.unwrap_err().to_string().contains("ambiguous"));
+    let (result, _, _) = script(
+        &dongle,
+        &["profile", "rule", "scale", "1", "07:04", "2/1"],
+        false,
+        b"",
+    );
+    assert_eq!(
+        result.unwrap_err().message,
+        "this adapter can't scale 07:04"
+    );
+    let (result, _, _) = script(
+        &dongle,
+        &["device", "set", "1", "profiles", "1", "2", "1", "2"],
+        false,
+        b"",
+    );
+    assert_eq!(
+        result.unwrap_err().message,
+        "a device can use at most 3 profiles"
+    );
+    assert!(!dongle.sent().contains(&"set_profile_rules"));
+    assert!(!dongle.sent().contains(&"set_device"));
+    assert!(!dongle.sent().contains(&"delete_profile"));
+}
+
+#[test]
+fn profile_commands_need_firmware_with_profiles() {
+    let dongle = Dongle::default();
+    for args in [
+        &["profile", "create", "Work"][..],
+        &["device", "set", "1", "profiles", "none"],
+        &["adapter", "set", "interface", "via", "off"],
+    ] {
+        let (result, _, _) = script(&dongle, args, false, b"");
+        assert!(
+            result.unwrap_err().to_string().contains("support profiles"),
+            "{args:?}"
+        );
+    }
+    assert!(!dongle.sent().contains(&"create_profile"));
+    assert!(!dongle.sent().contains(&"list_profiles"));
+    assert!(!dongle.sent().contains(&"set_device"));
 }

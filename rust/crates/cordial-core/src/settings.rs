@@ -360,11 +360,17 @@ impl Catalog {
             .try_reserve_exact(changes.len())
             .map_err(|_| Error::Resource)?;
         for change in changes {
-            let index = self
+            let Some(index) = self
                 .records
                 .iter()
                 .position(|r| r.metadata.key == change.key && r.writable)
-                .ok_or(Error::NotFound)?;
+            else {
+                // Forgetting a setting that has no saved value changes nothing.
+                if change.value.is_none() {
+                    continue;
+                }
+                return Err(Error::NotFound);
+            };
             let preference = match &change.value {
                 None => None,
                 Some(value) => {

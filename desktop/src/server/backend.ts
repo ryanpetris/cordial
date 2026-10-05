@@ -8,6 +8,7 @@ import { Controller } from "../core/controller.ts";
 import { listPorts, openSerial } from "@cordial/client/node";
 import { hostPlatform, watchHotplug } from "../node/host.ts";
 import { preferencesFrom, type AppState } from "../shared/state.ts";
+import { profileAlertText } from "../shared/text.ts";
 
 const log = (message: string) => console.log(`[cordial] ${new Date().toISOString()} ${message}`);
 
@@ -51,7 +52,8 @@ export interface Backend {
 export async function startBackend(simulate = 0): Promise<Backend> {
   const clients = new Set<ServerResponse>();
   const send = (res: ServerResponse, state: AppState) => res.write(`data: ${JSON.stringify(state)}\n\n`);
-  const ports = simulate > 0 ? (await import("../fake/ports.ts")).simulatedPorts(simulate) : { listPorts, openTransport: openSerial };
+  const simulated = simulate > 0 ? (await import("../fake/ports.ts")).simulatedPorts(simulate) : null;
+  const ports = simulated ?? { listPorts, openTransport: openSerial };
   const controller = new Controller({
     ...ports,
     log,
@@ -64,8 +66,13 @@ export async function startBackend(simulate = 0): Promise<Backend> {
     },
     lowBattery: (alert) => log(`notification: ${alert.name} battery ${alert.level}, ${alert.percent}%`),
     connection: (name, connected) => log(`notification: ${name} ${connected ? "connected" : "disconnected"}`),
+    profileAlert: (alert) => {
+      const { title, body } = profileAlertText(alert);
+      log(`notification: ${[title, body].filter(Boolean).join(" ")}`);
+    },
   });
-  const stopHotplug = !simulate ? await watchHotplug(() => controller.manager.burst(), log) : null;
+  simulated?.onHotplug(() => controller.manager.burst());
+  const stopHotplug = !simulated ? await watchHotplug(() => controller.manager.burst(), log) : null;
   controller.changed();
   await controller.manager.rescan();
 
@@ -84,7 +91,7 @@ export async function startBackend(simulate = 0): Promise<Backend> {
       return reply(res, 400, { error: (error as Error).message });
     }
     if (!isAction(action)) return reply(res, 400, { error: "invalid action" });
-    reply(res, 200, await controller.act(action));
+    reply(res, 200, await controller.request(action));
   }
 
   function events(req: IncomingMessage, res: ServerResponse) {

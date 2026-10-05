@@ -1,6 +1,6 @@
 // Small building blocks shared by the pages.
 import { useEffect, useId, useRef, type ReactNode } from "react";
-import { WarningIcon } from "./icons.tsx";
+import { StateMark, WarningIcon } from "./icons.tsx";
 
 /** A content page. Its header is a bar level with the window controls that
  * moves the window and holds the page's name and status. A `nav` row such as
@@ -154,6 +154,8 @@ export function SwitchRow(props: {
   subtitle?: ReactNode;
   checked: boolean;
   disabled?: boolean;
+  /** Shown before the switch. */
+  end?: ReactNode;
   onChange: (value: boolean) => void;
 }) {
   const id = useId();
@@ -164,7 +166,8 @@ export function SwitchRow(props: {
         {props.subtitle ? <div className="row-subtitle">{props.subtitle}</div> : null}
       </div>
       <div className="row-end">
-        <Switch id={id} checked={props.checked} disabled={props.disabled} onChange={props.onChange} />
+        {props.end}
+        <Switch id={id} label={props.title} checked={props.checked} disabled={props.disabled} onChange={props.onChange} />
       </div>
     </label>
   );
@@ -290,6 +293,13 @@ export function Banner({ kind = "info", children, action }: { kind?: "info" | "w
   );
 }
 
+/** Marks a control whose value is staged until Save. */
+export const Staged = ({ label }: { label: string }) => (
+  <span className="marker draft" role="img" aria-label={`${label}, Changed`}>
+    <StateMark shape="draft" />
+  </span>
+);
+
 export const Spinner = () => <span className="spinner" aria-label="Working" />;
 
 /** A modal dialog on the native <dialog> element. */
@@ -356,6 +366,74 @@ export function Summary({ items }: { items: [string, number][] }) {
           <span className="summary-value">{n}</span>
           <span className="summary-label">{label}</span>
         </div>
+      ))}
+    </div>
+  );
+}
+
+/** One menu entry: its text and what choosing it does; null disables it. */
+export type MenuOption = [string, (() => void) | null];
+
+/** A popup menu at a point, below the button that opened it. Arrow keys move, Escape closes
+ * and refocuses the opener, and a press outside or leaving the window closes it. */
+export function Menu({ label, x, y, options, onClose }: {
+  label: string;
+  x: number;
+  y: number;
+  options: MenuOption[];
+  onClose: (refocus: boolean) => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const menu = ref.current!;
+    menu.showPopover();
+    menu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+    const outside = (e: PointerEvent) => !menu.contains(e.target as Node) && !(e.target as Element).closest?.("[aria-expanded=true]") && onClose(false);
+    document.addEventListener("pointerdown", outside);
+    const blur = () => onClose(false);
+    window.addEventListener("blur", blur, { once: true });
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      window.removeEventListener("blur", blur);
+      menu.hidePopover();
+    };
+  }, []);
+  const move = (step: number) => {
+    const items = [...ref.current!.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+    const at = items.indexOf(document.activeElement as HTMLButtonElement);
+    items[(at + step + items.length) % items.length]?.focus();
+  };
+  return (
+    <div
+      ref={ref}
+      popover="manual"
+      role="menu"
+      aria-label={label}
+      className="context-menu"
+      style={{ left: Math.max(8, Math.min(x - 200, window.innerWidth - 208)), top: Math.min(y + 4, window.innerHeight - 40 * options.length - 16) }}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onClose(true);
+        else if (e.key === "ArrowDown") move(1);
+        else if (e.key === "ArrowUp") move(-1);
+        else if (e.key === "Tab") onClose(false);
+        else return;
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+    >
+      {options.map(([text, run]) => (
+        <button
+          key={text}
+          type="button"
+          role="menuitem"
+          disabled={!run}
+          onClick={() => {
+            onClose(true);
+            run?.();
+          }}
+        >
+          {text}
+        </button>
       ))}
     </div>
   );

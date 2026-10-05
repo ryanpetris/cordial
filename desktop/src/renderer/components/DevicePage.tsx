@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { isLow } from "../../shared/battery.ts";
 import { enabledFull } from "../../shared/capacity.ts";
 import { settingsBusy, settingsCurrent } from "../../shared/settings.ts";
-import type { AdapterEntry, AppState, DeviceEntry, InfoEntry, Scalar, Setting, SettingsChange, SettingsSaveItem } from "../../shared/state.ts";
+import type { AdapterEntry, AppState, DeviceChanges, DeviceEntry, DeviceRecord, InfoEntry, Scalar, Setting, SettingsChange, SettingsSaveItem } from "../../shared/state.ts";
 import {
   inactiveText,
   INFO_LABELS,
@@ -21,6 +21,7 @@ import {
   integrationText,
   kindText,
   neverValue,
+  profileErrorText,
   securityFacts,
   settingInfo,
   settingOrder,
@@ -29,7 +30,8 @@ import {
   wheelFigures,
 } from "../../shared/text.ts";
 import { useAction } from "../api.ts";
-import { Banner, Card, Dialog, Fact, Facts, Page, Pill, Row, Segmented, Spinner, Switch, SwitchRow, TabBar, TabPanel } from "./common.tsx";
+import { DeviceLayers } from "./Profiles.tsx";
+import { Banner, Card, Dialog, Fact, Facts, Menu, Page, Pill, Row, Segmented, Spinner, Staged, Switch, SwitchRow, TabBar, TabPanel, type MenuOption } from "./common.tsx";
 import {
   BatteryGlyph,
   CheckIcon,
@@ -44,9 +46,11 @@ import {
   type MarkShape,
 } from "./icons.tsx";
 
-const DEVICE_TABS: ["details" | "settings" | "diagnostics", string][] = [
+type DeviceTab = "details" | "settings" | "profiles" | "diagnostics";
+const DEVICE_TABS: [DeviceTab, string][] = [
   ["details", "Details"],
   ["settings", "Settings"],
+  ["profiles", "Profiles"],
   ["diagnostics", "Diagnostics"],
 ];
 /** Information keys shown on Details, in order. */
@@ -135,15 +139,12 @@ interface FormGuards {
   busy: boolean;
 }
 
-/** One marker menu entry; the menu stages it without sending anything. */
-type MarkerOption = [string, (() => void) | null];
-
 /** The fixed-width state marker; writable rows open their staging menu from it. */
 function Marker({ label, state, shape, options, sending, disabled }: {
   label: string;
   state: string;
   shape: MarkShape;
-  options: MarkerOption[];
+  options: MenuOption[];
   sending: boolean;
   disabled: boolean;
 }) {
@@ -174,7 +175,7 @@ function Marker({ label, state, shape, options, sending, disabled }: {
         <StateMark shape={shape} />
       </button>
       {menu ? (
-        <MarkerMenu
+        <Menu
           label={name}
           x={menu.x}
           y={menu.y}
@@ -186,69 +187,6 @@ function Marker({ label, state, shape, options, sending, disabled }: {
         />
       ) : null}
     </>
-  );
-}
-
-function MarkerMenu({ label, x, y, options, onClose }: {
-  label: string;
-  x: number;
-  y: number;
-  options: MarkerOption[];
-  onClose: (refocus: boolean) => void;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    const menu = ref.current!;
-    menu.showPopover();
-    menu.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
-    const outside = (e: PointerEvent) => !menu.contains(e.target as Node) && !(e.target as Element).closest?.("[aria-expanded=true]") && onClose(false);
-    document.addEventListener("pointerdown", outside);
-    const blur = () => onClose(false);
-    window.addEventListener("blur", blur, { once: true });
-    return () => {
-      document.removeEventListener("pointerdown", outside);
-      window.removeEventListener("blur", blur);
-      menu.hidePopover();
-    };
-  }, []);
-  const move = (step: number) => {
-    const items = [...ref.current!.querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
-    const at = items.indexOf(document.activeElement as HTMLButtonElement);
-    items[(at + step + items.length) % items.length]?.focus();
-  };
-  return (
-    <div
-      ref={ref}
-      popover="manual"
-      role="menu"
-      aria-label={label}
-      className="context-menu"
-      style={{ left: Math.max(8, Math.min(x - 200, window.innerWidth - 208)), top: Math.min(y + 4, window.innerHeight - 40 * options.length - 16) }}
-      onKeyDown={(e) => {
-        if (e.key === "Escape") onClose(true);
-        else if (e.key === "ArrowDown") move(1);
-        else if (e.key === "ArrowUp") move(-1);
-        else if (e.key === "Tab") onClose(false);
-        else return;
-        e.preventDefault();
-        e.stopPropagation();
-      }}
-    >
-      {options.map(([text, run]) => (
-        <button
-          key={text}
-          type="button"
-          role="menuitem"
-          disabled={!run}
-          onClick={() => {
-            onClose(true);
-            run?.();
-          }}
-        >
-          {text}
-        </button>
-      ))}
-    </div>
   );
 }
 
@@ -413,11 +351,11 @@ function SettingRow({ entry, s, drafts, guards, item }: {
   const { change, invalid } = pendingChange(s, draft);
   const staged = change !== null || invalid;
   const settable = fresh && accepts(s, s.value);
-  const forget: MarkerOption = ["Forget Saved Value", () => drafts.set(s.key, { type: "forget" })];
-  const keep = (text: string): MarkerOption => [text, settable ? () => drafts.set(s.key, { type: "set", value: s.value!, policy: true }) : null];
+  const forget: MenuOption = ["Forget Saved Value", () => drafts.set(s.key, { type: "forget" })];
+  const keep = (text: string): MenuOption => [text, settable ? () => drafts.set(s.key, { type: "set", value: s.value!, policy: true }) : null];
   let shape: MarkShape;
   let state: string;
-  let options: MarkerOption[];
+  let options: MenuOption[];
   if (staged) {
     [shape, state, options] = ["draft", "Changed", [["Undo Change", () => drafts.set(s.key, undefined)]]];
   } else if (!saved(s)) {
@@ -432,7 +370,6 @@ function SettingRow({ entry, s, drafts, guards, item }: {
 
   const notes: ReactNode[] = [];
   if (item?.status === "not_saved") notes.push(<span key="save" className="error-text">Couldn't Save{item.error ? `: ${item.error}` : ""}</span>);
-  else if (item?.status === "not_sent") notes.push(<span key="save">Not Sent{item.error ? `: ${item.error}` : ""}</span>);
   if (invalid) notes.push(<span key="range" className="error-text">{rangeText(typedRange(s))}</span>);
   if (saved(s) && s.state === "changed_on_device" && fresh) notes.push(<span key="device">Device: {valueText(s.key, s.value)}</span>);
   if (s.error) notes.push(<span key="error">{codeText(s.error)}</span>);
@@ -575,11 +512,8 @@ function Settings({ entry, adapter, drafts, bar }: {
   // The tab is only offered while there are settings.
   if (!settings.length && !readings.length && !figures.length) return null;
 
-  const counts: [string, number][] = [
-    ["Couldn't Save", items.filter((i) => i.status === "not_saved").length],
-    ["Not Sent", items.filter((i) => i.status === "not_sent").length],
-  ];
-  const failures = submission && !submission.running ? counts.filter(([, n]) => n > 0).map(([t, n]) => `${t} ${n}`).join(" · ") : "";
+  const notSaved = items.filter((i) => i.status === "not_saved").length;
+  const failures = submission && !submission.running && notSaved ? `Couldn't Save ${notSaved}` : "";
   const note = problem ?? (failures || (hidppError ? codeText(hidppError) : null));
   const refresh = async () => {
     setProblem(null);
@@ -667,15 +601,41 @@ function Settings({ entry, adapter, drafts, bar }: {
   );
 }
 
-export function DevicePage({ state, entry, drafts }: { state: AppState; entry: DeviceEntry; drafts: Drafts }) {
+/** The staged values in `draft` that differ from the device's saved ones. */
+function pendingDetails(draft: DeviceChanges, d: DeviceRecord): DeviceChanges {
+  const changes: DeviceChanges = {};
+  for (const k of ["enabled", "trusted", "blocked"] as const) if (draft[k] !== undefined && draft[k] !== d[k]) changes[k] = draft[k];
+  if (draft.hidpp !== undefined && draft.hidpp !== (d.hidpp?.enabled ?? false)) changes.hidpp = draft.hidpp;
+  if (draft.profiles !== undefined && d.profiles !== null && draft.profiles.join() !== d.profiles.join()) changes.profiles = draft.profiles;
+  return changes;
+}
+
+/** `draft` without the values `sent` saved; values staged again since stay. */
+function settleDetails(draft: DeviceChanges, sent: DeviceChanges): DeviceChanges {
+  const next = { ...draft };
+  for (const k of Object.keys(sent) as (keyof DeviceChanges)[]) if (String(next[k]) === String(sent[k])) delete next[k];
+  return next;
+}
+
+export function DevicePage({ state, entry, drafts, details, onDetails }: {
+  state: AppState;
+  entry: DeviceEntry;
+  drafts: Drafts;
+  /** The device's staged Details changes, kept by the window across tabs and pages. */
+  details: DeviceChanges;
+  onDetails: (update: (draft: DeviceChanges) => DeviceChanges) => void;
+}) {
   const [busy, run] = useAction(true);
+  const [saving, runSave] = useAction(true);
+  // A failed save, shown in the bar of the tab whose changes it sent.
+  const [saveError, setSaveError] = useState<{ tab: DeviceTab; message: string } | null>(null);
   const [connectBusy, runConnect] = useAction(true);
   const [infoBusy, runInfo] = useAction(true);
   // The last failed action on this page, shown next to the control that ran it.
   const [failure, setFailure] = useState<{ at: string; message: string } | null>(null);
   const [forgetting, setForgetting] = useState(false);
   // A device opens on its details, where Connect is; the tab stays put as the connection changes.
-  const [chosen, setTab] = useState<"details" | "settings" | "diagnostics">("details");
+  const [chosen, setTab] = useState<DeviceTab>("details");
   const tabs = useId();
   const [settingsBar, setSettingsBar] = useState<HTMLElement | null>(null);
   const d = entry.device;
@@ -692,7 +652,8 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
   const failed = (at: string) => (failure?.at === at ? failure.message : null);
   const failedText = (at: string) => (failure?.at === at ? <span className="error-text">{failure.message}</span> : undefined);
   const connecting = connectBusy || d.state === "connecting";
-  const tab = chosen === "settings" && !settings ? "details" : chosen;
+  const layered = !!adapter?.status?.profileSupport && d.profiles !== null;
+  const tab = (chosen === "settings" && !settings) || (chosen === "profiles" && !layered) ? "details" : chosen;
   const low = isLow(entry.battery, state.preferences.lowBatteryPercent);
   const battery = batteryText(entry.battery);
   const canConnect = d.inactive === null && d.state === "disconnected";
@@ -702,8 +663,57 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
   const facts = (keys: string[]) => keys.flatMap((key) => d.info.filter((f) => f.key === key));
   const info = facts(DETAILS_INFO);
   const identifiers = facts(IDENTIFIERS);
-  const set = (type: "device.enabled" | "device.trusted" | "device.blocked" | "device.hidpp") => (value: boolean) =>
-    void perform(type, run, { type, key: entry.key, value });
+  // Details and Profiles edits stage in `details`; each tab's Save sends only its own changes.
+  const changes = pendingDetails(details, d);
+  const { profiles: layerChanges, ...detailChanges } = changes;
+  const shown: DeviceChanges = tab === "profiles" ? (layerChanges !== undefined ? { profiles: layerChanges } : {}) : detailChanges;
+  const dirty = Object.keys(shown).length > 0;
+  const detailsDirty = Object.keys(detailChanges).length > 0;
+  const locked = adapter?.connection !== "connected" || saving;
+  const canSave = !locked && dirty;
+  const value = {
+    enabled: details.enabled ?? d.enabled,
+    trusted: details.trusted ?? d.trusted,
+    blocked: details.blocked ?? d.blocked,
+    hidpp: details.hidpp ?? d.hidpp?.enabled ?? false,
+    profiles: details.profiles ?? d.profiles ?? [],
+  };
+  const stage = (update: DeviceChanges) => {
+    setSaveError(null);
+    onDetails((x) => pendingDetails({ ...x, ...update }, d));
+  };
+  const save = async () => {
+    if (!canSave) return;
+    setSaveError(null);
+    const sent = shown;
+    const at = tab;
+    const result = await runSave({ type: "device.update", key: entry.key, ...sent });
+    if (result.ok) onDetails((x) => settleDetails(x, sent));
+    else setSaveError({ tab: at, message: result.message });
+  };
+  const discard = () => {
+    setSaveError(null);
+    onDetails((x) => {
+      if (tab !== "profiles") return x.profiles === undefined ? {} : { profiles: x.profiles };
+      const { profiles: _, ...rest } = x;
+      return rest;
+    });
+  };
+  const saveFailed = saveError?.tab === tab ? saveError.message : null;
+  // Ctrl+S or Cmd+S saves while Details or Profiles is shown and no dialog is open; the Settings
+  // tab has its own.
+  const saveRef = useRef<(() => void) | null>(null);
+  saveRef.current = tab === "details" || tab === "profiles" ? () => void save() : null;
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if (!saveRef.current || e.key.toLowerCase() !== "s" || !(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+      if (document.querySelector("dialog[open]")) return;
+      e.preventDefault();
+      saveRef.current();
+    };
+    document.addEventListener("keydown", key);
+    return () => document.removeEventListener("keydown", key);
+  }, []);
   const warningsFailed = !!entry.warningsError;
   // A failed list read is retried by reading the lists again rather than asking the device.
   const listsFailed = warningsFailed || !!entry.settingsError;
@@ -730,7 +740,7 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
         <TabBar
           id={tabs}
           label="Device"
-          tabs={DEVICE_TABS.filter(([t]) => t !== "settings" || settings)}
+          tabs={DEVICE_TABS.filter(([t]) => (t !== "settings" || settings) && (t !== "profiles" || layered))}
           value={tab}
           onChange={setTab}
         />
@@ -738,6 +748,17 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
       bar={
         tab === "settings" ? (
           <div ref={setSettingsBar} className="bar-slot" />
+        ) : tab === "profiles" ? (
+          <>
+            {saveFailed ? <span className="bar-start error-text">{saveFailed}</span> : null}
+            {saving ? <Spinner /> : null}
+            <button disabled={saving || !dirty} onClick={discard}>
+              <UndoIcon /> Discard
+            </button>
+            <button className="suggested" disabled={!canSave} onClick={() => void save()}>
+              <CheckIcon /> Save
+            </button>
+          </>
         ) : tab === "diagnostics" ? (
           <>
             {failed("info") ? <span className="bar-start error-text">{failed("info")}</span> : null}
@@ -761,22 +782,28 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
               >
                 <TrashIcon /> Forget Device
               </button>
-              {failedText("connection")}
+              {saveFailed ? <span className="error-text">{saveFailed}</span> : failedText("connection")}
             </span>
-            {busy || connectBusy ? <Spinner /> : null}
+            {busy || connectBusy || saving ? <Spinner /> : null}
             {connected || connecting ? (
               <button disabled={busy} onClick={() => void perform("connection", run, { type: "device.disconnect", key: entry.key })}>
                 <UnplugIcon /> Disconnect
               </button>
             ) : (
               <button
-                className={canConnect ? "suggested" : undefined}
+                className={canConnect && !detailsDirty ? "suggested" : undefined}
                 disabled={busy || !canConnect}
                 onClick={() => void perform("connection", runConnect, { type: "device.connect", key: entry.key })}
               >
                 <PlugIcon /> Connect
               </button>
             )}
+            <button disabled={saving || !dirty} onClick={discard}>
+              <UndoIcon /> Discard
+            </button>
+            <button className="suggested" disabled={!canSave} onClick={() => void save()}>
+              <CheckIcon /> Save
+            </button>
           </>
         )
       }
@@ -786,6 +813,15 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
       <TabPanel id={tabs} value={tab}>
         {tab === "settings" ? (
           <Settings entry={entry} adapter={adapter} drafts={drafts} bar={settingsBar} />
+        ) : tab === "profiles" ? (
+          <DeviceLayers
+            entry={entry}
+            adapter={adapter}
+            layers={value.profiles}
+            changed={layerChanges !== undefined}
+            locked={locked}
+            onChange={(profiles) => stage({ profiles })}
+          />
         ) : tab === "diagnostics" ? (
           <>
             {warningsFailed || entry.warnings?.length ? (
@@ -812,6 +848,17 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
               <Card title="Connection">
                 <Facts>
                   <Fact label="Last Error">{codeText(d.error)}</Fact>
+                </Facts>
+              </Card>
+            ) : null}
+
+            {connected && d.profileError ? (
+              <Card title="Profiles">
+                <Facts>
+                  <Fact label="Status">
+                    Not Loaded
+                    <span className="fact-detail">{profileErrorText(d.profileError)}</span>
+                  </Fact>
                 </Facts>
               </Card>
             ) : null}
@@ -859,37 +906,37 @@ export function DevicePage({ state, entry, drafts }: { state: AppState; entry: D
             <Card title="Connection">
               <SwitchRow
                 title="Use This Device"
-                subtitle={failedText("device.enabled")}
-                checked={d.enabled}
-                disabled={busy || full}
-                onChange={set("device.enabled")}
+                checked={value.enabled}
+                disabled={locked || (full && !value.enabled)}
+                end={changes.enabled !== undefined ? <Staged label="Use This Device" /> : null}
+                onChange={(enabled) => stage({ enabled })}
               />
               <SwitchRow
                 title="Automatic Connections"
-                subtitle={failedText("device.trusted")}
-                checked={d.trusted}
-                disabled={busy}
-                onChange={set("device.trusted")}
+                checked={value.trusted}
+                disabled={locked}
+                end={changes.trusted !== undefined ? <Staged label="Automatic Connections" /> : null}
+                onChange={(trusted) => stage({ trusted })}
               />
               <SwitchRow
                 title="Logitech Features"
-                subtitle={failedText("device.hidpp")}
-                checked={d.hidpp?.enabled ?? false}
-                disabled={busy || settingsBusy(entry)}
-                onChange={set("device.hidpp")}
+                checked={value.hidpp}
+                disabled={locked || settingsBusy(entry)}
+                end={changes.hidpp !== undefined ? <Staged label="Logitech Features" /> : null}
+                onChange={(hidpp) => stage({ hidpp })}
               />
               <SwitchRow
                 title="Block Connections"
-                subtitle={failedText("device.blocked")}
-                checked={d.blocked}
-                disabled={busy}
-                onChange={set("device.blocked")}
+                checked={value.blocked}
+                disabled={locked}
+                end={changes.blocked !== undefined ? <Staged label="Block Connections" /> : null}
+                onChange={(blocked) => stage({ blocked })}
               />
             </Card>
 
             <Card title="Information">
               <Facts>
-                {d.kind !== "unknown" ? <Fact label="Device Type">{kindText(entry.kind)}</Fact> : null}
+                {d.kinds.length ? <Fact label="Device Type">{kindText(entry.kind)}</Fact> : null}
                 {info.map((f) => (
                   <Fact key={f.key} label={INFO_LABELS[f.key]} dim={!connected}>
                     {infoValue(f)}

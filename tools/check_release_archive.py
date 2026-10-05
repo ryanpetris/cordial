@@ -31,6 +31,9 @@ def check(path, application, version):
             raise ValueError("Archive must contain a regular VERSION file")
         if archive.extractfile(metadata).read().decode("ascii").strip() != version:
             raise ValueError("Archive version does not match CORDIAL_VERSION")
+        rules = members.get(prefix + "50-cordial.rules")
+        if not rules or not rules.isfile():
+            raise ValueError("Archive must contain the udev rules")
         if not binary or not binary.isfile() or not binary.mode & 0o111:
             raise ValueError("Archive must contain the application executable")
         header = archive.extractfile(binary).read(20)

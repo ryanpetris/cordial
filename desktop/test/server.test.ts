@@ -37,13 +37,15 @@ function call(method: string, path: string, headers: Record<string, string> = {}
   });
 }
 
+// A successful action's reply names the state revision that includes it.
+const OK = { status: 200, body: expect.stringMatching(/^\{"ok":true,"revision":\d+\}$/) };
 const act = (action: unknown) => call("POST", "/api/act", { "content-type": "application/json" }, JSON.stringify(action));
 const state = async () => JSON.parse((await call("GET", "/api/state")).body) as AppState;
 
 describe("development server", () => {
   it("serves the state and performs actions", async () => {
-    expect((await state()).adapters.map((a) => a.id)).toEqual(["0000FAKE0001", "0000FAKE0002"]);
-    expect(await act({ type: "adapters.refresh" })).toEqual({ status: 200, body: '{"ok":true}' });
+    expect((await state()).adapters.map((a) => a.id)).toEqual(["00000000000FA001", "00000000000FA002"]);
+    expect(await act({ type: "adapters.refresh" })).toEqual(OK);
     expect((await act({ type: "nope" })).status).toBe(400);
     expect((await call("POST", "/api/act", { "content-type": "application/json" }, "{")).status).toBe(400);
     expect((await call("GET", "/api/other")).status).toBe(404);
@@ -53,7 +55,7 @@ describe("development server", () => {
     /** Waits until the adapter reports Bluetooth Classic as `enabled`. */
     const classic = async (enabled: boolean) => {
       for (let i = 0; i < 50; i++) {
-        const status = (await state()).adapters.find((a) => a.id === "0000FAKE0001")!.status;
+        const status = (await state()).adapters.find((a) => a.id === "00000000000FA001")!.status;
         if (status?.transports.find((t) => t.transport === "classic")?.enabled === enabled) return true;
         await new Promise((r) => setTimeout(r, 10));
       }
@@ -61,12 +63,12 @@ describe("development server", () => {
     };
     expect(await classic(false)).toBe(true);
     // The simulated ESP32-S3 supports only BLE, enabled.
-    expect((await state()).adapters.find((a) => a.id === "0000FAKE0002")!.status!.transports).toEqual([{ transport: "ble", maxEnabled: 7, enabled: true, settable: true }]);
-    const set = (enabled: unknown) => act({ type: "adapter.transport", adapterId: "0000FAKE0001", transport: "classic", enabled });
-    expect(await set(true)).toEqual({ status: 200, body: '{"ok":true}' });
+    expect((await state()).adapters.find((a) => a.id === "00000000000FA002")!.status!.transports).toEqual([{ transport: "ble", maxEnabled: 7, enabled: true }]);
+    const set = (enabled: unknown) => act({ type: "adapter.settings", adapterId: "00000000000FA001", transports: { classic: enabled } });
+    expect(await set(true)).toEqual(OK);
     expect(await classic(true)).toBe(true);
     expect((await set("on")).status).toBe(400);
-    expect(await set(false)).toEqual({ status: 200, body: '{"ok":true}' });
+    expect(await set(false)).toEqual(OK);
     expect(await classic(false)).toBe(true);
   });
 
@@ -85,7 +87,7 @@ describe("development server", () => {
     );
     req.end();
     await until(() => received.some((c) => c.startsWith("data: {")));
-    expect(await act({ type: "scan.start", adapterId: "0000FAKE0001" })).toEqual({ status: 200, body: '{"ok":true}' });
+    expect(await act({ type: "scan.start", adapterId: "00000000000FA001" })).toEqual(OK);
     await until(() => received.some((c) => c.includes('"running":true')));
     req.destroy();
     // Well before the simulated scan ends by itself after a second.

@@ -1,21 +1,28 @@
 //! Command workflows: checks the view can predict, the requests, and waiting for effects that
 //! arrive as events.
 use crate::{
-    controller::{Command, Outcome, RunOptions, Session, Subject, Toggle, Wait},
+    controller::{
+        AdapterUpdate, Command, DeviceUpdate, Outcome, Pick, RunOptions, Session, Subject, Target,
+        Toggle, Wait,
+    },
     error::Error,
     model::{self, Prompt},
+    profiles::{self, InterfaceUpdate},
     storage,
     ui::{catalog, text},
     view::State,
 };
+use cordial_client::paging::{self as paging, Page};
 use cordial_protocol::{
     self as p, CapacityReason, CodeKind, ErrorCode, IntegrationKind, keys, pairing,
-    request::Command as C, response,
+    profile_list_entry, profile_rule_change, request::Command as C, response,
 };
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 
 pub(crate) const STARTING: &str =
     "the adapter is still starting; status, files and bootloader work meanwhile";
+
+pub(crate) const NO_PROFILES: &str = "this adapter doesn't support profiles";
 
 /// The longest adapter name, in UTF-8 bytes.
 const NAME_BYTES: usize = 64;
@@ -23,9 +30,14 @@ const NAME_BYTES: usize = 64;
 /// The longest scan the adapter runs.
 pub const MAX_SCAN_SECONDS: u32 = 60;
 
-/// Whether an adapter name is accepted: 1 to 64 bytes without control characters.
-pub fn valid_name(name: &str) -> bool {
-    !name.is_empty() && name.len() <= NAME_BYTES && !name.chars().any(char::is_control)
+/// The name the adapter saves for `value`: trimmed, 1 to 64 bytes and without control
+/// characters, or `None` when the adapter refuses it.
+pub fn adapter_name(value: &str) -> Option<&str> {
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    let name = value.trim();
+    (!name.is_empty() && name.len() <= NAME_BYTES).then_some(name)
 }
 
 /// A refusal the Dongle would send, predicted from the view.
@@ -71,6 +83,26 @@ pub fn scan_transports(st: &State, named: &[p::Transport]) -> Result<Vec<p::Tran
     }
 }
 
+/// Whether a command needs the adapter's profile support.
+fn uses_profiles(command: &Command) -> bool {
+    match command {
+        Command::Interface { .. }
+        | Command::Layers(..)
+        | Command::Profiles { .. }
+        | Command::AllProfiles
+        | Command::ProfileShow(_)
+        | Command::ProfileLookup(_)
+        | Command::ProfileCreate(_)
+        | Command::ProfileCopy(..)
+        | Command::ProfileDelete(_)
+        | Command::Rules(_)
+        | Command::RuleChange(..) => true,
+        Command::AdapterSave(update) => !update.interfaces.is_empty(),
+        Command::DeviceSave(_, update) => update.layers.is_some(),
+        _ => false,
+    }
+}
+
 /// Why `command` can't run on this adapter, as far as the view tells.
 pub fn unsupported(st: &State, command: &Command) -> Option<String> {
     let development = model::development(&st.status);
@@ -82,6 +114,7 @@ pub fn unsupported(st: &State, command: &Command) -> Option<String> {
             Some("this adapter doesn't offer development functions".into())
         }
         Command::Scan { transports, .. } => scan_transports(st, transports).err(),
+        _ if uses_profiles(command) && !profiles::available(&st.status) => Some(NO_PROFILES.into()),
         _ => None,
     }
 }
@@ -103,7 +136,6 @@ pub(crate) fn execute(
     if let Some(reason) = unsupported(&st, command) {
         return Err(Error::new(reason));
     }
-    let wait = &options.wait;
     match command {
         Command::Status => {
             let r = session.call(C::GetStatus(p::GetStatus {}), "adapter status", true)?;
@@ -113,34 +145,51 @@ pub(crate) fn execute(
             }
         }
         Command::Name(name) => {
-            let name = name.clone().unwrap_or_default();
-            if !name.is_empty() && !valid_name(&name) {
-                return Err(Error::new("invalid adapter name"));
-            }
-            let status = set_adapter(
+            // The adapter saves the name trimmed, so the trimmed name is sent and shown.
+            let name = match name.as_deref() {
+                None | Some("") => String::new(),
+                Some(value) => adapter_name(value)
+                    .ok_or_else(|| Error::new("invalid adapter name"))?
+                    .to_owned(),
+            };
+            let before = session.cell.update(|st| st.status.name.clone());
+            set_adapter(
                 session,
                 p::SetAdapter {
-                    name: Some(name),
+                    name: Some(name.clone()),
                     ..Default::default()
                 },
+                "adapter name",
             )?;
-            Ok(Outcome::Name(status.name))
+            if !name.is_empty() {
+                return Ok(Outcome::Name { name, reset: false });
+            }
+            // Only the adapter knows its default name; it arrives as an adapter event. No event
+            // follows when the name was already the default.
+            let name = session
+                .cell
+                .wait_for(&Wait::timeout(Duration::from_secs(2)), |st| {
+                    (st.status.name != before).then(|| st.status.name.clone())
+                })
+                .unwrap_or(before);
+            Ok(Outcome::Name { name, reset: true })
         }
         Command::Platform(platform) => {
-            let status = set_adapter(
+            set_adapter(
                 session,
                 p::SetAdapter {
                     platform: Some(*platform as i32),
                     ..Default::default()
                 },
+                "adapter platform",
             )?;
-            Ok(Outcome::Platform(status.platform()))
+            Ok(Outcome::Platform(*platform))
         }
         Command::Transport(transport, on) => {
-            if !model::transport_settable(&st.status, *transport) {
+            if !model::supports(&st.status, *transport) {
                 return Err(refused(ErrorCode::Unsupported, "adapter transport"));
             }
-            let status = set_adapter(
+            set_adapter(
                 session,
                 p::SetAdapter {
                     transports: vec![p::TransportUpdate {
@@ -149,11 +198,30 @@ pub(crate) fn execute(
                     }],
                     ..Default::default()
                 },
+                "adapter transport",
             )?;
-            Ok(Outcome::Transport(
-                *transport,
-                model::transport_enabled(&status, *transport) == Some(true),
-            ))
+            Ok(Outcome::Transport(*transport, *on))
+        }
+        Command::Interface {
+            interface,
+            enabled,
+            profile,
+        } => {
+            let profile = match profile {
+                None => None,
+                Some(Pick::Clear) => Some(0),
+                Some(Pick::Profile(target)) => Some(resolve_profile(session, &st, target)?.id),
+            };
+            let update = AdapterUpdate {
+                interfaces: vec![InterfaceUpdate {
+                    interface: *interface,
+                    enabled: *enabled,
+                    profile,
+                }],
+                ..Default::default()
+            };
+            save_adapter(session, &st, &update, "adapter interface")?;
+            Ok(Outcome::Interface(*interface, session.state().status))
         }
         Command::Bootloader => {
             session.call(
@@ -189,22 +257,24 @@ pub(crate) fn execute(
             Ok(Outcome::PairingCancelled)
         }
         Command::Devices => {
-            session.call(C::ListDevices(p::ListDevices {}), "device list", true)?;
+            read_pages::<p::DeviceList>(session, "device list", true, |after| {
+                C::ListDevices(p::ListDevices {
+                    after: after.copied().unwrap_or(0),
+                })
+            })?;
             Ok(Outcome::Devices)
         }
         Command::Files(path) => {
-            let r = session.call(
-                C::ListFiles(p::ListFiles { path: path.clone() }),
-                "file list",
-                true,
-            )?;
-            match r.result {
-                Some(response::Result::Files(list)) => Ok(Outcome::Files {
+            let entries = read_pages::<p::FileList>(session, "file list", true, |after| {
+                C::ListFiles(p::ListFiles {
                     path: path.clone(),
-                    entries: list.entries,
-                }),
-                _ => Err(unexpected()),
-            }
+                    after: after.cloned().unwrap_or_default(),
+                })
+            })?;
+            Ok(Outcome::Files {
+                path: path.clone(),
+                entries,
+            })
         }
         Command::FileGet {
             path,
@@ -227,19 +297,158 @@ pub(crate) fn execute(
                 bytes,
             })
         }
+        Command::Profiles { after } => {
+            let list = read_page::<p::ProfileList>(
+                session,
+                C::ListProfiles(p::ListProfiles { after: *after }),
+                "profile list",
+                true,
+            )?;
+            Ok(Outcome::Profiles {
+                after: *after,
+                list,
+            })
+        }
+        Command::AllProfiles => {
+            let entries = read_pages::<p::ProfileList>(session, "profile list", true, |after| {
+                C::ListProfiles(p::ListProfiles {
+                    after: after.copied().unwrap_or(0),
+                })
+            })?;
+            Ok(Outcome::Profiles {
+                after: 0,
+                list: p::ProfileList { entries, end: true },
+            })
+        }
+        Command::ProfileShow(target) => {
+            let id = match target {
+                Target::Id(id) => *id,
+                Target::Name(_) => resolve_profile(session, &st, target)?.id,
+            };
+            let profile = get_profile(session, id, true).map_err(|e| missing(e, target))?;
+            Ok(Outcome::Profile(profile))
+        }
+        Command::ProfileLookup(id) => Ok(Outcome::Profile(get_profile(session, *id, true)?)),
+        Command::ProfileCreate(name) => {
+            if !profiles::valid_name(name) {
+                return Err(Error::new("invalid profile name"));
+            }
+            let _pending = session.pending("profile create", 0);
+            let request = C::CreateProfile(p::CreateProfile { name: name.clone() });
+            let id = created_result(session.call(request, "profile create", true)?)?;
+            Ok(Outcome::Profile(p::Profile {
+                id,
+                name: name.clone(),
+                roles: Vec::new(),
+            }))
+        }
+        Command::ProfileCopy(source, name) => {
+            if !profiles::valid_name(name) {
+                return Err(Error::new("invalid profile name"));
+            }
+            let source = resolve_profile(session, &st, source)?;
+            let request = C::CopyProfile(p::CopyProfile {
+                profile: source.id,
+                name: name.clone(),
+            });
+            let _pending = session.pending("profile copy", 0);
+            let id = created_result(session.call(request, "profile copy", true)?)?;
+            Ok(Outcome::Profile(p::Profile {
+                id,
+                name: name.clone(),
+                roles: source.roles,
+            }))
+        }
+        Command::ProfileDelete(target) => {
+            // An ID is deleted as given, even when the profile's name can't be read.
+            let profile = match target {
+                Target::Id(id) => st.profile(*id).cloned().unwrap_or_else(|| p::Profile {
+                    id: *id,
+                    name: id.to_string(),
+                    ..Default::default()
+                }),
+                Target::Name(_) => resolve_profile(session, &st, target)?,
+            };
+            if let Some(reason) = profiles::in_use(&st, profile.id) {
+                return Err(Error::new(reason));
+            }
+            let _pending = session.pending("profile delete", profile.id);
+            session
+                .call(
+                    C::DeleteProfile(p::DeleteProfile {
+                        profile: profile.id,
+                    }),
+                    "profile delete",
+                    true,
+                )
+                .map_err(|e| missing(e, target))?;
+            Ok(Outcome::ProfileDeleted(profile))
+        }
+        Command::Rules(target) => {
+            let profile = resolve_profile(session, &st, target)?;
+            let rules =
+                read_pages::<p::ProfileRules>(session, "profile rule list", true, |after| {
+                    C::ListProfileRules(p::ListProfileRules {
+                        profile: profile.id,
+                        after: after.copied(),
+                    })
+                })?;
+            Ok(Outcome::Rules { profile, rules })
+        }
+        Command::RuleChange(target, change) => {
+            if let Some(p::profile_rule_change::Change::Rule(rule)) = &change.change
+                && let Some(support) = profiles::support(&st.status)
+                && let Some(reason) = profiles::rule_refusal(support, rule)
+            {
+                return Err(Error::new(reason));
+            }
+            let profile = resolve_profile(session, &st, target)?;
+            let _pending = session.pending("profile rule", profile.id);
+            session.call(
+                C::SetProfileRules(p::SetProfileRules {
+                    profile: profile.id,
+                    changes: vec![change.clone()],
+                }),
+                "profile rule",
+                true,
+            )?;
+            // The profile now holds the rule sent in its saved form, or none for a forgotten
+            // input or a rule that changes nothing.
+            let rules = match (&change.change, profiles::support(&st.status)) {
+                (Some(profile_rule_change::Change::Rule(rule)), Some(support)) => {
+                    cordial_client::rules::normalized(support, rule)
+                        .into_iter()
+                        .collect()
+                }
+                (Some(profile_rule_change::Change::Rule(rule)), None) => vec![rule.clone()],
+                _ => Vec::new(),
+            };
+            Ok(Outcome::Rules { profile, rules })
+        }
+        Command::AdapterSave(update) => {
+            save_adapter(session, &st, update, "adapter settings")?;
+            Ok(Outcome::AdapterSaved(session.state().status))
+        }
         Command::Get(target)
         | Command::Connect(target)
         | Command::Disconnect(target)
         | Command::Unpair(target)
         | Command::Refresh(target)
         | Command::Set(target, ..)
+        | Command::Layers(target, _)
         | Command::Warnings(target)
         | Command::Settings(target)
         | Command::SettingGet(target, _)
         | Command::SettingSet(target, ..)
         | Command::SettingForget(target, _)
-        | Command::SettingsSave { device: target, .. }
-        | Command::Features(target) => device_command(session, &st, command, target, wait),
+        | Command::Features(target) => {
+            let d = resolve_device(&st, target)?;
+            device_command(session, &st, command, d)
+        }
+        Command::SettingsSave { device, .. } | Command::DeviceSave(device, _) => {
+            let d = resolve_device(&st, &Target::Id(*device))?;
+            device_command(session, &st, command, d)
+        }
     }
 }
 
@@ -263,18 +472,178 @@ fn unexpected() -> Error {
     Error::new("the adapter returned an unexpected result")
 }
 
-fn set_adapter(session: &Session, update: p::SetAdapter) -> Result<p::Status, Error> {
-    let name = if update.name.is_some() {
-        "adapter name"
-    } else if !update.transports.is_empty() {
-        "adapter transport"
-    } else {
-        "adapter platform"
-    };
-    match session.call(C::SetAdapter(update), name, true)?.result {
-        Some(response::Result::Status(status)) => Ok(status),
+/// Reads one page of a listing.
+fn read_page<P: Page>(
+    session: &Session,
+    request: C,
+    name: &'static str,
+    reported: bool,
+) -> Result<P, Error> {
+    session
+        .call(request, name, reported)?
+        .result
+        .and_then(P::from_result)
+        .ok_or_else(unexpected)
+}
+
+/// Reads a listing from the start, one request per page; `request` builds the request for the
+/// page after a key.
+fn read_pages<P: Page>(
+    session: &Session,
+    name: &'static str,
+    reported: bool,
+    request: impl Fn(Option<&P::Key>) -> C,
+) -> Result<Vec<P::Entry>, Error> {
+    paging::read_pages(
+        |after| read_page::<P>(session, request(after), name, reported),
+        unexpected,
+    )
+}
+
+/// Saves adapter preferences. The view takes the values sent once the adapter accepts them.
+fn set_adapter(session: &Session, update: p::SetAdapter, name: &'static str) -> Result<(), Error> {
+    session.call(C::SetAdapter(update), name, true)?;
+    Ok(())
+}
+
+fn get_profile(session: &Session, id: u32, reported: bool) -> Result<p::Profile, Error> {
+    profile_result(session.call(
+        C::GetProfile(p::GetProfile { profile: id }),
+        "profile show",
+        reported,
+    )?)
+}
+
+fn profile_result(r: p::Response) -> Result<p::Profile, Error> {
+    match r.result {
+        Some(response::Result::Profile(profile)) => Ok(profile),
         _ => Err(unexpected()),
     }
+}
+
+fn created_result(r: p::Response) -> Result<u32, Error> {
+    match r.result {
+        Some(response::Result::ProfileCreated(created)) => Ok(created.profile),
+        _ => Err(unexpected()),
+    }
+}
+
+fn not_found(target: &Target) -> Error {
+    Error::new(format!(
+        "profile {} not found; use profile list",
+        text::quote(&target.to_string())
+    ))
+}
+
+/// A NOT_FOUND refusal of a profile command, as the profile the user named.
+fn missing(error: Error, target: &Target) -> Error {
+    match error.code_of() {
+        Some(ErrorCode::NotFound) => not_found(target),
+        _ => error,
+    }
+}
+
+/// Resolves a profile: an ID, else a name exactly one profile has. Names are found by reading
+/// every page of the adapter's profiles.
+fn resolve_profile(session: &Session, st: &State, target: &Target) -> Result<p::Profile, Error> {
+    match target {
+        Target::Id(id) => match st.profile(*id) {
+            Some(profile) => Ok(profile.clone()),
+            None => get_profile(session, *id, false).map_err(|e| missing(e, target)),
+        },
+        Target::Name(name) => {
+            let all = all_profiles(session)?;
+            let id = unique_name(&all, name, target)?;
+            Ok(all.into_iter().find(|p| p.id == id).unwrap_or_default())
+        }
+    }
+}
+
+/// Resolves several profiles in order, reading the profile pages at most once for their names.
+fn resolve_profiles(session: &Session, st: &State, targets: &[Target]) -> Result<Vec<u32>, Error> {
+    let mut pages = None;
+    targets
+        .iter()
+        .map(|target| match target {
+            Target::Id(_) => resolve_profile(session, st, target).map(|p| p.id),
+            Target::Name(name) => {
+                if pages.is_none() {
+                    pages = Some(all_profiles(session)?);
+                }
+                unique_name(pages.as_deref().unwrap_or_default(), name, target)
+            }
+        })
+        .collect()
+}
+
+/// Every readable saved profile, read page by page.
+fn all_profiles(session: &Session) -> Result<Vec<p::Profile>, Error> {
+    let entries = read_pages::<p::ProfileList>(session, "profile list", false, |after| {
+        C::ListProfiles(p::ListProfiles {
+            after: after.copied().unwrap_or(0),
+        })
+    })?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| match entry.entry {
+            Some(profile_list_entry::Entry::Profile(profile)) => Some(profile),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The ID of the only profile with `name`.
+fn unique_name(all: &[p::Profile], name: &str, target: &Target) -> Result<u32, Error> {
+    let mut named = all.iter().filter(|p| p.name == name);
+    match (named.next(), named.next()) {
+        (Some(p), None) => Ok(p.id),
+        (None, _) => Err(not_found(target)),
+        _ => Err(Error::new(format!(
+            "profile name {} is ambiguous; use its ID",
+            text::quote(name)
+        ))),
+    }
+}
+
+/// Saves `update` in one SetAdapter request.
+fn save_adapter(
+    session: &Session,
+    st: &State,
+    update: &AdapterUpdate,
+    pending: &'static str,
+) -> Result<(), Error> {
+    for (transport, _) in &update.transports {
+        if !model::supports(&st.status, *transport) {
+            return Err(refused(ErrorCode::Unsupported, "adapter transport"));
+        }
+    }
+    if !update.interfaces.is_empty() {
+        if !profiles::available(&st.status) {
+            return Err(Error::new(NO_PROFILES));
+        }
+        if let Some(error) = profiles::interface_refusal(&st.status, &update.interfaces) {
+            return Err(error);
+        }
+    }
+    let request = p::SetAdapter {
+        platform: update.platform.map(|platform| platform as i32),
+        transports: update
+            .transports
+            .iter()
+            .map(|(t, on)| p::TransportUpdate {
+                transport: *t as i32,
+                enabled: Some(*on),
+            })
+            .collect(),
+        configuration_interfaces: update
+            .interfaces
+            .iter()
+            .map(InterfaceUpdate::wire)
+            .collect(),
+        ..Default::default()
+    };
+    let _pending = session.pending(pending, 0);
+    set_adapter(session, request, pending)
 }
 
 fn scan(
@@ -319,29 +688,30 @@ fn scan(
     }
 }
 
-/// Resolves a pair target: a candidate ID, else a name exactly one candidate has.
-fn resolve_candidate(st: &State, target: &str) -> Result<p::Candidate, Error> {
-    if let Some(c) = st.candidate(target) {
-        return Ok(c.clone());
-    }
-    let mut matches = st.candidates.iter().filter(|c| c.name == target);
-    let candidate = matches.next().ok_or_else(|| {
-        Error::new(
-            "put the device in pairing mode, scan, and pair its Nearby entry or candidate ID",
-        )
-    })?;
-    if matches.next().is_some() {
-        return Err(Error::new(
-            "more than one nearby device has that name; select its candidate ID in the interactive CLI or TUI",
-        ));
-    }
-    Ok(candidate.clone())
+/// Resolves a candidate: its ID, else a name exactly one candidate has.
+fn resolve_candidate(st: &State, target: &Target) -> Result<p::Candidate, Error> {
+    let found = match target {
+        Target::Id(id) => st.candidate(*id).cloned(),
+        Target::Name(name) => {
+            let mut matches = st.candidates.iter().filter(|c| c.name == *name);
+            let first = matches.next().cloned();
+            if first.is_some() && matches.next().is_some() {
+                return Err(Error::new(
+                    "more than one nearby device has that name; use its candidate ID",
+                ));
+            }
+            first
+        }
+    };
+    found.ok_or_else(|| {
+        Error::new("put the device in pairing mode, scan, and pair its candidate ID or name")
+    })
 }
 
-fn pair(session: &Session, target: &str, options: &RunOptions) -> Result<Outcome, Error> {
+fn pair(session: &Session, target: &Target, options: &RunOptions) -> Result<Outcome, Error> {
     let mut st = session.state();
-    if options.one_shot && st.candidate(target).is_none() {
-        // A one-shot pair finds its device by name with a scan of its own.
+    if options.one_shot && resolve_candidate(&st, target).is_err() {
+        // A one-shot pair finds its device with a scan of its own.
         scan(session, &st, &[], 0, options)?;
         st = session.state();
     }
@@ -359,11 +729,11 @@ fn pair(session: &Session, target: &str, options: &RunOptions) -> Result<Outcome
     if model::transport(candidate.transport).is_none_or(|t| !model::supports(&st.status, t)) {
         return Err(refused(ErrorCode::Unsupported, "pair start"));
     }
-    let _pending = session.pending("pair start", Some(&candidate.id));
+    let _pending = session.pending("pair start", candidate.id);
     session
         .call(
             C::StartPairing(p::StartPairing {
-                candidate: candidate.id.clone(),
+                candidate: candidate.id,
             }),
             "pair start",
             true,
@@ -375,7 +745,7 @@ fn pair(session: &Session, target: &str, options: &RunOptions) -> Result<Outcome
             .as_ref()
             .filter(|p| p.candidate == candidate.id)?;
         match &p.step {
-            Some(pairing::Step::Done(done)) => Some(Ok(done.device.clone())),
+            Some(pairing::Step::Done(done)) => Some(Ok(done.device)),
             Some(pairing::Step::Failed(code)) => Some(Err(model::code(*code))),
             _ => None,
         }
@@ -398,7 +768,7 @@ fn pair(session: &Session, target: &str, options: &RunOptions) -> Result<Outcome
     let record = session
         .cell
         .wait_for(&Wait::timeout(Duration::from_secs(2)), |st| {
-            st.device(&device).cloned()
+            st.device(device).cloned()
         })
         .ok();
     Ok(Outcome::Paired {
@@ -458,44 +828,33 @@ fn accept(session: &Session, st: &State, value: Option<&str>) -> Result<Outcome,
     Ok(Outcome::Answered)
 }
 
-/// A resolved device word.
-enum Resolved {
-    Saved(p::Device),
-    Candidate(p::Candidate),
-}
-
-/// Resolves a device word: an ID, else a name exactly one saved device or candidate has.
-fn resolve(st: &State, target: &str) -> Result<Resolved, Error> {
-    if let Some(d) = st.device(target) {
-        return Ok(Resolved::Saved(d.clone()));
+/// Resolves a saved device: its ID, else a name exactly one saved device has.
+pub(crate) fn resolve_device(st: &State, target: &Target) -> Result<p::Device, Error> {
+    match target {
+        Target::Id(id) => st
+            .device(*id)
+            .cloned()
+            .ok_or_else(|| Error::new(format!("device {id} not found; use device list"))),
+        Target::Name(name) => {
+            let mut matches = st.devices.iter().filter(|d| d.name == *name);
+            match (matches.next(), matches.next()) {
+                (Some(d), None) => Ok(d.clone()),
+                (Some(_), Some(_)) => Err(Error::new(format!(
+                    "device name {} is ambiguous; use the device ID",
+                    text::quote(name)
+                ))),
+                (None, _) => Err(Error::new(format!(
+                    "device {} not found; use device list",
+                    text::quote(name)
+                ))),
+            }
+        }
     }
-    if let Some(c) = st.candidate(target) {
-        return Ok(Resolved::Candidate(c.clone()));
-    }
-    let mut matches: BTreeMap<String, Resolved> = BTreeMap::new();
-    for d in st.devices.iter().filter(|d| d.name == target) {
-        matches.insert(d.id.clone(), Resolved::Saved(d.clone()));
-    }
-    for c in st.candidates.iter().filter(|c| c.name == target) {
-        matches
-            .entry(c.id.clone())
-            .or_insert_with(|| Resolved::Candidate(c.clone()));
-    }
-    if matches.len() > 1 {
-        return Err(Error::new(format!(
-            "name {target:?} is ambiguous; use a device or candidate ID"
-        )));
-    }
-    matches.pop_first().map(|(_, r)| r).ok_or_else(|| {
-        Error::new(format!(
-            "device {target:?} not found; scan or use a saved device ID"
-        ))
-    })
 }
 
 fn subject(d: &p::Device) -> Subject {
     Subject {
-        id: d.id.clone(),
+        id: d.id,
         name: d.name.clone(),
     }
 }
@@ -507,51 +866,25 @@ fn device_result(r: p::Response) -> Result<p::Device, Error> {
     }
 }
 
-fn settings_result(r: p::Response) -> Result<Vec<p::Setting>, Error> {
-    match r.result {
-        Some(response::Result::Settings(s)) => Ok(s.settings),
-        _ => Err(unexpected()),
-    }
-}
-
 fn device_command(
     session: &Session,
     st: &State,
     command: &Command,
-    target: &str,
-    _wait: &Wait,
+    d: p::Device,
 ) -> Result<Outcome, Error> {
-    let d = match resolve(st, target)? {
-        Resolved::Saved(d) => d,
-        Resolved::Candidate(c) => {
-            let subject = Subject {
-                id: c.id.clone(),
-                name: c.name.clone(),
-            };
-            return match command {
-                Command::Get(_) => Ok(Outcome::Candidate(c)),
-                Command::Unpair(_) => {
-                    session.cell.update(|st| st.hidden.insert(c.id.clone()));
-                    Ok(Outcome::Hidden(subject))
-                }
-                _ => Err(Error::new("pair the candidate before using this command")),
-            };
-        }
-    };
-    let id = d.id.clone();
+    let id = d.id;
     let subject = subject(&d);
     match command {
         Command::Get(_) => {
             let device = device_result(session.call(
-                C::GetDevice(p::GetDevice { device: id.clone() }),
+                C::GetDevice(p::GetDevice { device: id }),
                 "device get",
                 true,
             )?)?;
-            session.call(
-                C::ListWarnings(p::ListWarnings { device: id }),
-                "warning list",
-                false,
-            )?;
+            // A device has warnings only while it has a link.
+            if device.state() != p::DeviceState::Disconnected {
+                list_warnings(session, id, false)?;
+            }
             Ok(Outcome::Device { subject, device })
         }
         Command::Connect(_) => {
@@ -568,7 +901,7 @@ fn device_command(
                 return Err(no_capacity(CapacityReason::Enabled, "device connect"));
             }
             let transport = d.transport();
-            let _pending = session.pending("device connect", Some(&id));
+            let _pending = session.pending("device connect", id);
             let device = device_result(
                 session
                     .call(
@@ -581,7 +914,7 @@ fn device_command(
             Ok(Outcome::Device { subject, device })
         }
         Command::Disconnect(_) => {
-            let _pending = session.pending("device disconnect", Some(&id));
+            let _pending = session.pending("device disconnect", id);
             let device = device_result(session.call(
                 C::DisconnectDevice(p::DisconnectDevice { device: id }),
                 "device disconnect",
@@ -590,7 +923,7 @@ fn device_command(
             Ok(Outcome::Device { subject, device })
         }
         Command::Unpair(_) => {
-            let _pending = session.pending("device unpair", Some(&id));
+            let _pending = session.pending("device unpair", id);
             session.call(
                 C::UnpairDevice(p::UnpairDevice { device: id }),
                 "device unpair",
@@ -610,65 +943,71 @@ fn device_command(
             Ok(Outcome::Refreshing(subject))
         }
         Command::Set(_, toggle, on) => {
-            let mut update = p::SetDevice {
-                device: id.clone(),
+            let update = match toggle {
+                Toggle::Enabled => DeviceUpdate {
+                    enabled: Some(*on),
+                    ..Default::default()
+                },
+                Toggle::Trusted => DeviceUpdate {
+                    trusted: Some(*on),
+                    ..Default::default()
+                },
+                Toggle::Blocked => DeviceUpdate {
+                    blocked: Some(*on),
+                    ..Default::default()
+                },
+                Toggle::Hidpp => DeviceUpdate {
+                    hidpp: Some(*on),
+                    ..Default::default()
+                },
+            };
+            save_device(session, st, &d, subject, &update, pending_name(*toggle))
+        }
+        Command::Layers(_, targets) => {
+            let layers = resolve_profiles(session, st, targets)?;
+            let update = DeviceUpdate {
+                layers: Some(layers),
                 ..Default::default()
             };
-            match toggle {
-                Toggle::Enabled => {
-                    if *on && !d.enabled && enabled_full(st, &d) {
-                        return Err(no_capacity(CapacityReason::Enabled, "device set"));
-                    }
-                    update.enabled = Some(*on);
-                }
-                Toggle::Trusted => update.trusted = Some(*on),
-                Toggle::Blocked => update.blocked = Some(*on),
-                Toggle::Hidpp => update.integrations.push(p::IntegrationUpdate {
-                    kind: IntegrationKind::Hidpp as i32,
-                    enabled: Some(*on),
-                }),
-            }
-            let _pending = session.pending(pending_name(*toggle), Some(&id));
-            let device = device_result(session.call(C::SetDevice(update), "device set", true)?)?;
-            Ok(Outcome::Device { subject, device })
+            save_device(session, st, &d, subject, &update, "device set profiles")
         }
-        Command::Warnings(_) => {
-            let r = session.call(
-                C::ListWarnings(p::ListWarnings { device: id }),
-                "warning list",
-                true,
-            )?;
-            match r.result {
-                Some(response::Result::Warnings(w)) => Ok(Outcome::Warnings {
-                    subject,
-                    warnings: w.warnings,
-                }),
-                _ => Err(unexpected()),
-            }
+        Command::DeviceSave(_, update) => {
+            // A change to HID++ is tracked as such, so the settings it starts or stops wait
+            // for it.
+            let name = if update.hidpp.is_some() {
+                pending_name(Toggle::Hidpp)
+            } else {
+                "device set"
+            };
+            save_device(session, st, &d, subject, update, name)
         }
+        Command::Warnings(_) => Ok(Outcome::Warnings {
+            subject,
+            warnings: list_warnings(session, id, true)?,
+        }),
         Command::Settings(_) => {
-            let _pending = session.pending("setting list", Some(&id));
-            list_settings(session, &id, true)?;
+            let _pending = session.pending("setting list", id);
+            list_settings(session, id, true)?;
             Ok(Outcome::Settings(subject))
         }
         Command::SettingGet(_, key) => {
-            let settings = list_settings(session, &id, true)?;
+            let settings = list_settings(session, id, true)?;
             let setting = find(&settings, key, "setting get")?;
             Ok(Outcome::Setting { subject, setting })
         }
         Command::SettingSet(_, key, input) => {
-            let settings = list_settings(session, &id, false)?;
+            let settings = list_settings(session, id, false)?;
             let setting = find(&settings, key, "setting set")?;
             let value = catalog::setting_value(&setting, input).map_err(Error::new)?;
             save(session, &subject, vec![(setting, value)], Vec::new())
         }
         Command::SettingForget(_, key) => {
-            let settings = list_settings(session, &id, false)?;
+            let settings = list_settings(session, id, false)?;
             let setting = find(&settings, key, "setting forget")?;
             save(session, &subject, Vec::new(), vec![setting])
         }
         Command::SettingsSave { set, forget, .. } => {
-            let known = st.settings_of(&id);
+            let known = st.settings_of(id);
             let set = set
                 .iter()
                 .map(|(key, value)| {
@@ -686,21 +1025,73 @@ fn device_command(
             save(session, &subject, set, forget)
         }
         Command::Features(_) => {
-            let r = session.call(
-                C::ListFeatures(p::ListFeatures { device: id }),
-                "feature list",
-                true,
-            )?;
-            match r.result {
-                Some(response::Result::Features(list)) => Ok(Outcome::Features {
-                    subject,
-                    features: list.features,
-                }),
-                _ => Err(unexpected()),
-            }
+            let features = read_pages::<p::FeatureList>(session, "feature list", true, |after| {
+                C::ListFeatures(p::ListFeatures {
+                    device: id,
+                    after: after.copied(),
+                })
+            })?;
+            Ok(Outcome::Features { subject, features })
         }
         _ => unreachable!(),
     }
+}
+
+/// Saves `update` for device `d` in one SetDevice request.
+fn save_device(
+    session: &Session,
+    st: &State,
+    d: &p::Device,
+    subject: Subject,
+    update: &DeviceUpdate,
+    pending: &'static str,
+) -> Result<Outcome, Error> {
+    if update.enabled == Some(true) && !d.enabled && enabled_full(st, d) {
+        return Err(no_capacity(CapacityReason::Enabled, "device set"));
+    }
+    if let Some(layers) = &update.layers {
+        let Some(max) = profiles::max_layers(&st.status) else {
+            return Err(Error::new(NO_PROFILES));
+        };
+        if layers.len() > max as usize {
+            return Err(Error::new(format!(
+                "a device can use at most {max} profiles"
+            )));
+        }
+    }
+    let request = p::SetDevice {
+        device: d.id,
+        enabled: update.enabled,
+        trusted: update.trusted,
+        blocked: update.blocked,
+        integrations: update
+            .hidpp
+            .map(|on| p::IntegrationUpdate {
+                kind: IntegrationKind::Hidpp as i32,
+                enabled: Some(on),
+            })
+            .into_iter()
+            .collect(),
+        profiles: update
+            .layers
+            .clone()
+            .map(|profiles| p::ProfileLayers { profiles }),
+    };
+    // A missing profile and a missing device are told apart by what the request carried.
+    let name = if request.profiles.is_some() {
+        "device set profiles"
+    } else {
+        "device set"
+    };
+    let _pending = session.pending(pending, d.id);
+    session.call(C::SetDevice(request), name, true)?;
+    // The view took the preferences sent once the adapter accepted them.
+    let device = session
+        .state()
+        .device(d.id)
+        .cloned()
+        .unwrap_or_else(|| d.clone());
+    Ok(Outcome::Device { subject, device })
 }
 
 /// The progress name of a device preference change.
@@ -730,12 +1121,26 @@ pub fn enabled_full(st: &State, d: &p::Device) -> bool {
     enabled >= max as usize
 }
 
-fn list_settings(session: &Session, id: &str, reported: bool) -> Result<Vec<p::Setting>, Error> {
-    settings_result(session.call(
-        C::ListSettings(p::ListSettings { device: id.into() }),
-        "setting list",
-        reported,
-    )?)
+fn list_settings(session: &Session, id: u32, reported: bool) -> Result<Vec<p::Setting>, Error> {
+    read_pages::<p::DeviceSettings>(session, "setting list", reported, |after| {
+        C::ListSettings(p::ListSettings {
+            device: id,
+            after: after.cloned(),
+        })
+    })
+}
+
+fn list_warnings(
+    session: &Session,
+    id: u32,
+    reported: bool,
+) -> Result<Vec<p::DeviceWarning>, Error> {
+    read_pages::<p::DeviceWarnings>(session, "warning list", reported, |after| {
+        C::ListWarnings(p::ListWarnings {
+            device: id,
+            after: after.copied(),
+        })
+    })
 }
 
 /// The setting with `key`. A key the catalog doesn't know is never shown, so it isn't found.
@@ -747,44 +1152,36 @@ fn find(settings: &[p::Setting], key: &str, command: &'static str) -> Result<p::
         .ok_or_else(|| refused(ErrorCode::NotFound, command))
 }
 
+/// Saves values and forgets saved values in one request.
 fn save(
     session: &Session,
     subject: &Subject,
     set: Vec<(p::Setting, p::value::Value)>,
     forget: Vec<p::Setting>,
 ) -> Result<Outcome, Error> {
-    let _pending = session.pending("setting set", Some(&subject.id));
-    let mut settings = Vec::new();
+    let _pending = session.pending("setting set", subject.id);
     let set_keys: Vec<String> = set.iter().map(|(s, _)| s.key.clone()).collect();
-    if !set.is_empty() {
-        let changes = set
-            .into_iter()
-            .map(|(s, value)| p::SettingChange {
-                integration: s.integration,
-                key: s.key,
-                value: Some(model::wire_value(value)),
-            })
-            .collect();
-        settings = settings_result(session.call(
-            C::SetSettings(p::SetSettings {
-                device: subject.id.clone(),
-                changes,
-            }),
-            "setting set",
-            true,
-        )?)?;
-    }
     let forget_keys: Vec<String> = forget.iter().map(|s| s.key.clone()).collect();
-    if !forget.is_empty() {
-        settings = settings_result(session.call(
-            C::ForgetSettings(p::ForgetSettings {
-                device: subject.id.clone(),
-                settings: forget.iter().map(model::reference).collect(),
-            }),
-            "setting forget",
-            true,
-        )?)?;
-    }
+    let name = if set.is_empty() {
+        "setting forget"
+    } else {
+        "setting set"
+    };
+    let changes = set
+        .into_iter()
+        .map(|(s, value)| model::save_change(&s, value))
+        .chain(forget.iter().map(model::forget_change))
+        .collect();
+    session.call(
+        C::SetSettings(p::SetSettings {
+            device: subject.id,
+            changes,
+        }),
+        name,
+        true,
+    )?;
+    // The view took the values sent once the adapter accepted them.
+    let settings = session.state().settings_of(subject.id).to_vec();
     Ok(Outcome::Saved {
         subject: subject.clone(),
         set: set_keys,

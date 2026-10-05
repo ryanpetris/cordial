@@ -14,8 +14,10 @@ const app = await _electron.launch({ args: ['--no-sandbox', '.', `--user-data-di
 try {
   const page = await app.firstWindow();
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1100, 900));
-  await page.getByRole('button', { name: /^Pico W/ }).first().waitFor();
-  await page.getByRole('button', { name: /^Pico W/ }).first().click();
+  await page.getByRole('button', { name: /^Pico 2 W/ }).first().waitFor();
+  await page.getByRole('button', { name: /^Pico 2 W/ }).first().click();
+  const settings = () => page.getByRole('tab', { name: 'Settings', exact: true }).click();
+  await settings();
   // Each supported transport has a switch: Classic starts disabled and BLE enabled, as on the
   // adapter. A saved device of a disabled transport says so.
   const classic = page.getByRole('switch', { name: /Bluetooth Classic/ });
@@ -24,32 +26,44 @@ try {
     for (let i = 0; i < 100 && (await control.isChecked()) !== on; i++) await page.waitForTimeout(20);
     assert.equal(await control.isChecked(), on);
   };
+  // Switch edits stage until Save; the saved state shows once the staged marker is gone.
+  const bar = page.locator('.page-bar');
+  const save = async () => {
+    await bar.getByRole('button', { name: 'Save', exact: true }).click();
+    await page.getByRole('img', { name: /, Changed$/ }).waitFor({ state: 'detached' });
+    assert.equal(await bar.getByRole('button', { name: 'Save', exact: true }).isDisabled(), true);
+  };
   const disabledText = 'Bluetooth Classic is disabled. Enable it in the adapter settings.';
   await checked(classic, false);
   await checked(ble, true);
   await page.getByRole('button', { name: /Travel Keyboard/ }).first().click();
   await page.getByText(disabledText, { exact: true }).waitFor();
-  await page.getByRole('button', { name: /^Pico W/ }).first().click();
+  await page.getByRole('button', { name: /^Pico 2 W/ }).first().click();
+  await settings();
   await classic.click();
+  await save();
   await checked(classic, true);
   await page.getByRole('button', { name: /Travel Keyboard/ }).first().click();
   await page.getByRole('tab', { name: 'Details', exact: true }).waitFor();
   assert.equal(await page.getByText(disabledText, { exact: true }).count(), 0);
-  await page.getByRole('button', { name: /^Pico W/ }).first().click();
+  await page.getByRole('button', { name: /^Pico 2 W/ }).first().click();
+  await settings();
   await classic.click();
+  await save();
   await checked(classic, false);
   // The simulated ESP32-S3 supports only BLE.
   await page.getByRole('button', { name: /^XIAO ESP32-S3/ }).first().click();
+  await settings();
   await checked(ble, true);
   assert.equal(await classic.count(), 0);
-  await page.getByRole('button', { name: /^Pico W/ }).first().click();
-  // The page bar's Rename opens the dialog; the dialog's Rename submits it.
-  const bar = page.locator('.page-bar');
+  await page.getByRole('button', { name: /^Pico 2 W/ }).first().click();
+  // Details' page bar has Rename, which opens the dialog; the dialog's Rename submits it.
+  await page.getByRole('tab', { name: 'Details', exact: true }).click();
   const rename = bar.getByRole('button', { name: 'Rename', exact: true });
   const submit = page.getByRole('dialog').getByRole('button', { name: 'Rename', exact: true });
   await rename.click();
   const input = page.getByRole('textbox', { name: 'Adapter name' });
-  assert.equal(await input.inputValue(), 'Pico W');
+  assert.equal(await input.inputValue(), 'Pico 2 W');
   await input.fill('é'.repeat(33));
   assert.equal(await submit.isDisabled(), true);
   await input.fill('Desk \u{10400}');
@@ -64,7 +78,7 @@ try {
   await rename.click();
   await page.getByRole('button', { name: 'Reset to Default', exact: true }).click();
   await input.waitFor({ state: 'hidden' });
-  await page.getByRole('heading', { name: 'Pico W', exact: true }).waitFor({ state: 'attached' });
+  await page.getByRole('heading', { name: 'Pico 2 W', exact: true }).waitFor({ state: 'attached' });
   // Give both adapters the same name and verify the displayed and editable values.
   await rename.click();
   await input.fill('XIAO ESP32-S3');
@@ -100,7 +114,7 @@ try {
   assert.equal(await input.isVisible(), true);
   await app.evaluate(() => { globalThis.renameReply({ ok: true }); });
   await input.waitFor({ state: 'hidden' });
-  console.log('Desktop adapter UI: transport switches, rename save, reset, Unicode limit, cancel, errors, pending state, duplicate names and reconnect passed');
+  console.log('Desktop adapter UI: transport switches saved with Save, rename save, reset, Unicode limit, cancel, errors, pending state, duplicate names and reconnect passed');
 } catch (e) {
   const page = await app.firstWindow();
   console.error(await page.locator('body').innerText());

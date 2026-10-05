@@ -9,8 +9,8 @@ runtime, and no serial or DTR sequence, can enable them on production firmware.
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListFeatures` | `FeatureList` | The device's integration feature tables. For HID++, each entry has the feature index, ID, version and flags, and whether the Dongle supports it; hidden and engineering features are listed as unsupported. |
-| `ListFiles` | `FileList` | One directory of the application filesystem, not recursive. |
+| `ListFeatures` | `FeatureList` | One page of the device's integration feature tables, by integration and then index. For HID++, each entry has the feature index, ID, version and flags, and whether the Dongle supports it; hidden and engineering features are listed as unsupported. |
+| `ListFiles` | `FileList` | One page of a directory of the application filesystem, not recursive, by name compared bytewise. |
 | `ReadFile` | `FileData` | One whole file. |
 | `EnterBootloader` | none | See [Commands](commands.md#adapter). |
 

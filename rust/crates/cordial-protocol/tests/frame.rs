@@ -96,23 +96,14 @@ fn reset_drops_a_partial_frame() {
 fn unknown_commands_decode_as_no_command() {
     // Field 99 stands for a command added after this build.
     let mut bytes = Vec::new();
-    prost::encoding::message::encode(
-        99,
-        &GetDevice {
-            device: "d_1".into(),
-        },
-        &mut bytes,
-    );
+    prost::encoding::message::encode(99, &GetDevice { device: 1 }, &mut bytes);
     let request = Request::decode(bytes.as_slice()).unwrap();
     assert!(request.command.is_none());
 }
 
 #[test]
 fn unknown_fields_are_ignored() {
-    let mut bytes = GetDevice {
-        device: "d_1".into(),
-    }
-    .encode_to_vec();
+    let mut bytes = GetDevice { device: 1 }.encode_to_vec();
     prost::encoding::string::encode(15, &"later".to_string(), &mut bytes);
-    assert_eq!(GetDevice::decode(bytes.as_slice()).unwrap().device, "d_1");
+    assert_eq!(GetDevice::decode(bytes.as_slice()).unwrap().device, 1);
 }

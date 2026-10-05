@@ -128,12 +128,26 @@ fn status(name: &str) -> p::Status {
     }
 }
 
-fn device(id: &str) -> p::Device {
+fn device(id: u32) -> p::Device {
     p::Device {
-        id: id.into(),
+        id,
         transport: p::Transport::Ble as i32,
         ..Default::default()
     }
+}
+
+fn devices(entries: Vec<p::device_list_entry::Entry>, end: bool) -> p::DeviceList {
+    p::DeviceList {
+        entries: entries
+            .into_iter()
+            .map(|entry| p::DeviceListEntry { entry: Some(entry) })
+            .collect(),
+        end,
+    }
+}
+
+fn saved(id: u32) -> p::device_list_entry::Entry {
+    p::device_list_entry::Entry::Device(device(id))
 }
 
 #[test]
@@ -142,16 +156,15 @@ fn responses_match_requests_in_order_with_events_between() {
         |_| {},
         |command, out| match command {
             Command::GetStatus(_) => {
-                out.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved {
-                    id: "d_1".into(),
-                }));
+                out.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 1 }));
                 out.respond(Some(response::Result::Status(status("Desk"))));
             }
             Command::ListDevices(_) => {
-                out.event(p::event::Kind::Device(device("d_2")));
-                out.respond(Some(response::Result::Devices(p::DeviceList {
-                    devices: vec![device("d_2"), device("d_3")],
-                })));
+                out.event(p::event::Kind::Device(device(2)));
+                out.respond(Some(response::Result::Devices(devices(
+                    vec![saved(2), saved(3)],
+                    true,
+                ))));
             }
             Command::StopScan(_) => out.respond(None),
             other => panic!("{other:?}"),
@@ -159,15 +172,18 @@ fn responses_match_requests_in_order_with_events_between() {
     );
     let (connection, events) = Connection::new(reader, writer);
     assert_eq!(connection.status().unwrap().name, "Desk");
-    let devices = connection.list_devices().unwrap();
+    let page = connection.list_devices(0).unwrap();
     assert_eq!(
-        devices.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
-        ["d_2", "d_3"]
+        page.entries
+            .iter()
+            .map(cordial_client::paging::device_entry_id)
+            .collect::<Vec<_>>(),
+        [2, 3]
     );
     connection.stop_scan().unwrap();
     // The event before the first response belongs to the leftovers the session ignores.
     let event = events.recv_timeout(Duration::from_secs(1)).unwrap();
-    assert_eq!(event.kind, Some(p::event::Kind::Device(device("d_2"))));
+    assert_eq!(event.kind, Some(p::event::Kind::Device(device(2))));
     assert!(events.try_recv().is_err());
 }
 
@@ -178,9 +194,7 @@ fn the_first_request_follows_a_delimiter_and_leftovers_are_ignored() {
             // A previous session's partial frame and event, then the new session's delimiter.
             out.raw(&[3, 1, 2]);
             out.raw(&[0]);
-            out.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved {
-                id: "old".into(),
-            }));
+            out.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 9 }));
             out.raw(&[0xff, 0xff, 0]);
         },
         |command, out| match command {
@@ -219,7 +233,7 @@ fn dongle_errors_are_error_values_and_raw_responses_keep_them() {
     );
     let (connection, _events) = Connection::new(reader, writer);
     let result = connection.set_device(p::SetDevice {
-        device: "d_1".into(),
+        device: 1,
         enabled: Some(true),
         ..Default::default()
     });
@@ -228,13 +242,163 @@ fn dongle_errors_are_error_values_and_raw_responses_keep_them() {
         other => panic!("{other:?}"),
     }
     assert_eq!(
-        connection.connect_device("d_1").unwrap_err().code(),
+        connection.connect_device(1).unwrap_err().code(),
         Some(p::ErrorCode::NoCapacity)
     );
     let response = connection
         .request(Command::GetStatus(p::GetStatus {}))
         .unwrap();
     assert_eq!(response.result, Some(response::Result::Error(error)));
+}
+
+#[test]
+fn profile_commands_carry_their_fields_and_results() {
+    let profile = |id: u32, name: &str| p::Profile {
+        id,
+        name: name.into(),
+        roles: vec![p::Role::Mouse as i32],
+    };
+    let rule = p::ProfileRule {
+        input: Some(p::Usage {
+            usage_page: 9,
+            usage: 1,
+        }),
+        effect: Some(p::profile_rule::Effect::Remap(p::profile_rule::Remap {
+            outputs: vec![p::profile_rule::Output {
+                usage: Some(p::Usage {
+                    usage_page: 9,
+                    usage: 2,
+                }),
+                collection: None,
+            }],
+        })),
+    };
+    let saved = rule.clone();
+    let (reader, writer, _, _out) = dongle(
+        |_| {},
+        move |command, out| match command {
+            Command::GetStatus(_) => out.respond(Some(response::Result::Status(status("A")))),
+            Command::GetProfile(g) => {
+                out.respond(Some(response::Result::Profile(profile(g.profile, "Work"))))
+            }
+            Command::CreateProfile(c) => {
+                assert_eq!(c.name, "Games");
+                out.respond(Some(response::Result::ProfileCreated(p::ProfileCreated {
+                    profile: 5,
+                })))
+            }
+            Command::CopyProfile(c) => {
+                assert_eq!((c.profile, c.name.as_str()), (2, "Games"));
+                out.respond(Some(response::Result::ProfileCreated(p::ProfileCreated {
+                    profile: 3,
+                })));
+            }
+            Command::DeleteProfile(d) => {
+                assert_eq!(d.profile, 3);
+                out.respond(None);
+            }
+            Command::ListProfileRules(l) => {
+                assert_eq!(l.after, None);
+                out.respond(Some(response::Result::ProfileRules(p::ProfileRules {
+                    profile: l.profile,
+                    rules: vec![saved.clone()],
+                    end: true,
+                })))
+            }
+            Command::SetProfileRules(s) => {
+                assert_eq!(s.profile, 2);
+                assert!(matches!(
+                    s.changes[0].change,
+                    Some(p::profile_rule_change::Change::Forget(_))
+                ));
+                out.respond(None)
+            }
+            other => panic!("{other:?}"),
+        },
+    );
+    let (connection, _events) = Connection::new(reader, writer);
+    connection.status().unwrap();
+    assert_eq!(connection.get_profile(2).unwrap(), profile(2, "Work"));
+    assert_eq!(connection.create_profile("Games").unwrap(), 5);
+    assert_eq!(connection.copy_profile(2, "Games").unwrap(), 3);
+    connection.delete_profile(3).unwrap();
+    assert_eq!(connection.all_profile_rules(2).unwrap(), [rule]);
+    let forget = p::ProfileRuleChange {
+        change: Some(p::profile_rule_change::Change::Forget(p::ProfileRuleRef {
+            input: Some(p::Usage {
+                usage_page: 9,
+                usage: 1,
+            }),
+        })),
+    };
+    connection.set_profile_rules(2, vec![forget]).unwrap();
+}
+
+#[test]
+fn listings_read_every_page_and_keep_unreadable_ids() {
+    let afters = Arc::new(Mutex::new(Vec::new()));
+    let log = afters.clone();
+    let (reader, writer, _, _out) = dongle(
+        |_| {},
+        move |command, out| match command {
+            Command::ListDevices(l) => {
+                log.lock().unwrap().push(l.after);
+                let list = match l.after {
+                    0 => devices(
+                        vec![
+                            saved(1),
+                            p::device_list_entry::Entry::Unreadable(2),
+                            saved(4),
+                        ],
+                        false,
+                    ),
+                    4 => devices(vec![saved(9)], true),
+                    other => panic!("{other}"),
+                };
+                out.respond(Some(response::Result::Devices(list)));
+            }
+            Command::ListProfiles(l) => {
+                // A page whose last entry does not move past the key would never end.
+                let id = if l.after == 0 { 5 } else { 3 };
+                out.respond(Some(response::Result::Profiles(p::ProfileList {
+                    entries: vec![p::ProfileListEntry {
+                        entry: Some(p::profile_list_entry::Entry::Unreadable(id)),
+                    }],
+                    end: false,
+                })))
+            }
+            Command::ListSettings(l) => {
+                // A page without entries that does not end the listing would never end.
+                assert_eq!(l.after, None);
+                out.respond(Some(response::Result::Settings(p::DeviceSettings {
+                    device: l.device,
+                    ..Default::default()
+                })))
+            }
+            other => panic!("{other:?}"),
+        },
+    );
+    let (connection, _events) = Connection::new(reader, writer);
+    let all = connection.all_devices().unwrap();
+    assert_eq!(
+        all.iter()
+            .map(cordial_client::paging::device_entry_id)
+            .collect::<Vec<_>>(),
+        [1, 2, 4, 9]
+    );
+    assert_eq!(
+        all[1].entry,
+        Some(p::device_list_entry::Entry::Unreadable(2))
+    );
+    assert_eq!(*afters.lock().unwrap(), [0, 4]);
+    assert!(matches!(
+        connection.all_profiles(),
+        Err(Error::UnexpectedResponse)
+    ));
+    assert!(matches!(
+        connection.all_settings(1),
+        Err(Error::UnexpectedResponse)
+    ));
 }
 
 #[test]
@@ -245,10 +409,10 @@ fn a_result_of_the_wrong_kind_is_unexpected_and_unit_commands_accept_any_success
     );
     let (connection, _events) = Connection::new(reader, writer);
     assert!(matches!(
-        connection.list_devices(),
+        connection.list_devices(0),
         Err(Error::UnexpectedResponse)
     ));
-    connection.refresh_device("d_1").unwrap();
+    connection.refresh_device(1).unwrap();
     assert_eq!(connection.status().unwrap().name, "A");
 }
 
@@ -260,7 +424,7 @@ fn a_timed_out_request_closes_the_connection() {
         move |command, out| match command {
             Command::GetDevice(_) => {
                 wait.recv().unwrap();
-                out.respond(Some(response::Result::Device(device("d_1"))));
+                out.respond(Some(response::Result::Device(device(1))));
             }
             Command::GetStatus(_) => out.respond(Some(response::Result::Status(status("B")))),
             other => panic!("{other:?}"),
@@ -268,7 +432,7 @@ fn a_timed_out_request_closes_the_connection() {
     );
     let (connection, _events) = Connection::new(reader, writer);
     connection.set_timeout(Some(Duration::from_millis(50)));
-    assert!(matches!(connection.get_device("d_1"), Err(Error::Timeout)));
+    assert!(matches!(connection.get_device(1), Err(Error::Timeout)));
     assert!(matches!(connection.closed(), Some(Error::Timeout)));
     release.send(()).unwrap();
     assert!(matches!(connection.status(), Err(Error::Timeout)));
@@ -281,10 +445,10 @@ fn a_request_over_the_frame_limit_is_not_sent() {
     let change = p::SettingChange {
         integration: p::IntegrationKind::Hidpp as i32,
         key: "k".repeat(MAX_REQUEST_BYTES),
-        value: None,
+        change: None,
     };
     assert!(matches!(
-        connection.set_settings("d_1", vec![change]),
+        connection.set_settings(1, vec![change]),
         Err(Error::TooLong)
     ));
     thread::sleep(Duration::from_millis(30));
@@ -307,7 +471,7 @@ fn the_stream_ending_fails_waiting_and_later_requests() {
     assert!(matches!(waiting.join().unwrap(), Err(Error::Closed)));
     assert!(events.recv_timeout(Duration::from_secs(1)).is_err());
     assert!(matches!(connection.closed(), Some(Error::Closed)));
-    assert!(matches!(connection.list_devices(), Err(Error::Closed)));
+    assert!(matches!(connection.list_devices(0), Err(Error::Closed)));
 }
 
 #[test]
@@ -353,12 +517,11 @@ fn a_handler_sees_events_and_responses_in_stream_order() {
                     truncated: false,
                 }));
                 out.respond(Some(response::Result::Settings(p::DeviceSettings {
-                    device: "d_1".into(),
+                    device: 1,
                     settings: Vec::new(),
+                    end: true,
                 })));
-                out.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved {
-                    id: "d_1".into(),
-                }));
+                out.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 1 }));
             }
             other => panic!("{other:?}"),
         },
@@ -373,8 +536,8 @@ fn a_handler_sees_events_and_responses_in_stream_order() {
         });
     });
     connection.status().unwrap();
-    let settings = connection.list_settings("d_1").unwrap();
-    assert_eq!(settings.device, "d_1");
+    let settings = connection.list_settings(1, None).unwrap();
+    assert_eq!(settings.device, 1);
     // The response reached the handler before the request returned it.
     assert!(seen.lock().unwrap().len() >= 3);
     thread::sleep(Duration::from_millis(50));
@@ -402,11 +565,14 @@ impl Name for p::event::Kind {
             p::event::Kind::Adapter(_) => "adapter",
             p::event::Kind::Device(_) => "device",
             p::event::Kind::DeviceRemoved(_) => "device_removed",
-            p::event::Kind::Settings(_) => "settings",
+            p::event::Kind::SettingsChanged(_) => "settings_changed",
             p::event::Kind::ScanFound(_) => "scan_found",
             p::event::Kind::ScanDone(_) => "scan_done",
             p::event::Kind::Pairing(_) => "pairing",
-            p::event::Kind::Warnings(_) => "warnings",
+            p::event::Kind::WarningsChanged(_) => "warnings_changed",
+            p::event::Kind::Profile(_) => "profile",
+            p::event::Kind::ProfileRemoved(_) => "profile_removed",
+            p::event::Kind::ProfileRulesChanged(_) => "profile_rules_changed",
         }
     }
 }

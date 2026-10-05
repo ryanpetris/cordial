@@ -4,13 +4,13 @@ import { FakeAdapter, device, setting } from "../src/fake/adapter.ts";
 import type { AppState } from "../src/shared/state.ts";
 import { controller, until } from "./helpers.ts";
 
-const KEY = "AAAA0001/d_1";
+const KEY = "AAAA0001/1";
 
 function keyboard(state: "connected" | "disconnected" = "connected") {
   return new FakeAdapter({
     adapterId: "AAAA0001",
     devices: [
-      device("d_1", {
+      device(1, {
         state,
         hidppEnabled: true,
         hidpp: [4, 5],
@@ -33,10 +33,10 @@ async function start(fake: FakeAdapter) {
   return { ...harness, entry, row };
 }
 
-const sent = (fake: FakeAdapter) => fake.received.filter((r) => r.command.case === "setSettings" || r.command.case === "forgetSettings");
+const sent = (fake: FakeAdapter) => fake.received.filter((r) => r.command.case === "setSettings");
 
 describe("settings form submission", () => {
-  it("saves values in one write and forgetting in another, then follows the apply", async () => {
+  it("saves values and forgets others in one write, then follows the apply", async () => {
     const fake = keyboard();
     const { c, row } = await start(fake);
     const result = await c.act({
@@ -50,15 +50,15 @@ describe("settings form submission", () => {
     });
     expect(result).toMatchObject({ ok: true, settingsSave: { running: false } });
     expect(result.settingsSave!.items.map((i) => i.status)).toEqual(["saved", "saved", "saved"]);
-    const [set, forget] = sent(fake);
-    expect(set!.command.value).toMatchObject({
-      device: "d_1",
+    expect(sent(fake)).toHaveLength(1);
+    expect(sent(fake)[0]!.command.value).toMatchObject({
+      device: 1,
       changes: [
-        { integration: 1, key: "backlight.level", value: { value: { case: "integer", value: 5n } } },
-        { integration: 1, key: "backlight.enabled", value: { value: { case: "bool", value: false } } },
+        { integration: 1, key: "backlight.level", change: { case: "value", value: { value: { case: "integer", value: 5n } } } },
+        { integration: 1, key: "backlight.mode", change: { case: "forget" } },
+        { integration: 1, key: "backlight.enabled", change: { case: "value", value: { value: { case: "bool", value: false } } } },
       ],
     });
-    expect(forget!.command.value).toMatchObject({ device: "d_1", settings: [{ integration: 1, key: "backlight.mode" }] });
     await until(() => row("backlight.level").state === "applied");
     expect(row("backlight.level")).toMatchObject({ value: 5, saved: 5 });
     expect(row("backlight.mode")).toMatchObject({ saved: null, state: null });
@@ -71,14 +71,16 @@ describe("settings form submission", () => {
     expect(entry().device.hidpp?.state).toBe("disconnected");
     expect(await c.act({ type: "settings.save", key: KEY, changes: [{ type: "set", setting: "backlight.mode", value: "permanent_manual" }] })).toMatchObject({ ok: true });
     await until(() => row("backlight.mode").saved === "permanent_manual");
-    expect(row("backlight.mode")).toMatchObject({ value: "automatic", state: "pending" });
-    fake.changeDevice("d_1", { state: "connected" });
+    // A disconnected device's list holds its saved settings, without readings.
+    expect(row("backlight.mode")).toMatchObject({ value: null, state: "pending" });
+    expect(entry().settings!.map((s) => s.key)).toEqual(["backlight.mode"]);
+    fake.changeDevice(1, { state: "connected" });
     await until(() => row("backlight.mode").state === "applied");
     expect(row("backlight.mode").value).toBe("permanent_manual");
     await c.stop();
   });
 
-  it("shows a refused save without sending the rest or retrying", async () => {
+  it("shows a refused save without retrying", async () => {
     const fake = keyboard();
     const { c, row, state } = await start(fake);
     fake.failures.setSettings = [ErrorCode.STORAGE_FAILED];
@@ -91,7 +93,7 @@ describe("settings form submission", () => {
       ],
     });
     expect(result).toMatchObject({ ok: false, inline: true, message: expect.stringContaining("couldn't save") });
-    expect(result.settingsSave!.items.map((i) => i.status)).toEqual(["not_saved", "not_sent"]);
+    expect(result.settingsSave!.items.map((i) => i.status)).toEqual(["not_saved", "not_saved"]);
     expect(sent(fake)).toHaveLength(1);
     expect(row("backlight.level").saved).toBeNull();
     await new Promise((r) => setTimeout(r, 50));
@@ -114,19 +116,21 @@ describe("settings form submission", () => {
     await c.stop();
   });
 
-  it("refuses duplicate and unknown settings without sending anything", async () => {
+  it("sends changes to one setting in order, and refuses unknown settings without sending anything", async () => {
     const fake = keyboard();
-    const { c } = await start(fake);
+    const { c, row } = await start(fake);
+    expect(await c.act({ type: "settings.save", key: KEY, changes: [{ type: "set", setting: "wheel.mode", value: "ratchet" }] })).toMatchObject({ ok: false });
+    expect(sent(fake)).toHaveLength(0);
     expect(await c.act({
       type: "settings.save",
       key: KEY,
       changes: [
-        { type: "set", setting: "backlight.level", value: 1 },
         { type: "forget", setting: "backlight.level" },
+        { type: "set", setting: "backlight.level", value: 1 },
       ],
-    })).toEqual({ ok: false, message: "There are no distinct settings changes to save." });
-    expect(await c.act({ type: "settings.save", key: KEY, changes: [{ type: "set", setting: "wheel.mode", value: "ratchet" }] })).toMatchObject({ ok: false });
-    expect(sent(fake)).toHaveLength(0);
+    })).toMatchObject({ ok: true });
+    // The later change replaces the earlier one.
+    await until(() => row("backlight.level").saved === 1);
     await c.stop();
   });
 

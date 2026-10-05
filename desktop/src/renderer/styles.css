@@ -180,6 +180,20 @@ input.number,
   background: var(--button);
 }
 
+/* The arrow is drawn so it sits inside the same inset as the text. */
+select {
+  appearance: none;
+  padding-right: 32px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    right 17px center,
+    right 12px center;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+
 select option {
   background: var(--card);
 }
@@ -445,11 +459,18 @@ input.number {
 
 /* An empty state inside a page, centred in the space the page scrolls in;
    even padding above and below keeps it centred. */
-.page:has(> .page-empty) {
+.page:has(> .page-empty),
+.page:has(> [role="tabpanel"] > .page-empty) {
   display: flex;
   min-height: 100%;
   flex-direction: column;
   padding-bottom: 8px;
+}
+
+.page > [role="tabpanel"]:has(> .page-empty) {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
 }
 
 .page-empty {
@@ -478,6 +499,14 @@ input.number {
   margin: 0 0 8px 2px;
   font-size: 14px;
   font-weight: 700;
+}
+
+.group-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .card {
@@ -608,6 +637,54 @@ button.row {
 
 .row-title.strong {
   font-weight: 600;
+}
+
+/* A profile's roles, one icon each. */
+.role-icons {
+  display: inline-flex;
+  gap: 6px;
+  color: var(--dim);
+}
+
+.role-icons > span {
+  display: flex;
+}
+
+input.radio {
+  appearance: none;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  place-items: center;
+  border: 2px solid color-mix(in srgb, var(--fg) 30%, transparent);
+  border-radius: 50%;
+  background: var(--card);
+}
+
+input.radio:checked {
+  border-color: var(--accent);
+}
+
+input.radio:checked::after {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+input.radio.staged:checked {
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+input.radio:disabled {
+  opacity: 0.35;
+}
+
+input.radio:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: 2px;
 }
 
 .row-subtitle.warn {
@@ -928,30 +1005,6 @@ button.row {
 
 .card-actions {
   border-top: 1px solid var(--border);
-}
-
-.chip {
-  display: inline-block;
-  padding: 1px 8px;
-  margin-right: 4px;
-  border-radius: 99px;
-  background: var(--button);
-  font-size: 11.5px;
-  font-weight: 700;
-}
-
-.chip.applied {
-  color: var(--success);
-}
-
-.chip.changed_on_device,
-.chip.uncertain,
-.chip.unsupported {
-  color: var(--warning-fg);
-}
-
-.chip.error {
-  color: var(--destructive-fg);
 }
 
 /* Settings form: each row is label, control with unit, and a state marker

@@ -14,5 +14,6 @@
   "usb_backend": "embassy",
   "storage_backend": "littlefs",
   "radio_backend": "esp-idf",
-  "firmware_bytes": 2097152
+  "firmware_bytes": 2097152,
+  "profile_memory_budget": 32768
 }

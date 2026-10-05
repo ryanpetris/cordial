@@ -49,6 +49,8 @@ require(root + '/node_modules/serialport').SerialPort.list().then(() => console.
             raise SystemExit("Missing Electron user namespace AppArmor profile")
 required.append(f"/usr/share/doc/{args.package}/copyright" if args.debian
                 else f"/usr/share/licenses/{args.package}/LICENSE")
+rules = "desktop" if args.package == "cordial-desktop" else "cli"
+required.append(f"/usr/lib/udev/rules.d/50-cordial-{rules}.rules")
 for path in required:
     if not Path(path).is_file():
         raise SystemExit(f"Missing installed file: {path}")
