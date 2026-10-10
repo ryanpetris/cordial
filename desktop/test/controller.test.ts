@@ -284,7 +284,7 @@ describe("Controller", () => {
     const { c, state } = controller({ "/a": a });
     await c.manager.rescan();
     await until(() => loaded(state(), 3));
-    const full = { ok: false, message: "Every enabled-device place is in use; turn off another device first" };
+    const full = { ok: false, message: "Every enabled-device place is in use. Turn off another device first." };
     const find = (id: number) => state()!.devices.find((d) => d.key === `AAAA0001/${id}`)!.device;
     expect(find(3).inactive).toBe("capacity");
     const sent = a.received.length;
@@ -313,7 +313,7 @@ describe("Controller", () => {
     const sent = a.received.length;
     expect(await c.act({ type: "device.update", key: "AAAA0001/2", enabled: true })).toEqual({
       ok: false,
-      message: "Every enabled-device place is in use; turn off another device first",
+      message: "Every enabled-device place is in use. Turn off another device first.",
     });
     expect(a.received.length).toBe(sent);
     // Another transport has its own places.
@@ -324,7 +324,7 @@ describe("Controller", () => {
     await until(() => state()!.devices.find((d) => d.key === "AAAA0001/1")!.device.enabled === false);
     expect(await c.act({ type: "device.update", key: "AAAA0001/1", enabled: true })).toEqual({
       ok: false,
-      message: "Every enabled-device place is in use; turn off another device first",
+      message: "Every enabled-device place is in use. Turn off another device first.",
     });
     expect(commands(a).at(-1)).toBe("setDevice");
     await c.stop();
@@ -542,7 +542,7 @@ it("enables and disables each transport and explains a disabled transport's devi
   a.failures.setAdapter = [ErrorCode.STORAGE_FAILED];
   expect(await c.act({ type: "adapter.settings", adapterId: "AAAA0001", transports: { ble: true } })).toEqual({
     ok: false,
-    message: "The adapter couldn't save the change. Your saved data hasn't changed",
+    message: "The adapter couldn't save the change. Your saved data hasn't changed.",
   });
   await c.stop();
 });
@@ -589,7 +589,7 @@ it("refuses changing a transport the adapter doesn't support", async () => {
   const sent = a.received.length;
   expect(await c.act({ type: "adapter.settings", adapterId: "AAAA0001", transports: { classic: true } })).toEqual({
     ok: false,
-    message: "The adapter or device doesn't support this action",
+    message: "The adapter or device doesn't support this action.",
   });
   expect(a.received.length).toBe(sent);
   await c.stop();

@@ -100,8 +100,13 @@ seconds and records `ERROR_CODE_TIMEOUT` without pausing automatic reconnection.
 Enabled means the device is loaded into the Bluetooth stack's bond table, which lets it reconnect,
 be recognized when it connects in, and encrypt its link; a disabled device stays saved but cannot
 connect. The table has a fixed size per transport, reported as `TransportSupport.max_enabled` (the
-stack's bond table less one entry kept free for pairing). Enabling a device beyond it is refused
-with `ERROR_CODE_NO_CAPACITY` and `CAPACITY_REASON_ENABLED`. If firmware with a smaller table starts
+stack's bond table less one entry kept free for pairing). The table holds every enabled, unblocked
+device whose transport the firmware supports and has enabled. A `SetDevice` that changes anything
+about a device without an entry, and leaves it enabled and unblocked on such a transport, is refused
+with `ERROR_CODE_NO_CAPACITY` and `CAPACITY_REASON_ENABLED` while that transport's table is full. A
+`SetDevice` that changes nothing succeeds without the check, and a device that has an entry keeps
+it, including a device turned off or blocked whose link is still closing. If firmware with a
+smaller table starts
 with more devices enabled, nothing is disabled or deleted: the lowest device IDs are loaded and the
 rest report `INACTIVE_REASON_CAPACITY` until the user disables enough of them.
 

@@ -364,15 +364,17 @@ pub fn platform_token(p: Platform) -> String {
 fn general_text(code: ErrorCode) -> Option<&'static str> {
     use ErrorCode::*;
     Some(match code {
-        BadRequest => "the adapter rejected a malformed request",
-        UnknownCommand => "this adapter's firmware doesn't support that command",
-        BadArgs => "the adapter rejected the command's arguments",
+        BadRequest => "the adapter couldn't understand the request from Cordial",
+        UnknownCommand => {
+            "this adapter's firmware doesn't support that action. Update the firmware to use it"
+        }
+        BadArgs => "the adapter couldn't accept those values",
         TooLong => "the request was too large for the adapter",
         NotReady => "the adapter's Bluetooth or storage isn't ready",
         NotFound => "the adapter has no saved device with that ID",
         NotConnected => "the device isn't connected. Connect it first",
         Busy => "the adapter is busy. Try again when the current operation finishes",
-        Disabled => "the device is disabled; enable it before connecting",
+        Disabled => "the device is disabled. Enable it before connecting",
         Blocked => "connections to this device are blocked. Unblock it before connecting",
         Unsupported => "the adapter or device doesn't support this",
         NoCapacity => "the adapter has no room for that right now",
@@ -383,12 +385,12 @@ fn general_text(code: ErrorCode) -> Option<&'static str> {
             "this profile is still in use. Remove it from every device and interface before deleting it"
         }
         CandidateExpired => "this device is no longer available. Scan again",
-        AuthFailed => "Bluetooth authentication failed",
-        Rejected => "authentication was rejected by the user or the device",
-        Timeout => "the operation's deadline expired",
+        AuthFailed => "Bluetooth authentication with this device failed",
+        Rejected => "the pairing was rejected on this computer or on the device",
+        Timeout => "this device didn't respond in time",
         Cancelled => "the operation was cancelled",
-        ConnectionFailed => "the Bluetooth link or HID setup failed",
-        UnsupportedHid => "the device's HID format isn't supported",
+        ConnectionFailed => "the adapter couldn't connect to this device",
+        UnsupportedHid => "the adapter can't use this device's input format",
         _ => return None,
     })
 }
@@ -398,12 +400,12 @@ fn general_text(code: ErrorCode) -> Option<&'static str> {
 fn hidpp_text(code: ErrorCode) -> Option<&'static str> {
     use ErrorCode::*;
     Some(match code {
-        Timeout => "no response",
-        TransportError => "couldn't send",
-        DeviceError => "device error",
-        InvalidResponse => "unexpected reply",
-        FeatureUnavailable => "the device doesn't provide a feature this needs",
-        ProtocolUnsupported => "not supported",
+        Timeout => "this device didn't respond in time",
+        TransportError => "the adapter couldn't exchange messages with this device",
+        DeviceError => "this device reported an error",
+        InvalidResponse => "the adapter couldn't understand this device's reply",
+        FeatureUnavailable => "this device doesn't have a feature this action needs",
+        ProtocolUnsupported => "this device doesn't support this feature",
         NotConnected => "the device disconnected",
         Unsupported => "not supported by the device now",
         ReadbackMismatch => "the device reported a different value from the one requested",
@@ -468,12 +470,12 @@ fn code_text(code: ErrorCode, command: Option<&str>) -> String {
 pub fn capacity_words(reason: CapacityReason) -> &'static str {
     match reason {
         CapacityReason::Enabled => {
-            "every enabled-device place is in use; disable another device first"
+            "every enabled-device place is in use. Disable another device first"
         }
         CapacityReason::Storage => {
-            "the adapter's storage has no room for another paired device; remove unused devices or saved settings"
+            "the adapter's storage has no room for another paired device. Remove unused devices or saved settings"
         }
-        CapacityReason::Connections => "every connection is in use; disconnect a device first",
+        CapacityReason::Connections => "every connection is in use. Disconnect a device first",
         CapacityReason::ProfileMemory => {
             "the adapter doesn't have enough profile memory for this change"
         }
@@ -504,9 +506,7 @@ pub fn inactive_words(reason: InactiveReason, transport: Transport) -> String {
         InactiveReason::TransportDisabled => transport_disabled(transport),
         InactiveReason::Blocked => "it is blocked".into(),
         InactiveReason::Disabled => "it is disabled".into(),
-        InactiveReason::Capacity => {
-            "every enabled-device place is in use; disable another device to make room".into()
-        }
+        InactiveReason::Capacity => "every enabled-device place is in use".into(),
         InactiveReason::Unknown => "the adapter isn't using this device".into(),
     }
 }

@@ -791,7 +791,8 @@ impl<F: Fleet> Model<F> {
                     && let Some(id) = self.connecting_off(slot)
                 {
                     self.close_on(slot, port);
-                    self.connect_failed(&id, words::IN_USE_ELSEWHERE);
+                    let why = words::open_failed(&self.off_name(&id));
+                    self.connect_failed(&id, &why);
                 }
             }
             Phase::Lost(_) => {
@@ -802,7 +803,8 @@ impl<F: Fleet> Model<F> {
                     && let Some(id) = self.connecting_off(slot)
                 {
                     self.close_on(slot, port);
-                    self.connect_failed(&id, words::IN_USE_ELSEWHERE);
+                    let why = words::open_failed(&self.off_name(&id));
+                    self.connect_failed(&id, &why);
                 } else {
                     self.lose(slot);
                 }
@@ -840,7 +842,8 @@ impl<F: Fleet> Model<F> {
         };
         if id != key {
             self.close_slot(slot);
-            return self.connect_failed(&key, words::IN_USE_ELSEWHERE);
+            let why = words::other_adapter(&self.off_name(&key));
+            return self.connect_failed(&key, &why);
         }
         self.off.remove(&key);
         self.register(slot, port, id);
@@ -1030,6 +1033,20 @@ impl<F: Fleet> Model<F> {
         Some(id.clone())
     }
 
+    /// A disconnected adapter's name, as messages name it.
+    fn off_name(&self, id: &str) -> String {
+        let name = self
+            .off
+            .get(id)
+            .map(|o| words::clean(&o.status.name))
+            .unwrap_or_default();
+        if name.is_empty() {
+            "the adapter".to_owned()
+        } else {
+            name
+        }
+    }
+
     /// Reports a failed Connect beside the adapter's Connect, and in the status line when that
     /// isn't shown.
     fn connect_failed(&mut self, id: &str, why: &str) {
@@ -1117,7 +1134,7 @@ impl<F: Fleet> Model<F> {
             Kind::SettingsList(device) => {
                 if let Err(e) = &result {
                     self.settings_errors
-                        .insert((id, *device), words::failure(e));
+                        .insert((id, *device), words::read_failure(e));
                 }
             }
             Kind::Page { .. } | Kind::Lookup => self.page_result(&job, &result),

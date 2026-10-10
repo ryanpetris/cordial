@@ -237,7 +237,7 @@ describe("Profiles", () => {
     await until(() => state().devices[0]!.device.profiles!.length === 0);
     // The adapter's own refusal is shown as it is.
     fake.failures.deleteProfile = [ErrorCode.IN_USE];
-    expect(await del()).toEqual({ ok: false, message: "This profile is still in use. Remove it from every device and interface before deleting it" });
+    expect(await del()).toEqual({ ok: false, message: "This profile is still in use. Remove it from every device and interface before deleting it." });
     expect(await del()).toEqual({ ok: true });
     await c.stop();
   });

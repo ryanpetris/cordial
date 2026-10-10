@@ -22,6 +22,7 @@ import {
   type ByteStream,
 } from "@cordial/client";
 import {
+  ErrorCode,
   Platform,
   SettingSchema,
   SettingState,
@@ -35,7 +36,7 @@ import {
   type SetSettings,
 } from "@cordial/protocol";
 import type { AdapterStatus, DeviceRecord, DeviceWarning, Profile, ProfilePage, Setting } from "../shared/state.ts";
-import { errorText } from "../shared/text.ts";
+import { READ_FAILED, asSentence, errorText } from "../shared/text.ts";
 import * as convert from "./convert.ts";
 
 export interface SessionHooks {
@@ -50,12 +51,14 @@ export interface SessionHooks {
   log(message: string): void;
 }
 
-/** Why a failed request failed, in words. */
-export const failure = (error: unknown) =>
-  error instanceof CordialError ? errorText(convert.wireError(error))
-    : error instanceof ConnectionClosedError ? "The adapter disconnected before the change finished."
+/** Why a failed request failed, in words; `read` marks a request that only reads saved data. */
+export const failure = (error: unknown, read = false) =>
+  error instanceof CordialError && read && error.code === ErrorCode.STORAGE_FAILED ? READ_FAILED
+  : error instanceof CordialError ? errorText(convert.wireError(error))
+    : error instanceof ConnectionClosedError
+      ? read ? "The adapter disconnected before it answered." : "The adapter disconnected before the change finished."
       : error instanceof UnexpectedResponseError ? "The adapter returned an unexpected result."
-      : (error as Error).message;
+      : asSentence((error as Error).message);
 
 /** Whether `id` is in the range a page read after `after` covers, up to `next` (0 ends the listing). */
 const inPage = (id: number, after: number, next: number) => id > after && (next === 0 || id <= next);
@@ -227,7 +230,7 @@ export class AdapterSession {
           for (const id of [...this.devices.keys()]) await this.#readLists(id);
         } catch (error) {
           if (this.closed) break;
-          this.#hooks.log(`listing devices failed: ${failure(error)}`);
+          this.#hooks.log(`listing devices failed: ${failure(error, true)}`);
         }
       } while (this.#syncAgain && !this.closed);
       this.#syncing = null;
@@ -288,7 +291,7 @@ export class AdapterSession {
       state.error = null;
     } catch (error) {
       if (this.closed || read !== state.read) return;
-      state.error = failure(error);
+      state.error = failure(error, true);
       this.#hooks.log(`profiles unavailable: ${state.error}`);
     } finally {
       if (read === state.read) state.loading = false;
@@ -314,7 +317,7 @@ export class AdapterSession {
       } catch (error) {
         if (this.closed) return;
         this.#unnamed.add(id);
-        this.#hooks.log(`profile ${id} unavailable: ${failure(error)}`);
+        this.#hooks.log(`profile ${id} unavailable: ${failure(error, true)}`);
       } finally {
         this.#naming.delete(id);
       }
@@ -337,7 +340,7 @@ export class AdapterSession {
 
   #readFailed(id: number, errors: Map<number, string>, what: string, error: unknown) {
     if (this.closed || !this.devices.has(id)) return;
-    const reason = failure(error);
+    const reason = failure(error, true);
     this.#hooks.log(`${what} of ${id} unavailable: ${reason}`);
     errors.set(id, reason);
   }

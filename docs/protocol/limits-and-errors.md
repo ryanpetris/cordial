@@ -48,7 +48,7 @@ refuses, the client shows the error and does nothing else, since events bring it
 
 | Refusal | Client checks |
 | --- | --- |
-| Enabling: `NO_CAPACITY`, `CAPACITY_REASON_ENABLED` | Enabled devices of that transport against its `max_enabled` |
+| A device change that needs a bond table entry: `NO_CAPACITY`, `CAPACITY_REASON_ENABLED` | For a device whose `Device.inactive` is set, a change that leaves it enabled and unblocked on a transport the firmware supports and has enabled: the devices of that transport without `Device.inactive` against its `max_enabled` |
 | Pairing with no room: `NO_CAPACITY`, `CAPACITY_REASON_STORAGE` | `storage.full` in `Status.info` |
 | A second pairing: `BUSY` | The latest pairing step is not `done` or `failed` |
 | Answering a prompt: `NO_PROMPT` | The latest pairing step is `enter_code` or `confirm_code` |

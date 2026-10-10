@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { canEnable, copyName, interfaceName, profileName, profileText } from "../../shared/profiles.ts";
 import type { AdapterEntry, AdapterStatus, DeviceEntry, InterfaceChange, InterfaceState, Profile, RoleName } from "../../shared/state.ts";
-import { ROLES, memoryPercent } from "../../shared/text.ts";
+import { READ_FAILED, ROLES, memoryPercent } from "../../shared/text.ts";
 import { act, useAction } from "../api.ts";
 import { Card, Dialog, Menu, Meter, Row, Spinner, Staged, Switch } from "./common.tsx";
 import {
@@ -170,7 +170,7 @@ export function AdapterProfiles({ adapter, locked }: { adapter: AdapterEntry; lo
         }
       >
         {page?.error ? (
-          <Row title={`The adapter couldn't read its profiles. ${page.error}`}>
+          <Row title={page.error === READ_FAILED ? "The adapter couldn't read its profiles. Try again." : `The adapter couldn't read its profiles. ${page.error}`}>
             <button disabled={disabled} onClick={() => void run({ type: "adapter.reload", adapterId: adapter.id })}>
               <RefreshIcon /> Retry
             </button>

@@ -7,6 +7,7 @@ import type { AdapterEntry, AppState, DeviceChanges, DeviceEntry, DeviceRecord, 
 import {
   inactiveText,
   INFO_LABELS,
+  READ_FAILED,
   ROLES,
   SETTING_STATES,
   TRANSPORTS,
@@ -22,6 +23,7 @@ import {
   kindText,
   neverValue,
   profileErrorText,
+  reasonText,
   securityFacts,
   settingInfo,
   settingOrder,
@@ -369,11 +371,11 @@ function SettingRow({ entry, s, drafts, guards, item }: {
   }
 
   const notes: ReactNode[] = [];
-  if (item?.status === "not_saved") notes.push(<span key="save" className="error-text">Couldn't Save{item.error ? `: ${item.error}` : ""}</span>);
-  else if (item?.status === "unknown" && item.error) notes.push(<span key="save" className="error-text">{item.error}</span>);
+  if (item?.status === "not_saved") notes.push(<span key="save" className="error-text">Couldn't Save{item.error ? `: ${reasonText(item.error)}` : ""}</span>);
+  else if (item?.status === "unknown" && item.error) notes.push(<span key="save" className="error-text">{reasonText(item.error)}</span>);
   if (invalid) notes.push(<span key="range" className="error-text">{rangeText(typedRange(s))}</span>);
   if (saved(s) && s.state === "changed_on_device" && fresh) notes.push(<span key="device">Device: {valueText(s.key, s.value)}</span>);
-  if (s.error) notes.push(<span key="error">{codeText(s.error)}</span>);
+  if (s.error) notes.push(<span key="error">{reasonText(codeText(s.error))}</span>);
 
   const labelId = `setting-${s.key}`;
   return (
@@ -871,7 +873,13 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
 
             {entry.settingsError ? (
               <Card title="Device Settings">
-                <Row title={`The adapter couldn't read the device's settings. ${entry.settingsError}`} />
+                <Row
+                  title={
+                    entry.settingsError === READ_FAILED
+                      ? "The adapter couldn't read the device's settings. Try again."
+                      : `The adapter couldn't read the device's settings. ${entry.settingsError}`
+                  }
+                />
               </Card>
             ) : null}
 

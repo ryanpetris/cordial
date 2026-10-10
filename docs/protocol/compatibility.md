@@ -30,7 +30,8 @@ understood are Required.
   still means inactive.
 - A `oneof` that holds a variant newer than the client reads as unset, with a documented meaning:
   an unknown pairing step means pairing is still in progress, an unknown integration status means
-  off, and an unknown setting type means the client skips the setting.
+  off, an unknown setting type means the client skips the setting, and an unknown listing entry
+  means the client skips the entry.
 - `ErrorCode` and `WarningCode` are wire enums, separate from the firmware's internal error types.
   The firmware maps an internal error to the wire code that describes it to a user, or to a
   warning when the device keeps working.
@@ -153,6 +154,11 @@ A listing of saved records bounded only by flash, `ListDevices` and `ListProfile
 per record: the record, or its ID as `unreadable` when its saved record could not be read from
 flash, so the listing continues past it. An undecodable record is removed as lost and is not
 listed.
+
+A client skips a `DeviceListEntry` or `ProfileListEntry` holding a variant newer than the client,
+and reads the next page after the last entry it could read. A page that does not end the listing
+and holds no entry the client can read leaves it nothing to continue after, so the client reports
+the listing as failed.
 
 ## Information and settings
 

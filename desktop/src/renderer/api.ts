@@ -1,6 +1,7 @@
 // The main process API and small hooks around it.
 import { useCallback, useEffect, useState } from "react";
 import type { Action, ActionResult, AppState, DesktopApi } from "../shared/state.ts";
+import { asSentence } from "../shared/text.ts";
 
 declare global {
   interface Window {
@@ -56,7 +57,7 @@ export async function chooseAdapter(): Promise<ActionResult> {
     return { ok: true };
   } catch (error) {
     return error instanceof DOMException && error.name === "NotFoundError"
-      ? { ok: true } : { ok: false, message: (error as Error).message };
+      ? { ok: true } : { ok: false, message: asSentence((error as Error).message) };
   }
 }
 
@@ -66,7 +67,7 @@ export async function chooseAdapter(): Promise<ActionResult> {
 export async function act(action: Action, quiet = false): Promise<ActionResult> {
   let result: ActionResult;
   try { result = await api.act(action); }
-  catch { result = { ok: false, message: "Couldn't confirm that action." }; }
+  catch { result = { ok: false, message: "Cordial couldn't confirm whether the action finished. Check the result before trying again." }; }
   if (result.revision !== undefined) await published(result.revision);
   if (!result.ok && !result.inline && !quiet) report(result.message);
   return result;

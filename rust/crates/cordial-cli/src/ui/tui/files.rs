@@ -165,8 +165,8 @@ impl<F: Fleet> Model<F> {
                     Ok(_) => {}
                     Err(e) => {
                         d.state = Transfer::Failed(format!(
-                            "{}; no file was saved.",
-                            text::capitalized(&text::error_words(e))
+                            "{} No file was saved.",
+                            super::words::read_failure(e)
                         ))
                     }
                 }

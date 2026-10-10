@@ -10,15 +10,17 @@ fn error_clause(code: ErrorCode) -> &'static str {
     use ErrorCode::*;
     match code {
         Unknown | Internal => "the adapter hit an unexpected failure",
-        BadRequest => "the adapter rejected a malformed request",
-        UnknownCommand => "this adapter's firmware doesn't support that command",
-        BadArgs => "the adapter rejected the command's arguments",
+        BadRequest => "the adapter couldn't understand the request from Cordial",
+        UnknownCommand => {
+            "this adapter's firmware doesn't support that action. Update the firmware to use it"
+        }
+        BadArgs => "the adapter couldn't accept those values",
         TooLong => "the request was too large for the adapter",
         NotReady => "the adapter's Bluetooth or storage isn't ready. Try again in a moment",
         NotFound => "the adapter couldn't find this device, setting or profile",
         NotConnected => "the device isn't connected. Connect it first",
         Busy => "the adapter is busy. Try again when the current operation finishes",
-        Disabled => "the device is turned off in Cordial; turn on “Use This Device” first",
+        Disabled => "this device is turned off in Cordial. Turn on “Use This Device” first",
         Blocked => "connections to this device are blocked. Unblock it before connecting",
         Unsupported => "the adapter or device doesn't support this action",
         NoCapacity => "the adapter has no room for that right now",
@@ -28,17 +30,17 @@ fn error_clause(code: ErrorCode) -> &'static str {
             "this profile is still in use. Remove it from every device and interface before deleting it"
         }
         CandidateExpired => "this device is no longer available. Search again",
-        AuthFailed => "Bluetooth authentication failed",
-        Rejected => "authentication was rejected by you or the device",
-        Timeout => "the operation timed out",
+        AuthFailed => "Bluetooth authentication with this device failed",
+        Rejected => "the pairing was rejected on this computer or on the device",
+        Timeout => "this device didn't respond in time",
         Cancelled => "the operation was cancelled",
-        ConnectionFailed => "the Bluetooth link or HID setup failed",
-        UnsupportedHid => "the device's HID format isn't supported",
-        ProtocolUnsupported => "not supported",
-        FeatureUnavailable => "the device doesn't provide a feature this action needs",
-        TransportError => "couldn't send",
-        DeviceError => "device error",
-        InvalidResponse => "unexpected reply",
+        ConnectionFailed => "the adapter couldn't connect to this device",
+        UnsupportedHid => "the adapter can't use this device's input format",
+        ProtocolUnsupported => "this device doesn't support this feature",
+        FeatureUnavailable => "this device doesn't have a feature this action needs",
+        TransportError => "the adapter couldn't exchange messages with this device",
+        DeviceError => "this device reported an error",
+        InvalidResponse => "the adapter couldn't understand this device's reply",
         ReadbackMismatch => "the device reported a different value from the one requested",
     }
 }
@@ -47,26 +49,37 @@ fn capacity_clause(reason: CapacityReason) -> &'static str {
     match reason {
         CapacityReason::Unknown => error_clause(ErrorCode::NoCapacity),
         CapacityReason::Enabled => {
-            "every enabled-device place is in use; turn off another device first"
+            "every enabled-device place is in use. Turn off another device first"
         }
         CapacityReason::Storage => {
             "the adapter's storage is full. Remove an unused device or forget a saved setting, then try again"
         }
-        CapacityReason::Connections => "every connection is in use; disconnect a device first",
+        CapacityReason::Connections => "every connection is in use. Disconnect a device first",
         CapacityReason::ProfileMemory => {
             "the adapter doesn't have enough profile memory for this change"
         }
     }
 }
 
+/// A clause as a complete sentence: capitalized, with a final period.
+fn sentence(clause: &str) -> String {
+    format!("{}.", text::capitalized(clause))
+}
+
 pub fn code_text(code: ErrorCode) -> String {
-    text::capitalized(error_clause(code))
+    sentence(error_clause(code))
+}
+
+/// A message as a reason inserted into other text, such as "Failed: {reason}", without its final
+/// period.
+pub fn reason(message: &str) -> &str {
+    message.strip_suffix('.').unwrap_or(message)
 }
 
 /// An adapter error as a sentence.
 pub fn error_text(e: &p::Error) -> String {
     match e.code() {
-        ErrorCode::NoCapacity => text::capitalized(capacity_clause(e.reason())),
+        ErrorCode::NoCapacity => sentence(capacity_clause(e.reason())),
         ErrorCode::StorageFailed if e.outcome_unknown => {
             "The adapter couldn't confirm whether the change was saved. Check before trying again."
                 .into()
@@ -78,9 +91,24 @@ pub fn error_text(e: &p::Error) -> String {
 pub const GONE: &str = "This device or adapter is no longer available.";
 pub const ADAPTER_GONE: &str = "This adapter is no longer available.";
 pub const CLOSED: &str = "The adapter disconnected before the change finished.";
+pub const READ_CLOSED: &str = "The adapter disconnected before it answered.";
 pub const UNEXPECTED: &str = "The adapter returned an unexpected result.";
 pub const NOT_PLUGGED_IN: &str = "The adapter isn't plugged in.";
-pub const IN_USE_ELSEWHERE: &str = "Couldn't connect. Is another program using it?";
+/// A failed read of the adapter's saved data, where the save wording doesn't apply.
+pub const READ_FAILED: &str = "The adapter couldn't read its saved data. Try again.";
+
+/// Why Connect couldn't open an adapter's port.
+pub fn open_failed(adapter: &str) -> String {
+    format!(
+        "Cordial couldn't connect to {adapter}. Close any other app that uses it, then try again."
+    )
+}
+
+/// Why Connect didn't reach the adapter it opened the port for.
+pub fn other_adapter(adapter: &str) -> String {
+    format!("Cordial couldn't connect to {adapter}. Another adapter answered on its port.")
+}
+
 pub const STORAGE_FULL: &str = "Storage Full";
 pub const STORAGE_FULL_ATTENTION: &str = "The adapter's storage is full. Remove an unused device or forget a saved setting to pair another device.";
 pub const WARNINGS_READ_FAILED: &str = "The adapter couldn't read the device's warnings.";
@@ -105,6 +133,17 @@ pub fn failure(e: &Error) -> String {
         m if m == crate::commands::STARTING => code_text(ErrorCode::NotReady),
         "the control session is unavailable; select an adapter" => ADAPTER_GONE.into(),
         m => text::sentence(&text::display(m)),
+    }
+}
+
+/// A failed read: a storage failure reads as one of the saved data, not of a save.
+pub fn read_failure(e: &Error) -> String {
+    match e.code_of() {
+        Some(ErrorCode::StorageFailed) => READ_FAILED.into(),
+        _ if e.dongle.is_none() && e.message == "the connection to the adapter closed" => {
+            READ_CLOSED.into()
+        }
+        _ => failure(e),
     }
 }
 
@@ -258,7 +297,7 @@ pub fn integration_text(i: &p::Integration) -> String {
         model::Up::Starting => "Setting Up".into(),
         model::Up::Active => "Active".into(),
         model::Up::Unsupported => "Unsupported".into(),
-        model::Up::Error(code) => format!("Failed: {}", code_text(code)),
+        model::Up::Error(code) => format!("Failed: {}", reason(&code_text(code))),
     }
 }
 
@@ -472,6 +511,31 @@ mod tests {
         assert_eq!(memory_percent(&status(0, 0)), None);
         assert!(memory_alert(&status(85, 100)));
         assert!(!memory_alert(&status(84, 100)));
+    }
+
+    #[test]
+    fn messages_are_sentences_and_reasons_drop_the_period() {
+        assert_eq!(
+            code_text(ErrorCode::Busy),
+            "The adapter is busy. Try again when the current operation finishes."
+        );
+        assert_eq!(
+            reason(&code_text(ErrorCode::TransportError)),
+            "The adapter couldn't exchange messages with this device"
+        );
+        let storage = Error::code(ErrorCode::StorageFailed, Some("setting list"));
+        assert_eq!(read_failure(&storage), READ_FAILED);
+        assert_eq!(
+            failure(&storage),
+            "The adapter couldn't save the change. Your saved data hasn't changed."
+        );
+        let closed = Error::new("the connection to the adapter closed");
+        assert_eq!(read_failure(&closed), READ_CLOSED);
+        assert_eq!(failure(&closed), CLOSED);
+        assert_eq!(
+            other_adapter("Desk"),
+            "Cordial couldn't connect to Desk. Another adapter answered on its port."
+        );
     }
 
     #[test]

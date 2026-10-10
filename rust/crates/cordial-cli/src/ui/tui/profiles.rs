@@ -211,7 +211,7 @@ impl<F: Fleet> Model<F> {
                 }
             }
             Ok(_) => {}
-            Err(e) => page.error = Some(words::failure(e)),
+            Err(e) => page.error = Some(words::read_failure(e)),
         }
     }
 
@@ -467,7 +467,11 @@ impl<F: Fleet> Model<F> {
             );
             b.labelled(
                 styled(
-                    format!("The adapter couldn't read its profiles. {e}"),
+                    if e == words::READ_FAILED {
+                        "The adapter couldn't read its profiles. Try again.".to_owned()
+                    } else {
+                        format!("The adapter couldn't read its profiles. {e}")
+                    },
                     err(),
                 ),
                 row,

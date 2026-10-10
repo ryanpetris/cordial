@@ -37,8 +37,8 @@ upon connect must be stored on the Dongle.
   is needed to address it. Protocol support alone is not a reason. Any diverted input must have
   complete Dongle-owned translation into standard USB input.
 - Reporting must answer a useful user question. Keep useful status and settings information, place
-  technical diagnostics on the Device's Diagnostics tab or dialog, and omit raw implementation data
-  without a useful presentation.
+  technical diagnostics on the Device's Diagnostics tab, and omit raw implementation data without a
+  useful presentation.
 - Expose operations only when supported by protocol evidence and the Device's advertised
   capabilities. Verify writes with the relevant readback or documented confirmation. Record missing
   documentation or hardware verification without treating it as a permanent scope exclusion.
@@ -96,10 +96,10 @@ Messages:
   for the app. Never show "dongle", internal command or field names, or raw codes.
 - When an outcome is unknown, say so ("The adapter couldn't confirm whether the change was saved.")
   rather than reporting success or failure.
-- Desktop messages and TUI prompts start with a capital letter and end with a period. Error reasons
-  that are inserted into other text, such as "Failed: {reason}", have no final period. CLI and TUI
-  error reasons are lowercase clauses that follow "Error:" or a colon, such as "the request was too
-  large for the adapter".
+- Desktop and TUI messages start with a capital letter and end with a period. Error reasons that are
+  inserted into other text, such as "Failed: {reason}", have no final period. CLI error reasons are
+  lowercase clauses that follow "Error:" or a colon, such as "the request was too large for the
+  adapter".
 - Use the same words for the same thing in the desktop app, CLI and TUI, including labels such as
   "Logitech Features", "Pointer Speed {n}" and status words such as "Setting Up" and "Unsupported".
 
@@ -111,8 +111,7 @@ Labels, buttons and status:
 Placement:
 
 - Device warnings, protocol details, link security, identifiers and a device's last connection error
-  belong on the device's Diagnostics tab (the TUI's Diagnostics dialog), never as banners or on the
-  Details or Settings tabs.
+  belong on the device's Diagnostics tab, never as banners or on the Details or Settings tabs.
 - The result of an action the user just took appears next to that action, such as in the page's
   bottom bar, and clears when it no longer applies.
 

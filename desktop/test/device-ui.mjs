@@ -241,7 +241,7 @@ try {
   await publish();
   await app.evaluate((_electron, outcome) => { globalThis.uiReply({ ok: true, settingsSave: outcome }); globalThis.uiHold = null; }, outcome);
   await page.getByRole("button", { name: "Timeout With Hands Away, Failed, Options", exact: true }).waitFor();
-  await page.getByText("The operation timed out", { exact: true }).waitFor();
+  await page.getByText("This device didn't respond in time", { exact: true }).waitFor();
   assert.equal(await save.getAttribute("aria-disabled"), "true");
   // Retry works beside other drafts and leaves them staged, but not while
   // that setting's own draft differs or is invalid.
@@ -261,26 +261,27 @@ try {
   Object.assign(handsSaved, { state: "applied", error: null, value: 60 });
   await publish();
   await page.getByRole("button", { name: "Timeout With Hands Away, Saved, Options", exact: true }).waitFor();
-  assert.equal(await page.getByText("The operation timed out", { exact: true }).count(), 0);
+  assert.equal(await page.getByText("This device didn't respond in time", { exact: true }).count(), 0);
   assert.equal(await retryButton.count(), 0);
   // A refused save says why for each change it held.
   entry.settingsSave = {
     running: false,
     items: [
-      { change: { type: "set", setting: "backlight.level", value: 5 }, status: "not_saved", error: "The adapter is busy" },
-      { change: { type: "forget", setting: "backlight.mode" }, status: "not_saved", error: "The adapter is busy" },
+      { change: { type: "set", setting: "backlight.level", value: 5 }, status: "not_saved", error: "The adapter is busy. Try again when the current operation finishes." },
+      { change: { type: "forget", setting: "backlight.mode" }, status: "not_saved", error: "The adapter is busy. Try again when the current operation finishes." },
     ],
   };
   await publish();
-  await page.getByText("Couldn't Save: The adapter is busy", { exact: true }).nth(1).waitFor();
-  assert.equal(await page.getByText("Couldn't Save: The adapter is busy", { exact: true }).count(), 2);
+  await page.getByText("Couldn't Save: The adapter is busy. Try again when the current operation finishes", { exact: true }).nth(1).waitFor();
+  assert.equal(await page.getByText("Couldn't Save: The adapter is busy. Try again when the current operation finishes", { exact: true }).count(), 2);
   await page.getByText("Couldn't Save 2", { exact: true }).waitFor();
   // A save whose outcome is unknown says so, without reporting a failure.
   const unconfirmed = "The adapter couldn't confirm whether the change was saved. Check before trying again.";
   entry.settingsSave = { running: false, items: [{ change: { type: "set", setting: "backlight.level", value: 5 }, status: "unknown", error: unconfirmed }] };
   await publish();
-  await page.getByText(unconfirmed, { exact: true }).nth(1).waitFor();
-  assert.equal(await page.getByText(unconfirmed, { exact: true }).count(), 2);
+  // The bar shows the message; the setting's row notes it without the final period.
+  await page.getByText(unconfirmed, { exact: true }).waitFor();
+  await page.getByText(unconfirmed.slice(0, -1), { exact: true }).waitFor();
   assert.equal(await page.getByText(/Couldn't Save/).count(), 0);
   entry.settingsSave = null;
 
@@ -323,10 +324,10 @@ try {
   entry.device.error = "connection_failed";
   await publish();
   await tab("Diagnostics").click();
-  await page.getByText("The Bluetooth link or HID setup failed", { exact: true }).waitFor();
+  await page.getByText("The adapter couldn't connect to this device.", { exact: true }).waitFor();
   assert.equal(await page.locator(".banner").count(), 0);
   await tab("Details").click();
-  assert.equal(await page.getByText("The Bluetooth link or HID setup failed", { exact: true }).count(), 0);
+  assert.equal(await page.getByText("The adapter couldn't connect to this device.", { exact: true }).count(), 0);
   entry.device.error = null;
 
   // There is no Settings tab until the device has settings, even while HID++ starts; a failed
@@ -340,10 +341,10 @@ try {
   await publish();
   await tab("Diagnostics").waitFor();
   assert.equal(await tab("Settings").count(), 0);
-  entry.settingsError = "The adapter is busy";
+  entry.settingsError = "The adapter is busy. Try again when the current operation finishes.";
   await publish();
   await tab("Diagnostics").click();
-  await page.getByText("The adapter couldn't read the device's settings. The adapter is busy", { exact: true }).waitFor();
+  await page.getByText("The adapter couldn't read the device's settings. The adapter is busy. Try again when the current operation finishes.", { exact: true }).waitFor();
   assert.equal(await tab("Settings").count(), 0);
   // Retry reads the lists again.
   await bar.getByRole("button", { name: "Retry", exact: true }).click();
@@ -371,7 +372,7 @@ try {
   assert.equal(await page.getByRole("heading", { name: "Device Warnings" }).count(), 0);
   entry.device.hidpp = { ...entry.device.hidpp, state: null, error: "protocol_unsupported" };
   await publish();
-  await page.getByText("Failed: Not supported", { exact: true }).waitFor();
+  await page.getByText("Failed: This device doesn't support this feature", { exact: true }).waitFor();
   entry.device.hidpp = { ...entry.device.hidpp, state: "active", error: null };
   await publish();
   await fail("device.refresh");
@@ -400,7 +401,7 @@ try {
   await tab("Diagnostics").click();
   // A failed read of the list reports in the card and offers Retry.
   entry.warnings = null;
-  entry.warningsError = "The adapter is busy";
+  entry.warningsError = "The adapter is busy. Try again when the current operation finishes.";
   await publish();
   await page.getByText("The adapter couldn't read the device's warnings.", { exact: true }).waitFor();
   await bar.getByRole("button", { name: "Retry", exact: true }).click();

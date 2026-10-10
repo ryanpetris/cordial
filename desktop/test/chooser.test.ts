@@ -9,7 +9,7 @@ it("keeps chooser dismissal quiet and returns genuine chooser failures", async (
   choosePort.mockRejectedValueOnce(new DOMException("No port selected", "NotFoundError"));
   expect(await chooseAdapter()).toEqual({ ok: true });
   choosePort.mockRejectedValueOnce(new DOMException("Port selection is unavailable", "SecurityError"));
-  expect(await chooseAdapter()).toEqual({ ok: false, message: "Port selection is unavailable" });
+  expect(await chooseAdapter()).toEqual({ ok: false, message: "Port selection is unavailable." });
   choosePort.mockResolvedValueOnce(undefined);
   expect(await chooseAdapter()).toEqual({ ok: true });
 });
@@ -34,5 +34,5 @@ it("keeps transport failures in the action's feedback surface", async () => {
   expect(await act({ type: "device.refresh", key: "A/1" }, true)).toMatchObject({ ok: false });
   expect(report).not.toHaveBeenCalled();
   expect(await act({ type: "adapters.refresh" })).toMatchObject({ ok: false });
-  expect(report).toHaveBeenCalledExactlyOnceWith("Couldn't confirm that action.");
+  expect(report).toHaveBeenCalledExactlyOnceWith("Cordial couldn't confirm whether the action finished. Check the result before trying again.");
 });

@@ -943,9 +943,9 @@ impl<F: Fleet> Model<F> {
                     && let Some(e) = &sub.error
                 {
                     let text = if sub.unknown {
-                        e.clone()
+                        words::reason(e).to_owned()
                     } else {
-                        format!("Couldn't Save: {e}")
+                        format!("Couldn't Save: {}", words::reason(e))
                     };
                     notes.push((text, err()));
                 }
@@ -964,7 +964,7 @@ impl<F: Fleet> Model<F> {
                     ));
                 }
                 if let Some(Err(code)) = model::applied(s) {
-                    notes.push((words::code_text(code), dim()));
+                    notes.push((words::reason(&words::code_text(code)).to_owned(), dim()));
                 }
                 if !notes.is_empty() {
                     let mut line = Line::from(span("  ", Style::new()));

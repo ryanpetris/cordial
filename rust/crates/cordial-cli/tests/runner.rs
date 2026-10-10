@@ -305,7 +305,7 @@ fn refusals_name_their_code_and_explanation() {
     let (result, _, _) = script(&dongle, &["device", "connect", "Old Keyboard"], false, b"");
     assert_eq!(
         result.unwrap_err().message,
-        "disabled: the device is disabled; enable it before connecting"
+        "disabled: the device is disabled. Enable it before connecting"
     );
     let dongle = Dongle::with(|sim| {
         sim.refuse.insert("set_adapter", ErrorCode::StorageFailed);

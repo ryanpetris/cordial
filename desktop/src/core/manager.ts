@@ -4,6 +4,7 @@
 import { serialMatches, type ByteStream, type PortInfo } from "@cordial/client";
 import type { Event, Request, Response } from "@cordial/protocol";
 import type { AdapterStatus, Profile, ProfilePage } from "../shared/state.ts";
+import { clean } from "../shared/text.ts";
 import { AdapterSession } from "./session.ts";
 
 export interface ManagerDeps {
@@ -260,7 +261,10 @@ export class AdapterManager {
       }
       if (!session || session.adapterId !== id) {
         await session?.close();
-        d.error = "Couldn't connect. Is another program using it?";
+        const name = clean(d.status.name) || "the adapter";
+        d.error = session
+          ? `Cordial couldn't connect to ${name}. Another adapter answered on its port.`
+          : `Cordial couldn't connect to ${name}. Close any other app that uses it, then try again.`;
         this.#deps.changed();
         return d.error;
       }

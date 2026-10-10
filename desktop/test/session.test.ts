@@ -196,7 +196,7 @@ describe("AdapterSession", () => {
     expect(integrationText(entry().device.hidpp!)).toBe("Setting Up");
     fake.changeDevice(1, { hidppState: null, hidppError: 50 });
     await until(() => session.devices.get(1)!.hidpp?.error === "protocol_unsupported");
-    expect(integrationText(entry().device.hidpp!)).toBe("Failed: Not supported");
+    expect(integrationText(entry().device.hidpp!)).toBe("Failed: This device doesn't support this feature");
     // While disconnected, the list holds the saved settings, with their limits and without readings.
     fake.changeDevice(1, { hidppError: null, state: "disconnected" });
     await until(() => session.devices.get(1)!.hidpp?.state === "disconnected" && session.settings.get(1)!.length === 2);

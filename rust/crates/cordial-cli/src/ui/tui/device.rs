@@ -384,6 +384,7 @@ impl<F: Fleet> Model<F> {
                                 None => words::failure(e),
                             }
                         }
+                        Command::Warnings(_) => words::read_failure(e),
                         _ => words::failure(e),
                     },
                     None => words::failure(e),
@@ -783,10 +784,12 @@ impl<F: Fleet> Model<F> {
         }
         if let Some(e) = self.settings_errors.get(&(a.clone(), id)) {
             b.section("Device Settings");
-            b.para(
-                &format!("{} {e}", words::SETTINGS_READ_FAILED),
-                layout::plain(),
-            );
+            let text = if e == words::READ_FAILED {
+                format!("{} Try again.", words::SETTINGS_READ_FAILED)
+            } else {
+                format!("{} {e}", words::SETTINGS_READ_FAILED)
+            };
+            b.para(&text, layout::plain());
         }
         if let Some(i) = model::hidpp(&d.d) {
             b.section("Logitech Features");

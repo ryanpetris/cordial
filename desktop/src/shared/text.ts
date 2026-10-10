@@ -27,19 +27,24 @@ import type {
   WireError,
 } from "./state.ts";
 
-const sentence = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+/** A clause as a complete sentence: capitalized, with a final period. */
+const sentence = (s: string) => `${s.charAt(0).toUpperCase()}${s.slice(1)}.`;
+
+/** A message as a reason inserted into other text, such as "Failed: {reason}", without its final
+ * period. */
+export const reasonText = (s: string) => (s.endsWith(".") ? s.slice(0, -1) : s);
 
 const ERRORS: Record<Code, string> = {
   unknown: "the adapter hit an unexpected failure",
-  bad_request: "the adapter rejected a malformed request",
-  unknown_command: "this adapter's firmware doesn't support that command",
-  bad_args: "the adapter rejected the command's arguments",
+  bad_request: "the adapter couldn't understand the request from Cordial",
+  unknown_command: "this adapter's firmware doesn't support that action. Update the firmware to use it",
+  bad_args: "the adapter couldn't accept those values",
   too_long: "the request was too large for the adapter",
   not_ready: "the adapter's Bluetooth or storage isn't ready. Try again in a moment",
   not_found: "the adapter couldn't find this device, setting or profile",
   not_connected: "the device isn't connected. Connect it first",
   busy: "the adapter is busy. Try again when the current operation finishes",
-  disabled: "the device is turned off in Cordial; turn on “Use This Device” first",
+  disabled: "this device is turned off in Cordial. Turn on “Use This Device” first",
   blocked: "connections to this device are blocked. Unblock it before connecting",
   unsupported: "the adapter or device doesn't support this action",
   no_capacity: "the adapter has no room for that right now",
@@ -48,26 +53,37 @@ const ERRORS: Record<Code, string> = {
   internal: "the adapter hit an unexpected failure",
   in_use: "this profile is still in use. Remove it from every device and interface before deleting it",
   candidate_expired: "this device is no longer available. Search again",
-  auth_failed: "Bluetooth authentication failed",
-  rejected: "authentication was rejected by you or the device",
-  timeout: "the operation timed out",
+  auth_failed: "Bluetooth authentication with this device failed",
+  rejected: "the pairing was rejected on this computer or on the device",
+  timeout: "this device didn't respond in time",
   cancelled: "the operation was cancelled",
-  connection_failed: "the Bluetooth link or HID setup failed",
-  unsupported_hid: "the device's HID format isn't supported",
-  protocol_unsupported: "not supported",
-  feature_unavailable: "the device doesn't provide a feature this action needs",
-  transport_error: "couldn't send",
-  device_error: "device error",
-  invalid_response: "unexpected reply",
+  connection_failed: "the adapter couldn't connect to this device",
+  unsupported_hid: "the adapter can't use this device's input format",
+  protocol_unsupported: "this device doesn't support this feature",
+  feature_unavailable: "this device doesn't have a feature this action needs",
+  transport_error: "the adapter couldn't exchange messages with this device",
+  device_error: "this device reported an error",
+  invalid_response: "the adapter couldn't understand this device's reply",
   readback_mismatch: "the device reported a different value from the one requested",
 };
 
 const CAPACITY: Record<NonNullable<WireError["reason"]>, string> = {
   unknown: ERRORS.no_capacity,
-  enabled: "every enabled-device place is in use; turn off another device first",
+  enabled: "every enabled-device place is in use. Turn off another device first",
   storage: "the adapter's storage is full. Remove an unused device or forget a saved setting, then try again",
-  connections: "every connection is in use; disconnect a device first",
+  connections: "every connection is in use. Disconnect a device first",
   profile_memory: "the adapter doesn't have enough profile memory for this change",
+};
+
+/** A failed read of the adapter's saved data, where the save wording doesn't apply. */
+export const READ_FAILED = "The adapter couldn't read its saved data. Try again.";
+
+/** A local error's text as a complete sentence. */
+export const asSentence = (s: string) => {
+  const text = s.trim();
+  if (!text) return text;
+  const capital = text.charAt(0).toUpperCase() + text.slice(1);
+  return /[.!?]$/.test(capital) ? capital : `${capital}.`;
 };
 
 /** An adapter error as a sentence for the window or a notification. */
@@ -159,7 +175,7 @@ export const INTEGRATION_STATES: Record<IntegrationStateName, string> = {
 };
 
 export function integrationText(i: Integration): string {
-  return i.state ? INTEGRATION_STATES[i.state] : `Failed: ${codeText(i.error ?? "unknown")}`;
+  return i.state ? INTEGRATION_STATES[i.state] : `Failed: ${reasonText(codeText(i.error ?? "unknown"))}`;
 }
 
 /** The detected HID++ version, as "4.5". */
