@@ -1273,8 +1273,9 @@ fn main() -> ! {
         );
     }
     // What the firmware allocates at startup and keeps: the USB serial number, the mounted
-    // filesystem, the storage and Bluetooth state, the chipset and the application's owner.
-    let serial: *mut str = Box::into_raw("E6613008E35A4733".into());
+    // filesystem, the storage and Bluetooth state, the chipset and the application's owner. The
+    // serial number has the length of a board's 16-digit unique ID; its digits don't matter.
+    let serial: *mut str = Box::into_raw("0".repeat(16).into_boxed_str());
     unsafe {
         core::ptr::addr_of_mut!(FLASH)
             .cast::<u8>()

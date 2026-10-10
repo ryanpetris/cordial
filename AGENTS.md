@@ -58,8 +58,9 @@ upon connect must be stored on the Dongle.
   tooling's default says.
 - Write commit messages that describe the change as it stands. Do not narrate removals or rewrites.
 - Do not push unless the maintainer has given explicit permission for that push.
-- Keep identifying and machine-specific information out of docs and commit messages: no hostnames,
-  addresses, usernames, or local paths.
+- Keep identifying and machine-specific information out of the repository, including code, tests,
+  configuration, docs, and commit messages: no hostnames, addresses, usernames, local paths, or
+  serial numbers or other identifiers of particular hardware.
 
 ## Comments
 
@@ -182,8 +183,8 @@ Keep this catalog aligned with `Makefile`, `desktop/package.json`, and
 | Firmware and packaging tool fixtures | `make check-tools`: `rust/tests/test_*.py`, covering board configuration, firmware artifacts, flashing, dependency notices, packaging, native BLE, HID reports, and host terminal behavior. |
 | Linux CLI/TUI terminal fixture | Build the CLI and install `pyte`, then run `CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py`. The default tool run skips this fixture without these prerequisites. |
 | ARM memory fixture | `make check-memory`: build development firmware for each Pico board and run the 32-bit allocation workloads in `rust/tests/memory-arm` under QEMU with that board's configuration, against its linked firmware's heap. |
-| Firmware static checks | `make check-firmware-all`: firmware Clippy for `pico_w`, `pico2_w`, `waveshare_rp2350b_plus_w`, and `xiao_esp32s3`, each with `production` and `debug` profiles. |
-| Firmware artifact validation | `make firmware-all PROFILE=production` and `make firmware-all PROFILE=debug`: link and package every board, including metadata, image layout, and storage-boundary checks in `rust/tools/build_firmware.py`. |
+| Firmware static checks | `make check-firmware BOARD=pico2_w PROFILE=production` and `make check-firmware BOARD=pico2_w PROFILE=debug`: firmware Clippy for the Pico 2 W. Also run them for another board (`pico_w`, `waveshare_rp2350b_plus_w`, `xiao_esp32s3`) when a change materially affects that board specifically, such as its board definition, platform code, radio backend, configuration, or partition or storage layout. |
+| Firmware artifact validation | `make firmware BOARD=pico2_w PROFILE=production` and `make firmware BOARD=pico2_w PROFILE=debug`: link and package the Pico 2 W, including metadata, image layout, and storage-boundary checks in `rust/tools/build_firmware.py`. Also build another board under the same condition as its static checks. |
 | Portable application packages | `make package-desktop package-cli package-web`; validate the desktop and CLI archives with `tools/check_release_archive.py` for the selected `CORDIAL_VERSION`. |
 | Arch package fixture | Build both native packages with `make package-desktop-arch package-cli-arch`, then run `packaging/check-arch.sh` in a clean Arch container. Checks independent installation, native modules, package contents, Namcap, reinstallation, and removal. |
 | Debian/Ubuntu package fixtures | Build both native packages with `make package-desktop-deb package-cli-deb DEB_DISTRIBUTION=...`, then run `packaging/check-deb.sh` in the matching clean container for `trixie`, `noble`, and `resolute`. Checks independent installation, native modules, package contents, Lintian, reinstallation, and removal. |
@@ -191,7 +192,7 @@ Keep this catalog aligned with `Makefile`, `desktop/package.json`, and
 | Release asset validation | When assembling a release, verify all expected application and board/profile archives and their checksums using the asset checklist in `.github/workflows/release.yml`. Publishing is not a check and still requires authorization. |
 
 `make check` covers the Rust, desktop, protocol, and Python tool suites. It does not enable the
-garbage-collection or terminal prerequisites, or run the memory, firmware matrix, package
+garbage-collection or terminal prerequisites, or run the memory, firmware, package
 installation, or installed desktop smoke checks. Run package installation fixtures only in
 disposable environments, never against the developer's installed
 applications. See [building documentation](docs/building.md) and the release workflow for setup

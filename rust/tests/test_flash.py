@@ -21,7 +21,7 @@ spec.loader.exec_module(flash)
 
 def image(**changes):
     manifest = dict(schema=1, profile="development", bootloader="bootsel", hardware="pico_w",
-                    hardware_digest=flash.PROTECTED_DIGEST, chip="rp2040", package="rp2040",
+                    hardware_digest="0" * 64, chip="rp2040", package="rp2040",
                     flash_bytes=2097152, storage_offset=2097152 - 131072, version="0.0.0", storage_bytes=131072, erase_bytes=4096,
                     bluetooth_backend="btstack", radio_backend="pico-sdk-cyw43",
                     usb_backend="embassy", storage_backend="littlefs")
@@ -43,8 +43,8 @@ def image(**changes):
 class FakeROM:
     """Emulate USB descriptors, ROM acknowledgements and the flash address space."""
 
-    def __init__(self, manifest, serial=flash.PROTECTED_SERIAL):
-        self.manifest, self.serial = manifest, serial
+    def __init__(self, manifest):
+        self.manifest = manifest
         self.memory = bytearray(b"\xa5" * manifest["flash_bytes"])
         metadata = flash.MAGIC + json.dumps(manifest).encode() + b"\0"
         self.memory[:len(metadata)] = metadata
@@ -65,12 +65,8 @@ class FakeROM:
                 if transfer.value == 0x0100:
                     descriptor = bytearray(18); descriptor[:2] = b"\x12\x01"
                     pid = 3 if self.manifest["chip"] == "rp2040" else 15
-                    struct.pack_into("<HH", descriptor, 8, 0x2e8a, pid); descriptor[16] = 3
+                    struct.pack_into("<HH", descriptor, 8, 0x2e8a, pid)
                     value = bytes(descriptor)
-                elif transfer.value == 0x0300:
-                    value = b"\x04\x03\x09\x04"
-                elif transfer.value == 0x0303:
-                    name = self.serial.encode("utf-16-le"); value = bytes((len(name) + 2, 3)) + name
                 elif transfer.value == 0x0200:
                     value = (bytes((9, 2, 32, 0, 1, 1, 0, 0x80, 50)) +
                              bytes((9, 4, 0, 0, 2, 0xff, 0, 0, 0)) +
@@ -136,24 +132,23 @@ class FakeROM:
 
 class FlashPolicy(unittest.TestCase):
     def test_development(self):
-        self.assertEqual(flash.verify_development(image(), flash.PROTECTED_SERIAL, "pico_w")["profile"], "development")
+        self.assertEqual(flash.verify_development(image(), "pico_w")["profile"], "development")
 
     def test_debug(self):
         data = image(profile="debug", version="1.2.3-debug")
-        self.assertEqual(flash.verify_development(data, flash.PROTECTED_SERIAL, "pico_w")["version"], "1.2.3-debug")
+        self.assertEqual(flash.verify_development(data, "pico_w")["version"], "1.2.3-debug")
 
     def test_production_rejected_before_hardware_access(self):
         data = image(profile="production", bootloader=None)
         manifest = flash.inspect_uf2(data)
         with patch.object(flash, "mounted_target", side_effect=AssertionError("hardware access")):
             with self.assertRaisesRegex(ValueError, "Refusing production"):
-                flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL)
+                flash.write_development(data, manifest, "/unused")
 
-    def test_protected_hardware(self):
-        for changes in (dict(hardware_digest="a" * 64), dict(hardware="custom"),
-                        dict(chip="rp2350", package="a"), dict(bootloader=None)):
+    def test_hardware_and_bootloader(self):
+        for changes in (dict(hardware="custom"), dict(bootloader=None)):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
-                flash.verify_development(image(**changes), flash.PROTECTED_SERIAL.lower(), "pico_w")
+                flash.verify_development(image(**changes), "pico_w")
 
     def test_disconnect_after_submission_is_uncertain(self):
         data = image(); manifest = flash.inspect_uf2(data)
@@ -164,18 +159,18 @@ class FlashPolicy(unittest.TestCase):
                 patch.object(flash.os, "fsync", side_effect=OSError("device disconnected")), \
                 patch.object(flash.os, "close"), patch.object(flash, "check_development_storage"):
             with self.assertRaises(flash.SubmissionUnconfirmed):
-                flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL)
+                flash.write_development(data, manifest, "/unused")
 
     def test_storage_erase_is_explicit_and_confined(self):
         data = image(); manifest = flash.inspect_uf2(data)
         rom = FakeROM(manifest)
         original = bytes(rom.memory)
         with rom.environment():
-            flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL)
+            flash.write_development(data, manifest, "/unused")
         self.assertNotIn(3, [cmd for cmd, _, _ in rom.commands])
         rom.writes.clear()
         with rom.environment():
-            flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL, clear_storage=True)
+            flash.write_development(data, manifest, "/unused", clear_storage=True)
         start = manifest["storage_offset"]
         self.assertEqual(rom.memory[:start], original[:start])
         self.assertEqual(rom.memory[start:], b"\xff" * 131072)
@@ -185,14 +180,6 @@ class FlashPolicy(unittest.TestCase):
         self.assertTrue(set(cmd for cmd, _, _ in rom.commands) <= {1, 3, 6, 7, 0x84})
         self.assertEqual(rom.writes, ["uf2-open"])
 
-    def test_clear_requires_matching_usb_handle_identity(self):
-        data = image(); manifest = flash.inspect_uf2(data)
-        rom = FakeROM(manifest, "ANOTHER_BOARD")
-        with rom.environment(), self.assertRaisesRegex(ValueError, "specified board"):
-            flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL, clear_storage=True)
-        self.assertEqual(rom.commands, [])
-        self.assertEqual(rom.writes, [])
-
     def test_interrupted_explicit_clear_can_be_retried(self):
         data = image(); manifest = flash.inspect_uf2(data)
         start = manifest["storage_offset"]
@@ -200,12 +187,12 @@ class FlashPolicy(unittest.TestCase):
             rom = FakeROM(manifest)
             rom.fail_erase_after = completed
             with rom.environment(), self.assertRaisesRegex(OSError, "erase failure"):
-                flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL, clear_storage=True)
+                flash.write_development(data, manifest, "/unused", clear_storage=True)
             self.assertEqual(rom.writes, [])
             self.assertEqual(rom.memory[start:start+32], bytes.fromhex(manifest["storage_identity"]))
             rom.fail_erase_after = None
             with rom.environment():
-                flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL, clear_storage=True)
+                flash.write_development(data, manifest, "/unused", clear_storage=True)
             self.assertEqual(rom.memory[start:], b"\xff" * manifest["storage_bytes"])
             self.assertEqual(rom.writes, ["uf2-open"])
 
@@ -216,7 +203,7 @@ class FlashPolicy(unittest.TestCase):
             rom = FakeROM(manifest)
             rom.memory[offset] ^= 1
             with rom.environment(), self.assertRaises(ValueError):
-                flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL, clear_storage=clear)
+                flash.write_development(data, manifest, "/unused", clear_storage=clear)
             self.assertEqual(rom.writes, [])
             self.assertNotIn(3, [cmd for cmd, _, _ in rom.commands])
 
@@ -225,12 +212,12 @@ class FlashPolicy(unittest.TestCase):
         rom = FakeROM(manifest)
         rom.memory[:] = b"\xff" * len(rom.memory)
         with rom.environment():
-            flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL)
+            flash.write_development(data, manifest, "/unused")
         self.assertEqual(rom.writes, ["uf2-open"])
         rom.writes.clear()
         rom.memory[8192] = 0
         with rom.environment(), self.assertRaisesRegex(ValueError, "unrecognized"):
-            flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL)
+            flash.write_development(data, manifest, "/unused")
         self.assertEqual(rom.writes, [])
 
     def test_erase_failure_prevents_firmware_write(self):
@@ -238,14 +225,14 @@ class FlashPolicy(unittest.TestCase):
         for fail_erase, bad_status in ((True, False), (False, True)):
             rom = FakeROM(manifest); rom.fail_erase, rom.bad_status = fail_erase, bad_status
             with rom.environment(), self.assertRaises(OSError):
-                flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL, clear_storage=True)
+                flash.write_development(data, manifest, "/unused", clear_storage=True)
             self.assertEqual(rom.writes, [])
 
     def test_clear_rejects_production_before_usb_access(self):
         data = image(profile="production", bootloader=None)
         with patch.object(flash, "_PicoBoot", side_effect=AssertionError("USB opened")), \
                 self.assertRaisesRegex(ValueError, "Refusing production"):
-            flash.clear_development_storage(data, flash.PROTECTED_SERIAL, "pico_w", Path("/unused"))
+            flash.clear_development_storage(data, "pico_w", Path("/unused"))
 
     def test_erase_preserves_rp2350_reserved_sector(self):
         flash_bytes = 2097152
@@ -255,10 +242,10 @@ class FlashPolicy(unittest.TestCase):
                               256, 0, 2, 0xE48BFF57) + b"\xef" * 256 + struct.pack("<I", 0x9957E304) +
                   b"\0" * 216 + struct.pack("<I", 0x0AB16F30))
         data = marker + data; manifest = flash.inspect_uf2(data)
-        rom = FakeROM(manifest, "ANOTHER_BOARD")
+        rom = FakeROM(manifest)
         original = bytes(rom.memory)
         with rom.environment():
-            flash.write_development(data, manifest, "/unused", "ANOTHER_BOARD", clear_storage=True)
+            flash.write_development(data, manifest, "/unused", clear_storage=True)
         start = manifest["storage_offset"]
         self.assertEqual(rom.memory[:start], original[:start])
         self.assertEqual(rom.memory[start:start + 131072], b"\xff" * 131072)
@@ -269,12 +256,12 @@ class FlashPolicy(unittest.TestCase):
         rom = FakeROM(manifest)
         with rom.environment(), patch.object(flash.os, "fstat", return_value=SimpleNamespace(st_dev=99)), \
                 self.assertRaisesRegex(ValueError, "Mount changed"):
-            flash.write_development(data, manifest, "/unused", flash.PROTECTED_SERIAL, clear_storage=True)
+            flash.write_development(data, manifest, "/unused", clear_storage=True)
         self.assertEqual(rom.commands, [])
         self.assertEqual(rom.writes, [])
 
     def test_clear_requires_write(self):
-        with patch.object(flash.sys, "argv", ["flash_dev.py", "/unused", "--clear-storage"]), \
+        with patch.object(flash.sys, "argv", ["flash_dev.py", "/unused", "--hardware", "pico_w", "--clear-storage"]), \
                 patch.object(flash.Path, "read_bytes", side_effect=AssertionError("file read")):
             self.assertEqual(flash.main(), 1)
 

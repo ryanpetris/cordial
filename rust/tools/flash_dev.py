@@ -18,11 +18,6 @@ import sys
 
 from firmware_artifact import MAGIC, FAMILIES, inspect as inspect_manifest
 FLASH_BASE = 0x10000000
-PROTECTED_SERIAL = "E0C9125B0D9B"
-# Independent of the selected build configuration, which might have been edited.
-PROTECTED_DIGEST = hashlib.sha256(
-    b"rp2040/rp2040/2097152/2/12000000/23/24/24/24/29/25/0/-1/1500000000/6/2/1200000000/5/5/False/False"
-).hexdigest()
 
 
 class SubmissionUnconfirmed(OSError):
@@ -96,21 +91,16 @@ def inspect_uf2(data):
     return manifest
 
 
-def verify_development(data, serial, hardware):
+def verify_development(data, hardware):
     manifest = inspect_uf2(data)
     if manifest["profile"] == "production" or manifest["bootloader"] != "bootsel":
         raise ValueError("Refusing production firmware: only debug or development firmware with remote BOOTSEL may be flashed")
     if manifest["hardware"] != hardware:
         raise ValueError("Artifact hardware does not match the selected hardware")
-    if serial.upper() == PROTECTED_SERIAL:
-        if (manifest["hardware"] != "pico_w" or manifest["chip"] != "rp2040" or
-                manifest["package"] != "rp2040" or manifest["flash_bytes"] != 2097152 or
-                manifest["hardware_digest"] != PROTECTED_DIGEST):
-            raise ValueError("Artifact is incompatible with the protected Pico W")
     return manifest
 
 
-def mounted_target(mount, serial, chip):
+def mounted_target(mount, chip):
     mount = Path(mount).resolve(strict=True)
     result = subprocess.run(["findmnt", "--json", "--target", str(mount), "--output", "TARGET,FSTYPE,MAJ:MIN"],
                             check=True, capture_output=True, text=True)
@@ -122,10 +112,10 @@ def mounted_target(mount, serial, chip):
     usb = next((p for p in (device, *device.parents) if (p / "idVendor").exists()), None)
     if usb is None:
         raise ValueError("Cannot identify the mounted volume's USB device")
-    attributes = {key: (usb / key).read_text().strip() for key in ("idVendor", "idProduct", "serial")}
+    attributes = {key: (usb / key).read_text().strip() for key in ("idVendor", "idProduct")}
     expected_pid = "0003" if chip == "rp2040" else "000f"
-    if attributes["idVendor"] != "2e8a" or attributes["idProduct"] != expected_pid or attributes["serial"].upper() != serial.upper():
-        raise ValueError("Mounted volume is not the specified board in compatible BOOTSEL mode")
+    if attributes["idVendor"] != "2e8a" or attributes["idProduct"] != expected_pid:
+        raise ValueError("Mounted volume is not a board in compatible BOOTSEL mode")
     return mount, os.makedev(major, minor), usb
 
 
@@ -144,7 +134,7 @@ class _USBBulk(ctypes.Structure):
 class _PicoBoot:
     """Linux usbfs transport for the SDK's boot/picoboot.h ROM protocol."""
 
-    def __init__(self, usb, serial, chip):
+    def __init__(self, usb, chip):
         self.fd = None
         self.interface = None
         self.token = 0
@@ -158,16 +148,8 @@ class _PicoBoot:
             descriptor = self.control(0x80, 6, 0x0100, 0, 18)
             pid = 0x0003 if chip == "rp2040" else 0x000f
             if (len(descriptor) != 18 or descriptor[:2] != b"\x12\x01" or
-                    struct.unpack_from("<HH", descriptor, 8) != (0x2e8a, pid) or not descriptor[16]):
+                    struct.unpack_from("<HH", descriptor, 8) != (0x2e8a, pid)):
                 raise ValueError("PICOBOOT handle is not the expected processor")
-            languages = self.control(0x80, 6, 0x0300, 0, 255)
-            if len(languages) < 4 or languages[1] != 3 or languages[0] != len(languages):
-                raise ValueError("Cannot verify BOOTSEL USB serial language")
-            language = struct.unpack_from("<H", languages, 2)[0]
-            identity = self.control(0x80, 6, 0x0300 | descriptor[16], language, 255)
-            if (len(identity) < 2 or identity[1] != 3 or identity[0] != len(identity) or
-                    identity[2:].decode("utf-16-le").upper() != serial.upper()):
-                raise ValueError("PICOBOOT handle is not the specified board")
             config = self.control(0x80, 6, 0x0200, 0, 9)
             if len(config) != 9 or config[:2] != b"\x09\x02":
                 raise ValueError("Invalid BOOTSEL USB configuration")
@@ -256,11 +238,11 @@ class _PicoBoot:
                 self.fd = None
 
 
-def check_development_storage(data, serial, hardware, usb, clear=False):
-    verified = verify_development(data, serial, hardware)
+def check_development_storage(data, hardware, usb, clear=False):
+    verified = verify_development(data, hardware)
     start = FLASH_BASE + verified["storage_offset"]
     size = verified["storage_bytes"]
-    boot = _PicoBoot(usb, serial, verified["chip"])
+    boot = _PicoBoot(usb, verified["chip"])
     try:
         for endpoint in (boot.out_ep, boot.in_ep):
             fcntl.ioctl(boot.fd, 0x80045515, struct.pack("I", endpoint))
@@ -304,20 +286,20 @@ def check_development_storage(data, serial, hardware, usb, clear=False):
         boot.close()
 
 
-def clear_development_storage(data, serial, hardware, usb):
-    check_development_storage(data, serial, hardware, usb, clear=True)
+def clear_development_storage(data, hardware, usb):
+    check_development_storage(data, hardware, usb, clear=True)
 
 
-def write_development(data, manifest, mount, serial, clear_storage=False):
+def write_development(data, manifest, mount, clear_storage=False):
     # Recheck artifact policy inside the sole write function too.
-    verified = verify_development(data, serial, manifest["hardware"])
-    mount, device_number, usb = mounted_target(mount, serial, verified["chip"])
+    verified = verify_development(data, manifest["hardware"])
+    mount, device_number, usb = mounted_target(mount, verified["chip"])
     directory = os.open(mount, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         if os.fstat(directory).st_dev != device_number:
             raise ValueError("Mount changed during verification")
-        check_development_storage(data, serial, verified["hardware"], usb, clear=clear_storage)
-        if mounted_target(mount, serial, verified["chip"]) != (mount, device_number, usb):
+        check_development_storage(data, verified["hardware"], usb, clear=clear_storage)
+        if mounted_target(mount, verified["chip"]) != (mount, device_number, usb):
             raise ValueError("Mount changed after storage check; no firmware was written")
         fd = os.open("CORDIAL.UF2", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644, dir_fd=directory)
         try:
@@ -340,8 +322,7 @@ def write_development(data, manifest, mount, serial, clear_storage=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("uf2", type=Path)
-    parser.add_argument("--serial", default=PROTECTED_SERIAL)
-    parser.add_argument("--hardware", default="pico_w")
+    parser.add_argument("--hardware", required=True, help="board the artifact must be built for, such as pico2_w")
     parser.add_argument("--mount", type=Path)
     parser.add_argument("--write", action="store_true", help="write after artifact and USB identity checks; otherwise inspect only")
     parser.add_argument("--clear-storage", action="store_true",
@@ -351,12 +332,12 @@ def main():
         if args.clear_storage and not args.write:
             raise ValueError("--clear-storage requires --write")
         data = args.uf2.read_bytes()
-        manifest = verify_development(data, args.serial, args.hardware)
+        manifest = verify_development(data, args.hardware)
         print(json.dumps({"artifact": str(args.uf2), "sha256": hashlib.sha256(data).hexdigest(), "manifest": manifest}, indent=2))
         if args.write:
             if args.mount is None:
                 raise ValueError("--write requires --mount")
-            write_development(data, manifest, args.mount, args.serial, args.clear_storage)
+            write_development(data, manifest, args.mount, args.clear_storage)
             print("Development UF2 written. Check USB enumeration before attempting another write.")
         return 0
     except SubmissionUnconfirmed as error:
