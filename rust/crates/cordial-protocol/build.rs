@@ -1,5 +1,5 @@
-//! Generates the protobuf messages from `proto/cordial.proto` and the key constants from
-//! `proto/keys.toml`.
+//! Generates the protobuf messages from `proto/cordial.proto` and `proto/storage.proto`, and the
+//! key constants from `proto/keys.toml`.
 use std::{env, fmt::Write, fs, path::PathBuf};
 
 use serde::Deserialize;
@@ -33,10 +33,15 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
+        proto.join("storage.proto").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         proto.join("keys.toml").display()
     );
 
-    let descriptors = protox::compile(["cordial.proto"], [&proto]).expect("compile cordial.proto");
+    let descriptors =
+        protox::compile(["cordial.proto", "storage.proto"], [&proto]).expect("compile schemas");
     prost_build::Config::new()
         .compile_fds(descriptors.clone())
         .expect("generate messages");

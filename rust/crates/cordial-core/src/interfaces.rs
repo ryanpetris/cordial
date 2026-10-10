@@ -1,10 +1,9 @@
 //! Configuration interfaces: external editing protocols the adapter exposes over USB, each with
 //! its own saved enabled flag and profile.
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
+use cordial_protocol::storage as saved;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Interface {
     Via,
     Vial,
@@ -29,13 +28,37 @@ impl Interface {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InterfacePreference {
     pub interface: Interface,
     pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<u64>,
+}
+impl InterfacePreference {
+    pub fn saved(&self) -> saved::InterfacePreference {
+        saved::InterfacePreference {
+            interface: match self.interface {
+                Interface::Via => saved::ConfigurationInterface::Via,
+                Interface::Vial => saved::ConfigurationInterface::Vial,
+            }
+            .into(),
+            enabled: self.enabled,
+            profile: self.profile,
+        }
+    }
+    /// The saved preference of an interface this firmware has; `None` for another interface.
+    pub fn from_saved(preference: saved::InterfacePreference) -> Option<Self> {
+        let interface = match saved::ConfigurationInterface::try_from(preference.interface) {
+            Ok(saved::ConfigurationInterface::Via) => Interface::Via,
+            Ok(saved::ConfigurationInterface::Vial) => Interface::Vial,
+            _ => return None,
+        };
+        Some(Self {
+            interface,
+            enabled: preference.enabled,
+            profile: preference.profile,
+        })
+    }
 }
 
 /// The saved preference of `interface`: disabled with no profile when it has none.

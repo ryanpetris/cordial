@@ -1,6 +1,6 @@
 //! The Cordial serial API: protobuf messages generated from `proto/cordial.proto`, the frame
 //! encoding used on the USB serial port, and the information and setting keys from
-//! `proto/keys.toml`.
+//! `proto/keys.toml`; and the Dongle's saved records in [`storage`].
 //!
 //! A client sends [`Request`] frames and receives [`Message`] frames, each holding a
 //! [`Response`] or an [`Event`]. [`frame`] turns messages into frames and back.
@@ -15,6 +15,15 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/cordial.serde.rs"));
 }
 pub use generated::*;
+
+/// The records the Dongle saves in its filesystem, generated from `proto/storage.proto`. Each file
+/// holds one of these messages.
+#[allow(clippy::all, clippy::pedantic, missing_docs)]
+pub mod storage {
+    include!(concat!(env!("OUT_DIR"), "/cordial.storage.rs"));
+    #[cfg(feature = "json")]
+    include!(concat!(env!("OUT_DIR"), "/cordial.storage.serde.rs"));
+}
 
 pub mod frame;
 pub mod keys;

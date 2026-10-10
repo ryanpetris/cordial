@@ -1057,6 +1057,93 @@ impl Fixture {
             self.connect(9, false);
         }
     }
+    /// A profile that fills the memory budget with disabled Consumer controls, leaving room for a
+    /// row of VIA edits: saved through the serial API in requests of the largest size, listed from
+    /// flash, edited with VIA and loaded by a connecting device.
+    fn large_profile(&mut self) {
+        use cordial_protocol::{profile_rule, profile_rule_change};
+        let budget = board::PROFILE_MEMORY_BUDGET.unwrap() as usize;
+        // A disabled input's rule takes one 8-byte table entry; a VIA edit to a key, two.
+        let edits = cordial_core::configurator::COLS;
+        let count = (budget - 64 - edits * 16) / 8;
+        // The workload's own peak, from what is live as it starts.
+        unsafe {
+            let h = &mut *HEAP.0.get();
+            h.peak = h.talc.counters().allocated_bytes + h.talc.counters().overhead_bytes();
+        }
+        stats("large profile start");
+        self.app.session(true, &mut self.radio);
+        self.send(Command::CreateProfile(cordial_protocol::CreateProfile {
+            name: "Large".into(),
+        }));
+        let id = PROFILES as u32 + 1;
+        assert!(block_on(profiles::metadata(&mut self.store, id.into())).is_ok());
+        for start in (0..count).step_by(64) {
+            let changes = host(|| {
+                (start..count.min(start + 64))
+                    .map(|i| cordial_protocol::ProfileRuleChange {
+                        change: Some(profile_rule_change::Change::Rule(
+                            cordial_protocol::ProfileRule {
+                                input: Some(cordial_protocol::Usage {
+                                    usage_page: u32::from(profiles::CONSUMER_PAGE),
+                                    usage: 0x239 + i as u32,
+                                }),
+                                effect: Some(profile_rule::Effect::Remap(
+                                    profile_rule::Remap::default(),
+                                )),
+                            },
+                        )),
+                    })
+                    .collect()
+            });
+            self.send(Command::SetProfileRules(cordial_protocol::SetProfileRules {
+                profile: id,
+                changes,
+            }));
+        }
+        stats("large profile saved");
+        self.list(Command::ListProfileRules(
+            cordial_protocol::ListProfileRules {
+                profile: id,
+                after: None,
+            },
+        ));
+        stats("large profile listed");
+        self.send(Command::SetAdapter(cordial_protocol::SetAdapter {
+            configuration_interfaces: vec![cordial_protocol::ConfigurationInterfaceUpdate {
+                interface: cordial_protocol::ConfigurationInterface::Via as i32,
+                enabled: Some(true),
+                profile: Some(id),
+            }],
+            ..Default::default()
+        }));
+        self.app.usb_reconnect = false;
+        // The editor loads the profile and remaps a row of keys, which is saved once it pauses.
+        for col in 0..edits as u8 {
+            assert_ne!(self.via(&[0x05, 0, 0, col, 0, 0x1e + col])[0], 0xff);
+        }
+        let used = self.app.manager.profiles.used();
+        assert!(used <= budget && used + 16 > budget, "{used} of {budget}");
+        self.now += cordial_core::application::EDITOR_BATCH_MS;
+        self.poll(4);
+        assert!(!self.app.has_unsaved());
+        stats("large profile edited");
+        // The idle editor releases it; a device then loads it from flash as it connects.
+        self.now += cordial_core::application::EDITOR_IDLE_MS;
+        self.poll(4);
+        assert_eq!(self.app.manager.profiles.used(), 0);
+        let (device, layers) = CONNECTED[0];
+        self.layers(device, [id]);
+        self.app.session(false, &mut self.radio);
+        self.connect(device, true);
+        assert_eq!(self.live(device).profile_error, None);
+        assert_eq!(self.app.manager.profiles.used(), used);
+        stats("large profile loaded");
+        self.disconnect(device);
+        self.app.session(true, &mut self.radio);
+        self.layers(device, layers.map(|id| id as u32));
+        self.app.session(false, &mut self.radio);
+    }
     fn commands(&mut self, ids: &[u64], maximum: bool, turn: usize) {
         // Long enough for the idle editor to release its profile, and for no drop to be rapid.
         self.now += 10_000;
@@ -1323,6 +1410,9 @@ fn main() -> ! {
         fixture.poll(4);
         assert_eq!(fixture.app.manager.profiles.used(), 0);
         stats("after disconnect");
+    }
+    if PROFILES_SUPPORTED {
+        fixture.large_profile();
     }
     drop(fixture);
     drop(owner);

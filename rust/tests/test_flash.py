@@ -26,7 +26,7 @@ def image(**changes):
                     bluetooth_backend="btstack", radio_backend="pico-sdk-cyw43",
                     usb_backend="embassy", storage_backend="littlefs")
     manifest.update(changes)
-    layout = dict(format="littlefs-json-1",
+    layout = dict(format="littlefs-2",
                   storage_backend=manifest["storage_backend"], offset=manifest["storage_offset"],
                   bytes=manifest["storage_bytes"], erase_bytes=4096)
     manifest["storage_identity"] = hashlib.sha256(json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()).hexdigest()

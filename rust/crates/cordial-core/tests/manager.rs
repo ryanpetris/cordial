@@ -9,10 +9,11 @@ use cordial_core::{
     interfaces::{Interface, InterfacePreference},
     link::ServiceId,
     manager::Manager,
-    storage::{RecordStore, record_key},
+    storage::{RecordKey, RecordStore, record_key},
 };
 use cordial_protocol as p;
 use embassy_futures::block_on;
+use prost::Message;
 use support::*;
 
 /// The saved device with identity `peer`, read from every saved device record.
@@ -40,7 +41,7 @@ fn change(
 ) -> Result<(), Error> {
     let mut policy = policy(store, id);
     f(&mut policy);
-    block_on(manager.save_policy(policy, store, radio))
+    block_on(manager.save_policy(policy, None, store, radio))
 }
 /// Commits a saved device with a bond, as pairing would.
 fn add(store: &mut Store, id: u64, peer: Peer, f: impl FnOnce(&mut Policy)) {
@@ -252,24 +253,29 @@ fn unsupported_transport_keeps_the_device_and_a_lost_bond_deletes_it() {
     );
     assert!(d.enabled);
     let key = record_key(2, 77);
-    let mut value: serde_json::Value = serde_json::from_slice(&store.records[&key]).unwrap();
-    value["bond"]["complete"] = false.into();
-    store
-        .records
-        .insert(key, serde_json::to_vec(&value).unwrap());
+    lose_bond(&mut store.records, key);
     block_on(manager.load(&mut store, &mut radio)).unwrap();
     assert!(manager.devices.iter().all(Option::is_none));
     assert!(!store.records.contains_key(&key));
+}
+/// Gives the saved device record at `key` a bond of another device, so the record is lost.
+fn lose_bond(records: &mut std::collections::BTreeMap<RecordKey, Vec<u8>>, key: RecordKey) {
+    let mut record = cordial_protocol::storage::Device::decode(records[&key].as_slice()).unwrap();
+    record.bond.as_mut().unwrap().owner += 1;
+    records.insert(key, record.encode_to_vec());
+}
+/// The last device ID the saved sequence allocated.
+fn last_device(store: &Store) -> u64 {
+    cordial_protocol::storage::Sequence::decode(store.records[&record_key(7, 0)].as_slice())
+        .unwrap()
+        .next_device
+        - 1
 }
 #[test]
 fn a_lost_record_whose_cleanup_fails_is_still_reported_removed() {
     let (mut manager, mut store, mut radio) = setup();
     let key = record_key(2, 77);
-    let mut value: serde_json::Value = serde_json::from_slice(&store.records[&key]).unwrap();
-    value["bond"]["complete"] = false.into();
-    store
-        .records
-        .insert(key, serde_json::to_vec(&value).unwrap());
+    lose_bond(&mut store.records, key);
     store.fail_remove = Some(key);
     assert_eq!(
         block_on(manager.sync_bonds(&mut store, &mut radio)),
@@ -511,11 +517,7 @@ fn policy_and_adapter_commit_errors_are_read_back_before_publishing() {
 fn deleting_highest_device_does_not_reuse_its_id() {
     let (mut manager, mut store, mut radio) = setup();
     block_on(manager.prepare_pair(peer(2), None, &mut store, &mut radio)).unwrap();
-    let first = serde_json::from_slice::<cordial_core::storage::Sequence>(
-        &store.records[&record_key(7, 0)],
-    )
-    .unwrap()
-    .device;
+    let first = last_device(&store);
     let link = manager.pair(peer(2), 90_000, &mut radio).unwrap();
     let (id, _) = block_on(manager.bonded(
         link,
@@ -532,11 +534,7 @@ fn deleting_highest_device_does_not_reuse_its_id() {
     assert!(!store.records.contains_key(&record_key(2, first)));
     block_on(manager.load(&mut store, &mut radio)).unwrap();
     block_on(manager.prepare_pair(peer(3), None, &mut store, &mut radio)).unwrap();
-    let next = serde_json::from_slice::<cordial_core::storage::Sequence>(
-        &store.records[&record_key(7, 0)],
-    )
-    .unwrap()
-    .device;
+    let next = last_device(&store);
     assert!(next > first);
 }
 #[test]
@@ -578,12 +576,18 @@ fn late_identity_cannot_take_over_an_existing_live_link() {
     assert_eq!(policy(&mut store, 77), original);
 }
 #[test]
-fn device_and_bond_are_one_json_record() {
+fn device_and_bond_are_one_record() {
     let (_, store, _) = setup();
     assert!(store.records.keys().all(|key| !matches!(key[0], 5 | 6)));
-    let value: serde_json::Value =
-        serde_json::from_slice(&store.records[&record_key(2, 77)]).unwrap();
-    assert!(value["bond"]["keys"]["Classic"]["key"].is_string());
+    let record =
+        cordial_protocol::storage::Device::decode(store.records[&record_key(2, 77)].as_slice())
+            .unwrap();
+    assert_eq!(record.policy.unwrap().id, 77);
+    let Some(cordial_protocol::storage::bond::Keys::Classic(keys)) = record.bond.unwrap().keys
+    else {
+        panic!("a Classic bond");
+    };
+    assert_eq!(keys.link_key.len(), 16);
 }
 
 #[test]

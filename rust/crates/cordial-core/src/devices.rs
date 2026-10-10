@@ -5,12 +5,13 @@ use crate::model::{
     identifiers::{ConnectionState, HostPlatform, Transport},
 };
 use crate::{
+    bonds::Bond,
     interfaces::InterfacePreference,
     settings::Catalog,
     storage::{self, RecordStore, record_key},
 };
 use alloc::{boxed::Box, string::String, vec::Vec};
-use serde::{Deserialize, Serialize};
+use cordial_protocol::storage as saved;
 
 /// The first retry delay after a failure, doubling per further failure up to
 /// `RETRY_DELAY_MAX_MS`.
@@ -29,12 +30,20 @@ impl Backoff {
     pub fn due(&self, now: u64) -> bool {
         now >= self.at
     }
+    /// When the work may run again; zero when it has not failed.
+    pub fn at(&self) -> u64 {
+        self.at
+    }
     /// Records a failure at `now`.
     pub fn failed(&mut self, now: u64) {
+        self.failed_up_to(now, RETRY_DELAY_MAX_MS);
+    }
+    /// Records a failure at `now`, doubling the delay up to `max` milliseconds.
+    pub fn failed_up_to(&mut self, now: u64, max: u32) {
         self.delay = if self.delay == 0 {
-            RETRY_DELAY_MS
+            RETRY_DELAY_MS.min(max)
         } else {
-            self.delay.saturating_mul(2).min(RETRY_DELAY_MAX_MS)
+            self.delay.saturating_mul(2).min(max)
         };
         self.at = now.saturating_add(self.delay.into());
     }
@@ -59,66 +68,86 @@ pub const PAGE_SIZE: usize = 8;
 
 /// A resolved bonded identity, or a transport-specific discovery address.
 /// Backends resolve private BLE addresses before matching a saved policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Peer {
     pub address: [u8; 6],
     pub random: bool,
     pub transport: Transport,
 }
+impl Peer {
+    pub fn saved(&self) -> saved::Peer {
+        saved::Peer {
+            address: self.address.into(),
+            random: self.random,
+            transport: saved_transport(self.transport).into(),
+        }
+    }
+    /// The saved peer of a record, which is required.
+    pub fn from_saved(peer: Option<saved::Peer>) -> Result<Self, storage::Error> {
+        let peer = peer.ok_or(storage::Error::Corrupt)?;
+        Ok(Self {
+            address: storage::array(&peer.address)?,
+            random: peer.random,
+            transport: from_saved_transport(peer.transport).ok_or(storage::Error::Corrupt)?,
+        })
+    }
+}
+pub fn saved_transport(transport: Transport) -> saved::Transport {
+    match transport {
+        Transport::Classic => saved::Transport::Classic,
+        Transport::Ble => saved::Transport::Ble,
+    }
+}
+/// The transport a saved value names; `None` for an unknown or unspecified one.
+pub fn from_saved_transport(value: i32) -> Option<Transport> {
+    match saved::Transport::try_from(value) {
+        Ok(saved::Transport::Classic) => Some(Transport::Classic),
+        Ok(saved::Transport::Ble) => Some(Transport::Ble),
+        _ => None,
+    }
+}
 
 /// The integrations a device can have a saved preference for.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntegrationKind {
     Hidpp,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SavedIntegration {
     pub kind: IntegrationKind,
     pub enabled: bool,
 }
 
-/// The input roles of a device's HID descriptor, as `hid` role bits, saved as their names.
+/// The input roles of a device's HID descriptor, as `hid` role bits.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Roles(pub u8);
 impl Roles {
-    const NAMES: [(u8, &'static str); 4] = [
-        (crate::hid::KEYBOARD, "keyboard"),
-        (crate::hid::MOUSE, "mouse"),
-        (crate::hid::CONSUMER, "consumer_control"),
-        (crate::hid::SYSTEM, "system_control"),
+    const SAVED: [(u8, saved::Role); 4] = [
+        (crate::hid::KEYBOARD, saved::Role::Keyboard),
+        (crate::hid::MOUSE, saved::Role::Mouse),
+        (crate::hid::CONSUMER, saved::Role::ConsumerControl),
+        (crate::hid::SYSTEM, saved::Role::SystemControl),
     ];
-}
-impl Serialize for Roles {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let mut seq = serializer.serialize_seq(None)?;
-        for (bit, name) in Self::NAMES {
-            if self.0 & bit != 0 {
-                seq.serialize_element(name)?;
-            }
-        }
-        seq.end()
+    pub fn saved(self) -> Vec<i32> {
+        Self::SAVED
+            .into_iter()
+            .filter(|(bit, _)| self.0 & bit != 0)
+            .map(|(_, role)| role.into())
+            .collect()
     }
-}
-impl<'de> Deserialize<'de> for Roles {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut roles = 0;
-        for name in Vec::<String>::deserialize(deserializer)? {
-            let (bit, _) = Self::NAMES
+    /// The roles a record lists. Roles this firmware does not know are left out.
+    pub fn from_saved(roles: &[i32]) -> Self {
+        Self(
+            Self::SAVED
                 .into_iter()
-                .find(|(_, n)| *n == name)
-                .ok_or_else(|| serde::de::Error::custom("unknown role"))?;
-            roles |= bit;
-        }
-        Ok(Self(roles))
+                .filter(|(_, role)| roles.contains(&i32::from(*role)))
+                .fold(0, |bits, (bit, _)| bits | bit),
+        )
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Policy {
     pub id: u64,
     pub peer: Peer,
@@ -126,23 +155,67 @@ pub struct Policy {
     pub trusted: bool,
     pub blocked: bool,
     pub enabled: bool,
-    /// Set from pairing until the device's first-connection setup completes;
-    /// saved only while set.
-    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    /// Set from pairing until the device's first-connection setup completes.
     pub setup_pending: bool,
     pub integrations: Vec<SavedIntegration>,
-    #[serde(default, skip_serializing_if = "is_empty_roles")]
     pub roles: Roles,
     /// The device's profile layers, applied in order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<u64>,
-    #[serde(skip)]
+    /// The ID of the bond the policy's record holds; not saved, since it is the record's own.
     pub bond: u64,
 }
-fn is_empty_roles(roles: &Roles) -> bool {
-    roles.0 == 0
-}
 impl Policy {
+    pub fn saved(&self) -> saved::Policy {
+        saved::Policy {
+            id: self.id,
+            peer: Some(self.peer.saved()),
+            name: self.name.as_ref().into(),
+            trusted: self.trusted,
+            blocked: self.blocked,
+            enabled: self.enabled,
+            setup_pending: self.setup_pending,
+            integrations: self
+                .integrations
+                .iter()
+                .map(|i| saved::IntegrationPreference {
+                    integration: match i.kind {
+                        IntegrationKind::Hidpp => saved::Integration::Hidpp,
+                    }
+                    .into(),
+                    enabled: i.enabled,
+                })
+                .collect(),
+            roles: self.roles.saved(),
+            profiles: self.profiles.clone(),
+        }
+    }
+    /// The policy a record holds, not yet validated. Entries for integrations this firmware does
+    /// not know are left out.
+    pub fn from_saved(policy: Option<saved::Policy>) -> Result<Self, storage::Error> {
+        let policy = policy.ok_or(storage::Error::Corrupt)?;
+        let mut integrations = Vec::new();
+        for integration in policy.integrations {
+            if integration.integration == i32::from(saved::Integration::Hidpp) {
+                integrations.push(SavedIntegration {
+                    kind: IntegrationKind::Hidpp,
+                    enabled: integration.enabled,
+                });
+            }
+        }
+        Ok(Self {
+            id: policy.id,
+            peer: Peer::from_saved(policy.peer)?,
+            name: policy.name.into_boxed_str(),
+            trusted: policy.trusted,
+            blocked: policy.blocked,
+            enabled: policy.enabled,
+            setup_pending: policy.setup_pending,
+            integrations,
+            roles: Roles::from_saved(&policy.roles),
+            profiles: policy.profiles,
+            bond: 0,
+        })
+    }
     pub fn paired(id: u64, peer: Peer, name: &[u8]) -> Self {
         Self {
             id,
@@ -432,20 +505,69 @@ impl Device {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AdapterPreference {
     pub name: Option<alloc::string::String>,
     pub host_platform: HostPlatform,
-    /// The enabled transports. BLE alone when absent.
-    #[serde(default)]
+    /// The enabled transports. BLE alone by default.
     pub transports: Transports,
     /// Saved preferences of each configuration interface that has any.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub configuration_interfaces: Vec<InterfacePreference>,
 }
+impl AdapterPreference {
+    pub fn saved(&self) -> saved::Adapter {
+        saved::Adapter {
+            name: self.name.clone(),
+            host_platform: match self.host_platform {
+                HostPlatform::Linux => saved::HostPlatform::Linux,
+                HostPlatform::Windows => saved::HostPlatform::Windows,
+                HostPlatform::Mac => saved::HostPlatform::Mac,
+            }
+            .into(),
+            transports: Transports::ALL
+                .into_iter()
+                .map(|transport| saved::TransportPreference {
+                    transport: saved_transport(transport).into(),
+                    enabled: self.transports.contains(transport),
+                })
+                .collect(),
+            configuration_interfaces: self
+                .configuration_interfaces
+                .iter()
+                .map(InterfacePreference::saved)
+                .collect(),
+        }
+    }
+    /// The preferences a record holds, not yet validated. Entries for transports and interfaces
+    /// this firmware does not know are left out.
+    pub fn from_saved(adapter: saved::Adapter) -> Result<Self, storage::Error> {
+        let mut transports = Transports::default();
+        for preference in &adapter.transports {
+            if let Some(transport) = from_saved_transport(preference.transport) {
+                transports.set(transport, preference.enabled);
+            }
+        }
+        let mut configuration_interfaces = Vec::new();
+        for preference in adapter.configuration_interfaces {
+            if let Some(preference) = InterfacePreference::from_saved(preference) {
+                configuration_interfaces.push(preference);
+            }
+        }
+        Ok(Self {
+            name: adapter.name,
+            // An unknown platform reads as the default, Linux.
+            host_platform: match saved::HostPlatform::try_from(adapter.host_platform) {
+                Ok(saved::HostPlatform::Windows) => HostPlatform::Windows,
+                Ok(saved::HostPlatform::Mac) => HostPlatform::Mac,
+                _ => HostPlatform::Linux,
+            },
+            transports,
+            configuration_interfaces,
+        })
+    }
+}
 
-/// A set of transports, saved as the list of their names.
+/// A set of transports.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Transports(u8);
 impl Transports {
@@ -473,26 +595,6 @@ impl Default for Transports {
         Self(Self::bit(Transport::Ble))
     }
 }
-impl Serialize for Transports {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let mut seq = serializer.serialize_seq(None)?;
-        for transport in Self::ALL.into_iter().filter(|t| self.contains(*t)) {
-            seq.serialize_element(&transport)?;
-        }
-        seq.end()
-    }
-}
-impl<'de> Deserialize<'de> for Transports {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut set = Self::NONE;
-        for transport in Vec::<Transport>::deserialize(deserializer)? {
-            set.set(transport, true);
-        }
-        Ok(set)
-    }
-}
-
 pub struct Policies<'a, S> {
     pub store: &'a mut S,
 }
@@ -500,8 +602,7 @@ impl<S: RecordStore> Policies<'_, S> {
     pub async fn load_adapter(&mut self) -> Result<AdapterPreference, storage::Error> {
         match self.store.load_owned(record_key(1, 0)).await? {
             Some(bytes) => {
-                let value: AdapterPreference =
-                    serde_json::from_slice(&bytes).map_err(|_| storage::Error::Corrupt)?;
+                let value = AdapterPreference::from_saved(storage::decode(&bytes)?)?;
                 if value
                     .name
                     .as_deref()
@@ -517,36 +618,49 @@ impl<S: RecordStore> Policies<'_, S> {
     }
     pub async fn save_adapter(&mut self, value: &AdapterPreference) -> Result<(), storage::Error> {
         self.store
-            .save(record_key(1, 0), &storage::json(&value)?)
+            .save(record_key(1, 0), &storage::encode(&value.saved())?)
             .await
     }
     /// The saved policy of device `id`. `Missing` when the device does not exist; `Corrupt`
     /// when its record is undecodable or does not match its ID.
     pub async fn load(&mut self, id: u64) -> Result<Policy, storage::Error> {
+        self.load_record(id).await.map(|(policy, _)| policy)
+    }
+    /// The saved policy of device `id` and the bond its record holds, which is not validated.
+    /// Errors as for `load`.
+    pub async fn load_record(&mut self, id: u64) -> Result<(Policy, Bond), storage::Error> {
         let bytes = self
             .store
             .load_owned(record_key(2, id))
             .await?
             .ok_or(storage::Error::Missing)?;
-        crate::codec::read_policy(id, &bytes)
+        crate::bonds::read_record(id, &bytes)
     }
+    /// Saves `policy` with the bond its saved record holds. `Missing` when the record is lost.
     pub async fn save(&mut self, policy: &Policy) -> Result<(), storage::Error> {
         if !policy.valid() {
             return Err(storage::Error::Corrupt);
         }
-        // A bond that is gone, unreadable or another device's means the record was lost.
         let bond = match crate::bonds::load(self.store, policy.id).await {
-            Ok(Some(bond))
-                if bond.valid() && bond.owner == policy.id && bond.identity == policy.peer =>
-            {
-                bond
-            }
-            Ok(_) | Err(storage::Error::Corrupt) => return Err(storage::Error::Missing),
+            Ok(Some(bond)) => bond,
+            Ok(None) | Err(storage::Error::Corrupt) => return Err(storage::Error::Missing),
             // The store's own errors are read and write failures, never a lost record.
             Err(storage::Error::Missing) => return Err(storage::Error::Io),
             Err(error) => return Err(error),
         };
-        match crate::bonds::commit(self.store, policy, &bond).await {
+        self.save_with(policy, &bond).await
+    }
+    /// Saves `policy` with `bond`, the bond its saved record holds, read in this step.
+    /// `Missing` when the record is lost.
+    pub async fn save_with(&mut self, policy: &Policy, bond: &Bond) -> Result<(), storage::Error> {
+        if !policy.valid() {
+            return Err(storage::Error::Corrupt);
+        }
+        // A bond that is unusable or another device's means the record was lost.
+        if !crate::bonds::belongs(policy, bond) {
+            return Err(storage::Error::Missing);
+        }
+        match crate::bonds::commit(self.store, policy, bond).await {
             Err(storage::Error::Missing) => Err(storage::Error::Io),
             result => result,
         }

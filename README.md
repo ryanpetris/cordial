@@ -135,6 +135,12 @@ esptool --chip esp32s3 write_flash \
   0x10000 cordial-xiao_esp32s3-esp-nimble-esp-idf.bin
 ```
 
+Updating a board from release 0.6.3 or earlier? Those releases save data in an
+earlier storage format, which this firmware doesn't open. Erase the board's flash
+first, with `picotool erase` in BOOTSEL mode or
+`esptool --chip esp32s3 erase_flash`, then flash it as above and pair your devices
+again. See [building](docs/building.md#firmware).
+
 ### 3. Pair your devices
 
 1. Plug in the adapter and open **Cordial**. The adapter appears in the sidebar.

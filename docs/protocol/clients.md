@@ -56,7 +56,7 @@ Bluetooth controllers.
 | `setting list DEV` / `setting get DEV KEY` | The device's settings, or one in detail. |
 | `setting set DEV KEY VALUE` / `setting forget DEV KEY` | Save or forget a setting. |
 | `feature list DEV` | Development firmware: the device's integration features. |
-| `file list PATH` / `file get PATH DEST` | Development firmware: browse or download adapter files. |
+| `file list PATH` / `file get [--raw] PATH DEST` | Development firmware: browse or download adapter files. A saved record is converted to JSON unless `--raw` is given; see [downloaded records](#downloaded-records). |
 | `help` / `help COMMAND` / `quit` / `exit` | Local help and clean shutdown. |
 
 `DEV` is a device ID shown in output, or an unambiguous name; completion offers both. A number is
@@ -103,6 +103,17 @@ $ cordial --port PORT
 [cordial]# quit
 ```
 
+### Downloaded records
+
+The adapter sends a file's bytes as it saved them; it never converts them. Each saved record holds
+one message from `proto/storage.proto`, named by its path as listed in the [storage
+format](../storage-format.md#files). `file get` decodes a file at such a path and saves the message
+as indented protobuf JSON with the schema's field names, the mapping `--json` uses, under the
+destination name with `.json` in place of `.pb`. A file at any other path, an empty file, one that
+doesn't decode, or one holding an enum value this version of Cordial has no name for is saved
+unconverted under its original name, with `.pb` in place of a destination's `.json`, and the result
+says why. `--raw` saves the bytes unconverted under the destination name as given.
+
 ## TUI
 
 The TUI uses Ratatui and Crossterm and the same commands as the CLI. It follows the desktop
@@ -124,9 +135,10 @@ attached adapter; `--port` limits it to that one port.
   connected devices with their batteries, and the adapters. Adapter and device pages have the same
   tabs and controls as the desktop application's, and the same pages and dialogs. Development
   firmware adds Files and Enter Bootloader to the adapter's Diagnostics tab. Files browses adapter
-  directories and downloads a file to a host destination, asking before replacing one. A download
-  is written to a temporary file and moved into place only when complete, with a no-replace
-  rename, so a failure leaves the destination unchanged.
+  directories and downloads a file to a host destination, asking before replacing one. A saved
+  record is converted to JSON as `file get` converts it, and its destination is suggested with
+  `.json` in place of `.pb`. A download is written to a temporary file and moved into place only
+  when complete, with a no-replace rename, so a failure leaves the destination unchanged.
 - Attention: while the TUI runs, a device whose battery is low (20% or less and not charging) or
   critical (5% or less), a connected device whose profiles weren't loaded, an adapter whose
   profile memory is 85% used, and an adapter that needs attention are listed under Needs Attention

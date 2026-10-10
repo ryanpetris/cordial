@@ -170,6 +170,8 @@ check-desktop: desktop/node_modules/.package-lock.json
 check-tools:
 	$(PYTHON) -m unittest discover -s tools -p 'test_*.py'
 	$(PYTHON) -m unittest discover -s rust/tests -p 'test_*.py'
+# Lint and breaking checks cover every schema in proto/. A schema the base release lacks, such as
+# storage.proto before its first release, is new to buf breaking and has nothing to break.
 check-protocol: desktop/node_modules/.package-lock.json
 	$(PYTHON) tools/check_keys.py $(if $(PROTOCOL_BASE),--against $(PROTOCOL_BASE))
 	npm --prefix desktop/packages/protocol run lint

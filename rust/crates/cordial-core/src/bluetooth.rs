@@ -61,32 +61,26 @@ pub const LAYOUT_SERVICES: usize = 3;
 /// A bonded device's HID layout. The application saves it after discovery and
 /// supplies it to later connections, which admit input without rediscovering
 /// it. The backend then verifies it in the background and reports a change.
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Layout {
     /// The raw report map of each HID service, indexed by `ServiceId`.
     /// Classic devices have exactly one.
     pub maps: Vec<ReportMap>,
     /// BLE report characteristics. Classic devices have none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reports: Vec<LayoutReport>,
     /// The device's GATT Database Hash when it exposes one. A backend given a
     /// layout with a hash reads the device's current hash before using the
     /// layout and discovers the device instead when they differ.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<DatabaseHash>,
 }
-#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct ReportMap(#[serde(with = "crate::hex::bytes")] pub Vec<u8>);
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReportMap(pub Vec<u8>);
 /// The value of the GATT Database Hash characteristic (0x2B2A).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct DatabaseHash(#[serde(with = "crate::hex")] pub [u8; 16]);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseHash(pub [u8; 16]);
 
 /// One HID Report characteristic of a saved BLE layout.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LayoutReport {
     /// Index of the owning service in `Layout::maps`.
     pub service: u16,
@@ -98,11 +92,7 @@ pub struct LayoutReport {
     /// GATT characteristic properties.
     pub properties: u8,
     /// Client Characteristic Configuration descriptor handle; zero when absent.
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub cccd: u16,
-}
-fn is_zero(value: &u16) -> bool {
-    *value == 0
 }
 impl Layout {
     /// Whether a backend can use this layout for `transport` without discovery.

@@ -8,7 +8,7 @@ use crate::{
     error::Error,
     model::{self, Prompt},
     profiles::{self, InterfaceUpdate},
-    storage,
+    records, storage,
     ui::{catalog, text},
     view::State,
 };
@@ -280,8 +280,10 @@ pub(crate) fn execute(
             path,
             local,
             overwrite,
+            raw,
         } => {
-            storage::check_destination(local, *overwrite)?;
+            let expected = records::destination(path, local, *raw);
+            storage::check_destination(&expected, *overwrite)?;
             // The response isn't reported, so file contents are never printed.
             let r = session.call(
                 C::ReadFile(p::ReadFile { path: path.clone() }),
@@ -291,11 +293,32 @@ pub(crate) fn execute(
             let Some(response::Result::File(file)) = r.result else {
                 return Err(unexpected());
             };
-            let bytes = storage::save(local, *overwrite, &file.data)?;
+            let (local, data, unconverted) = if *raw {
+                (local.clone(), file.data, None)
+            } else {
+                records::convert(path, local, file.data)
+            };
+            // Replacing was allowed for the expected destination only; a fallback to another
+            // name never replaces a file.
+            let bytes =
+                storage::save(&local, *overwrite && local == expected, &data).map_err(|e| {
+                    if local == expected {
+                        e
+                    } else {
+                        // The pre-check was of another name, so this one is named here.
+                        Error::new(format!(
+                            "the file couldn't be converted, and saving its bytes to {} failed: {}",
+                            text::safe(&local.display().to_string()),
+                            e.message
+                        ))
+                    }
+                })?;
             Ok(Outcome::FileSaved {
                 path: path.clone(),
-                local: local.clone(),
+                local,
                 bytes,
+                json: !*raw && unconverted.is_none(),
+                unconverted,
             })
         }
         Command::Profiles { after } => {

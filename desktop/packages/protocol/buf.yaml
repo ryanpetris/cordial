@@ -7,6 +7,8 @@ lint:
     - PACKAGE_VERSION_SUFFIX
     # The schema lives in the repository's proto directory, not one named after its package.
     - PACKAGE_DIRECTORY_MATCH
+    # The storage records' schema sits beside the serial API's in its own package.
+    - DIRECTORY_SAME_PACKAGE
 breaking:
   use:
     - WIRE_JSON

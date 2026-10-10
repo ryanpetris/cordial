@@ -148,7 +148,7 @@ environment variables, and configuration keys in backticks.
 - Any change to the Dongle's on-board storage layout requires explicit maintainer approval before
   it is made. This includes adding, removing, or renaming files and directories, changing paths,
   and changing the format, fields, or meaning of file contents, as documented in
-  `docs/storage-format.md` and `docs/storage.schema.json`.
+  `docs/storage-format.md` and `proto/storage.proto`.
 - Firmware downgrades are not supported. Saved data written by newer firmware does not need to
   stay readable by older firmware.
 

@@ -32,8 +32,6 @@ def manifest(config):
                  bootloader=("download" if config["chip"] == "esp32s3" else "bootsel")
                  if config["profile"] != "production" else None,
                  version=version(config["profile"]))
-    if config["chip"] == "esp32s3":
-        value.update(native_storage_offset=0x9000, native_storage_bytes=0x6000)
     return value
 
 
@@ -70,8 +68,6 @@ def inspect(data):
     if not isinstance(value, dict):
         raise ValueError("Invalid artifact manifest")
     esp = value.get("chip") == "esp32s3"
-    if esp:
-        required |= {"native_storage_offset", "native_storage_bytes"}
     if set(value) != required or type(value["schema"]) is not int or value["schema"] != 1:
         raise ValueError("Unsupported artifact manifest")
     if value["profile"] not in PROFILES:
@@ -100,12 +96,12 @@ def inspect(data):
         raise ValueError("Unsupported storage backend")
     if value["bluetooth_backend"] not in (("btstack", "esp-nimble") if esp else ("btstack",)):
         raise ValueError("Unsupported Bluetooth backend")
-    layout = dict(format="littlefs-json-1",
+    layout = dict(format="littlefs-2",
                   storage_backend=value["storage_backend"], offset=offset, bytes=size, erase_bytes=4096)
     if esp:
-        if flash & (flash-1) or type(value["native_storage_offset"]) is not int or type(value["native_storage_bytes"]) is not int or (value["native_storage_offset"], value["native_storage_bytes"]) != (0x9000, 0x6000):
-            raise ValueError("Invalid native storage partition")
-        layout.update(guard_bytes=4096, native_offset=0x9000, native_bytes=0x6000)
+        if flash & (flash-1):
+            raise ValueError("ESP32-S3 flash capacity must be a power of two")
+        layout.update(guard_bytes=4096)
     identity = hashlib.sha256(json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if value["storage_identity"] != identity:
         raise ValueError("Storage identity does not match manifest layout")

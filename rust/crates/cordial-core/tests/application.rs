@@ -23,6 +23,7 @@ use cordial_protocol::{
     message::Kind as M,
     request::Command,
     response::Result as R,
+    storage,
 };
 use embassy_futures::block_on;
 use prost::Message;
@@ -33,6 +34,33 @@ const SAVED: u32 = 77;
 /// The profile memory budget of the test board.
 const PROFILE_BUDGET: u32 = 4096;
 const FIRST_RETRY: u64 = cordial_core::devices::RETRY_DELAY_MS as u64;
+
+thread_local! {
+    /// How many of the next allocations on this thread fail.
+    static FAILS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Whether this allocation is one asked to fail.
+fn fails() -> bool {
+    FAILS
+        .try_with(|f| {
+            let fails = f.get();
+            f.set(fails.saturating_sub(1));
+            fails > 0
+        })
+        .unwrap_or(false)
+}
+/// Makes the next `count` allocations fail. They must be ones the code under test handles.
+fn fail_allocations(count: usize) {
+    FAILS.with(|f| f.set(count));
+}
+/// Makes the next allocation fail. It must be one the code under test handles.
+fn fail_next_allocation() {
+    fail_allocations(1);
+}
+/// Whether every allocation asked to fail has been made.
+fn allocation_failed() -> bool {
+    FAILS.with(|f| f.get()) == 0
+}
 
 fn build(development: bool, bootloader: Option<fn() -> !>) -> Build {
     Build {
@@ -102,6 +130,11 @@ impl Test {
     fn poll(&mut self) {
         self.now += 1;
         block_on(self.app.poll(&mut self.store, &mut self.radio, 0, self.now));
+    }
+    /// Lets input stay quiet for as long as deferred saves wait for, then polls.
+    fn quiet(&mut self) {
+        self.now += cordial_core::deferred::QUIET_MS;
+        self.poll();
     }
     /// Every complete frame written so far.
     fn output(&mut self) -> Vec<M> {
@@ -985,9 +1018,10 @@ fn unpair_finishes_once_the_link_is_gone() {
 fn lost_records_are_deleted_at_startup() {
     let (_, mut store, radio) = setup();
     // A record that does not decode, and one whose bond belongs to another device.
-    store
-        .records
-        .insert(cordial_core::storage::record_key(2, 90), b"{".to_vec());
+    store.records.insert(
+        cordial_core::storage::record_key(2, 90),
+        UNDECODABLE.to_vec(),
+    );
     let mut other = Policy::paired(91, peer(5), b"Other");
     other.bond = 91;
     block_on(cordial_core::bonds::commit(
@@ -997,14 +1031,12 @@ fn lost_records_are_deleted_at_startup() {
     ))
     .unwrap();
     let key = cordial_core::storage::record_key(2, 91);
-    let mut record: serde_json::Value = serde_json::from_slice(&store.records[&key]).unwrap();
-    record["bond"]["owner"] = 5.into();
-    store
-        .records
-        .insert(key, serde_json::to_vec(&record).unwrap());
+    let mut record = storage::Device::decode(store.records[&key].as_slice()).unwrap();
+    record.bond.as_mut().unwrap().owner = 5;
+    store.records.insert(key, record.encode_to_vec());
     // Layouts of the lost devices and of the saved one. A layout whose device record is gone
     // is the record store's to reclaim with the device's directory.
-    let layout = cordial_core::storage::json(&classic_layout(KEYBOARD_MAP)).unwrap();
+    let layout = cordial_core::layouts::encode(&classic_layout(KEYBOARD_MAP)).unwrap();
     for id in [77, 90, 91] {
         store
             .records
@@ -1033,7 +1065,7 @@ fn lost_records_are_deleted_at_startup() {
 fn a_lost_record_that_cannot_be_removed_at_startup_is_removed_later() {
     let (_, mut store, radio) = setup();
     let key = cordial_core::storage::record_key(2, 90);
-    store.records.insert(key, b"{".to_vec());
+    store.records.insert(key, UNDECODABLE.to_vec());
     store.fail_remove = Some(key);
     let mut t = Test::with(store, radio, build(false, None));
     // Startup leaves the lost record out and completes.
@@ -1073,9 +1105,10 @@ fn a_read_error_at_startup_deletes_nothing() {
 #[test]
 fn a_record_lost_while_running_removes_the_device() {
     let mut t = Test::new(true);
-    t.store
-        .records
-        .insert(cordial_core::storage::record_key(2, 77), b"{".to_vec());
+    t.store.records.insert(
+        cordial_core::storage::record_key(2, 77),
+        UNDECODABLE.to_vec(),
+    );
     t.poll();
     let link = t.radio.connects[0].0;
     t.event(Event::Disconnected { link, error: None });
@@ -1911,14 +1944,20 @@ fn first_connection_setup_turns_hidpp_on_for_a_hidpp_2_device() {
     t.settle();
     let events = t.events();
     assert!(saved_policy(&mut t).hidpp_enabled() && !saved_policy(&mut t).setup_pending);
-    let record: serde_json::Value =
-        serde_json::from_slice(&t.store.records[&cordial_core::storage::record_key(2, 77)])
-            .unwrap();
+    let record = storage::Device::decode(
+        t.store.records[&cordial_core::storage::record_key(2, 77)].as_slice(),
+    )
+    .unwrap()
+    .policy
+    .unwrap();
     assert_eq!(
-        record["policy"]["integrations"],
-        serde_json::json!([{"kind": "hidpp", "enabled": true}])
+        record.integrations,
+        [storage::IntegrationPreference {
+            integration: storage::Integration::Hidpp.into(),
+            enabled: true,
+        }]
     );
-    assert!(record["policy"].get("setup_pending").is_none());
+    assert!(!record.setup_pending);
     let last = events
         .iter()
         .filter_map(|e| match e {
@@ -1983,6 +2022,7 @@ fn integration_state_follows_the_connection() {
     );
 }
 
+/// Counts allocations while asked to, and fails the next one once asked to.
 struct CountAllocations;
 thread_local! {
     static TRACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1990,6 +2030,9 @@ thread_local! {
 }
 unsafe impl std::alloc::GlobalAlloc for CountAllocations {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if fails() {
+            return std::ptr::null_mut();
+        }
         if TRACK.try_with(|v| v.get()).unwrap_or(false) {
             let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
         }
@@ -1999,6 +2042,9 @@ unsafe impl std::alloc::GlobalAlloc for CountAllocations {
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        if fails() {
+            return std::ptr::null_mut();
+        }
         if TRACK.try_with(|v| v.get()).unwrap_or(false) {
             let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
         }
@@ -2069,9 +2115,10 @@ fn a_failed_free_space_read_keeps_storage_ready() {
 fn a_record_found_lost_while_saving_removes_the_device() {
     let mut t = Test::new(true);
     t.events();
-    t.store
-        .records
-        .insert(cordial_core::storage::record_key(2, 77), b"{".to_vec());
+    t.store.records.insert(
+        cordial_core::storage::record_key(2, 77),
+        UNDECODABLE.to_vec(),
+    );
     assert_eq!(
         t.code(Command::SetDevice(p::SetDevice {
             device: SAVED,
@@ -2223,13 +2270,13 @@ fn layout_key() -> cordial_core::storage::RecordKey {
 fn put_layout(t: &mut Test, layout: &Layout) {
     t.store
         .records
-        .insert(layout_key(), cordial_core::storage::json(layout).unwrap());
+        .insert(layout_key(), cordial_core::layouts::encode(layout).unwrap());
 }
 fn saved_layout(t: &Test) -> Option<Layout> {
     t.store
         .records
         .get(&layout_key())
-        .map(|bytes| serde_json::from_slice(bytes).unwrap())
+        .map(|bytes| cordial_core::layouts::decode(bytes).unwrap())
 }
 fn drain_forward(t: &mut Test) {
     while t.app.manager.forward.packet().is_some() {
@@ -2285,8 +2332,8 @@ fn saved_layouts_are_supplied_to_reconnections() {
 #[test]
 fn an_unusable_saved_layout_is_ignored_and_removed() {
     for bytes in [
-        b"{".to_vec(),
-        cordial_core::storage::json(&ble_layout()).unwrap(),
+        UNDECODABLE.to_vec(),
+        cordial_core::layouts::encode(&ble_layout()).unwrap(),
     ] {
         let mut t = Test::new(true);
         t.store.records.insert(layout_key(), bytes);
@@ -2336,12 +2383,15 @@ fn pairing_supplies_no_layout_and_saves_the_discovered_one() {
     ));
     let reads = t.store.reads.len();
     t.poll();
-    assert_eq!(saved_layout(&t), Some(discovered));
     assert_eq!(
         t.store.reads[reads],
         cordial_core::storage::record_key(2, SAVED.into()),
         "the policy is read first"
     );
+    // The layout is saved once input pauses.
+    assert_eq!(saved_layout(&t), None);
+    t.quiet();
+    assert_eq!(saved_layout(&t), Some(discovered));
 }
 
 #[test]
@@ -2414,6 +2464,8 @@ fn a_changed_layout_moves_the_live_link_and_is_saved() {
     assert!(t.radio.closes.is_empty());
     t.poll();
     t.poll();
+    assert_eq!(saved_layout(&t), None, "input has not paused");
+    t.quiet();
     assert_eq!(saved_layout(&t), Some(changed));
     t.event(Event::Input(
         InputReport::new(link, ServiceId(7), 1, &[1]).unwrap(),
@@ -3035,10 +3087,11 @@ fn a_layout_with_the_same_maps_keeps_the_live_link() {
         descriptors: descriptor(),
         layout: moved.clone(),
     });
-    // The held key is not released, and the new layout is saved.
+    // The held key is not released, and the new layout is saved once input pauses.
     assert!(t.app.manager.forward.packet().is_none());
     t.poll();
     t.poll();
+    t.quiet();
     assert_eq!(saved_layout(&t), Some(moved));
 }
 
@@ -3121,6 +3174,43 @@ fn a_layout_never_takes_the_room_kept_for_pairing() {
     });
     assert_eq!(saved_layout(&t), None);
     assert!(!t.app.manager.storage_full());
+}
+
+#[test]
+fn free_space_is_counted_after_writes_in_a_later_step() {
+    let mut t = Test::new(true);
+    let id = create(&mut t, "Keys");
+    t.store.available = Some(1 << 20);
+    t.poll();
+    assert!(!t.app.manager.storage_full());
+    let counts = t.store.counts;
+    t.poll();
+    assert_eq!(
+        t.store.counts, counts,
+        "nothing was written since the count"
+    );
+    // The next write fills the storage.
+    t.store.available = Some(0);
+    assert_eq!(
+        t.ok(Command::SetProfileRules(p::SetProfileRules {
+            profile: id,
+            changes: vec![remap(key(4), &[key(5)])],
+        })),
+        None
+    );
+    assert_eq!(t.store.counts, counts, "the write's step does not count");
+    // Admission checks count for themselves.
+    let error = t.error(Command::CreateProfile(p::CreateProfile {
+        name: "More".into(),
+    }));
+    assert_eq!(error.reason, p::CapacityReason::Storage as i32);
+    assert_eq!(t.store.counts, counts + 1);
+    let counts = t.store.counts;
+    t.poll();
+    assert!(t.app.manager.storage_full());
+    assert_eq!(t.store.counts, counts + 1);
+    t.poll();
+    assert_eq!(t.store.counts, counts + 1);
 }
 
 #[test]
@@ -3248,9 +3338,10 @@ fn device_listings_are_paged_and_report_unreadable_and_lost_records() {
     t.events();
     // 77 and 78..=87.
     t.store.fail_load = Some(cordial_core::storage::record_key(2, 80));
-    t.store
-        .records
-        .insert(cordial_core::storage::record_key(2, 82), b"{".to_vec());
+    t.store.records.insert(
+        cordial_core::storage::record_key(2, 82),
+        UNDECODABLE.to_vec(),
+    );
     let page = |t: &mut Test, after| match t.ok(Command::ListDevices(p::ListDevices { after })) {
         Some(R::Devices(list)) => list,
         r => panic!("{r:?}"),
@@ -3467,6 +3558,31 @@ fn set_rules(
     rules_of(t, profile)
 }
 /// Every rule of `profile`, read page by page.
+/// Profile `profile`'s rules as its saved file holds them.
+fn saved_rules(t: &mut Test, profile: u32) -> Vec<cordial_core::profiles::Rule> {
+    block_on(cordial_core::profiles::saved_page(
+        &mut t.store,
+        profile.into(),
+        None,
+        usize::MAX,
+    ))
+    .unwrap()
+}
+/// A remap of `input` to keyboard `keys`.
+fn remap_rule(input: p::Usage, keys: &[u32]) -> cordial_core::profiles::Rule {
+    use cordial_core::profiles;
+    profiles::Rule {
+        input: profiles::usage(input.usage_page as u16, input.usage as u16),
+        effect: profiles::Effect::Remap(
+            keys.iter()
+                .map(|k| profiles::Output {
+                    usage: profiles::usage(profiles::KEYBOARD_PAGE, *k as u16),
+                    collection: profiles::KEYBOARD,
+                })
+                .collect(),
+        ),
+    }
+}
 fn rules_of(t: &mut Test, profile: u32) -> Vec<p::ProfileRule> {
     let mut rules: Vec<p::ProfileRule> = Vec::new();
     loop {
@@ -3717,9 +3833,10 @@ fn profile_listings_are_paged_and_report_unreadable_and_lost_records() {
     }
     t.events();
     t.store.fail_load = Some(cordial_core::storage::record_key(8, 3));
-    t.store
-        .records
-        .insert(cordial_core::storage::record_key(8, 5), b"{".to_vec());
+    t.store.records.insert(
+        cordial_core::storage::record_key(8, 5),
+        UNDECODABLE.to_vec(),
+    );
     let page = |t: &mut Test, after| match t.ok(Command::ListProfiles(p::ListProfiles { after })) {
         Some(R::Profiles(list)) => list,
         r => panic!("{r:?}"),
@@ -4120,7 +4237,7 @@ fn a_device_retries_its_layers_once_memory_is_released() {
     // Other background work is waiting when the memory is released.
     t.store.records.insert(
         cordial_core::storage::record_key(8, unused.into()),
-        b"{".to_vec(),
+        UNDECODABLE.to_vec(),
     );
     assert_eq!(
         t.code(Command::GetProfile(p::GetProfile { profile: unused })),
@@ -4417,20 +4534,33 @@ fn via_edits_the_interface_profile_for_every_device_using_it() {
     );
     assert_eq!(press(&mut t, link, &[4]), [5]);
     assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
-    // An unsupported action or a failed save changes nothing.
+    // An unsupported action changes nothing.
     assert_eq!(
         configure(&mut t, Interface::Via, &[5, 0, 0, 0, 0x52, 0])[0],
         0xff
     );
-    t.store.fail_save = Some((cordial_core::storage::record_key(9, id.into()), false));
-    assert_eq!(
-        configure(&mut t, Interface::Via, &[5, 0, 0, 0, 0, 6])[0],
-        0xff
-    );
-    t.store.fail_save = None;
     assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
-    assert_eq!(press(&mut t, link, &[4]), [5]);
+    // The edit reaches flash once the editor and input pause.
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.quiet();
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    // A save that fails after the echo keeps the edit in use and is retried.
+    let rules = cordial_core::storage::record_key(9, id.into());
+    t.store.fail_save = Some((rules, false));
+    assert_eq!(configure(&mut t, Interface::Via, &[5, 0, 0, 0, 0, 6])[0], 5);
+    assert_eq!(press(&mut t, link, &[4]), [6]);
     assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.quiet();
+    assert!(t.status().ready);
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(press(&mut t, link, &[4]), [6]);
+    assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
+    t.store.fail_save = None;
+    t.now += FIRST_RETRY;
+    t.quiet();
+    assert!(t.status().ready);
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[6])]);
     // Writing an input's own usage forgets its rule.
     assert_eq!(configure(&mut t, Interface::Via, &[5, 0, 0, 0, 0, 4])[0], 5);
     assert!(rules_of(&mut t, id).is_empty());
@@ -4585,7 +4715,7 @@ fn an_undecodable_rules_file_leaves_the_profile_empty_after_the_first_input() {
     set_layers(&mut t, SAVED, &[id]);
     t.events();
     let rules = cordial_core::storage::record_key(9, id.into());
-    t.store.records.insert(rules, b"{".to_vec());
+    t.store.records.insert(rules, UNDECODABLE.to_vec());
     let link = t.radio.connects[0].0;
     t.event(Event::Connected {
         link,
@@ -4598,8 +4728,12 @@ fn an_undecodable_rules_file_leaves_the_profile_empty_after_the_first_input() {
         Some(p::ErrorCode::StorageFailed)
     );
     assert_eq!(press(&mut t, link, &[4]), [4]);
-    // No cleanup runs between the connection starting and its policy being read.
+    // No cleanup runs between the connection starting and its policy being read, nor until
+    // input pauses.
     assert!(t.store.records.contains_key(&rules));
+    t.poll();
+    assert!(t.store.records.contains_key(&rules));
+    t.now += cordial_core::deferred::QUIET_MS;
     let events = t.events();
     assert!(!t.store.records.contains_key(&rules));
     // The lost rules are unknown, so no rule change can be reported.
@@ -4626,6 +4760,46 @@ fn record_key(kind: u8, id: u32) -> cordial_core::storage::RecordKey {
 }
 fn reads_of(t: &Test, key: cordial_core::storage::RecordKey) -> usize {
     t.store.reads.iter().filter(|k| **k == key).count()
+}
+
+#[test]
+fn commands_read_each_record_once() {
+    let mut t = Test::new(true);
+    let id = create(&mut t, "Keys");
+    t.store.reads.clear();
+    assert_eq!(
+        t.ok(Command::SetProfileRules(p::SetProfileRules {
+            profile: id,
+            changes: vec![remap(key(4), &[key(5)])],
+        })),
+        None
+    );
+    assert_eq!(reads_of(&t, record_key(8, id)), 1);
+    assert_eq!(rules_of(&mut t, id).len(), 1);
+
+    t.store.reads.clear();
+    let updates = (0..40)
+        .map(|n| {
+            let via = p::ConfigurationInterface::Via;
+            interface(via, Some(n % 2 == 0), Some(id))
+        })
+        .collect();
+    assert_eq!(set_interfaces(&mut t, updates).result, None);
+    assert_eq!(reads_of(&t, record_key(8, id)), 1);
+
+    t.store.reads.clear();
+    let writes = t.store.writes.len();
+    assert_eq!(
+        t.ok(Command::SetDevice(p::SetDevice {
+            device: SAVED,
+            trusted: Some(false),
+            ..Default::default()
+        })),
+        None
+    );
+    assert_eq!(reads_of(&t, record_key(2, SAVED)), 1);
+    assert_eq!(t.store.writes[writes..], [record_key(2, SAVED)]);
+    assert!(!t.device(SAVED).trusted);
 }
 
 #[test]
@@ -4670,7 +4844,7 @@ fn nothing_but_profile_rules_is_read_or_written_before_the_first_input() {
     assert!(reads_of(&t, record_key(2, SAVED)) > 0);
     assert_eq!(reads_of(&t, record_key(4, SAVED)), 1);
     assert_eq!(t.live(SAVED).catalog.preferences().count(), 1);
-    t.poll();
+    t.quiet();
     assert_eq!(saved_layout(&t), Some(layout));
 }
 
@@ -4749,6 +4923,8 @@ fn a_failed_policy_read_backs_off_without_holding_up_other_work() {
     for _ in 0..20 {
         t.poll();
     }
+    assert_eq!(reads_of(&t, record_key(2, SAVED)), reads);
+    t.quiet();
     assert_eq!(reads_of(&t, record_key(2, SAVED)), reads);
     assert_eq!(
         saved_layout(&t),
@@ -4904,13 +5080,25 @@ fn rules_saved_without_their_roles_summary_take_effect_and_the_summary_is_repair
     assert_eq!(press(&mut t, link, &[4]), [5]);
     assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
     assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
-    assert!(profile(&mut t, id).roles.is_empty());
-    // The repair fails too and backs off.
+    // The profile reports its rules' roles while the summary waits to be saved.
+    assert_eq!(profile(&mut t, id).roles, [p::Role::Keyboard as i32]);
+    assert!(
+        block_on(cordial_core::profiles::metadata(&mut t.store, id.into()))
+            .unwrap()
+            .roles
+            .0
+            == 0
+    );
+    // The repair waits for input to pause, fails too and backs off.
     for _ in 0..5 {
         t.poll();
     }
+    assert_eq!(t.store.writes.iter().filter(|k| **k == record).count(), 1);
+    t.quiet();
     let writes = t.store.writes.iter().filter(|k| **k == record).count();
     assert_eq!(writes, 2);
+    // A failed roles summary is not reported as a storage failure.
+    assert!(t.status().ready);
     for _ in 0..10 {
         t.poll();
     }
@@ -5448,6 +5636,10 @@ fn first_connection_setup_waits_for_another_connections_first_input() {
         InputReport::new(starting, ServiceId(7), 0, &[1]).unwrap(),
     ));
     t.events();
+    // Setup progress is saved once input pauses.
+    assert!(saved_policy(&mut t).setup_pending);
+    t.now += cordial_core::deferred::QUIET_MS;
+    t.events();
     assert!(saved_policy(&mut t).hidpp_enabled() && !saved_policy(&mut t).setup_pending);
 }
 
@@ -5693,4 +5885,814 @@ fn a_settings_event_backoff_grows_across_device_events() {
         |e| matches!(e, Ev::SettingsChanged(s) if s.device == SAVED),
         |e| matches!(e, Ev::Device(d) if d.id == SAVED),
     );
+}
+
+// ---------------------------------------------------------------------------
+// Deferred saves
+// ---------------------------------------------------------------------------
+
+/// A VIA editor on a new profile that `SAVED`'s connection uses. Returns the profile and the link.
+fn editing(t: &mut Test) -> (u32, cordial_core::link::LinkId) {
+    let id = create(t, "Keys");
+    set_layers(t, SAVED, &[id]);
+    let link = connect_saved(t, descriptor());
+    set_interfaces(
+        t,
+        vec![interface(
+            p::ConfigurationInterface::Via,
+            Some(true),
+            Some(id),
+        )],
+    );
+    t.app.usb_reconnect = false;
+    t.events();
+    t.now += cordial_core::deferred::MAX_DELAY_MS;
+    t.events();
+    t.store.writes.clear();
+    (id, link)
+}
+/// Sets VIA's key at row 0, column 0, which selects key 4, to `code`; returns the reply's command.
+fn set_first_key(t: &mut Test, code: u8) -> u8 {
+    configure(t, Interface::Via, &[5, 0, 0, 0, 0, code])[0]
+}
+fn rules_writes(t: &Test, id: u32) -> usize {
+    t.store
+        .writes
+        .iter()
+        .filter(|k| **k == record_key(9, id))
+        .count()
+}
+/// Types a key on `link` and releases it.
+fn tap(t: &mut Test, link: cordial_core::link::LinkId) {
+    press(t, link, &[5]);
+    press(t, link, &[]);
+}
+
+#[test]
+fn editor_edits_are_echoed_at_once_and_saved_in_one_write() {
+    let mut t = Test::new(true);
+    let (id, link) = editing(&mut t);
+    // Each edit is echoed and in use before anything is written.
+    for code in 5..=20 {
+        assert_eq!(set_first_key(&mut t, code), 5);
+        assert_eq!(press(&mut t, link, &[4]), [u16::from(code)]);
+        assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
+        t.poll();
+    }
+    assert!(t.store.writes.is_empty());
+    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[20])]);
+    assert_eq!(profile(&mut t, id).roles, [p::Role::Keyboard as i32]);
+    // Once the editor and input pause, the edits are written once, then the roles summary.
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    assert_eq!(rules_writes(&t, id), 1);
+    assert_eq!(t.store.writes, [record_key(9, id), record_key(8, id)]);
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[20])]);
+    assert_eq!(profile(&mut t, id).roles, [p::Role::Keyboard as i32]);
+    // Nothing more is written.
+    t.now += cordial_core::deferred::MAX_DELAY_MS;
+    t.events();
+    assert_eq!(t.store.writes.len(), 2);
+}
+
+#[test]
+fn edits_are_saved_once_input_pauses_or_after_the_longest_wait() {
+    use cordial_core::{application::EDITOR_BATCH_MS, deferred::MAX_DELAY_MS, deferred::QUIET_MS};
+    let mut t = Test::new(true);
+    let (id, link) = editing(&mut t);
+    // Typing pauses after the editor does: the edit is written once input has been quiet.
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    let edited = t.now;
+    while t.now < edited + EDITOR_BATCH_MS + 100 {
+        t.now += 50;
+        tap(&mut t, link);
+        t.poll();
+    }
+    let typed = t.now;
+    assert_eq!(rules_writes(&t, id), 0);
+    t.now = typed + QUIET_MS - 10;
+    t.poll();
+    assert_eq!(rules_writes(&t, id), 0);
+    t.now = typed + QUIET_MS;
+    t.poll();
+    assert_eq!(rules_writes(&t, id), 1);
+    // While typing goes on, an edit is written no later than the longest wait after it was made.
+    assert_eq!(set_first_key(&mut t, 6), 5);
+    let edited = t.now;
+    while t.now < edited + MAX_DELAY_MS - 60 {
+        t.now += 50;
+        tap(&mut t, link);
+        t.poll();
+        assert_eq!(rules_writes(&t, id), 1, "at {}", t.now - edited);
+    }
+    t.now = edited + MAX_DELAY_MS;
+    tap(&mut t, link);
+    t.poll();
+    assert_eq!(rules_writes(&t, id), 2);
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[6])]);
+}
+
+#[test]
+fn a_continuous_stream_of_edits_is_handed_to_storage_every_longest_batch() {
+    use cordial_core::application::EDITOR_BATCH_MAX_MS;
+    let mut t = Test::new(true);
+    let (id, _) = editing(&mut t);
+    let mut code = 5;
+    // An edit every 100 ms, with no typing: no edit waits longer than the longest batch.
+    let mut first = None;
+    let mut writes = Vec::new();
+    for _ in 0..60 {
+        assert_eq!(set_first_key(&mut t, code), 5);
+        code = if code == 20 { 5 } else { code + 1 };
+        first.get_or_insert(t.now);
+        t.poll();
+        if rules_writes(&t, id) > writes.len() {
+            let waited = t.now - first.take().unwrap();
+            assert!(
+                (EDITOR_BATCH_MAX_MS..EDITOR_BATCH_MAX_MS + 10).contains(&waited),
+                "{waited}"
+            );
+            writes.push(t.now);
+        }
+        t.now += 98;
+    }
+    assert_eq!(writes.len(), 2);
+}
+
+#[test]
+fn a_failed_deferred_save_is_reported_and_retried_with_a_backoff() {
+    let mut t = Test::new(true);
+    let (id, link) = editing(&mut t);
+    let rules = record_key(9, id);
+    // A full filesystem: storage reports full, and stays ready so room can be made.
+    t.store.full = Some(rules);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    let events = t.events();
+    assert!(events.iter().any(|e| matches!(e, Ev::Adapter(s)
+        if s.ready && s.info.iter().any(|i| i.key == p::keys::STORAGE_FULL))));
+    assert_eq!(rules_writes(&t, id), 1);
+    // The edit stays in use, and nothing is tried again before the backoff.
+    assert_eq!(press(&mut t, link, &[4]), [5]);
+    press(&mut t, link, &[]);
+    t.now += FIRST_RETRY - 300;
+    t.events();
+    assert_eq!(rules_writes(&t, id), 1);
+    // A flash failure is retried, and storage stays ready, so the profile can still be changed.
+    t.store.full = None;
+    t.store.fail_save = Some((rules, false));
+    t.now += 300;
+    let events = t.events();
+    assert_eq!(rules_writes(&t, id), 2);
+    assert!(t.status().ready);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Ev::Adapter(s) if !s.ready))
+    );
+    assert!(matches!(
+        t.ok(Command::ListProfiles(p::ListProfiles { after: 0 })),
+        Some(R::Profiles(_))
+    ));
+    assert_eq!(set_first_key(&mut t, 6), 5);
+    assert_eq!(press(&mut t, link, &[4]), [6]);
+    press(&mut t, link, &[]);
+    // A write whose outcome is unknown makes storage not ready until the save succeeds.
+    t.store.fail_save = None;
+    t.store.unknown = Some(rules);
+    t.now += 2 * FIRST_RETRY;
+    let events = t.events();
+    assert_eq!(rules_writes(&t, id), 3);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Ev::Adapter(s) if !s.ready))
+    );
+    assert_eq!(
+        t.code(Command::ListProfiles(p::ListProfiles { after: 0 })),
+        p::ErrorCode::NotReady
+    );
+    // The editor waits too.
+    assert_eq!(set_first_key(&mut t, 7), 0xff);
+    t.store.unknown = None;
+    t.now += 4 * FIRST_RETRY;
+    let events = t.events();
+    assert_eq!(rules_writes(&t, id), 4);
+    assert!(events.iter().any(|e| matches!(e, Ev::Adapter(s)
+        if s.ready && s.info.iter().all(|i| i.key != p::keys::STORAGE_FULL))));
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[6])]);
+    assert_eq!(set_first_key(&mut t, 7), 5);
+}
+
+#[test]
+fn a_rules_file_that_keeps_failing_can_be_overwritten_or_deleted() {
+    let mut t = Test::new(true);
+    let (id, link) = editing(&mut t);
+    let rules = record_key(9, id);
+    t.store.fail_save = Some((rules, false));
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    assert_eq!(rules_writes(&t, id), 1);
+    assert!(t.status().ready);
+    // Overwriting the rules writes them at once; the failure is reported to that command.
+    assert_eq!(
+        t.code(Command::SetProfileRules(p::SetProfileRules {
+            profile: id,
+            changes: vec![remap(key(4), &[key(8)])],
+        })),
+        p::ErrorCode::StorageFailed
+    );
+    t.store.fail_save = None;
+    set_rules(&mut t, id, vec![remap(key(4), &[key(9)])]);
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[9])]);
+    assert_eq!(press(&mut t, link, &[4]), [9]);
+    press(&mut t, link, &[]);
+    // Nothing is left to write.
+    let writes = rules_writes(&t, id);
+    t.now += 8 * FIRST_RETRY;
+    t.events();
+    assert_eq!(rules_writes(&t, id), writes);
+    assert!(!t.app.has_unsaved());
+    // A profile whose edits keep failing can be deleted, which ends the retries.
+    t.store.fail_save = Some((rules, false));
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    assert_eq!(rules_writes(&t, id), writes + 1);
+    set_interfaces(
+        &mut t,
+        vec![interface(
+            p::ConfigurationInterface::Via,
+            Some(false),
+            Some(0),
+        )],
+    );
+    set_layers(&mut t, SAVED, &[]);
+    t.ok(Command::DeleteProfile(p::DeleteProfile { profile: id }));
+    assert!(!t.store.records.contains_key(&rules));
+    assert!(t.status().ready);
+    let writes = rules_writes(&t, id);
+    t.now += 8 * FIRST_RETRY;
+    t.events();
+    assert_eq!(rules_writes(&t, id), writes);
+    assert!(!t.app.has_unsaved());
+}
+
+#[test]
+fn a_released_editor_saves_its_edits_at_once() {
+    use cordial_core::application::EDITOR_IDLE_MS;
+    let mut t = Test::new(true);
+    let (id, _) = editing(&mut t);
+    let rules = record_key(9, id);
+    t.store.fail_save = Some((rules, false));
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    let edited = t.now;
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    t.now += FIRST_RETRY;
+    t.events();
+    // Two failures: the next retry waits until after the editor is released.
+    assert_eq!(rules_writes(&t, id), 2);
+    assert!(t.now + 2 * FIRST_RETRY > edited + EDITOR_IDLE_MS);
+    t.store.fail_save = None;
+    t.now = edited + EDITOR_IDLE_MS - 2;
+    t.poll();
+    assert_eq!(rules_writes(&t, id), 2);
+    // Releasing the idle editor saves at once.
+    t.poll();
+    assert_eq!(rules_writes(&t, id), 3);
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+}
+
+#[test]
+fn space_is_checked_after_deferred_saves_are_written() {
+    let mut t = Test::new(true);
+    let (id, link) = editing(&mut t);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    tap(&mut t, link);
+    // Input has not paused, but a profile copy writes the edit before counting free space.
+    let copy = match t.ok(Command::CopyProfile(p::CopyProfile {
+        profile: id,
+        name: "Copy".into(),
+    })) {
+        Some(R::ProfileCreated(created)) => created.profile,
+        r => panic!("{r:?}"),
+    };
+    assert_eq!(t.store.writes[0], record_key(9, id));
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(rules_of(&mut t, copy), [saved_remap(key(4), &[5])]);
+}
+
+#[cfg(feature = "development")]
+#[test]
+fn bootloader_entry_saves_edits_first() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REBOOTED: AtomicBool = AtomicBool::new(false);
+    let (_, store, radio) = setup();
+    let mut t = Test::with(
+        store,
+        radio,
+        build(
+            true,
+            Some(|| {
+                REBOOTED.store(true, Ordering::SeqCst);
+                panic!("rebooted")
+            }),
+        ),
+    );
+    let (id, link) = editing(&mut t);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    tap(&mut t, link);
+    assert_eq!(t.ok(Command::EnterBootloader(p::EnterBootloader {})), None);
+    let rebooted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for _ in 0..4 {
+            t.poll();
+            drain_forward(&mut t);
+        }
+    }));
+    assert!(rebooted.is_err() && REBOOTED.load(Ordering::SeqCst));
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+}
+
+#[test]
+fn rules_pages_read_only_as_far_as_the_page() {
+    let mut t = Test::new(false);
+    let id = create(&mut t, "Many");
+    let changes: Vec<_> = (4..=0xa4)
+        .map(|k| remap(key(k), &[key(0xe0), key(4)]))
+        .collect();
+    let count = changes.len();
+    for chunk in changes.chunks(16) {
+        set_rules(&mut t, id, chunk.to_vec());
+    }
+    // The profile is not loaded, so its pages come from the file.
+    assert!(t.app.manager.profiles.get(id.into()).is_none());
+    let file = t.store.records[&record_key(9, id)].len();
+    t.store.part_bytes = 0;
+    let first = match t.ok(Command::ListProfileRules(p::ListProfileRules {
+        profile: id,
+        after: None,
+    })) {
+        Some(R::ProfileRules(page)) => page,
+        r => panic!("{r:?}"),
+    };
+    assert!(!first.end);
+    assert!(
+        t.store.part_bytes < file / 2,
+        "{} of {file} bytes",
+        t.store.part_bytes
+    );
+    // Every page together is the whole saved table.
+    let listed = rules_of(&mut t, id);
+    assert_eq!(listed.len(), count);
+    let decoded: Vec<_> = block_on(cordial_core::profiles::rules(&mut t.store, id.into()))
+        .unwrap()
+        .iter()
+        .collect();
+    assert_eq!(saved_rules(&mut t, id), decoded);
+    assert_eq!(listed[..first.rules.len()], first.rules[..]);
+}
+
+#[test]
+fn saved_pages_match_the_decoded_file_and_find_damage() {
+    use cordial_core::profiles;
+    let mut t = Test::new(false);
+    let id = create(&mut t, "Mixed");
+    let mut changes: Vec<_> = (4..=60).map(|k| remap(key(k), &[key(k + 1)])).collect();
+    changes.push(remap(key(61), &[]));
+    for chunk in changes.chunks(16) {
+        set_rules(&mut t, id, chunk.to_vec());
+    }
+    let id = u64::from(id);
+    let all: Vec<_> = block_on(profiles::rules(&mut t.store, id))
+        .unwrap()
+        .iter()
+        .collect();
+    for after in [
+        None,
+        Some(all[0].input),
+        Some(all[30].input),
+        Some(u32::MAX),
+    ] {
+        for count in [1, 7, 33, 1000] {
+            let page = block_on(profiles::saved_page(&mut t.store, id, after, count)).unwrap();
+            let expected: Vec<_> = all
+                .iter()
+                .filter(|r| after.is_none_or(|a| r.input > a))
+                .take(count)
+                .cloned()
+                .collect();
+            assert_eq!(page, expected, "after {after:?}, {count}");
+        }
+    }
+    // A file cut short, or with rules out of order, is undecodable once reading reaches it.
+    let key = record_key(9, id as u32);
+    let bytes = t.store.records[&key].clone();
+    t.store
+        .records
+        .insert(key, bytes[..bytes.len() - 1].to_vec());
+    assert!(block_on(profiles::saved_page(&mut t.store, id, None, 3)).is_ok());
+    assert_eq!(
+        block_on(profiles::saved_page(&mut t.store, id, None, 1000)),
+        Err(cordial_core::storage::Error::Corrupt)
+    );
+    let rule = |input| storage::Rule {
+        input,
+        effect: Some(storage::rule::Effect::Remap(storage::Remap {
+            outputs: vec![],
+        })),
+    };
+    let unsorted = storage::Rules {
+        rules: vec![rule(9), rule(8)],
+    };
+    t.store.records.insert(key, unsorted.encode_to_vec());
+    assert_eq!(
+        block_on(profiles::saved_page(&mut t.store, id, None, 10)),
+        Err(cordial_core::storage::Error::Corrupt)
+    );
+}
+
+#[test]
+fn a_reset_of_many_rules_is_reported_a_page_at_a_time() {
+    let mut t = Test::new(true);
+    let (id, _) = editing(&mut t);
+    // Four rows of keys all send key 0x1e.
+    for row in 0..4u8 {
+        for col in 0..16u8 {
+            let reply = configure(&mut t, Interface::Via, &[5, 0, row, col, 0, 0x1e]);
+            assert_eq!(reply[0], 5);
+        }
+    }
+    let count = rules_of(&mut t, id).len();
+    assert_eq!(count, 63, "key 0x1e at its own position is no rule");
+    t.events();
+    assert_eq!(&configure(&mut t, Interface::Via, &[6])[..2], &[6, 0]);
+    let mut removed = Vec::new();
+    for e in t.events() {
+        if let Ev::ProfileRulesChanged(r) = e {
+            assert!(r.removed.len() <= 32 && r.changed.is_empty());
+            removed.extend(r.removed);
+        }
+    }
+    assert_eq!(removed.len(), count);
+}
+
+#[test]
+fn a_command_that_matches_unsaved_edits_saves_them_before_it_responds() {
+    let mut t = Test::new(true);
+    let (id, link) = editing(&mut t);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    tap(&mut t, link);
+    // The same rule through the serial API changes nothing in RAM, but its response promises
+    // it is on flash.
+    set_rules(&mut t, id, vec![remap(key(4), &[key(5)])]);
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(rules_writes(&t, id), 1);
+    // Nothing is left to write once the editor pauses.
+    t.now += cordial_core::deferred::MAX_DELAY_MS;
+    t.events();
+    assert_eq!(rules_writes(&t, id), 1);
+    assert!(!t.app.has_unsaved());
+}
+
+#[test]
+fn admission_stops_when_saving_pending_edits_makes_storage_not_ready() {
+    let mut t = Test::new(true);
+    let (id, link) = editing(&mut t);
+    let rules = record_key(9, id);
+    t.store.unknown = Some(rules);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    tap(&mut t, link);
+    let profiles = t.store.records.keys().filter(|k| k[0] == 8).count();
+    // Saving the edit before counting free space ends with an unknown outcome, so nothing new
+    // is admitted.
+    assert_eq!(
+        t.code(Command::CreateProfile(p::CreateProfile {
+            name: "New".into(),
+        })),
+        p::ErrorCode::NotReady
+    );
+    assert_eq!(rules_writes(&t, id), 1);
+    assert_eq!(
+        t.store.records.keys().filter(|k| k[0] == 8).count(),
+        profiles
+    );
+    assert!(!t.status().ready);
+}
+
+#[test]
+fn an_editor_moving_to_another_profile_saves_its_edits_first() {
+    let mut t = Test::new(true);
+    let (id, link) = editing(&mut t);
+    let other = create(&mut t, "Other");
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    tap(&mut t, link);
+    assert_eq!(rules_writes(&t, id), 0);
+    // The interface's saved profile changes without the editor being released first.
+    let mut via = cordial_core::interfaces::preference(
+        &t.app.manager.preference.configuration_interfaces,
+        Interface::Via,
+    );
+    via.profile = Some(other.into());
+    cordial_core::interfaces::set(&mut t.app.manager.preference.configuration_interfaces, via);
+    // The next packet edits the other profile, after the first one's edits are written, even
+    // though input has not paused.
+    assert_eq!(set_first_key(&mut t, 6), 5);
+    assert_eq!(rules_writes(&t, id), 1);
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(rules_of(&mut t, other), [saved_remap(key(4), &[6])]);
+    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
+}
+
+#[test]
+fn storage_is_ready_again_once_no_rules_file_has_an_unknown_outcome() {
+    let mut t = Test::new(true);
+    let (id, _) = editing(&mut t);
+    let other = create(&mut t, "Other");
+    // The first profile's edits keep failing.
+    t.store.fail_save = Some((record_key(9, id), false));
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    let mut via = cordial_core::interfaces::preference(
+        &t.app.manager.preference.configuration_interfaces,
+        Interface::Via,
+    );
+    via.profile = Some(other.into());
+    cordial_core::interfaces::set(&mut t.app.manager.preference.configuration_interfaces, via);
+    assert_eq!(set_first_key(&mut t, 6), 5);
+    assert_eq!(rules_writes(&t, id), 1);
+    assert!(t.status().ready);
+    // The other profile's write ends with an unknown outcome.
+    t.store.unknown = Some(record_key(9, other));
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    assert_eq!(rules_writes(&t, other), 1);
+    assert!(!t.status().ready);
+    // Once it is written, storage is ready, though the first profile's edits still fail.
+    t.store.unknown = None;
+    t.now += 2 * FIRST_RETRY;
+    t.events();
+    assert_eq!(rules_writes(&t, other), 2);
+    assert!(rules_writes(&t, id) > 1);
+    assert!(t.status().ready);
+    assert!(t.app.has_unsaved());
+    assert_eq!(saved_rules(&mut t, other), [remap_rule(key(4), &[6])]);
+}
+
+/// A VIA editor on a new profile with no device connected, so nothing has been listed to save
+/// yet. Returns the profile.
+fn editing_alone(t: &mut Test) -> u32 {
+    let id = create(t, "Keys");
+    set_interfaces(
+        t,
+        vec![interface(
+            p::ConfigurationInterface::Via,
+            Some(true),
+            Some(id),
+        )],
+    );
+    t.app.usb_reconnect = false;
+    t.store.writes.clear();
+    id
+}
+/// Points VIA at profile `id` without releasing its editor.
+fn move_via(t: &mut Test, id: u32) {
+    let mut via = cordial_core::interfaces::preference(
+        &t.app.manager.preference.configuration_interfaces,
+        Interface::Via,
+    );
+    via.profile = Some(id.into());
+    cordial_core::interfaces::set(&mut t.app.manager.preference.configuration_interfaces, via);
+}
+
+#[test]
+fn edits_there_is_no_memory_to_list_are_written_from_the_editor() {
+    let mut t = Test::new(true);
+    let id = editing_alone(&mut t);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    // Listing the edits fails, as before the bootloader, so the editor's table is written as it is.
+    fail_next_allocation();
+    block_on(t.app.save_all(&mut t.store, t.now));
+    assert!(allocation_failed());
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(
+        block_on(cordial_core::profiles::metadata(&mut t.store, id.into()))
+            .unwrap()
+            .roles
+            .0,
+        cordial_core::hid::KEYBOARD
+    );
+    assert!(!t.app.has_unsaved());
+}
+
+#[test]
+fn an_editor_kept_for_lack_of_memory_does_not_outlive_its_deleted_profile() {
+    let mut t = Test::new(true);
+    let id = editing_alone(&mut t);
+    let other = create(&mut t, "Other");
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    // Moving to another profile can neither list the edits, nor encode them to write them from
+    // the editor, nor then list them again, so the editor is kept and refuses.
+    move_via(&mut t, other);
+    fail_allocations(3);
+    assert_eq!(set_first_key(&mut t, 6), 0xff);
+    assert!(allocation_failed());
+    assert_eq!(rules_writes(&t, id), 0);
+    assert!(t.app.has_unsaved());
+    t.ok(Command::DeleteProfile(p::DeleteProfile { profile: id }));
+    // Its edits are not written back as a rules file of the deleted profile.
+    block_on(t.app.save_all(&mut t.store, t.now));
+    t.now += cordial_core::application::EDITOR_IDLE_MS;
+    t.events();
+    assert!(!t.store.records.contains_key(&record_key(9, id)));
+    assert_eq!(set_first_key(&mut t, 6), 5);
+    assert_eq!(rules_of(&mut t, other), [saved_remap(key(4), &[6])]);
+}
+
+#[test]
+fn an_unknown_outcome_ends_only_once_the_file_is_read() {
+    let mut t = Test::new(true);
+    let (id, _) = editing(&mut t);
+    let rules = record_key(9, id);
+    t.store.unknown = Some(rules);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    assert_eq!(rules_writes(&t, id), 1);
+    assert!(!t.status().ready);
+    t.store.unknown = None;
+    // The unknown write did not reach the file after all.
+    t.store.records.remove(&rules);
+    let retry = |t: &mut Test| t.now += cordial_core::deferred::RULES_RETRY_MAX_MS as u64 + 1;
+    // A retry that cannot even encode the rules leaves the outcome unknown.
+    retry(&mut t);
+    fail_next_allocation();
+    assert!(block_on(t.app.save(&mut t.store, t.now)));
+    assert!(allocation_failed());
+    assert_eq!(rules_writes(&t, id), 1);
+    assert!(!t.status().ready);
+    // So does a failed retry whose file cannot be read.
+    t.store.fail_save = Some((rules, false));
+    t.store.fail_load = Some(rules);
+    retry(&mut t);
+    t.events();
+    assert_eq!(rules_writes(&t, id), 2);
+    assert!(!t.status().ready);
+    // A failed retry whose file is read and lacks the edits is a definite failure.
+    t.store.fail_load = None;
+    retry(&mut t);
+    t.events();
+    assert_eq!(rules_writes(&t, id), 3);
+    assert!(t.status().ready);
+    assert!(t.app.has_unsaved());
+    t.store.fail_save = None;
+    retry(&mut t);
+    t.events();
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert!(!t.app.has_unsaved());
+}
+
+#[test]
+fn a_failed_retry_of_a_file_that_holds_the_edits_counts_as_saved() {
+    let mut t = Test::new(true);
+    let (id, _) = editing(&mut t);
+    let rules = record_key(9, id);
+    // The unknown write reached the file.
+    t.store.unknown = Some(rules);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    assert!(!t.status().ready);
+    t.store.unknown = None;
+    t.store.fail_save = Some((rules, false));
+    t.now += FIRST_RETRY + cordial_core::deferred::QUIET_MS;
+    t.events();
+    assert_eq!(rules_writes(&t, id), 2);
+    assert!(t.status().ready);
+    assert!(!t.app.has_unsaved());
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+}
+
+#[test]
+fn reloading_storage_keeps_edits_not_yet_saved() {
+    let mut t = Test::new(true);
+    let id = editing_alone(&mut t);
+    set_layers(&mut t, SAVED, &[id]);
+    let rules = record_key(9, id);
+    t.store.unknown = Some(rules);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    assert!(!t.status().ready);
+    // The write did not reach the file, and storage is loaded again while the edits wait.
+    t.store.unknown = None;
+    t.store.fail_save = Some((rules, false));
+    t.store.records.remove(&rules);
+    t.event(Event::Restarting(ErrorCode::RadioUnavailable));
+    t.event(Event::Ready);
+    // Loading resolves nothing of the unknown write, so storage stays not ready until a retry
+    // reads the file back.
+    assert!(!t.status().ready);
+    t.now += cordial_core::deferred::RULES_RETRY_MAX_MS as u64;
+    t.events();
+    assert!(t.status().ready);
+    assert!(!t.store.records.contains_key(&rules));
+    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
+    // A device that connects uses the edited table, and further edits change that same table.
+    let link = connect_saved(&mut t, descriptor());
+    t.events();
+    assert_eq!(press(&mut t, link, &[4]), [5]);
+    press(&mut t, link, &[]);
+    assert_eq!(configure(&mut t, Interface::Via, &[5, 0, 0, 1, 0, 7])[0], 5);
+    t.store.fail_save = None;
+    t.now += cordial_core::application::EDITOR_BATCH_MS
+        + cordial_core::deferred::RULES_RETRY_MAX_MS as u64;
+    t.events();
+    let saved = saved_rules(&mut t, id);
+    assert_eq!(saved.len(), 2);
+    assert!(saved.contains(&remap_rule(key(4), &[5])));
+    assert_eq!(press(&mut t, link, &[4]), [5]);
+}
+
+#[test]
+fn edits_that_change_a_profiles_roles_are_profile_events() {
+    let mut t = Test::new(true);
+    let (id, _) = editing(&mut t);
+    let roles = |events: &[Ev]| {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Ev::Profile(p) if p.id == id => Some(p.roles.clone()),
+                _ => None,
+            })
+            .next_back()
+    };
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    assert_eq!(roles(&t.events()), Some(vec![p::Role::Keyboard as i32]));
+    // Restoring the key before anything is written reports the roles again.
+    assert_eq!(set_first_key(&mut t, 4), 5);
+    assert_eq!(roles(&t.events()), Some(vec![]));
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    assert!(profile(&mut t, id).roles.is_empty());
+}
+
+#[test]
+fn an_editor_moving_on_does_not_edit_once_saving_leaves_storage_not_ready() {
+    let mut t = Test::new(true);
+    let (id, _) = editing(&mut t);
+    let other = create(&mut t, "Other");
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    move_via(&mut t, other);
+    t.store.unknown = Some(record_key(9, id));
+    assert_eq!(set_first_key(&mut t, 6), 0xff);
+    assert_eq!(rules_writes(&t, id), 1);
+    assert!(!t.status().ready);
+    // The other profile was not loaded for editing, so its rules are unchanged.
+    assert!(t.app.manager.profiles.get(other.into()).is_none());
+}
+
+#[test]
+fn an_editor_moving_on_without_memory_writes_its_edits_from_the_table() {
+    let mut t = Test::new(true);
+    let id = editing_alone(&mut t);
+    let other = create(&mut t, "Other");
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    move_via(&mut t, other);
+    // The edits cannot be listed, so they are written from the editor before it moves on.
+    fail_next_allocation();
+    assert_eq!(set_first_key(&mut t, 6), 5);
+    assert!(allocation_failed());
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(rules_of(&mut t, other), [saved_remap(key(4), &[6])]);
+    // The roles summary follows the rules written.
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    assert_eq!(profile(&mut t, id).roles, [p::Role::Keyboard as i32]);
+    assert_eq!(
+        block_on(cordial_core::profiles::metadata(&mut t.store, id.into()))
+            .unwrap()
+            .roles
+            .0,
+        cordial_core::hid::KEYBOARD
+    );
+}
+
+#[test]
+fn a_full_filesystem_for_edits_written_from_the_editor_is_reported() {
+    let mut t = Test::new(true);
+    let id = editing_alone(&mut t);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    let rules = record_key(9, id);
+    t.store.full = Some(rules);
+    fail_next_allocation();
+    block_on(t.app.save_all(&mut t.store, t.now));
+    assert!(allocation_failed());
+    let full = |s: &p::Status| s.info.iter().any(|i| i.key == p::keys::STORAGE_FULL);
+    let status = t.status();
+    assert!(status.ready && full(&status));
+    t.store.full = None;
+    block_on(t.app.save_all(&mut t.store, t.now));
+    assert!(!full(&t.status()));
+    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
 }

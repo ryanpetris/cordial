@@ -1,0 +1,334 @@
+// The records the Dongle saves in its LittleFS filesystem. Each file holds one message, encoded as
+// protobuf without framing or length prefix; docs/storage-format.md names the message of each path.
+// An empty file holds no record, so every record has a field that writers always set.
+//
+// Fields follow the kinds in docs/protocol/compatibility.md. A field marked Required must be set
+// for the record to be valid, and the firmware checks it. A plain field reads its zero value as its
+// default. An `optional` scalar or a message field has explicit presence. Later firmware adds
+// fields whose zero value or absence means what earlier firmware did, and never changes the number,
+// type or meaning of an existing field, so records can gain fields without a new storage layout.
+// Firmware ignores unknown fields, and leaves out entries of repeated fields whose transport,
+// integration, configuration interface or role is unknown or unspecified. An unknown host platform
+// reads as Linux.
+syntax = "proto3";
+
+package cordial.storage;
+
+// /format.pb: the filesystem's root record, written when storage is provisioned.
+message Format {
+  // Required. Always 1.
+  uint32 format = 1;
+  // Whether the identity and the initial sequence have been committed.
+  bool initialized = 2;
+}
+
+// /identity.pb: the adapter's Bluetooth identity. Keys are most-significant byte first.
+message Identity {
+  // Required. The adapter's 6-byte Bluetooth address, which must match the radio's.
+  bytes address = 1;
+  // Required. The 16-byte identity root.
+  bytes ir = 2;
+  // Required. The 16-byte encryption root.
+  bytes er = 3;
+  // Required. The 16-byte identity resolving key: AES-128 under `ir` of the block whose last byte
+  // is 1 and whose other bytes are 0.
+  bytes irk = 4;
+}
+
+// /adapter.pb: the adapter's preferences. Without the file, the adapter uses the image's default
+// name, Linux, BLE alone and no configuration interface.
+message Adapter {
+  // The name override: 1..64 UTF-8 bytes, trimmed, without control characters. Absent selects the
+  // image's default name.
+  optional string name = 1;
+  HostPlatform host_platform = 2;
+  // Whether each transport is enabled, at most one entry per transport. A transport without an
+  // entry uses its default: BLE enabled, Classic disabled. Writers list every transport.
+  repeated TransportPreference transports = 3;
+  // The saved preferences of each configuration interface that has any, at most one entry per
+  // interface. An interface without an entry is disabled with no profile, and writers omit such
+  // entries. An enabled interface has a profile, and no two enabled interfaces conflict.
+  repeated InterfacePreference configuration_interfaces = 4;
+}
+
+enum HostPlatform {
+  HOST_PLATFORM_LINUX = 0;
+  HOST_PLATFORM_WINDOWS = 1;
+  HOST_PLATFORM_MAC = 2;
+}
+
+enum Transport {
+  TRANSPORT_UNSPECIFIED = 0;
+  TRANSPORT_CLASSIC = 1;
+  TRANSPORT_BLE = 2;
+}
+
+message TransportPreference {
+  // Required.
+  Transport transport = 1;
+  bool enabled = 2;
+}
+
+enum ConfigurationInterface {
+  CONFIGURATION_INTERFACE_UNSPECIFIED = 0;
+  CONFIGURATION_INTERFACE_VIA = 1;
+  CONFIGURATION_INTERFACE_VIAL = 2;
+}
+
+message InterfacePreference {
+  // Required.
+  ConfigurationInterface interface = 1;
+  bool enabled = 2;
+  // The ID of the profile the interface edits.
+  optional uint64 profile = 3;
+}
+
+// /sequence.pb: the next device and profile IDs. Each is saved before a record with the ID it
+// replaces is published, so IDs are never reused.
+message Sequence {
+  // Required. The ID the next paired device gets: 1 at first, and 4294967296 once every 32-bit ID
+  // has been used.
+  uint64 next_device = 1;
+  // Required. The ID the next created profile gets, likewise.
+  uint64 next_profile = 2;
+}
+
+// /devices/<id>/device.pb: a paired device's policy and complete bond. This file commits the
+// device's existence.
+message Device {
+  // Required.
+  Policy policy = 1;
+  // Required.
+  Bond bond = 2;
+}
+
+// A Bluetooth peer's identity.
+message Peer {
+  // Required. 6 bytes, most-significant first.
+  bytes address = 1;
+  // Whether the address is a random BLE address. Classic addresses are public.
+  bool random = 2;
+  // Required.
+  Transport transport = 3;
+}
+
+message Policy {
+  // Required. The device ID, which names the record's directory.
+  uint64 id = 1;
+  // Required. The device's resolved identity address.
+  Peer peer = 2;
+  // At most 128 UTF-8 bytes without ASCII control characters.
+  string name = 3;
+  bool trusted = 4;
+  bool blocked = 5;
+  // Whether the user wants the device enabled.
+  bool enabled = 6;
+  // Set from pairing until the device's first-connection setup completes.
+  bool setup_pending = 7;
+  // Saved integration preferences, at most one entry per integration.
+  repeated IntegrationPreference integrations = 8;
+  // The input roles the device's HID descriptor produces, from the last descriptor read. Empty
+  // until the first descriptor is read.
+  repeated Role roles = 9;
+  // The device's layers: the IDs of the profiles it applies, in order. Empty passes all input
+  // through.
+  repeated uint64 profiles = 10;
+}
+
+enum Integration {
+  INTEGRATION_UNSPECIFIED = 0;
+  INTEGRATION_HIDPP = 1;
+}
+
+message IntegrationPreference {
+  // Required.
+  Integration integration = 1;
+  bool enabled = 2;
+}
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_KEYBOARD = 1;
+  ROLE_MOUSE = 2;
+  ROLE_CONSUMER_CONTROL = 3;
+  ROLE_SYSTEM_CONTROL = 4;
+}
+
+// A complete bond in a form independent of any Bluetooth stack. Native adapters convert it at
+// their boundaries.
+message Bond {
+  // Required. The ID of the device the bond belongs to, equal to `Policy.id`.
+  uint64 owner = 1;
+  // Required. Equal to `Policy.peer`.
+  Peer identity = 2;
+  // Required: the keys of `identity.transport`.
+  oneof keys {
+    ClassicKeys classic = 3;
+    BleKeys ble = 4;
+  }
+}
+
+message ClassicKeys {
+  // Required. The 16-byte link key.
+  bytes link_key = 1;
+  // The link key type, 0..8, as the Bluetooth Core Specification numbers it.
+  uint32 key_type = 2;
+}
+
+// The BLE security of both sides, at least one of which has an LTK.
+message BleKeys {
+  // Required. What the adapter distributed.
+  Security local = 1;
+  // Required. What the device distributed.
+  Security peer = 2;
+}
+
+message Security {
+  // Bits 0..5: LTK present, IRK present, CSRK present, authenticated, authorized, secure
+  // connections.
+  uint32 flags = 1;
+  // The encryption key size, 7..16 when an LTK is present.
+  uint32 key_size = 2;
+  uint32 ediv = 3;
+  // Required. 8 bytes.
+  bytes rand = 4;
+  // Required. 16 bytes.
+  bytes ltk = 5;
+  // Required. 16 bytes.
+  bytes irk = 6;
+  // Required. 16 bytes.
+  bytes csrk = 7;
+  // The signing counter.
+  uint32 counter = 8;
+}
+
+// /devices/<id>/settings.pb: the device's explicitly saved preferences. Forgetting the last one
+// deletes the file.
+message Settings {
+  // Required: at least one. Each integration and key at most once.
+  repeated Preference preferences = 1;
+}
+
+message Preference {
+  // Required.
+  Integration integration = 1;
+  // Required. What listing the setting needs while the device is disconnected.
+  SettingMetadata metadata = 2;
+  // The saved value: 0 or 1 for a boolean, the value's index for an enum (from 1 for `wheel.mode`),
+  // and the number for an integer.
+  uint32 value = 3;
+}
+
+message SettingMetadata {
+  // Required. The setting's name, such as `backlight.level`.
+  string key = 1;
+  // Required. The stable HID++ feature ID, not its device-assigned index.
+  uint32 feature = 2;
+  uint32 revision = 3;
+  // Required.
+  SettingScope scope = 4;
+  // The values the setting accepts. Empty when a range applies, or for a boolean.
+  repeated uint32 choices = 5;
+  // The inclusive range of an integer setting without choices.
+  Range range = 6;
+}
+
+enum SettingScope {
+  SETTING_SCOPE_UNSPECIFIED = 0;
+  SETTING_SCOPE_DEVICE = 1;
+  SETTING_SCOPE_CURRENT_HOST = 2;
+}
+
+message Range {
+  uint32 min = 1;
+  // At least `min`, a whole number of steps above it.
+  uint32 max = 2;
+  // Required. At least 1.
+  uint32 step = 3;
+}
+
+// /devices/<id>/layout.pb: the device's HID layout, an optional cache that lets a later connection
+// forward input without rediscovering the device.
+message Layout {
+  // Required: 1..3. The raw report map of each HID service, 1..2048 bytes each, in service order.
+  // A Classic device has one.
+  repeated bytes maps = 1;
+  // A BLE device's report characteristics, at least one of them an input report. A Classic device
+  // has none.
+  repeated Report reports = 2;
+  // The device's 16-byte GATT Database Hash. Empty when the device exposes none.
+  bytes database_hash = 3;
+}
+
+enum ReportType {
+  REPORT_TYPE_UNSPECIFIED = 0;
+  REPORT_TYPE_INPUT = 1;
+  REPORT_TYPE_OUTPUT = 2;
+  REPORT_TYPE_FEATURE = 3;
+}
+
+// One HID Report characteristic. Service, type and ID are unique within a layout.
+message Report {
+  // The index of the owning service in `Layout.maps`.
+  uint32 service = 1;
+  // Required.
+  ReportType type = 2;
+  // The report ID from the Report Reference descriptor. Zero when the report is unnumbered.
+  uint32 id = 3;
+  // Required. The characteristic value handle.
+  uint32 value_handle = 4;
+  // The GATT characteristic properties.
+  uint32 properties = 5;
+  // The Client Characteristic Configuration descriptor handle, above `value_handle`. Zero when the
+  // characteristic has none.
+  uint32 cccd_handle = 6;
+}
+
+// /profiles/<id>/profile.pb: a profile's record. Its directory supplies its ID. This file commits
+// the profile's existence.
+message Profile {
+  // Required. 1..64 UTF-8 bytes without control characters.
+  string name = 1;
+  // The roles of the input the profile's rules change, worked out when the rules are saved.
+  repeated Role roles = 2;
+}
+
+// /profiles/<id>/rules.pb: a profile's rules. Forgetting the last rule deletes the file.
+message Rules {
+  // Required: at least one. Sorted by input in ascending order, with at most one rule for each
+  // input, so the rules can be searched, read or skipped one entry at a time.
+  repeated Rule rules = 1;
+}
+
+// A HID usage is a uint32 with the usage page in its high 16 bits and the usage ID in its low 16.
+message Rule {
+  // Required. The input usage.
+  uint32 input = 1;
+  // Required.
+  oneof effect {
+    Remap remap = 2;
+    Scale scale = 3;
+  }
+}
+
+message Remap {
+  // The outputs held together while the input is held, in ascending order of usage, then
+  // collection, each at most once. Empty disables the input.
+  repeated Output outputs = 1;
+}
+
+message Output {
+  // Required. The output usage.
+  uint32 usage = 1;
+  // Required. The application collection, as a usage, of the adapter's USB report that carries
+  // the output.
+  uint32 collection = 2;
+}
+
+// Multiplies a relative value by `numerator / denominator`, in lowest terms.
+message Scale {
+  // Required. Nonzero; a negative numerator inverts the value.
+  sint32 numerator = 1;
+  // Required. Nonzero.
+  uint32 denominator = 2;
+}

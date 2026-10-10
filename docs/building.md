@@ -142,7 +142,18 @@ contain UF2; ESP packages contain bootloader and partition-table images plus
 `rust/tools/flash_dev.py` inspects Pico UF2 artifacts and supports explicit
 storage-preserving development updates. See its `--help` for identity and mount
 arguments. ESP32-S3 uses its ROM download protocol and the regions in `flash.json`.
-Ordinary firmware updates preserve saved bonds, identities and preferences.
+
+Firmware updates within one storage format, named by the layout identity in the
+[storage format](storage-format.md), preserve saved bonds, identities and
+preferences. Firmware never opens or reformats storage of another format, such
+as the `littlefs-json-1` storage of release 0.6.3 and earlier, so the adapter
+never becomes ready. Erase the board's whole flash before flashing it: on Pico boards
+in BOOTSEL mode with `picotool erase` (picotool 2.0 or later), then copy the
+UF2; on the ESP32-S3 with `esptool --chip esp32s3 erase_flash` before
+`write_flash`. The adapter then starts with a new Bluetooth identity and no
+saved devices, so pair each device again, removing the adapter from the device
+first where it keeps a pairing. `flash_dev.py` refuses an update whose storage
+layout differs from the installed image's, including with `--clear-storage`.
 
 ### Versioning and release packages
 

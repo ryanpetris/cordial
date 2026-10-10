@@ -355,6 +355,85 @@ fn file_get_writes_the_file_and_never_replaces_one() {
 }
 
 #[test]
+fn file_get_saves_records_as_json_unless_raw() {
+    use prost::Message;
+    let dir = std::env::temp_dir().join(format!("cordial-records-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let arg = |name: &str| -> &'static str {
+        Box::leak(dir.join(name).display().to_string().into_boxed_str())
+    };
+    let profile = p::storage::Profile {
+        name: "Work".into(),
+        roles: vec![p::storage::Role::Keyboard.into()],
+    }
+    .encode_to_vec();
+    let dongle = Dongle::with(|sim| {
+        sim.data
+            .insert("/profiles/3/profile.pb".into(), profile.clone());
+        sim.data.insert("/devices/1/device.pb".into(), vec![0xff]);
+    });
+    // A record is saved as JSON under its name with .json.
+    let (result, out, _) = script(
+        &dongle,
+        &["file", "get", "/profiles/3/profile.pb", arg("profile.pb")],
+        false,
+        b"",
+    );
+    result.unwrap();
+    assert!(out.contains("as JSON to"), "{out}");
+    assert!(!dir.join("profile.pb").exists());
+    let json: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("profile.json")).unwrap()).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"name": "Work", "roles": ["ROLE_KEYBOARD"]})
+    );
+    // An existing JSON file is not replaced.
+    let (result, _, _) = script(
+        &dongle,
+        &["file", "get", "/profiles/3/profile.pb", arg("profile.pb")],
+        false,
+        b"",
+    );
+    assert_eq!(result.unwrap_err().message, "the local file already exists");
+    // --raw keeps the bytes under the name given.
+    let (result, out, _) = script(
+        &dongle,
+        &[
+            "file",
+            "get",
+            "--raw",
+            "/profiles/3/profile.pb",
+            arg("profile.pb"),
+        ],
+        false,
+        b"",
+    );
+    result.unwrap();
+    assert!(
+        !out.contains("JSON") && !out.contains("converting"),
+        "{out}"
+    );
+    assert_eq!(fs::read(dir.join("profile.pb")).unwrap(), profile);
+    // A file that doesn't decode keeps its bytes and original name, and the result says so.
+    let (result, out, _) = script(
+        &dongle,
+        &["file", "get", "/devices/1/device.pb", arg("device.json")],
+        false,
+        b"",
+    );
+    result.unwrap();
+    assert!(
+        out.contains("without converting it: the file doesn't decode as its record."),
+        "{out}"
+    );
+    assert_eq!(fs::read(dir.join("device.pb")).unwrap(), [0xff]);
+    assert!(!dir.join("device.json").exists());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn production_firmware_refuses_development_commands_locally() {
     let dongle = Dongle::with(|sim| sim.status.info.clear());
     let (result, _, _) = script(&dongle, &["file", "list", "/"], false, b"");

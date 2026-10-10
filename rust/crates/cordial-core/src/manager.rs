@@ -58,6 +58,14 @@ pub struct Manager {
     pub preference: AdapterPreference,
     pub storage_ready: bool,
     pub write_uncertain: bool,
+    /// A deferred save whose outcome is unknown made storage not ready; its first later success
+    /// makes it ready again, unless another failure has made it not ready since.
+    pub unsaved_unready: bool,
+    /// A deferred save found the filesystem full, so the status reports storage full until it
+    /// succeeds.
+    pub unsaved_full: bool,
+    /// When input last reached the forwarder.
+    pub last_input: Option<u64>,
     pub radio_ready: bool,
     generation: u64,
     /// What the radio supports, whether or not a transport is enabled.
@@ -90,6 +98,9 @@ impl Default for Manager {
             preference: AdapterPreference::default(),
             storage_ready: false,
             write_uncertain: false,
+            unsaved_unready: false,
+            unsaved_full: false,
+            last_input: None,
             radio_ready: false,
             generation: 0,
             caps: Capabilities {
@@ -168,6 +179,7 @@ impl Manager {
             return Err(Error::Busy);
         }
         self.storage_ready = false;
+        self.unsaved_unready = false;
         self.write_uncertain = false;
         self.removed.clear();
         self.changed.clear();
@@ -188,7 +200,8 @@ impl Manager {
         let existing = profile_ids(store).await?;
         self.clear_interfaces(store, &existing).await;
         self.devices = Vec::new();
-        self.profiles = profiles::Cache::default();
+        // Tables still held, such as ones with edits not yet saved, are newer than their files.
+        self.profiles.prune();
         // Startup reads every saved policy once: it deletes lost records, removes references to
         // profiles that no longer exist, and keeps entries for the devices that fit.
         let mut peers: Vec<Peer> = Vec::new();
@@ -208,7 +221,7 @@ impl Manager {
                 else {
                     continue;
                 };
-                let Some(mut policy) = crate::bonds::decode(id, &bytes) else {
+                let Some((mut policy, bond)) = crate::bonds::decode(id, &bytes) else {
                     lost.push(id);
                     continue;
                 };
@@ -223,7 +236,7 @@ impl Manager {
                 // next startup.
                 if policy.profiles.iter().any(|p| !existing.contains(p)) {
                     policy.profiles.retain(|p| existing.contains(p));
-                    let _ = Policies { store }.save(&policy).await;
+                    let _ = Policies { store }.save_with(&policy, &bond).await;
                 }
                 if self.eligible(&policy) && self.room(policy.peer.transport) {
                     self.add(&policy)?;
@@ -420,6 +433,12 @@ impl Manager {
         self.native_limits[kind(transport)].saturating_sub(1)
     }
     /// No room to save another device.
+    /// Storage stops being ready after a failure.
+    pub fn fail_storage(&mut self) {
+        self.storage_ready = false;
+        self.unsaved_unready = false;
+    }
+    /// Whether free space, as last counted, leaves no room to pair another device.
     pub fn storage_full(&self) -> bool {
         self.available_bytes < crate::bonds::MAINTENANCE_BYTES + crate::bonds::PAIR_BYTES
     }
@@ -839,7 +858,7 @@ impl Manager {
         if let Err(error) = crate::bonds::commit(store, &policy, &bond).await {
             self.write_uncertain = error == crate::storage::Error::Unknown;
             if self.write_uncertain {
-                self.storage_ready = false;
+                self.fail_storage();
             }
             return Err(if error == crate::storage::Error::Full {
                 Error::StorageFull
@@ -869,7 +888,7 @@ impl Manager {
             c.device = Some(slot);
         }
         if self.finish_pair(store).await.is_err() {
-            self.storage_ready = false;
+            self.fail_storage();
         }
         Ok((policy.id, slot))
     }
@@ -1024,6 +1043,7 @@ impl Manager {
         // The first-input wait ends with input that reached the forwarder.
         if link.take_input_forwarded() {
             c.starting = None;
+            self.last_input = Some(now);
         }
         Ok(changed)
     }
@@ -1128,15 +1148,16 @@ impl Manager {
         Ok(changed.then_some(slot))
     }
     /// Reads a connected device's saved policy and preferences once its connection has forwarded
-    /// input, or once it has waited `FIRST_INPUT_WAIT_MS` for it. Saves the roles its descriptor
-    /// reported when they changed. Returns the slot of a device it read. On an error, returns the
+    /// input, or once it has waited `FIRST_INPUT_WAIT_MS` for it. Returns the slot of a device it
+    /// read and, once its descriptor reported roles, those roles and whether its record holds
+    /// others, for the caller to save; the read policy holds them already. On an error, returns the
     /// ID of the device it failed on: `NotFound` when its record is lost, and `StorageFailed` when
     /// the read failed, which is tried again after a backoff.
     pub async fn hydrate<S: RecordStore>(
         &mut self,
         store: &mut S,
         now: u64,
-    ) -> Result<Option<usize>, (u64, Error)> {
+    ) -> Result<Option<(usize, Option<(crate::devices::Roles, bool)>)>, (u64, Error)> {
         let Some((slot, id)) = self
             .connections
             .iter()
@@ -1183,13 +1204,13 @@ impl Manager {
             let _ = store.remove(crate::storage::record_key(4, id)).await;
         }
         live.catalog.connection(true, d.hidpp_enabled);
-        if policy.roles.0 != live.roles && live.roles != 0 {
+        let roles = (live.roles != 0).then(|| {
+            let changed = policy.roles.0 != live.roles;
             policy.roles.0 = live.roles;
-            // A failed save keeps the roles the device last saved; the next connection retries.
-            let _ = Policies { store }.save(&policy).await;
-        }
+            (policy.roles, changed)
+        });
         live.policy = Some(policy);
-        Ok(Some(slot))
+        Ok(Some((slot, roles)))
     }
     /// The next first-connection setup progress to save: the connection and
     /// device slot of a connected device with `setup_pending`, the policy
@@ -1228,10 +1249,13 @@ impl Manager {
     }
     /// Saves a device's policy, resident or not, and brings the resident set, the stack and the
     /// device's connection in line with it. Turning a connected device off or blocking it closes
-    /// its link; its entry leaves once the link has closed.
+    /// its link; its entry leaves once the link has closed. `bond` is the bond the device's
+    /// saved record holds when the caller read it in this step; otherwise the record is read for
+    /// it.
     pub async fn save_policy<S: RecordStore, B: Bluetooth>(
         &mut self,
         policy: Policy,
+        bond: Option<&crate::bonds::Bond>,
         store: &mut S,
         radio: &mut B,
     ) -> Result<(), Error> {
@@ -1247,10 +1271,14 @@ impl Manager {
         if slot.is_some_and(|s| self.devices[s].as_ref().unwrap().deleting) {
             return Err(Error::Busy);
         }
-        Policies { store }.save(&policy).await.map_err(|error| {
+        let saved = match bond {
+            Some(bond) => Policies { store }.save_with(&policy, bond).await,
+            None => Policies { store }.save(&policy).await,
+        };
+        saved.map_err(|error| {
             self.write_uncertain = error == crate::storage::Error::Unknown;
             if self.write_uncertain {
-                self.storage_ready = false;
+                self.fail_storage();
             }
             match error {
                 crate::storage::Error::Full => Error::StorageFull,
@@ -1449,7 +1477,7 @@ impl Manager {
             .map_err(|error| {
                 self.write_uncertain = error == crate::storage::Error::Unknown;
                 if self.write_uncertain {
-                    self.storage_ready = false;
+                    self.fail_storage();
                 }
                 if error == crate::storage::Error::Full {
                     Error::StorageFull
@@ -1505,13 +1533,13 @@ impl Manager {
         if let Err(error) = (Policies { store }).remove(id).await {
             self.write_uncertain = error == crate::storage::Error::Unknown;
             if self.write_uncertain {
-                self.storage_ready = false;
+                self.fail_storage();
             } else {
                 if let Some(slot) = slot {
                     self.devices[slot].as_mut().unwrap().deleting = false;
                 }
                 if self.sync_bonds(store, radio).await.is_err() {
-                    self.storage_ready = false;
+                    self.fail_storage();
                 }
             }
             return Err(if error == crate::storage::Error::Full {
@@ -1528,7 +1556,7 @@ impl Manager {
             Ok(bytes) => self.available_bytes = bytes,
             Err(_) => {
                 self.available_bytes = 0;
-                self.storage_ready = false;
+                self.fail_storage();
             }
         }
         Ok(())

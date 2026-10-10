@@ -10,15 +10,14 @@ license.workspace = true
 cordial-client = { workspace = true, features = ["serialport"] }
 cordial-protocol = { workspace = true, features = ["json"] }
 serde_json = { workspace = true, features = ["std"] }
+serde.workspace = true
+prost = { version = "=0.14.4", default-features = false }
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm"] }
 unicode-width = "=0.2.2"
 unicode-segmentation = "=1.13.3"
 unicode-properties = { version = "=0.1.4", default-features = false, features = ["general-category"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
 ctrlc = { version = "=3.5.2", features = ["termination"] }
-
-[dev-dependencies]
-prost = { version = "=0.14.4", default-features = false }
 
 [[bin]]
 name = "cordial"

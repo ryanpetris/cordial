@@ -1,7 +1,8 @@
 //! Files, on development firmware: a dialog listing one directory of the adapter's filesystem at
-//! a time, with a download of the selected file. A download is written to a private temporary
-//! file, which becomes the chosen local file only once the whole file has arrived; an existing
-//! local file is replaced only after the Replace confirmation.
+//! a time, with a download of the selected file. A saved record is downloaded as JSON, under its
+//! name with `.json` in place of `.pb`. A download is written to a private temporary file, which
+//! becomes the chosen local file only once the whole file has arrived; an existing local file is
+//! replaced only after the Replace confirmation.
 use super::{
     Action, Dialog, Job, Kind, Model,
     fleet::Fleet,
@@ -11,6 +12,7 @@ use super::{
 use crate::{
     controller::{Command, Outcome},
     error::Error,
+    records::{self, Unconverted},
     storage,
     ui::{
         field::Field,
@@ -31,7 +33,8 @@ pub enum Listing {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Transfer {
     Running,
-    Saved(u64),
+    /// Saved to the download's local file, with the reason when it was saved unconverted.
+    Saved(u64, Option<Unconverted>),
     Failed(String),
 }
 
@@ -94,6 +97,11 @@ pub fn keep_directory(dest: &str, name: &str) -> String {
         Some(dir) => dir.join(name).display().to_string(),
         None => name.to_owned(),
     }
+}
+
+/// Where a download is expected to be saved: as JSON for a known record.
+fn saved_to(target: &Target) -> PathBuf {
+    records::destination(&target.path, &target.local, false)
 }
 
 /// An adapter path below `dir`.
@@ -161,7 +169,15 @@ impl<F: Fleet> Model<F> {
                     return;
                 };
                 match result {
-                    Ok(Outcome::FileSaved { bytes, .. }) => d.state = Transfer::Saved(*bytes),
+                    Ok(Outcome::FileSaved {
+                        bytes,
+                        local,
+                        unconverted,
+                        ..
+                    }) => {
+                        d.local.clone_from(local);
+                        d.state = Transfer::Saved(*bytes, *unconverted);
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         d.state = Transfer::Failed(format!(
@@ -185,7 +201,12 @@ impl<F: Fleet> Model<F> {
             return;
         }
         let dest = keep_directory(&self.files.dest.value(), &name);
-        self.files.dest.set_value(&dest);
+        let dest = records::destination(
+            &child(&self.files.path, &name),
+            std::path::Path::new(&dest),
+            false,
+        );
+        self.files.dest.set_value(&dest.display().to_string());
         self.files.dest_err.clear();
         self.files.selected = Some(name);
     }
@@ -219,7 +240,7 @@ impl<F: Fleet> Model<F> {
         if self.files.busy() {
             return;
         }
-        match storage::check_destination(&target.local, false) {
+        match storage::check_destination(&saved_to(&target), false) {
             Err(e) if e.message == storage::EXISTS => {
                 self.dialog = Some(Dialog::Replace(adapter, target));
             }
@@ -233,7 +254,7 @@ impl<F: Fleet> Model<F> {
         self.files.dest_err.clear();
         self.files.download = Some(Download {
             path: target.path.clone(),
-            local: target.local.clone(),
+            local: saved_to(&target),
             size: target.size,
             state: Transfer::Running,
         });
@@ -244,6 +265,7 @@ impl<F: Fleet> Model<F> {
                 path: target.path,
                 local: target.local,
                 overwrite,
+                raw: false,
             },
         );
     }
@@ -385,10 +407,16 @@ impl<F: Fleet> Model<F> {
                     b.fact("Saving To", &local, layout::plain());
                     b.line(busy("Downloading…"));
                 }
-                Transfer::Saved(n) => {
+                Transfer::Saved(n, unconverted) => {
                     b.fact("Saved", &shown, ok());
                     b.fact("To", &local, layout::plain());
                     b.fact("Size", &format!("{n} bytes"), layout::plain());
+                    if let Some(why) = unconverted {
+                        b.para(
+                            &format!("Saved without converting to JSON: {}.", why.reason()),
+                            warn(),
+                        );
+                    }
                 }
                 Transfer::Failed(error) => {
                     b.fact("Not Saved", &shown, err());
@@ -439,7 +467,7 @@ impl<F: Fleet> Model<F> {
         body.para(
             &format!(
                 "{} already exists. Replace it?",
-                display(&target.local.display().to_string())
+                display(&saved_to(target).display().to_string())
             ),
             layout::bold(),
         );

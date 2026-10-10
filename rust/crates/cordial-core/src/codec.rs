@@ -1,9 +1,6 @@
-//! Native bond byte helpers and persisted JSON policy validation.
+//! Byte helpers of the binary bond form native adapters exchange.
 use crate::model::identifiers::Transport;
-use crate::{
-    devices::{Peer, Policy},
-    storage::Error,
-};
+use crate::{devices::Peer, storage::Error};
 use alloc::vec::Vec;
 
 pub struct Reader<'a>(&'a [u8]);
@@ -57,14 +54,4 @@ pub fn peer(bytes: &mut Vec<u8>, peer: Peer) {
     });
     bytes.push(u8::from(peer.random));
     bytes.extend_from_slice(&peer.address);
-}
-pub fn read_policy(id: u64, bytes: &[u8]) -> Result<Policy, Error> {
-    let record: crate::bonds::DeviceRecord =
-        serde_json::from_slice(bytes).map_err(|_| Error::Corrupt)?;
-    let mut policy = record.policy;
-    policy.bond = id;
-    if !policy.valid() || policy.id != id {
-        return Err(Error::Corrupt);
-    }
-    Ok(policy)
 }

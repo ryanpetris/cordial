@@ -2,54 +2,43 @@ use crate::model::hidpp::{FeatureId, FeatureRevision};
 use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
-/// Explicit codes: persisted setting-record keys use them, so never renumber.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+/// The settings the firmware knows, each saved and serialized by its name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 #[repr(u8)]
 pub enum SettingKey {
-    #[serde(rename = "fn.row_default")]
     FnRowDefault = 7,
-    #[serde(rename = "backlight.enabled")]
     BacklightEnabled = 8,
-    #[serde(rename = "backlight.mode")]
     BacklightMode = 9,
-    #[serde(rename = "backlight.level")]
     BacklightLevel = 10,
-    #[serde(rename = "backlight.delay.hands_out")]
     BacklightDelayHandsOut = 11,
-    #[serde(rename = "backlight.delay.hands_in")]
     BacklightDelayHandsIn = 12,
-    #[serde(rename = "backlight.delay.powered")]
     BacklightDelayPowered = 13,
-    #[serde(rename = "pointer.dpi.0")]
     PointerDpi0 = 14,
-    #[serde(rename = "pointer.dpi.1")]
     PointerDpi1 = 15,
-    #[serde(rename = "wheel.mode")]
     WheelMode = 16,
-    #[serde(rename = "wheel.threshold")]
     WheelThreshold = 17,
-    #[serde(rename = "wheel.invert")]
     WheelInvert = 18,
-    #[serde(rename = "thumbwheel.invert")]
     ThumbwheelInvert = 19,
-    #[serde(rename = "backlight.power_on")]
     BacklightPowerOn = 22,
-    #[serde(rename = "backlight.crown")]
     BacklightCrown = 23,
-    #[serde(rename = "backlight.power_save")]
     BacklightPowerSave = 24,
-    #[serde(rename = "backlight.effect")]
     BacklightEffect = 25,
-    #[serde(rename = "backlight.current_level")]
     BacklightCurrentLevel = 26,
-    #[serde(rename = "backlight.status")]
     BacklightStatus = 27,
-    #[serde(rename = "wheel.info")]
     WheelInfo = 28,
-    #[serde(rename = "keyboard.platform")]
     KeyboardPlatform = 29,
-    #[serde(rename = "power.auto_off")]
     PowerAutoOff = 30,
+}
+impl Serialize for SettingKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+impl<'de> Deserialize<'de> for SettingKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <&str>::deserialize(deserializer)?;
+        Self::from_name(name).ok_or_else(|| serde::de::Error::custom("unknown setting key"))
+    }
 }
 
 impl SettingKey {
@@ -78,8 +67,35 @@ impl SettingKey {
         Self::PowerAutoOff,
     ];
     pub fn from_name(value: &str) -> Option<Self> {
-        Self::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value))
-            .ok()
+        Self::ALL.into_iter().find(|key| key.name() == value)
+    }
+    /// The name a saved preference stores the setting by.
+    pub fn name(self) -> &'static str {
+        use SettingKey::*;
+        match self {
+            FnRowDefault => "fn.row_default",
+            BacklightEnabled => "backlight.enabled",
+            BacklightMode => "backlight.mode",
+            BacklightLevel => "backlight.level",
+            BacklightDelayHandsOut => "backlight.delay.hands_out",
+            BacklightDelayHandsIn => "backlight.delay.hands_in",
+            BacklightDelayPowered => "backlight.delay.powered",
+            PointerDpi0 => "pointer.dpi.0",
+            PointerDpi1 => "pointer.dpi.1",
+            WheelMode => "wheel.mode",
+            WheelThreshold => "wheel.threshold",
+            WheelInvert => "wheel.invert",
+            ThumbwheelInvert => "thumbwheel.invert",
+            BacklightPowerOn => "backlight.power_on",
+            BacklightCrown => "backlight.crown",
+            BacklightPowerSave => "backlight.power_save",
+            BacklightEffect => "backlight.effect",
+            BacklightCurrentLevel => "backlight.current_level",
+            BacklightStatus => "backlight.status",
+            WheelInfo => "wheel.info",
+            KeyboardPlatform => "keyboard.platform",
+            PowerAutoOff => "power.auto_off",
+        }
     }
     pub fn kind(self) -> SettingType {
         use SettingKey::*;

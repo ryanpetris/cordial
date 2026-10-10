@@ -69,7 +69,7 @@ def esp_image_header(data, settings, revisions):
 
 def esp_partitions(data, config):
     expected = [
-        (1, 2, 0x9000, 0x6000, b"nvs", 0), (1, 1, 0xf000, 0x1000, b"phy_init", 0),
+        (1, 1, 0xf000, 0x1000, b"phy_init", 0),
         (0, 0, 0x10000, config["storage_offset"] - 0x10000, b"factory", 0),
         (1, 0x40, config["storage_offset"], 4096, b"cordial_layout", 0),
         (1, 0x83, config["storage_offset"] + 4096, config["storage_bytes"] - 4096, b"cordial_app", 0),

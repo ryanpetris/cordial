@@ -14,7 +14,8 @@ littlefs2 = { version = "=0.8.1", default-features = false }
 embassy-futures = "=0.1.2"
 
 [dev-dependencies]
-serde_json.workspace = true
+cordial-protocol.workspace = true
+prost = { version = "=0.14.4", default-features = false }
 
 [[test]]
 name = "esp_storage"

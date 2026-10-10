@@ -687,3 +687,40 @@ fn a_connect_whose_port_went_away_fails_instead_of_hanging() {
     assert_eq!(app.m.off["00000000000FA002"].connecting, None);
     assert!(app.calls().contains(&Call::Close(slot)));
 }
+
+#[test]
+fn file_downloads_save_records_as_json() {
+    let mut app = App::two(110, 40);
+    app.m.open_files("00000000000FA001");
+    app.finish(Ok(Outcome::Files {
+        path: "/".into(),
+        entries: vec![p::FileEntry {
+            name: "sequence.pb".into(),
+            directory: false,
+            size: 4,
+        }],
+    }));
+    app.click("sequence.pb");
+    assert_eq!(app.m.files.dest.value(), "sequence.json");
+    app.click("Download");
+    assert!(
+        app.ran(r#"FileGet { path: "/sequence.pb", local: "sequence.json", overwrite: false, raw: false }"#),
+        "{:?}",
+        app.calls()
+    );
+    // A file that doesn't decode is saved as it is, under its own name.
+    app.finish(Ok(Outcome::FileSaved {
+        path: "/sequence.pb".into(),
+        local: "sequence.pb".into(),
+        bytes: 4,
+        json: false,
+        unconverted: Some(crate::records::Unconverted::Undecodable),
+    }));
+    let screen = app.screen();
+    assert!(
+        screen.contains("Saved without converting to JSON: the file doesn't decode as its record."),
+        "{screen}"
+    );
+    let to = screen.lines().find(|l| l.contains(" To ")).unwrap();
+    assert!(to.contains("sequence.pb") && !to.contains("json"), "{to}");
+}

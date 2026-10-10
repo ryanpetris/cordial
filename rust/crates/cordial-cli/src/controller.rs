@@ -275,11 +275,13 @@ pub enum Command {
     /// Saves several preferences of one device in one request.
     DeviceSave(u32, DeviceUpdate),
     Files(String),
-    /// Downloads an adapter file; an existing destination is replaced only with `overwrite`.
+    /// Downloads an adapter file; an existing destination is replaced only with `overwrite`. A
+    /// known record is saved as JSON unless `raw`.
     FileGet {
         path: String,
         local: PathBuf,
         overwrite: bool,
+        raw: bool,
     },
 }
 
@@ -379,10 +381,14 @@ pub enum Outcome {
         path: String,
         entries: Vec<p::FileEntry>,
     },
+    /// A download saved to `local`: the record's JSON, or the bytes as they are when `raw` or
+    /// when `unconverted` says why.
     FileSaved {
         path: String,
         local: PathBuf,
         bytes: u64,
+        json: bool,
+        unconverted: Option<crate::records::Unconverted>,
     },
 }
 

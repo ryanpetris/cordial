@@ -1,7 +1,9 @@
-//! Exercise the actual ESP raw adapter without hardware or NVS calls.
+//! Exercise the actual ESP raw adapter without hardware or ESP-IDF calls.
 #![allow(non_camel_case_types, non_upper_case_globals)]
 extern crate self as esp_idf_sys;
-use cordial_core::storage::Error;
+use cordial_core::{identity::Identity, storage::Error};
+use embassy_futures::block_on;
+use prost::Message;
 use std::{
     cell::RefCell,
     ffi::{c_char, c_void},
@@ -87,14 +89,17 @@ fn open() -> Result<adapter::Storage, Error> {
 fn common_filesystem_uses_only_application_partitions() {
     FLASH.with_borrow_mut(|f| f[..4096].fill(0x42));
     let mut fs = open().unwrap();
-    fs.replace_file("/devices/1/device.json", b"{\"name\":\"keyboard\"}")
-        .unwrap();
+    let address = [1, 2, 3, 4, 5, 6];
+    let identity = block_on(Identity::initialize(&mut fs, address, || {
+        0x0123_4567_89ab_cdef
+    }))
+    .unwrap();
     let mut fs = open().unwrap();
+    assert_eq!(block_on(Identity::load(&mut fs)).unwrap(), Some(identity));
     let mut bytes = [0; 100];
-    let n = fs
-        .read_file("/devices/1/device.json", 0, &mut bytes)
-        .unwrap();
-    assert_eq!(&bytes[..n], b"{\"name\":\"keyboard\"}");
+    let n = fs.read_file("/identity.pb", 0, &mut bytes).unwrap();
+    let saved = cordial_protocol::storage::Identity::decode(&bytes[..n]).unwrap();
+    assert_eq!(saved.address, address);
     FLASH.with_borrow(|f| assert!(f[..4096].iter().all(|b| *b == 0x42)));
 }
 #[test]

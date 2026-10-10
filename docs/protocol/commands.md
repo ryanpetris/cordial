@@ -290,7 +290,7 @@ See [Input profiles](../input-profiles.md) for external editors.
 
 ### Lost profiles
 
-A profile whose `profile.json` turns out to be missing or undecodable when the Dongle reads it is
+A profile whose `profile.pb` turns out to be missing or undecodable when the Dongle reads it is
 deleted with its rules, and `profile_removed` follows. Its references are removed first, so no
 device applies its rules once deletion begins. An undecodable rules file is removed, leaving the
 profile empty, and a `profile_rules_changed` event follows. Neither cleanup runs between a

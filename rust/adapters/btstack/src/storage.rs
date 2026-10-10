@@ -213,12 +213,30 @@ impl<S: RecordStore> RecordStore for Handle<'_, S> {
             .await
     }
 
+    async fn load_owned(&mut self, key: RecordKey) -> Result<Option<Vec<u8>>, Error> {
+        if let Some(error) = self.0.error() {
+            return Err(error);
+        }
+        let mut store = self.0.store.try_lock().map_err(|_| Error::Unavailable)?;
+        store.load_owned(key).await
+    }
     async fn load(&mut self, key: RecordKey, value: &mut [u8]) -> Result<Option<usize>, Error> {
         if let Some(error) = self.0.error() {
             return Err(error);
         }
         let mut store = self.0.store.try_lock().map_err(|_| Error::Unavailable)?;
         store.load(key, value).await
+    }
+    async fn read_parts(
+        &mut self,
+        key: RecordKey,
+        f: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, Error> {
+        if let Some(error) = self.0.error() {
+            return Err(error);
+        }
+        let mut store = self.0.store.try_lock().map_err(|_| Error::Unavailable)?;
+        store.read_parts(key, f).await
     }
     async fn save(&mut self, key: RecordKey, value: &[u8]) -> Result<(), Error> {
         if let Some(error) = self.0.error() {

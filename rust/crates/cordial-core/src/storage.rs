@@ -1,4 +1,6 @@
+use crate::model::settings::{SettingKey, SettingScope};
 use alloc::vec::Vec;
+use cordial_protocol::storage as saved;
 
 /// Logical document selector. Backends map kind and owner to filesystem paths.
 pub type RecordKey = [u8; 9];
@@ -82,6 +84,8 @@ pub trait RecordStore {
         }
         Ok(ids)
     }
+    /// Record `key` whole. Backends that know the record's length override this to allocate
+    /// once; this default grows a buffer until `load` fits.
     async fn load_owned(&mut self, key: RecordKey) -> Result<Option<Vec<u8>>, Error> {
         let mut bytes = Vec::new();
         let mut size = 512usize;
@@ -100,6 +104,20 @@ pub trait RecordStore {
                 Err(e) => return Err(e),
             }
         }
+    }
+    /// Reads record `key` from its start, handing it to `f` a part at a time until `f` returns
+    /// false or the record ends. Returns whether the record exists. Backends override this to
+    /// hold one part at a time; this default reads the record whole and hands it over at once.
+    async fn read_parts(
+        &mut self,
+        key: RecordKey,
+        f: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, Error> {
+        let Some(bytes) = self.load_owned(key).await? else {
+            return Ok(false);
+        };
+        f(&bytes);
+        Ok(true)
     }
     /// Conservative remaining payload budget after backend reclamation reserves.
     async fn available(&mut self) -> Result<usize, Error>;
@@ -120,6 +138,28 @@ pub async fn save_confirmed<S: RecordStore>(
 }
 pub async fn remove_confirmed<S: RecordStore>(store: &mut S, key: RecordKey) -> Result<(), Error> {
     store.remove(key).await
+}
+/// Whether record `key` holds exactly `bytes`, or does not exist when `bytes` is `None`. Reads the
+/// record a part at a time.
+pub async fn holds<S: RecordStore>(
+    store: &mut S,
+    key: RecordKey,
+    bytes: Option<&[u8]>,
+) -> Result<bool, Error> {
+    let expected = bytes.unwrap_or_default();
+    let mut at = 0;
+    let mut same = true;
+    let found = store
+        .read_parts(key, &mut |part| {
+            same = expected.get(at..at + part.len()) == Some(part);
+            at += part.len();
+            same
+        })
+        .await?;
+    Ok(match bytes {
+        Some(_) => found && same && at == expected.len(),
+        None => !found,
+    })
 }
 fn preference_error(error: Error) -> crate::settings::Error {
     match error {
@@ -163,6 +203,16 @@ impl<S: RecordStore> RecordStore for Result<S, Error> {
         self.as_mut().map_err(|e| *e)?.available().await
     }
 
+    async fn load_owned(&mut self, key: RecordKey) -> Result<Option<Vec<u8>>, Error> {
+        self.as_mut().map_err(|e| *e)?.load_owned(key).await
+    }
+    async fn read_parts(
+        &mut self,
+        key: RecordKey,
+        f: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, Error> {
+        self.as_mut().map_err(|e| *e)?.read_parts(key, f).await
+    }
     async fn load(&mut self, key: RecordKey, value: &mut [u8]) -> Result<Option<usize>, Error> {
         self.as_mut().map_err(|e| *e)?.load(key, value).await
     }
@@ -190,42 +240,117 @@ pub fn record_key(kind: u8, owner: u64) -> RecordKey {
     key
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Sequence {
-    pub device: u64,
-    pub profile: u64,
+/// The bytes of a saved record: `message` encoded into a buffer of exactly its length.
+pub fn encode<M: prost::Message>(message: &M) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(message.encoded_len())
+        .map_err(|_| Error::Unavailable)?;
+    message.encode(&mut bytes).map_err(|_| Error::TooLarge)?;
+    Ok(bytes)
+}
+/// The saved record in `bytes`. `Corrupt` when they do not decode as `M`.
+pub fn decode<M: prost::Message + Default>(bytes: &[u8]) -> Result<M, Error> {
+    M::decode(bytes).map_err(|_| Error::Corrupt)
+}
+/// A fixed-length byte field of a saved record. `Corrupt` when it has another length.
+pub fn array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Error> {
+    bytes.try_into().map_err(|_| Error::Corrupt)
+}
+/// A numeric field of a saved record that the firmware holds in a narrower type. `Corrupt` when
+/// it does not fit.
+pub fn narrow<T: TryFrom<u32>>(value: u32) -> Result<T, Error> {
+    T::try_from(value).map_err(|_| Error::Corrupt)
 }
 
+const SEQUENCE: RecordKey = [7, 0, 0, 0, 0, 0, 0, 0, 0];
+/// The sequence a new filesystem starts with.
+const FIRST: saved::Sequence = saved::Sequence {
+    next_device: 1,
+    next_profile: 1,
+};
+
+/// Allocates the next device ID, or the next profile ID when `profile`, and saves the sequence
+/// before returning it.
 pub async fn allocate<S: RecordStore>(store: &mut S, profile: bool) -> Result<u64, Error> {
-    let key = record_key(7, 0);
-    let bytes = store.load_owned(key).await?.ok_or(Error::Corrupt)?;
-    let mut sequence: Sequence = serde_json::from_slice(&bytes).map_err(|_| Error::Corrupt)?;
-    let counter = if profile {
-        &mut sequence.profile
+    let bytes = store.load_owned(SEQUENCE).await?.ok_or(Error::Corrupt)?;
+    let mut sequence: saved::Sequence = decode(&bytes)?;
+    if sequence.next_device == 0 || sequence.next_profile == 0 {
+        return Err(Error::Corrupt);
+    }
+    let next = if profile {
+        &mut sequence.next_profile
     } else {
-        &mut sequence.device
+        &mut sequence.next_device
     };
+    let id = *next;
     // Identifiers are 32-bit on the wire.
-    *counter = counter
-        .checked_add(1)
-        .filter(|id| *id <= u64::from(u32::MAX))
-        .ok_or(Error::Full)?;
-    let id = *counter;
-    store.save(key, &json(&sequence)?).await?;
+    if id > u64::from(u32::MAX) {
+        return Err(Error::Full);
+    }
+    *next = id + 1;
+    store.save(SEQUENCE, &encode(&sequence)?).await?;
     Ok(id)
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Integration {
-    Hidpp,
+fn preference(value: &crate::compact::Preference) -> saved::Preference {
+    let metadata = &value.metadata;
+    saved::Preference {
+        integration: saved::Integration::Hidpp.into(),
+        metadata: Some(saved::SettingMetadata {
+            key: metadata.key.name().into(),
+            feature: metadata.feature.0.into(),
+            revision: metadata.revision.0.into(),
+            scope: match metadata.scope {
+                SettingScope::Device => saved::SettingScope::Device,
+                SettingScope::CurrentHost => saved::SettingScope::CurrentHost,
+            }
+            .into(),
+            choices: metadata.choices.iter().copied().map(u32::from).collect(),
+            range: metadata.range.map(|range| saved::Range {
+                min: range.min.into(),
+                max: range.max.into(),
+                step: range.step.into(),
+            }),
+        }),
+        value: value.value.into(),
+    }
 }
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SavedPreference<T> {
-    integration: Integration,
-    #[serde(flatten)]
-    preference: T,
+/// A saved preference of an integration the firmware has; `None` for another integration.
+fn saved_preference(value: saved::Preference) -> Result<Option<crate::compact::Preference>, Error> {
+    if value.integration != i32::from(saved::Integration::Hidpp) {
+        return Ok(None);
+    }
+    let metadata = value.metadata.ok_or(Error::Corrupt)?;
+    let range = metadata
+        .range
+        .map(|range| {
+            Ok::<_, Error>(crate::compact::Range {
+                min: narrow(range.min)?,
+                max: narrow(range.max)?,
+                step: narrow(range.step)?,
+            })
+        })
+        .transpose()?;
+    Ok(Some(crate::compact::Preference {
+        metadata: crate::compact::Metadata {
+            key: SettingKey::from_name(&metadata.key).ok_or(Error::Corrupt)?,
+            feature: crate::model::hidpp::FeatureId(narrow(metadata.feature)?),
+            revision: crate::model::hidpp::FeatureRevision(narrow(metadata.revision)?),
+            scope: match saved::SettingScope::try_from(metadata.scope) {
+                Ok(saved::SettingScope::Device) => SettingScope::Device,
+                Ok(saved::SettingScope::CurrentHost) => SettingScope::CurrentHost,
+                _ => return Err(Error::Corrupt),
+            },
+            choices: metadata
+                .choices
+                .into_iter()
+                .map(narrow)
+                .collect::<Result<_, _>>()?,
+            range,
+        },
+        value: narrow(value.value)?,
+    }))
 }
 
 pub struct Preferences<'a, S> {
@@ -240,9 +365,16 @@ impl<S: RecordStore> Preferences<'_, S> {
         let Some(bytes) = self.store.load_owned(self.key()).await? else {
             return Ok(Vec::new());
         };
-        let saved: Vec<SavedPreference<crate::compact::Preference>> =
-            serde_json::from_slice(&bytes).map_err(|_| Error::Corrupt)?;
-        let result: Vec<_> = saved.into_iter().map(|p| p.preference).collect();
+        let saved: saved::Settings = decode(&bytes)?;
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(saved.preferences.len())
+            .map_err(|_| Error::Unavailable)?;
+        for preference in saved.preferences {
+            if let Some(preference) = saved_preference(preference)? {
+                result.push(preference);
+            }
+        }
         for (i, p) in result.iter().enumerate() {
             if !p.valid()
                 || result[..i]
@@ -258,14 +390,10 @@ impl<S: RecordStore> Preferences<'_, S> {
         if values.is_empty() {
             self.store.remove(self.key()).await
         } else {
-            let saved: Vec<_> = values
-                .iter()
-                .map(|preference| SavedPreference {
-                    integration: Integration::Hidpp,
-                    preference,
-                })
-                .collect();
-            self.store.save(self.key(), &json(&saved)?).await
+            let saved = saved::Settings {
+                preferences: values.iter().map(preference).collect(),
+            };
+            self.store.save(self.key(), &encode(&saved)?).await
         }
     }
 }
@@ -330,80 +458,43 @@ impl<S: RecordStore> crate::settings::PreferenceStore for Preferences<'_, S> {
             .map_err(preference_error)
     }
 }
-pub fn json<T: serde::Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Error> {
-    let mut bytes = Vec::new();
-    let mut size = 512;
-    loop {
-        bytes
-            .try_reserve_exact(size - bytes.len())
-            .map_err(|_| Error::Unavailable)?;
-        bytes.resize(size, 0);
-        match serde_json_core::to_slice(value, &mut bytes) {
-            Ok(n) => {
-                bytes.truncate(n);
-                return Ok(bytes);
-            }
-            Err(serde_json_core::ser::Error::BufferFull) => {
-                size = size.checked_mul(2).ok_or(Error::TooLarge)?
-            }
-            Err(_) => return Err(Error::Corrupt),
-        }
-    }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Format {
-    pub format: u8,
-    pub initialized: bool,
-}
-pub async fn format<S: RecordStore>(store: &mut S) -> Result<Format, Error> {
-    let bytes = store
-        .load_owned(record_key(0, 0))
-        .await?
-        .ok_or(Error::Layout)?;
-    let value: Format = serde_json::from_slice(&bytes).map_err(|_| Error::Layout)?;
-    if value.format != 1 {
+const FORMAT: RecordKey = [0; 9];
+/// The value of `Format.format`.
+const FORMAT_VALUE: u32 = 1;
+/// The filesystem's root record. `Layout` when it is missing or is not this firmware's.
+pub async fn format<S: RecordStore>(store: &mut S) -> Result<saved::Format, Error> {
+    let bytes = store.load_owned(FORMAT).await?.ok_or(Error::Layout)?;
+    let value: saved::Format = decode(&bytes).map_err(|_| Error::Layout)?;
+    if value.format != FORMAT_VALUE {
         return Err(Error::Layout);
     }
     Ok(value)
 }
+fn format_record(initialized: bool) -> Result<Vec<u8>, Error> {
+    encode(&saved::Format {
+        format: FORMAT_VALUE,
+        initialized,
+    })
+}
 pub async fn initialized<S: RecordStore>(store: &mut S) -> Result<(), Error> {
-    let sequence = record_key(7, 0);
     let initialized = format(store).await?.initialized;
-    if store.load_owned(sequence).await?.is_none() {
+    if store.load_owned(SEQUENCE).await?.is_none() {
         if initialized {
             return Err(Error::Corrupt);
         }
-        store.save(sequence, &json(&Sequence::default())?).await?;
+        store.save(SEQUENCE, &encode(&FIRST)?).await?;
     }
     if !initialized {
-        store
-            .save(
-                record_key(0, 0),
-                &json(&Format {
-                    format: 1,
-                    initialized: true,
-                })?,
-            )
-            .await?;
+        store.save(FORMAT, &format_record(true)?).await?;
     }
     Ok(())
 }
 /// A missing header is provisioned only in a verified empty filesystem.
 pub async fn open<S: RecordStore>(store: &mut S) -> Result<(), Error> {
-    if store.load_owned(record_key(0, 0)).await?.is_some() {
+    if store.load_owned(FORMAT).await?.is_some() {
         format(store).await.map(|_| ())
     } else if store.next_key(None).await?.is_none() {
-        store
-            .save(
-                record_key(0, 0),
-                &json(&Format {
-                    format: 1,
-                    initialized: false,
-                })?,
-            )
-            .await
+        store.save(FORMAT, &format_record(false)?).await
     } else {
         Err(Error::Layout)
     }

@@ -243,38 +243,14 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
         // Never format on mount failure. An interrupted provisioning attempt
         // requires explicit recovery, just like unknown or damaged storage.
         store.mount.with(|_| Ok(())).map_err(error)?;
-        // Cleanup is best effort, and its first failure ends it: a stale temporary file is
-        // truncated by the next replacement, listings skip a record directory without its
-        // record file, and record IDs are never reused. A failure that may leave the mounted
-        // state behind the flash unmounts it, so the next operation mounts again.
+        // Cleanup removes record directories without their commit file, or with an empty one. It
+        // is best effort, and its first failure ends it: loads find no record in such a
+        // directory, and record IDs are never reused. A failure that may leave the mounted state
+        // behind the flash unmounts it, so the next operation mounts again.
         let _ = store.mount.with(|fs| {
-            for name in [
-                "/identity.json.tmp",
-                "/adapter.json.tmp",
-                "/sequence.json.tmp",
-                "/format.json.tmp",
-            ] {
-                let path = PathBuf::try_from(name).map_err(|_| LfsError::INVALID)?;
-                match fs.remove(&path) {
-                    Ok(()) | Err(LfsError::NO_SUCH_ENTRY) => (),
-                    Err(e) => return Err(e),
-                }
-            }
-            for (directory, record, temps) in [
-                (
-                    path!("/devices"),
-                    path!("device.json"),
-                    &[
-                        path!("device.json.tmp"),
-                        path!("settings.json.tmp"),
-                        path!("layout.json.tmp"),
-                    ][..],
-                ),
-                (
-                    path!("/profiles"),
-                    path!("profile.json"),
-                    &[path!("profile.json.tmp"), path!("rules.json.tmp")][..],
-                ),
+            for (directory, record) in [
+                (path!("/devices"), path!("device.pb")),
+                (path!("/profiles"), path!("profile.pb")),
             ] {
                 match fs.read_dir_and_then(directory, |iter| {
                     for entry in iter {
@@ -285,18 +261,13 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
                             continue;
                         }
                         match fs.metadata(&entry.path().join(record)) {
-                            // A directory in the commit file's place holds no record.
-                            Ok(meta) if !meta.is_file() => fs.remove_dir_all(entry.path())?,
-                            Err(LfsError::NO_SUCH_ENTRY) => fs.remove_dir_all(entry.path())?,
-                            Err(e) => return Err(e),
-                            Ok(_) => {
-                                for temp in temps {
-                                    match fs.remove(&entry.path().join(temp)) {
-                                        Ok(()) | Err(LfsError::NO_SUCH_ENTRY) => (),
-                                        Err(e) => return Err(e),
-                                    }
-                                }
+                            Ok(meta) if holds_record(&meta) => (),
+                            // A directory, an empty file or nothing in the commit file's place
+                            // holds no record.
+                            Ok(_) | Err(LfsError::NO_SUCH_ENTRY) => {
+                                fs.remove_dir_all(entry.path())?
                             }
+                            Err(e) => return Err(e),
                         }
                     }
                     Ok(())
@@ -408,37 +379,83 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
             })
             .map_err(error)
     }
+    /// Writes `bytes` as the whole file `name`, unless it already holds them. Old contents that
+    /// cannot be read are written over.
+    ///
+    /// The file is opened truncated, written and closed. LittleFS keeps an existing file's old
+    /// contents until the close commits the new ones in one metadata commit, so an interrupted
+    /// write leaves the old or the new contents. Creating a missing file commits it empty when it
+    /// is opened, so an interrupted creation can leave an empty file, which holds no record.
     pub fn replace_file(&mut self, name: &str, bytes: &[u8]) -> Result<(), Error> {
         let path = checked_path(name)?;
-        let temp = checked_path(&format!("{name}.tmp"))?;
-        let same = self.mount.with(|fs| equal(fs, &path, bytes));
-        if same == Ok(true) {
-            return Ok(());
+        match self.mount.with(|fs| compare(fs, &path, bytes)) {
+            Ok(Ok(true)) => return Ok(()),
+            Ok(Ok(false)) => {}
+            // Old contents that cannot be read are written over, from a fresh mount.
+            Ok(Err(_)) => self.mount.unmount(),
+            Err(e) => return Err(error(e)),
         }
-        same.map_err(error)?;
-        // Even a failed attempt can change temporary files visible to debug readers.
+        // Even a failed attempt can change the filesystem, such as by creating an empty file.
         self.generation = self.generation.checked_add(1).ok_or(Error::Unavailable)?;
         self.available = None;
-        let result = self.mount.with(|fs| {
-            if let Some(parent) = path.parent() {
-                fs.create_dir_all(&parent)?;
-            }
-            fs.create_file_and_then(&temp, |file| file.write_all(bytes))?;
-            fs.rename(&temp, &path)
-        });
+        let mut started = false;
+        let mut unwritten = false;
+        let result = self
+            .mount
+            .with(|fs| {
+                started = true;
+                if let Some(parent) = path.parent() {
+                    fs.create_dir_all(&parent)?;
+                }
+                // A failed write marks the file errored, so closing it does not commit.
+                fs.create_file_and_then(&path, |file| {
+                    file.write_all(bytes).inspect_err(|_| unwritten = true)
+                })
+            })
+            // LittleFS reports a creation whose commit finds no room as a name too long. A checked
+            // path is within LittleFS's 255-byte name limit, so the filesystem is full.
+            .map_err(|e| match e {
+                LfsError::FILENAME_TOO_LONG => LfsError::NO_SPACE,
+                e => e,
+            });
         match result {
             Ok(()) => Ok(()),
+            // A filesystem that cannot be mounted was not changed.
+            Err(e) if !started => Err(error(e)),
             Err(e) => {
                 // Resolve against a fresh mount, never the mutation's caches.
                 self.mount.unmount();
                 match self.mount.with(|fs| equal(fs, &path, bytes)) {
                     Ok(true) => Ok(()),
                     Ok(false) => {
-                        // The old destination is authoritative. Reclaim the failed
-                        // replacement now; startup retries cleanup after I/O failure.
-                        let _ = self.mount.with(|fs| fs.remove(&temp));
+                        // The old contents are authoritative. An empty file left by a failed
+                        // creation holds no record and is reclaimed now when possible, with its
+                        // record directory when nothing else is in it.
+                        let _ = self.mount.with(|fs| {
+                            match fs.metadata(&path) {
+                                Ok(meta) if meta.is_file() && meta.is_empty() => {
+                                    fs.remove(&path)?
+                                }
+                                Err(LfsError::NO_SUCH_ENTRY) => (),
+                                Ok(_) => return Ok(()),
+                                Err(e) => return Err(e),
+                            }
+                            if (name.starts_with("/devices/") || name.starts_with("/profiles/"))
+                                && let Some(parent) = path.parent()
+                            {
+                                match fs.remove_dir(&parent) {
+                                    Ok(())
+                                    | Err(LfsError::DIR_NOT_EMPTY | LfsError::NO_SUCH_ENTRY) => {}
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            Ok(())
+                        });
                         Err(error(e))
                     }
+                    // A write that failed before closing committed nothing of the new contents,
+                    // whether or not the old ones can be read.
+                    Err(_) if unwritten => Err(error(e)),
                     Err(_) => Err(Error::Unknown),
                 }
             }
@@ -485,18 +502,66 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
         }
     }
 }
+impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
+    /// Reads record `key` whole into the buffer `buffer` supplies for the file's length.
+    fn read_record<B: AsMut<[u8]>>(
+        &mut self,
+        key: RecordKey,
+        buffer: impl FnOnce(usize) -> Result<B, Error>,
+    ) -> Result<Option<B>, Error> {
+        let path = checked_path(&record_path(key)?)?;
+        let read = self.mount.with(|fs| {
+            fs.open_file_and_then(&path, |file| {
+                let n = file.len()?;
+                if n == 0 {
+                    return Ok(Ok(None));
+                }
+                let mut bytes = match buffer(n) {
+                    Ok(bytes) => bytes,
+                    Err(e) => return Ok(Err(e)),
+                };
+                Ok(if file.read(bytes.as_mut())? == n {
+                    Ok(Some(bytes))
+                } else {
+                    Err(Error::Io)
+                })
+            })
+        });
+        match read {
+            Ok(result) => result,
+            Err(LfsError::NO_SUCH_ENTRY) => Ok(None),
+            // A directory in the record's place.
+            Err(LfsError::PATH_IS_DIR) => Err(Error::Io),
+            Err(e) => Err(error(e)),
+        }
+    }
+}
+/// Whether a record file's metadata describes a saved record. Every record is a nonempty
+/// document; an empty file is a creation that did not complete.
+fn holds_record(meta: &littlefs2::fs::Metadata) -> bool {
+    meta.is_file() && !meta.is_empty()
+}
 fn equal<F: driver::Storage>(
     fs: &Filesystem<'_, F>,
     path: &littlefs2::path::Path,
     bytes: &[u8],
 ) -> littlefs2::io::Result<bool> {
+    compare(fs, path, bytes)?
+}
+/// Whether file `path` holds exactly `bytes`. A failure to look the file up is the outer error; a
+/// failure to read the contents of a file of the same length is the inner one.
+fn compare<F: driver::Storage>(
+    fs: &Filesystem<'_, F>,
+    path: &littlefs2::path::Path,
+    bytes: &[u8],
+) -> littlefs2::io::Result<littlefs2::io::Result<bool>> {
     match fs.metadata(path) {
-        Err(LfsError::NO_SUCH_ENTRY) => return Ok(false),
+        Err(LfsError::NO_SUCH_ENTRY) => return Ok(Ok(false)),
         Err(e) => return Err(e),
-        Ok(m) if m.len() != bytes.len() || !m.is_file() => return Ok(false),
+        Ok(m) if m.len() != bytes.len() || !m.is_file() => return Ok(Ok(false)),
         _ => (),
     }
-    fs.open_file_and_then(path, |file| {
+    Ok(fs.open_file_and_then(path, |file| {
         let mut buffer = [0; 512];
         let mut at = 0;
         while at < bytes.len() {
@@ -508,20 +573,20 @@ fn equal<F: driver::Storage>(
             at += n;
         }
         Ok(true)
-    })
+    }))
 }
 fn record_path(key: RecordKey) -> Result<alloc::string::String, Error> {
     let id = u64::from_be_bytes(key[1..].try_into().unwrap());
     Ok(match (key[0], id) {
-        (0, 0) => "/format.json".into(),
-        (1, 0) => "/adapter.json".into(),
-        (3, 0) => "/identity.json".into(),
-        (7, 0) => "/sequence.json".into(),
-        (8, id) if id != 0 => format!("/profiles/{id}/profile.json"),
-        (9, id) if id != 0 => format!("/profiles/{id}/rules.json"),
-        (2, id) if id != 0 => format!("/devices/{id}/device.json"),
-        (4, id) if id != 0 => format!("/devices/{id}/settings.json"),
-        (5, id) if id != 0 => format!("/devices/{id}/layout.json"),
+        (0, 0) => "/format.pb".into(),
+        (1, 0) => "/adapter.pb".into(),
+        (3, 0) => "/identity.pb".into(),
+        (7, 0) => "/sequence.pb".into(),
+        (8, id) if id != 0 => format!("/profiles/{id}/profile.pb"),
+        (9, id) if id != 0 => format!("/profiles/{id}/rules.pb"),
+        (2, id) if id != 0 => format!("/devices/{id}/device.pb"),
+        (4, id) if id != 0 => format!("/devices/{id}/settings.pb"),
+        (5, id) if id != 0 => format!("/devices/{id}/layout.pb"),
         _ => return Err(Error::Bounds),
     })
 }
@@ -624,23 +689,25 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> RecordStore for Storage<F, BLOC
                     }
                 }
                 for (kind, name) in [
-                    (0, path!("/format.json")),
-                    (1, path!("/adapter.json")),
-                    (3, path!("/identity.json")),
-                    (7, path!("/sequence.json")),
+                    (0, path!("/format.pb")),
+                    (1, path!("/adapter.pb")),
+                    (3, path!("/identity.pb")),
+                    (7, path!("/sequence.pb")),
                 ] {
                     match fs.metadata(name) {
-                        Ok(_) => consider(&mut next, after, record_key(kind, 0)),
-                        Err(LfsError::NO_SUCH_ENTRY) => (),
+                        Ok(meta) if holds_record(&meta) => {
+                            consider(&mut next, after, record_key(kind, 0))
+                        }
+                        Ok(_) | Err(LfsError::NO_SUCH_ENTRY) => (),
                         Err(e) => return Err(e),
                     }
                 }
                 for (directory, records) in [
                     (
                         path!("/devices"),
-                        &[(2, "device.json"), (4, "settings.json")][..],
+                        &[(2, "device.pb"), (4, "settings.pb")][..],
                     ),
-                    (path!("/profiles"), &[(8, "profile.json")][..]),
+                    (path!("/profiles"), &[(8, "profile.pb")][..]),
                 ] {
                     if after.is_some_and(|key| key[0] > records.last().unwrap().0)
                         || next.is_some_and(|key| key[0] < records[0].0)
@@ -662,10 +729,11 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> RecordStore for Storage<F, BLOC
                                 let suffix =
                                     PathBuf::try_from(suffix).map_err(|_| LfsError::INVALID)?;
                                 match fs.metadata(&entry.path().join(&suffix)) {
-                                    Ok(meta) if meta.is_file() => {
+                                    Ok(meta) if holds_record(&meta) => {
                                         consider(&mut next, after, record_key(kind, id))
                                     }
-                                    // A directory in a record's place holds no record.
+                                    // A directory or an empty file in a record's place holds
+                                    // no record.
                                     Ok(_) | Err(LfsError::NO_SUCH_ENTRY) => (),
                                     Err(e) => return Err(e),
                                 }
@@ -690,24 +758,43 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> RecordStore for Storage<F, BLOC
         self.available = Some(bytes);
         Ok(bytes)
     }
+    async fn load_owned(&mut self, key: RecordKey) -> Result<Option<Vec<u8>>, Error> {
+        self.read_record(key, |n| {
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(n).map_err(|_| Error::Unavailable)?;
+            bytes.resize(n, 0);
+            Ok(bytes)
+        })
+    }
     async fn load(&mut self, key: RecordKey, bytes: &mut [u8]) -> Result<Option<usize>, Error> {
+        Ok(self
+            .read_record(key, |n| bytes.get_mut(..n).ok_or(Error::TooLarge))?
+            .map(|bytes| bytes.len()))
+    }
+    async fn read_parts(
+        &mut self,
+        key: RecordKey,
+        f: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, Error> {
         let path = checked_path(&record_path(key)?)?;
         let read = self.mount.with(|fs| {
             fs.open_file_and_then(&path, |file| {
-                let n = file.len()?;
-                let Some(bytes) = bytes.get_mut(..n) else {
-                    return Ok(Err(Error::TooLarge));
-                };
-                Ok(if file.read(bytes)? == n {
-                    Ok(Some(n))
-                } else {
-                    Err(Error::Io)
-                })
+                if file.len()? == 0 {
+                    return Ok(false);
+                }
+                // One cache's worth at a time.
+                let mut part = [0; 512];
+                loop {
+                    let n = file.read(&mut part)?;
+                    if n == 0 || !f(&part[..n]) {
+                        return Ok(true);
+                    }
+                }
             })
         });
         match read {
-            Ok(result) => result,
-            Err(LfsError::NO_SUCH_ENTRY) => Ok(None),
+            Ok(found) => Ok(found),
+            Err(LfsError::NO_SUCH_ENTRY) => Ok(false),
             // A directory in the record's place.
             Err(LfsError::PATH_IS_DIR) => Err(Error::Io),
             Err(e) => Err(error(e)),

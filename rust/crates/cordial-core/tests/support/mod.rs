@@ -9,6 +9,10 @@ use cordial_core::{
 use embassy_futures::block_on;
 use std::{collections::BTreeMap, string::String};
 
+/// Bytes that do not decode as any record: a field key cut short.
+#[allow(dead_code)]
+pub const UNDECODABLE: &[u8] = &[0xff];
+
 #[derive(Default)]
 pub struct Store {
     pub records: BTreeMap<RecordKey, Vec<u8>>,
@@ -30,6 +34,15 @@ pub struct Store {
     pub reads: Vec<RecordKey>,
     /// The keys of record saves and removals, in order.
     pub writes: Vec<RecordKey>,
+    /// Free-space counts so far.
+    pub counts: usize,
+    /// Records read a part at a time so far, and the bytes handed out in parts.
+    pub parts: usize,
+    pub part_bytes: usize,
+    /// A record whose saves find the filesystem full.
+    pub full: Option<RecordKey>,
+    /// Runs at the start of each save, such as to advance a test clock.
+    pub on_save: Option<fn()>,
 }
 impl RecordStore for Store {
     async fn generation(&mut self) -> Result<u64, storage::Error> {
@@ -73,6 +86,7 @@ impl RecordStore for Store {
         Ok(self.records.keys().copied().collect())
     }
     async fn available(&mut self) -> Result<usize, storage::Error> {
+        self.counts += 1;
         if self.fail {
             return Err(storage::Error::Io);
         }
@@ -112,13 +126,42 @@ impl RecordStore for Store {
             bytes.len()
         }))
     }
+    /// Hands records over a few bytes at a time, so readers see rules split across parts.
+    async fn read_parts(
+        &mut self,
+        key: RecordKey,
+        f: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<bool, storage::Error> {
+        self.loads += 1;
+        self.reads.push(key);
+        if self.fail || self.fail_load == Some(key) {
+            return Err(storage::Error::Io);
+        }
+        let Some(bytes) = self.records.get(&key).filter(|bytes| !bytes.is_empty()) else {
+            return Ok(false);
+        };
+        self.parts += 1;
+        for part in bytes.chunks(7) {
+            self.part_bytes += part.len();
+            if !f(part) {
+                break;
+            }
+        }
+        Ok(true)
+    }
     async fn save(&mut self, key: RecordKey, value: &[u8]) -> Result<(), storage::Error> {
+        if let Some(f) = self.on_save {
+            f();
+        }
         self.writes.push(key);
         if self.fail {
             return Err(storage::Error::Io);
         }
         if self.fail_save == Some((key, false)) {
             return Err(storage::Error::Io);
+        }
+        if self.full == Some(key) {
+            return Err(storage::Error::Full);
         }
         self.generation += 1;
         self.records.insert(key, value.to_vec());
@@ -347,7 +390,10 @@ pub fn setup() -> (Manager, Store, Radio) {
     block_on(Policies { store: &mut store }.save(&policy)).unwrap();
     store.records.insert(
         storage::record_key(7, 0),
-        br#"{"device":77,"profile":0}"#.to_vec(),
+        prost::Message::encode_to_vec(&cordial_protocol::storage::Sequence {
+            next_device: 78,
+            next_profile: 1,
+        }),
     );
     let mut radio = Radio {
         bonds: vec![peer(1)],

@@ -11,6 +11,7 @@ use cordial_core::{
     storage::{Error, Preferences, RecordKey, RecordStore},
 };
 use embassy_futures::block_on;
+use prost::Message;
 use std::collections::BTreeMap;
 
 #[derive(Default)]
@@ -266,33 +267,26 @@ fn setup_pending_is_saved_only_while_set() {
             peer: Default::default(),
         },
     };
-    let save = |p: &Policy| {
-        cordial_core::storage::json(&cordial_core::bonds::DeviceRecord {
-            policy: p.clone(),
-            bond: bond.clone(),
-        })
-        .unwrap()
-    };
+    let save = |p: &Policy| cordial_core::bonds::record(p, &bond).unwrap();
     let pending = save(&p);
+    let saved = cordial_protocol::storage::Device::decode(pending.as_slice()).unwrap();
+    assert!(saved.policy.unwrap().setup_pending);
     assert!(
-        std::str::from_utf8(&pending)
-            .unwrap()
-            .contains("\"setup_pending\":true")
-    );
-    assert!(
-        cordial_core::codec::read_policy(10, &pending)
+        cordial_core::bonds::read_policy(10, &pending)
             .unwrap()
             .setup_pending
     );
     p.setup_pending = false;
     let done = save(&p);
     assert!(
-        !std::str::from_utf8(&done)
+        !cordial_protocol::storage::Device::decode(done.as_slice())
             .unwrap()
-            .contains("setup_pending")
+            .policy
+            .unwrap()
+            .setup_pending
     );
     assert_eq!(
-        cordial_core::codec::read_policy(10, &done).unwrap(),
+        cordial_core::bonds::read_policy(10, &done).unwrap(),
         Policy { bond: 10, ..p }
     );
 }
@@ -304,26 +298,52 @@ fn only_ble_is_enabled_unless_saved_otherwise() {
         let mut policies = Policies { store: &mut memory };
         let ble_only = policies.load_adapter().await.unwrap().transports;
         assert!(ble_only.contains(Transport::Ble) && !ble_only.contains(Transport::Classic));
-        // A saved preference without the field.
+        // A saved preference without transports.
+        let adapter = |transports| {
+            cordial_protocol::storage::Adapter {
+                name: Some("Desk".into()),
+                host_platform: cordial_protocol::storage::HostPlatform::Mac.into(),
+                transports,
+                configuration_interfaces: Vec::new(),
+            }
+            .encode_to_vec()
+        };
         policies
             .store
             .save(
                 cordial_core::storage::record_key(1, 0),
-                br#"{"name":"Desk","host_platform":"mac"}"#,
+                &adapter(Vec::new()),
             )
             .await
             .unwrap();
         let saved = policies.load_adapter().await.unwrap();
         assert_eq!(saved.name.as_deref(), Some("Desk"));
+        assert_eq!(saved.host_platform, HostPlatform::Mac);
         assert_eq!(saved.transports, ble_only);
-        // The enabled transports are saved by name, and none is a valid choice.
-        for (names, enabled) in [
+        // Each transport has an entry, and none enabled is a valid choice. An entry of a
+        // transport this firmware doesn't know is left out.
+        let entry = |transport: i32, enabled| cordial_protocol::storage::TransportPreference {
+            transport,
+            enabled,
+        };
+        let (classic, ble) = (
+            cordial_protocol::storage::Transport::Classic.into(),
+            cordial_protocol::storage::Transport::Ble.into(),
+        );
+        for (entries, enabled) in [
             (
-                r#"["ble","classic"]"#,
+                vec![entry(ble, true), entry(classic, true), entry(9, true)],
                 &[Transport::Classic, Transport::Ble][..],
             ),
-            (r#"["classic"]"#, &[Transport::Classic]),
-            ("[]", &[]),
+            (
+                vec![entry(classic, true)],
+                &[Transport::Classic, Transport::Ble],
+            ),
+            (
+                vec![entry(classic, true), entry(ble, false)],
+                &[Transport::Classic],
+            ),
+            (vec![entry(classic, false), entry(ble, false)], &[]),
         ] {
             let mut transports = Transports::NONE;
             for t in enabled {
@@ -335,14 +355,21 @@ fn only_ble_is_enabled_unless_saved_otherwise() {
             };
             policies.save_adapter(&preference).await.unwrap();
             assert_eq!(policies.load_adapter().await.unwrap(), preference);
-            let json = format!(r#"{{"name":"Desk","host_platform":"mac","transports":{names}}}"#);
             policies
                 .store
-                .save(cordial_core::storage::record_key(1, 0), json.as_bytes())
+                .save(cordial_core::storage::record_key(1, 0), &adapter(entries))
                 .await
                 .unwrap();
             assert_eq!(policies.load_adapter().await.unwrap(), preference);
         }
+        // Writers list every transport, so a saved preference is never empty.
+        policies
+            .save_adapter(&AdapterPreference::default())
+            .await
+            .unwrap();
+        let bytes = &policies.store.values[&cordial_core::storage::record_key(1, 0)];
+        let saved = cordial_protocol::storage::Adapter::decode(bytes.as_slice()).unwrap();
+        assert_eq!(saved.transports, [entry(classic, false), entry(ble, true)]);
     });
 }
 

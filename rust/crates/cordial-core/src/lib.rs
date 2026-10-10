@@ -9,6 +9,7 @@ pub mod codec;
 pub mod compact;
 pub mod configurator;
 pub mod control;
+pub mod deferred;
 pub mod devices;
 pub mod features;
 pub mod forward;
@@ -26,7 +27,5 @@ pub mod storage;
 pub mod wire;
 
 pub mod identity;
-
-pub mod hex;
 
 pub mod battery;

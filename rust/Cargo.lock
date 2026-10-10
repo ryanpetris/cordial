@@ -261,6 +261,7 @@ dependencies = [
  "prost",
  "ratatui",
  "rustix",
+ "serde",
  "serde_json",
  "unicode-properties",
  "unicode-segmentation",
@@ -287,7 +288,6 @@ dependencies = [
  "heapless",
  "prost",
  "serde",
- "serde-json-core",
  "serde_json",
 ]
 
@@ -309,11 +309,12 @@ name = "cordial-record-storage"
 version = "0.0.0"
 dependencies = [
  "cordial-core",
+ "cordial-protocol",
  "delog",
  "embassy-futures",
  "embedded-storage-async",
  "littlefs2",
- "serde_json",
+ "prost",
 ]
 
 [[package]]
@@ -1662,16 +1663,6 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde-json-core"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b81787e655bd59cecadc91f7b6b8651330b2be6c33246039a65e5cd6f4e0828"
-dependencies = [
- "ryu",
- "serde",
 ]
 
 [[package]]

@@ -15,7 +15,8 @@ const check = process.argv.includes("--check");
 function messages(out) {
   // buf only reads module paths inside the current directory, so the schema
   // directory is the input and this package's buf.yaml is passed explicitly.
-  execFileSync("buf", ["generate", proto, "--config", join(root, "buf.yaml"), "--template", join(root, "buf.gen.yaml"), "--output", out], {
+  // Only the serial API is generated; the storage records stay on the Dongle.
+  execFileSync("buf", ["generate", proto, "--path", join(proto, "cordial.proto"), "--config", join(root, "buf.yaml"), "--template", join(root, "buf.gen.yaml"), "--output", out], {
     cwd: root,
     stdio: "inherit",
   });

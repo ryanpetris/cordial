@@ -25,9 +25,9 @@ def normalize(config, profile):
             raise ValueError("LED pin is absent, reserved for flash, or used by native USB")
     physical = {k: config[k] for k in ("chip", "package", "flash_bytes", "xosc_hz", "mcu_led")}
     digest = hashlib.sha256(json.dumps(physical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    layout = {"format": "littlefs-json-1", "storage_backend": "littlefs",
+    layout = {"format": "littlefs-2", "storage_backend": "littlefs",
               "offset": flash - storage, "bytes": storage, "erase_bytes": 4096,
-              "guard_bytes": 4096, "native_offset": 0x9000, "native_bytes": 0x6000}
+              "guard_bytes": 4096}
     marker = hashlib.sha256(json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()).digest()
     return config | {"profile": profile, "target": "xtensa-esp32s3-espidf",
                      "storage_bytes": storage, "hardware_digest": digest, "storage_offset": flash - storage,
@@ -40,7 +40,6 @@ def generate(config, out):
     out.mkdir(parents=True, exist_ok=True)
     partitions = out / "partitions.csv"
     partitions.write_text(f"""# Name,Type,SubType,Offset,Size
-nvs,data,nvs,0x9000,0x6000
 phy_init,data,phy,0xf000,0x1000
 factory,app,factory,0x10000,{config['storage_offset'] - 0x10000:#x}
 cordial_layout,data,0x40,{config['storage_offset']:#x},0x1000
@@ -52,6 +51,9 @@ cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_byte
         "ESP_CONSOLE_NONE": True, "ESP_CONSOLE_SECONDARY_NONE": True,
         "USJ_ENABLE_USB_SERIAL_JTAG": True, "LOG_DEFAULT_LEVEL_NONE": True,
         "BOOTLOADER_LOG_LEVEL_NONE": True,
+        # The partition table has no NVS partition. Calibrate the PHY fully at
+        # every boot rather than loading and storing calibration data in NVS.
+        "ESP_PHY_CALIBRATION_AND_DATA_STORAGE": False,
         "FREERTOS_HZ": 1000, "ESP_MAIN_TASK_STACK_SIZE": 65536,
         f"ESPTOOLPY_FLASHSIZE_{config['flash_bytes'] // 1048576}MB": True,
         "PARTITION_TABLE_CUSTOM": True, "PARTITION_TABLE_CUSTOM_FILENAME": str(partitions.resolve()),
@@ -86,8 +88,6 @@ pub const HARDWARE: &str = {json.dumps(config['name'])};
 pub const PROFILE_MEMORY_BUDGET: Option<u32> = {profile_memory_budget(config)};
 pub const STORAGE_START: u32 = {config['storage_offset']};
 pub const STORAGE_END: u32 = {config['flash_bytes']};
-pub const NATIVE_STORAGE_START: u32 = 0x9000;
-pub const NATIVE_STORAGE_END: u32 = 0xf000;
 pub const STORAGE_IDENTITY: [u8; 32] = {list(config['storage_identity'])!r};
 pub const MCU_LED: Option<(u8, bool)> = {('Some((' + str(config['mcu_led']['pin']) + ', ' + str(config['mcu_led']['active_low']).lower() + '))') if config['mcu_led'] else 'None'};
 """)

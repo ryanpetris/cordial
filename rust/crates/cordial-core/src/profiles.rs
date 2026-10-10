@@ -10,8 +10,9 @@ use alloc::{
     string::String,
     vec::Vec,
 };
+use cordial_protocol::storage as saved;
 use core::cell::RefCell;
-use serde::{Deserialize, Serialize};
+use prost::Message;
 
 /// A HID usage as `(usage page << 16) | usage`. Zero names nothing.
 pub type Usage = u32;
@@ -241,14 +242,19 @@ impl Rule {
         }
     }
     /// The role of the input this rule changes, as a `hid` role bit.
+    #[cfg(test)]
     fn role(&self) -> u8 {
-        match input_collection(self.input) {
-            KEYBOARD => crate::hid::KEYBOARD,
-            MOUSE => crate::hid::MOUSE,
-            CONSUMER => crate::hid::CONSUMER,
-            SYSTEM => crate::hid::SYSTEM,
-            _ => 0,
-        }
+        role(self.input)
+    }
+}
+/// The role of `input`, as a `hid` role bit.
+fn role(input: Usage) -> u8 {
+    match input_collection(input) {
+        KEYBOARD => crate::hid::KEYBOARD,
+        MOUSE => crate::hid::MOUSE,
+        CONSUMER => crate::hid::CONSUMER,
+        SYSTEM => crate::hid::SYSTEM,
+        _ => 0,
     }
 }
 
@@ -257,6 +263,22 @@ pub enum Change {
     Set(Rule),
     /// Forgets the rule for this input.
     Forget(Usage),
+}
+impl Change {
+    fn input(&self) -> Usage {
+        match self {
+            Self::Set(rule) => rule.input,
+            Self::Forget(input) => *input,
+        }
+    }
+    /// The rule this change leaves for its input: none for a forget or a rule that changes
+    /// nothing.
+    fn rule(&self) -> Option<&Rule> {
+        match self {
+            Self::Set(rule) if !rule.identity() => Some(rule),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -269,9 +291,23 @@ struct Entry {
 }
 const SCALE: u8 = u8::MAX;
 
+#[derive(PartialEq)]
 enum Found<'a> {
     Remap(&'a [Output]),
     Scale(i32, u32),
+}
+impl<'a> Found<'a> {
+    fn of(effect: &'a Effect) -> Self {
+        match effect {
+            Effect::Remap(outputs) => Self::Remap(outputs),
+            Effect::Scale(n, d) => Self::Scale(*n, *d),
+        }
+    }
+}
+/// One rule of a table after changes: one it keeps, or one a change sets.
+enum Merged<'a> {
+    Kept(&'a Entry),
+    Set(&'a Rule),
 }
 
 /// A profile's rules, sorted by input for lookup.
@@ -366,6 +402,25 @@ impl Rules {
     pub fn iter(&self) -> impl Iterator<Item = Rule> + '_ {
         self.entries.iter().map(|e| self.rule(e))
     }
+    /// The rules for inputs above `after`, in ascending input order.
+    pub fn after(&self, after: Option<Usage>) -> impl Iterator<Item = Rule> + '_ {
+        let start = after.map_or(0, |after| {
+            self.entries.partition_point(|e| e.input <= after)
+        });
+        self.entries[start..].iter().map(|e| self.rule(e))
+    }
+    /// The inputs that have a rule, in ascending order.
+    pub fn inputs(&self) -> impl Iterator<Item = Usage> + '_ {
+        self.entries.iter().map(|e| e.input)
+    }
+    /// The rule for `input`, if it has one.
+    pub fn get(&self, input: Usage) -> Option<Rule> {
+        let i = self
+            .entries
+            .binary_search_by_key(&input, |e| e.input)
+            .ok()?;
+        Some(self.rule(&self.entries[i]))
+    }
     /// The rule for `input`.
     fn lookup(&self, input: Usage) -> Option<Found<'_>> {
         let i = self
@@ -382,162 +437,298 @@ impl Rules {
     }
     /// The roles of the input the rules change, as `hid` role bits.
     pub fn roles(&self) -> u8 {
-        self.iter().fold(0, |roles, rule| roles | rule.role())
+        self.entries
+            .iter()
+            .fold(0, |roles, e| roles | role(e.input))
     }
-    /// The table after `changes`, applied in order. A rule that changes nothing forgets the rule
-    /// it would replace.
-    pub fn changed(&self, changes: Vec<Change>) -> Result<Self, Error> {
-        let mut rules: Vec<Rule> = self.iter().collect();
-        for change in changes {
-            let input = match &change {
-                Change::Set(rule) => rule.input,
-                Change::Forget(input) => *input,
-            };
-            rules.retain(|r| r.input != input);
-            if let Change::Set(rule) = change
-                && !rule.identity()
-            {
-                rules.try_reserve(1).map_err(|_| Error::Capacity)?;
-                rules.push(rule);
-            }
-        }
-        Self::new(rules)
-    }
-}
-
-/// The inputs whose rule differs between `before` and `after`, including those only one of them
-/// has a rule for, in ascending order.
-pub fn differences(before: &Rules, after: &Rules) -> Vec<Usage> {
-    let (mut old, mut new) = (before.iter().peekable(), after.iter().peekable());
-    let mut inputs = Vec::new();
-    loop {
-        match (old.peek().map(|r| r.input), new.peek().map(|r| r.input)) {
-            (None, None) => return inputs,
-            (Some(a), Some(b)) if a == b => {
-                if old.next() != new.next() {
-                    inputs.push(a);
+    /// The rules of this table and `changes` sorted by input with one change per input, merged
+    /// in input order: a change replaces the rule for its input.
+    fn merged<'a>(&'a self, changes: &'a [Change]) -> impl Iterator<Item = Merged<'a>> + 'a {
+        let (mut kept, mut changed) = (0, 0);
+        core::iter::from_fn(move || {
+            loop {
+                let entry = self.entries.get(kept);
+                let Some(change) = changes.get(changed) else {
+                    kept += 1;
+                    return entry.map(Merged::Kept);
+                };
+                if let Some(entry) = entry.filter(|e| e.input < change.input()) {
+                    kept += 1;
+                    return Some(Merged::Kept(entry));
+                }
+                if entry.is_some_and(|e| e.input == change.input()) {
+                    kept += 1;
+                }
+                changed += 1;
+                if let Some(rule) = change.rule() {
+                    return Some(Merged::Set(rule));
                 }
             }
-            (Some(a), Some(b)) if a < b => {
-                old.next();
-                inputs.push(a);
-            }
-            (Some(a), None) => {
-                old.next();
-                inputs.push(a);
-            }
-            (_, Some(b)) => {
-                new.next();
-                inputs.push(b);
+        })
+    }
+    /// The table after `changes`, applied in order, and the inputs whose rule they change, in
+    /// ascending order. A rule that changes nothing forgets the rule it would replace. The new
+    /// table is merged from this one and reserved at its exact size; this one is only read.
+    pub fn changed(&self, mut changes: Vec<Change>) -> Result<(Self, Vec<Usage>), Error> {
+        // The last change to each input is the one that applies.
+        changes.reverse();
+        changes.sort_by_key(Change::input);
+        changes.dedup_by_key(|c| c.input());
+        let mut inputs = Vec::new();
+        inputs
+            .try_reserve_exact(changes.len())
+            .map_err(|_| Error::Capacity)?;
+        inputs.extend(
+            changes
+                .iter()
+                .filter(|c| self.lookup(c.input()) != c.rule().map(|rule| Found::of(&rule.effect)))
+                .map(Change::input),
+        );
+        let (mut rules, mut outputs, mut scales) = (0, 0, 0);
+        for item in self.merged(&changes) {
+            rules += 1;
+            match item {
+                Merged::Kept(entry) if entry.count == SCALE => scales += 1,
+                Merged::Kept(entry) => outputs += usize::from(entry.count),
+                Merged::Set(Rule {
+                    effect: Effect::Scale(..),
+                    ..
+                }) => scales += 1,
+                Merged::Set(Rule {
+                    effect: Effect::Remap(o),
+                    ..
+                }) => outputs += o.len(),
             }
         }
+        if outputs > usize::from(u16::MAX) || scales > usize::from(u16::MAX) {
+            return Err(Error::Limit);
+        }
+        let mut table = Self::default();
+        table
+            .entries
+            .try_reserve_exact(rules)
+            .map_err(|_| Error::Capacity)?;
+        table
+            .outputs
+            .try_reserve_exact(outputs)
+            .map_err(|_| Error::Capacity)?;
+        table
+            .scales
+            .try_reserve_exact(scales)
+            .map_err(|_| Error::Capacity)?;
+        for item in self.merged(&changes) {
+            let (input, found) = match item {
+                Merged::Kept(entry) => (entry.input, self.found(entry)),
+                Merged::Set(rule) => match &rule.effect {
+                    // A rule a change sets holds what a remap may; one kept is left as it is.
+                    Effect::Remap(o) if o.len() > MAX_REMAP_OUTPUTS => return Err(Error::Limit),
+                    effect => (rule.input, Found::of(effect)),
+                },
+            };
+            let (first, count) = match found {
+                Found::Remap(o) => {
+                    table.outputs.extend_from_slice(o);
+                    (table.outputs.len() - o.len(), o.len() as u8)
+                }
+                Found::Scale(n, d) => {
+                    table.scales.push((n, d));
+                    (table.scales.len() - 1, SCALE)
+                }
+            };
+            table.entries.push(Entry {
+                input,
+                // Both lists hold at most `u16::MAX` items, checked above.
+                first: first as u16,
+                count,
+            });
+        }
+        Ok((table, inputs))
     }
 }
 
-/// The saved form of `rules.json`.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RulesFile {
-    rules: Vec<SavedRule>,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SavedRule {
-    input: [u16; 2],
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    remap: Option<Vec<[u16; 4]>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    scale: Option<(i32, u32)>,
-}
-fn pair(usage: Usage) -> [u16; 2] {
-    [page(usage), id(usage)]
-}
-fn from_pair([p, u]: [u16; 2]) -> Usage {
-    self::usage(p, u)
+/// The encoded bytes of each length-delimited field `tag` of a message, in order, without decoding
+/// them. Other fields are skipped. For a rules file, field 1 holds the rules.
+fn fields(mut bytes: &[u8], tag: u32) -> impl Iterator<Item = Result<&[u8], storage::Error>> {
+    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
+    core::iter::from_fn(move || {
+        while !bytes.is_empty() {
+            let entry = match decode_key(&mut bytes) {
+                Ok((t, WireType::LengthDelimited)) if t == tag => decode_varint(&mut bytes)
+                    .ok()
+                    .and_then(|len| usize::try_from(len).ok())
+                    .and_then(|len| bytes.split_at_checked(len))
+                    .map(|(entry, rest)| {
+                        bytes = rest;
+                        Some(entry)
+                    }),
+                Ok((t, _)) if t == tag => None,
+                Err(_) => None,
+                Ok((t, wire)) => skip_field(wire, t, &mut bytes, DecodeContext::default())
+                    .ok()
+                    .map(|()| None),
+            };
+            match entry {
+                Some(Some(entry)) => return Some(Ok(entry)),
+                Some(None) => {}
+                None => {
+                    bytes = &[];
+                    return Some(Err(storage::Error::Corrupt));
+                }
+            }
+        }
+        None
+    })
 }
 impl Rules {
+    /// The table a saved rules file holds. A first pass counts the rules, outputs and scales from
+    /// the file's framing so the table is reserved once, exactly. The file lists each rule once,
+    /// sorted by input, so the table is filled in file order; a file that does not is undecodable.
     fn decode(bytes: &[u8]) -> Result<Self, storage::Error> {
-        let file: RulesFile = serde_json::from_slice(bytes).map_err(|_| storage::Error::Corrupt)?;
-        let mut rules = Vec::new();
-        rules
-            .try_reserve_exact(file.rules.len())
-            .map_err(|_| storage::Error::Unavailable)?;
-        for saved in file.rules {
-            let effect = match (saved.remap, saved.scale) {
-                (Some(outputs), None) => Effect::Remap(
-                    outputs
-                        .into_iter()
-                        .map(|[p, u, cp, cu]| Output {
-                            usage: usage(p, u),
-                            collection: usage(cp, cu),
-                        })
-                        .collect(),
-                ),
-                (None, Some((n, d))) if n != 0 && d != 0 => Effect::Scale(n, d),
-                _ => return Err(storage::Error::Corrupt),
-            };
-            let input = from_pair(saved.input);
-            if input == 0 {
-                return Err(storage::Error::Corrupt);
+        let count = |bytes, tag| fields(bytes, tag).try_fold(0usize, |n, e| e.map(|_| n + 1));
+        let (mut rules, mut outputs, mut scales) = (0, 0, 0);
+        for rule in fields(bytes, 1) {
+            let rule = rule?;
+            rules += 1;
+            for remap in fields(rule, 2) {
+                outputs += count(remap?, 1)?;
             }
-            if let Effect::Remap(outputs) = &effect
-                && (outputs.len() > usize::from(u8::MAX - 1)
-                    || outputs.iter().any(|o| o.usage == 0 || o.collection == 0))
-            {
-                return Err(storage::Error::Corrupt);
-            }
-            rules.push(Rule { input, effect });
+            scales += count(rule, 3)?;
         }
-        let mut table = Self::new(rules).map_err(|e| match e {
-            Error::Capacity => storage::Error::Unavailable,
-            _ => storage::Error::Corrupt,
-        })?;
-        table.entries.shrink_to_fit();
-        table.outputs.shrink_to_fit();
-        table.scales.shrink_to_fit();
+        let mut table = Self::default();
+        let unavailable = |_| storage::Error::Unavailable;
+        table
+            .entries
+            .try_reserve_exact(rules)
+            .map_err(unavailable)?;
+        table
+            .outputs
+            .try_reserve_exact(outputs)
+            .map_err(unavailable)?;
+        table
+            .scales
+            .try_reserve_exact(scales)
+            .map_err(unavailable)?;
+        for entry in fields(bytes, 1) {
+            let rule = saved::Rule::decode(entry?).map_err(|_| storage::Error::Corrupt)?;
+            if rule.input == 0 || table.entries.last().is_some_and(|e| e.input >= rule.input) {
+                return Err(storage::Error::Corrupt);
+            }
+            let (first, count) = match rule.effect.ok_or(storage::Error::Corrupt)? {
+                saved::rule::Effect::Remap(remap) => {
+                    if !valid_outputs(&remap.outputs) {
+                        return Err(storage::Error::Corrupt);
+                    }
+                    let first = table.outputs.len();
+                    table.outputs.extend(remap.outputs.iter().map(|o| Output {
+                        usage: o.usage,
+                        collection: o.collection,
+                    }));
+                    (first, remap.outputs.len() as u8)
+                }
+                saved::rule::Effect::Scale(scale) => {
+                    if scale.numerator == 0 || scale.denominator == 0 {
+                        return Err(storage::Error::Corrupt);
+                    }
+                    table.scales.push((scale.numerator, scale.denominator));
+                    (table.scales.len() - 1, SCALE)
+                }
+            };
+            table.entries.push(Entry {
+                input: rule.input,
+                first: u16::try_from(first).map_err(|_| storage::Error::Corrupt)?,
+                count,
+            });
+        }
+        // Only a rule that repeats its effect field, which firmware never writes, counts more than
+        // it holds; the slack stays reserved and counts against the profile memory budget.
         Ok(table)
     }
-    fn json(&self) -> Result<Vec<u8>, storage::Error> {
-        let rules = self
-            .iter()
-            .map(|rule| {
-                let (remap, scale) = match rule.effect {
-                    Effect::Remap(outputs) => (
-                        Some(
-                            outputs
-                                .iter()
-                                .map(|o| {
-                                    let [p, u] = pair(o.usage);
-                                    let [cp, cu] = pair(o.collection);
-                                    [p, u, cp, cu]
-                                })
-                                .collect(),
-                        ),
-                        None,
-                    ),
-                    Effect::Scale(n, d) => (None, Some((n, d))),
+    fn saved_rule(&self, entry: &Entry) -> saved::Rule {
+        saved::Rule {
+            input: entry.input,
+            effect: Some(match self.found(entry) {
+                Found::Remap(outputs) => saved::rule::Effect::Remap(saved::Remap {
+                    outputs: outputs
+                        .iter()
+                        .map(|o| saved::Output {
+                            usage: o.usage,
+                            collection: o.collection,
+                        })
+                        .collect(),
+                }),
+                Found::Scale(numerator, denominator) => saved::rule::Effect::Scale(saved::Scale {
+                    numerator,
+                    denominator,
+                }),
+            }),
+        }
+    }
+    /// The encoded length of a rule's message, worked out from the table.
+    fn rule_len(&self, entry: &Entry) -> usize {
+        use prost::encoding::{encoded_len_varint, key_len, sint32, uint32};
+        let scalar = |tag, value: u32| {
+            if value == 0 {
+                0
+            } else {
+                uint32::encoded_len(tag, &value)
+            }
+        };
+        let field = |tag, len: usize| key_len(tag) + encoded_len_varint(len as u64) + len;
+        let effect = match self.found(entry) {
+            Found::Remap(outputs) => field(
+                2,
+                outputs
+                    .iter()
+                    .map(|o| field(1, scalar(1, o.usage) + scalar(2, o.collection)))
+                    .sum(),
+            ),
+            Found::Scale(numerator, denominator) => {
+                let numerator = if numerator == 0 {
+                    0
+                } else {
+                    sint32::encoded_len(1, &numerator)
                 };
-                SavedRule {
-                    input: pair(rule.input),
-                    remap,
-                    scale,
-                }
+                field(3, numerator + scalar(2, denominator))
+            }
+        };
+        scalar(1, entry.input) + effect
+    }
+    /// The saved form of the table: its rules in order, each converted and encoded on its own
+    /// into a buffer of exactly the file's length, which the table gives.
+    fn encode(&self) -> Result<Vec<u8>, storage::Error> {
+        use prost::encoding::{encoded_len_varint, key_len, message};
+        let len: usize = self
+            .entries
+            .iter()
+            .map(|e| {
+                let len = self.rule_len(e);
+                key_len(1) + encoded_len_varint(len as u64) + len
             })
-            .collect();
-        storage::json(&RulesFile { rules })
+            .sum();
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| storage::Error::Unavailable)?;
+        for entry in &self.entries {
+            message::encode(1, &self.saved_rule(entry), &mut bytes);
+        }
+        Ok(bytes)
     }
 }
 
-/// The saved form of `profile.json`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A profile's record.
+#[derive(Clone, Debug)]
 pub struct Metadata {
     pub name: String,
-    #[serde(default, skip_serializing_if = "no_roles")]
     pub roles: Roles,
 }
-fn no_roles(roles: &Roles) -> bool {
-    roles.0 == 0
+impl Metadata {
+    fn encode(&self) -> Result<Vec<u8>, storage::Error> {
+        storage::encode(&saved::Profile {
+            name: self.name.clone(),
+            roles: self.roles.saved(),
+        })
+    }
 }
 pub fn name_valid(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && !name.chars().any(char::is_control)
@@ -553,7 +744,11 @@ pub async fn metadata<S: RecordStore>(store: &mut S, id: u64) -> Result<Metadata
         .load_owned(record_key(METADATA, id))
         .await?
         .ok_or(storage::Error::Missing)?;
-    let meta: Metadata = serde_json::from_slice(&bytes).map_err(|_| storage::Error::Corrupt)?;
+    let saved: saved::Profile = storage::decode(&bytes)?;
+    let meta = Metadata {
+        roles: Roles::from_saved(&saved.roles),
+        name: saved.name,
+    };
     if !name_valid(&meta.name) {
         return Err(storage::Error::Corrupt);
     }
@@ -566,17 +761,240 @@ pub async fn rules<S: RecordStore>(store: &mut S, id: u64) -> Result<Rules, stor
         None => Ok(Rules::default()),
     }
 }
+/// Reads a varint at the front of `bytes`: its value and length, or `None` when `bytes` end inside
+/// it.
+fn varint(bytes: &[u8]) -> Result<Option<(u64, usize)>, storage::Error> {
+    let mut value = 0u64;
+    for (i, &byte) in bytes.iter().enumerate().take(10) {
+        value |= u64::from(byte & 0x7f) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Ok(Some((value, i + 1)));
+        }
+    }
+    if bytes.len() >= 10 {
+        Err(storage::Error::Corrupt)
+    } else {
+        Ok(None)
+    }
+}
+/// The length of a whole field of a message and, when it is field 1, where its contents are.
+type Field = (usize, Option<core::ops::Range<usize>>);
+/// The field at the front of a message's `bytes`. `None` when `bytes` end inside it.
+fn next_field(bytes: &[u8]) -> Result<Option<Field>, storage::Error> {
+    let corrupt = storage::Error::Corrupt;
+    let Some((key, at)) = varint(bytes)? else {
+        return Ok(None);
+    };
+    let (tag, wire) = (key >> 3, key & 7);
+    let (len, contents) = match wire {
+        0 => match varint(&bytes[at..])? {
+            Some((_, n)) => (n, None),
+            None => return Ok(None),
+        },
+        1 => (8, None),
+        5 => (4, None),
+        2 => match varint(&bytes[at..])? {
+            Some((len, n)) => {
+                let len = usize::try_from(len).map_err(|_| corrupt)?;
+                let start = at + n;
+                (
+                    n.checked_add(len).ok_or(corrupt)?,
+                    Some(start..start.checked_add(len).ok_or(corrupt)?),
+                )
+            }
+            None => return Ok(None),
+        },
+        _ => return Err(corrupt),
+    };
+    if tag == 0 || (tag == 1 && contents.is_none()) {
+        return Err(corrupt);
+    }
+    let end = at.checked_add(len).ok_or(corrupt)?;
+    Ok((end <= bytes.len()).then(|| (end, contents.filter(|_| tag == 1))))
+}
+/// The input of a saved rule, read without decoding the rest of it.
+fn saved_input(mut rule: &[u8]) -> Result<Usage, storage::Error> {
+    use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
+    let corrupt = |_| storage::Error::Corrupt;
+    let mut input = 0;
+    while !rule.is_empty() {
+        match decode_key(&mut rule).map_err(corrupt)? {
+            (1, WireType::Varint) => input = decode_varint(&mut rule).map_err(corrupt)? as u32,
+            (1, _) => return Err(storage::Error::Corrupt),
+            (tag, wire) => {
+                skip_field(wire, tag, &mut rule, DecodeContext::default()).map_err(corrupt)?
+            }
+        }
+    }
+    Ok(input)
+}
+/// Whether a saved remap's outputs are ones the firmware can hold.
+fn valid_outputs(outputs: &[saved::Output]) -> bool {
+    outputs.len() < usize::from(SCALE) && outputs.iter().all(|o| o.usage != 0 && o.collection != 0)
+}
+/// The rule a saved rule's bytes hold.
+fn loaded_rule(bytes: &[u8]) -> Result<Rule, storage::Error> {
+    let corrupt = storage::Error::Corrupt;
+    let rule = saved::Rule::decode(bytes).map_err(|_| corrupt)?;
+    if rule.input == 0 {
+        return Err(corrupt);
+    }
+    let effect = match rule.effect.ok_or(corrupt)? {
+        saved::rule::Effect::Remap(remap) if valid_outputs(&remap.outputs) => Effect::Remap(
+            remap
+                .outputs
+                .iter()
+                .map(|o| Output {
+                    usage: o.usage,
+                    collection: o.collection,
+                })
+                .collect(),
+        ),
+        saved::rule::Effect::Scale(scale) if scale.numerator != 0 && scale.denominator != 0 => {
+            Effect::Scale(scale.numerator, scale.denominator)
+        }
+        _ => return Err(corrupt),
+    };
+    Ok(Rule {
+        input: rule.input,
+        effect,
+    })
+}
+/// Collects a page of rules from the parts of a rules file as they are read.
+struct Pager {
+    after: Option<Usage>,
+    count: usize,
+    rules: Vec<Rule>,
+    /// The input of the last rule read, so rules out of order are found.
+    last: Usage,
+    /// The start of a rule that continues in the next part.
+    pending: Vec<u8>,
+    error: Option<storage::Error>,
+}
+impl Pager {
+    /// Reads the whole rules at the front of `bytes`. Returns how many bytes they take and
+    /// whether the page is complete.
+    fn read(&mut self, bytes: &[u8]) -> Result<(usize, bool), storage::Error> {
+        let mut at = 0;
+        while self.rules.len() < self.count {
+            let Some((len, contents)) = next_field(&bytes[at..])? else {
+                break;
+            };
+            if let Some(contents) = contents {
+                let rule = &bytes[at..][contents];
+                let input = saved_input(rule)?;
+                if input == 0 || input <= self.last {
+                    return Err(storage::Error::Corrupt);
+                }
+                self.last = input;
+                if self.after.is_none_or(|after| input > after) {
+                    self.rules
+                        .try_reserve(1)
+                        .map_err(|_| storage::Error::Unavailable)?;
+                    self.rules.push(loaded_rule(rule)?);
+                }
+            }
+            at += len;
+        }
+        Ok((at, self.rules.len() >= self.count))
+    }
+    /// Takes the next part of the file. Returns whether to read more.
+    fn feed(&mut self, part: &[u8]) -> bool {
+        let mut pending = core::mem::take(&mut self.pending);
+        let result = if pending.is_empty() {
+            self.read(part).and_then(|(used, done)| {
+                pending
+                    .try_reserve_exact(part.len() - used)
+                    .map_err(|_| storage::Error::Unavailable)?;
+                pending.extend_from_slice(&part[used..]);
+                Ok(done)
+            })
+        } else {
+            pending
+                .try_reserve(part.len())
+                .map_err(|_| storage::Error::Unavailable)
+                .and_then(|()| {
+                    pending.extend_from_slice(part);
+                    let (used, done) = self.read(&pending)?;
+                    pending.drain(..used);
+                    Ok(done)
+                })
+        };
+        self.pending = pending;
+        match result {
+            Ok(done) => !done,
+            Err(error) => {
+                self.error = Some(error);
+                false
+            }
+        }
+    }
+}
+/// Up to `count` of profile `id`'s saved rules for inputs above `after`, in ascending input order.
+/// The rules file is read from its start only until they are found, a part at a time; the rules
+/// before them are checked for order and skipped without being decoded.
+pub async fn saved_page<S: RecordStore>(
+    store: &mut S,
+    id: u64,
+    after: Option<Usage>,
+    count: usize,
+) -> Result<Vec<Rule>, storage::Error> {
+    let mut pager = Pager {
+        after,
+        count,
+        rules: Vec::new(),
+        last: 0,
+        pending: Vec::new(),
+        error: None,
+    };
+    store
+        .read_parts(record_key(RULES, id), &mut |part| pager.feed(part))
+        .await?;
+    if let Some(error) = pager.error {
+        return Err(error);
+    }
+    // The file ends inside a rule.
+    if pager.rules.len() < count && !pager.pending.is_empty() {
+        return Err(storage::Error::Corrupt);
+    }
+    Ok(pager.rules)
+}
+impl Rules {
+    /// The rules file's bytes; none for a table without rules, which has no file.
+    pub fn saved(&self) -> Result<Option<Vec<u8>>, storage::Error> {
+        if self.is_empty() {
+            Ok(None)
+        } else {
+            self.encode().map(Some)
+        }
+    }
+}
 /// Saves the rules. Forgetting every rule deletes the rules file.
 pub async fn save_rules<S: RecordStore>(
     store: &mut S,
     id: u64,
     rules: &Rules,
 ) -> Result<(), storage::Error> {
-    if rules.is_empty() {
-        store.remove(record_key(RULES, id)).await
-    } else {
-        store.save(record_key(RULES, id), &rules.json()?).await
+    write_rules(store, id, rules.saved()?.as_deref()).await
+}
+/// Writes `bytes` as profile `id`'s rules file, or deletes the file when there are none.
+pub async fn write_rules<S: RecordStore>(
+    store: &mut S,
+    id: u64,
+    bytes: Option<&[u8]>,
+) -> Result<(), storage::Error> {
+    match bytes {
+        Some(bytes) => store.save(record_key(RULES, id), bytes).await,
+        None => store.remove(record_key(RULES, id)).await,
     }
+}
+/// Whether profile `id`'s rules file holds exactly `bytes`, or is absent when `bytes` is `None`.
+pub async fn rules_hold<S: RecordStore>(
+    store: &mut S,
+    id: u64,
+    bytes: Option<&[u8]>,
+) -> Result<bool, storage::Error> {
+    storage::holds(store, record_key(RULES, id), bytes).await
 }
 /// Saves the profile's record.
 pub async fn save_metadata<S: RecordStore>(
@@ -584,9 +1002,7 @@ pub async fn save_metadata<S: RecordStore>(
     id: u64,
     meta: &Metadata,
 ) -> Result<(), storage::Error> {
-    store
-        .save(record_key(METADATA, id), &storage::json(meta)?)
-        .await
+    store.save(record_key(METADATA, id), &meta.encode()?).await
 }
 // Until metadata is published, a failed operation cannot have created a visible profile.
 fn unpublished_error(error: storage::Error) -> storage::Error {
@@ -609,9 +1025,9 @@ pub async fn create<S: RecordStore>(
     let bytes = if rules.is_empty() {
         None
     } else {
-        Some(rules.json()?)
+        Some(rules.encode()?)
     };
-    let record = storage::json(&meta)?;
+    let record = meta.encode()?;
     let size = bytes.as_ref().map_or(0, Vec::len) + record.len();
     if store.available().await?
         < crate::bonds::MAINTENANCE_BYTES
@@ -690,7 +1106,7 @@ impl Cache {
         budget: usize,
         releasing: &[Map],
     ) -> Result<Vec<Map>, LoadError> {
-        self.0.retain(|(_, map)| map.strong_count() != 0);
+        self.prune();
         let used = self.used();
         let mut found: Vec<(u64, Map)> = Vec::new();
         found
@@ -768,11 +1184,10 @@ impl Cache {
             None => true,
         }
     }
-    /// Replaces the rules of loaded profile `id` for every user.
-    pub fn publish(&self, id: u64, rules: &Rules) {
-        if let Some(map) = self.get(id) {
-            *map.borrow_mut() = rules.clone();
-        }
+    /// Forgets the entries of tables nothing holds. A table still held, such as one with edits
+    /// not yet saved, stays the one later loads of its profile share.
+    pub fn prune(&mut self) {
+        self.0.retain(|(_, map)| map.strong_count() != 0);
     }
     /// Unloads profile `id`'s entry so no later load shares a table that no longer exists.
     pub fn forget(&mut self, id: u64) {
@@ -1202,21 +1617,23 @@ mod tests {
         let identity = remap(key(0x04), &[out(0x04)]).normalized().unwrap();
         assert!(identity.identity());
         let table = Rules::new(alloc::vec![remap(key(0x04), &[out(0x05)])]).unwrap();
-        let table = table.changed(alloc::vec![Change::Set(identity)]).unwrap();
+        let (table, inputs) = table.changed(alloc::vec![Change::Set(identity)]).unwrap();
         assert!(table.is_empty());
+        assert_eq!(inputs, [key(0x04)]);
         // Rules are identified by their input alone.
         let table = Rules::new(alloc::vec![
             remap(key(0x04), &[out(0x05)]),
             remap(key(0x06), &[out(0x07)]),
         ])
         .unwrap();
-        let table = table
+        let (table, inputs) = table
             .changed(alloc::vec![
                 Change::Forget(key(0x04)),
                 Change::Set(remap(key(0x06), &[out(0x08)])),
             ])
             .unwrap();
         assert!(table.iter().eq([remap(key(0x06), &[out(0x08)])]));
+        assert_eq!(inputs, [key(0x04), key(0x06)]);
         assert!(
             Rules::new(alloc::vec![
                 remap(key(0x04), &[]),
@@ -1259,12 +1676,63 @@ mod tests {
             },
         ])
         .unwrap();
-        let decoded = Rules::decode(&table.json().unwrap()).unwrap();
+        let bytes = table.encode().unwrap();
+        let decoded = Rules::decode(&bytes).unwrap();
         assert_eq!(decoded, table);
         assert_eq!(
             table.roles(),
             crate::hid::KEYBOARD | crate::hid::CONSUMER | crate::hid::MOUSE
         );
-        assert!(Rules::decode(br#"{"rules":[{"input":[7,4]}]}"#).is_err());
+        // The file is the generated message, one entry per rule, sorted by input.
+        let file = saved::Rules::decode(bytes.as_slice()).unwrap();
+        assert_eq!(bytes.len(), file.encoded_len());
+        assert_eq!(
+            file.rules.iter().map(|r| r.input).collect::<Vec<_>>(),
+            [AXES[2], key(0x39), usage(CONSUMER_PAGE, 0xcd)]
+        );
+        assert_eq!(fields(&bytes, 1).count(), 3);
+        // The buffer is reserved at the file's exact length.
+        assert_eq!(bytes.capacity(), bytes.len());
+        for (rule, entry) in file.rules.iter().zip(&table.entries) {
+            assert_eq!(rule.encoded_len(), table.rule_len(entry));
+        }
+        // An empty remap disables its input.
+        let disabled = Rules::new(alloc::vec![remap(key(0x39), &[])]).unwrap();
+        let encoded = disabled.encode().unwrap();
+        assert_eq!(encoded.capacity(), encoded.len());
+        assert_eq!(Rules::decode(&encoded).unwrap(), disabled);
+        // Loading reserves the table exactly.
+        assert_eq!(decoded.outputs.capacity(), decoded.outputs.len());
+        assert_eq!(decoded.scales.capacity(), decoded.scales.len());
+        assert_eq!(decoded.entries.capacity(), decoded.entries.len());
+        let encode = |rules: Vec<saved::Rule>| saved::Rules { rules }.encode_to_vec();
+        let scale = |input| saved::Rule {
+            input,
+            effect: Some(saved::rule::Effect::Scale(saved::Scale {
+                numerator: -1,
+                denominator: 1,
+            })),
+        };
+        // A rule without an effect, a zero input, a zero ratio, unsorted or repeated inputs and
+        // truncated bytes are undecodable.
+        let effectless = saved::Rule {
+            input: key(4),
+            effect: None,
+        };
+        assert!(Rules::decode(&encode(alloc::vec![effectless])).is_err());
+        assert!(Rules::decode(&encode(alloc::vec![scale(0)])).is_err());
+        let mut zero = scale(AXES[0]);
+        zero.effect = Some(saved::rule::Effect::Scale(saved::Scale {
+            numerator: 0,
+            denominator: 1,
+        }));
+        assert!(Rules::decode(&encode(alloc::vec![zero])).is_err());
+        assert!(Rules::decode(&encode(alloc::vec![scale(AXES[1]), scale(AXES[0])])).is_err());
+        assert!(Rules::decode(&encode(alloc::vec![scale(AXES[0]), scale(AXES[0])])).is_err());
+        assert!(Rules::decode(&bytes[..bytes.len() - 1]).is_err());
+        // Fields a later firmware adds are skipped.
+        let mut extended = bytes.clone();
+        prost::encoding::uint32::encode(2, &7, &mut extended);
+        assert_eq!(Rules::decode(&extended).unwrap(), table);
     }
 }

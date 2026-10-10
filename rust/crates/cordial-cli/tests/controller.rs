@@ -849,3 +849,43 @@ fn a_missing_device_and_a_missing_profile_are_told_apart() {
         "not_found: the adapter has no profile with that ID"
     );
 }
+
+#[test]
+fn a_download_replaces_only_the_file_it_was_allowed_to() {
+    let dir = std::env::temp_dir().join(format!("cordial-replace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dongle = Dongle::with(|sim| {
+        sim.data.insert("/devices/1/device.pb".into(), vec![0xff]);
+    });
+    let (c, rx) = ready(&dongle);
+    let get = || Command::FileGet {
+        path: "/devices/1/device.pb".into(),
+        local: dir.join("device.json"),
+        overwrite: true,
+        raw: false,
+    };
+    // Replacing device.json was confirmed, but the file doesn't decode, so its bytes go to
+    // device.pb, which exists and is kept.
+    std::fs::write(dir.join("device.pb"), b"old").unwrap();
+    assert_eq!(
+        run(&c, &rx, get()).unwrap_err().message,
+        format!(
+            "the file couldn't be converted, and saving its bytes to {} failed: the local file \
+             already exists",
+            dir.join("device.pb").display()
+        )
+    );
+    assert_eq!(std::fs::read(dir.join("device.pb")).unwrap(), b"old");
+    std::fs::remove_file(dir.join("device.pb")).unwrap();
+    let Ok(Outcome::FileSaved {
+        local, unconverted, ..
+    }) = run(&c, &rx, get())
+    else {
+        panic!("saved");
+    };
+    assert_eq!(local, dir.join("device.pb"));
+    assert!(unconverted.is_some());
+    assert_eq!(std::fs::read(dir.join("device.pb")).unwrap(), [0xff]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

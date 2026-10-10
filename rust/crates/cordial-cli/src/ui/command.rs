@@ -185,8 +185,8 @@ const SPECS: &[Spec] = &[
     ),
     spec(
         "file get",
-        "PATH LOCAL_FILE",
-        "Download an adapter file; an existing local file is never replaced",
+        "[--raw] PATH LOCAL_FILE",
+        "Download an adapter file, a saved record as JSON unless --raw; an existing local file is never replaced",
     ),
     spec("help", "[COMMAND]", "Show this help"),
     spec("quit", "", "Close control session; saved HID keeps working"),
@@ -622,6 +622,20 @@ fn find(words: &[&str]) -> Result<(&'static Spec, usize), String> {
     })
 }
 
+/// Takes the flag `--NAME` out of `words`, wherever it is: whether it was there, or an error when
+/// it is repeated.
+fn take_flag(words: &mut Vec<&str>, name: &str) -> Result<bool, ()> {
+    let flag = format!("--{name}");
+    let Some(i) = words.iter().position(|w| *w == flag) else {
+        return Ok(false);
+    };
+    words.remove(i);
+    if words.contains(&flag.as_str()) {
+        return Err(());
+    }
+    Ok(true)
+}
+
 /// Takes `--NAME VALUE` or `--NAME=VALUE` out of `words`, wherever it is.
 fn take_option<'a>(words: &mut Vec<&'a str>, name: &str) -> Result<Option<&'a str>, ()> {
     let flag = format!("--{name}");
@@ -807,11 +821,19 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
         )),
         ("feature list", 1) => Line::Run(Command::Features(target(0)?)),
         ("file list", 1) => Line::Run(Command::Files(arg(0))),
-        ("file get", 2) if !words[1].is_empty() => Line::Run(Command::FileGet {
-            path: arg(0),
-            local: PathBuf::from(words[1]),
-            overwrite: false,
-        }),
+        ("file get", 2 | 3) => {
+            let mut rest = words.to_vec();
+            let raw = take_flag(&mut rest, "raw");
+            match rest[..] {
+                [path, local] if !local.is_empty() && raw.is_ok() => Line::Run(Command::FileGet {
+                    path: path.to_owned(),
+                    local: PathBuf::from(local),
+                    overwrite: false,
+                    raw: raw == Ok(true),
+                }),
+                _ => return usage(),
+            }
+        }
         _ => return usage(),
     };
     Ok(line)
@@ -1146,6 +1168,7 @@ fn completions(words: &[String], st: Option<&State>) -> Vec<String> {
             .unwrap_or_else(|| owned(&["on", "off"])),
         (_, 0) if PROFILE_TARGETS.contains(&cmd) => profiles(),
         ("profile list", 0) => owned(&["--after"]),
+        ("file get", 0) => owned(&["--raw"]),
         ("setting get" | "setting set" | "setting forget", 1) => st
             .map(|st| known_settings(&args[0], st))
             .unwrap_or_default()
@@ -1428,9 +1451,29 @@ pub(crate) mod tests {
             Command::FileGet {
                 path: "/".into(),
                 local: "out.bin".into(),
-                overwrite: false
+                overwrite: false,
+                raw: false,
             }
         );
+        for line in ["file get --raw /a.pb a.pb", "file get /a.pb --raw a.pb"] {
+            assert_eq!(
+                run(line),
+                Command::FileGet {
+                    path: "/a.pb".into(),
+                    local: "a.pb".into(),
+                    overwrite: false,
+                    raw: true,
+                }
+            );
+        }
+        for line in [
+            "file get --raw --raw /a.pb a.pb",
+            "file get --raw /a.pb",
+            "file get /a.pb a.pb b",
+            "file get /a.pb \"\"",
+        ] {
+            assert!(parse(&words(line)).is_err(), "{line}");
+        }
         assert!(matches!(
             parse(&words("device list enabled")).unwrap(),
             Line::Devices(Filter::Enabled)
@@ -1553,7 +1596,7 @@ pub(crate) mod tests {
         assert!(help_on(None, Some("exit")).starts_with("quit | exit"));
         let mut production = state();
         production.status.info.clear();
-        assert!(help_on(Some(&production), Some("file get")).starts_with("file get PATH"));
+        assert!(help_on(Some(&production), Some("file get")).starts_with("file get [--raw] PATH"));
     }
 
     #[test]

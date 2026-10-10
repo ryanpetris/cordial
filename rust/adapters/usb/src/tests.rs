@@ -62,6 +62,13 @@ fn rules(store: &mut support::Store, id: u64) -> usize {
         .unwrap()
         .len()
 }
+/// The rules profile `id` holds while loaded.
+fn loaded_rules(app: &Application, id: u64) -> usize {
+    app.manager
+        .profiles
+        .get(id)
+        .map_or(0, |map| map.borrow().len())
+}
 fn ok() -> cordial_protocol::Response {
     cordial_protocol::Response { result: None }
 }
@@ -548,7 +555,8 @@ fn raw_packets_reach_the_interface_they_arrived_on() {
         Interface::Vial
     );
     let generation = io.status().generation;
-    // A packet tagged for an interface the slot no longer exposes is refused.
+    // A packet tagged for an interface the slot no longer exposes is refused. An accepted edit
+    // changes the loaded rules at once and reaches flash once the editor pauses.
     for (interface, answer, edited) in [(Interface::Via, 255, 0), (Interface::Vial, 5, 1)] {
         io.raw[0]
             .rx
@@ -563,10 +571,42 @@ fn raw_packets_reach_the_interface_they_arrived_on() {
         let reply = io.raw[0].tx.try_receive().ok().unwrap();
         assert_eq!(reply.interface, interface);
         assert_eq!(reply.bytes[0], answer);
-        assert_eq!(rules(&mut s.store, 1), edited);
+        assert_eq!(loaded_rules(&s.app, 1), edited);
+        assert_eq!(rules(&mut s.store, 1), 0);
         assert_eq!(rules(&mut s.store, 2), 0);
     }
+    loops.poll(&mut s, 1 + cordial_core::application::EDITOR_BATCH_MS);
+    assert_eq!(rules(&mut s.store, 1), 1);
     assert!(!io.reconnect.signaled());
+}
+
+#[test]
+fn edits_are_saved_before_usb_enumerates_again() {
+    let io = Io::new();
+    let (mut app, store, _) = profile_application();
+    app.manager.preference.configuration_interfaces = std::vec![enabled(Interface::Vial, 1)];
+    let mut s = shared(app, store);
+    let mut loops = Loops::new(&io, Interface::Vial.bit());
+    io.set_interfaces(Interface::Vial.bit());
+    BusHandler(&io).configured(true);
+    let generation = io.status().generation;
+    io.raw[0]
+        .rx
+        .try_send(RawPacket {
+            generation,
+            interface: Interface::Vial,
+            bytes: set_keycode(),
+        })
+        .ok()
+        .unwrap();
+    loops.poll(&mut s, 1);
+    assert_eq!(io.raw[0].tx.try_receive().ok().unwrap().bytes[0], 5);
+    assert_eq!(rules(&mut s.store, 1), 0);
+    // Enumerating again follows the save in the same step, however soon after the edit.
+    s.app.usb_reconnect = true;
+    loops.poll(&mut s, 2);
+    assert_eq!(io.reconnect.try_take(), Some(Interface::Vial.bit()));
+    assert_eq!(rules(&mut s.store, 1), 1);
 }
 
 #[test]
@@ -1066,4 +1106,75 @@ fn continuous_input_leaves_the_secondary_loop_a_step() {
     });
     assert!(answered, "the request was not answered");
     assert!(host.reports > reports + 10);
+}
+
+#[test]
+fn a_step_that_writes_is_followed_by_a_rest_as_long_as_it_took() {
+    use cordial_protocol::request::Command;
+    use core::cell::{Cell, RefCell};
+    use embassy_futures::{join::join, select::select, yield_now};
+    std::thread_local! {
+        static CLOCK: Cell<u64> = const { Cell::new(NOW) };
+        static SAVED: RefCell<std::vec::Vec<u64>> = const { RefCell::new(std::vec::Vec::new()) };
+    }
+    fn clock() -> u64 {
+        CLOCK.with(Cell::get)
+    }
+    /// Each save takes 20 ms.
+    fn slow_save() {
+        CLOCK.with(|c| c.set(c.get() + 20));
+        SAVED.with(|s| s.borrow_mut().push(clock()));
+    }
+    let (owner, io, _) = running(2, 0);
+    let mut host = Host::new();
+    settle(&owner, io, &mut host);
+    block_on(owner.lock()).store.on_save = Some(slow_save);
+    let rename = |host: &Host, n: usize| {
+        host.send(
+            io,
+            Command::SetAdapter(cordial_protocol::SetAdapter {
+                name: Some(std::format!("Adapter {n}")),
+                ..Default::default()
+            }),
+        )
+    };
+    host.messages.clear();
+    rename(&host, 0);
+    let mut sent = 1;
+    block_on(async {
+        let loops = join(
+            owner.priority(
+                async |_: &mut Shared<support::Store, support::Radio>| {},
+                async || yield_now().await,
+                clock,
+            ),
+            owner.secondary(0, clock),
+        );
+        let driver = async {
+            for _ in 0..1000 {
+                for _ in 0..4 {
+                    yield_now().await;
+                    host.serve(io);
+                }
+                // Each rename follows the response to the last.
+                if host.response().is_some() {
+                    if sent == 3 {
+                        return;
+                    }
+                    host.messages.clear();
+                    rename(&host, sent);
+                    sent += 1;
+                }
+                CLOCK.with(|c| c.set(c.get() + 1));
+            }
+            panic!("the renames were not answered");
+        };
+        select(loops, driver).await;
+    });
+    let saved = SAVED.with(|s| s.borrow().clone());
+    assert_eq!(saved.len(), 3);
+    for pair in saved.windows(2) {
+        // The next save starts no sooner than 20 ms after the last one ended.
+        assert!(pair[1] - 20 >= pair[0] + 20, "{saved:?}");
+    }
 }

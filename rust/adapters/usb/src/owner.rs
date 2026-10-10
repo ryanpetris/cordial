@@ -10,8 +10,11 @@
 //! and output, configuration editor packets, background storage work and deciding when USB
 //! enumerates again. Before each step it waits for a pass of the priority loop that left nothing
 //! waiting, or, under continuous input, for a pass `SECONDARY_WAIT_MS` after its last step ended.
-//! Each step reads or writes about one record, counting free space again after a write, so input
-//! waits for at most one such step at a time.
+//! Most steps read or write about one record. A step that needs everything waiting on flash
+//! first writes all of it: before USB enumerates again, before the bootloader, when a
+//! configuration editor's profile is released and before free space is counted to admit new
+//! data. Input waits for one step at a time. A step that wrote flash is followed by a rest at least
+//! as long as the step took, so input keeps at least half the time while writes continue.
 use crate::{HidTx, Io, RawPacket, SerialRx, SerialTx, Status};
 use cordial_core::{
     application::Application, bluetooth::EventSource, interfaces, storage::RecordStore,
@@ -51,6 +54,9 @@ pub struct Owner<'a, S, B> {
     turn: Signal<NoopRawMutex, ()>,
     /// When the secondary loop's last step ended.
     stepped: blocking_mutex::Mutex<NoopRawMutex, Cell<u64>>,
+    /// When the secondary loop may take its next step: after a step that wrote flash, as long
+    /// after it ended as it took.
+    rested: blocking_mutex::Mutex<NoopRawMutex, Cell<u64>>,
 }
 impl<'a, S: RecordStore, B: EventSource> Owner<'a, S, B> {
     pub fn new(io: &'a Io, app: Application, store: S, radio: B) -> Self {
@@ -59,6 +65,7 @@ impl<'a, S: RecordStore, B: EventSource> Owner<'a, S, B> {
             shared: Mutex::new(Shared { app, store, radio }),
             turn: Signal::new(),
             stepped: blocking_mutex::Mutex::new(Cell::new(0)),
+            rested: blocking_mutex::Mutex::new(Cell::new(0)),
         }
     }
     /// The shared state, once neither loop is using it.
@@ -83,7 +90,9 @@ impl<'a, S: RecordStore, B: EventSource> Owner<'a, S, B> {
                 let at = now();
                 (priority.pass(&mut shared, at).await, at)
             };
-            if idle || at.saturating_sub(self.stepped.lock(Cell::get)) >= SECONDARY_WAIT_MS {
+            if at >= self.rested.lock(Cell::get)
+                && (idle || at.saturating_sub(self.stepped.lock(Cell::get)) >= SECONDARY_WAIT_MS)
+            {
                 self.turn.signal(());
             }
             select(self.io.changed(), wake()).await;
@@ -95,8 +104,16 @@ impl<'a, S: RecordStore, B: EventSource> Owner<'a, S, B> {
         loop {
             self.turn.wait().await;
             let mut shared = self.shared.lock().await;
-            secondary.step(&mut shared, now()).await;
-            self.stepped.lock(|stepped| stepped.set(now()));
+            let start = now();
+            let generation = shared.store.generation().await;
+            secondary.step(&mut shared, start).await;
+            let end = now();
+            self.stepped.lock(|stepped| stepped.set(end));
+            // The store's generation changes with every write.
+            if shared.store.generation().await != generation {
+                let rest = end.saturating_add(end.saturating_sub(start));
+                self.rested.lock(|rested| rested.set(rest));
+            }
         }
     }
 }
@@ -220,9 +237,10 @@ impl<'a> Secondary<'a> {
         self.serial_pending = false;
         self.seen = status;
     }
-    /// One step: asks USB to enumerate again when it should, or else continues the command in
-    /// progress, or reads and starts the next request, or answers one configuration editor
-    /// packet, or does the application's other work. Then it hands serial output to USB.
+    /// One step: asks USB to enumerate again when it should, saving everything waiting first, or
+    /// else continues the command in progress, or writes a deferred save that is due, or reads and
+    /// starts the next request, or answers one configuration editor packet, or does the
+    /// application's other work. Then it hands serial output to USB.
     pub async fn step<S: RecordStore, B: EventSource>(
         &mut self,
         shared: &mut Shared<S, B>,
@@ -242,11 +260,15 @@ impl<'a> Secondary<'a> {
             }
         }
         // Enumerating again goes before anything that could queue more output.
-        if self.reconnect(app) {
+        if self.reconnect_due(app) {
+            app.save_all(store, now).await;
+            self.reconnect(app);
             return;
         }
         if app.command_pending() {
             app.proceed(store, radio, now).await;
+        } else if app.save(store, now).await {
+            // The step wrote a deferred save.
         } else if let Some(request) = self.read(app) {
             app.begin(request, store, radio, now).await;
         } else if !self.edit(app, store, now).await {
@@ -321,22 +343,21 @@ impl<'a> Secondary<'a> {
     }
     /// Saved interfaces are known once storage is ready. USB enumerates again only when they
     /// differ from the exposed set or the application requests it, once no command is in progress
-    /// and its output has been sent. Returns whether it asked USB to.
-    fn reconnect(&mut self, app: &mut Application) -> bool {
-        let wanted = Self::wanted(app);
-        if app.manager.storage_ready
-            && (wanted != self.interfaces || app.usb_reconnect)
+    /// and its output has been sent.
+    fn reconnect_due(&self, app: &Application) -> bool {
+        app.manager.storage_ready
+            && (Self::wanted(app) != self.interfaces || app.usb_reconnect)
             && !app.command_pending()
             && app.serial.queued() == 0
             && !self.serial_pending
-        {
-            self.interfaces = wanted;
-            app.usb_reconnect = false;
-            self.io.reset(false);
-            self.io.reconnect.signal(wanted);
-            return true;
-        }
-        false
+    }
+    /// Asks USB to enumerate again with the interfaces the saved preference enables.
+    fn reconnect(&mut self, app: &mut Application) {
+        let wanted = Self::wanted(app);
+        self.interfaces = wanted;
+        app.usb_reconnect = false;
+        self.io.reset(false);
+        self.io.reconnect.signal(wanted);
     }
     /// Hands the next chunk of serial output to USB, while the application follows the session
     /// USB has open.

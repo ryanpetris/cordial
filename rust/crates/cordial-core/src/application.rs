@@ -4,8 +4,16 @@
 //! needs right now: radio events, connection setup with its profile loads, link timers and output,
 //! and HID forwarding (`event`, `operate`). The secondary loop handles everything that can wait:
 //! client commands, events, configuration editors and background storage work (`begin`,
-//! `proceed`, `work`). Each call the secondary loop makes reads or writes about one record, and
-//! one that writes may count free space again, so the priority loop waits for at most that.
+//! `proceed`, `save`, `work`). Most calls the secondary loop makes read or write about one record,
+//! and one that writes may count free space again, so the priority loop usually waits for at most
+//! that.
+//!
+//! Records nothing needs on flash at once, such as a configuration editor's edits, discovered
+//! layouts and first-connection setup, are saved once keyboard and mouse input pauses
+//! ([`crate::deferred`]), one per call. Everything waiting is saved in one call before USB
+//! enumerates again, before the bootloader and when an editor is released, and every dirty record
+//! before free space is checked for a new profile, a pairing or a new setting. Saves that commands
+//! promise, and bonds, are written before the command responds.
 //!
 //! A command that reads many records, such as a listing, proceeds one record per `proceed`, and no
 //! other secondary work runs until it has responded. A listing answers one page; a page of a list
@@ -23,6 +31,7 @@ use cordial_protocol::{self as p, event::Kind as Ev, request::Command, response:
 use crate::{
     bluetooth::{Bluetooth, Event},
     control::Session,
+    deferred::{self, Record},
     devices::{self, Backoff, Peer, Policies, Policy},
     interfaces::{self, Interface},
     link::LinkId,
@@ -303,11 +312,20 @@ const ALL_KEYS: u32 = u32::MAX;
 const _: () = assert!(SettingKey::ALL.len() <= 32);
 
 /// The profile a configuration interface's editor uses, loaded while the editor sends packets.
+/// Edits change the loaded table at once; they are handed to storage as one change once the
+/// editor pauses.
 pub(crate) struct Editor {
     pub interface: Interface,
     pub profile: u64,
     pub map: profiles::Map,
     pub last: u64,
+    /// When the first edit not yet handed to storage was made, and when the last one was.
+    pub edited: Option<(u64, u64)>,
+    /// How the last write of the edits straight from the table, made when there was no memory
+    /// to hand them over, failed.
+    pub failure: Option<crate::storage::Error>,
+    /// The backoff of those writes.
+    pub retry: devices::Backoff,
 }
 
 const DEVICE: u8 = 1;
@@ -331,7 +349,11 @@ const PAGE_BUSY_MS: u64 = 1000;
 const SCAN_DEFAULT_SECONDS: u32 = 10;
 const SCAN_MAX_SECONDS: u32 = 60;
 /// An editor's profile is released after this long without a packet.
-const EDITOR_IDLE_MS: u64 = 5000;
+pub const EDITOR_IDLE_MS: u64 = 5000;
+/// An editor's edits are handed to storage this long after its last edit packet,
+pub const EDITOR_BATCH_MS: u64 = 500;
+/// and at least this often while edit packets keep arriving.
+pub const EDITOR_BATCH_MAX_MS: u64 = 2000;
 
 pub struct Application {
     pub manager: Manager,
@@ -362,6 +384,9 @@ pub struct Application {
     reported: Vec<Reported>,
     removed: VecDeque<u64>,
     adapter_dirty: bool,
+    /// The store generation free space was last counted at for the status. Writes change the
+    /// generation, and a later background step counts again.
+    counted: Option<u64>,
     /// Pending profile record and rules events, by profile ID.
     profile_dirty: Vec<(u64, u8)>,
     /// Rule inputs that may have changed since the last rules event, by profile ID.
@@ -382,9 +407,8 @@ pub struct Application {
     /// Scan results go before device events next time, so neither starves the other.
     scan_turn: bool,
     reboot_at: Option<u64>,
-    /// Profiles whose saved roles summary may not match their saved rules.
-    roles_pending: Vec<u64>,
-    roles_retry: Backoff,
+    /// Records saved once input pauses.
+    unsaved: deferred::Dirty,
     lost_retry: Backoff,
     /// Pending events whose reads failed, each with its own backoff. An entry stays only while
     /// its event is pending.
@@ -529,6 +553,7 @@ impl Application {
             reported: Vec::new(),
             removed: VecDeque::new(),
             adapter_dirty: false,
+            counted: None,
             profile_dirty: Vec::new(),
             touched_rules: Vec::new(),
             profile_removed: VecDeque::new(),
@@ -541,8 +566,7 @@ impl Application {
             next_profile: 0,
             scan_turn: false,
             reboot_at: None,
-            roles_pending: Vec::new(),
-            roles_retry: Backoff::default(),
+            unsaved: deferred::Dirty::default(),
             lost_retry: Backoff::default(),
             event_retries: Vec::new(),
             bonds_retry: Backoff::default(),
@@ -583,7 +607,8 @@ impl Application {
         if self.development() {
             fact(p::keys::BUILD_DEVELOPMENT, p::value::Value::Bool(true));
         }
-        if self.manager.storage_ready && self.manager.storage_full() {
+        if self.manager.storage_ready && (self.manager.storage_full() || self.manager.unsaved_full)
+        {
             fact(p::keys::STORAGE_FULL, p::value::Value::Bool(true));
         }
         let profile_support = self.manager.profile_budget.map(|budget| p::ProfileSupport {
@@ -769,7 +794,7 @@ impl Application {
 
     pub(crate) fn storage_error(&mut self, error: crate::storage::Error) -> p::Error {
         if error == crate::storage::Error::Unknown {
-            self.manager.storage_ready = false;
+            self.manager.fail_storage();
             self.manager.write_uncertain = true;
             self.adapter_dirty = true;
         }
@@ -792,6 +817,18 @@ impl Application {
         store: &mut S,
         radio: &mut B,
     ) -> Result<(Policy, Option<usize>), p::Error> {
+        self.policy_record(id, store, radio)
+            .await
+            .map(|(policy, slot, _)| (policy, slot))
+    }
+
+    /// As `policy_of`, with the bond of the saved record when it was read.
+    async fn policy_record<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u32,
+        store: &mut S,
+        radio: &mut B,
+    ) -> Result<(Policy, Option<usize>, Option<crate::bonds::Bond>), p::Error> {
         let id = u64::from(id);
         if id == 0 {
             return Err(failure(Error::NotFound));
@@ -802,13 +839,13 @@ impl Application {
             .and_then(|d| d.live.as_ref())
             .and_then(|l| l.policy.clone())
         {
-            return Ok((policy, slot));
+            return Ok((policy, slot, None));
         }
         if !self.manager.storage_ready {
             return Err(failure(Error::RadioUnavailable));
         }
-        match (Policies { store }).load(id).await {
-            Ok(policy) => Ok((policy, slot)),
+        match (Policies { store }).load_record(id).await {
+            Ok((policy, bond)) => Ok((policy, slot, Some(bond))),
             Err(crate::storage::Error::Missing) => Err(failure(Error::NotFound)),
             Err(crate::storage::Error::Corrupt) => {
                 let _ = self.manager.lose(id, store, radio).await;
@@ -847,8 +884,11 @@ impl Application {
             return false;
         }
         if let Some((index, slot, policy, setup)) = self.manager.setup() {
+            if !self.write_allowed(now) {
+                return false;
+            }
             let uncertain = self.manager.write_uncertain;
-            let saved = self.manager.save_policy(policy, store, radio).await;
+            let saved = self.manager.save_policy(policy, None, store, radio).await;
             self.manager.write_uncertain = uncertain;
             if saved.is_ok() {
                 if let Some(live) = self.manager.devices[slot]
@@ -918,14 +958,10 @@ impl Application {
                     Err(e) => self.fail(e),
                 }
             }
-            Some(Pending::Rules(id, after)) => match self.rules(id.into(), store).await {
+            Some(Pending::Rules(id, after)) => match self.rules_page(id.into(), after, store).await
+            {
                 Ok(rules) => {
-                    let mut page: Vec<p::ProfileRule> = rules
-                        .iter()
-                        .filter(|r| after.is_none_or(|after| r.input > after))
-                        .take(RULES_PAGE + 1)
-                        .map(wire_rule)
-                        .collect();
+                    let mut page: Vec<p::ProfileRule> = rules.into_iter().map(wire_rule).collect();
                     let end = page.len() <= RULES_PAGE;
                     page.truncate(RULES_PAGE);
                     self.reply(Some(R::ProfileRules(p::ProfileRules {
@@ -987,10 +1023,11 @@ impl Application {
                 }
             }
             Command::CreateProfile(args) if profiles => {
-                self.create_profile(&args.name, None, store, radio).await
+                self.create_profile(&args.name, None, store, radio, now)
+                    .await
             }
             Command::CopyProfile(args) if profiles => {
-                self.create_profile(&args.name, Some(args.profile), store, radio)
+                self.create_profile(&args.name, Some(args.profile), store, radio, now)
                     .await
             }
             Command::DeleteProfile(args) if profiles => {
@@ -1010,7 +1047,7 @@ impl Application {
                 }
             }
             Command::SetProfileRules(args) if profiles => {
-                self.set_profile_rules(args, store, radio).await
+                self.set_profile_rules(args, store, now).await
             }
             Command::ListProfiles(_)
             | Command::GetProfile(_)
@@ -1090,7 +1127,7 @@ impl Application {
                     None => self.pending = Some(Pending::Settings(policy, args.after)),
                 }
             }
-            Command::SetSettings(args) => self.change_settings(args, store, radio).await,
+            Command::SetSettings(args) => self.change_settings(args, store, radio, now).await,
             Command::ListFeatures(args) if development => {
                 let after = args
                     .after
@@ -1281,7 +1318,7 @@ impl Application {
             Ok(meta) => Ok(p::Profile {
                 id: id as u32,
                 name: meta.name,
-                roles: wire::roles(meta.roles.0),
+                roles: wire::roles(self.pending_roles(id).unwrap_or(meta.roles).0),
             }),
             Err(crate::storage::Error::Corrupt) => {
                 self.lost_profile(id);
@@ -1289,6 +1326,18 @@ impl Application {
             }
             Err(error) => Err(self.storage_error(error)),
         }
+    }
+
+    /// The roles summary of profile `id` when RAM is ahead of its saved record: that of rules
+    /// edited or waiting to be saved, or a summary waiting to be saved.
+    fn pending_roles(&self, id: u64) -> Option<devices::Roles> {
+        self.editor
+            .as_ref()
+            .filter(|e| e.profile == id && e.edited.is_some())
+            .map(|e| &e.map)
+            .or_else(|| self.unsaved.map(id))
+            .map(|map| devices::Roles(map.borrow().roles()))
+            .or_else(|| self.unsaved.roles(id))
     }
 
     /// Queues the cleanup of a profile whose saved files are undecodable.
@@ -1334,14 +1383,42 @@ impl Application {
         self.pending = Some(Pending::Profiles(listing, list));
     }
 
-    /// The rules of profile `id`: the loaded table when a device or editor uses it, otherwise
-    /// the saved one.
+    /// Profile `id`'s table in RAM, which its users share. A table waiting to be saved, or held
+    /// by an editor, stays loaded: a loaded entry is forgotten only once nothing holds its table,
+    /// or when its profile is deleted, which drops those too.
+    pub(crate) fn loaded(&self, id: u64) -> Option<profiles::Map> {
+        self.manager.profiles.get(id)
+    }
+
+    /// Up to one more than a page of profile `id`'s rules for inputs above `after`: from its table
+    /// in RAM when there is one, otherwise from the saved file, read only as far as the page.
+    async fn rules_page<S: RecordStore>(
+        &mut self,
+        id: u64,
+        after: Option<profiles::Usage>,
+        store: &mut S,
+    ) -> Result<Vec<profiles::Rule>, p::Error> {
+        if let Some(map) = self.loaded(id) {
+            return Ok(map.borrow().after(after).take(RULES_PAGE + 1).collect());
+        }
+        match profiles::saved_page(store, id, after, RULES_PAGE + 1).await {
+            Ok(rules) => Ok(rules),
+            Err(crate::storage::Error::Corrupt) => {
+                self.lost_profile(id);
+                Err(failure(Error::StorageFailed))
+            }
+            Err(error) => Err(self.storage_error(error)),
+        }
+    }
+
+    /// The rules of profile `id`: a copy of its table in RAM when there is one, otherwise the
+    /// saved one.
     async fn rules<S: RecordStore>(
         &mut self,
         id: u64,
         store: &mut S,
     ) -> Result<profiles::Rules, p::Error> {
-        if let Some(map) = self.manager.profiles.get(id) {
+        if let Some(map) = self.loaded(id) {
             return Ok(map.borrow().clone());
         }
         match profiles::rules(store, id).await {
@@ -1360,6 +1437,7 @@ impl Application {
         source: Option<u32>,
         store: &mut S,
         radio: &mut B,
+        now: u64,
     ) {
         if !profiles::name_valid(name) {
             return self.fail(bad_args());
@@ -1376,13 +1454,13 @@ impl Application {
                 }
             }
         };
-        if !self.manager.storage_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+        // Free space is checked with every deferred save on flash.
+        if let Err(e) = self.save_for_admission(store, now).await {
+            return self.fail(e);
         }
         match profiles::create(store, name, &rules).await {
             Ok((id, _)) => {
                 self.mark_profile(id, PROFILE);
-                let _ = self.refresh_available(store).await;
                 self.reply(Some(R::ProfileCreated(p::ProfileCreated {
                     profile: id as u32,
                 })));
@@ -1442,7 +1520,6 @@ impl Application {
                     return self.fail(error);
                 }
                 self.removed_profile(id);
-                let _ = self.refresh_available(store).await;
                 return self.reply(None);
             }
         }
@@ -1450,7 +1527,14 @@ impl Application {
     }
 
     fn removed_profile(&mut self, id: u64) {
+        // An editor still holding the profile, kept because its edits could not be handed over,
+        // must not write its rules file again.
+        if self.editor.as_ref().is_some_and(|e| e.profile == id) {
+            self.editor = None;
+        }
         self.manager.profiles.forget(id);
+        self.unsaved.forget_profile(id);
+        self.writes_recovered();
         self.profile_dirty.retain(|(p, _)| *p != id);
         self.event_retries
             .retain(|(r, _)| *r != EventRead::Profile(id) && *r != EventRead::Rules(id));
@@ -1461,13 +1545,15 @@ impl Application {
     }
 
     /// Applies rule changes to profile `id`, saves them and publishes them to every user of the
-    /// profile. Returns the profile's rules.
+    /// profile. A loaded table is changed in place of a copy: the new table is merged from it and
+    /// replaces it once saved, and the saved file then holds any edits not yet saved too.
     pub(crate) async fn change_rules<S: RecordStore>(
         &mut self,
         id: u64,
         changes: Vec<profiles::Change>,
         store: &mut S,
-    ) -> Result<profiles::Rules, p::Error> {
+        now: u64,
+    ) -> Result<(), p::Error> {
         let Some(budget) = self.manager.profile_budget else {
             return Err(failure(Error::UnknownCommand));
         };
@@ -1482,12 +1568,22 @@ impl Application {
             }
             Err(error) => return Err(self.storage_error(error)),
         };
-        let current = self.rules(id, store).await?;
-        let rules = current
-            .changed(changes)
-            .map_err(|_| failure(Error::Capacity))?;
-        if rules == current {
-            return Ok(current);
+        // What listings report now, which the saved change may change.
+        let reported = self.pending_roles(id).unwrap_or(meta.roles);
+        let loaded = self.loaded(id);
+        let changed = match &loaded {
+            Some(map) => map.borrow().changed(changes),
+            None => self.rules(id, store).await?.changed(changes),
+        };
+        let (rules, inputs) = changed.map_err(|_| failure(Error::Capacity))?;
+        // Rules already in RAM but not yet on flash are saved, so the response holds for them too.
+        let unsaved = self.unsaved.map(id).is_some()
+            || self
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.profile == id && e.edited.is_some());
+        if inputs.is_empty() && !unsaved {
+            return Ok(());
         }
         let memory = rules.memory();
         if memory > budget || !self.manager.profiles.fits(id, memory, budget) {
@@ -1496,25 +1592,84 @@ impl Application {
         if let Err(error) = profiles::save_rules(store, id, &rules).await {
             return Err(self.storage_error(error));
         }
+        let roles = devices::Roles(rules.roles());
         // The saved rules are the edit; the roles summary follows them.
-        self.manager.profiles.publish(id, &rules);
+        if let Some(map) = loaded {
+            *map.borrow_mut() = rules;
+        }
+        self.unsaved.rules_saved(id);
+        self.writes_recovered();
+        if let Some(editor) = self.editor.as_mut().filter(|e| e.profile == id) {
+            editor.edited = None;
+            editor.failure = None;
+            editor.retry.succeeded();
+        }
         self.retry_users(id);
-        self.touch_rules(id, profiles::differences(&current, &rules));
-        self.save_roles(id, &mut meta, &rules, store).await;
-        self.refresh_available(store).await;
-        Ok(rules)
+        self.touch_rules(id, inputs);
+        self.save_roles(id, &mut meta, roles, store, now).await;
+        if roles != reported {
+            self.mark_profile(id, PROFILE);
+        }
+        Ok(())
     }
 
-    /// Saves profile `id`'s roles summary for its saved `rules` when it changed. A failed save is
-    /// repaired in the background.
+    /// Applies an editor's rule changes to the loaded table `map` of profile `id` without writing
+    /// it: the editor hands its edits to storage once it pauses. `reset` forgets every rule first.
+    pub(crate) fn edit_rules(
+        &mut self,
+        id: u64,
+        map: &profiles::Map,
+        reset: bool,
+        changes: Vec<profiles::Change>,
+        now: u64,
+    ) -> Result<(), ()> {
+        let budget = self.manager.profile_budget.ok_or(())?;
+        let (rules, inputs) = if reset {
+            let inputs: Vec<profiles::Usage> = map.borrow().inputs().collect();
+            let (rules, mut more) = profiles::Rules::default()
+                .changed(changes)
+                .map_err(|_| ())?;
+            more.retain(|input| inputs.binary_search(input).is_err());
+            let mut inputs = inputs;
+            inputs.extend(more);
+            inputs.sort_unstable();
+            (rules, inputs)
+        } else {
+            map.borrow().changed(changes).map_err(|_| ())?
+        };
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let memory = rules.memory();
+        if memory > budget || !self.manager.profiles.fits(id, memory, budget) {
+            return Err(());
+        }
+        // Listings report the roles of the edited rules, so a change of them is a profile event.
+        if rules.roles() != map.borrow().roles() {
+            self.mark_profile(id, PROFILE);
+        }
+        *map.borrow_mut() = rules;
+        self.retry_users(id);
+        self.touch_rules(id, inputs);
+        if let Some(editor) = self.editor.as_mut().filter(|e| e.profile == id) {
+            let first = editor.edited.map_or(now, |(first, _)| first);
+            editor.edited = Some((first, now));
+        }
+        Ok(())
+    }
+
+    /// Saves `roles` as profile `id`'s roles summary when it changed. A failed save is repaired
+    /// once input pauses.
     async fn save_roles<S: RecordStore>(
         &mut self,
         id: u64,
         meta: &mut profiles::Metadata,
-        rules: &profiles::Rules,
+        roles: devices::Roles,
         store: &mut S,
+        now: u64,
     ) {
-        let roles = devices::Roles(rules.roles());
+        // These roles replace any summary still waiting to be saved.
+        self.unsaved.saved(&Record::Roles(id, roles));
         if roles == meta.roles {
             return;
         }
@@ -1525,46 +1680,11 @@ impl Application {
                 if error == crate::storage::Error::Unknown {
                     let _ = self.storage_error(error);
                 }
-                if !self.roles_pending.contains(&id) {
-                    self.roles_pending.push(id);
-                }
+                // Without memory to list the repair, the summary is corrected at the next save
+                // of the profile's rules, and listings report the saved one until then.
+                let _ = self.unsaved.mark(Record::Roles(id, roles), now);
             }
         }
-    }
-
-    /// Brings profile `id`'s saved roles summary in line with its saved rules. A profile that no
-    /// longer exists needs nothing; one whose files are undecodable is queued as lost.
-    async fn repair_roles<S: RecordStore>(&mut self, id: u64, store: &mut S) -> Result<(), ()> {
-        let mut meta = match profiles::metadata(store, id).await {
-            Ok(meta) => meta,
-            Err(crate::storage::Error::Missing) => return Ok(()),
-            Err(crate::storage::Error::Corrupt) => {
-                self.lost_profile(id);
-                return Ok(());
-            }
-            Err(_) => return Err(()),
-        };
-        let rules = match self.manager.profiles.get(id) {
-            Some(map) => map.borrow().clone(),
-            None => match profiles::rules(store, id).await {
-                Ok(rules) => rules,
-                Err(crate::storage::Error::Corrupt) => {
-                    self.lost_profile(id);
-                    return Ok(());
-                }
-                Err(_) => return Err(()),
-            },
-        };
-        let roles = devices::Roles(rules.roles());
-        if roles == meta.roles {
-            return Ok(());
-        }
-        meta.roles = roles;
-        profiles::save_metadata(store, id, &meta)
-            .await
-            .map_err(|_| ())?;
-        self.mark_profile(id, PROFILE);
-        Ok(())
     }
 
     /// Connected devices whose profiles are not loaded and whose layers include profile `id`
@@ -1581,11 +1701,11 @@ impl Application {
         }
     }
 
-    async fn set_profile_rules<S: RecordStore, B: Bluetooth>(
+    async fn set_profile_rules<S: RecordStore>(
         &mut self,
         args: p::SetProfileRules,
         store: &mut S,
-        radio: &mut B,
+        now: u64,
     ) {
         if args.changes.is_empty() {
             return self.fail(bad_args());
@@ -1613,10 +1733,14 @@ impl Application {
             };
             changes.push(change);
         }
-        if let Err(e) = self.profile_record(args.profile, store, radio).await {
-            return self.fail(e);
+        if args.profile == 0 {
+            return self.fail(failure(Error::NotFound));
         }
-        match self.change_rules(args.profile.into(), changes, store).await {
+        // `change_rules` reads the profile's metadata, which also confirms that it exists.
+        match self
+            .change_rules(args.profile.into(), changes, store, now)
+            .await
+        {
             Ok(_) => self.reply(None),
             Err(e) => self.fail(e),
         }
@@ -1637,6 +1761,7 @@ impl Application {
         scan: Option<Records>,
         store: &mut S,
         radio: &mut B,
+        now: u64,
     ) -> Result<Option<Records>, Error> {
         let Some(mut scan) = scan else {
             match profiles::metadata(store, id).await {
@@ -1645,19 +1770,32 @@ impl Application {
                     profiles::save_rules(store, id, &empty)
                         .await
                         .map_err(|_| Error::StorageFailed)?;
-                    // A loaded table holds the rules a client may have listed.
-                    let loaded = self
-                        .manager
-                        .profiles
-                        .get(id)
-                        .map(|map| map.borrow().clone());
-                    self.manager.profiles.publish(id, &empty);
-                    self.retry_users(id);
-                    if let Some(loaded) = loaded {
-                        self.touch_rules(id, loaded.iter().map(|r| r.input));
+                    // What listings report now, and a table in RAM holding the rules a client may
+                    // have listed.
+                    let reported = self.pending_roles(id).unwrap_or(meta.roles);
+                    let map = self.loaded(id);
+                    self.unsaved.rules_saved(id);
+                    // The saved empty rules replace an editor's edits too.
+                    if let Some(editor) = self.editor.as_mut().filter(|e| e.profile == id) {
+                        editor.edited = None;
+                        editor.failure = None;
+                        editor.retry.succeeded();
                     }
-                    self.save_roles(id, &mut meta, &empty, store).await;
-                    self.refresh_available(store).await;
+                    self.writes_recovered();
+                    let loaded: Vec<profiles::Usage> = match &map {
+                        Some(map) => map.borrow().inputs().collect(),
+                        None => Vec::new(),
+                    };
+                    if let Some(map) = map {
+                        *map.borrow_mut() = empty;
+                    }
+                    self.retry_users(id);
+                    self.touch_rules(id, loaded);
+                    self.save_roles(id, &mut meta, devices::Roles(0), store, now)
+                        .await;
+                    if reported != devices::Roles(0) {
+                        self.mark_profile(id, PROFILE);
+                    }
                     return Ok(None);
                 }
                 Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {}
@@ -1686,8 +1824,8 @@ impl Application {
         match scan.next(store).await? {
             Visit::Page => {}
             Visit::Record(device) => {
-                let mut policy = match (Policies { store }).load(device).await {
-                    Ok(policy) => policy,
+                let (mut policy, bond) = match (Policies { store }).load_record(device).await {
+                    Ok(record) => record,
                     Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
                         return Ok(Some(scan));
                     }
@@ -1696,11 +1834,13 @@ impl Application {
                 if policy.profiles.contains(&id) {
                     policy.profiles.retain(|p| *p != id);
                     if self.manager.find(device).is_some() {
-                        self.manager.save_policy(policy, store, radio).await?;
+                        self.manager
+                            .save_policy(policy, Some(&bond), store, radio)
+                            .await?;
                     } else {
                         // Nothing is resident for this device, so only its record changes. It
                         // takes no room in the stack, whether or not it is enabled.
-                        match (Policies { store }).save(&policy).await {
+                        match (Policies { store }).save_with(&policy, &bond).await {
                             Ok(()) | Err(crate::storage::Error::Missing) => {}
                             Err(_) => return Err(Error::StorageFailed),
                         }
@@ -1758,6 +1898,8 @@ impl Application {
                 transports.set(transport, enabled);
             }
         }
+        // Each profile is read once, however many updates name it.
+        let mut found: Vec<u32> = Vec::new();
         for update in &args.configuration_interfaces {
             let interface = match p::ConfigurationInterface::try_from(update.interface) {
                 Ok(p::ConfigurationInterface::Via) => Interface::Via,
@@ -1776,8 +1918,11 @@ impl Application {
                 None => {}
                 Some(0) => entry.profile = None,
                 Some(id) => {
-                    if let Err(e) = self.profile_record(id, store, radio).await {
-                        return self.fail(e);
+                    if !found.contains(&id) {
+                        if let Err(e) = self.profile_record(id, store, radio).await {
+                            return self.fail(e);
+                        }
+                        found.push(id);
                     }
                     entry.profile = Some(id.into());
                 }
@@ -1816,7 +1961,7 @@ impl Application {
             self.adapter_dirty = true;
             self.usb_reconnect |= reconnect;
             if reconnect {
-                self.editor = None;
+                self.drop_editor();
             }
             if platform_changed {
                 for slot in 0..self.manager.devices.len() {
@@ -2183,7 +2328,7 @@ impl Application {
         if !self.manager.storage_ready {
             return self.fail(failure(Error::RadioUnavailable));
         }
-        let (original, slot) = match self.policy_of(args.device, store, radio).await {
+        let (original, slot, bond) = match self.policy_record(args.device, store, radio).await {
             Ok(found) => found,
             Err(e) => return self.fail(e),
         };
@@ -2243,7 +2388,11 @@ impl Application {
         }
         let id = policy.id;
         let hidpp = policy.hidpp_enabled();
-        if let Err(code) = self.manager.save_policy(policy, store, radio).await {
+        if let Err(code) = self
+            .manager
+            .save_policy(policy, bond.as_ref(), store, radio)
+            .await
+        {
             if code == Error::NotFound {
                 // The device's record was lost; it is deleted as at startup.
                 let _ = self.manager.lose(id, store, radio).await;
@@ -2484,6 +2633,7 @@ impl Application {
         args: p::SetSettings,
         store: &mut S,
         radio: &mut B,
+        now: u64,
     ) {
         let (policy, slot) = match self.policy_of(args.device, store, radio).await {
             Ok(found) => found,
@@ -2513,8 +2663,9 @@ impl Application {
             parsed.retain(|c| c.key != key);
             parsed.push(Change { key, value });
         }
-        if !self.manager.storage_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+        // Free space is checked with every deferred save on flash.
+        if let Err(e) = self.save_for_admission(store, now).await {
+            return self.fail(e);
         }
         let mut prefs = Preferences {
             store,
@@ -2540,7 +2691,7 @@ impl Application {
         };
         if let Err(error) = result {
             if error == crate::settings::Error::StorageUnknown {
-                self.manager.storage_ready = false;
+                self.manager.fail_storage();
                 self.adapter_dirty = true;
             }
             return self.fail(wire::error(
@@ -2995,8 +3146,10 @@ impl Application {
             self.manager.load(store, radio).await
         };
         match ready {
-            Ok(()) => {}
-            Err(Error::StorageFailed) => self.manager.storage_ready = false,
+            // Loading resolves nothing of a write whose outcome is unknown, so storage stays not
+            // ready until that write is.
+            Ok(()) => self.writes_recovered(),
+            Err(Error::StorageFailed) => self.manager.fail_storage(),
             Err(_) => self.manager.radio_ready = false,
         }
         self.adapter_dirty = true;
@@ -3021,7 +3174,7 @@ impl Application {
         }
         self.manager.radio_ready = false;
         if error == Error::StorageFailed {
-            self.manager.storage_ready = false;
+            self.manager.fail_storage();
         }
         self.adapter_dirty = true;
     }
@@ -3052,9 +3205,338 @@ impl Application {
         self.adapter_dirty |= full != self.manager.storage_full();
     }
 
-    /// A failed read keeps the last estimate.
+    /// Whether a connection holds a discovered layout to save.
+    fn layout_pending(&self) -> bool {
+        self.manager
+            .connections
+            .iter()
+            .flatten()
+            .any(|c| c.layout.is_some() && c.device.is_some())
+    }
+
+    /// Saves the next discovered layout a connection holds, or every one when not `one`.
+    async fn save_layouts<S: RecordStore>(&mut self, one: bool, store: &mut S) {
+        for index in 0..devices::ACTIVE_CONNECTIONS {
+            let Some(c) = self.manager.connections[index].as_mut() else {
+                continue;
+            };
+            let (Some(slot), Some(layout)) = (c.device, c.layout.take()) else {
+                continue;
+            };
+            self.save_layout(slot, &layout, store).await;
+            if one {
+                return;
+            }
+        }
+    }
+
+    /// For background work with a write to make: whether it may write at `now`, which is once
+    /// input pauses.
+    fn write_allowed(&mut self, now: u64) -> bool {
+        let starting = self.manager.starting(now);
+        self.unsaved.wait(now, self.manager.last_input, starting)
+    }
+
+    /// Hands the editor's edits to storage as one change of its profile's rules, once the editor
+    /// has paused or has been editing for long enough, or at once when `now` is `None`. Returns
+    /// `false` when edits are left with the editor because there is no memory to list them; they
+    /// are handed over at a later try.
+    fn hand_over(&mut self, now: Option<u64>) -> bool {
+        let Some(editor) = &mut self.editor else {
+            return true;
+        };
+        let Some((first, last)) = editor.edited else {
+            return true;
+        };
+        if now.is_some_and(|now| {
+            now.saturating_sub(last) < EDITOR_BATCH_MS
+                && now.saturating_sub(first) < EDITOR_BATCH_MAX_MS
+        }) {
+            return true;
+        }
+        let (id, map) = (editor.profile, editor.map.clone());
+        let roles = devices::Roles(map.borrow().roles());
+        let (rules, summary) = (Record::Rules(id, map), Record::Roles(id, roles));
+        // Records already listed need no room; listed rules are this same table.
+        let listed = self.unsaved.lists(&rules);
+        let needed = usize::from(!listed) + usize::from(!self.unsaved.lists(&summary));
+        if !self.unsaved.reserve(needed) && !listed {
+            return false;
+        }
+        editor.edited = None;
+        let failure = editor.failure.take();
+        editor.retry.succeeded();
+        // The edits became unsaved when they were made.
+        let marked = self.unsaved.mark(rules.clone(), first);
+        debug_assert!(marked);
+        if let Some(failure) = failure {
+            self.unsaved.set_failure(&rules, failure);
+        }
+        // Without room for it, the roles summary is listed once the rules are written.
+        let _ = self.unsaved.mark(summary, first);
+        true
+    }
+
+    /// Releases the editor's profile, handing its edits to storage first. An editor whose edits
+    /// cannot be handed over yet is kept, so they are not lost.
+    pub(crate) fn drop_editor(&mut self) {
+        if self.hand_over(None) {
+            self.editor = None;
+        }
+    }
+
+    /// Whether anything waits to be saved: an editor's edits, a dirty record or a discovered
+    /// layout.
+    pub fn has_unsaved(&self) -> bool {
+        self.editor.as_ref().is_some_and(|e| e.edited.is_some())
+            || !self.unsaved.is_empty()
+            || self.layout_pending()
+    }
+
+    /// Hands an editor's edits to storage once it pauses, and writes the next dirty record once
+    /// it is due. Returns whether it wrote.
+    pub async fn save<S: RecordStore>(&mut self, store: &mut S, now: u64) -> bool {
+        let listed = self.hand_over(Some(now));
+        // A failed save that made storage not ready is still retried.
+        if !(self.manager.storage_ready || self.manager.unsaved_unready) {
+            return false;
+        }
+        let starting = self.manager.starting(now);
+        // Edits there is no memory to list are written straight from the editor, on the timing
+        // of a dirty record: their longest wait counts from the first edit, or from the end of
+        // the backoff of a failed write.
+        if !listed
+            && self.editor.as_ref().is_some_and(|e| {
+                e.edited.is_some_and(|(first, _)| {
+                    let since = first.max(e.retry.at());
+                    deferred::allowed(since, now, self.manager.last_input, starting)
+                })
+            })
+            && self.save_editor(store, now, false).await
+        {
+            return true;
+        }
+        let Some(record) = self.unsaved.next(now, self.manager.last_input, starting) else {
+            return false;
+        };
+        let _ = self.write(record, store, now).await;
+        true
+    }
+
+    /// Saves everything waiting at once, whatever input is doing: before USB enumerates again,
+    /// before the bootloader and when an editor is released.
+    pub async fn save_all<S: RecordStore>(&mut self, store: &mut S, now: u64) {
+        self.save_records(store, now).await;
+        if self.manager.storage_ready {
+            self.save_layouts(false, store).await;
+        }
+    }
+
+    /// Saves an editor's edits and every dirty record at once, whatever input is doing, as before
+    /// free space is checked for new data. Each dirty record is tried once; one that fails stays
+    /// dirty and is retried after its backoff. Layouts are left to wait, since a layout never
+    /// takes the room admission keeps.
+    async fn save_records<S: RecordStore>(&mut self, store: &mut S, now: u64) {
+        let listed = self.hand_over(None);
+        if !(self.manager.storage_ready || self.manager.unsaved_unready) {
+            return;
+        }
+        if !listed {
+            self.save_editor(store, now, true).await;
+        }
+        self.unsaved.start_flush();
+        while let Some(record) = self.unsaved.next_flushed() {
+            let _ = self.write(record, store, now).await;
+        }
+    }
+
+    /// Writes the editor's edits, which there was no memory to list, straight from its table,
+    /// once its own backoff allows, or at once when `forced`. Edits that cannot be written stay
+    /// with the editor, which tracks the outcome as a listed record would. Returns whether it
+    /// wrote.
+    pub(crate) async fn save_editor<S: RecordStore>(
+        &mut self,
+        store: &mut S,
+        now: u64,
+        forced: bool,
+    ) -> bool {
+        let Some(editor) = self
+            .editor
+            .as_ref()
+            .filter(|e| e.edited.is_some() && (forced || e.retry.due(now)))
+        else {
+            return false;
+        };
+        let record = Record::Rules(editor.profile, editor.map.clone());
+        let result = self.write(record, store, now).await;
+        if let Some(editor) = self.editor.as_mut() {
+            match result {
+                Ok(()) => {
+                    editor.edited = None;
+                    editor.failure = None;
+                    editor.retry.succeeded();
+                }
+                Err(error) => {
+                    editor.failure = Some(error);
+                    editor.retry.failed_up_to(now, deferred::RULES_RETRY_MAX_MS);
+                }
+            }
+        }
+        self.writes_recovered();
+        true
+    }
+
+    /// Saves everything [`Self::save_records`] does before free space is counted to admit new
+    /// data. Fails as storage not being ready, before or after the saves, so nothing is admitted
+    /// once a save has made it so.
+    async fn save_for_admission<S: RecordStore>(
+        &mut self,
+        store: &mut S,
+        now: u64,
+    ) -> Result<(), p::Error> {
+        if self.manager.storage_ready {
+            self.save_records(store, now).await;
+        }
+        if self.manager.storage_ready {
+            Ok(())
+        } else {
+            Err(failure(Error::RadioUnavailable))
+        }
+    }
+
+    /// Writes one dirty record. A rules file that cannot be written, which holds edits an editor
+    /// has been told are made, is retried with its backoff, and the failure of its last try is
+    /// reported ([`Self::writes_recovered`]). A failure that is not reported leaves storage ready,
+    /// so the profile can still be changed, overwritten or deleted. Roles summaries are repaired
+    /// without being reported, as when they are saved at once.
+    ///
+    /// After a write whose outcome is unknown, a failed retry ends that only when the file is then
+    /// read: it holds the new rules, which counts as saved, or other contents, which leaves the
+    /// definite failure. A retry that fails before reaching the file, or whose file cannot be
+    /// read, keeps the outcome unknown. Returns how the write ended.
+    async fn write<S: RecordStore>(
+        &mut self,
+        record: Record,
+        store: &mut S,
+        now: u64,
+    ) -> Result<(), crate::storage::Error> {
+        use crate::storage::Error as E;
+        let unknown = self.unsaved.failure(&record) == Some(E::Unknown)
+            || matches!(&record, Record::Rules(id, _)
+                if self.editor.as_ref().is_some_and(|e| e.profile == *id
+                    && e.failure == Some(E::Unknown)));
+        let result = match &record {
+            Record::Rules(id, map) => {
+                let (bytes, roles) = {
+                    let rules = map.borrow();
+                    (rules.saved(), devices::Roles(rules.roles()))
+                };
+                let bytes = match bytes {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let error = if unknown { E::Unknown } else { error };
+                        self.write_failed(&record, error, now);
+                        return Err(error);
+                    }
+                };
+                let saved = match profiles::write_rules(store, *id, bytes.as_deref()).await {
+                    Err(error) if unknown && error != E::Unknown => {
+                        match profiles::rules_hold(store, *id, bytes.as_deref()).await {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err(error),
+                            Err(_) => Err(E::Unknown),
+                        }
+                    }
+                    saved => saved,
+                };
+                // The roles summary that follows describes the rules just written. One that could
+                // not be listed with the rules is listed now; without memory for it, listings
+                // report the saved summary until the next save of the rules.
+                if saved.is_ok() {
+                    if self.unsaved.lists(&Record::Roles(*id, roles)) {
+                        self.unsaved.follow_rules(*id, roles);
+                    } else if !self.unsaved.mark(Record::Roles(*id, roles), now) {
+                        self.mark_profile(*id, PROFILE);
+                    }
+                }
+                saved
+            }
+            Record::Roles(id, roles) => match profiles::metadata(store, *id).await {
+                Ok(meta) if meta.roles == *roles => Ok(()),
+                Ok(mut meta) => {
+                    meta.roles = *roles;
+                    let saved = profiles::save_metadata(store, *id, &meta).await;
+                    if saved.is_ok() {
+                        self.mark_profile(*id, PROFILE);
+                    }
+                    saved
+                }
+                // A profile that is gone needs nothing; one that is undecodable is lost.
+                Err(E::Missing) => Ok(()),
+                Err(E::Corrupt) => {
+                    self.lost_profile(*id);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+            Record::DeviceRoles(id, roles) => match (Policies { store }).load_record(*id).await {
+                Ok((mut policy, bond)) if policy.roles != *roles => {
+                    policy.roles = *roles;
+                    Policies { store }.save_with(&policy, &bond).await
+                }
+                // A record that is gone or lost is dealt with when it is next read.
+                Ok(_) | Err(E::Missing | E::Corrupt) => Ok(()),
+                Err(error) => Err(error),
+            },
+        };
+        match result {
+            Ok(()) => {
+                self.unsaved.saved(&record);
+                self.writes_recovered();
+            }
+            Err(error) => self.write_failed(&record, error, now),
+        }
+        result
+    }
+
+    fn write_failed(&mut self, record: &Record, error: crate::storage::Error, now: u64) {
+        self.unsaved.failed(record, error, now);
+        self.writes_recovered();
+    }
+
+    /// Reports the failures of the last tries of the dirty rules files: storage is full while one
+    /// found the filesystem full, and not ready while one ended with an unknown outcome. Other
+    /// failures, including running out of memory for a file's buffer, are only retried.
+    fn writes_recovered(&mut self) {
+        use crate::storage::Error as E;
+        let editor = |error| {
+            self.editor
+                .as_ref()
+                .is_some_and(|e| e.failure == Some(error))
+        };
+        let full = self.unsaved.rules_failed(E::Full) || editor(E::Full);
+        if full != self.manager.unsaved_full {
+            self.manager.unsaved_full = full;
+            self.adapter_dirty = true;
+        }
+        let unknown = self.unsaved.rules_failed(E::Unknown) || editor(E::Unknown);
+        if unknown && self.manager.storage_ready {
+            self.manager.fail_storage();
+            self.manager.unsaved_unready = true;
+            self.adapter_dirty = true;
+        } else if !unknown && core::mem::take(&mut self.manager.unsaved_unready) {
+            // Storage that another failure has made not ready since stays so: that failure
+            // cleared `unsaved_unready`.
+            self.manager.storage_ready = true;
+            self.adapter_dirty = true;
+        }
+    }
+
+    /// Counts free space for the status. A failed count keeps the last estimate until the next
+    /// write.
     async fn refresh_available<S: RecordStore>(&mut self, store: &mut S) {
         let full = self.manager.storage_full();
+        self.counted = store.generation().await.ok();
         if let Ok(bytes) = store.available().await {
             self.manager.available_bytes = bytes;
         }
@@ -3283,6 +3765,11 @@ impl Application {
             return false;
         }
         let (address, expected, deadline) = (pair.address, pair.expected, pair.deadline);
+        // Free space is checked with every deferred save on flash.
+        if self.save_for_admission(store, now).await.is_err() {
+            self.stop_pairing(Error::RadioUnavailable, radio);
+            return true;
+        }
         let result = match self
             .manager
             .prepare_pair(address, expected, store, radio)
@@ -3402,12 +3889,17 @@ impl Application {
         radio: &mut B,
         now: u64,
     ) -> bool {
+        self.unsaved.start_pass();
         // A pairing's bond is matched before other work, so the device connects promptly.
-        self.advance_pair(store, radio, now).await
+        let worked = self.advance_pair(store, radio, now).await
             || self.continue_work(store, radio, now).await
             || self.setup(store, radio, now).await
             || self.finish_unpairs(store, radio, now).await
-            || self.background(store, radio, now).await
+            || self.background(store, radio, now).await;
+        if !worked {
+            self.unsaved.end_pass();
+        }
+        worked
     }
 
     /// Background storage work: reading connected devices' policies, saving their layouts,
@@ -3425,10 +3917,21 @@ impl Application {
             return false;
         }
         match self.manager.hydrate(store, now).await {
-            Ok(Some(slot)) => {
+            Ok(Some((slot, roles))) => {
                 self.mark_slot(slot, DEVICE | SETTINGS);
                 if let Some(id) = self.manager.devices[slot].as_ref().map(|d| d.id) {
                     self.job(id).apply = true;
+                    match roles {
+                        // Without memory to list it, the record is updated at a later
+                        // connection.
+                        Some((roles, true)) => {
+                            let _ = self.unsaved.mark(Record::DeviceRoles(id, roles), now);
+                        }
+                        // The record holds the roles reported now, whatever an earlier
+                        // connection left waiting.
+                        Some((roles, false)) => self.unsaved.saved(&Record::DeviceRoles(id, roles)),
+                        None => {}
+                    }
                 }
                 return true;
             }
@@ -3440,17 +3943,13 @@ impl Application {
             }
             Err(_) => return true,
         }
-        let pending = (0..devices::ACTIVE_CONNECTIONS).find_map(|index| {
-            let c = self.manager.connections[index].as_mut()?;
-            let layout = c.layout.take()?;
-            Some((c.device?, layout))
-        });
-        if let Some((slot, layout)) = pending {
-            self.save_layout(slot, &layout, store).await;
+        if self.layout_pending() && self.write_allowed(now) {
+            self.save_layouts(true, store).await;
             return true;
         }
         if let Some(&id) = self.manager.lost_devices.first()
             && self.lost_retry.due(now)
+            && self.write_allowed(now)
         {
             if (Policies { store }).remove(id).await.is_ok() {
                 self.manager.lost_devices.remove(0);
@@ -3466,6 +3965,7 @@ impl Application {
         if self.work.is_none() {
             if let Some(&id) = self.manager.lost_profiles.first()
                 && self.lost_retry.due(now)
+                && self.write_allowed(now)
             {
                 self.manager.lost_profiles.remove(0);
                 self.work = Some(Work::LostProfile(id, None));
@@ -3492,18 +3992,12 @@ impl Application {
                 return self.continue_work(store, radio, now).await;
             }
         }
-        if let Some(&id) = self.roles_pending.first()
-            && self.roles_retry.due(now)
+        // Free space is counted for the status once writes have stopped. Admission checks count
+        // it themselves when it is out of date.
+        if let Ok(generation) = store.generation().await
+            && self.counted != Some(generation)
         {
-            self.roles_pending.remove(0);
-            if self.repair_roles(id, store).await.is_ok() {
-                self.roles_retry.succeeded();
-            } else {
-                if !self.roles_pending.contains(&id) {
-                    self.roles_pending.push(id);
-                }
-                self.roles_retry.failed(now);
-            }
+            self.refresh_available(store).await;
             return true;
         }
         // Released memory lets each device that did not fit try again, in turn, in a pass over
@@ -3568,7 +4062,11 @@ impl Application {
                 self.sync_bonds(sync, store, radio, now).await;
             }
             Work::LostProfile(id, scan) => {
-                match self.clean_lost_profile(id, scan, store, radio).await {
+                if !self.write_allowed(now) {
+                    self.work = Some(Work::LostProfile(id, scan));
+                    return false;
+                }
+                match self.clean_lost_profile(id, scan, store, radio, now).await {
                     Ok(Some(scan)) => self.work = Some(Work::LostProfile(id, Some(scan))),
                     Ok(None) => {
                         // A connection that found it lost meanwhile queued it again.
@@ -3669,8 +4167,9 @@ impl Application {
         }
     }
 
-    /// Releases an editor's profile once the editor has gone quiet or its interface changed.
-    fn release_editor(&mut self, now: u64) {
+    /// Releases an editor's profile once the editor has gone quiet or its interface changed, and
+    /// saves its edits.
+    async fn release_editor<S: RecordStore>(&mut self, store: &mut S, now: u64) {
         let Some(editor) = &self.editor else { return };
         let saved = interfaces::preference(
             &self.manager.preference.configuration_interfaces,
@@ -3680,7 +4179,18 @@ impl Application {
             || !saved.enabled
             || saved.profile != Some(editor.profile)
         {
-            self.editor = None;
+            self.drop_editor();
+            // Edits there is no memory to hand over are written from the editor first. An editor
+            // whose edits are still not saved is released at a later try.
+            if self.editor.is_some()
+                && (self.manager.storage_ready || self.manager.unsaved_unready)
+                && self.save_editor(store, now, false).await
+            {
+                self.drop_editor();
+            }
+            if self.editor.is_none() {
+                self.save_all(store, now).await;
+            }
         }
     }
 
@@ -3854,11 +4364,12 @@ impl Application {
                     self.profile_dirty[index].1 &= !PROFILE;
                 }
                 result.ok().map(Ev::Profile)
-            } else if bits & RULES != 0
-                && (self.manager.profiles.get(id).is_some() || self.event_due(rules, now))
+            } else if bits & RULES != 0 && (self.loaded(id).is_some() || self.event_due(rules, now))
             {
                 let result = self.rules_event(id, store).await;
-                if self.event_settled(rules, result.as_ref().err(), now) {
+                if self.event_settled(rules, result.as_ref().err(), now)
+                    && !self.touched_rules.iter().any(|(p, _)| *p == id)
+                {
                     self.profile_dirty[index].1 &= !RULES;
                 }
                 result.ok().flatten()
@@ -3886,8 +4397,8 @@ impl Application {
 
     /// The changes to the rules of profile `id` whose inputs were touched: the current rule for
     /// each that has one, and the input of each that does not. `None` when there is nothing to
-    /// send. Touched inputs stay touched when the rules cannot be read, so the next rules event
-    /// of the profile carries them.
+    /// send. An event carries at most a page of rules; touched inputs beyond it stay touched for
+    /// the next rules event of the profile, as do all of them when the rules cannot be read.
     async fn rules_event<S: RecordStore>(
         &mut self,
         id: u64,
@@ -3896,17 +4407,31 @@ impl Application {
         if !self.touched_rules.iter().any(|(p, _)| *p == id) {
             return Ok(None);
         }
-        let rules = self.rules(id, store).await?;
+        let saved;
+        let map;
+        let rules = match self.loaded(id) {
+            Some(loaded) => {
+                map = loaded;
+                map.borrow()
+            }
+            None => {
+                saved = core::cell::RefCell::new(self.rules(id, store).await?);
+                saved.borrow()
+            }
+        };
         let Some(index) = self.touched_rules.iter().position(|(p, _)| *p == id) else {
             return Ok(None);
         };
-        let (_, inputs) = self.touched_rules.swap_remove(index);
+        let (_, mut inputs) = self.touched_rules.swap_remove(index);
+        // An event carries at most a page of rules; the rest follow in the next ones.
+        if inputs.len() > RULES_PAGE {
+            let rest = inputs.split_off(RULES_PAGE);
+            self.touched_rules.push((id, rest));
+        }
         let mut changed = Vec::new();
         let mut removed = Vec::new();
-        let mut current = rules.iter().peekable();
         for input in inputs {
-            while current.next_if(|r| r.input < input).is_some() {}
-            match current.next_if(|r| r.input == input) {
+            match rules.get(input) {
                 Some(rule) => changed.push(wire_rule(rule)),
                 None => removed.push(wire_usage(input)),
             }
@@ -4098,15 +4623,21 @@ impl Application {
         radio: &mut B,
         now: u64,
     ) -> bool {
-        self.release_editor(now);
+        self.release_editor(store, now).await;
         if let Some(deadline) = self.reboot_at {
             if ((self.serial.queued() == 0 && self.manager.forward.pending() == 0)
                 || now >= deadline)
-                && let Some(boot) = &self.build.bootloader
+                && self.build.bootloader.is_some()
             {
-                (boot.enter)();
+                self.save_all(store, now).await;
+                if let Some(boot) = &self.build.bootloader {
+                    (boot.enter)();
+                }
             }
             return false;
+        }
+        if self.save(store, now).await {
+            return true;
         }
         self.start_jobs(now);
         self.collect_changes();

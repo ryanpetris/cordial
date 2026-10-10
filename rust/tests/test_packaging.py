@@ -41,7 +41,7 @@ class Packaging(unittest.TestCase):
 
     def test_esp_rejects_wrong_images_and_partitions(self):
         config = {"storage_offset": 0x7e0000, "storage_bytes": 0x20000}
-        entries = [(1, 2, 0x9000, 0x6000, b"nvs"), (1, 1, 0xf000, 0x1000, b"phy_init"),
+        entries = [(1, 1, 0xf000, 0x1000, b"phy_init"),
                    (0, 0, 0x10000, 0x7d0000, b"factory"), (1, 0x40, 0x7e0000, 0x1000, b"cordial_layout"),
                    (1, 0x83, 0x7e1000, 0x1f000, b"cordial_app")]
         def table(rows):
@@ -52,7 +52,7 @@ class Packaging(unittest.TestCase):
         build.esp_partitions(data, config)
         # A wrong table with a valid checksum is still rejected.
         for malformed in (table(entries[:-1]), table(entries[::-1]),
-                          data[:170] + b"\0" + data[171:], data + b"\xff"):
+                          data[:150] + b"\0" + data[151:], data + b"\xff"):
             with self.assertRaises(ValueError):
                 build.esp_partitions(malformed, config)
         settings = {"flash_mode": "dio", "flash_freq": "80m", "flash_size": "8MB"}

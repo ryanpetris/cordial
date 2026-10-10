@@ -236,27 +236,50 @@ impl Application {
             editor.last = now;
             return Some((id, editor.map.clone()));
         }
-        self.editor = None;
-        let map = match self.manager.profiles.load(store, &[id], budget, &[]).await {
-            Ok(mut maps) => maps.pop()?,
-            Err(profiles::LoadError::Lost(id)) => {
-                if !self.manager.lost_profiles.contains(&id) {
-                    self.manager.lost_profiles.push(id);
-                }
+        if self.editor.is_some() {
+            // The released profile's edits are written at once, as whenever an editor is
+            // released, so its table stops counting against the budget before this one loads.
+            self.drop_editor();
+            // Edits there is no memory to hand over are written from the editor first.
+            if self.editor.is_some() && self.save_editor(store, now, false).await {
+                self.drop_editor();
+            }
+            if self.editor.is_some() {
                 return None;
             }
-            Err(_) => return None,
+            self.save_all(store, now).await;
+            // A save that left storage not ready leaves the new profile unedited.
+            if !self.manager.storage_ready {
+                return None;
+            }
+        }
+        let map = match self.loaded(id) {
+            Some(map) => map,
+            None => match self.manager.profiles.load(store, &[id], budget, &[]).await {
+                Ok(mut maps) => maps.pop()?,
+                Err(profiles::LoadError::Lost(id)) => {
+                    if !self.manager.lost_profiles.contains(&id) {
+                        self.manager.lost_profiles.push(id);
+                    }
+                    return None;
+                }
+                Err(_) => return None,
+            },
         };
         self.editor = Some(Editor {
             interface,
             profile: id,
             map: map.clone(),
             last: now,
+            edited: None,
+            failure: None,
+            retry: Default::default(),
         });
         Some((id, map))
     }
-    /// Answers one packet from `interface`'s editor. Writes commit before the successful echo.
-    /// An unsupported command or failed write returns FF.
+    /// Answers one packet from `interface`'s editor. A write changes the loaded rules and is
+    /// echoed at once, before it reaches flash: the editor's edits are saved once it pauses. An
+    /// unsupported command, or a write the profile memory cannot hold, returns FF.
     pub async fn configure<S: RecordStore>(
         &mut self,
         interface: Interface,
@@ -274,7 +297,7 @@ impl Application {
             let Some(input) = input(index) else {
                 return Some(0);
             };
-            match map.borrow().iter().find(|r| r.input == input) {
+            match map.borrow().get(input) {
                 None => Some(encode(interface, &[own(input)]).unwrap_or(TRANSPARENT)),
                 Some(rule) => match rule.effect {
                     profiles::Effect::Remap(outputs) => encode(interface, &outputs),
@@ -442,13 +465,6 @@ impl Application {
         }
         if reset || !edits.is_empty() {
             let mut changes = Vec::new();
-            if reset {
-                changes.extend(
-                    map.borrow()
-                        .iter()
-                        .map(|rule| profiles::Change::Forget(rule.input)),
-                );
-            }
             for (input, outputs) in edits {
                 let rule = profiles::Rule {
                     input,
@@ -462,7 +478,7 @@ impl Application {
                     }
                 }
             }
-            if self.change_rules(id, changes, store).await.is_err() {
+            if self.edit_rules(id, &map, reset, changes, now).is_err() {
                 data[0] = 0xff;
             }
         }

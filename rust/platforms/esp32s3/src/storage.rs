@@ -1,4 +1,4 @@
-//! Raw application flash. The platform NVS partition remains owned by ESP-IDF.
+//! Raw application flash in the `cordial_layout` and `cordial_app` partitions.
 use cordial_core::storage::Error;
 use embedded_storage_async::nor_flash::{ErrorType, NorFlash, NorFlashErrorKind, ReadNorFlash};
 use esp_idf_sys as sys;

@@ -104,7 +104,7 @@ def load(path, profile):
     errata_bytes = 4096 if config["chip"] == "rp2350" else 0
     storage = flash - offset - errata_bytes
     # Identity includes record format and selected backend, independently of pins.
-    layout = {"format": "littlefs-json-1",
+    layout = {"format": "littlefs-2",
               "storage_backend": selected[2], "offset": offset, "bytes": storage,
               "erase_bytes": 4096}
     marker = hashlib.sha256(json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()).digest()

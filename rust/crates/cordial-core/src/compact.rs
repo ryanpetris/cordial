@@ -9,7 +9,6 @@ use crate::model::{
 use crate::settings::{Error, MAX_CHOICES, MAX_TEXT_BYTES, SettingMetadata};
 use alloc::{boxed::Box, rc::Rc, string::ToString, vec::Vec};
 use core::{cell::Cell, num::NonZeroU64};
-use serde::{Deserialize, Serialize};
 
 /// Enumeration order supplies the feature index; support is a handler property.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,14 +33,14 @@ impl FeatureEntry {
 }
 const _: () = assert!(core::mem::size_of::<FeatureEntry>() == 4);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Range {
     pub min: u16,
     pub max: u16,
     pub step: u16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Metadata {
     pub key: SettingKey,
     pub feature: FeatureId,
@@ -179,7 +178,7 @@ impl Observed {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Preference {
     pub metadata: Metadata,
     pub value: u16,

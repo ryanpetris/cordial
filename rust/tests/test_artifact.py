@@ -31,7 +31,7 @@ class Artifact(unittest.TestCase):
             return artifact.MAGIC + json.dumps(value).encode() + b'\0'
         self.assertEqual(artifact.inspect(blob(expected)), expected)
         for changes in ({'bootloader': 'bootsel'},
-                        {'storage_bytes': 4096}, {'native_storage_bytes': 0x7000},
+                        {'storage_bytes': 4096}, {'storage_identity': '0' * 64},
                         {'profile': 'production'}, {'unused': True}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 artifact.inspect(blob(expected | changes))

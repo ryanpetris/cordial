@@ -1196,11 +1196,23 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
         Outcome::Files { entries, .. } => {
             entries.iter().map(file_line).collect::<Vec<_>>().join("\n")
         }
-        Outcome::FileSaved { path, local, bytes } => format!(
-            "Saved {} to {} ({bytes} bytes).",
-            safe(path),
-            safe(&local.display().to_string())
-        ),
+        Outcome::FileSaved {
+            path,
+            local,
+            bytes,
+            json,
+            unconverted,
+        } => {
+            let (path, local) = (safe(path), safe(&local.display().to_string()));
+            match unconverted {
+                Some(why) => format!(
+                    "Saved {path} to {local} ({bytes} bytes) without converting it: {}.",
+                    why.reason()
+                ),
+                None if *json => format!("Saved {path} as JSON to {local} ({bytes} bytes)."),
+                None => format!("Saved {path} to {local} ({bytes} bytes)."),
+            }
+        }
         Outcome::Name { name, reset: true } => {
             format!("Adapter name reset to {}.", display(name))
         }

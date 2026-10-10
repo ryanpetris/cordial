@@ -91,10 +91,17 @@ layers, tap dance, combos, matrix spying, lighting, bootloader entry, and whole-
 commands are unsupported. Enabling Vial explicitly authorizes fixed remap edits; the interface
 reports unlocked and provides no executable or timed actions.
 
-Each supported edit packet commits atomically before acknowledgement. An invalid action or failed
-save returns VIA's unhandled response, 0xff, without publishing a new runtime rule. A complete
-multi-packet import is not atomic. External editors may not present rejection clearly; verify the
-result by reading it back. Copies include every saved rule and remain independent.
+Each supported edit packet changes the loaded rules atomically and is acknowledged at once, before
+it reaches flash: devices use the edit immediately, and the editor's edits are saved together once
+it pauses, within about 2 s of each edit, and before USB enumerates again or the bootloader is
+entered. See [when files are written](storage-format.md#when-files-are-written). An edit made
+shortly before power is removed can be lost. An invalid action, or an edit the profile memory budget
+cannot hold, returns VIA's unhandled response, 0xff, without publishing a new runtime rule. A save
+that fails after the acknowledgement keeps the edit in use and is retried until it succeeds. While
+its last try found the filesystem full, storage is reported full, and while its last try ended with
+an unknown outcome, storage is not ready; editor packets are refused while storage is not ready. A
+complete multi-packet import is not atomic. External editors may not present rejection clearly;
+verify the result by reading it back. Copies include every saved rule and remain independent.
 
 The USB consumer report holds at most eight distinct simultaneous consumer usages across all
 connected devices, including remapped outputs. Exceeding that bound triggers the input-overflow
@@ -137,6 +144,11 @@ VIA, Vial and Remap sessions still require hardware verification.
    unlock screens used with the adapter.
 10. Measure the time from a keyboard's reconnection to its first key reaching the Host with and
     without profiles in its layers; loading profiles should add only their flash reads.
+11. Load a whole layout in Vial while moving the mouse, and confirm the pointer does not stall and
+    the load completes promptly. Unplug the adapter at various moments: during the load, within a
+    second of the last edit, and a few seconds after. Plug it back in and confirm edits older than
+    about 2 s are kept. Make an edit and at once switch the interface between VIA and Vial; after
+    USB enumerates again, confirm the edit is kept.
 
 Protocol references: [QMK VIA commands](https://github.com/qmk/qmk_firmware/blob/master/quantum/via.h),
 [Vial VIA implementation](https://github.com/vial-kb/vial-qmk/blob/vial/quantum/via.c), and
