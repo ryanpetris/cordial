@@ -206,7 +206,8 @@ export type SettingsChange =
 
 export interface SettingsSaveItem {
   change: SettingsChange;
-  status: "saving" | "saved" | "not_saved";
+  /** `unknown` when the adapter couldn't confirm the outcome or the session ended before it answered. */
+  status: "saving" | "saved" | "not_saved" | "unknown";
   error: string | null;
 }
 

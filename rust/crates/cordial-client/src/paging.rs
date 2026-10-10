@@ -19,22 +19,36 @@ pub trait Page: Sized {
     /// Nothing follows the page's last entry.
     fn end(&self) -> bool;
     fn key(entry: &Self::Entry) -> Self::Key;
+    /// Whether the entry carries its key. An entry of a variant newer than this client reads
+    /// as unset and carries none.
+    fn keyed(_entry: &Self::Entry) -> bool {
+        true
+    }
     /// The listing's order.
     fn order(a: &Self::Key, b: &Self::Key) -> Ordering;
 
+    /// The key of the page's last entry that has one.
+    fn last_key(&self) -> Option<Self::Key> {
+        self.entries()
+            .iter()
+            .rev()
+            .find(|e| Self::keyed(e))
+            .map(Self::key)
+    }
+
     /// The key to read the next page after, or `None` when the page ends the listing. A page
-    /// without entries that does not end the listing has no next key either; [`read_pages`]
-    /// refuses it.
+    /// without an entry whose key can be read that does not end the listing has no next key
+    /// either; [`read_pages`] refuses it.
     fn next(&self) -> Option<Self::Key> {
         if self.end() {
             return None;
         }
-        self.entries().last().map(Self::key)
+        self.last_key()
     }
 
     /// Whether `key` falls in the range this page covers, read after `after`: past `after`, and
-    /// up to the page's last entry unless the page ends the listing. A client replaces what it
-    /// holds in this range with the page's entries.
+    /// up to the page's last keyed entry unless the page ends the listing. A client replaces
+    /// what it holds in this range with the page's entries.
     fn covers(&self, after: Option<&Self::Key>, key: &Self::Key) -> bool {
         if after.is_some_and(|a| Self::order(key, a) != Ordering::Greater) {
             return false;
@@ -42,9 +56,8 @@ pub trait Page: Sized {
         if self.end() {
             return true;
         }
-        self.entries()
-            .last()
-            .is_some_and(|last| Self::order(key, &Self::key(last)) != Ordering::Greater)
+        self.last_key()
+            .is_some_and(|last| Self::order(key, &last) != Ordering::Greater)
     }
 }
 
@@ -78,7 +91,7 @@ pub fn read_pages<P: Page, E>(
     }
 }
 
-/// The ID a device listing entry names.
+/// The ID a device listing entry names; 0 for an entry variant newer than this client.
 pub fn device_entry_id(entry: &p::DeviceListEntry) -> u32 {
     match entry.entry {
         Some(device_list_entry::Entry::Device(ref d)) => d.id,
@@ -87,7 +100,7 @@ pub fn device_entry_id(entry: &p::DeviceListEntry) -> u32 {
     }
 }
 
-/// The ID a profile listing entry names.
+/// The ID a profile listing entry names; 0 for an entry variant newer than this client.
 pub fn profile_entry_id(entry: &p::ProfileListEntry) -> u32 {
     match entry.entry {
         Some(profile_list_entry::Entry::Profile(ref profile)) => profile.id,
@@ -170,6 +183,9 @@ impl Page for p::DeviceList {
     fn key(entry: &Self::Entry) -> u32 {
         device_entry_id(entry)
     }
+    fn keyed(entry: &Self::Entry) -> bool {
+        entry.entry.is_some()
+    }
     fn order(a: &u32, b: &u32) -> Ordering {
         a.cmp(b)
     }
@@ -195,6 +211,9 @@ impl Page for p::ProfileList {
     }
     fn key(entry: &Self::Entry) -> u32 {
         profile_entry_id(entry)
+    }
+    fn keyed(entry: &Self::Entry) -> bool {
+        entry.entry.is_some()
     }
     fn order(a: &u32, b: &u32) -> Ordering {
         a.cmp(b)
@@ -378,6 +397,38 @@ mod tests {
             || "stalled",
         );
         assert_eq!(same.unwrap_err(), "stalled");
+    }
+
+    #[test]
+    fn entries_of_unknown_variants_are_paged_past() {
+        let page = |ids: &[Option<u32>], end: bool| p::DeviceList {
+            entries: ids
+                .iter()
+                .map(|id| p::DeviceListEntry {
+                    entry: id.map(device_list_entry::Entry::Unreadable),
+                })
+                .collect(),
+            end,
+        };
+        let mut asked = Vec::new();
+        let all = read_pages(
+            |after: Option<&u32>| {
+                asked.push(after.copied());
+                Ok::<_, ()>(match after {
+                    None => page(&[Some(1), Some(3), None], false),
+                    Some(3) => page(&[None, Some(7), None], false),
+                    _ => page(&[None], true),
+                })
+            },
+            || (),
+        )
+        .unwrap();
+        assert_eq!(asked, [None, Some(3), Some(7)]);
+        assert_eq!(all.len(), 7);
+        let first = page(&[Some(4), None], false);
+        assert!(first.covers(None, &4) && !first.covers(None, &5));
+        let unknown = read_pages(|_: Option<&u32>| Ok(page(&[None], false)), || "stalled");
+        assert_eq!(unknown.unwrap_err(), "stalled");
     }
 
     #[test]

@@ -16,6 +16,7 @@ import {
   CordialError,
   UnexpectedResponseError,
   compareSettingRefs,
+  entryId,
   compareWarnings,
   settingRef,
   type ByteStream,
@@ -261,7 +262,7 @@ export class AdapterSession {
     if (page === "first") [before, after] = [[], 0];
     else if (page === "next") {
       if (!state.next) return;
-      [before, after] = [state.cursors, state.next];
+      [before, after] = [[...state.cursors], state.next];
     } else if (page === "previous") {
       if (state.cursors.length < 2) return;
       [before, after] = [state.cursors.slice(0, -2), state.cursors.at(-2)!];
@@ -277,13 +278,13 @@ export class AdapterSession {
         list = await this.#connection.listProfiles(after);
       }
       if (read !== state.read) return;
-      if (!list.entries.length && !list.end) throw new UnexpectedResponseError("listProfiles");
-      const last = list.entries.at(-1)?.entry;
+      // The cursor of the following page is the key of this page's last entry with a known key.
+      const last = list.entries.map(entryId).findLast((id) => id !== undefined);
+      if (last === undefined && !list.end) throw new UnexpectedResponseError("listProfiles");
       state.cursors = [...before, after];
       state.profiles = list.entries.flatMap((e) => (e.entry.case === "profile" ? [convert.profile(e.entry.value)] : []));
       state.unreadable = list.entries.flatMap((e) => (e.entry.case === "unreadable" ? [e.entry.value] : []));
-      // The cursor of the following page is the key of this page's last entry.
-      state.next = list.end || !last ? 0 : last.case === "profile" ? last.value.id : (last.value ?? 0);
+      state.next = list.end ? 0 : last!;
       state.error = null;
     } catch (error) {
       if (this.closed || read !== state.read) return;
@@ -366,11 +367,13 @@ export class AdapterSession {
         const { entries, end } = result.value;
         const devices = entries.flatMap((e) => (e.entry.case === "device" ? [e.entry.value] : []));
         const unreadable = entries.flatMap((e) => (e.entry.case === "unreadable" ? [e.entry.value] : []));
-        const last = entries.at(-1)?.entry;
-        const next = end || !last ? 0 : last.case === "device" ? last.value.id : (last.value ?? 0);
+        // The page covers up to its last entry with a known key; one without such an entry that
+        // doesn't end the listing covers nothing.
+        const last = entries.map(entryId).findLast((id) => id !== undefined);
         const listed = new Set(devices.map((d) => d.id));
-        for (const id of [...this.devices.keys()])
-          if (inPage(id, after, next) && !listed.has(id) && !unreadable.includes(id)) this.#remove(id);
+        if (end || last !== undefined)
+          for (const id of [...this.devices.keys()])
+            if (inPage(id, after, end ? 0 : last!) && !listed.has(id) && !unreadable.includes(id)) this.#remove(id);
         for (const d of devices) this.devices.set(d.id, convert.device(d));
         if (unreadable.length) this.#hooks.log(`devices ${unreadable.join(", ")} unreadable`);
         break;

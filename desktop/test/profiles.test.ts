@@ -89,6 +89,39 @@ describe("Profiles", () => {
     await c.stop();
   });
 
+  it("keeps the cursors when moving back from an emptied next page fails", async () => {
+    const profiles = [1, 2, 3, 4, 5, 6].map((id) => profile(id, `P${id}`));
+    const { fake, c, state } = await start({ profiles, pageSize: 2 });
+    await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
+    expect(ids(state)).toEqual([3, 4]);
+    // The following page empties without the adapter saying so, and reading the shown one fails.
+    fake.profiles = fake.profiles.filter((p) => p.id < 5);
+    fake.failures.listProfiles = [undefined as unknown as ErrorCode, ErrorCode.BUSY];
+    await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
+    expect(page(state)).toMatchObject({ previous: true, error: expect.stringContaining("busy") });
+    expect(ids(state)).toEqual([3, 4]);
+    await c.request({ type: "profiles.page", adapterId: ID, page: "previous" });
+    expect(ids(state)).toEqual([1, 2]);
+    await c.stop();
+  });
+
+  it("pages on after the last profile listing entry of a known kind", async () => {
+    const fake = new FakeAdapter({ adapterId: ID, devices: [], profiles: [1, 2, 3].map((id) => profile(id, `P${id}`)), pageSize: 2 });
+    fake.newerProfiles.add(2);
+    const harness = controller({ "/a": fake });
+    const { c } = harness;
+    const state = harness.state as () => AppState;
+    await c.manager.rescan();
+    await until(() => !!state()?.adapters[0]?.profilePage && !page(state).loading);
+    expect(ids(state)).toEqual([1]);
+    expect(page(state)).toMatchObject({ next: true });
+    await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
+    expect(ids(state)).toEqual([3]);
+    const afters = fake.received.flatMap((r) => (r.command.case === "listProfiles" ? [r.command.value.after] : []));
+    expect(afters).toEqual([0, 1]);
+    await c.stop();
+  });
+
   it("pages the profile picker separately from the Profiles list", async () => {
     const profiles = [1, 2, 3, 4, 5].map((id) => profile(id, `P${id}`));
     const { c, state } = await start({ profiles, pageSize: 2 });

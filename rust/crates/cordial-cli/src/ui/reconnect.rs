@@ -97,24 +97,6 @@ impl Reconnect {
         }
     }
 
-    /// The save being followed.
-    pub(crate) fn ticket(&self) -> Ticket {
-        self.ticket
-    }
-
-    /// The ID of the adapter the save was sent to.
-    pub(crate) fn adapter(&self) -> &str {
-        &self.id
-    }
-
-    /// The save's reply was cut short, as by the connection dropping, so it may have been stored
-    /// and the drop is expected.
-    pub(crate) fn cut_short(&mut self) {
-        if matches!(self.stage, Stage::Saving) {
-            self.stage = Stage::Saved(Instant::now() + WINDOW);
-        }
-    }
-
     /// Whether losing `session` is the expected reconnect, which starts the wait for the adapter.
     pub(crate) fn lost(&mut self, session: SessionId, error: &Error) -> bool {
         let now = Instant::now();

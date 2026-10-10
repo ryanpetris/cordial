@@ -282,10 +282,11 @@ pub(crate) fn execute(
             overwrite,
         } => {
             storage::check_destination(local, *overwrite)?;
+            // The response isn't reported, so file contents are never printed.
             let r = session.call(
                 C::ReadFile(p::ReadFile { path: path.clone() }),
                 "file get",
-                true,
+                false,
             )?;
             let Some(response::Result::File(file)) = r.result else {
                 return Err(unexpected());
@@ -646,13 +647,13 @@ fn save_adapter(
     set_adapter(session, request, pending)
 }
 
-fn scan(
+/// Starts a scan and returns its transports.
+fn start_scan(
     session: &Session,
     st: &State,
     named: &[p::Transport],
     seconds: u32,
-    options: &RunOptions,
-) -> Result<Outcome, Error> {
+) -> Result<Vec<p::Transport>, Error> {
     let transports = scan_transports(st, named).map_err(Error::new)?;
     if seconds > MAX_SCAN_SECONDS {
         return Err(Error::new("scan duration must be between 1s and 60s"));
@@ -667,6 +668,17 @@ fn scan(
             true,
         )
         .map_err(|e| transport_refusal(session, &transports, e))?;
+    Ok(transports)
+}
+
+fn scan(
+    session: &Session,
+    st: &State,
+    named: &[p::Transport],
+    seconds: u32,
+    options: &RunOptions,
+) -> Result<Outcome, Error> {
+    let transports = start_scan(session, st, named, seconds)?;
     if !options.one_shot {
         return Ok(Outcome::ScanStarted(transports));
     }
@@ -711,8 +723,19 @@ fn resolve_candidate(st: &State, target: &Target) -> Result<p::Candidate, Error>
 fn pair(session: &Session, target: &Target, options: &RunOptions) -> Result<Outcome, Error> {
     let mut st = session.state();
     if options.one_shot && resolve_candidate(&st, target).is_err() {
-        // A one-shot pair finds its device with a scan of its own.
-        scan(session, &st, &[], 0, options)?;
+        // A one-shot pair finds its device with a scan of its own, which ends once it has.
+        start_scan(session, &st, &[], 0)?;
+        let found = session.cell.wait_for(&options.wait, |st| {
+            (st.scanning.is_none() || resolve_candidate(st, target).is_ok()).then_some(())
+        });
+        let stopped = match session.state().scanning {
+            Some(_) => session
+                .call(C::StopScan(p::StopScan {}), "scan stop", true)
+                .map(drop),
+            None => Ok(()),
+        };
+        found?;
+        stopped?;
         st = session.state();
     }
     let candidate = resolve_candidate(&st, target)?;
@@ -1046,7 +1069,18 @@ fn save_device(
     update: &DeviceUpdate,
     pending: &'static str,
 ) -> Result<Outcome, Error> {
-    if update.enabled == Some(true) && !d.enabled && enabled_full(st, d) {
+    let enabled = update.enabled.unwrap_or(d.enabled);
+    let blocked = update.blocked.unwrap_or(d.blocked);
+    // The adapter takes an update that changes nothing as done, whatever room it has.
+    let changes = enabled != d.enabled
+        || blocked != d.blocked
+        || update.trusted.is_some_and(|v| v != d.trusted)
+        || update.hidpp.is_some_and(|v| v != model::hidpp_enabled(d))
+        || update
+            .layers
+            .as_ref()
+            .is_some_and(|l| l.as_slice() != profiles::layers(d));
+    if changes && capacity_refused(st, d, enabled, blocked) {
         return Err(no_capacity(CapacityReason::Enabled, "device set"));
     }
     if let Some(layers) = &update.layers {
@@ -1102,6 +1136,16 @@ pub fn pending_name(toggle: Toggle) -> &'static str {
         Toggle::Blocked => "device set blocked",
         Toggle::Hidpp => "device set hidpp",
     }
+}
+
+/// Whether the adapter would refuse a device's preferences for lack of room, as it decides: the
+/// device isn't in use now, the preferences make it usable on a transport the adapter has enabled,
+/// and that transport has every place in use.
+pub fn capacity_refused(st: &State, d: &p::Device, enabled: bool, blocked: bool) -> bool {
+    let usable = model::transport(d.transport).is_some_and(|t| {
+        model::supports(&st.status, t) && !model::transport_disabled(&st.status, t)
+    });
+    d.inactive.is_some() && enabled && !blocked && usable && enabled_full(st, d)
 }
 
 /// Whether the device's transport already has as many devices in use as the adapter allows.

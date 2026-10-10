@@ -85,25 +85,29 @@ export interface Page<E> {
 
 /**
  * Reads a listing to its end. Each request passes the key of the last entry received as `after`,
- * undefined for the first; the Dongle chooses how many entries each page holds. A page without
- * entries that does not end the listing breaks the protocol and rejects with
+ * undefined for the first; the Dongle chooses how many entries each page holds. An entry whose
+ * key is undefined, such as one of a kind newer than this client, is kept but never continues the
+ * listing: the next page follows the last entry with a key. A page that does not end the listing
+ * and has no entry with a key breaks the protocol, or can't be continued, and rejects with
  * UnexpectedResponseError.
  */
-export async function readAll<E, K>(command: string, read: (after: K | undefined) => Promise<Page<E>>, key: (entry: E) => K): Promise<E[]> {
+export async function readAll<E, K>(command: string, read: (after: K | undefined) => Promise<Page<E>>, key: (entry: E) => K | undefined): Promise<E[]> {
   const all: E[] = [];
   let after: K | undefined;
   for (;;) {
     const page = await read(after);
     all.push(...page.entries);
     if (page.end) return all;
-    const last = page.entries.at(-1);
+    const last = page.entries.map(key).findLast((k) => k !== undefined);
     if (last === undefined) throw new UnexpectedResponseError(command);
-    after = key(last);
+    after = last;
   }
 }
 
-/** The ID a device or profile listing entry is listed by. */
-const entryId = (e: DeviceListEntry | ProfileListEntry) => (e.entry.case === "device" || e.entry.case === "profile" ? e.entry.value.id : e.entry.value ?? 0);
+/** The ID a device or profile listing entry is listed by; undefined for an entry of a kind this
+ * client doesn't know. */
+export const entryId = (e: DeviceListEntry | ProfileListEntry): number | undefined =>
+  e.entry.case === "device" || e.entry.case === "profile" ? e.entry.value.id : e.entry.case === "unreadable" ? e.entry.value : undefined;
 
 /** The session ended before a request was answered. */
 export class ConnectionClosedError extends Error {
@@ -173,6 +177,9 @@ export class Connection {
       // The delimiter ends whatever an earlier client left half-written.
       const response = await connection.#enqueue({ case: "getStatus", value: {} }, options.openTimeoutMs ?? OPEN_TIMEOUT_MS, true);
       if (response.result.case !== "status") throw new Error("the first response is not a status");
+      // The session can end after the response and before this continuation runs, before
+      // onClose could report it.
+      if (connection.#closed) throw new ConnectionClosedError();
       connection.#status = response.result.value;
       return connection;
     } catch (error) {

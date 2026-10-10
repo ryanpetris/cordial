@@ -7,7 +7,7 @@ use crate::{
     profiles,
     ui::{
         catalog::{self, value_string},
-        text::{Filter, quote},
+        text::{Filter, quote, safe},
     },
 };
 use cordial_protocol::{self as p, Platform, Transport, profile_rule};
@@ -264,11 +264,36 @@ pub const DIRECT: &[&str] = &[
 /// offers; without one it documents every command and claims nothing about
 /// any adapter.
 pub fn help(st: Option<&State>) -> String {
+    help_on(st, None)
+}
+
+/// Whether a help row or note for `words` belongs to the commands that start with `topic`.
+fn about(words: &str, topic: &str) -> bool {
+    words == topic || words.starts_with(&format!("{topic} "))
+}
+
+/// The help for the commands that start with `topic`, or the whole help without one. A topic
+/// the adapter doesn't offer is documented as it is without an adapter.
+pub fn help_on(st: Option<&State>, topic: Option<&str>) -> String {
+    let topic = topic.map(|t| if t == "exit" { "quit" } else { t });
+    let st = match topic {
+        Some(t)
+            if st.is_some_and(|st| {
+                !SPECS
+                    .iter()
+                    .any(|r| about(r.words, t) && offered(r.words, st))
+            }) =>
+        {
+            None
+        }
+        _ => st,
+    };
     let listed = |words: &str| st.is_none_or(|st| offered(words, st));
+    let shown = |words: &str| topic.is_none_or(|t| about(words, t));
     let mut out = Vec::new();
     for r in SPECS
         .iter()
-        .filter(|r| r.words != "exit" && listed(r.words))
+        .filter(|r| r.words != "exit" && listed(r.words) && shown(r.words))
     {
         let (syntax, text) = match r.words {
             SCAN => scan_row(st),
@@ -315,6 +340,25 @@ pub fn help(st: Option<&State>) -> String {
                 "device set DEV profiles LAYERS"
             ));
         }
+    }
+    if let Some(topic) = topic {
+        let notes: Vec<&str> = NOTES
+            .iter()
+            .filter(|(words, text)| {
+                !text.is_empty()
+                    && words.iter().any(|w| {
+                        SPECS
+                            .iter()
+                            .any(|r| about(r.words, topic) && about(r.words, w) && listed(r.words))
+                    })
+            })
+            .map(|(_, text)| text.trim_start_matches('\n'))
+            .collect();
+        if !notes.is_empty() {
+            out.push(String::new());
+            out.extend(notes.into_iter().map(str::to_owned));
+        }
+        return out.join("\n");
     }
     out.push(String::new());
     for (words, text) in NOTES {
@@ -859,17 +903,21 @@ fn last_word(line: &str) -> (&str, &str) {
 /// range is small enough for fine steps alone.
 pub fn steps(s: &p::Setting) -> (i64, i64) {
     match model::range(s) {
-        Some((min, max, fine)) if (max - min) / fine <= 20 => (fine, 0),
-        Some((_, _, fine)) => (fine, fine * 10),
+        Some((min, max, fine)) if model::step_count(min, max, fine) <= 20 => (fine, 0),
+        Some((_, _, fine)) => (fine, fine.saturating_mul(10)),
         None => (1, 10),
     }
 }
 
-fn shell_word(word: String) -> String {
-    if word.contains(char::is_whitespace) || word.contains(['"', '\'', '\\']) {
-        quote(&word)
+/// A word as the shell line takes it back, quoted when needed. A word with characters the
+/// terminal can't show safely is never offered: shown escaped, it wouldn't name the same thing.
+fn shell_word(word: String) -> Option<String> {
+    if safe(&word) != word {
+        None
+    } else if word.contains(char::is_whitespace) || word.contains(['"', '\'', '\\']) {
+        Some(quote(&word))
     } else {
-        word
+        Some(word)
     }
 }
 
@@ -883,14 +931,14 @@ fn value_words(s: &p::Setting) -> Vec<String> {
     if !choices.is_empty() {
         return choices
             .iter()
-            .map(|c| shell_word(value_string(c)))
+            .filter_map(|c| shell_word(value_string(c)))
             .collect();
     }
     if let Some((min, max, fine)) = model::range(s)
-        && (max - min) / fine < 16
+        && model::step_count(min, max, fine) < 16
     {
-        return (0..)
-            .map(|i| min + i * fine)
+        return (0..16)
+            .map_while(|i| fine.checked_mul(i).and_then(|d| min.checked_add(d)))
             .take_while(|n| *n <= max)
             .map(|n| n.to_string())
             .collect();
@@ -922,7 +970,7 @@ fn device_words(st: &State, cmd: &str, accepts: impl Fn(u32) -> bool) -> Vec<Str
             resolve(name, st) == Some(id)
         };
         if !name.is_empty() && names_id && matches!(Target::parse(name), Ok(Target::Name(_))) {
-            words.push(shell_word(name.to_owned()));
+            words.extend(shell_word(name.to_owned()));
         }
         words.push(id.to_string());
     }
@@ -1011,7 +1059,7 @@ fn profile_words(st: &State) -> Vec<String> {
             && profile.name != "none"
             && matches!(Target::parse(&profile.name), Ok(Target::Name(_)));
         if unique && named {
-            words.push(shell_word(profile.name.clone()));
+            words.extend(shell_word(profile.name.clone()));
         }
         words.push(profile.id.to_string());
     }
@@ -1270,6 +1318,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn extreme_integer_ranges_neither_overflow_nor_enumerate_far() {
+        let ranged = |min: i64, max: i64, step: u64| p::Setting {
+            key: "pointer.sensor.0.dpi".into(),
+            r#type: Some(p::setting::Type::Integer(p::IntegerSetting {
+                limits: Some(p::integer_setting::Limits::Range(p::IntegerRange {
+                    min,
+                    max,
+                    step,
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let all = ranged(i64::MIN, i64::MAX, 1);
+        assert_eq!(steps(&all), (1, 10));
+        assert!(value_words(&all).is_empty());
+        assert!(model::accepts(&all, &p::value::Value::Integer(i64::MAX)));
+        let top = ranged(i64::MAX - 2, i64::MAX, 1);
+        assert_eq!(value_words(&top).len(), 3);
+        let wide = ranged(0, i64::MAX, u64::MAX);
+        assert_eq!(steps(&wide), (i64::MAX, 0));
+        assert_eq!(value_words(&wide), ["0", &i64::MAX.to_string()]);
+        assert!(value_words(&ranged(5, 1, 1)).is_empty());
+    }
+
+    #[test]
     fn split_quotes_and_escapes() {
         assert_eq!(
             words("a 'b c' \"d\\\"e\" f\\ g"),
@@ -1388,6 +1462,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn completion_offers_only_names_that_round_trip() {
+        let mut st = state();
+        st.devices[1].name = "Desk \u{202e}draobyeK".into();
+        st.candidates[0].name = "Pad\u{9b}2J".into();
+        st.candidates[1].name = "Two Words".into();
+        assert_eq!(
+            complete("device get ", Some(&st)),
+            ["device get 1", "device get 2", "device get Keyboard"]
+        );
+        let pair = complete("pair start ", Some(&st));
+        assert_eq!(
+            pair,
+            ["pair start \"Two Words\"", "pair start 1", "pair start 2"]
+        );
+        let line = &pair[0];
+        assert_eq!(split(line).unwrap(), ["pair", "start", "Two Words"]);
+    }
+
+    #[test]
     fn names_resolve_only_when_unique_among_their_kind() {
         let mut st = state();
         // A device and a candidate may share a name; each command takes only one kind.
@@ -1428,6 +1521,39 @@ pub(crate) mod tests {
             complete("scan start ", Some(&st)),
             ["scan start classic", "scan start ble"]
         );
+    }
+
+    #[test]
+    fn help_for_a_command_shows_its_rows_and_notes() {
+        let st = state();
+        assert!(matches!(
+            parse(&words("help pair")).unwrap(),
+            Line::Help(Some(t)) if t == "pair"
+        ));
+        let pair = help_on(Some(&st), Some("pair"));
+        assert!(pair.starts_with("pair start CANDIDATE"), "{pair}");
+        assert!(
+            pair.contains("pair cancel") && pair.contains("CANDIDATE is"),
+            "{pair}"
+        );
+        assert!(
+            !pair.contains("device list") && !pair.contains("DEV is"),
+            "{pair}"
+        );
+        let get = help_on(Some(&st), Some("device get"));
+        assert_eq!(
+            get.lines().next().unwrap().split_whitespace().next(),
+            Some("device")
+        );
+        assert_eq!(
+            get.lines().filter(|l| l.starts_with("device")).count(),
+            1,
+            "{get}"
+        );
+        assert!(help_on(None, Some("exit")).starts_with("quit | exit"));
+        let mut production = state();
+        production.status.info.clear();
+        assert!(help_on(Some(&production), Some("file get")).starts_with("file get PATH"));
     }
 
     #[test]

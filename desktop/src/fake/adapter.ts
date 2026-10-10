@@ -382,6 +382,8 @@ export class FakeAdapter implements ByteStream {
   events: NonNullable<MessageInitShape<typeof EventSchema>["kind"]>[] = [];
   /** Error codes to answer the next requests of a command with, in order, by command case. */
   failures: Record<string, ErrorCode[]> = {};
+  /** Whether a STORAGE_FAILED failure leaves the outcome of its write unknown. */
+  uncertainWrites = false;
   /** Apply failures for settings that are saved anyway. */
   settingFailures: Record<string, ErrorCode> = {};
   readonly profileSupport: boolean;
@@ -394,6 +396,9 @@ export class FakeAdapter implements ByteStream {
   /** Records whose flash read fails: listed as unreadable, and a profile here can't load. */
   unreadableDevices = new Set<number>();
   unreadableProfiles = new Set<number>();
+  /** Records listed as entries of a kind newer than the client, which it reads as unset. */
+  newerDevices = new Set<number>();
+  newerProfiles = new Set<number>();
   /** How often USB reconnected for a configuration interface change. */
   usbReconnects = 0;
   /** Whether the USB device is attached; false briefly while it reconnects. */
@@ -909,7 +914,8 @@ export class FakeAdapter implements ByteStream {
       this.#run(command);
     } catch (error) {
       if (!(error instanceof Refusal)) throw error;
-      this.#reply({ result: { case: "error", value: { code: error.code, reason: error.reason } } });
+      const outcomeUnknown = this.uncertainWrites && error.code === ErrorCode.STORAGE_FAILED;
+      this.#reply({ result: { case: "error", value: { code: error.code, reason: error.reason, outcomeUnknown } } });
     }
   }
 
@@ -1001,7 +1007,8 @@ export class FakeAdapter implements ByteStream {
       case "listDevices": {
         const { entries, end } = page(this.devices, command.value.after, this.pageSize, (d) => d.id, (a, b) => a - b);
         const listed = entries.map((d) =>
-          this.unreadableDevices.has(d.id) ? { entry: { case: "unreadable" as const, value: d.id } } : { entry: { case: "device" as const, value: this.record(d) } });
+          this.newerDevices.has(d.id) ? { entry: { case: undefined } }
+            : this.unreadableDevices.has(d.id) ? { entry: { case: "unreadable" as const, value: d.id } } : { entry: { case: "device" as const, value: this.record(d) } });
         return this.#reply({ result: { case: "devices", value: { entries: listed, end } } });
       }
       case "getDevice": {
@@ -1146,7 +1153,14 @@ export class FakeAdapter implements ByteStream {
       if (layers.some((id) => !this.profiles.some((p) => p.id === id))) throw new Refusal(ErrorCode.NOT_FOUND);
     }
     this.#needReady();
-    if (enabled && !d.enabled && !d.blocked) {
+    // An update to what the adapter already holds succeeds without checking anything more.
+    const same = (enabled === undefined || enabled === d.enabled) && (trusted === undefined || trusted === d.trusted)
+      && (blocked === undefined || blocked === d.blocked) && integrations.every((i) => i.enabled === undefined || i.enabled === d.hidppEnabled)
+      && (!layers || (layers.length === d.profiles.length && layers.every((id, i) => id === d.profiles[i])));
+    if (same) return this.#reply({});
+    // As the firmware does, a change that leaves an unused device enabled and not blocked needs a place.
+    const unused = [InactiveReason.DISABLED, InactiveReason.BLOCKED, InactiveReason.CAPACITY].includes(this.inactive(d)!);
+    if (unused && (enabled ?? d.enabled) && !(blocked ?? d.blocked)) {
       const used = this.devices.filter((x) => x !== d && x.transport === d.transport && this.inactive(x) === undefined).length;
       if (used >= this.maxEnabled) throw new Refusal(ErrorCode.NO_CAPACITY, CapacityReason.ENABLED);
     }
@@ -1200,7 +1214,8 @@ export class FakeAdapter implements ByteStream {
       case "listProfiles": {
         const { entries, end } = page(this.profiles, command.value.after, this.pageSize, (p) => p.id, (a, b) => a - b);
         const listed = entries.map((p) =>
-          this.unreadableProfiles.has(p.id) ? { entry: { case: "unreadable" as const, value: p.id } } : { entry: { case: "profile" as const, value: this.#profileRecord(p) } });
+          this.newerProfiles.has(p.id) ? { entry: { case: undefined } }
+            : this.unreadableProfiles.has(p.id) ? { entry: { case: "unreadable" as const, value: p.id } } : { entry: { case: "profile" as const, value: this.#profileRecord(p) } });
         return this.#reply({ result: { case: "profiles", value: { entries: listed, end } } });
       }
       case "getProfile": {

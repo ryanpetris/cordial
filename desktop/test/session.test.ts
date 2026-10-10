@@ -51,6 +51,19 @@ describe("AdapterSession", () => {
     await session.close();
   });
 
+  it("continues listing devices after the last entry of a known kind", async () => {
+    const fake = new FakeAdapter({ devices: [1, 2, 3, 4, 5].map((id) => device(id)), pageSize: 2 });
+    fake.newerDevices = new Set([2, 4]);
+    const hooks = { changed: vi.fn(), closed: vi.fn(), event: vi.fn(), log: vi.fn() };
+    const session = await AdapterSession.open(fake.open(), hooks);
+    session.run();
+    await until(() => session.listed);
+    const afters = fake.received.flatMap((r) => (r.command.case === "listDevices" ? [r.command.value.after] : []));
+    expect(afters).toEqual([0, 1, 3]);
+    expect([...session.devices.keys()]).toEqual([1, 3, 5]);
+    await session.close();
+  });
+
   it("reads every page of settings in the adapter's order and merges change events", async () => {
     const settings = ["wheel.mode", "backlight.level", "wheel.invert", "backlight.enabled"].map((key, i) => setting(key, { value: true, saved: i === 0 ? true : null, state: "applied" }));
     const { fake, session } = await openSession({ devices: [device(1, { state: "connected", settings })], pageSize: 1 });

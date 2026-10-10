@@ -57,6 +57,8 @@ pub(crate) enum Msg {
     Paste(String),
     Resize(u16, u16),
     Controller(Box<Event>),
+    /// An event of one of the TUI's sessions.
+    Fleet(u64, Box<Event>),
     Ports(Result<Vec<PortInfo>, String>),
     Interrupt,
 }
@@ -82,7 +84,6 @@ pub(crate) trait Backend {
     fn close(&self);
     fn run(&self, command: Command) -> Ticket;
     fn state(&self) -> Option<State>;
-    fn hide_candidate(&self, id: u32);
     /// Lists adapters off the interface thread; the result arrives as Msg::Ports.
     fn list_ports(&self);
 }
@@ -115,9 +116,6 @@ impl Backend for Live {
     }
     fn state(&self) -> Option<State> {
         self.controller.state()
-    }
-    fn hide_candidate(&self, id: u32) {
-        self.controller.hide_candidate(id);
     }
     fn list_ports(&self) {
         let tx = self.tx.clone();

@@ -26,12 +26,11 @@ impl Field {
     pub fn is_empty(&self) -> bool {
         self.chars.is_empty()
     }
+    /// Replaces the value, filtered as [`Field::insert`] filters typed text.
     pub fn set_value(&mut self, value: &str) {
-        self.chars = value.chars().collect();
-        if self.limit > 0 {
-            self.chars.truncate(self.limit);
-        }
-        self.cursor = self.chars.len();
+        self.chars.clear();
+        self.cursor = 0;
+        self.insert(value);
     }
     pub fn reset(&mut self) {
         self.chars.clear();
@@ -173,6 +172,8 @@ mod tests {
         assert!(f.is_empty());
         f.insert("a\u{1b}[2Jb");
         assert_eq!(f.value(), "a[2Jb");
+        f.set_value("x\u{9b}2J\ty\u{1b}");
+        assert_eq!(f.value(), "x2J y");
     }
 
     #[test]

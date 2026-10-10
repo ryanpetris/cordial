@@ -126,10 +126,6 @@ export function AddDevice({
     void attempt({ type: "scan.start", adapterId: chosen.id });
   }, [open, chosen?.id, pairing === null]);
 
-  useEffect(() => {
-    if (open && !chosen) onClose();
-  }, [open, chosen]);
-
   const close = () => {
     if (pairing?.phase === "pairing") void act({ type: "pair.cancel" }, true);
     void act({ type: "scan.stop" }, true);
@@ -138,6 +134,11 @@ export function AddDevice({
     setSearchFailed(false);
     onClose();
   };
+
+  // Without a ready adapter the dialog closes, ending its search and pairing.
+  useEffect(() => {
+    if (open && !chosen) close();
+  }, [open, chosen]);
 
   const again = () => {
     void act({ type: "pair.dismiss" }, true);

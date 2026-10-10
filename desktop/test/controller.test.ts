@@ -1,9 +1,10 @@
 import { ErrorCode, Transport } from "@cordial/protocol";
 import { describe, expect, it, vi } from "vitest";
 import { AdapterManager } from "../src/core/manager.ts";
+import { AdapterSession } from "../src/core/session.ts";
 import { FakeAdapter, device, profile } from "../src/fake/adapter.ts";
 import type { AppState } from "../src/shared/state.ts";
-import { inactiveText, transportDisabledText } from "../src/shared/text.ts";
+import { codeText, inactiveText, transportDisabledText } from "../src/shared/text.ts";
 import { controller, openSession, until } from "./helpers.ts";
 
 /** Every adapter is ready and `devices` devices are listed. */
@@ -41,6 +42,27 @@ describe("Controller", () => {
     expect(manager.connected.size).toBe(0);
     expect(close).toHaveBeenCalledOnce();
     expect(await manager.connect(fake.id)).toBe("This adapter is no longer available.");
+  });
+
+  it("doesn't keep a session that ended while it was opening", async () => {
+    const fake = new FakeAdapter({ adapterId: "AAAA0001" });
+    const log = vi.fn();
+    const manager = new AdapterManager({
+      listPorts: async () => [{ path: "/a", serial: fake.id }],
+      openTransport: async () => fake.open(),
+      changed: vi.fn(),
+      log,
+    });
+    const open = AdapterSession.open.bind(AdapterSession);
+    vi.spyOn(AdapterSession, "open").mockImplementationOnce(async (stream, hooks) => {
+      const session = await open(stream, hooks);
+      fake.unplug();
+      return session;
+    });
+    await manager.rescan();
+    expect(manager.connected.size).toBe(0);
+    expect(log).toHaveBeenCalledWith("/a: session ended while opening");
+    await manager.stop();
   });
 
   it("combines adapters and hides a port that isn't one", async () => {
@@ -230,6 +252,51 @@ describe("Controller", () => {
     await until(() => state()!.adapters[0]!.status?.platform === "windows");
     expect(await c.act({ type: "device.unpair", key: "AAAA0001/4" })).toEqual({ ok: true });
     await until(() => !state()!.devices.some((d) => d.key === "AAAA0001/4"));
+    await c.stop();
+  });
+
+  it("refuses device changes before sending while the adapter isn't ready", async () => {
+    const a = new FakeAdapter({ adapterId: "AAAA0001", devices: [device(1), device(2, { state: "connected" })] });
+    const { c, state } = controller({ "/a": a });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 2));
+    a.changeAdapter({ ready: false });
+    await until(() => state()!.adapters[0]!.readiness === "waiting");
+    const sent = a.received.length;
+    const notReady = { ok: false, message: codeText("not_ready") };
+    expect(await c.act({ type: "device.connect", key: "AAAA0001/1" })).toEqual(notReady);
+    expect(await c.act({ type: "device.unpair", key: "AAAA0001/1" })).toEqual(notReady);
+    expect(await c.act({ type: "device.update", key: "AAAA0001/1", trusted: false })).toEqual(notReady);
+    expect(await c.act({ type: "settings.save", key: "AAAA0001/2", changes: [] })).toEqual(notReady);
+    expect(a.received.length).toBe(sent);
+    // Refreshing a connected device and disconnecting need neither Bluetooth nor storage.
+    expect(await c.act({ type: "device.refresh", key: "AAAA0001/2" })).toEqual({ ok: true });
+    expect(await c.act({ type: "device.disconnect", key: "AAAA0001/2" })).toEqual({ ok: true });
+    await c.stop();
+  });
+
+  it("predicts the enabled-device limit only for changes that leave an unused device eligible", async () => {
+    const a = new FakeAdapter({
+      adapterId: "AAAA0001",
+      maxEnabled: 1,
+      devices: [device(1), device(2, { enabled: false, blocked: true }), device(3)],
+    });
+    const { c, state } = controller({ "/a": a });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 3));
+    const full = { ok: false, message: "Every enabled-device place is in use; turn off another device first" };
+    const find = (id: number) => state()!.devices.find((d) => d.key === `AAAA0001/${id}`)!.device;
+    expect(find(3).inactive).toBe("capacity");
+    const sent = a.received.length;
+    // Unblocking an enabled device and changing a device left out for capacity need a place.
+    expect(await c.act({ type: "device.update", key: "AAAA0001/2", enabled: true, blocked: false })).toEqual(full);
+    expect(await c.act({ type: "device.update", key: "AAAA0001/3", trusted: false })).toEqual(full);
+    expect(a.received.length).toBe(sent);
+    // Turning on a blocked device leaves it unused, and turning off one left out for capacity frees nothing.
+    expect(await c.act({ type: "device.update", key: "AAAA0001/2", enabled: true })).toEqual({ ok: true });
+    await until(() => find(2).enabled);
+    expect(await c.act({ type: "device.update", key: "AAAA0001/2", blocked: false })).toEqual(full);
+    expect(await c.act({ type: "device.update", key: "AAAA0001/3", enabled: false })).toEqual({ ok: true });
     await c.stop();
   });
 

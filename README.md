@@ -149,7 +149,7 @@ That's it. The device now reconnects to the adapter automatically.
 ```sh
 cordial adapter list            # find your adapter
 cordial --port PORT             # interactive shell
-cordial --port PORT tui         # full-screen interface
+cordial tui                     # full-screen interface for every attached adapter
 ```
 
 Only one app can manage an adapter at a time. Quit the desktop app, or disconnect the

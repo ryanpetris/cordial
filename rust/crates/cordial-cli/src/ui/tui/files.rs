@@ -1,21 +1,18 @@
-//! The Files page replaces the device list and details with a directory of
-//! the adapter's filesystem and a download panel. Directories are read one at
-//! a time as they are opened, never recursively. A download runs on a
-//! controller thread and is written to a private temporary file, which
-//! becomes the chosen local file only once the whole file has arrived. An
-//! existing local file is replaced only after the Replace confirmation.
-//! Switching or losing the adapter clears the page.
+//! Files, on development firmware: a dialog listing one directory of the adapter's filesystem at
+//! a time, with a download of the selected file. A download is written to a private temporary
+//! file, which becomes the chosen local file only once the whole file has arrived; an existing
+//! local file is replaced only after the Replace confirmation.
 use super::{
-    Action, Area, Dialog, Model,
+    Action, Dialog, Job, Kind, Model,
+    fleet::Fleet,
     layout::{self, Layout, Tone, accent, dim, err, inherit, ok, pad_str, span, styled, warn},
-    view::spinner,
+    render::{DialogView, busy, button_if},
 };
 use crate::{
-    controller::{Command, Outcome, State, Ticket},
+    controller::{Command, Outcome},
     error::Error,
     storage,
     ui::{
-        Backend,
         field::Field,
         text::{self, display},
     },
@@ -46,26 +43,21 @@ pub struct Target {
     pub size: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Download {
-    pub ticket: Ticket,
     pub path: String,
     pub local: PathBuf,
     pub size: Option<u64>,
     pub state: Transfer,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Files {
-    pub open: bool,
     pub path: String,
     pub entries: Vec<FileEntry>,
-    pub listing: Option<Ticket>,
     pub state: Option<Listing>,
     /// The selected row's name.
     pub selected: Option<String>,
-    pub list_scroll: usize,
-    pub panel_scroll: usize,
-    pub reveal: bool,
     pub dest: Field,
     pub editing: bool,
     pub dest_err: String,
@@ -73,10 +65,6 @@ pub struct Files {
 }
 
 impl Files {
-    /// Drops what belonged to the previous adapter.
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
     pub fn busy(&self) -> bool {
         self.download
             .as_ref()
@@ -93,8 +81,8 @@ impl Files {
     }
 }
 
-/// The destination for a newly selected file: its name in the directory the
-/// destination already names, so a chosen directory is kept.
+/// The destination for a newly selected file: its name in the directory the destination already
+/// names, so a chosen directory is kept.
 pub fn keep_directory(dest: &str, name: &str) -> String {
     let path = std::path::Path::new(dest);
     let dir = if dest.ends_with(std::path::is_separator) {
@@ -130,72 +118,66 @@ pub fn parent(path: &str) -> Option<String> {
     })
 }
 
-impl<B: Backend> Model<B> {
-    pub(super) fn files_open(&self, st: &State) -> bool {
-        self.files.open && st.available
+impl<F: Fleet> Model<F> {
+    pub(super) fn open_files(&mut self, adapter: &str) {
+        self.files = Files::default();
+        self.dialog = Some(Dialog::Files(adapter.to_owned()));
+        self.dialog_scroll = 0;
+        self.list_files(adapter, "/".into());
     }
 
-    pub(super) fn open_files(&mut self) {
-        self.close_settings();
-        self.files.open = true;
-        if self.files.path.is_empty() {
-            self.list_files("/".into());
+    fn files_adapter(&self) -> Option<String> {
+        match &self.dialog {
+            Some(Dialog::Files(a) | Dialog::Replace(a, _)) => Some(a.clone()),
+            _ => None,
         }
     }
 
-    pub(super) fn close_files(&mut self) {
-        self.files.open = false;
-        self.files.editing = false;
-    }
-
-    /// Starts reading a directory, replacing the rows shown.
-    fn list_files(&mut self, path: String) {
+    fn list_files(&mut self, adapter: &str, path: String) {
         self.files.path = path.clone();
         self.files.entries.clear();
         self.files.selected = None;
-        self.files.list_scroll = 0;
         self.files.state = Some(Listing::Loading);
-        self.files.listing = Some(self.backend.run(Command::Files(path)));
+        self.dialog_scroll = 0;
+        self.run(adapter, Kind::Files, Command::Files(path));
     }
 
-    /// Takes a file command's result; false for other tickets.
-    pub(super) fn files_done(&mut self, ticket: Ticket, result: &Result<Outcome, Error>) -> bool {
-        if self.files.listing == Some(ticket) {
-            self.files.listing = None;
-            self.files.state = Some(match result {
-                Ok(Outcome::Files { entries, .. }) => {
-                    self.files.entries = entries.clone();
-                    Listing::Complete
+    pub(super) fn files_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
+        match (&job.kind, &job.command) {
+            _ if self.files_adapter().as_deref() != Some(job.adapter.as_str())
+                && !matches!(job.kind, Kind::Bootloader) => {}
+            (Kind::Files, Command::Files(path)) if *path == self.files.path => {
+                self.files.state = Some(match result {
+                    Ok(Outcome::Files { entries, .. }) => {
+                        self.files.entries = entries.clone();
+                        Listing::Complete
+                    }
+                    Ok(_) => Listing::Complete,
+                    Err(e) => Listing::Failed(text::error_words(e)),
+                });
+            }
+            (Kind::FileGet, Command::FileGet { path, .. }) => {
+                let Some(d) = self.files.download.as_mut().filter(|d| d.path == *path) else {
+                    return;
+                };
+                match result {
+                    Ok(Outcome::FileSaved { bytes, .. }) => d.state = Transfer::Saved(*bytes),
+                    Ok(_) => {}
+                    Err(e) => {
+                        d.state = Transfer::Failed(format!(
+                            "{}; no file was saved.",
+                            text::capitalized(&text::error_words(e))
+                        ))
+                    }
                 }
-                Ok(_) => Listing::Complete,
-                Err(e) => Listing::Failed(text::error_words(e)),
-            });
-            return true;
-        }
-        let Some(d) = self.files.download.as_mut().filter(|d| d.ticket == ticket) else {
-            return false;
-        };
-        let name = display(&d.path);
-        match result {
-            Ok(Outcome::FileSaved { bytes, .. }) => {
-                d.state = Transfer::Saved(*bytes);
-                let text = format!(
-                    "Downloaded {name} to {}",
-                    display(&d.local.display().to_string())
-                );
-                self.note(super::activity::Kind::Good, text);
             }
-            Ok(_) => {}
-            Err(e) => {
-                let error = format!("{}; no file was saved.", text::error_words(e));
-                d.state = Transfer::Failed(error.clone());
-                self.note(
-                    super::activity::Kind::Bad,
-                    format!("Download of {name}: {error}"),
-                );
+            (Kind::Bootloader, _) => {
+                if let Err(e) = result {
+                    self.toast(super::words::failure(e));
+                }
             }
+            _ => {}
         }
-        true
     }
 
     fn select_file(&mut self, name: String) {
@@ -206,46 +188,8 @@ impl<B: Backend> Model<B> {
         self.files.dest.set_value(&dest);
         self.files.dest_err.clear();
         self.files.selected = Some(name);
-        self.files.panel_scroll = 0;
-        self.files.reveal = true;
     }
 
-    /// Moves the selection through the rows as listed.
-    pub(super) fn move_file(&mut self, delta: isize) {
-        let names: Vec<String> = self
-            .files
-            .rows()
-            .into_iter()
-            .map(|e| e.name.clone())
-            .collect();
-        if names.is_empty() {
-            return;
-        }
-        let i = match names
-            .iter()
-            .position(|n| Some(n) == self.files.selected.as_ref())
-        {
-            None if delta < 0 => names.len() - 1,
-            None => 0,
-            Some(i) => i.saturating_add_signed(delta).min(names.len() - 1),
-        };
-        self.select_file(names[i].clone());
-        self.focus = None;
-    }
-
-    /// Opens the selected directory, or downloads the selected file.
-    pub(super) fn files_enter(&mut self) {
-        let Some(name) = self.files.selected.clone() else {
-            return;
-        };
-        match self.files.entry(&name).map(|e| e.directory) {
-            Some(true) => self.action(Action::FilesEntry(name)),
-            Some(false) => self.action(Action::FilesDownload),
-            None => {}
-        }
-    }
-
-    /// Starts a download of the selected file to the typed destination.
     fn start_download(&mut self) {
         let Some(e) = self
             .files
@@ -268,56 +212,61 @@ impl<B: Backend> Model<B> {
         });
     }
 
-    /// Downloads exactly this target, asking before replacing a local file.
     fn request_download(&mut self, target: Target) {
+        let Some(adapter) = self.files_adapter() else {
+            return;
+        };
         if self.files.busy() {
             return;
         }
         match storage::check_destination(&target.local, false) {
             Err(e) if e.message == storage::EXISTS => {
-                self.dialog = Some(Dialog::Replace(target));
-                self.dialog_scroll = 0;
+                self.dialog = Some(Dialog::Replace(adapter, target));
             }
             Err(e) => self.files.dest_err = text::capitalized(&text::error_words(&e)),
-            Ok(()) => self.begin_download(target, false),
+            Ok(()) => self.begin_download(&adapter, target, false),
         }
     }
 
-    fn begin_download(&mut self, target: Target, overwrite: bool) {
+    fn begin_download(&mut self, adapter: &str, target: Target, overwrite: bool) {
         self.files.editing = false;
         self.files.dest_err.clear();
-        let ticket = self.backend.run(Command::FileGet {
+        self.files.download = Some(Download {
             path: target.path.clone(),
             local: target.local.clone(),
-            overwrite,
-        });
-        self.files.download = Some(Download {
-            ticket,
-            path: target.path,
-            local: target.local,
             size: target.size,
             state: Transfer::Running,
         });
+        self.run(
+            adapter,
+            Kind::FileGet,
+            Command::FileGet {
+                path: target.path,
+                local: target.local,
+                overwrite,
+            },
+        );
     }
 
     /// Handles a Files control; false for other actions.
     pub(super) fn files_action(&mut self, action: &Action) -> bool {
+        let Some(adapter) = self.files_adapter() else {
+            return false;
+        };
         match action {
-            Action::FilesOpen => self.open_files(),
-            Action::FilesClose => self.close_files(),
             Action::FilesUp => {
                 if let Some(p) = parent(&self.files.path) {
-                    self.list_files(p);
+                    self.list_files(&adapter, p);
                 }
             }
             Action::FilesRefresh => {
                 let path = self.files.path.clone();
-                self.list_files(if path.is_empty() { "/".into() } else { path });
+                self.list_files(&adapter, path);
             }
             Action::FilesEntry(name) => match self.files.entry(name).map(|e| e.directory) {
                 Some(true) => {
                     let path = child(&self.files.path, name);
-                    self.list_files(path);
+                    self.list_files(&adapter, path);
                 }
                 Some(false) => self.select_file(name.clone()),
                 None => {}
@@ -330,8 +279,6 @@ impl<B: Backend> Model<B> {
             }
             Action::FilesDownload => self.start_download(),
             Action::FilesRetry => {
-                // The failed transfer's own file and destination, whatever is
-                // selected or typed now.
                 if let Some(d) = self
                     .files
                     .download
@@ -352,20 +299,23 @@ impl<B: Backend> Model<B> {
     }
 
     /// The Replace confirmation's answer: that target, replacing its file.
-    pub(super) fn confirm_replace(&mut self, target: Target) {
+    pub(super) fn confirm_replace(&mut self, adapter: &str, target: Target) {
+        self.dialog = Some(Dialog::Files(adapter.to_owned()));
         if !self.files.busy() {
-            self.begin_download(target, true);
+            self.begin_download(adapter, target, true);
         }
     }
 
-    pub(super) fn files_pane(&mut self, st: &State, w: usize, h: usize) -> Layout {
-        let mut b = Layout::new(w.saturating_sub(4));
+    pub(super) fn files_dialog(&mut self, adapter: &str, w: usize) -> DialogView {
+        let mut b = Layout::new(w);
         let size_w = 10;
-        let name_w = b.width.saturating_sub(2 + size_w).max(4);
-        let mut selected_line = None;
-        if !st.status.ready {
-            b.hang(
-                Line::default(),
+        let name_w = w.saturating_sub(2 + size_w).max(4);
+        let ready = self
+            .adapter(adapter)
+            .and_then(|a| a.status.as_ref())
+            .is_some_and(|s| s.ready);
+        if !ready {
+            b.para(
                 "Adapter storage isn't ready; reading files may fail.",
                 warn(),
             );
@@ -381,9 +331,6 @@ impl<B: Backend> Model<B> {
             } else {
                 layout::plain()
             };
-            if chosen {
-                selected_line = Some(b.lines.len());
-            }
             let (name, size) = if e.directory {
                 (format!("{}/", display(&e.name)), String::new())
             } else {
@@ -402,120 +349,137 @@ impl<B: Backend> Model<B> {
                 ),
                 span(format!("{size:>size_w$}"), inherit(dim(), base)),
             ]);
-            let fill = b.width.saturating_sub(layout::line_width(&line));
+            let fill = w.saturating_sub(layout::line_width(&line));
             line.spans.push(span(" ".repeat(fill), base));
             b.control(line, Action::FilesEntry(e.name.clone()));
         }
         match &self.files.state {
-            Some(Listing::Loading) => {
-                b.line(styled(format!("  {} Reading…", spinner()), warn()));
-            }
+            Some(Listing::Loading) => b.line(busy("Reading…")),
             Some(Listing::Failed(e)) => {
                 let note = if rows.is_empty() {
-                    format!("✕ Couldn't read this directory: {e}")
+                    format!("Couldn't read this directory: {e}")
                 } else {
-                    format!("✕ Incomplete: {e}")
+                    format!("Incomplete: {e}")
                 };
-                b.hang(Line::from("  "), &note, err());
+                b.para(&note, err());
             }
             Some(Listing::Complete) if rows.is_empty() => {
-                b.line(styled("  Empty directory", dim()));
+                b.line(styled("  Empty directory", dim()))
             }
             _ => {}
         }
-        if self.files.reveal
-            && let Some(line) = selected_line
-        {
-            self.files.reveal = false;
-            self.files.list_scroll = self
-                .files
-                .list_scroll
-                .max(line.saturating_sub(h.saturating_sub(4)))
-                .min(line);
-        }
-        let mut pinned = Layout::new(b.width);
-        if parent(&self.files.path).is_some() {
-            pinned.button("Up", Action::FilesUp, Tone::Normal);
-        }
-        pinned.button("Refresh", Action::FilesRefresh, Tone::Normal);
-        pinned.button_right("Close", Action::FilesClose, Tone::Normal);
-        let heading = format!("Files · {}", display(&self.files.path));
-        self.frame(&heading, b, pinned, Some(Area::Files), false, w, h)
-    }
-
-    pub(super) fn transfer_pane(&mut self, st: &State, w: usize, h: usize) -> Layout {
-        let (heading, b, actions) = self.transfer(st, w);
-        self.frame(&heading, b, actions, Some(Area::Transfer), false, w, h)
-    }
-
-    /// The download panel for the selected file, or the running download.
-    pub(super) fn transfer(&mut self, st: &State, w: usize) -> (String, Layout, Layout) {
-        let mut b = Layout::new(w.saturating_sub(4));
-        let mut actions = Layout::new(b.width);
+        b.row();
         let entry = self
             .files
             .selected
             .as_deref()
             .and_then(|n| self.files.entry(n))
             .cloned();
-        if let Some(d) = &self.files.download {
+        let mut buttons = Layout::new(w);
+        if let Some(d) = self.files.download.clone() {
             let shown = display(&d.path);
             let local = display(&d.local.display().to_string());
             match &d.state {
                 Transfer::Running => {
-                    b.field("File", &shown, layout::plain());
-                    b.field("Saving To", &local, layout::plain());
-                    b.line(styled(format!("{} Downloading…", spinner()), warn()));
-                    return ("Download".into(), b, actions);
+                    b.fact("File", &shown, layout::plain());
+                    b.fact("Saving To", &local, layout::plain());
+                    b.line(busy("Downloading…"));
                 }
                 Transfer::Saved(n) => {
-                    b.field("Saved", &shown, ok());
-                    b.field("To", &local, layout::plain());
-                    b.field("Size", &format!("{n} bytes"), layout::plain());
-                    b.row();
+                    b.fact("Saved", &shown, ok());
+                    b.fact("To", &local, layout::plain());
+                    b.fact("Size", &format!("{n} bytes"), layout::plain());
                 }
                 Transfer::Failed(error) => {
-                    b.field("Not Saved", &shown, err());
+                    b.fact("Not Saved", &shown, err());
                     b.para(error, err());
-                    if !self.files.dest_err.is_empty() {
-                        b.para(&self.files.dest_err.clone(), err());
-                    }
-                    if self.offers(st, &Action::FilesRetry) {
-                        actions.button("Retry", Action::FilesRetry, Tone::Primary);
-                    }
-                    b.row();
+                    buttons.button("Retry", Action::FilesRetry, Tone::Normal);
                 }
             }
         }
-        let Some(e) = entry.filter(|e| !e.directory) else {
-            if self.files.download.is_none() {
-                b.para(
-                    "Select a file to download it. Click a directory to open it.",
-                    dim(),
-                );
+        if let Some(e) = entry.filter(|e| !e.directory)
+            && !self.files.busy()
+        {
+            b.row();
+            b.fact(
+                "File",
+                &display(&child(&self.files.path, &e.name)),
+                layout::plain(),
+            );
+            b.fact("Size", &format!("{} bytes", e.size), layout::plain());
+            b.line(styled("Save As", dim()));
+            let focused = self.files.editing;
+            let line = super::keys::edit_line(&mut self.files.dest, focused, w.saturating_sub(3));
+            b.control(line, Action::FilesDest);
+            if !self.files.dest_err.is_empty() {
+                b.para(&self.files.dest_err.clone(), err());
             }
-            return ("Download".into(), b, actions);
-        };
-        b.field(
-            "File",
-            &display(&child(&self.files.path, &e.name)),
+            buttons.button("Download", Action::FilesDownload, Tone::Primary);
+        }
+        if parent(&self.files.path).is_some() {
+            buttons.button("Up", Action::FilesUp, Tone::Normal);
+        }
+        button_if(
+            &mut buttons,
+            "Refresh",
+            Action::FilesRefresh,
+            Tone::Normal,
+            true,
+        );
+        buttons.button_right("Close", Action::Cancel, Tone::Normal);
+        DialogView {
+            title: format!("Files · {}", display(&self.files.path)),
+            body: b,
+            buttons,
+        }
+    }
+
+    pub(super) fn replace_dialog(&mut self, target: &Target, w: usize) -> DialogView {
+        let mut body = Layout::new(w);
+        body.para(
+            &format!(
+                "{} already exists. Replace it?",
+                display(&target.local.display().to_string())
+            ),
+            layout::bold(),
+        );
+        body.row();
+        body.para(
+            "The existing file is replaced only after the whole download succeeds.",
             layout::plain(),
         );
-        b.field("Size", &format!("{} bytes", e.size), layout::plain());
-        b.line(styled("Save As", dim()));
-        let focused = self.files.editing;
-        let line = super::view::edit_line(&mut self.files.dest, focused, b.width.saturating_sub(3));
-        b.control(line, Action::FilesDest);
-        if !self.files.dest_err.is_empty() {
-            b.para(&self.files.dest_err.clone(), err());
+        let mut buttons = Layout::new(w);
+        let mut right = Layout::new(w);
+        right.button("Cancel", Action::Cancel, Tone::Normal);
+        right.button("Replace", Action::Confirm, Tone::Danger);
+        buttons.align_right(right);
+        DialogView {
+            title: "Replace File".into(),
+            body,
+            buttons,
         }
-        b.para(
-            "A relative name is saved in the directory cordial was started from.",
-            dim(),
+    }
+
+    pub(super) fn bootloader_dialog(&mut self, w: usize) -> DialogView {
+        let mut body = Layout::new(w);
+        body.para(
+            "Restart the adapter into USB programming mode?",
+            layout::bold(),
         );
-        if self.offers(st, &Action::FilesDownload) {
-            actions.button("Download", Action::FilesDownload, Tone::Primary);
+        body.row();
+        body.para(
+            "Keyboard and mouse input stops until the adapter restarts. Saved bonds are kept and no firmware is installed.",
+            layout::plain(),
+        );
+        let mut buttons = Layout::new(w);
+        let mut right = Layout::new(w);
+        right.button("Cancel", Action::Cancel, Tone::Normal);
+        right.button("Enter Bootloader", Action::Confirm, Tone::Danger);
+        buttons.align_right(right);
+        DialogView {
+            title: "Enter Bootloader".into(),
+            body,
+            buttons,
         }
-        (display(&e.name), b, actions)
     }
 }

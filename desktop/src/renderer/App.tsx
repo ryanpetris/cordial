@@ -29,7 +29,8 @@ export function App() {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [preferences, setPreferences] = useState(false);
-  const [toast, setToast] = useState<string | null>(null);
+  // Each report is a new toast, so the same message again shows for its full time.
+  const [toast, setToast] = useState<{ message: string; id: number } | null>(null);
   // Staged setting changes by device and setting, kept across tabs and pages.
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   // Staged Details changes by device, kept across tabs and pages.
@@ -38,7 +39,8 @@ export function App() {
   const [adapterDrafts, setAdapterDrafts] = useState<Record<string, AdapterChanges>>({});
 
   useEffect(() => {
-    setReporter(setToast);
+    let reports = 0;
+    setReporter((message) => setToast({ message, id: ++reports }));
     return api.onNavigate((to: Navigation) => {
       if (to.page === "hidden") {
         setAdding(false);
@@ -136,8 +138,8 @@ export function App() {
       <AddDevice state={state} open={adding} onClose={() => setAdding(false)} onOpenDevice={(key) => setSelection({ page: "device", key })} />
       <Preferences state={state} open={preferences} onClose={() => setPreferences(false)} />
       {toast ? (
-        <div className="toast" role="alert" onClick={() => setToast(null)}>
-          {toast}
+        <div key={toast.id} className="toast" role="alert" onClick={() => setToast(null)}>
+          {toast.message}
         </div>
       ) : null}
     </div>

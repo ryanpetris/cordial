@@ -8,7 +8,16 @@ use cordial_cli::{
 };
 use cordial_protocol::{self as p, ErrorCode};
 use serde_json::Value;
-use std::{fs, io::Cursor};
+use std::{
+    fs,
+    io::{self, Cursor, Read},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 /// Runs a script against the simulated Dongle and returns its result, output and
 /// diagnostics.
@@ -18,28 +27,168 @@ fn script(
     json: bool,
     input: &'static [u8],
 ) -> (Result<(), Error>, String, String) {
+    run(dongle, args, json, Duration::ZERO, Cursor::new(input))
+}
+
+/// `script` with a timeout and any input.
+fn run(
+    dongle: &Dongle,
+    args: &[&str],
+    json: bool,
+    timeout: Duration,
+    input: impl Read + Send + 'static,
+) -> (Result<(), Error>, String, String) {
     let mut out = Vec::new();
     let mut diagnostics = Vec::new();
     let result = Script {
         options: Options {
             port: Some("simulated".into()),
             json,
+            timeout,
             args: args.iter().map(|s| (*s).to_owned()).collect(),
-            ..Default::default()
         },
         cancellation: Cancellation::default(),
     }
-    .with_connector(
-        Cursor::new(input),
-        &mut out,
-        &mut diagnostics,
-        dongle.connector(),
-    );
+    .with_connector(input, &mut out, &mut diagnostics, dongle.connector());
     (
         result,
         String::from_utf8(out).unwrap(),
         String::from_utf8(diagnostics).unwrap(),
     )
+}
+
+/// Input that records whether anything read it.
+struct Watched(Arc<AtomicBool>);
+
+impl Read for Watched {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        self.0.store(true, Ordering::Release);
+        Ok(0)
+    }
+}
+
+#[test]
+fn a_one_shot_command_leaves_standard_input_unread() {
+    let dongle = Dongle::default();
+    let read = Arc::new(AtomicBool::new(false));
+    let (result, out, _) = run(
+        &dongle,
+        &["device", "list"],
+        false,
+        Duration::ZERO,
+        Watched(read.clone()),
+    );
+    result.unwrap();
+    assert!(out.contains("Office Mouse"), "{out}");
+    assert!(!read.load(Ordering::Acquire));
+}
+
+#[test]
+fn a_one_shot_scan_lasts_the_timeout_and_ends_normally() {
+    let dongle = Dongle::with(|sim| sim.scan_ends = false);
+    let started = Instant::now();
+    let (result, out, _) = run(
+        &dongle,
+        &["scan", "start"],
+        false,
+        Duration::from_millis(1500),
+        Cursor::new(b""),
+    );
+    result.unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(1500));
+    assert_eq!(
+        out.matches("Discovery finished: 1 candidate.").count(),
+        1,
+        "{out}"
+    );
+    let sim = dongle.0.lock().unwrap();
+    assert!(sim.log.iter().any(|c| matches!(
+        c,
+        p::request::Command::StartScan(s) if s.seconds == 2
+    )));
+    assert!(
+        sim.log
+            .iter()
+            .any(|c| matches!(c, p::request::Command::StopScan(_)))
+    );
+}
+
+#[test]
+fn a_one_shot_pair_scans_only_until_it_finds_its_device() {
+    let dongle = Dongle::with(|sim| sim.scan_ends = false);
+    let (result, out, _) = run(
+        &dongle,
+        &["pair", "start", "New Keyboard"],
+        false,
+        Duration::from_secs(3),
+        Cursor::new(b""),
+    );
+    result.unwrap();
+    assert!(out.contains("Paired and saved New Keyboard."), "{out}");
+    let sent = dongle.sent();
+    let stop = sent.iter().position(|c| *c == "stop_scan").unwrap();
+    let pair = sent.iter().position(|c| *c == "start_pairing").unwrap();
+    assert!(stop < pair, "{sent:?}");
+}
+
+#[test]
+fn scripts_run_direct_commands_before_the_adapter_is_ready() {
+    let dongle = Dongle::with(|sim| {
+        sim.status = common::status(false);
+        sim.files.insert("/".into(), Vec::new());
+    });
+    let (result, out, diagnostics) = script(&dongle, &[], false, b"adapter status\nfile list /\n");
+    result.unwrap();
+    assert!(out.contains("  Ready: no"), "{out}");
+    assert!(!out.contains("Waiting") && !diagnostics.contains("Waiting"));
+    assert!(dongle.sent().contains(&"list_files"));
+    assert!(!dongle.sent().contains(&"list_devices"));
+
+    // Other commands wait for readiness, which is told as progress.
+    let dongle = Dongle::with(|sim| sim.status = common::status(false));
+    let later = dongle.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        let mut sim = later.0.lock().unwrap();
+        sim.status.ready = true;
+        let status = sim.status.clone();
+        sim.event(p::event::Kind::Adapter(status));
+    });
+    let (result, out, diagnostics) = script(&dongle, &[], false, b"adapter status\ndevice list\n");
+    result.unwrap();
+    assert!(out.contains("  Ready: no"), "{out}");
+    assert!(out.contains("Office Mouse"), "{out}");
+    assert!(!out.contains("Waiting"), "{out}");
+    assert!(
+        diagnostics.contains("Waiting for adapter readiness"),
+        "{diagnostics}"
+    );
+}
+
+#[test]
+fn json_prints_responses_and_events_in_the_order_they_arrived() {
+    for _ in 0..50 {
+        let dongle = Dongle::default();
+        let (result, out, _) = script(&dongle, &["scan", "start", "ble", "5"], true, b"");
+        result.unwrap();
+        let lines: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let found = lines
+            .iter()
+            .position(|l| !l["event"]["scan_found"].is_null())
+            .unwrap_or_else(|| panic!("{out}"));
+        let started = lines
+            .iter()
+            .rposition(|l| l.get("response").is_some())
+            .unwrap();
+        assert!(started < found, "{out}");
+        assert!(
+            lines.iter().any(|l| !l["event"]["scan_done"].is_null()),
+            "{out}"
+        );
+    }
 }
 
 #[test]
@@ -195,6 +344,13 @@ fn file_get_writes_the_file_and_never_replaces_one() {
     assert_eq!(fs::read(&local).unwrap(), [1, 2, 3]);
     let (result, _, _) = script(&dongle, &["file", "get", "/a.bin", local_arg], false, b"");
     assert_eq!(result.unwrap_err().message, "the local file already exists");
+    fs::remove_file(&local).unwrap();
+    let (result, out, diagnostics) =
+        script(&dongle, &["file", "get", "/a.bin", local_arg], true, b"");
+    result.unwrap();
+    assert!(!out.contains("AQID") && !out.contains("\"file\""), "{out}");
+    assert!(diagnostics.contains("(3 bytes)"), "{diagnostics}");
+    assert_eq!(fs::read(&local).unwrap(), [1, 2, 3]);
     fs::remove_dir_all(&dir).unwrap();
 }
 

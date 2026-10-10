@@ -322,6 +322,11 @@ pub fn range(s: &p::Setting) -> Option<(i64, i64, i64)> {
     }
 }
 
+/// How many steps of `step` span `min` through `max`; negative when `min` is above `max`.
+pub fn step_count(min: i64, max: i64, step: i64) -> i128 {
+    (i128::from(max) - i128::from(min)) / i128::from(step.max(1))
+}
+
 /// The values an integer or enum setting accepts, when it lists them.
 pub fn choices(s: &p::Setting) -> Vec<Value> {
     match s.r#type.as_ref() {
@@ -348,7 +353,8 @@ pub fn accepts(s: &p::Setting, v: &Value) -> bool {
         (Some(Type::Bool), Value::Bool(_)) => true,
         (Some(Type::Integer), Value::Integer(n)) => {
             if let Some((min, max, step)) = range(s) {
-                return (min..=max).contains(n) && (n - min) % step == 0;
+                return (min..=max).contains(n)
+                    && (i128::from(*n) - i128::from(min)) % i128::from(step) == 0;
             }
             let choices = choices(s);
             choices.is_empty() || choices.contains(v)

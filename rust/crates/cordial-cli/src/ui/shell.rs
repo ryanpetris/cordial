@@ -223,7 +223,7 @@ impl<B: Backend> Model<B> {
     pub(crate) fn update(&mut self, msg: Msg) {
         match msg {
             Msg::Interrupt => self.quit(),
-            Msg::Resize(..) | Msg::Mouse(_) => {}
+            Msg::Resize(..) | Msg::Mouse(_) | Msg::Fleet(..) => {}
             Msg::Paste(text) => {
                 if self.answering() {
                     self.form.insert(&text);
@@ -482,7 +482,9 @@ impl<B: Backend> Model<B> {
         let (command, filter) = match parsed {
             Line::Quit => return self.quit(),
             Line::Select(port) => return self.open(port),
-            Line::Help(_) => return self.log(command::help(self.state().as_ref())),
+            Line::Help(topic) => {
+                return self.log(command::help_on(self.state().as_ref(), topic.as_deref()));
+            }
             Line::List => return self.backend.list_ports(),
             Line::Devices(filter) => (Command::Devices, Some(filter)),
             Line::Run(command) => (command, None),

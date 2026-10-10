@@ -33,6 +33,10 @@ pub fn warn() -> Style {
 pub fn err() -> Style {
     Style::new().fg(Color::Red)
 }
+/// Information that helps a decision, such as why a device isn't used.
+pub fn info_style() -> Style {
+    Style::new().fg(Color::Blue)
+}
 /// The selected row keeps this background across its columns.
 pub fn selected() -> Style {
     Style::new().bg(Color::DarkGray)
@@ -208,20 +212,30 @@ pub struct Choice {
     pub chosen: bool,
 }
 
-/// On and Off options for a boolean. An unknown value chooses neither.
-pub fn on_off(on: Option<bool>, on_action: Action, off_action: Action) -> Vec<Choice> {
-    vec![
-        Choice {
-            label: "On".into(),
-            action: on_action,
-            chosen: on == Some(true),
-        },
-        Choice {
-            label: "Off".into(),
-            action: off_action,
-            chosen: on == Some(false),
-        },
-    ]
+/// A switch: its state in words, which a click turns over. An unknown state turns on.
+pub fn switch(on: Option<bool>, action: Action, enabled: bool) -> Layout {
+    let mut l = Layout::new(8);
+    let text = match on {
+        Some(true) => "[✓] On",
+        Some(false) => "[ ] Off",
+        None => "[?] Unknown",
+    };
+    let look = match (enabled, on) {
+        (false, _) => dim(),
+        (true, Some(true)) => ok().add_modifier(Modifier::BOLD),
+        (true, _) => bold(),
+    };
+    l.width = width(text);
+    l.lines.push(Line::from(span(text, look)));
+    if enabled {
+        l.hits.push(Hit {
+            x: 0,
+            y: 0,
+            w: width(text),
+            action,
+        });
+    }
+    l
 }
 
 impl Layout {
@@ -252,6 +266,10 @@ impl Layout {
     pub fn para(&mut self, text: &str, style: Style) {
         self.hang(Line::default(), text, style);
     }
+    /// The current row, made when there is none.
+    pub fn last_row(&mut self) -> usize {
+        self.last()
+    }
     fn last(&mut self) -> usize {
         if self.lines.is_empty() {
             self.row();
@@ -278,6 +296,30 @@ impl Layout {
         self.lines[y].spans.push(span(text, tone.style()));
         self.hits.push(Hit { x, y, w, action });
     }
+    /// Adds a one-line group of controls to the current row, wrapping like a button.
+    pub fn append(&mut self, group: Layout) {
+        let Some(line) = group.lines.into_iter().next() else {
+            return;
+        };
+        let w = line_width(&line);
+        let mut y = self.last();
+        let mut x = line_width(&self.lines[y]);
+        if x > 0 {
+            x += 1;
+        }
+        if x > 0 && x + w > self.width {
+            self.row();
+            y += 1;
+            x = 0;
+        }
+        if x > 0 {
+            self.lines[y].spans.push(Span::raw(" "));
+        }
+        self.lines[y].spans.extend(line.spans);
+        for h in group.hits.into_iter().filter(|h| h.y == 0) {
+            self.hits.push(Hit { x: h.x + x, y, ..h });
+        }
+    }
     /// Adds plain text to the current row, wrapping like a button.
     pub fn label(&mut self, text: &str, style: Style) {
         let mut y = self.last();
@@ -298,23 +340,29 @@ impl Layout {
     /// Places a one-line group at the end of the current row, or of a new
     /// row when it does not fit.
     pub fn align_right(&mut self, r: Layout) {
-        let Some(group) = r.lines.into_iter().next() else {
-            return;
-        };
-        let mut y = self.last();
-        let (mut used, w) = (line_width(&self.lines[y]), line_width(&group));
-        if used > 0 && used + 1 + w > self.width {
-            self.row();
-            y += 1;
-            used = 0;
-        }
-        let x = self.width.saturating_sub(w);
-        self.lines[y]
-            .spans
-            .push(Span::raw(" ".repeat(x.saturating_sub(used))));
-        self.lines[y].spans.extend(group.spans);
-        for h in r.hits {
-            self.hits.push(Hit { x: h.x + x, y, ..h });
+        // Each line of the group goes at the end of a row: the first on the current row when it
+        // fits there, the rest on rows of their own.
+        let Layout { lines, hits, .. } = r;
+        for (i, group) in lines.into_iter().enumerate() {
+            let mut y = self.last();
+            let (mut used, w) = (line_width(&self.lines[y]), line_width(&group));
+            if i > 0 || used > 0 && used + 1 + w > self.width {
+                self.row();
+                y += 1;
+                used = 0;
+            }
+            let x = self.width.saturating_sub(w);
+            self.lines[y]
+                .spans
+                .push(Span::raw(" ".repeat(x.saturating_sub(used))));
+            self.lines[y].spans.extend(group.spans);
+            for h in hits.iter().filter(|h| h.y == i) {
+                self.hits.push(Hit {
+                    x: h.x + x,
+                    y,
+                    ..h.clone()
+                });
+            }
         }
     }
     pub fn button_right(&mut self, label: &str, action: Action, tone: Tone) {
@@ -338,18 +386,6 @@ impl Layout {
         self.lines.extend(b.lines);
         self.hits
             .extend(b.hits.into_iter().map(|h| Hit { y: h.y + y, ..h }));
-    }
-    /// A field: a dim key column, then wrapped text.
-    pub fn field(&mut self, key: &str, value: &str, style: Style) {
-        self.field_at(key, 11, value, style);
-    }
-    pub fn field_at(&mut self, key: &str, kw: usize, value: &str, style: Style) {
-        self.hang(styled(pad_str(key, kw), dim()), value, style);
-    }
-    /// A field whose value is picked by clicking one of its options. The
-    /// chosen option is marked; options wrap under the first when narrow.
-    pub fn choice(&mut self, key: &str, kw: usize, options: Vec<Choice>) {
-        self.choice_if(key, kw, options, true);
     }
     /// A choice drawn in place but dim and without click targets while it
     /// is unavailable, so nothing moves when it becomes available again.
@@ -387,6 +423,42 @@ impl Layout {
             x += w;
         }
     }
+    /// A row with `label` on the left and a one-line group of controls at its end, or on the
+    /// next row when both don't fit.
+    pub fn labelled(&mut self, label: Styled, controls: Layout) {
+        self.line(label);
+        self.align_right(controls);
+    }
+    /// A section heading after a blank line, except at the top.
+    pub fn section(&mut self, title: &str) {
+        if !self.lines.is_empty() {
+            self.row();
+        }
+        self.line(styled(title.to_owned(), bold()));
+    }
+    /// A fact: a dim label column, then the value, wrapped.
+    pub fn fact(&mut self, label: &str, value: &str, style: Style) {
+        let kw = (self.width / 3).clamp(10, 24);
+        self.hang(
+            styled(pad_str(&truncate_str(label, kw - 1), kw), dim()),
+            value,
+            style,
+        );
+    }
+    /// A whole-row control drawn on two lines, such as a list row with a subtitle.
+    pub fn control2(&mut self, first: Styled, second: Styled, action: Action) {
+        let y = self.lines.len();
+        for dy in 0..2 {
+            self.hits.push(Hit {
+                x: 0,
+                y: y + dy,
+                w: self.width,
+                action: action.clone(),
+            });
+        }
+        self.line(first);
+        self.line(second);
+    }
     /// Indents every line and hit by one cell.
     pub fn indent(&mut self) {
         for l in &mut self.lines {
@@ -396,24 +468,6 @@ impl Layout {
             h.x += 1;
         }
     }
-}
-
-/// Joins two blocks of equal height side by side.
-pub fn beside(a: Layout, b: Layout) -> Layout {
-    let shift = a.width;
-    let mut out = Layout {
-        width: a.width + b.width,
-        hits: a.hits,
-        lines: Vec::new(),
-    };
-    for (l, r) in a.lines.into_iter().zip(b.lines) {
-        out.lines.push(join(l, r));
-    }
-    out.hits.extend(b.hits.into_iter().map(|h| Hit {
-        x: h.x + shift,
-        ..h
-    }));
-    out
 }
 
 #[cfg(test)]
@@ -436,7 +490,7 @@ mod tests {
         let mut l = Layout::new(12);
         l.button("One", Action::Quit, Tone::Normal);
         l.button("Two", Action::Help, Tone::Normal);
-        l.button("Three", Action::Reopen, Tone::Normal);
+        l.button("Three", Action::AddDevice, Tone::Normal);
         assert_eq!(l.lines.len(), 2);
         assert_eq!(
             l.hits[1],

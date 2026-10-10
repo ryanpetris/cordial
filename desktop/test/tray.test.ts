@@ -75,6 +75,20 @@ describe("trayModel", () => {
       ["Adapter B", 1],
     ]);
   });
+
+  it("names what is missing when there are no devices to list", () => {
+    expect(trayModel(app([adapter("A")], [entry("A", "1")])).empty).toBeNull();
+    expect(trayModel(app([adapter("A")], [])).empty).toBe("No Saved Devices");
+    expect(trayModel(app([], [])).empty).toBe("No Adapter Connected");
+    expect(trayModel(app([adapter("A", { connection: "connecting" }), adapter("B", { connection: "disconnected" })], [entry("A", "1")])).empty).toBe("No Adapter Connected");
+  });
+
+  it("offers Connect only through a ready adapter", () => {
+    const ready = trayModel(app([adapter("A")], [entry("A", "1")]));
+    expect(ready.groups[0]!.devices[0]!.canConnect).toBe(true);
+    const waiting = trayModel(app([adapter("A", { readiness: "waiting" })], [entry("A", "1")]));
+    expect(waiting.groups[0]!.devices[0]!.canConnect).toBe(false);
+  });
 });
 
 describe("battery", () => {

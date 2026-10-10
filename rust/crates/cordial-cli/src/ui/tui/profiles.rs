@@ -1,51 +1,38 @@
-//! The Profiles views and dialogs. The adapter's Profiles view shows its profile memory, its
-//! configuration interfaces, each with its own switch and profile staged until Save, and one
-//! page of profiles at a time, each labelled with its roles, with creating, copying and
-//! deleting them. A device's Profiles view shows its layers, staged until its own Save. The
-//! chooser of a profile for an interface or a device's layers pages on its own. Profile rules
-//! are never read or changed here.
+//! Profiles: an adapter's profile memory, its configuration interfaces, each with a switch and a
+//! profile staged until Save, and one page of profiles at a time, each labelled with its roles,
+//! with creating, copying and deleting them at once. The picker of a profile for an interface or
+//! a device's layers pages on its own. Profile rules are never read or changed here.
 use super::{
-    Action, Dialog, Job, Model, PickFor, can_set_platform,
-    layout::{Choice, Layout, Tone, accent, bold, dim, err, pad_str, styled, title, warn},
-    settings::button_if,
-    view::spinner,
+    Action, Dialog, Job, Kind, Menu, Model, PickFor, Spot,
+    fleet::Fleet,
+    layout::{self, Layout, Tone, bold, dim, err, styled},
+    render::{DialogView, button_if, staged_label},
+    words,
+    world::AdapterView,
 };
 use crate::{
-    controller::{Command, Notice, Outcome, State, Target},
+    controller::{Command, Outcome, Target},
     error::Error,
     profiles,
-    ui::{
-        Backend,
-        text::{self, display, display_name},
-    },
-    view::Item,
 };
 use cordial_client::paging::Page;
 use cordial_protocol::{self as p, ConfigurationInterface, event, profile_list_entry};
-use ratatui::text::Line;
-use std::collections::HashSet;
-
-/// Shown before saving a configuration interface change that reconnects USB.
-pub(super) const RECONNECT_TEXT: &str =
-    "The adapter will disconnect from this computer for a moment after it saves these changes.";
-
-/// The label column of the configuration interfaces.
-const INTERFACE_KEY: usize = 10;
+use ratatui::{style::Style, text::Line};
 
 /// How a page read moves through the pages once it succeeds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Step {
+pub enum Step {
     /// The first page.
     Open,
     Forward,
     Back,
-    /// The shown page again.
+    /// The shown page again, or the first when none is shown.
     Again,
 }
 
-/// One page of profiles, as a Profiles view or the chooser shows it.
-#[derive(Default)]
-pub(super) struct ProfilePage {
+/// One page of profiles, as the Profiles tab or the picker shows it.
+#[derive(Clone, Debug, Default)]
+pub struct ProfilePage {
     /// The cursors of the earlier pages shown, for Previous.
     pub back: Vec<u32>,
     /// The shown page's cursor; 0 for the first page.
@@ -55,176 +42,112 @@ pub(super) struct ProfilePage {
     pub unreadable: Vec<u32>,
     /// The next page's cursor; 0 on the last page.
     pub next: u32,
-    /// The read under way: how it moves, and the cursor it asked for. The shown page and the
-    /// cursors change only once it succeeds.
+    /// A page has been read.
+    pub shown: bool,
+    /// The read under way: how it moves, and the cursor it asked for.
     pub reading: Option<(Step, u32)>,
-    pub load_err: String,
-    /// Profiles whose names were read once because nothing had named them.
-    pub looked_up: HashSet<u32>,
+    pub error: Option<String>,
 }
 
 impl ProfilePage {
-    /// Whether a profile with this ID belongs on the shown page.
     fn covers(&self, id: u32) -> bool {
         id > self.after && (self.next == 0 || id <= self.next)
     }
 }
 
-/// How much of the adapter's profile memory loaded profiles use, in percent.
-fn memory_percent(status: &p::Status) -> Option<u32> {
-    let support = profiles::support(status).filter(|s| s.memory_budget > 0)?;
-    let percent = u64::from(support.memory_used) * 100 / u64::from(support.memory_budget);
-    let rest = u64::from(support.memory_used) * 100 % u64::from(support.memory_budget);
-    // Rounded half up, as the desktop app shows it.
-    let round = u64::from(rest * 2 >= u64::from(support.memory_budget));
-    Some((percent + round) as u32)
-}
+impl<F: Fleet> Model<F> {
+    fn page_of(&self, adapter: &str, picker: bool) -> Option<&ProfilePage> {
+        let s = self.session_of(adapter)?;
+        Some(if picker { &s.picker } else { &s.list })
+    }
 
-impl<B: Backend> Model<B> {
-    /// A profile command of this TUI is running.
-    pub(super) fn profiles_running(&self) -> bool {
-        self.running(|c| {
-            matches!(
-                c,
-                Command::ProfileCreate(..)
-                    | Command::ProfileCopy(..)
-                    | Command::ProfileDelete(_)
-                    | Command::AdapterSave(_)
-            )
+    fn page_mut(&mut self, adapter: &str, picker: bool) -> Option<&mut ProfilePage> {
+        let s = self.session_of_mut(adapter)?;
+        Some(if picker { &mut s.picker } else { &mut s.list })
+    }
+
+    /// The page shown while the adapter is held, else its live page.
+    fn shown_page(&self, adapter: &str, picker: bool) -> Option<ProfilePage> {
+        self.page_of(adapter, picker).cloned().or_else(|| {
+            self.held.get(adapter).map(|h| {
+                if picker {
+                    h.picker.clone()
+                } else {
+                    h.list.clone()
+                }
+            })
         })
     }
 
-    fn profile_name(&self, st: &State, id: u32) -> String {
-        display(&profiles::name_of(st, id))
-    }
-
-    fn page(&self, picker: bool) -> &ProfilePage {
-        if picker {
-            &self.picker_page
-        } else {
-            &self.profile_page
-        }
-    }
-
-    fn page_mut(&mut self, picker: bool) -> &mut ProfilePage {
-        if picker {
-            &mut self.picker_page
-        } else {
-            &mut self.profile_page
-        }
-    }
-
-    /// Reads the page after `after` for the chooser when `picker`, else for the adapter's
-    /// Profiles view; `step` says where it goes once read.
-    fn read_page(&mut self, picker: bool, step: Step, after: u32) {
-        let page = self.page_mut(picker);
+    /// Reads a page for the picker when `picker`, else for the Profiles tab.
+    pub(super) fn read_page(&mut self, adapter: &str, picker: bool, step: Step) {
+        let Some(page) = self.page_mut(adapter, picker) else {
+            return;
+        };
+        let after = match step {
+            Step::Open => 0,
+            Step::Forward => page.next,
+            Step::Back => page.back.last().copied().unwrap_or(0),
+            Step::Again => page.after,
+        };
         page.reading = Some((step, after));
-        page.load_err.clear();
-        let mut job = Job::new(Command::Profiles { after });
-        job.lookup = true;
-        job.picker = picker;
-        self.execute_job(job);
+        page.error = None;
+        self.run(
+            adapter,
+            Kind::Page {
+                picker,
+                step,
+                after,
+            },
+            Command::Profiles { after },
+        );
     }
 
-    /// Shows the first page.
-    pub(super) fn open_page(&mut self, picker: bool) {
-        let page = self.page_mut(picker);
-        page.back.clear();
-        page.after = 0;
-        page.list.clear();
-        page.unreadable.clear();
-        page.next = 0;
-        self.read_page(picker, Step::Open, 0);
+    pub(super) fn open_picker(&mut self, adapter: &str) {
+        self.read_page(adapter, true, Step::Open);
     }
 
-    /// Selects a row; another row's Profiles view closes.
-    pub(super) fn select(&mut self, item: Item) {
-        if self.selected != Some(item) {
-            self.profiles_open = None;
-            self.profile_err.clear();
-        }
-        self.selected = Some(item);
-        self.detail_scroll = 0;
-        if item == Item::Adapter {
-            // The adapter row is the Adapters pane's first line.
-            self.adapter_scroll = 0;
-        }
+    pub(super) fn picker_open(&self, adapter: &str) -> bool {
+        matches!(&self.dialog, Some(Dialog::Pick { adapter: a, .. }) if a == adapter)
     }
 
-    /// Returns from a Profiles view to the page it replaced. Staged changes are kept.
-    pub(super) fn close_profiles(&mut self) {
-        self.profiles_open = None;
-        self.detail_scroll = 0;
-        self.profile_err.clear();
-        self.focus = None;
-    }
-
-    /// Whether the adapter's Profiles view is shown.
-    pub(super) fn adapter_profiles_open(&self, st: &State) -> bool {
-        self.selected == Some(Item::Adapter)
-            && self.profiles_open == Some(Item::Adapter)
-            && profiles::available(&st.status)
-    }
-
-    /// The device whose Profiles view is shown.
-    pub(super) fn layers_open<'a>(&self, st: &'a State) -> Option<&'a p::Device> {
-        let Some(Item::Device(id)) = self.selected.filter(|s| Some(*s) == self.profiles_open)
-        else {
-            return None;
-        };
-        st.device(id).filter(|d| layered(st, d))
-    }
-
-    /// Whether a page is shown: the chooser's while it is open, else the adapter's Profiles
-    /// view's, including under the dialogs opened from it.
-    fn page_shown(&self, picker: bool) -> bool {
-        if picker {
-            return matches!(self.dialog, Some(Dialog::ProfilePick(_)));
-        }
-        self.state()
-            .is_some_and(|st| self.adapter_profiles_open(&st))
-    }
-
-    /// Reads the names of profiles in use that nothing has named yet, each once.
+    /// Reads the names of profiles in use that nothing has named yet, each once per session.
     pub(super) fn sync_profiles(&mut self) {
-        if self.preparing {
-            return;
-        }
-        let Some(st) = self.state().filter(State::ready) else {
-            return;
-        };
-        for id in profiles::unnamed(&st) {
-            if self.profile_page.looked_up.insert(id) {
-                let mut job = Job::new(Command::ProfileLookup(id));
-                job.lookup = true;
-                self.execute_job(job);
+        let mut lookups = Vec::new();
+        for s in &mut self.sessions {
+            let Some(st) = self.states.get(&s.slot).filter(|st| st.ready()) else {
+                continue;
+            };
+            for id in profiles::unnamed(st) {
+                if s.looked_up.insert(id) {
+                    lookups.push((s.id.clone(), id));
+                }
             }
         }
+        for (adapter, id) in lookups {
+            self.run(&adapter, Kind::Lookup, Command::ProfileLookup(id));
+        }
     }
 
-    /// Follows a changed or removed profile on the shown pages. A page is read again when a
-    /// profile of its range isn't on it, or when a removal leaves it empty, which moves on to
-    /// the profiles that follow or back to the page before. A read already under way is left
-    /// to finish: a Next or Previous in flight keeps its result.
-    pub(super) fn profile_notice(&mut self, notice: &Notice) {
-        let Notice::Event { event, .. } = notice else {
-            return;
-        };
+    /// Follows a changed or removed profile on the shown pages.
+    pub(super) fn profile_event(&mut self, adapter: &str, kind: &event::Kind) {
         for picker in [false, true] {
-            let shown = self.page_shown(picker);
-            let page = self.page_mut(picker);
+            let shown = !picker || self.picker_open(adapter);
+            let Some(page) = self.page_mut(adapter, picker) else {
+                continue;
+            };
             let idle = page.reading.is_none();
-            let again = match &event.kind {
-                Some(event::Kind::Profile(profile)) => {
+            let again = match kind {
+                event::Kind::Profile(profile) => {
                     match page.list.iter_mut().find(|p| p.id == profile.id) {
                         Some(entry) => {
                             *entry = profile.clone();
                             false
                         }
-                        None => page.covers(profile.id),
+                        None => page.shown && page.covers(profile.id),
                     }
                 }
-                Some(event::Kind::ProfileRemoved(removed)) => {
+                event::Kind::ProfileRemoved(removed) => {
                     let had = page.list.iter().any(|p| p.id == removed.id)
                         || page.unreadable.contains(&removed.id);
                     page.list.retain(|p| p.id != removed.id);
@@ -234,25 +157,28 @@ impl<B: Backend> Model<B> {
                 _ => false,
             };
             if again && shown && idle {
-                let after = page.after;
-                self.read_page(picker, Step::Again, after);
+                self.read_page(adapter, picker, Step::Again);
             }
         }
     }
 
-    /// Records a page read.
-    pub(super) fn lookup_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
-        let Command::Profiles { after } = &job.command else {
+    pub(super) fn page_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
+        let Kind::Page {
+            picker,
+            step,
+            after,
+        } = job.kind
+        else {
             return;
         };
-        let picker = job.picker;
-        let page = self.page_mut(picker);
-        if page.reading.is_none_or(|(_, sent)| sent != *after) {
+        let adapter = job.adapter.clone();
+        let Some(page) = self.page_mut(&adapter, picker) else {
+            return;
+        };
+        if page.reading != Some((step, after)) {
             return;
         }
-        let Some((step, _)) = page.reading.take() else {
-            return;
-        };
+        page.reading = None;
         match result {
             Ok(Outcome::Profiles { after: shown, list }) => {
                 match step {
@@ -264,6 +190,7 @@ impl<B: Backend> Model<B> {
                     Step::Again => {}
                 }
                 page.after = *shown;
+                page.shown = true;
                 page.list.clear();
                 page.unreadable.clear();
                 for e in &list.entries {
@@ -278,529 +205,497 @@ impl<B: Backend> Model<B> {
                     }
                 }
                 page.next = list.next().unwrap_or(0);
-                // A page that has emptied, as after deleting its last profile, shows the page
-                // before it instead.
-                if list.entries.is_empty()
-                    && let Some(&before) = page.back.last()
-                {
-                    self.read_page(picker, Step::Back, before);
+                // A page that has emptied shows the page before it instead.
+                if list.entries.is_empty() && !page.back.is_empty() {
+                    self.read_page(&adapter, picker, Step::Back);
                 }
             }
             Ok(_) => {}
-            // A failed read leaves the shown page and its cursors as they were.
-            Err(e) => page.load_err = text::capitalized(&text::error_words(e)),
+            Err(e) => page.error = Some(words::failure(e)),
         }
     }
 
-    /// The adapter's Profiles view: its heading, body and pinned controls.
-    pub(super) fn adapter_profiles(&self, st: &State, w: usize) -> (String, Layout, Layout) {
-        let mut body = Layout::new(w.saturating_sub(4));
-        let mut pinned = Layout::new(w.saturating_sub(4));
-        let running = self.profiles_running();
-        let idle = can_set_platform(st) && !running;
-        if let Some(percent) = memory_percent(&st.status) {
-            body.line(styled("Profile Memory", title()));
-            let look = if percent >= 85 {
-                warn()
-            } else {
-                super::layout::plain()
-            };
-            body.field_at("In Use", INTERFACE_KEY, &format!("{percent}%"), look);
-            body.row();
-        }
-        self.interfaces_section(st, &mut body, idle);
-        if running {
-            body.para(&format!("{} Saving…", spinner()), warn());
-        } else if let Some(e) = self.adapter_error(st) {
-            body.para(&format!("✕ {e}"), err());
-        } else {
-            self.refusal_hint(st, &mut body);
-        }
-        if !profiles::interfaces(&st.status).is_empty() {
-            body.row();
-            body.line(styled("Profiles", title()));
-        }
-        if !running && !self.profile_err.is_empty() {
-            body.para(&format!("✕ {}", self.profile_err), err());
-        }
-        for profile in &self.profile_page.list {
-            body.row();
-            body.label(&display(&profile.name), bold());
-            let roles = text::role_names(&profiles::roles(profile));
-            if !roles.is_empty() {
-                body.label(&roles, dim());
-            }
-            if idle {
-                body.button("Copy", Action::ProfileCopy(profile.id), Tone::Normal);
-                let delete = Action::ProfileDelete(profile.id);
-                body.button("Delete", delete, Tone::Danger);
-            }
-        }
-        for id in &self.profile_page.unreadable {
-            body.row();
-            body.label(&format!("Profile {id}"), bold());
-            body.label("Couldn't Read", dim());
-        }
-        self.page_controls(&mut body, false);
-        self.adapter_buttons(st, &mut pinned);
-        if idle {
-            pinned.button("New Profile", Action::ProfileNew, Tone::Normal);
-        }
-        pinned.button_right("‹ Back", Action::ProfilesBack, Tone::Normal);
-        let heading = format!("Profiles · {}", display(&st.status.name));
-        (heading, body, pinned)
-    }
-
-    /// A device's Profiles view: its layers, each profile in the order it applies, with controls
-    /// to reorder and remove it, and Add Profile while there is room; Save and Discard send or
-    /// drop only the layers.
-    pub(super) fn device_layers(
-        &self,
-        st: &State,
-        d: &p::Device,
-        w: usize,
-    ) -> (String, Layout, Layout) {
-        let mut body = Layout::new(w.saturating_sub(4));
-        let mut pinned = Layout::new(w.saturating_sub(4));
-        let saving = self.device_saving(d.id);
-        let idle = !saving && can_set_platform(st);
-        let layers = self.device_values(st, d).layers.unwrap_or_default();
-        let max = profiles::max_layers(&st.status).unwrap_or(0) as usize;
-        for (i, id) in layers.iter().enumerate() {
-            body.row();
-            body.label(
-                &format!("{}. {}", i + 1, self.profile_name(st, *id)),
-                bold(),
-            );
-            if let Some(profile) = st.profile(*id) {
-                let roles = text::role_names(&profiles::roles(profile));
-                if !roles.is_empty() {
-                    body.label(&roles, dim());
-                }
-            }
-            button_if(
-                &mut body,
-                "↑",
-                Action::LayerUp(i),
-                Tone::Normal,
-                idle && i > 0,
-            );
-            let down = idle && i + 1 < layers.len();
-            button_if(&mut body, "↓", Action::LayerDown(i), Tone::Normal, down);
-            button_if(
-                &mut body,
-                "Remove",
-                Action::LayerRemove(i),
-                Tone::Normal,
-                idle,
-            );
-        }
-        let draft = self.device_draft(st, d);
-        if draft.layers.is_some() {
-            body.line(styled("✎ Changed", accent()));
-        }
-        if saving {
-            body.para(&format!("{} Saving…", spinner()), warn());
-        } else if let Some(e) = self.layers_error(st, d) {
-            body.para(&format!("✕ Couldn't Save: {e}"), err());
-        }
-        body.row();
-        let room = layers.len() < max;
-        button_if(
-            &mut body,
-            "Add Profile",
-            Action::LayerAdd,
-            Tone::Normal,
-            idle && room,
-        );
-        let staged = draft.layers.is_some();
-        let can_save = idle && staged;
-        button_if(
-            &mut pinned,
-            "Save",
-            Action::LayersSave,
-            Tone::Primary,
-            can_save,
-        );
-        let can_discard = !saving && staged;
-        button_if(
-            &mut pinned,
-            "Discard",
-            Action::LayersDiscard,
-            Tone::Normal,
-            can_discard,
-        );
-        pinned.button_right("‹ Back", Action::ProfilesBack, Tone::Normal);
-        let heading = format!("Profiles · {}", display_name(Some(&d.name)));
-        (heading, body, pinned)
-    }
-
-    /// Draws the profile dialogs.
-    pub(super) fn profiles_dialog(
-        &mut self,
-        st: &State,
-        heading: &mut String,
-        body: &mut Layout,
-        pinned: &mut Layout,
-    ) {
-        let running = self.profiles_running();
-        let form_err = self.form_err.clone();
-        let idle = can_set_platform(st) && !running;
-        match self.dialog {
-            Some(Dialog::ProfilePick(target)) => {
-                let page = self.picker_page.list.clone();
-                let (current, none) = match target {
-                    PickFor::Interface(i) => {
-                        *heading = "Choose Profile".into();
-                        let draft = self.adapter_draft(st);
-                        let configured = profiles::configured(&st.status, &draft.interfaces);
-                        let s = configured.iter().find(|s| s.interface == i as i32);
-                        // An enabled interface always has a profile, so None is offered only
-                        // while it is off.
-                        (s.map_or(0, |s| s.profile), s.is_some_and(|s| !s.enabled))
-                    }
-                    PickFor::Layer => {
-                        *heading = "Add Profile".into();
-                        (0, false)
-                    }
-                };
-                let mut choices = Vec::new();
-                if none {
-                    choices.push(Choice {
-                        label: "None".into(),
-                        action: Action::PickProfile(0),
-                        chosen: current == 0,
-                    });
-                }
-                if current != 0 && !page.iter().any(|p| p.id == current) {
-                    choices.push(Choice {
-                        label: self.profile_name(st, current),
-                        action: Action::PickProfile(current),
-                        chosen: true,
-                    });
-                }
-                choices.extend(page.iter().map(|p| Choice {
-                    label: display(&p.name),
-                    action: Action::PickProfile(p.id),
-                    chosen: p.id == current,
-                }));
-                let idle = match target {
-                    PickFor::Interface(_) => idle,
-                    PickFor::Layer => can_set_platform(st),
-                };
-                body.choice_if("", 0, choices, idle);
-                self.page_controls(body, true);
-                pinned.button("Close", Action::CancelDialog, Tone::Normal);
-            }
-            Some(Dialog::ProfileName(source)) => {
-                *heading = match source {
-                    Some(id) => format!("Copy {}", self.profile_name(st, id)),
-                    None => "New Profile".into(),
-                };
-                let field = self.field_line(body.width.saturating_sub(3));
-                body.control(field, Action::Input);
-                if running {
-                    body.para(&format!("{} Saving…", spinner()), warn());
-                } else if !form_err.is_empty() {
-                    body.para(&format!("✕ {form_err}"), err());
-                }
-                if !running {
-                    let label = if source.is_some() { "Copy" } else { "Create" };
-                    pinned.button(label, Action::SaveProfileName, Tone::Primary);
-                }
-                pinned.button("Cancel", Action::CancelDialog, Tone::Normal);
-            }
-            Some(Dialog::ProfileDelete(id)) => {
-                *heading = "Delete Profile".into();
-                body.para(&format!("Delete {}?", self.profile_name(st, id)), bold());
-                pinned.button("Delete", Action::Confirm, Tone::Danger);
-                pinned.button("Cancel", Action::CancelDialog, Tone::Normal);
-            }
-            Some(Dialog::SaveAdapter) => {
-                *heading = "USB Reconnect Required".into();
-                body.para(RECONNECT_TEXT, bold());
-                pinned.button("Save", Action::Confirm, Tone::Primary);
-                pinned.button("Cancel", Action::CancelDialog, Tone::Normal);
-            }
-            _ => {}
-        }
-    }
-
-    /// Why Save is unavailable for the staged interface changes, where it is drawn.
-    pub(super) fn refusal_hint(&self, st: &State, body: &mut Layout) {
-        let draft = self.adapter_draft(st);
-        if let Some(e) = profiles::interface_refusal(&st.status, &draft.interfaces) {
-            body.para(&text::sentence(&text::error_words(&e)), dim());
-        }
-    }
-
-    /// Each configuration interface the adapter supports: its switch and its profile, with
-    /// staged values in place of saved ones.
-    fn interfaces_section(&self, st: &State, body: &mut Layout, idle: bool) {
-        let draft = self.adapter_draft(st);
-        let configured = profiles::configured(&st.status, &draft.interfaces);
-        let supported = profiles::interfaces(&st.status);
-        if supported.is_empty() {
-            return;
-        }
-        body.line(styled("Configuration Interfaces", title()));
-        let changed = |b: &mut Layout| {
-            b.hang(
-                Line::from(pad_str("", INTERFACE_KEY)),
-                "✎ Changed",
-                accent(),
-            );
-        };
-        for saved in supported {
-            let i = saved.interface();
-            let Some(s) = configured.iter().find(|s| s.interface == saved.interface) else {
-                continue;
-            };
-            let staged = draft.interfaces.iter().find(|u| u.interface == i);
-            body.row();
-            let options = super::layout::on_off(
-                Some(s.enabled),
-                Action::InterfaceEnabled(i, true),
-                Action::InterfaceEnabled(i, false),
-            );
-            body.choice_if(profiles::interface_label(i), INTERFACE_KEY, options, idle);
-            if staged.is_some_and(|u| u.enabled.is_some()) {
-                changed(body);
-            }
-            let profile = match s.profile {
-                0 => "None".to_owned(),
-                id => self.profile_name(st, id),
-            };
-            body.line(styled(pad_str("", INTERFACE_KEY), dim()));
-            body.label("Profile", dim());
-            body.label(&profile, bold());
-            if idle {
-                body.button("Choose Profile", Action::InterfaceChoose(i), Tone::Normal);
-            }
-            if staged.is_some_and(|u| u.profile.is_some()) {
-                changed(body);
-            }
-        }
-    }
-
-    /// A page's progress, and Previous and Next.
-    fn page_controls(&self, body: &mut Layout, picker: bool) {
-        let page = self.page(picker);
-        let loading = page.reading.is_some();
-        if loading {
-            body.para(&format!("{} Loading…", spinner()), warn());
-        } else if !page.load_err.is_empty() {
-            body.para(&format!("✕ {}", page.load_err), err());
-            body.button("Retry", Action::ProfilesRetry, Tone::Normal);
-        }
-        if page.back.is_empty() && page.next == 0 {
-            return;
-        }
-        body.row();
-        button_if(
-            body,
-            "‹ Previous",
-            Action::ProfilePage(false),
-            Tone::Normal,
-            !page.back.is_empty() && !loading,
-        );
-        button_if(
-            body,
-            "Next ›",
-            Action::ProfilePage(true),
-            Tone::Normal,
-            page.next != 0 && !loading,
-        );
+    fn profiles_busy(&self, adapter: &str) -> bool {
+        self.running(adapter, |k| matches!(k, Kind::Profile))
     }
 
     /// Handles a profile action; false when `action` isn't one.
-    pub(super) fn profiles_action(&mut self, action: &Action) -> bool {
-        let st = self.state();
-        let available = st
-            .as_ref()
-            .is_some_and(|st| profiles::available(&st.status));
-        let idle = st.as_ref().is_some_and(can_set_platform) && !self.profiles_running();
+    pub(super) fn profiles_action(&mut self, adapter: &str, action: &Action) -> bool {
+        let Some(a) = self.adapter(adapter).cloned() else {
+            return false;
+        };
+        let ready = a.live().is_some();
+        let disabled = self.profiles_busy(adapter) || self.adapter_locked(&a) || !ready;
         match action {
-            Action::Profiles => {
-                if !available {
-                    return true;
-                }
-                self.select(Item::Adapter);
-                self.profiles_open = Some(Item::Adapter);
-                self.profile_err.clear();
-                self.form_focused = false;
-                self.focus = None;
-                self.open_page(false);
-            }
-            Action::DeviceProfiles => {
-                let layered = st.as_ref().is_some_and(
-                    |st| matches!(Self::find(st, self.selected), (Some(d), _) if layered(st, d)),
-                );
-                if layered {
-                    self.profiles_open = self.selected;
-                    self.detail_scroll = 0;
-                    self.focus = None;
+            Action::ProfilePage(next) => {
+                if ready {
+                    let step = if *next { Step::Forward } else { Step::Back };
+                    self.read_page(adapter, false, step);
                 }
             }
-            Action::ProfilesBack => self.close_profiles(),
-            Action::InterfaceChoose(i) => {
-                if !available || !idle {
-                    return true;
-                }
-                self.dialog = Some(Dialog::ProfilePick(PickFor::Interface(*i)));
-                self.dialog_scroll = 0;
-                self.open_page(true);
-            }
-            Action::LayerAdd => {
-                let room = st.as_ref().is_some_and(|st| {
-                    let (d, _) = Self::find(st, self.selected);
-                    let max = profiles::max_layers(&st.status).unwrap_or(0) as usize;
-                    d.is_some_and(|d| {
-                        self.device_values(st, d).layers.unwrap_or_default().len() < max
-                    })
+            Action::ProfilesRetry if !disabled => self.read_page(adapter, false, Step::Again),
+            Action::ProfileMenu(id) if !disabled => {
+                let (x, y) = self
+                    .hits
+                    .iter()
+                    .find(|h| h.action == *action)
+                    .map_or((0, 0), |h| (h.x, h.y + 1));
+                self.menu = Some(Menu {
+                    x,
+                    y,
+                    items: vec![
+                        ("Copy".into(), Some(Action::ProfileCopy(*id))),
+                        ("Delete".into(), Some(Action::ProfileDelete(*id))),
+                    ],
                 });
-                if !room {
-                    return true;
-                }
-                self.dialog = Some(Dialog::ProfilePick(PickFor::Layer));
-                self.dialog_scroll = 0;
-                self.open_page(true);
             }
-            Action::ProfilesRetry => {
-                let picker = matches!(self.dialog, Some(Dialog::ProfilePick(_)));
-                let page = self.page(picker);
-                if page.reading.is_none() {
-                    let after = page.after;
-                    self.read_page(picker, Step::Again, after);
-                }
-            }
-            Action::ProfilePage(forward) => {
-                // The chooser pages while it is open; otherwise the adapter's Profiles view.
-                let picker = matches!(self.dialog, Some(Dialog::ProfilePick(_)));
-                let page = self.page(picker);
-                if page.reading.is_some() {
-                    return true;
-                }
-                let read = if *forward {
-                    (page.next != 0).then_some((Step::Forward, page.next))
-                } else {
-                    page.back.last().map(|after| (Step::Back, *after))
-                };
-                let Some((step, after)) = read else {
-                    return true;
-                };
-                if picker {
-                    self.dialog_scroll = 0;
-                } else {
-                    self.detail_scroll = 0;
-                }
-                self.read_page(picker, step, after);
-            }
-            Action::ProfileNew | Action::ProfileCopy(_) => {
-                let Some(st) = st.filter(|_| idle) else {
-                    return true;
-                };
-                let (source, name) = match action {
-                    Action::ProfileCopy(id) => {
-                        let name = profiles::name_of(&st, *id);
-                        (Some(*id), profiles::copy_name(&name))
-                    }
-                    _ => (None, String::new()),
-                };
-                self.dialog = Some(Dialog::ProfileName(source));
-                self.form.limit = profiles::NAME_BYTES;
-                self.form.set_value(&name);
+            Action::ProfileNew if !disabled => {
+                self.menu = None;
+                self.form.limit = 64;
+                self.form.set_value("");
                 self.form_focused = true;
-                self.form_err.clear();
-                self.profile_err.clear();
+                self.notes.remove(&Spot::Dialog);
+                self.dialog = Some(Dialog::ProfileName(adapter.to_owned(), None));
             }
-            Action::ProfileDelete(id) => {
-                let Some(st) = st.filter(|_| idle) else {
-                    return true;
-                };
-                match profiles::in_use(&st, *id) {
-                    // The reason starts with a name, which keeps its own case.
-                    Some(reason) => self.profile_err = format!("{reason}."),
-                    None => {
-                        self.profile_err.clear();
-                        self.dialog = Some(Dialog::ProfileDelete(*id));
-                    }
+            Action::ProfileCopy(id) if !disabled => {
+                self.menu = None;
+                let name = self.profile_text(adapter, *id);
+                self.form.limit = 64;
+                self.form.set_value(&profiles::copy_name(&name));
+                self.form_focused = true;
+                self.notes.remove(&Spot::Dialog);
+                self.dialog = Some(Dialog::ProfileName(adapter.to_owned(), Some(*id)));
+            }
+            Action::ProfileDelete(id) if !disabled => {
+                self.menu = None;
+                self.notes.remove(&Spot::Dialog);
+                self.dialog = Some(Dialog::ProfileDelete(adapter.to_owned(), *id));
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Creates or copies the profile the name dialog names.
+    pub(super) fn submit_profile_name(&mut self, adapter: &str, copy: Option<u32>) {
+        let available = self.adapter(adapter).and_then(AdapterView::live).is_some();
+        if self.profiles_busy(adapter) || !available {
+            return;
+        }
+        let name = self.form.value();
+        let trimmed = name.trim();
+        if !profiles::valid_name(trimmed) {
+            self.notes
+                .insert(Spot::Dialog, words::PROFILE_NAME_INVALID.into());
+            return;
+        }
+        let command = match copy {
+            Some(id) => Command::ProfileCopy(Target::Id(id), trimmed.to_owned()),
+            None => Command::ProfileCreate(trimmed.to_owned()),
+        };
+        self.notes.remove(&Spot::Dialog);
+        if !self.run(adapter, Kind::Profile, command) {
+            self.notes.insert(Spot::Dialog, words::ADAPTER_GONE.into());
+        }
+    }
+
+    pub(super) fn delete_profile(&mut self, adapter: &str, id: u32) {
+        if self.profiles_busy(adapter) {
+            return;
+        }
+        let in_use = self
+            .state_of(adapter)
+            .and_then(|st| profiles::in_use(st, id));
+        if let Some(why) = in_use {
+            self.notes
+                .insert(Spot::Dialog, crate::ui::text::sentence(&why));
+            return;
+        }
+        self.notes.remove(&Spot::Dialog);
+        if !self.run(
+            adapter,
+            Kind::Profile,
+            Command::ProfileDelete(Target::Id(id)),
+        ) {
+            self.notes.insert(Spot::Dialog, words::ADAPTER_GONE.into());
+        }
+    }
+
+    pub(super) fn profile_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
+        let dialog_of_adapter = matches!(
+            &self.dialog,
+            Some(Dialog::ProfileName(a, _) | Dialog::ProfileDelete(a, _)) if *a == job.adapter
+        );
+        match result {
+            Ok(Outcome::Profile(created)) => {
+                if dialog_of_adapter {
+                    self.dialog = None;
+                    self.form_focused = false;
+                }
+                // A new profile shows on the page whose range covers it.
+                let adapter = job.adapter.clone();
+                if let Some(page) = self.page_mut(&adapter, false)
+                    && page.shown
+                    && page.covers(created.id)
+                    && page.reading.is_none()
+                {
+                    self.read_page(&adapter, false, Step::Again);
                 }
             }
-            Action::SaveProfileName => {
-                let Some(Dialog::ProfileName(source)) = self.dialog.clone() else {
-                    return true;
+            Ok(_) => {
+                if dialog_of_adapter {
+                    self.dialog = None;
+                    self.form_focused = false;
+                }
+            }
+            Err(e) => {
+                if dialog_of_adapter {
+                    self.notes.insert(Spot::Dialog, words::failure(e));
+                }
+            }
+        }
+    }
+
+    /// Chooses a profile in the picker.
+    pub(super) fn choose_profile(&mut self, adapter: &str, purpose: PickFor, chosen: u32) {
+        self.dialog = None;
+        match purpose {
+            PickFor::Interface(i) => self.stage_interface(adapter, i, None, Some(chosen)),
+            PickFor::Layer(device) if chosen != 0 => self.add_layer(adapter, device, chosen),
+            PickFor::Layer(_) => {}
+        }
+    }
+
+    /// The Profiles tab: memory, configuration interfaces and the profiles.
+    pub(super) fn adapter_profiles(&self, a: &AdapterView, b: &mut Layout) {
+        let Some(view) = a.view() else {
+            b.row();
+            b.line(styled(a.status_text().0, bold()));
+            return;
+        };
+        if let Some(percent) = words::memory_percent(view) {
+            b.section("Profile Memory");
+            let look = if percent >= words::MEMORY_ALERT_PERCENT as u32 {
+                err()
+            } else {
+                Style::new()
+            };
+            let filled = (percent.min(100) as usize * 20).div_ceil(100);
+            let meter = Line::from(vec![
+                layout::span(
+                    "█".repeat(filled),
+                    if look == err() {
+                        err()
+                    } else {
+                        layout::accent()
+                    },
+                ),
+                layout::span("░".repeat(20 - filled), dim()),
+                layout::span(format!(" {percent}%"), look),
+            ]);
+            b.labelled(styled("In Use", Style::new()), {
+                let mut r = Layout::new(b.width);
+                r.width = layout::line_width(&meter);
+                r.lines.push(meter);
+                r
+            });
+        }
+        let locked = self.adapter_locked(a);
+        let changes = self.adapter_changes(a);
+        let known: Vec<ConfigurationInterface> = profiles::interfaces(view)
+            .iter()
+            .filter_map(|s| ConfigurationInterface::try_from(s.interface).ok())
+            .filter(|i| profiles::INTERFACES.contains(i))
+            .collect();
+        if !known.is_empty() {
+            b.section("Configuration Interfaces");
+            let staged_all = profiles::configured(
+                view,
+                &self
+                    .adapter_drafts
+                    .get(&a.id)
+                    .map(|d| d.interfaces.clone())
+                    .unwrap_or_default(),
+            );
+            for i in known {
+                let Some(s) = staged_all.iter().find(|s| s.interface == i as i32) else {
+                    continue;
                 };
-                if !idle {
-                    return true;
-                }
-                let name = self.form.value();
-                if !profiles::valid_name(&name) {
-                    self.form_err = "Enter a profile name of up to 64 bytes.".into();
-                    return true;
-                }
-                self.form_err.clear();
-                self.form_focused = false;
-                self.execute(match source {
-                    Some(id) => Command::ProfileCopy(Target::Id(id), name),
-                    None => Command::ProfileCreate(name),
+                let staged = changes.interfaces.iter().any(|u| u.interface == i);
+                let conflict = staged_all.iter().any(|o| {
+                    o.enabled
+                        && o.interface != s.interface
+                        && (s.conflicts.contains(&o.interface)
+                            || o.conflicts.contains(&s.interface))
                 });
+                let can_enable = s.profile != 0 && !conflict;
+                let mut controls = Layout::new(b.width);
+                let label = if s.profile == 0 {
+                    "Choose Profile".to_owned()
+                } else {
+                    self.profile_text(&a.id, s.profile)
+                };
+                button_if(
+                    &mut controls,
+                    &label,
+                    Action::InterfacePick(i),
+                    Tone::Normal,
+                    !locked,
+                );
+                let sw = layout::switch(
+                    Some(s.enabled),
+                    Action::InterfaceEnabled(i, !s.enabled),
+                    !locked && (s.enabled || can_enable),
+                );
+                controls.append(sw);
+                b.labelled(staged_label(profiles::interface_label(i), staged), controls);
             }
-            _ => return false,
         }
-        true
+
+        b.section("Profiles");
+        let page = self.shown_page(&a.id, false).unwrap_or_default();
+        let ready = a.live().is_some();
+        let disabled = self.profiles_busy(&a.id) || locked || !ready;
+        if let Some(e) = &page.error {
+            let mut row = Layout::new(b.width);
+            button_if(
+                &mut row,
+                "Retry",
+                Action::ProfilesRetry,
+                Tone::Normal,
+                !disabled,
+            );
+            b.labelled(
+                styled(
+                    format!("The adapter couldn't read its profiles. {e}"),
+                    err(),
+                ),
+                row,
+            );
+        }
+        for profile in &page.list {
+            let mut label = Line::from(layout::span(words::clean(&profile.name), Style::new()));
+            let marks: Vec<&str> = profiles::roles(profile)
+                .into_iter()
+                .filter_map(words::role_text)
+                .collect();
+            if !marks.is_empty() {
+                label
+                    .spans
+                    .push(layout::span(format!("  {}", marks.join(", ")), dim()));
+            }
+            let mut row = Layout::new(b.width);
+            button_if(
+                &mut row,
+                "…",
+                Action::ProfileMenu(profile.id),
+                Tone::Normal,
+                !disabled,
+            );
+            b.labelled(label, row);
+        }
+        for id in &page.unreadable {
+            b.line(Line::from(vec![
+                layout::span(format!("Profile {id}"), dim()),
+                layout::span("  Couldn't Read", dim()),
+            ]));
+        }
+        let mut footer = Layout::new(b.width);
+        if page.reading.is_some() || self.profiles_busy(&a.id) {
+            footer.label(&format!("{}", super::spinner()), layout::accent());
+        }
+        if !page.back.is_empty() {
+            button_if(
+                &mut footer,
+                "Previous",
+                Action::ProfilePage(false),
+                Tone::Normal,
+                ready,
+            );
+        }
+        if page.next != 0 {
+            button_if(
+                &mut footer,
+                "Next",
+                Action::ProfilePage(true),
+                Tone::Normal,
+                ready,
+            );
+        }
+        let primary = page.list.is_empty() && page.unreadable.is_empty() && page.back.is_empty();
+        let tone = if primary { Tone::Primary } else { Tone::Normal };
+        button_if(
+            &mut footer,
+            "+ New Profile",
+            Action::ProfileNew,
+            tone,
+            !disabled && page.shown,
+        );
+        b.add(footer);
     }
 
-    /// Answers a profile confirmation; false when the dialog isn't one.
-    pub(super) fn profiles_confirm(&mut self, dialog: &Dialog) -> bool {
-        match dialog {
-            Dialog::ProfileDelete(id) => self.execute(Command::ProfileDelete(Target::Id(*id))),
-            _ => return false,
+    pub(super) fn profile_name_dialog(
+        &mut self,
+        adapter: &str,
+        copy: Option<u32>,
+        w: usize,
+    ) -> DialogView {
+        let mut body = Layout::new(w);
+        let line = self.field_line(w);
+        body.control(line, Action::Field);
+        if let Some(e) = self.notes.get(&Spot::Dialog) {
+            body.para(e, err());
         }
-        true
+        let busy = self.profiles_busy(adapter);
+        let available = self.adapter(adapter).and_then(AdapterView::live).is_some();
+        let valid = profiles::valid_name(self.form.value().trim());
+        let mut buttons = Layout::new(w);
+        let mut right = Layout::new(w);
+        button_if(&mut right, "Cancel", Action::Cancel, Tone::Normal, !busy);
+        let label = if copy.is_some() { "Copy" } else { "Create" };
+        button_if(
+            &mut right,
+            label,
+            Action::Submit,
+            Tone::Primary,
+            !busy && available && valid,
+        );
+        buttons.align_right(right);
+        let title = match copy {
+            Some(id) => format!("Copy “{}”", self.profile_text(adapter, id)),
+            None => "New Profile".into(),
+        };
+        DialogView {
+            title,
+            body,
+            buttons,
+        }
     }
-}
 
-/// Whether a device has layers to show: the adapter supports profiles and reports the device's
-/// layer list.
-pub(super) fn layered(st: &State, d: &p::Device) -> bool {
-    profiles::available(&st.status) && d.profiles.is_some()
-}
+    pub(super) fn profile_delete_dialog(&mut self, adapter: &str, id: u32, w: usize) -> DialogView {
+        let mut body = Layout::new(w);
+        if let Some(e) = self.notes.get(&Spot::Dialog) {
+            body.para(e, err());
+        }
+        let busy = self.profiles_busy(adapter);
+        let ready = self.adapter(adapter).and_then(AdapterView::live).is_some();
+        let mut buttons = Layout::new(w);
+        let mut right = Layout::new(w);
+        button_if(&mut right, "Cancel", Action::Cancel, Tone::Normal, !busy);
+        button_if(
+            &mut right,
+            "Delete",
+            Action::Confirm,
+            Tone::Danger,
+            !busy && ready,
+        );
+        buttons.align_right(right);
+        DialogView {
+            title: format!("Delete “{}”?", self.profile_text(adapter, id)),
+            body,
+            buttons,
+        }
+    }
 
-/// The interfaces a configuration enables that conflict with `i`.
-pub(super) fn conflicting(
-    configured: &[p::ConfigurationInterfaceSupport],
-    i: ConfigurationInterface,
-) -> Vec<ConfigurationInterface> {
-    let Some(this) = configured.iter().find(|s| s.interface == i as i32) else {
-        return Vec::new();
-    };
-    // Either side listing the other is a conflict.
-    configured
-        .iter()
-        .filter(|s| s.enabled && s.interface != i as i32)
-        .filter(|s| this.conflicts.contains(&s.interface) || s.conflicts.contains(&(i as i32)))
-        .filter_map(|s| ConfigurationInterface::try_from(s.interface).ok())
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn memory_is_shown_in_whole_percent() {
-        let mut status = p::Status::default();
-        assert_eq!(memory_percent(&status), None);
-        status.profile_support = Some(p::ProfileSupport {
-            memory_budget: 8192,
-            memory_used: 1024,
-            ..Default::default()
-        });
-        assert_eq!(memory_percent(&status), Some(13));
-        status.profile_support.as_mut().unwrap().memory_used = 8192;
-        assert_eq!(memory_percent(&status), Some(100));
-        status.profile_support.as_mut().unwrap().memory_budget = 0;
-        assert_eq!(memory_percent(&status), None);
+    pub(super) fn pick_dialog(
+        &mut self,
+        adapter: &str,
+        purpose: PickFor,
+        chosen: u32,
+        w: usize,
+    ) -> DialogView {
+        let page = self.shown_page(adapter, true).unwrap_or_default();
+        let none = match purpose {
+            PickFor::Interface(i) => self
+                .adapter(adapter)
+                .and_then(|a| self.staged_interface(a, i))
+                .is_some_and(|s| !s.enabled),
+            PickFor::Layer(_) => false,
+        };
+        let title = match purpose {
+            PickFor::Interface(i) => format!("{} Profile", profiles::interface_label(i)),
+            PickFor::Layer(_) => "Add Profile".into(),
+        };
+        let current = match purpose {
+            PickFor::Interface(i) => self
+                .adapter(adapter)
+                .and_then(|a| self.staged_interface(a, i))
+                .map_or(0, |s| s.profile),
+            PickFor::Layer(_) => 0,
+        };
+        let mut body = Layout::new(w);
+        let choice = |b: &mut Layout, label: String, marks: String, id: u32| {
+            let mark = if id == chosen { "(•) " } else { "( ) " };
+            let look = if id == chosen {
+                layout::title()
+            } else {
+                Style::new()
+            };
+            let mut line = Line::from(vec![layout::span(mark, look), layout::span(label, look)]);
+            if !marks.is_empty() {
+                line.spans.push(layout::span(format!("  {marks}"), dim()));
+            }
+            b.control(line, Action::Pick(id));
+        };
+        if none {
+            choice(&mut body, "None".into(), String::new(), 0);
+        }
+        for profile in &page.list {
+            let marks = profiles::roles(profile)
+                .into_iter()
+                .filter_map(words::role_text)
+                .collect::<Vec<_>>()
+                .join(", ");
+            choice(&mut body, words::clean(&profile.name), marks, profile.id);
+        }
+        if current != 0 && !page.list.iter().any(|p| p.id == current) {
+            choice(
+                &mut body,
+                self.profile_text(adapter, current),
+                String::new(),
+                current,
+            );
+        }
+        if let Some(e) = &page.error {
+            body.para(e, err());
+        }
+        let mut buttons = Layout::new(w);
+        let loading = page.reading.is_some();
+        if loading {
+            buttons.label(&format!("{}", super::spinner()), layout::accent());
+        }
+        if !page.back.is_empty() {
+            button_if(
+                &mut buttons,
+                "Previous",
+                Action::PickPage(false),
+                Tone::Normal,
+                !loading,
+            );
+        }
+        if page.next != 0 {
+            button_if(
+                &mut buttons,
+                "Next",
+                Action::PickPage(true),
+                Tone::Normal,
+                !loading,
+            );
+        }
+        let mut right = Layout::new(w);
+        right.button("Cancel", Action::Cancel, Tone::Normal);
+        button_if(
+            &mut right,
+            "Choose",
+            Action::Submit,
+            Tone::Primary,
+            none || chosen != 0,
+        );
+        buttons.align_right(right);
+        DialogView {
+            title,
+            body,
+            buttons,
+        }
     }
 }

@@ -370,6 +370,7 @@ function SettingRow({ entry, s, drafts, guards, item }: {
 
   const notes: ReactNode[] = [];
   if (item?.status === "not_saved") notes.push(<span key="save" className="error-text">Couldn't Save{item.error ? `: ${item.error}` : ""}</span>);
+  else if (item?.status === "unknown" && item.error) notes.push(<span key="save" className="error-text">{item.error}</span>);
   if (invalid) notes.push(<span key="range" className="error-text">{rangeText(typedRange(s))}</span>);
   if (saved(s) && s.state === "changed_on_device" && fresh) notes.push(<span key="device">Device: {valueText(s.key, s.value)}</span>);
   if (s.error) notes.push(<span key="error">{codeText(s.error)}</span>);
@@ -451,7 +452,9 @@ function Settings({ entry, adapter, drafts, bar }: {
   if (figures.length && !categories.includes("Wheel")) categories.push("Wheel");
   const connected = d.state === "connected";
   const reachable = adapter?.connection === "connected";
-  const busy = !reachable || saving || refreshing || settingsBusy(entry);
+  const occupied = saving || refreshing || settingsBusy(entry);
+  // Saving needs the adapter ready; refreshing a connected device doesn't.
+  const busy = !reachable || !adapter.status?.ready || occupied;
   const guards: FormGuards = { locked: busy, busy };
   const submission = entry.settingsSave;
   const items = submission?.items ?? [];
@@ -513,7 +516,8 @@ function Settings({ entry, adapter, drafts, bar }: {
   if (!settings.length && !readings.length && !figures.length) return null;
 
   const notSaved = items.filter((i) => i.status === "not_saved").length;
-  const failures = submission && !submission.running && notSaved ? `Couldn't Save ${notSaved}` : "";
+  const unknown = items.find((i) => i.status === "unknown")?.error ?? "";
+  const failures = submission && !submission.running ? (notSaved ? `Couldn't Save ${notSaved}` : unknown) : "";
   const note = problem ?? (failures || (hidppError ? codeText(hidppError) : null));
   const refresh = async () => {
     setProblem(null);
@@ -536,7 +540,7 @@ function Settings({ entry, adapter, drafts, bar }: {
         {note ? <span className="error-text">{note}</span> : null}
         {entry.settingsError ? loadProblem : null}
       </span>
-      <button type="button" {...guard(!busy && connected, () => void refresh())}>
+      <button type="button" {...guard(reachable && !occupied && connected, () => void refresh())}>
         <RefreshIcon /> Refresh
       </button>
       {retryable.length ? (
@@ -544,7 +548,7 @@ function Settings({ entry, adapter, drafts, bar }: {
           <RefreshIcon /> Retry
         </button>
       ) : null}
-      <button type="button" {...guard(!busy && dirty, () => drafts.clear())}>
+      <button type="button" {...guard(!saving && dirty, () => drafts.clear())}>
         <UndoIcon /> Discard
       </button>
       <button type="submit" form={formId} className="suggested" aria-disabled={!canSave}>
@@ -656,20 +660,22 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
   const tab = (chosen === "settings" && !settings) || (chosen === "profiles" && !layered) ? "details" : chosen;
   const low = isLow(entry.battery, state.preferences.lowBatteryPercent);
   const battery = batteryText(entry.battery);
-  const canConnect = d.inactive === null && d.state === "disconnected";
+  const ready = adapter?.connection === "connected" && !!adapter.status?.ready;
+  const canConnect = ready && d.inactive === null && d.state === "disconnected";
   const peers = state.devices.filter((x) => x.adapterId === entry.adapterId).map((x) => x.device);
-  // Turning the device on is not offered while every place for its transport is in use.
-  const full = !d.enabled && enabledFull(adapter?.status ?? null, peers, d);
   const facts = (keys: string[]) => keys.flatMap((key) => d.info.filter((f) => f.key === key));
   const info = facts(DETAILS_INFO);
   const identifiers = facts(IDENTIFIERS);
   // Details and Profiles edits stage in `details`; each tab's Save sends only its own changes.
   const changes = pendingDetails(details, d);
   const { profiles: layerChanges, ...detailChanges } = changes;
+  // Turning the device on or unblocking it is not offered while the adapter would refuse it for
+  // want of a place for its transport.
+  const full = (update: DeviceChanges) => enabledFull(adapter?.status ?? null, peers, d, { ...detailChanges, ...update });
   const shown: DeviceChanges = tab === "profiles" ? (layerChanges !== undefined ? { profiles: layerChanges } : {}) : detailChanges;
   const dirty = Object.keys(shown).length > 0;
   const detailsDirty = Object.keys(detailChanges).length > 0;
-  const locked = adapter?.connection !== "connected" || saving;
+  const locked = !ready || saving;
   const canSave = !locked && dirty;
   const value = {
     enabled: details.enabled ?? d.enabled,
@@ -907,7 +913,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
               <SwitchRow
                 title="Use This Device"
                 checked={value.enabled}
-                disabled={locked || (full && !value.enabled)}
+                disabled={locked || (!value.enabled && full({ enabled: true }))}
                 end={changes.enabled !== undefined ? <Staged label="Use This Device" /> : null}
                 onChange={(enabled) => stage({ enabled })}
               />
@@ -928,7 +934,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
               <SwitchRow
                 title="Block Connections"
                 checked={value.blocked}
-                disabled={locked}
+                disabled={locked || (value.blocked && full({ blocked: false }))}
                 end={changes.blocked !== undefined ? <Staged label="Block Connections" /> : null}
                 onChange={(blocked) => stage({ blocked })}
               />

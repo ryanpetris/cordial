@@ -74,7 +74,7 @@ silently between duplicate names. Setting keys are the catalog keys, such as `ke
   Saving the bond and the later connection result are reported separately.
 - Ctrl-C, Ctrl-D, end of input, SIGINT and SIGTERM quit the shell, which closes the port: a
   running scan stops and an unsaved pairing is cancelled.
-- After a configuration interface change that reconnects USB, the shell and TUI wait up to 15
+- After a configuration interface change that reconnects USB, the shell waits up to 15
   seconds for the same adapter, found by the adapter ID at the start of its USB serial number, and
   reopen it on whichever port it returns to. Only an adapter that doesn't return in time is reported
   as lost.
@@ -86,7 +86,8 @@ silently between duplicate names. Setting keys are the catalog keys, such as `ke
   [Client pre-checks](limits-and-errors.md#client-pre-checks)); when the Dongle refuses anyway, the
   error is shown and nothing is retried.
 - Output is human-readable and rendered safely for the terminal. `--json` instead prints every
-  response and event as one line of protobuf JSON with the schema's field names.
+  response and event as one line of protobuf JSON with the schema's field names. File contents
+  are never printed: the response of `file get` is not shown.
 
 Example interactive workflow:
 
@@ -104,48 +105,45 @@ $ cordial --port PORT
 
 ## TUI
 
-The TUI uses Ratatui and Crossterm and the same commands as the CLI. It connects automatically when
-it finds exactly one adapter, or to `--port`; otherwise it shows a chooser, and returns to it when
-the adapter goes away.
+The TUI uses Ratatui and Crossterm and the same commands as the CLI. It follows the desktop
+application's layout, words and staging rules in the terminal, and opens a session with every
+attached adapter; `--port` limits it to that one port.
 
-- Every action works with the mouse: selection, discovery, pairing and its prompts,
-  connect/disconnect, enable, trust and block, settings, help and quit. Keyboard input is needed
-  only for text such as a passkey, and every control also has a keyboard equivalent. Mouse movement
-  and Tab share one highlight; hover alone never activates anything, and a click in a dialog never
-  reaches the controls underneath it.
-- The view is built from the first full listing and then from events, and is marked unavailable when
-  the session ends. After reconnecting it shows the current state and retries nothing.
-- The Adapters pane below the device list shows the connected adapter with Disconnect, Choose
-  Adapter, Refresh and, on development firmware, Files and the bootloader action.
-  Selecting the adapter shows its page in place of a device's details: the name, with a rename
-  dialog that keeps the draft on failure, the Linux, Windows and macOS platform choices, an On and
-  Off choice for each transport the firmware supports, and the use of each transport's
-  enabled-device places. On an adapter with profiles, its page leads to its Profiles view, which
-  shows the profile memory in use, the configuration interfaces, and one page of profiles at a time,
-  each with labels for its roles.
-- A saved device shows its Logitech Features switch even while disconnected. On an adapter with
-  profiles, a device that reports a layer list has a Profiles view that orders, adds and removes
-  its layers. Its Diagnostics dialog lists its warnings, why its profiles aren't loaded, HID++
-  protocol and status, link security and identifiers, and refreshes a connected device's
-  information. New warnings are not written to the activity log.
-- Settings are edited in place; Save sends every change in one request, and apply results arrive as
-  they happen.
-- Choices that change the adapter or a saved device stay staged, marked as changed, until Save:
-  adapter settings and configuration interface choices go out together in one adapter request; a
-  device's enable, trust, block and Logitech Features in one device request from its details, and
-  its layers in another from its Profiles view. Ctrl-S presses the Save shown on screen; plain `s`
-  never saves. Discard drops the staged changes the shown Save would send, and a failed save keeps
-  them. Saving a change that reconnects USB, such as enabling a configuration interface, asks for
-  confirmation first. The profile chooser pages on its own, apart from the Profiles view. Connect,
-  disconnect, rename, removal and creating, copying and deleting profiles act at once.
-- Development firmware adds the bootloader action and Files, which browses adapter directories and
-  downloads a file to a host destination, asking before replacing one. A download is written to a
-  temporary file and moved into place only when complete, with a no-replace rename, so a failure
-  leaves the destination unchanged. Files works while Bluetooth is unavailable.
+- Discovery: it lists the attached adapters every second, opens each new port that matches the
+  [USB discovery descriptors](transport.md#discovery), and shows an adapter once its first
+  `GetStatus` identifies it. A port that fails to open, or whose session ends within 10 seconds
+  of opening, is tried again after a wait that doubles with each failure in a row, up to a minute;
+  Refresh Adapters (F5) tries it at once. An adapter that goes away keeps its page, locked, for
+  15 seconds; its devices leave the list at once. The same adapter returning, found by the adapter
+  ID that begins its USB serial number, keeps its page and tab. Disconnect, from the adapter's page or menu,
+  closes its session; the adapter stays listed while plugged in and is opened again only by
+  Connect.
+- Layout: a sidebar with Overview, the saved devices of every adapter in one list, the adapters,
+  and Add Device; and the selected page with its tabs and bottom bar. The Overview counts
+  connected and paired devices and connected adapters, and lists what needs attention, the
+  connected devices with their batteries, and the adapters. Adapter and device pages have the same
+  tabs and controls as the desktop application's, and the same pages and dialogs. Development
+  firmware adds Files and Enter Bootloader to the adapter's Diagnostics tab. Files browses adapter
+  directories and downloads a file to a host destination, asking before replacing one. A download
+  is written to a temporary file and moved into place only when complete, with a no-replace
+  rename, so a failure leaves the destination unchanged.
+- Attention: while the TUI runs, a device whose battery is low (20% or less and not charging) or
+  critical (5% or less), a connected device whose profiles weren't loaded, an adapter whose
+  profile memory is 85% used, and an adapter that needs attention are listed under Needs Attention
+  on the Overview, and the most pressing one is shown in red on the status line.
+- Staging: changes stay staged, marked as changed, until Save, as in the desktop application;
+  Ctrl-S presses the Save shown on screen. Discard drops the changes the shown Save would send, and
+  a failed save keeps them. Saving a change that reconnects USB asks for confirmation first.
+  Connect, disconnect, rename, forget and creating, copying and deleting profiles act at once.
+- Input: every action works with the mouse, and every control has a keyboard equivalent. Tab and
+  Shift-Tab move between controls, Up and Down choose in the sidebar or move between controls,
+  Left and Right change the highlighted setting or switch tabs, and Enter or Space presses the
+  highlighted control. Mouse movement and Tab share one highlight; hover alone never activates
+  anything, and a click in a dialog never reaches the controls underneath it.
 - Resizing keeps form input and recomputes click targets. Text labels accompany every color. `tui`
-  is refused with `--json` or without an interactive terminal. Ctrl-C and SIGINT quit from anywhere,
-  stop a scan, cancel an unsaved pairing, close the port and restore the terminal; quitting never
-  disconnects saved devices.
+  is refused with `--json` or without an interactive terminal. Ctrl-C and SIGINT quit from
+  anywhere, close every session, which stops a scan and cancels an unsaved pairing, and restore the
+  terminal; quitting never disconnects saved devices.
 
 ## Desktop application
 
@@ -170,12 +168,13 @@ The desktop application uses the same commands and session rules as the CLI.
   open, stops the scan before pairing, answers prompts in the dialog, and follows the new device
   until it connects or fails. Closing the dialog, or hiding the window, stops a scan or cancels an
   unsaved pairing.
-- Devices open on the Details tab, with the connection switches, the device's layers (an ordered
-  list of profiles, empty for a new device) and the device's own facts. Those changes stay staged
-  until Save sends them in one request, like the Settings tab's; Connect, Disconnect and Forget act
-  at once. Settings follows when the device has settings to show, then Diagnostics: the device's
-  warnings with the HID field or report each applies to, the HID++ protocol and status, link
-  security and identifiers, with Refresh. Warnings never appear as banners.
+- Devices open on the Details tab, with the connection switches and the device's own facts. Settings
+  follows when the device has settings to show, then Profiles when the adapter supports profiles,
+  with the device's layers (an ordered list of profiles, empty for a new device), then Diagnostics:
+  the device's warnings with the HID field or report each applies to, the HID++ protocol and status,
+  link security and identifiers, with Refresh. Changes on Details, Settings and Profiles stay staged
+  across tabs until that tab's Save sends its own changes in one request; Connect, Disconnect and
+  Forget act at once. Warnings never appear as banners.
 - Profile memory: the application notifies once when `memory_used` reaches 85% of `memory_budget`,
   and once when a connected device's `profile_error` shows its profiles were not loaded, and resets
   each after the condition clears. The device's Diagnostics tab shows a `profile_error`.

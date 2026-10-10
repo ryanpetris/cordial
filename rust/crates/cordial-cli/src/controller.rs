@@ -446,13 +446,6 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub fn notice(&self, notice: Notice) {
-        (self.sink)(Event::Notice {
-            session: self.id,
-            notice,
-        });
-    }
-
     fn phase(&self, phase: Phase) {
         (self.sink)(Event::Connection {
             session: self.id,
@@ -465,20 +458,26 @@ impl Session {
         self.cell.snapshot()
     }
 
-    /// Sends one command. A command an interface ran reports its response.
+    /// Sends one command. A command an interface ran reports its response, in order with the
+    /// events around it.
     pub fn call(
         &self,
         command: request::Command,
         name: &'static str,
         reported: bool,
     ) -> Result<p::Response, Error> {
-        let response = self
-            .connection
-            .request(command)
-            .map_err(|e| Error::from_client(e, name))?;
-        if reported {
-            self.notice(Notice::Response(response.clone()));
+        let response = if reported {
+            let (sink, session) = (self.sink.clone(), self.id);
+            self.connection.request_with(command, move |response| {
+                sink(Event::Notice {
+                    session,
+                    notice: Notice::Response(response.clone()),
+                })
+            })
+        } else {
+            self.connection.request(command)
         }
+        .map_err(|e| Error::from_client(e, name))?;
         if let Some(p::response::Result::Error(e)) = response.result {
             return Err(Error::dongle(e, Some(name)));
         }

@@ -14,11 +14,11 @@ use std::{
     collections::VecDeque,
     io::{self, Read, Write},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
     },
-    thread,
+    thread::{self, ThreadId},
     time::{Duration, Instant},
 };
 
@@ -27,6 +27,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a stalled write may take before the connection is closed.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long [`Connection::close`] waits for the reader thread to release the stream.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// What the reader thread received, passed to a handler in the order it arrived.
 #[derive(Debug)]
@@ -41,9 +44,12 @@ pub enum Received<'a> {
 
 type Reply = SyncSender<Result<p::Response>>;
 
+/// Sees a request's response on the reader thread; see [`Connection::request_with`].
+type Observer = Box<dyn FnOnce(&p::Response) + Send>;
+
 struct State {
     /// One entry per request written and not yet answered, oldest first.
-    pending: VecDeque<(p::Request, Reply)>,
+    pending: VecDeque<(p::Request, Reply, Option<Observer>)>,
     closed: Option<Error>,
 }
 
@@ -55,6 +61,9 @@ struct Shared {
     started: AtomicBool,
     stop: AtomicBool,
     timeout: Mutex<Option<Duration>>,
+    /// Set once the reader thread has dropped the reading half.
+    released: Mutex<bool>,
+    release: Condvar,
 }
 
 impl Shared {
@@ -68,7 +77,7 @@ impl Shared {
             state.closed = Some(error.clone());
             std::mem::take(&mut state.pending)
         };
-        for (_, reply) in pending {
+        for (_, reply, _) in pending {
             let _ = reply.try_send(Err(error.clone()));
         }
         self.stop.store(true, Ordering::Release);
@@ -88,6 +97,7 @@ impl Shared {
 /// Dropping the connection closes it.
 pub struct Connection {
     shared: Arc<Shared>,
+    reader: ThreadId,
 }
 
 impl Connection {
@@ -111,6 +121,8 @@ impl Connection {
     /// thread, in the order received. A response reaches the handler before its request
     /// returns, so a caller that applies events and responses to one view in the handler sees
     /// them in the Dongle's order.
+    ///
+    /// Reads should time out, as a serial port's do, so the reader thread notices a close.
     pub fn with_handler<R, W, H>(reader: R, writer: W, handler: H) -> Self
     where
         R: Read + Send + 'static,
@@ -126,13 +138,17 @@ impl Connection {
             started: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             timeout: Mutex::new(Some(DEFAULT_TIMEOUT)),
+            released: Mutex::new(false),
+            release: Condvar::new(),
         });
         let reader_shared = shared.clone();
-        thread::Builder::new()
+        let reader = thread::Builder::new()
             .name("cordial-read".into())
             .spawn(move || read_loop(&reader_shared, reader, handler))
-            .expect("spawn reader thread");
-        Self { shared }
+            .expect("spawn reader thread")
+            .thread()
+            .id();
+        Self { shared, reader }
     }
 
     /// Sets how long each request waits for its response; `None` waits without limit. A request
@@ -147,12 +163,40 @@ impl Connection {
     }
 
     /// Closes the connection. Waiting requests fail with [`Error::Closed`].
+    ///
+    /// Both halves of the stream are dropped before this returns, so the same port can be
+    /// opened again at once. Called from the handler, or when the reader thread doesn't finish
+    /// its current read within a second, it returns without waiting for the reading half.
     pub fn close(&self) {
         self.shared.close(Error::Closed);
+        if thread::current().id() == self.reader {
+            return;
+        }
+        let released = self.shared.released.lock().unwrap();
+        let _ = self
+            .shared
+            .release
+            .wait_timeout_while(released, RELEASE_TIMEOUT, |released| !*released);
     }
 
     /// Sends one command and returns the Dongle's response, which may hold an error result.
     pub fn request(&self, command: Command) -> Result<p::Response> {
+        self.send(command, None)
+    }
+
+    /// Sends one command as [`Connection::request`] does, and passes its response to `observe`
+    /// on the reader thread, after the handler and before the request returns it. Whatever
+    /// `observe` does with the response is ordered with what the handler does with the events
+    /// around it.
+    pub fn request_with(
+        &self,
+        command: Command,
+        observe: impl FnOnce(&p::Response) + Send + 'static,
+    ) -> Result<p::Response> {
+        self.send(command, Some(Box::new(observe)))
+    }
+
+    fn send(&self, command: Command, observe: Option<Observer>) -> Result<p::Response> {
         let request = p::Request {
             command: Some(command),
         };
@@ -169,7 +213,7 @@ impl Connection {
                 if let Some(error) = &state.closed {
                     return Err(error.clone());
                 }
-                state.pending.push_back((request, tx));
+                state.pending.push_back((request, tx, observe));
             }
             if !self.shared.started.swap(true, Ordering::AcqRel) {
                 frame.push(frame::DELIMITER);
@@ -607,11 +651,14 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
                 Some(message::Kind::Event(event)) => handler(Received::Event(event)),
                 Some(message::Kind::Response(response)) => {
                     let waiting = shared.state.lock().unwrap().pending.pop_front();
-                    let Some((request, reply)) = waiting else {
+                    let Some((request, reply, observe)) = waiting else {
                         failed = Some(Error::Protocol);
                         break;
                     };
                     handler(Received::Response(&request, &response));
+                    if let Some(observe) = observe {
+                        observe(&response);
+                    }
                     let _ = reply.try_send(Ok(response));
                 }
                 // A message kind added after this client was built.
@@ -622,6 +669,10 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
             break error;
         }
     };
+    // The reading half holds the port too; dropping it lets the port be opened again.
+    drop(reader);
+    *shared.released.lock().unwrap() = true;
+    shared.release.notify_all();
     shared.close(error.clone());
     let closed = shared.state.lock().unwrap().closed.clone();
     handler(Received::Closed(&closed.unwrap_or(error)));

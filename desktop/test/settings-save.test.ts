@@ -102,6 +102,31 @@ describe("settings form submission", () => {
     await c.stop();
   });
 
+  it("shows a save whose outcome the adapter couldn't confirm as unknown", async () => {
+    const fake = keyboard();
+    const { c } = await start(fake);
+    fake.failures.setSettings = [ErrorCode.STORAGE_FAILED];
+    fake.uncertainWrites = true;
+    const result = await c.act({ type: "settings.save", key: KEY, changes: [{ type: "set", setting: "backlight.level", value: 5 }] });
+    expect(result).toMatchObject({ ok: false, inline: true, message: "The adapter couldn't confirm whether the change was saved. Check before trying again." });
+    expect(result.settingsSave!.items.map((i) => i.status)).toEqual(["unknown"]);
+    await c.stop();
+  });
+
+  it("shows a save the adapter disconnected during as unknown", async () => {
+    const fake = keyboard();
+    const { c } = await start(fake);
+    const release = fake.hold();
+    const pending = c.act({ type: "settings.save", key: KEY, changes: [{ type: "set", setting: "backlight.level", value: 5 }] });
+    await until(() => sent(fake).length === 1);
+    fake.unplug();
+    release();
+    const result = await pending;
+    expect(result).toMatchObject({ ok: false, message: "The adapter disconnected before the change finished." });
+    expect(result.settingsSave!.items.map((i) => i.status)).toEqual(["unknown"]);
+    await c.stop();
+  });
+
   it("shows a value that saved but didn't apply", async () => {
     const fake = keyboard();
     fake.settingFailures["backlight.level"] = ErrorCode.DEVICE_ERROR;

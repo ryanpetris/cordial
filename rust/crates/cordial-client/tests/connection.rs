@@ -555,6 +555,72 @@ fn a_handler_sees_events_and_responses_in_stream_order() {
     );
 }
 
+#[test]
+fn an_observer_sees_its_response_between_the_events_around_it() {
+    let (reader, writer, _, _out) = dongle(
+        |_| {},
+        |command, out| match command {
+            Command::GetStatus(_) => out.respond(Some(response::Result::Status(status("A")))),
+            Command::StopScan(_) => {
+                out.respond(None);
+                out.event(p::event::Kind::ScanDone(p::ScanDone::default()));
+            }
+            other => panic!("{other:?}"),
+        },
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let connection = Connection::with_handler(reader, writer, move |received| {
+        if let Received::Event(_) | Received::Response(..) = received {
+            log.lock().unwrap().push(match received {
+                Received::Event(_) => "event",
+                _ => "response",
+            });
+        }
+    });
+    connection.status().unwrap();
+    let log = seen.clone();
+    connection
+        .request_with(Command::StopScan(p::StopScan {}), move |r| {
+            assert!(r.result.is_none());
+            log.lock().unwrap().push("observed");
+        })
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["response", "response", "observed", "event"]
+    );
+}
+
+/// A reading half that records when it is dropped, as a serial port releases its lock.
+struct Tracked(PipeReader, Arc<Mutex<bool>>);
+
+impl Read for Tracked {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        self.0.read(out)
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        *self.1.lock().unwrap() = true;
+    }
+}
+
+#[test]
+fn close_releases_the_reading_half_before_returning() {
+    let (reader, writer, _, _out) = dongle(
+        |_| {},
+        |_, out| out.respond(Some(response::Result::Status(status("A")))),
+    );
+    let dropped = Arc::new(Mutex::new(false));
+    let (connection, _events) = Connection::new(Tracked(reader, dropped.clone()), writer);
+    connection.status().unwrap();
+    connection.close();
+    assert!(*dropped.lock().unwrap());
+}
+
 trait Name {
     fn as_name(&self) -> &'static str;
 }

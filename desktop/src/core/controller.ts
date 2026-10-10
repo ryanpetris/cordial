@@ -3,7 +3,7 @@
 // Refusals the adapter would make that this app can predict from what it
 // knows are made here, before sending; one the adapter makes anyway is shown
 // as it is, without retrying or reading anything again.
-import { CordialError } from "@cordial/client";
+import { ConnectionClosedError, CordialError } from "@cordial/client";
 import { IntegrationKind, Platform, Transport, type Event, type Request, type Response } from "@cordial/protocol";
 import { adapterName } from "../shared/adapter-name.ts";
 import {
@@ -326,6 +326,7 @@ export class Controller {
     const target = this.#target(key);
     if (!target) return GONE;
     const { session, id } = target;
+    if (!session.status.ready) return { ok: false, message: codeText("not_ready") };
     const entry = this.#device(session.adapterId, session, target.device);
     if (settingsBusy(entry)) return { ok: false, message: codeText("busy") };
     if (!changes.length) return { ok: true };
@@ -353,7 +354,8 @@ export class Controller {
       for (const item of items) item.status = "saved";
     } catch (error) {
       const reason = failure(error);
-      for (const item of items) Object.assign(item, { status: "not_saved", error: reason });
+      const unknown = error instanceof ConnectionClosedError || (error instanceof CordialError && error.outcomeUnknown);
+      for (const item of items) Object.assign(item, { status: unknown ? "unknown" : "not_saved", error: reason });
     } finally {
       save.running = false;
       this.#publish();
@@ -400,7 +402,8 @@ export class Controller {
     const { session, id, device } = t;
     const { enabled, trusted, blocked, hidpp, profiles } = action;
     if (enabled === undefined && trusted === undefined && blocked === undefined && hidpp === undefined && profiles === undefined) return { ok: true };
-    if (enabled && !device.enabled && enabledFull(session.status, [...session.devices.values()], device))
+    if (!session.status.ready) return { ok: false, message: codeText("not_ready") };
+    if (enabledFull(session.status, [...session.devices.values()], device, { enabled, trusted, blocked, hidpp, profiles }))
       return { ok: false, message: errorText({ code: "no_capacity", reason: "enabled", outcomeUnknown: false }) };
     if (hidpp !== undefined && settingsBusy(this.#device(session.adapterId, session, device))) return { ok: false, message: codeText("busy") };
     if (profiles !== undefined) {
@@ -455,6 +458,9 @@ export class Controller {
           const t = this.#target(action.key);
           if (!t) return GONE;
           const { session, id, device } = t;
+          // Disconnecting, and refreshing a connected device, need neither Bluetooth nor storage
+          // to have started.
+          if ((action.type === "device.connect" || action.type === "device.unpair") && !session.status.ready) return { ok: false, message: codeText("not_ready") };
           if (action.type === "device.refresh" && device.state !== "connected") return { ok: false, message: codeText("not_connected") };
           if (action.type === "device.connect") {
             if (device.inactive === "transport_disabled" && device.transport) return { ok: false, message: transportDisabledText(device.transport) };

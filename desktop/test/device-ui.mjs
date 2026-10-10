@@ -75,6 +75,15 @@ try {
   assert.equal(await page.locator(".toast").count(), 0);
   assert.equal(await retryButton.count(), 0);
   await fail(null);
+  // While the adapter isn't ready, settings can't be edited, but the device can still be refreshed.
+  const readiness = state.adapters.find((a) => a.id === entry.adapterId).status;
+  readiness.ready = false;
+  await publish();
+  await page.getByRole("group", { name: "Backlight", exact: true }).locator("fieldset:disabled").waitFor();
+  assert.equal(await refresh.getAttribute("aria-disabled"), "false");
+  readiness.ready = true;
+  await publish();
+  await page.getByRole("group", { name: "Backlight", exact: true }).locator("fieldset:enabled").waitFor();
 
   // The footer is always there; with nothing staged it has nothing to do.
   // An unknown reading is a mixed checkbox rather than a switch.
@@ -263,8 +272,16 @@ try {
     ],
   };
   await publish();
+  await page.getByText("Couldn't Save: The adapter is busy", { exact: true }).nth(1).waitFor();
   assert.equal(await page.getByText("Couldn't Save: The adapter is busy", { exact: true }).count(), 2);
   await page.getByText("Couldn't Save 2", { exact: true }).waitFor();
+  // A save whose outcome is unknown says so, without reporting a failure.
+  const unconfirmed = "The adapter couldn't confirm whether the change was saved. Check before trying again.";
+  entry.settingsSave = { running: false, items: [{ change: { type: "set", setting: "backlight.level", value: 5 }, status: "unknown", error: unconfirmed }] };
+  await publish();
+  await page.getByText(unconfirmed, { exact: true }).nth(1).waitFor();
+  assert.equal(await page.getByText(unconfirmed, { exact: true }).count(), 2);
+  assert.equal(await page.getByText(/Couldn't Save/).count(), 0);
   entry.settingsSave = null;
 
   // Logitech Features off still saves.
@@ -402,12 +419,31 @@ try {
   state.adapters.find((a) => a.id === entry.adapterId).status.transports.find((t) => t.transport === "ble").maxEnabled = 1;
   await publish();
   await use.and(page.locator(":disabled")).waitFor();
+  // Turning on a blocked device leaves it unused, so it needs no place; unblocking it then does.
+  const block = page.getByRole("switch", { name: "Block Connections", exact: true });
+  entry.device.blocked = true;
+  entry.device.inactive = "blocked";
+  await publish();
+  await use.and(page.locator(":enabled")).waitFor();
+  assert.equal(await block.isDisabled(), false);
+  entry.device.enabled = true;
+  await publish();
+  await block.and(page.locator(":disabled")).waitFor();
   state.adapters.find((a) => a.id === entry.adapterId).status.transports.find((t) => t.transport === "ble").maxEnabled = 7;
   await publish();
   await use.and(page.locator(":enabled")).waitFor();
-  entry.device.enabled = true;
+  await block.and(page.locator(":enabled")).waitFor();
+  entry.device.blocked = false;
   entry.device.inactive = null;
   await publish();
+  // Device changes wait for the adapter to be ready.
+  const adapterStatus = state.adapters.find((a) => a.id === entry.adapterId).status;
+  adapterStatus.ready = false;
+  await publish();
+  await use.and(page.locator(":disabled")).waitFor();
+  adapterStatus.ready = true;
+  await publish();
+  await use.and(page.locator(":enabled")).waitFor();
 
   // Details changes stage until Save, which sends them in one request; a failed save keeps them.
   const trust = page.getByRole("switch", { name: "Automatic Connections", exact: true });
@@ -552,6 +588,21 @@ try {
   await publish();
   await pairing.getByRole("button", { name: "Add Another", exact: true }).waitFor();
   await pairing.getByRole("button", { name: "Done", exact: true }).click();
+  state.pairing = null;
+  await publish();
+  // The dialog closes when no adapter is ready, cancelling its pairing and stopping its search.
+  await page.getByRole("button", { name: "Add Device", exact: true }).click();
+  state.pairing = { adapterId: entry.adapterId, candidateId: 7, name: "Nearby Keyboard", phase: "pairing", prompt: null, deviceKey: null, message: null };
+  await publish();
+  await pairing.getByText("Pairing with Nearby Keyboard…", { exact: true }).waitFor();
+  const before = (await actions()).length;
+  for (const a of state.adapters) a.readiness = "waiting";
+  await publish();
+  await pairing.waitFor({ state: "hidden" });
+  for (const type of ["pair.cancel", "scan.stop", "pair.dismiss"])
+    await app.evaluate(async (_electron, [before, type]) => {
+      while (!globalThis.uiActions.slice(before).some((a) => a.type === type)) await new Promise((r) => setTimeout(r, 10));
+    }, [before, type]);
   state.pairing = null;
   state.scan = null;
   state.adapters = [];

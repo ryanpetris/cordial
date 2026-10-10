@@ -143,6 +143,11 @@ export class AdapterManager {
         }
         return;
       }
+      // A session that ended before it was registered had no entry to remove.
+      if (session.closed) {
+        this.#deps.log(`${port.path}: session ended while opening`);
+        return;
+      }
       this.#register(id, port.path, session);
     } finally {
       this.#probing.delete(port.path);

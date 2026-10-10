@@ -1,6 +1,6 @@
 //! Terminal ownership: raw mode and restoration, the input reader and the
 //! TUI's event loop.
-use crate::ui::{Interrupter, Live, Msg, UiError, UiOptions, tui};
+use crate::ui::{Interrupter, Msg, UiError, UiOptions, tui};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -174,7 +174,8 @@ impl Tui {
         let modes = Modes::enter(true)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         let input = Input::spawn(self.tx.clone());
-        let mut model = tui::Model::new(Live::new(self.tx.clone()), self.port);
+        let fleet = tui::Live::new(self.tx.clone(), self.port.clone());
+        let mut model = tui::Model::new(fleet);
         let mut closing: Option<Instant> = None;
         loop {
             if self.interrupted.load(Ordering::Acquire) && !model.quitting() {

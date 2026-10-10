@@ -80,6 +80,9 @@ impl Options {
 /// How long a script waits for an adapter that is still starting.
 const STARTUP_LIMIT: Duration = Duration::from_secs(35);
 
+/// How long a one-shot scan that ends at the timeout may take to stop.
+const SCAN_STOP: Duration = Duration::from_secs(2);
+
 fn write_line(out: &mut dyn Write, line: &str) -> Result<(), Error> {
     if !line.is_empty() {
         writeln!(out, "{line}")?;
@@ -149,41 +152,30 @@ impl Script {
             },
             connect,
         );
-        let (send, lines) = mpsc::sync_channel(1);
-        thread::spawn(move || {
-            let mut input = BufReader::new(input);
-            loop {
-                let mut line = String::new();
-                let result = match input.by_ref().take(4097).read_line(&mut line) {
-                    Ok(0) => Ok(None),
-                    Ok(_) if line.len() > 4096 => {
-                        Err(Error::new("command line exceeds 4096 bytes"))
-                    }
-                    Ok(_) => Ok(Some(line.trim_end_matches(['\r', '\n']).to_string())),
-                    Err(error) => Err(error.into()),
-                };
-                let end = !matches!(result, Ok(Some(_)));
-                if send.send(result).is_err() || end {
-                    break;
-                }
-            }
-        });
         let mut run = Run {
             script: self,
             controller: &controller,
             events: &events,
-            lines: &lines,
+            input: Some(Box::new(input)),
+            lines: None,
             one_shot,
+            session: 0,
             foreground: None,
             pending: BTreeMap::new(),
             answered: None,
         };
         let result = run.run_loop(port, first, out, diagnostics);
         controller.close();
+        // With --json, events that arrive before the session closes are still printed.
         let end = Instant::now() + Duration::from_secs(2);
         while Instant::now() < end {
             match events.recv_timeout(Duration::from_millis(25)) {
                 Ok(Event::Closed) | Err(RecvTimeoutError::Disconnected) => break,
+                Ok(Event::Notice { session, notice })
+                    if self.options.json && session == run.session =>
+                {
+                    let _ = run.notice(&notice, None, out, diagnostics);
+                }
                 _ => {}
             }
         }
@@ -198,9 +190,9 @@ impl Script {
         diagnostics: &mut dyn Write,
     ) -> Result<(), Error> {
         match line {
-            Line::Help(_) => write_line(
+            Line::Help(topic) => write_line(
                 if self.options.json { diagnostics } else { out },
-                &command::help(state),
+                &command::help_on(state, topic.as_deref()),
             ),
             Line::List => {
                 let ports = serial::ports()?;
@@ -223,12 +215,17 @@ impl Script {
     }
 }
 
+type Lines = Receiver<Result<Option<String>, Error>>;
+
 struct Run<'a> {
     script: &'a Script,
     controller: &'a Controller,
     events: &'a Receiver<Event>,
-    lines: &'a Receiver<Result<Option<String>, Error>>,
+    /// Standard input, until the first line is needed.
+    input: Option<Box<dyn Read + Send>>,
+    lines: Option<Lines>,
     one_shot: bool,
+    session: SessionId,
     foreground: Option<Ticket>,
     pending: BTreeMap<Ticket, (Command, Filter)>,
     /// The pairing step last answered, so one prompt takes one answer.
@@ -286,7 +283,17 @@ impl Run<'_> {
         (!answering && self.answered != st.pairing).then_some(prompt)
     }
 
-    fn start(&mut self, command: Command, filter: Filter, deadline: Option<Instant>) {
+    /// The next typed line, if one has arrived. Input is read only from the first time a line
+    /// is needed, so a one-shot command that never asks for one leaves standard input unread.
+    fn line(&mut self) -> Result<Result<Option<String>, Error>, mpsc::TryRecvError> {
+        let input = &mut self.input;
+        let lines = self
+            .lines
+            .get_or_insert_with(|| read_lines(input.take().expect("input is read once")));
+        lines.try_recv()
+    }
+
+    fn start(&mut self, command: Command, filter: Filter, deadline: Option<Instant>) -> Ticket {
         let ticket = self.controller.run(
             command.clone(),
             RunOptions {
@@ -298,6 +305,7 @@ impl Run<'_> {
         if self.foreground.is_none() {
             self.foreground = Some(ticket);
         }
+        ticket
     }
 
     fn run_loop(
@@ -307,27 +315,52 @@ impl Run<'_> {
         out: &mut dyn Write,
         diagnostics: &mut dyn Write,
     ) -> Result<(), Error> {
-        let direct = matches!(&next, Some(Line::Run(command)) if command.direct());
         let timeout = self.script.options.timeout;
         let deadline = (self.one_shot && !timeout.is_zero()).then(|| Instant::now() + timeout);
-        let mut session: SessionId = self.controller.open(port);
-        let mut prepared = false;
+        self.session = self.controller.open(port);
+        let mut opened = false;
+        let mut ready = false;
+        // Why the adapter didn't become ready; the session stays for direct commands.
+        let mut unready: Option<Error> = None;
         let mut lost: Option<Error> = None;
         let mut starting: Option<Instant> = None;
+        let mut told = false;
+        // A one-shot scan as long as the timeout, which ends at the deadline, and whether it was
+        // stopped there.
+        let mut timed_scan = false;
+        let mut stopped = false;
         loop {
             if self.script.cancellation.cancelled() {
                 return Err(Error::new("interrupted"));
             }
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                return Err(Error::new("operation timed out"));
+            if let Some(d) = deadline
+                && Instant::now() >= d
+            {
+                let scanning = || {
+                    self.controller
+                        .state()
+                        .is_some_and(|s| s.scanning.is_some())
+                };
+                if timed_scan && !stopped && scanning() {
+                    // Stopped only once the adapter has started it, so the stop can't arrive
+                    // first. The scan reports its own result once it stops; this one isn't
+                    // awaited.
+                    self.controller.run(
+                        Command::ScanStop,
+                        RunOptions {
+                            one_shot: true,
+                            wait: self.script.wait(None),
+                        },
+                    );
+                    stopped = true;
+                } else if !timed_scan || Instant::now() >= d + SCAN_STOP {
+                    return Err(Error::new("operation timed out"));
+                }
             }
-            if !prepared && starting.is_some_and(|d| Instant::now() >= d) {
-                return Err(Error::new("the adapter didn't finish starting in time"));
-            }
-            if prepared && next.is_none() {
+            if opened && next.is_none() {
                 let prompt = self.prompt();
                 if self.foreground.is_none() || prompt.is_some() {
-                    match self.lines.try_recv() {
+                    match self.line() {
                         Ok(Ok(Some(line))) => {
                             if let Some(prompt) = prompt
                                 && !line.starts_with('/')
@@ -363,7 +396,24 @@ impl Run<'_> {
             {
                 return Err(error);
             }
-            if prepared && let Some(line) = next.take() {
+            // A command that needs the adapter ready waits for it before it runs.
+            let held = !ready && next.as_ref().is_some_and(needs_ready);
+            if held {
+                if let Some(error) = unready.clone() {
+                    return Err(error);
+                }
+                if starting.is_some_and(|d| Instant::now() >= d) {
+                    return Err(Error::new("the adapter didn't finish starting in time"));
+                }
+                if starting.is_some() && !told {
+                    told = true;
+                    write_line(diagnostics, "Waiting for adapter readiness…")?;
+                }
+            }
+            if opened
+                && !held
+                && let Some(line) = next.take()
+            {
                 let (line, filter) = match line {
                     Line::Devices(filter) => (Line::Run(Command::Devices), filter),
                     line => (line, Filter::All),
@@ -372,9 +422,12 @@ impl Run<'_> {
                     Line::Devices(_) => unreachable!(),
                     Line::Quit => return Ok(()),
                     Line::Select(port) => {
-                        session = self.controller.open(port);
-                        prepared = false;
+                        self.session = self.controller.open(port);
+                        opened = false;
+                        ready = false;
+                        unready = None;
                         starting = None;
+                        told = false;
                         self.foreground = None;
                         self.pending.clear();
                         lost = None;
@@ -390,11 +443,12 @@ impl Run<'_> {
                         }
                     }
                     Line::Run(mut command) => {
-                        // A one-shot scan without its own length scans for the timeout.
+                        // A one-shot scan without its own length scans until the timeout ends
+                        // it; the adapter's own end comes later.
+                        let timed = deadline.is_some()
+                            && matches!(command, Command::Scan { seconds: 0, .. });
                         if let Command::Scan { seconds, .. } = &mut command
-                            && *seconds == 0
-                            && self.one_shot
-                            && !timeout.is_zero()
+                            && timed
                         {
                             *seconds = timeout
                                 .as_secs_f64()
@@ -402,37 +456,34 @@ impl Run<'_> {
                                 .clamp(1.0, f64::from(crate::commands::MAX_SCAN_SECONDS))
                                 as u32;
                         }
-                        self.start(
-                            command,
-                            filter,
-                            deadline.map(|d| d + Duration::from_secs(1)),
-                        );
+                        let grace = if timed {
+                            SCAN_STOP
+                        } else {
+                            Duration::from_secs(1)
+                        };
+                        self.start(command, filter, deadline.map(|d| d + grace));
+                        timed_scan |= timed;
                     }
                 }
             }
             match self.events.recv_timeout(Duration::from_millis(20)) {
                 Ok(Event::Connection {
                     session: id, phase, ..
-                }) if id == session => match phase {
-                    Phase::Opened if direct => prepared = true,
-                    Phase::Ready => prepared = true,
-                    Phase::Failed { open: true, .. } if prepared => {}
+                }) if id == self.session => match phase {
+                    Phase::Opened => opened = true,
+                    Phase::Ready => ready = true,
+                    Phase::Failed { open: true, error } => unready = Some(error),
                     Phase::Failed { error, .. } => return Err(error),
                     // The command running reports its own outcome first.
                     Phase::Lost(error) => lost = Some(error),
                     Phase::Waiting => {
                         starting.get_or_insert(Instant::now() + STARTUP_LIMIT);
-                        write_line(
-                            if self.json() { diagnostics } else { out },
-                            "Waiting for adapter readiness…",
-                        )?
                     }
-                    _ => {}
                 },
                 Ok(Event::Notice {
                     session: id,
                     notice,
-                }) if id == session => {
+                }) if id == self.session => {
                     let st = self.controller.state();
                     self.notice(&notice, st.as_ref(), out, diagnostics)?
                 }
@@ -440,7 +491,7 @@ impl Run<'_> {
                     session: id,
                     ticket,
                     result,
-                }) if id == session => {
+                }) if id == self.session => {
                     if let Some((command, filter)) = self.pending.remove(&ticket) {
                         let state = self.controller.state();
                         let dest: &mut dyn Write = if self.json() { diagnostics } else { out };
@@ -479,4 +530,35 @@ impl Run<'_> {
             }
         }
     }
+}
+
+/// Whether a line runs only once the adapter is ready.
+fn needs_ready(line: &Line) -> bool {
+    match line {
+        Line::Run(command) => !command.direct(),
+        Line::Devices(_) => true,
+        _ => false,
+    }
+}
+
+/// Reads standard input line by line on its own thread.
+fn read_lines(input: Box<dyn Read + Send>) -> Lines {
+    let (send, lines) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut input = BufReader::new(input);
+        loop {
+            let mut line = String::new();
+            let result = match input.by_ref().take(4097).read_line(&mut line) {
+                Ok(0) => Ok(None),
+                Ok(_) if line.len() > 4096 => Err(Error::new("command line exceeds 4096 bytes")),
+                Ok(_) => Ok(Some(line.trim_end_matches(['\r', '\n']).to_string())),
+                Err(error) => Err(error.into()),
+            };
+            let end = !matches!(result, Ok(Some(_)));
+            if send.send(result).is_err() || end {
+                break;
+            }
+        }
+    });
+    lines
 }

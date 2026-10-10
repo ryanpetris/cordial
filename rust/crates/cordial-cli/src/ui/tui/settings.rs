@@ -1,182 +1,60 @@
-//! The Device settings page replaces the device list and details with a saved
-//! device's settings and an editor for one of them. The controls and the
-//! editor's staging actions only stage changes; Save sends every staged
-//! change of the device at once, and Discard drops them. Opening and
-//! navigating the page read only the adapter's own records.
-//!
-//! The adapter stores a Save in one write and replies, then applies the
-//! saved values to the device; each setting's apply outcome arrives later in
-//! its status. With Logitech Features off, values are stored and not applied.
+//! A device's Settings tab: its settings grouped by category, each with the control its type
+//! calls for and a marker for its saved state, and the readings that belong beside them. Every
+//! control stages a change; Save sends every staged change of the device in one request.
 use super::{
-    Action, Area, Job, Model, connected,
-    layout::{
-        self, Choice, Layout, Styled, Tone, dim, err, inherit, ok, pad_str, span, styled, warn,
-    },
-    pending_for,
-    view::{device_status, hidpp_status, spinner},
+    Action, Job, Kind, Menu, Model, Spot, Submission,
+    fleet::Fleet,
+    layout::{self, Layout, Tone, accent, dim, err, ok, span, styled, warn},
+    render::{PageView, button_if},
+    words,
+    world::DeviceView,
 };
 use crate::{
-    controller::{Command, Outcome, State, Target},
+    controller::{Command, Outcome, Target},
     error::Error,
-    model::{self, Type, Up},
-    ui::{
-        Backend, catalog,
-        command::steps,
-        text::{self, display, display_name, on_off},
-    },
+    model::{self, Type},
+    ui::{catalog, text},
 };
 use cordial_protocol::{self as p, ErrorCode, SettingState, keys, value::Value};
 use ratatui::{style::Style, text::Line};
-use std::collections::{HashMap, HashSet};
-
-/// The key column of the editor.
-const EDITOR_KEY: usize = 13;
+use std::collections::BTreeMap;
 
 /// SmartShift's threshold that turns it off.
 const SMARTSHIFT_OFF: i64 = 255;
 
 /// A staged change to one setting.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Change {
-    /// A value to save. `policy` marks Save Current Value and Save Device
-    /// Value, which are changes even when they match the value shown.
+pub enum Draft {
+    /// A value to save. `policy` marks Save Current Value and Save Device Value, which are
+    /// changes even when they match the value shown.
     Set {
         value: Value,
         policy: bool,
     },
+    /// A typed number, parsed when saving.
+    Typed(String),
     Forget,
 }
 
-#[derive(Default)]
-pub struct Page {
-    /// The saved device whose page is open, or 0.
-    pub device: u32,
-    pub key: Option<String>,
-    pub collapsed: HashSet<&'static str>,
-    /// Staged changes by device and key, kept until saved, discarded or the
-    /// session ends.
-    pub drafts: HashMap<u32, HashMap<String, Change>>,
-    pub list_scroll: usize,
-    pub editor_scroll: usize,
-    pub reveal: bool,
-    /// Devices whose settings list is being read.
-    pub loading: HashSet<u32>,
-    /// Why the open page's last read failed.
-    pub load_err: Option<Error>,
-    /// Why the last Save failed.
-    pub job_note: String,
-    pub job_look: Style,
-    /// Last reported apply state by device and key, for the activity log.
-    pub setting_states: HashMap<String, Option<Result<SettingState, ErrorCode>>>,
+/// What a staged change sends, once checked.
+#[derive(Clone, Debug, PartialEq)]
+enum Change {
+    Set(Value),
+    Forget,
 }
 
-impl Page {
-    /// Drops what belonged to the previous adapter; categories stay collapsed.
-    pub fn reset(&mut self) {
-        let collapsed = std::mem::take(&mut self.collapsed);
-        *self = Self {
-            collapsed,
-            ..Self::default()
-        };
-    }
-}
-
-/// Why the page can't save, refresh or stage changes now, or "".
-pub(super) fn settings_busy(st: &State, d: &p::Device, saving: bool) -> &'static str {
-    if !st.available {
-        return "Lost the Adapter Connection";
-    }
-    if saving {
-        return "Saving Settings…";
-    }
-    for (command, text) in [
-        ("setting set", "Saving Settings…"),
-        ("device refresh", "Reading Settings…"),
-        ("device set hidpp", "Saving Logitech Features…"),
-    ] {
-        if pending_for(st, command, d.id) {
-            return text;
-        }
-    }
-    match model::hidpp_up(d) {
-        Up::Starting => "Setting Up Logitech Features…",
-        _ => "",
-    }
-}
-
-fn fresh_words(d: &p::Device, s: &p::Setting) -> &'static str {
-    match () {
-        _ if model::current(s).is_none() && !connected(d) => "Disconnected",
-        _ if model::current(s).is_none() => "Not Read",
-        _ if catalog::fresh(d, s) => "Read from Device",
-        _ => "Last Known",
-    }
-}
-
-/// A value as the TUI labels it.
-pub(super) fn human_value(key: &str, v: Option<&Value>) -> String {
-    let Some(v) = v else {
-        return "Unavailable".into();
-    };
-    let unit = catalog::unit(key);
-    match v {
-        Value::Bool(b) => if *b { "On" } else { "Off" }.into(),
-        Value::Integer(n) if key == keys::WHEEL_THRESHOLD && *n == SMARTSHIFT_OFF => "Off".into(),
-        Value::Integer(0) if key == keys::POWER_AUTO_OFF => "Never".into(),
-        Value::Integer(n) if unit.is_empty() => n.to_string(),
-        Value::Integer(n) => format!("{n} {unit}"),
-        Value::Text(t) if model::key(key).is_some_and(|(k, _)| k.kind == keys::Kind::Enum) => {
-            display(&catalog::choice_words(key, t))
-        }
-        Value::Text(t) => display(t),
-        Value::Color(c) => format!("#{c:06x}"),
-    }
-}
-
-/// An integer setting's range, such as "5-300, Steps of 5".
-fn range_words(s: &p::Setting) -> Option<String> {
-    let (min, max, step) = model::range(s)?;
-    let range = format!("{min}-{max}");
-    Some(if step > 1 {
-        format!("{range}, Steps of {step}")
-    } else {
-        range
-    })
-}
-
-/// A saved setting's state. With Logitech Features off a saved value is
-/// only stored.
-fn status_words(d: &p::Device, s: &p::Setting) -> (&'static str, Style) {
-    match model::applied(s) {
-        None => ("Not Saved", layout::plain()),
-        Some(Ok(SettingState::Pending)) if !model::hidpp_enabled(d) => ("Saved", ok()),
-        Some(Ok(SettingState::Pending)) => ("Pending", warn()),
-        Some(Ok(SettingState::Applied)) => ("Applied", ok()),
-        Some(Ok(SettingState::ChangedOnDevice)) => ("Changed on Device", warn()),
-        Some(Ok(SettingState::Unsupported)) => ("Can't Apply Now", dim()),
-        Some(Err(_)) => ("Failed", err()),
-    }
-}
-
-/// The value the device keeps when nothing is staged: the saved value, else
-/// the reading.
+/// The value the device keeps when nothing is staged: the saved value, else the reading.
 fn base(s: &p::Setting) -> Option<Value> {
     model::saved(s).or_else(|| model::current(s))
 }
 
-/// A staged change that would change something; None when it matches what
-/// is saved, or forgets a value that isn't saved.
-fn effective(s: &p::Setting, draft: Option<&Change>) -> Option<Change> {
-    match draft? {
-        Change::Forget if model::saved(s).is_some() => Some(Change::Forget),
-        Change::Forget => None,
-        Change::Set { value, .. } if !model::accepts(s, value) => None,
-        Change::Set { value, policy } if !policy && Some(value) == base(s).as_ref() => None,
-        change => Some(change.clone()),
-    }
+fn is_smartshift(s: &p::Setting) -> bool {
+    s.key == keys::WHEEL_THRESHOLD
+        && model::kind(s) == Some(Type::Integer)
+        && model::choices(s).is_empty()
 }
 
-/// An integer setting's range for stepping: its limits, else no bounds.
+/// An integer setting's range for stepping and checking.
 #[derive(Clone, Copy)]
 struct Bounds {
     min: Option<i64>,
@@ -186,11 +64,11 @@ struct Bounds {
 }
 
 fn bounds(s: &p::Setting) -> Bounds {
-    match model::range(s) {
+    let mut b = match model::range(s) {
         Some((min, max, step)) => Bounds {
             min: Some(min),
             max: Some(max),
-            step,
+            step: step.max(1),
             base: min,
         },
         None => Bounds {
@@ -199,893 +77,1062 @@ fn bounds(s: &p::Setting) -> Bounds {
             step: 1,
             base: 0,
         },
+    };
+    if is_smartshift(s) {
+        b.min = Some(b.min.unwrap_or(1).max(1));
+        b.max = Some(b.max.unwrap_or(SMARTSHIFT_OFF - 1).min(SMARTSHIFT_OFF - 1));
     }
-}
-
-/// SmartShift's threshold range while it is On: its limits without the value
-/// the device takes as Off.
-fn smartshift_bounds(s: &p::Setting) -> Bounds {
-    let mut b = bounds(s);
-    b.max = Some(b.max.unwrap_or(SMARTSHIFT_OFF - 1).min(SMARTSHIFT_OFF - 1));
     b
 }
 
-/// Moves an integer by delta within its range, on its steps; an off-step
-/// reading moves to the next step first.
+/// Moves an integer by one step in `delta`'s direction within its range, on its steps. The
+/// arithmetic is wide, so a range at the limits of i64 can't overflow.
 fn step_value(b: Bounds, from: Option<&Value>, delta: i64) -> Value {
-    let fine = b.step.max(1);
-    let mut n = match from {
+    let fine = i128::from(b.step.max(1));
+    let base = i128::from(b.base);
+    let start = match from {
+        Some(Value::Integer(n)) => Some(i128::from(*n)),
+        _ => None,
+    };
+    let mut n: i128 = match from {
         Some(Value::Integer(n)) => {
-            let off = (n - b.base).rem_euclid(fine);
+            let n = i128::from(*n);
+            let off = (n - base).rem_euclid(fine);
             match () {
-                _ if off == 0 => n + delta,
-                _ if delta > 0 => n - off + delta,
-                _ => n - off + delta + fine,
+                _ if off == 0 => n + i128::from(delta.signum()) * fine,
+                _ if delta > 0 => n - off + fine,
+                _ => n - off,
             }
         }
-        _ if delta < 0 && b.max.is_some() => b.max.unwrap(),
-        _ => b.base,
+        _ if delta < 0 && b.max.is_some() => i128::from(b.max.unwrap_or(0)),
+        _ => i128::from(b.min.unwrap_or(b.base)),
     };
-    if let Some(min) = b.min {
-        n = n.max(min);
-    }
     if let Some(max) = b.max {
-        n = n.min(max);
+        // The highest value on the steps, which the maximum itself may not be; a reading above
+        // it is never lowered by stepping up.
+        let max = i128::from(max);
+        let top = max - (max - base).rem_euclid(fine);
+        let top = start
+            .filter(|v| *v > top && delta > 0)
+            .map_or(top, |v| v.min(max));
+        n = n.min(top);
     }
-    Value::Integer(n)
+    if let Some(min) = b.min {
+        n = n.max(i128::from(min));
+    }
+    Value::Integer(n.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
 }
 
-/// A button, or the same label disabled in its place.
-pub(super) fn button_if(b: &mut Layout, label: &str, action: Action, tone: Tone, enabled: bool) {
-    if enabled {
-        b.button(label, action, tone);
-    } else {
-        b.disabled(label);
+/// A typed number as the setting would save it, or None when it isn't acceptable.
+fn parse_typed(s: &p::Setting, typed: &str) -> Option<Value> {
+    let n: i64 = typed.trim().parse().ok()?;
+    let b = bounds(s);
+    if b.min.is_some_and(|min| n < min) || b.max.is_some_and(|max| n > max) {
+        return None;
+    }
+    if (i128::from(n) - i128::from(b.base)).rem_euclid(i128::from(b.step)) != 0 {
+        return None;
+    }
+    Some(Value::Integer(n))
+}
+
+/// The change a draft makes; Err for a draft that can't be saved, None for no change.
+fn change_of(s: &p::Setting, draft: Option<&Draft>) -> Result<Option<Change>, ()> {
+    match draft {
+        None => Ok(None),
+        Some(Draft::Forget) => Ok(model::saved(s).is_some().then_some(Change::Forget)),
+        Some(Draft::Typed(t)) => {
+            let v = parse_typed(s, t).ok_or(())?;
+            Ok((Some(&v) != base(s).as_ref()).then_some(Change::Set(v)))
+        }
+        Some(Draft::Set { value, policy }) => {
+            if !model::accepts(s, value) {
+                return Err(());
+            }
+            Ok((*policy || Some(value) != base(s).as_ref()).then(|| Change::Set(value.clone())))
+        }
     }
 }
 
-impl<B: Backend> Model<B> {
-    /// Whether a saved device's settings page is shown.
-    pub(super) fn settings_open(&self, st: &State) -> bool {
-        self.page.device != 0 && self.session.is_some() && st.device(self.page.device).is_some()
+/// The range a typed number must be in, as words.
+fn range_text(s: &p::Setting) -> String {
+    let b = bounds(s);
+    let mut text = match (b.min, b.max) {
+        (Some(min), Some(max)) => format!("{min}-{max}"),
+        (Some(min), None) => format!("At Least {min}"),
+        (None, Some(max)) => format!("At Most {max}"),
+        (None, None) => "Whole Numbers".into(),
+    };
+    if b.step > 1 {
+        text.push_str(&format!(", Steps of {}", b.step));
+    }
+    text
+}
+
+/// A value in words.
+pub fn value_text(key: &str, v: Option<&Value>) -> String {
+    match v {
+        None => "Unknown".into(),
+        Some(Value::Bool(b)) => if *b { "On" } else { "Off" }.into(),
+        Some(Value::Integer(0)) if key == keys::POWER_AUTO_OFF => "Never".into(),
+        Some(Value::Integer(n)) => n.to_string(),
+        Some(Value::Text(t)) => text::display(&catalog::choice_words(key, t)),
+        Some(Value::Color(c)) => format!("#{c:06X}"),
+    }
+}
+
+/// The unit shown beside a value; none when the value reads "Never".
+fn display_unit(key: &str, v: Option<&Value>) -> &'static str {
+    match v {
+        Some(Value::Integer(0)) if key == keys::POWER_AUTO_OFF => "",
+        _ => catalog::unit(key),
+    }
+}
+
+/// The device's information entries that read like settings and aren't settings themselves.
+pub fn readings(d: &p::Device) -> Vec<&p::Info> {
+    const FIGURES: [&str; 3] = [
+        keys::WHEEL_RESOLUTION_MULTIPLIER,
+        keys::WHEEL_RATCHETS_PER_ROTATION,
+        keys::WHEEL_DIAMETER,
+    ];
+    catalog::presented_info(&d.info)
+        .into_iter()
+        .filter(|i| !catalog::category(&i.key).is_empty() && !FIGURES.contains(&i.key.as_str()))
+        .collect()
+}
+
+/// The marker of a setting's saved state, and the menu it opens.
+struct Marker {
+    text: &'static str,
+    look: Style,
+    items: Vec<(&'static str, Option<Action>)>,
+}
+
+impl<F: Fleet> Model<F> {
+    fn drafts_of(&self, d: &DeviceView) -> Option<&BTreeMap<String, Draft>> {
+        self.setting_drafts.get(&(d.adapter.clone(), d.d.id))
     }
 
-    pub(super) fn open_settings(&mut self, id: u32) {
-        self.close_files();
-        self.page.device = id;
-        self.page.key = None;
-        self.page.list_scroll = 0;
-        self.page.editor_scroll = 0;
-        self.page.load_err = None;
-        self.page.job_note.clear();
-        self.focus = None;
-        self.load_settings(id);
+    fn draft_of(&self, d: &DeviceView, key: &str) -> Option<&Draft> {
+        self.drafts_of(d)?.get(key)
     }
 
-    /// Leaves the settings page. Staged changes are kept.
-    pub(super) fn close_settings(&mut self) {
-        self.page.device = 0;
-        self.page.key = None;
-        self.page.load_err = None;
-        self.page.job_note.clear();
-        self.focus = None;
+    fn settings_of(&self, d: &DeviceView) -> Vec<p::Setting> {
+        self.state_of(&d.adapter)
+            .map(|st| {
+                catalog::presented(st.settings_of(d.d.id))
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
-    /// Discards everything the page kept for a device's bond.
-    pub(super) fn forget_device(&mut self, id: u32) {
-        self.page.drafts.remove(&id);
-        let prefix = format!("{id}/");
-        self.page
-            .setting_states
-            .retain(|k, _| !k.starts_with(&prefix));
+    fn setting(&self, d: &DeviceView, key: &str) -> Option<p::Setting> {
+        self.settings_of(d).into_iter().find(|s| s.key == key)
     }
 
-    /// Whether a Save of the device's settings is running.
-    pub(super) fn saving(&self, id: u32) -> bool {
-        self.jobs.values().any(|j| {
-            j.save.is_some()
-                && matches!(&j.command, Command::SettingsSave { device, .. } if *device == id)
-        })
+    /// The device's settings are current: it is connected and its Logitech Features are up.
+    fn settings_current(d: &DeviceView) -> bool {
+        d.connected() && model::hidpp_up(&d.d) == model::Up::Active
     }
 
-    /// Leaves a page whose device was removed.
-    pub(super) fn sync_settings(&mut self) {
-        let Some(st) = self.state() else {
-            return;
-        };
-        if self.page.device != 0 && st.device(self.page.device).is_none() {
-            self.close_settings();
+    fn refreshing(&self, d: &DeviceView) -> bool {
+        let id = d.d.id;
+        self.running(
+            &d.adapter,
+            |k| matches!(k, Kind::Device(device, Spot::SettingsNote(..)) if *device == id),
+        )
+    }
+
+    /// Whether the settings form takes no changes now.
+    fn form_busy(&self, d: &DeviceView) -> bool {
+        !self.adapter_ready(d) || self.refreshing(d) || self.settings_busy(d)
+    }
+
+    /// Whether the device's adapter is connected and ready, so it can save settings.
+    pub(super) fn adapter_ready(&self, d: &DeviceView) -> bool {
+        self.adapter(&d.adapter)
+            .is_some_and(|a| a.connected() && a.ready)
+    }
+
+    /// Whether the device can be asked for its current settings.
+    fn can_refresh(&self, d: &DeviceView) -> bool {
+        !self.form_busy(d) && d.connected()
+    }
+
+    fn submitting(&self, d: &DeviceView) -> bool {
+        self.submissions
+            .get(&(d.adapter.clone(), d.d.id))
+            .is_some_and(|s| s.running)
+    }
+
+    /// The value a setting's control shows.
+    fn shown_value(&self, d: &DeviceView, s: &p::Setting) -> Option<Value> {
+        match self.draft_of(d, &s.key) {
+            Some(Draft::Set { value, .. }) => Some(value.clone()),
+            Some(Draft::Typed(t)) => parse_typed(s, t).or_else(|| base(s)),
+            Some(Draft::Forget) => model::current(s),
+            None => base(s),
         }
     }
 
-    /// Reads a device's settings list, unless a read is under way. Events
-    /// keep it current afterwards.
-    fn load_settings(&mut self, id: u32) {
-        if !self.page.loading.insert(id) {
-            return;
-        }
-        let mut job = Job::new(Command::Settings(Target::Id(id)));
-        job.load = true;
-        self.execute_job(job);
-    }
-
-    fn draft(&self, id: u32, key: &str) -> Option<&Change> {
-        self.page.drafts.get(&id)?.get(key)
-    }
-
-    /// The value the controls show: the staged value, else the saved value,
-    /// else a legal current reading. A reading that cannot be set, such as a
-    /// temporary mode, is never offered as chosen.
-    fn edit_value(&self, s: &p::Setting) -> Option<Value> {
-        match self.draft(self.page.device, &s.key) {
-            Some(Change::Set { value, .. }) => return Some(value.clone()),
-            Some(Change::Forget) => {}
+    fn set_draft(&mut self, d: &DeviceView, s: &p::Setting, draft: Option<Draft>) {
+        let key = (d.adapter.clone(), d.d.id);
+        let drafts = self.setting_drafts.entry(key.clone()).or_default();
+        match draft {
+            Some(draft) => {
+                drafts.insert(s.key.clone(), draft);
+            }
             None => {
-                if let Some(saved) = model::saved(s) {
-                    return Some(saved);
+                drafts.remove(&s.key);
+            }
+        }
+        if drafts.is_empty() {
+            self.setting_drafts.remove(&key);
+        }
+        self.notes.remove(&Spot::SettingsNote(key.0, key.1));
+    }
+
+    /// Stages a value; a value the device keeps already drops the draft.
+    fn edit(&mut self, d: &DeviceView, s: &p::Setting, value: Value) {
+        let keep_policy = matches!(
+            self.draft_of(d, &s.key),
+            Some(Draft::Set { policy: true, .. })
+        ) && model::saved(s).is_none();
+        let draft = if Some(&value) == base(s).as_ref() && !keep_policy {
+            None
+        } else {
+            Some(Draft::Set {
+                value,
+                policy: keep_policy,
+            })
+        };
+        self.set_draft(d, s, draft);
+    }
+
+    /// The staged changes and whether any is invalid.
+    fn setting_changes(&self, d: &DeviceView) -> (Vec<(String, Change)>, bool) {
+        let mut out = Vec::new();
+        let mut invalid = false;
+        let Some(drafts) = self.drafts_of(d) else {
+            return (out, false);
+        };
+        for s in self.settings_of(d) {
+            match change_of(&s, drafts.get(&s.key)) {
+                Ok(Some(c)) => out.push((s.key.clone(), c)),
+                Ok(None) => {}
+                Err(()) => invalid = true,
+            }
+        }
+        (out, invalid)
+    }
+
+    fn settings_dirty(&self, d: &DeviceView) -> bool {
+        let (changes, invalid) = self.setting_changes(d);
+        invalid || !changes.is_empty()
+    }
+
+    /// Handles a settings action; false when `action` isn't one.
+    pub(super) fn settings_action(&mut self, adapter: &str, id: u32, action: &Action) -> bool {
+        let Some(d) = self.device(adapter, id).cloned() else {
+            return false;
+        };
+        let busy = self.form_busy(&d);
+        let key = (adapter.to_owned(), id);
+        match action {
+            Action::SettingBool(k, v) if !busy => {
+                if let Some(s) = self.setting(&d, k) {
+                    self.edit(&d, &s, Value::Bool(*v));
                 }
             }
-        }
-        model::current(s).filter(|v| model::accepts(s, v))
-    }
-
-    /// Stages a value from a control. Choosing what the device keeps anyway
-    /// drops the draft, except that a staged save of an unsaved value stays
-    /// one; nothing is sent until Save.
-    fn set_draft(&mut self, s: &p::Setting, v: Value) {
-        if !model::accepts(s, &v) {
-            return;
-        }
-        let drafts = self.page.drafts.entry(self.page.device).or_default();
-        let policy = model::saved(s).is_none()
-            && matches!(drafts.get(&s.key), Some(Change::Set { policy: true, .. }));
-        if !policy && Some(&v) == base(s).as_ref() {
-            drafts.remove(&s.key);
-        } else {
-            drafts.insert(s.key.clone(), Change::Set { value: v, policy });
-        }
-    }
-
-    /// The staged changes that would change something, in display order.
-    fn changes(&self, id: u32, settings: &[p::Setting]) -> Vec<(String, Change)> {
-        catalog::presented(settings)
-            .into_iter()
-            .filter_map(|s| Some((s.key.clone(), effective(s, self.draft(id, &s.key))?)))
-            .collect()
-    }
-
-    /// The visible setting rows, in display order.
-    fn visible_keys(&self, settings: &[p::Setting]) -> Vec<String> {
-        let known = catalog::presented(settings);
-        let mut keys = Vec::new();
-        for category in catalog::categories(settings) {
-            if self.page.collapsed.contains(category) {
-                continue;
+            Action::SettingChoice(k, v) if !busy => {
+                self.menu = None;
+                if let Some(s) = self.setting(&d, k) {
+                    self.edit(&d, &s, v.clone());
+                }
             }
-            keys.extend(
-                known
+            Action::SettingSelect(k) if !busy => {
+                let Some(s) = self.setting(&d, k) else {
+                    return true;
+                };
+                let (x, y) = self
+                    .hits
                     .iter()
-                    .filter(|s| catalog::category(&s.key) == category)
-                    .map(|s| s.key.clone()),
-            );
-        }
-        keys
-    }
-
-    /// A setting row's tag: a staged change, else its saved state.
-    fn row_tag(&self, d: &p::Device, s: &p::Setting) -> (&'static str, Style) {
-        let staged = effective(s, self.draft(d.id, &s.key)).is_some();
-        match model::applied(s) {
-            _ if staged && self.saving(d.id) => ("◌ Sending", warn()),
-            _ if staged => ("✎ Changed", layout::accent()),
-            None => ("○ Not Saved", dim()),
-            Some(Err(_)) => ("✕ Failed", err()),
-            Some(Ok(SettingState::Unsupported)) => ("○ Can't Apply Now", dim()),
-            Some(Ok(SettingState::ChangedOnDevice)) if catalog::fresh(d, s) => {
-                ("◆ Changed on Device", warn())
-            }
-            Some(Ok(SettingState::Pending)) if model::hidpp_enabled(d) && connected(d) => {
-                ("◌ Pending", warn())
-            }
-            _ => ("● Saved", ok()),
-        }
-    }
-
-    pub(super) fn settings_pane(&mut self, st: &State, w: usize, h: usize) -> Layout {
-        let d = st.device(self.page.device).unwrap().clone();
-        let id = d.id;
-        let settings = st.settings_of(id).to_vec();
-        let loaded = st.settings.contains_key(&id);
-        let mut b = Layout::new(w.saturating_sub(4));
-        let mut pinned = Layout::new(w.saturating_sub(4));
-        let (text, look) = device_status(&d);
-        b.line(Line::from(vec![
-            span(text, look),
-            span(
-                format!(" · Logitech Features {}", on_off(model::hidpp_enabled(&d))),
-                dim(),
-            ),
-        ]));
-        if let Some((t, l)) = hidpp_status(&d) {
-            b.para(&t, l);
-        }
-        if let Some(e) = &self.page.load_err {
-            b.para(
-                &format!("✕ Couldn't Load Settings: {}", text::error_words(e)),
-                err(),
-            );
-            b.button("Retry", Action::SettingsReload, Tone::Normal);
-        } else if !loaded {
-            b.line(styled(format!("{} Loading Settings…", spinner()), warn()));
-        }
-        let known = catalog::presented(&settings);
-        if loaded && self.page.load_err.is_none() && known.is_empty() {
-            b.para("No Settings", dim());
-        }
-        let busy = settings_busy(st, &d, self.saving(id));
-        let inner = b.width;
-        let tag_w = if inner >= 64 { 20 } else { 14 };
-        let value_w = (inner.saturating_sub(2 + tag_w) * 2 / 5).max(6);
-        let label_w = inner.saturating_sub(2 + tag_w + value_w).max(4);
-        let mut selected_line = None;
-        for category in catalog::categories(&settings) {
-            b.row();
-            let collapsed = self.page.collapsed.contains(category);
-            let arrow = if collapsed { "▸ " } else { "▾ " };
-            b.control(
-                styled(format!("{arrow}{}", display(category)), layout::title()),
-                Action::Category(category),
-            );
-            if collapsed {
-                continue;
-            }
-            for s in known
-                .iter()
-                .filter(|s| catalog::category(&s.key) == category)
-            {
-                let (row_base, look, marker) = if Some(&s.key) == self.page.key.as_ref() {
-                    selected_line = Some(b.lines.len());
-                    (
-                        layout::selected(),
-                        inherit(layout::bold(), layout::selected()),
-                        "▌ ",
-                    )
-                } else {
-                    (layout::plain(), layout::plain(), "  ")
-                };
-                // The form value: what is staged, else saved, else read.
-                let shown = match self.draft(id, &s.key) {
-                    Some(Change::Set { value, .. }) => Some(value.clone()),
-                    _ => model::saved(s).or_else(|| model::current(s)),
-                };
-                let value = human_value(&s.key, shown.as_ref());
-                let value_look =
-                    if !busy.is_empty() || !catalog::fresh(&d, s) && model::saved(s).is_none() {
-                        dim()
-                    } else {
-                        layout::plain()
-                    };
-                let (tag, tag_look) = self.row_tag(&d, s);
-                let label = layout::truncate_str(&display(&catalog::label(&s.key)), label_w - 1);
-                let mut row: Styled = Line::from(vec![
-                    span(marker, inherit(layout::accent(), row_base)),
-                    span(pad_str(&label, label_w), look),
-                    span(
-                        pad_str(&layout::truncate_str(&value, value_w - 1), value_w),
-                        inherit(value_look, row_base),
-                    ),
-                    span(
-                        layout::truncate_str(tag, tag_w),
-                        inherit(tag_look, row_base),
-                    ),
-                ]);
-                let fill = inner.saturating_sub(layout::line_width(&row));
-                row.spans.push(span(" ".repeat(fill), row_base));
-                b.control(row, Action::Setting(s.key.clone()));
-            }
-        }
-        if self.page.reveal
-            && let Some(line) = selected_line
-        {
-            self.page.reveal = false;
-            self.page.list_scroll = self
-                .page
-                .list_scroll
-                .max(line.saturating_sub(h.saturating_sub(3)))
-                .min(line);
-        }
-        if !busy.is_empty() {
-            pinned.para(&format!("{} {busy}", spinner()), warn());
-        } else if !self.page.job_note.is_empty() {
-            pinned.para(&self.page.job_note.clone(), self.page.job_look);
-        }
-        pinned.row();
-        let idle = busy.is_empty();
-        let can_save = idle && !self.changes(id, &settings).is_empty();
-        button_if(
-            &mut pinned,
-            "Save",
-            Action::SaveAll,
-            Tone::Primary,
-            can_save,
-        );
-        let staged = self.page.drafts.get(&id).is_some_and(|d| !d.is_empty());
-        button_if(
-            &mut pinned,
-            "Discard",
-            Action::Discard,
-            Tone::Normal,
-            idle && staged,
-        );
-        let can = idle && connected(&d) && loaded;
-        button_if(
-            &mut pinned,
-            "Refresh",
-            Action::SettingsRefresh,
-            Tone::Normal,
-            can,
-        );
-        pinned.button_right("‹ Back", Action::SettingsBack, Tone::Normal);
-        let title = format!("Settings · {}", display_name(Some(&d.name)));
-        self.frame(&title, b, pinned, Some(Area::SetList), false, w, h)
-    }
-
-    pub(super) fn editor_pane(&mut self, st: &State, w: usize, h: usize) -> Layout {
-        let (title, b, actions) = self.editor(st, w);
-        self.frame(&title, b, actions, Some(Area::Editor), false, w, h)
-    }
-
-    /// The selected setting's card, value controls and staging actions.
-    pub(super) fn editor(&self, st: &State, w: usize) -> (String, Layout, Layout) {
-        let mut b = Layout::new(w.saturating_sub(4));
-        let mut actions = Layout::new(w.saturating_sub(4));
-        let d = st.device(self.page.device).unwrap();
-        let id = d.id;
-        let Some(s) = self
-            .page
-            .key
-            .as_ref()
-            .and_then(|k| st.settings_of(id).iter().find(|s| s.key == *k))
-        else {
-            b.para("No Setting Selected", dim());
-            return ("Setting".into(), b, actions);
-        };
-        let field = |b: &mut Layout, key: &str, value: &str, st: Style| {
-            b.field_at(key, EDITOR_KEY, value, st);
-        };
-        let is_fresh = catalog::fresh(d, s);
-        let look = if is_fresh { layout::plain() } else { dim() };
-        let current = model::current(s);
-        field(
-            &mut b,
-            "Current",
-            &format!(
-                "{} · {}",
-                human_value(&s.key, current.as_ref()),
-                fresh_words(d, s)
-            ),
-            look,
-        );
-        let title = display(&catalog::label(&s.key));
-        match model::saved(s) {
-            Some(saved) => field(
-                &mut b,
-                "Saved",
-                &human_value(&s.key, Some(&saved)),
-                layout::plain(),
-            ),
-            None => field(&mut b, "Saved", "Not Saved", dim()),
-        }
-        if let Some(range) = range_words(s) {
-            field(&mut b, "Range", &range, layout::plain());
-        }
-        if model::saved(s).is_some() {
-            let (text, look) = status_words(d, s);
-            field(&mut b, "Status", text, look);
-        }
-        if let Some(Err(code)) = model::applied(s) {
-            field(&mut b, "Error", &text::hidpp_words(code), err());
-        }
-        b.row();
-        // Controls stay in place while unavailable, dim and without targets.
-        let busy = settings_busy(st, d, self.saving(id));
-        let locked = !busy.is_empty();
-        let (first_line, first_hit) = (b.lines.len(), b.hits.len());
-        let value = self.edit_value(s);
-        let choice = |label: String, action: Action, chosen: bool| Choice {
-            label,
-            action,
-            chosen,
-        };
-        let choices = model::choices(s);
-        match model::kind(s) {
-            Some(Type::Bool) => {
-                let on = match value {
-                    Some(Value::Bool(b)) => Some(b),
-                    _ => None,
-                };
-                let options = layout::on_off(
-                    on,
-                    Action::Draft(s.key.clone(), Value::Bool(true)),
-                    Action::Draft(s.key.clone(), Value::Bool(false)),
-                );
-                b.choice("Value", EDITOR_KEY, options);
-            }
-            _ if !choices.is_empty() => {
-                let options = choices
-                    .iter()
+                    .find(|h| h.action == *action)
+                    .map_or((0, 0), |h| (h.x, h.y + 1));
+                let items = model::choices(&s)
+                    .into_iter()
                     .map(|v| {
-                        choice(
-                            human_value(&s.key, Some(v)),
-                            Action::Draft(s.key.clone(), v.clone()),
-                            value.as_ref() == Some(v),
-                        )
+                        let label = value_text(&s.key, Some(&v));
+                        (label, Some(Action::SettingChoice(k.clone(), v)))
                     })
                     .collect();
-                b.choice("Value", EDITOR_KEY, options);
+                self.menu = Some(Menu { x, y, items });
             }
-            Some(Type::Integer) if s.key == keys::WHEEL_THRESHOLD => {
-                let n = match value {
-                    Some(Value::Integer(n)) => Some(n),
-                    _ => None,
-                };
-                let on = n.is_some_and(|n| n != SMARTSHIFT_OFF);
-                let options = layout::on_off(
-                    n.map(|_| on),
-                    Action::Switch(s.key.clone(), smartshift_on(s, value.as_ref())),
-                    Action::Switch(s.key.clone(), Value::Integer(SMARTSHIFT_OFF)),
-                );
-                b.choice("Value", EDITOR_KEY, options);
-                if on {
-                    stepper(&mut b, "Threshold", s, smartshift_bounds(s), value.as_ref());
+            Action::SettingStep(k, delta) if !busy => {
+                if let Some(s) = self.setting(&d, k) {
+                    self.commit_editing();
+                    let from = self.shown_value(&d, &s);
+                    let v = step_value(bounds(&s), from.as_ref(), *delta);
+                    self.edit(&d, &s, v);
                 }
             }
-            Some(Type::Integer) => stepper(&mut b, "Value", s, bounds(s), value.as_ref()),
-            _ => field(
-                &mut b,
-                "Value",
-                &human_value(&s.key, current.as_ref()),
-                look,
-            ),
-        }
-        if locked {
-            b.hits.truncate(first_hit);
-            for line in &mut b.lines[first_line..] {
-                *line = styled(layout::strip(line), dim());
-            }
-        }
-        // The staging actions: each stages a change, and nothing is sent until Save.
-        let staging = busy.is_empty();
-        actions.row();
-        let staged = effective(s, self.draft(id, &s.key)).is_some();
-        let settable = is_fresh && current.as_ref().is_some_and(|v| model::accepts(s, v));
-        if staged {
-            button_if(
-                &mut actions,
-                "Undo Change",
-                Action::Undo(s.key.clone()),
-                Tone::Normal,
-                staging,
-            );
-        } else if model::saved(s).is_none() {
-            button_if(
-                &mut actions,
-                "Save Current Value",
-                Action::Keep(s.key.clone()),
-                Tone::Normal,
-                staging && settable,
-            );
-        } else {
-            if model::applied(s) == Some(Ok(SettingState::ChangedOnDevice)) {
-                button_if(
-                    &mut actions,
-                    "Save Device Value",
-                    Action::Keep(s.key.clone()),
-                    Tone::Normal,
-                    staging && settable,
-                );
-            }
-            button_if(
-                &mut actions,
-                "Forget Saved Value",
-                Action::Forget(s.key.clone()),
-                Tone::Normal,
-                staging,
-            );
-        }
-        (title, b, actions)
-    }
-
-    /// Handles the page's controls. Every mouse and key path passes here, so
-    /// the drawn guards hold for all of them.
-    pub(super) fn settings_action(&mut self, action: Action) {
-        let Some(st) = self.state() else {
-            return;
-        };
-        if self.page.device == 0 {
-            return;
-        }
-        let Some(d) = st.device(self.page.device).cloned() else {
-            return;
-        };
-        let id = d.id;
-        let settings = st.settings_of(id).to_vec();
-        let setting = |key: &str| settings.iter().find(|s| s.key == key).cloned();
-        let busy = !settings_busy(&st, &d, self.saving(id)).is_empty();
-        match action {
-            Action::SettingsBack => self.close_settings(),
-            Action::SettingsReload => {
-                self.page.load_err = None;
-                self.load_settings(id);
-            }
-            Action::SettingsRefresh => {
-                if busy || !connected(&d) {
-                    return;
-                }
-                self.page.job_note.clear();
-                self.execute(Command::Refresh(Target::Id(id)));
-            }
-            Action::Category(category) => {
-                if !self.page.collapsed.remove(category) {
-                    self.page.collapsed.insert(category);
+            Action::SettingEdit(k) if !busy => {
+                if let Some(s) = self.setting(&d, k) {
+                    let shown = self.shown_value(&d, &s);
+                    let text = match self.draft_of(&d, k) {
+                        Some(Draft::Typed(t)) => t.clone(),
+                        _ => match shown {
+                            Some(Value::Integer(n)) => n.to_string(),
+                            _ => String::new(),
+                        },
+                    };
+                    self.form.limit = 12;
+                    self.form.set_value(&text);
+                    self.editing = Some(k.clone());
                 }
             }
-            Action::Setting(key) if setting(&key).is_some() => {
-                self.page.key = Some(key);
-                self.page.editor_scroll = 0;
-            }
-            // Nothing changes while the device's settings work runs.
-            Action::Draft(..)
-            | Action::Switch(..)
-            | Action::Step(..)
-            | Action::Keep(_)
-            | Action::Undo(_)
-            | Action::Forget(_)
-            | Action::Discard
-            | Action::SaveAll
-                if busy => {}
-            Action::Draft(key, v) | Action::Switch(key, v) => {
-                if let Some(s) = setting(&key) {
-                    self.set_draft(&s, v);
-                }
-            }
-            Action::Step(key, delta) => {
-                if let Some(s) = setting(&key) {
-                    let from = self.edit_value(&s);
-                    let range = if key == keys::WHEEL_THRESHOLD {
-                        smartshift_bounds(&s)
+            Action::SmartShift(k, on) if !busy => {
+                if let Some(s) = self.setting(&d, k) {
+                    let v = if *on {
+                        let keep = [model::saved(&s), model::current(&s)]
+                            .into_iter()
+                            .flatten()
+                            .find(|v| matches!(v, Value::Integer(n) if (1..SMARTSHIFT_OFF).contains(n)));
+                        keep.unwrap_or(Value::Integer(SMARTSHIFT_OFF - 1))
                     } else {
-                        bounds(&s)
+                        Value::Integer(SMARTSHIFT_OFF)
                     };
-                    self.set_draft(&s, step_value(range, from.as_ref(), delta));
+                    self.edit(&d, &s, v);
                 }
             }
-            Action::Keep(key) => {
-                if let Some(s) = setting(&key)
-                    && catalog::fresh(&d, &s)
-                    && let Some(v) = model::current(&s).filter(|v| model::accepts(&s, v))
+            Action::Marker(k) => {
+                let Some(s) = self.setting(&d, k) else {
+                    return true;
+                };
+                let marker = self.marker(&d, &s, busy);
+                let (x, y) = self
+                    .hits
+                    .iter()
+                    .find(|h| h.action == *action)
+                    .map_or((0, 0), |h| (h.x, h.y + 1));
+                let items = marker
+                    .items
+                    .into_iter()
+                    .map(|(label, action)| (label.to_owned(), action))
+                    .collect();
+                self.menu = Some(Menu { x, y, items });
+            }
+            Action::Undo(k) => {
+                self.menu = None;
+                if let Some(s) = self.setting(&d, k) {
+                    self.set_draft(&d, &s, None);
+                }
+            }
+            Action::Keep(k) if !busy => {
+                self.menu = None;
+                if let Some(s) = self.setting(&d, k)
+                    && let Some(v) = model::current(&s)
                 {
-                    let change = Change::Set {
-                        value: v,
-                        policy: true,
-                    };
-                    self.page.drafts.entry(id).or_default().insert(key, change);
+                    self.set_draft(
+                        &d,
+                        &s,
+                        Some(Draft::Set {
+                            value: v,
+                            policy: true,
+                        }),
+                    );
                 }
             }
-            Action::Forget(key) => {
-                if setting(&key).is_some_and(|s| model::saved(&s).is_some()) {
-                    self.page
-                        .drafts
-                        .entry(id)
-                        .or_default()
-                        .insert(key, Change::Forget);
+            Action::ForgetSetting(k) if !busy => {
+                self.menu = None;
+                if let Some(s) = self.setting(&d, k) {
+                    self.set_draft(&d, &s, Some(Draft::Forget));
                 }
             }
-            Action::Undo(key) => {
-                if let Some(drafts) = self.page.drafts.get_mut(&id) {
-                    drafts.remove(&key);
+            Action::SettingsRefresh if self.can_refresh(&d) => {
+                let spot = Spot::SettingsNote(key.0.clone(), key.1);
+                self.notes.remove(&spot);
+                self.run(
+                    adapter,
+                    Kind::Device(id, spot),
+                    Command::Refresh(Target::Id(id)),
+                );
+            }
+            Action::SettingsReload => {
+                if !self.running(adapter, |k| matches!(k, Kind::SettingsList(x) if *x == id)) {
+                    self.list_settings(adapter, id);
                 }
             }
-            Action::Discard => {
-                if let Some(drafts) = self.page.drafts.get_mut(&id) {
-                    drafts.clear();
-                }
+            Action::SettingsReapply if !busy => {
+                let sent: Vec<(String, Draft)> = self
+                    .settings_of(&d)
+                    .into_iter()
+                    .filter(|s| {
+                        matches!(model::applied(s), Some(Err(_)))
+                            && self.draft_of(&d, &s.key).is_none()
+                    })
+                    .filter_map(|s| {
+                        let v = model::saved(&s)?;
+                        Some((
+                            s.key.clone(),
+                            Draft::Set {
+                                value: v,
+                                policy: true,
+                            },
+                        ))
+                    })
+                    .collect();
+                self.send_settings(&d, sent);
             }
-            Action::SaveAll => {
-                let changes = self.changes(id, &settings);
-                if changes.is_empty() {
-                    return;
-                }
-                let mut set = Vec::new();
-                let mut forget = Vec::new();
-                for (key, change) in &changes {
-                    match change {
-                        Change::Set { value, .. } => set.push((key.clone(), value.clone())),
-                        Change::Forget => forget.push(key.clone()),
-                    }
-                }
-                self.page.job_note.clear();
-                let mut job = Job::new(Command::SettingsSave {
-                    device: id,
-                    set,
-                    forget,
-                });
-                job.save = Some(changes.into_iter().map(|(k, _)| k).collect());
-                self.execute_job(job);
+            Action::SettingsDiscard if !self.submitting(&d) => {
+                self.setting_drafts.remove(&key);
+                self.editing = None;
+                self.notes.remove(&Spot::SettingsNote(key.0, key.1));
             }
-            _ => {}
+            Action::SettingsSave => {
+                self.commit_editing();
+                self.save_settings(adapter, id);
+            }
+            _ => return false,
         }
+        true
     }
 
-    /// Records a settings command's outcome on the page: a stored Save drops
-    /// the drafts it sent, unless they were edited since.
-    pub(super) fn settings_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
-        let Command::SettingsSave {
-            device,
-            set,
-            forget,
-            ..
-        } = &job.command
-        else {
+    /// Saves the device's staged settings.
+    pub(super) fn save_settings(&mut self, adapter: &str, id: u32) {
+        let Some(d) = self.device(adapter, id).cloned() else {
             return;
         };
+        let (changes, invalid) = self.setting_changes(&d);
+        if self.form_busy(&d) || invalid || changes.is_empty() {
+            return;
+        }
+        let sent: Vec<(String, Draft)> = changes
+            .into_iter()
+            .filter_map(|(k, _)| Some((k.clone(), self.draft_of(&d, &k)?.clone())))
+            .collect();
+        self.send_settings(&d, sent);
+    }
+
+    fn send_settings(&mut self, d: &DeviceView, sent: Vec<(String, Draft)>) {
+        if sent.is_empty() {
+            return;
+        }
+        let settings = self.settings_of(d);
+        let mut set = Vec::new();
+        let mut forget = Vec::new();
+        for (k, draft) in &sent {
+            let Some(s) = settings.iter().find(|s| s.key == *k) else {
+                continue;
+            };
+            match change_of(s, Some(draft)) {
+                Ok(Some(Change::Set(v))) => set.push((k.clone(), v)),
+                Ok(Some(Change::Forget)) => forget.push(k.clone()),
+                _ => {}
+            }
+        }
+        let key = (d.adapter.clone(), d.d.id);
+        self.submissions.insert(
+            key.clone(),
+            Submission {
+                running: true,
+                keys: sent.iter().map(|(k, _)| k.clone()).collect(),
+                error: None,
+                unknown: false,
+            },
+        );
+        self.notes.remove(&Spot::SettingsNote(key.0.clone(), key.1));
+        self.run(
+            &key.0,
+            Kind::SettingsSave {
+                device: key.1,
+                sent,
+            },
+            Command::SettingsSave {
+                device: key.1,
+                set,
+                forget,
+            },
+        );
+    }
+
+    pub(super) fn settings_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
+        let Kind::SettingsSave { device, sent } = &job.kind else {
+            return;
+        };
+        let key = (job.adapter.clone(), *device);
         match result {
             Ok(_) => {
-                if let Some(drafts) = self.page.drafts.get_mut(device) {
-                    for (key, value) in set {
-                        if matches!(drafts.get(key), Some(Change::Set { value: v, .. }) if v == value)
-                        {
-                            drafts.remove(key);
+                self.submissions.remove(&key);
+                if let Some(drafts) = self.setting_drafts.get_mut(&key) {
+                    for (k, draft) in sent {
+                        // A draft changed since it was sent stays staged.
+                        if drafts.get(k) == Some(draft) {
+                            drafts.remove(k);
                         }
                     }
-                    for key in forget {
-                        if drafts.get(key) == Some(&Change::Forget) {
-                            drafts.remove(key);
-                        }
+                    if drafts.is_empty() {
+                        self.setting_drafts.remove(&key);
                     }
-                }
-                if *device == self.page.device {
-                    self.page.job_note.clear();
                 }
             }
             Err(e) => {
-                let words = text::error_words(e);
-                let name = self.label(crate::view::Item::Device(*device));
-                self.note(
-                    super::activity::Kind::Bad,
-                    format!("Couldn't save the settings of {name}: {words}"),
-                );
-                if *device == self.page.device {
-                    self.page.job_note = format!("✕ Couldn't Save: {words}");
-                    self.page.job_look = err();
+                let unknown = e
+                    .dongle
+                    .as_ref()
+                    .is_some_and(|w| w.code() == ErrorCode::StorageFailed && w.outcome_unknown)
+                    || words::failure(e) == words::CLOSED;
+                let text = match words::failure(e) {
+                    t if t.is_empty() => words::SETTINGS_SAVE_FAILED.to_owned(),
+                    t => t,
+                };
+                if let Some(s) = self.submissions.get_mut(&key) {
+                    s.running = false;
+                    s.error = Some(text);
+                    s.unknown = unknown;
                 }
             }
         }
     }
 
-    /// Selects the next or previous visible setting row.
-    pub(super) fn move_setting(&mut self, delta: isize) {
-        let Some(st) = self.state() else {
+    /// Ends typing a number: the typed text becomes the row's draft.
+    pub(super) fn commit_editing(&mut self) {
+        let Some(k) = self.editing.take() else {
             return;
         };
-        let keys = self.visible_keys(st.settings_of(self.page.device));
-        if keys.is_empty() {
+        let super::Page::Device(adapter, id) = self.shown() else {
             return;
+        };
+        let Some(d) = self.device(&adapter, id).cloned() else {
+            return;
+        };
+        let Some(s) = self.setting(&d, &k) else {
+            return;
+        };
+        let typed = self.form.value();
+        match parse_typed(&s, &typed) {
+            Some(v) => self.edit(&d, &s, v),
+            None => self.set_draft(&d, &s, Some(Draft::Typed(typed))),
         }
-        let i = match self
-            .page
-            .key
-            .as_ref()
-            .and_then(|k| keys.iter().position(|x| x == k))
+    }
+
+    /// Ends typing a number and drops the row's draft, as Esc does.
+    pub(super) fn revert_editing(&mut self) {
+        let Some(k) = self.editing.take() else {
+            return;
+        };
+        if let super::Page::Device(adapter, id) = self.shown()
+            && let Some(d) = self.device(&adapter, id).cloned()
+            && let Some(s) = self.setting(&d, &k)
         {
-            None if delta < 0 => keys.len() - 1,
-            None => 0,
-            Some(i) => i.saturating_add_signed(delta).min(keys.len() - 1),
-        };
-        self.page.key = Some(keys[i].clone());
-        self.page.editor_scroll = 0;
-        self.page.reveal = true;
-        self.focus = None;
-    }
-
-    /// Left and Right edit the selected setting: the previous or next choice,
-    /// or a fine step. Space switches between On and Off.
-    pub(super) fn edit_selected(&mut self, delta: i64, toggle: bool) {
-        let Some(st) = self.state() else {
-            return;
-        };
-        let Some(s) = self
-            .page
-            .key
-            .as_ref()
-            .and_then(|k| {
-                st.settings_of(self.page.device)
-                    .iter()
-                    .find(|s| s.key == *k)
-            })
-            .cloned()
-        else {
-            return;
-        };
-        let value = self.edit_value(&s);
-        let choices = model::choices(&s);
-        let key = s.key.clone();
-        let action = match model::kind(&s) {
-            Some(Type::Bool) => {
-                let next = match (value, toggle) {
-                    (Some(Value::Bool(b)), true) => !b,
-                    (_, true) => true,
-                    // On comes first: Left chooses On and Right Off.
-                    (_, false) => delta < 0,
-                };
-                Action::Draft(key, Value::Bool(next))
-            }
-            _ if key == keys::WHEEL_THRESHOLD && toggle => {
-                let on = matches!(value, Some(Value::Integer(n)) if n != SMARTSHIFT_OFF);
-                let next = if on {
-                    Value::Integer(SMARTSHIFT_OFF)
-                } else {
-                    smartshift_on(&s, value.as_ref())
-                };
-                Action::Switch(key, next)
-            }
-            _ if toggle => return,
-            _ if !choices.is_empty() => {
-                let n = choices.len() as i64;
-                let at = choices.iter().position(|c| Some(c) == value.as_ref());
-                let i = match at {
-                    Some(i) => (i as i64 + delta).clamp(0, n - 1),
-                    None if delta < 0 => n - 1,
-                    None => 0,
-                };
-                Action::Draft(key, choices[i as usize].clone())
-            }
-            Some(Type::Integer) => {
-                if key == keys::WHEEL_THRESHOLD
-                    && !matches!(value, Some(Value::Integer(n)) if n != SMARTSHIFT_OFF)
-                {
-                    return;
-                }
-                let (fine, _) = steps(&s);
-                Action::Step(key, delta.signum() * fine)
-            }
-            _ => return,
-        };
-        self.action(action);
-    }
-
-    /// Backspace drops the selected setting's staged change.
-    pub(super) fn undo_selected(&mut self) {
-        if let Some(key) = self.page.key.clone() {
-            self.action(Action::Undo(key));
+            self.set_draft(&d, &s, None);
         }
     }
-}
 
-/// The threshold SmartShift turns On with: the one shown, else the saved or
-/// read one, else the highest.
-fn smartshift_on(s: &p::Setting, value: Option<&Value>) -> Value {
-    [value.cloned(), model::saved(s), model::current(s)]
-        .into_iter()
-        .flatten()
-        .find(|v| matches!(v, Value::Integer(k) if (1..SMARTSHIFT_OFF).contains(k)))
-        .unwrap_or(Value::Integer(SMARTSHIFT_OFF - 1))
-}
-
-/// Fine and coarse increments around an integer value, and the range ends.
-fn stepper(b: &mut Layout, key: &str, s: &p::Setting, bounds: Bounds, value: Option<&Value>) {
-    let (fine, mut coarse) = steps(s);
-    if let (Some(min), Some(max)) = (bounds.min, bounds.max)
-        && (max - min) / fine <= 20
-    {
-        coarse = 0;
+    /// Steps the highlighted setting's value, or moves its choice, by `delta`; false when the
+    /// highlight isn't on a setting.
+    pub(super) fn adjust_focused(&mut self, delta: i64) -> bool {
+        let Some(focus) = self.focus.clone() else {
+            return false;
+        };
+        let super::Page::Device(adapter, id) = self.shown() else {
+            return false;
+        };
+        let key = match &focus {
+            Action::SettingStep(k, _) | Action::SettingEdit(k) => k.clone(),
+            Action::SettingChoice(k, _) | Action::SettingSelect(k) | Action::SettingBool(k, _) => {
+                k.clone()
+            }
+            _ => return false,
+        };
+        let Some(d) = self.device(&adapter, id).cloned() else {
+            return false;
+        };
+        let Some(s) = self.setting(&d, &key) else {
+            return false;
+        };
+        if self.form_busy(&d) {
+            return true;
+        }
+        let choices = model::choices(&s);
+        let shown = self.shown_value(&d, &s);
+        if model::kind(&s) == Some(Type::Bool) {
+            self.edit(&d, &s, Value::Bool(delta > 0));
+        } else if !choices.is_empty() {
+            let i = shown
+                .as_ref()
+                .and_then(|v| choices.iter().position(|c| c == v));
+            let n = choices.len() as i64;
+            let next = match i {
+                Some(i) => (i as i64 + delta).clamp(0, n - 1),
+                None if delta > 0 => 0,
+                None => n - 1,
+            };
+            self.edit(&d, &s, choices[next as usize].clone());
+            self.focus = match &focus {
+                Action::SettingChoice(..) => {
+                    Some(Action::SettingChoice(key, choices[next as usize].clone()))
+                }
+                other => Some(other.clone()),
+            };
+        } else if model::kind(&s) == Some(Type::Integer) {
+            let v = step_value(bounds(&s), shown.as_ref(), delta);
+            self.edit(&d, &s, v);
+        }
+        true
     }
-    let n = match value {
-        Some(Value::Integer(n)) => Some(*n),
-        _ => None,
-    };
-    let at_min = n.is_some_and(|n| bounds.min.is_some_and(|m| n <= m));
-    let at_max = n.is_some_and(|n| bounds.max.is_some_and(|m| n >= m));
-    b.line(styled(pad_str(key, EDITOR_KEY - 1), dim())); // Buttons add a space.
-    let control = |b: &mut Layout, label: String, delta: i64, enabled: bool| {
-        button_if(
-            b,
-            &label,
-            Action::Step(s.key.clone(), delta),
-            Tone::Normal,
-            enabled,
+
+    fn marker(&self, d: &DeviceView, s: &p::Setting, busy: bool) -> Marker {
+        let key = &s.key;
+        let fresh = Self::settings_current(d) && model::current(s).is_some();
+        let can_keep = fresh && !busy && model::current(s).is_some_and(|v| model::accepts(s, &v));
+        let forget = (
+            "Forget Saved Value",
+            (!busy).then(|| Action::ForgetSetting(key.clone())),
         );
-    };
-    if coarse > 0 {
-        control(b, format!("−{coarse}"), -coarse, !at_min);
+        let staged = !matches!(change_of(s, self.draft_of(d, key)), Ok(None));
+        if staged {
+            return Marker {
+                text: "✎ Changed",
+                look: accent(),
+                items: vec![("Undo Change", (!busy).then(|| Action::Undo(key.clone())))],
+            };
+        }
+        if model::saved(s).is_none() {
+            return Marker {
+                text: "○ Not Saved",
+                look: dim(),
+                items: vec![(
+                    "Save Current Value",
+                    can_keep.then(|| Action::Keep(key.clone())),
+                )],
+            };
+        }
+        match model::applied(s) {
+            Some(Ok(SettingState::ChangedOnDevice)) => Marker {
+                text: "◆ Changed on Device",
+                look: warn(),
+                items: vec![
+                    (
+                        "Save Device Value",
+                        can_keep.then(|| Action::Keep(key.clone())),
+                    ),
+                    forget,
+                ],
+            },
+            Some(Err(_)) => Marker {
+                text: "▲ Failed",
+                look: warn(),
+                items: vec![forget],
+            },
+            Some(Ok(SettingState::Unsupported)) => Marker {
+                text: "▲ Can't Apply Now",
+                look: warn(),
+                items: vec![forget],
+            },
+            _ => Marker {
+                text: "● Saved",
+                look: ok(),
+                items: vec![forget],
+            },
+        }
     }
-    control(b, format!("−{fine}"), -fine, !at_min);
-    b.label(
-        &n.map_or_else(|| "—".into(), |n| n.to_string()),
-        layout::bold(),
-    );
-    control(b, format!("+{fine}"), fine, !at_max);
-    if coarse > 0 {
-        control(b, format!("+{coarse}"), coarse, !at_max);
+
+    /// The control of one setting.
+    fn control(&self, d: &DeviceView, s: &p::Setting, busy: bool, w: usize) -> Layout {
+        let mut c = Layout::new(w);
+        let key = &s.key;
+        let fresh = Self::settings_current(d) && model::current(s).is_some();
+        let stale = if fresh { Style::new() } else { dim() };
+        let shown = self.shown_value(d, s);
+        let choices = model::choices(s);
+        let kind = model::kind(s);
+        let text_only = matches!(kind, Some(Type::Text | Type::Color))
+            || (kind == Some(Type::Enum) && choices.is_empty());
+        if text_only {
+            let v = model::current(s);
+            let unit = display_unit(key, v.as_ref());
+            let mut text = value_text(key, v.as_ref());
+            if !unit.is_empty() {
+                text = format!("{text} {unit}");
+            }
+            c.label(&text, stale);
+            return c;
+        }
+        if kind == Some(Type::Bool) {
+            let on = match &shown {
+                Some(Value::Bool(b)) => Some(*b),
+                _ => None,
+            };
+            let next = on.is_none_or(|on| !on);
+            return layout::switch(on, Action::SettingBool(key.clone(), next), !busy);
+        }
+        if is_smartshift(s) {
+            let on = !matches!(shown, Some(Value::Integer(SMARTSHIFT_OFF)));
+            return layout::switch(Some(on), Action::SmartShift(key.clone(), !on), !busy);
+        }
+        if !choices.is_empty() {
+            let labels: Vec<String> = choices.iter().map(|v| value_text(key, Some(v))).collect();
+            let short = choices.len() <= 3
+                && labels.iter().map(|l| l.chars().count()).sum::<usize>() <= 24
+                && shown.as_ref().is_some_and(|v| choices.contains(v));
+            if short {
+                for (v, label) in choices.iter().zip(labels) {
+                    let chosen = shown.as_ref() == Some(v);
+                    let text = if chosen {
+                        format!("[● {label}]")
+                    } else {
+                        format!("[○ {label}]")
+                    };
+                    let look = match () {
+                        _ if busy => dim(),
+                        _ if chosen => Tone::Chosen.style(),
+                        _ => Tone::Normal.style(),
+                    };
+                    let x = layout::line_width(c.lines.last().unwrap_or(&Line::default()));
+                    let x = if x > 0 { x + 1 } else { 0 };
+                    if c.lines.is_empty() {
+                        c.row();
+                    }
+                    let y = c.lines.len() - 1;
+                    if x > 0 {
+                        c.lines[y].spans.push(span(" ", Style::new()));
+                    }
+                    let tw = text::width(&text);
+                    c.lines[y].spans.push(span(text, look));
+                    if !busy {
+                        c.hits.push(layout::Hit {
+                            x,
+                            y,
+                            w: tw,
+                            action: Action::SettingChoice(key.clone(), v.clone()),
+                        });
+                    }
+                }
+                c.width = layout::line_width(&c.lines[0]);
+                return c;
+            }
+            let text = format!("{} ▾", value_text(key, shown.as_ref()));
+            if busy {
+                c.disabled(&text);
+            } else {
+                c.button(&text, Action::SettingSelect(key.clone()), Tone::Normal);
+            }
+            return c;
+        }
+        self.stepper(&mut c, d, s, busy);
+        c
     }
-    let unit = catalog::unit(&s.key);
-    if !unit.is_empty() {
-        b.label(unit, dim());
+
+    /// An integer's stepper: down, the value (typed when clicked), up and the unit.
+    fn stepper(&self, c: &mut Layout, d: &DeviceView, s: &p::Setting, busy: bool) {
+        let key = &s.key;
+        let shown = self.shown_value(d, s);
+        button_if(
+            c,
+            "-",
+            Action::SettingStep(key.clone(), -1),
+            Tone::Normal,
+            !busy,
+        );
+        if self.editing.as_deref() == Some(key.as_str()) {
+            let mut form = self.form.clone();
+            let line = super::keys::edit_line(&mut form, true, 8);
+            let y = c.lines.len() - 1;
+            c.lines[y].spans.push(span(" ", Style::new()));
+            c.lines[y].spans.extend(line.spans);
+        } else {
+            let text = match self.draft_of(d, key) {
+                Some(Draft::Typed(t)) => t.clone(),
+                _ => value_text(key, shown.as_ref()),
+            };
+            button_if(
+                c,
+                &text,
+                Action::SettingEdit(key.clone()),
+                Tone::Normal,
+                !busy,
+            );
+        }
+        button_if(
+            c,
+            "+",
+            Action::SettingStep(key.clone(), 1),
+            Tone::Normal,
+            !busy,
+        );
+        let unit = display_unit(key, shown.as_ref());
+        if !unit.is_empty() {
+            c.label(unit, dim());
+        }
+        c.width = c.lines.iter().map(layout::line_width).max().unwrap_or(0);
     }
-    if let (Some(min), Some(max)) = (bounds.min, bounds.max) {
-        b.line(Line::from(pad_str("", EDITOR_KEY - 1)));
-        let draft = |n| Action::Draft(s.key.clone(), Value::Integer(n));
-        button_if(b, &format!("Min {min}"), draft(min), Tone::Normal, !at_min);
-        button_if(b, &format!("Max {max}"), draft(max), Tone::Normal, !at_max);
+
+    /// The Settings tab.
+    pub(super) fn device_settings(&mut self, d: &DeviceView, v: &mut PageView) {
+        let settings = self.settings_of(d);
+        let readings: Vec<p::Info> = readings(&d.d).into_iter().cloned().collect();
+        let figures = words::wheel_figures(&d.d.info);
+        let busy = self.form_busy(d);
+        let key = (d.adapter.clone(), d.d.id);
+        let submission = self.submissions.get(&key).cloned();
+        let mut categories: Vec<&'static str> = Vec::new();
+        for k in settings
+            .iter()
+            .map(|s| s.key.as_str())
+            .chain(readings.iter().map(|i| i.key.as_str()))
+        {
+            let c = catalog::category(k);
+            if !categories.contains(&c) {
+                categories.push(c);
+            }
+        }
+        if !figures.is_empty() && !categories.contains(&"Wheel") {
+            categories.push("Wheel");
+        }
+        let w = v.body.width;
+        let b = &mut v.body;
+        for category in categories {
+            b.section(category);
+            for s in settings
+                .iter()
+                .filter(|s| catalog::category(&s.key) == category)
+            {
+                let label = Line::from(span(catalog::label(&s.key), Style::new()));
+                let mut group = self.control(d, s, busy, w.saturating_sub(4));
+                if group.lines.is_empty() {
+                    group.row();
+                }
+                let marker = self.marker(d, s, busy);
+                let saving = submission
+                    .as_ref()
+                    .is_some_and(|sub| sub.running && sub.keys.contains(&s.key));
+                let (mark_text, mark_look) = if saving {
+                    (format!("{} Sending", super::spinner()), accent())
+                } else {
+                    (marker.text.to_owned(), marker.look)
+                };
+                group.width = w.saturating_sub(4);
+                let mut mark = Layout::new(group.width);
+                mark.lines
+                    .push(Line::from(span(format!(" {mark_text}"), mark_look)));
+                if !saving {
+                    mark.hits.push(layout::Hit {
+                        x: 1,
+                        y: 0,
+                        w: text::width(&mark_text),
+                        action: Action::Marker(s.key.clone()),
+                    });
+                }
+                group.append(mark);
+                b.labelled(label, group);
+                if is_smartshift(s)
+                    && !matches!(self.shown_value(d, s), Some(Value::Integer(SMARTSHIFT_OFF)))
+                {
+                    let mut c = Layout::new(w);
+                    self.stepper(&mut c, d, s, busy);
+                    b.labelled(styled("  SmartShift Threshold", Style::new()), c);
+                }
+                let mut notes: Vec<(String, Style)> = Vec::new();
+                if let Some(sub) = &submission
+                    && !sub.running
+                    && sub.keys.contains(&s.key)
+                    && let Some(e) = &sub.error
+                {
+                    let text = if sub.unknown {
+                        e.clone()
+                    } else {
+                        format!("Couldn't Save: {e}")
+                    };
+                    notes.push((text, err()));
+                }
+                if change_of(s, self.draft_of(d, &s.key)).is_err() {
+                    notes.push((range_text(s), err()));
+                }
+                let fresh = Self::settings_current(d) && model::current(s).is_some();
+                if model::saved(s).is_some()
+                    && model::applied(s) == Some(Ok(SettingState::ChangedOnDevice))
+                    && fresh
+                {
+                    let reading = model::current(s);
+                    notes.push((
+                        format!("Device: {}", value_text(&s.key, reading.as_ref())),
+                        dim(),
+                    ));
+                }
+                if let Some(Err(code)) = model::applied(s) {
+                    notes.push((words::code_text(code), dim()));
+                }
+                if !notes.is_empty() {
+                    let mut line = Line::from(span("  ", Style::new()));
+                    for (i, (text, look)) in notes.into_iter().enumerate() {
+                        if i > 0 {
+                            line.spans.push(span(" · ", dim()));
+                        }
+                        line.spans.push(span(text, look));
+                    }
+                    b.line(line);
+                }
+            }
+            let look = if d.connected() { Style::new() } else { dim() };
+            for i in readings
+                .iter()
+                .filter(|i| catalog::category(&i.key) == category)
+            {
+                let value = i.value.as_ref().and_then(|v| v.value.clone());
+                let mut text = match &value {
+                    Some(Value::Text(t)) => text::display(&catalog::choice_words(&i.key, t)),
+                    v => value_text(&i.key, v.as_ref()),
+                };
+                let unit = display_unit(&i.key, value.as_ref());
+                if !unit.is_empty() {
+                    text = format!("{text} {unit}");
+                }
+                b.labelled(styled(catalog::label(&i.key), Style::new()), {
+                    let mut r = Layout::new(w);
+                    r.label(&text, look);
+                    r.width = text::width(&text);
+                    r
+                });
+            }
+            if category == "Wheel" {
+                for (label, value) in &figures {
+                    b.fact(label, value, look);
+                }
+            }
+        }
+
+        // The bar.
+        let bar = &mut v.bar;
+        let saving = submission.as_ref().is_some_and(|s| s.running);
+        let starting = d.connected() && model::hidpp_up(&d.d) == model::Up::Starting;
+        if saving || self.refreshing(d) || starting {
+            bar.label(&format!("{}", super::spinner()), accent());
+        }
+        let note = self
+            .notes
+            .get(&Spot::SettingsNote(key.0.clone(), key.1))
+            .cloned()
+            .or_else(|| {
+                submission
+                    .as_ref()
+                    .filter(|s| !s.running && s.error.is_some() && !s.unknown)
+                    .map(|s| format!("Couldn't Save {}", s.keys.len()))
+            })
+            .or_else(|| match model::hidpp_up(&d.d) {
+                model::Up::Error(code) => Some(words::code_text(code)),
+                _ => None,
+            });
+        if let Some(note) = note {
+            bar.para(&note, err());
+        }
+        if self.settings_errors.contains_key(&key) {
+            bar.para(words::SETTINGS_READ_FAILED, dim());
+            let reloading = self.running(
+                &d.adapter,
+                |k| matches!(k, Kind::SettingsList(x) if *x == d.d.id),
+            );
+            button_if(
+                bar,
+                "Retry",
+                Action::SettingsReload,
+                Tone::Normal,
+                !reloading,
+            );
+        }
+        let mut right = Layout::new(bar.width);
+        button_if(
+            &mut right,
+            "Refresh",
+            Action::SettingsRefresh,
+            Tone::Normal,
+            self.can_refresh(d),
+        );
+        let failed: Vec<p::Setting> = settings
+            .iter()
+            .filter(|s| matches!(model::applied(s), Some(Err(_))) && model::saved(s).is_some())
+            .cloned()
+            .collect();
+        if !failed.is_empty() {
+            let any_free = failed.iter().any(|s| self.draft_of(d, &s.key).is_none());
+            button_if(
+                &mut right,
+                "Retry",
+                Action::SettingsReapply,
+                Tone::Normal,
+                !busy && any_free,
+            );
+        }
+        let dirty = self.settings_dirty(d);
+        let (changes, invalid) = self.setting_changes(d);
+        button_if(
+            &mut right,
+            "Discard",
+            Action::SettingsDiscard,
+            Tone::Normal,
+            !self.submitting(d) && dirty,
+        );
+        button_if(
+            &mut right,
+            "Save",
+            Action::SettingsSave,
+            Tone::Primary,
+            !busy && !changes.is_empty() && !invalid,
+        );
+        bar.align_right(right);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::catalog::tests::{boolean, integer};
 
     #[test]
-    fn steps_snap_to_the_range() {
-        let s = integer(keys::BACKLIGHT_DELAY_POWERED, 5, 300, 5);
-        assert_eq!(steps(&s), (5, 50));
-        let b = bounds(&s);
-        assert_eq!(
-            step_value(b, Some(&Value::Integer(12)), 5),
-            Value::Integer(15)
-        );
-        assert_eq!(
-            step_value(b, Some(&Value::Integer(12)), -5),
-            Value::Integer(10)
-        );
-        assert_eq!(
-            step_value(b, Some(&Value::Integer(10)), -50),
-            Value::Integer(5)
-        );
-        assert_eq!(step_value(b, None, -5), Value::Integer(300));
-        assert_eq!(step_value(b, None, 5), Value::Integer(5));
-    }
-
-    #[test]
-    fn auto_off_reads_never_at_zero() {
-        let s = integer(keys::POWER_AUTO_OFF, 0, 15300, 60);
-        assert_eq!(steps(&s), (60, 600));
-        assert_eq!(human_value(&s.key, Some(&Value::Integer(0))), "Never");
-        assert_eq!(human_value(&s.key, Some(&Value::Integer(600))), "600 s");
-    }
-
-    #[test]
-    fn staged_changes_compare_with_what_the_device_keeps() {
-        let mut s = boolean(keys::WHEEL_INVERT);
-        let set_type = |s: &mut p::Setting, value: Option<bool>, saved: Option<bool>| {
-            s.r#type = Some(p::setting::Type::Bool(p::BoolSetting { value, saved }));
+    fn steps_stay_in_range_at_the_limits() {
+        let b = Bounds {
+            min: Some(i64::MIN),
+            max: Some(i64::MAX),
+            step: i64::MAX,
+            base: i64::MIN,
         };
-        set_type(&mut s, Some(false), None);
-        let set = |v: bool, policy| Change::Set {
-            value: Value::Bool(v),
-            policy,
-        };
-        // Unsaved: choosing the reading is no change, but saving it is.
-        assert_eq!(effective(&s, Some(&set(false, false))), None);
         assert_eq!(
-            effective(&s, Some(&set(false, true))),
-            Some(set(false, true))
+            step_value(b, Some(&Value::Integer(i64::MAX)), 1),
+            Value::Integer(i64::MAX),
+            "a reading above the highest step isn't lowered"
         );
-        assert_eq!(effective(&s, Some(&Change::Forget)), None);
-        // Saved: the saved value is what counts, and forgetting is a change.
-        set_type(&mut s, Some(false), Some(true));
-        s.status = Some(p::setting::Status::State(SettingState::Applied as i32));
-        assert_eq!(effective(&s, Some(&set(true, false))), None);
         assert_eq!(
-            effective(&s, Some(&set(false, false))),
-            Some(set(false, false))
+            step_value(b, Some(&Value::Integer(i64::MIN)), -1),
+            Value::Integer(i64::MIN)
         );
-        assert_eq!(effective(&s, Some(&Change::Forget)), Some(Change::Forget));
-        // A value the setting doesn't take is never sent.
-        let wrong = Change::Set {
-            value: Value::Integer(1),
-            policy: true,
+        let b = Bounds {
+            min: Some(200),
+            max: Some(4000),
+            step: 50,
+            base: 200,
         };
-        assert_eq!(effective(&s, Some(&wrong)), None);
+        assert_eq!(
+            step_value(b, Some(&Value::Integer(1025)), 1),
+            Value::Integer(1050)
+        );
+        assert_eq!(
+            step_value(b, Some(&Value::Integer(1025)), -1),
+            Value::Integer(1000)
+        );
+        assert_eq!(
+            step_value(b, Some(&Value::Integer(4000)), 1),
+            Value::Integer(4000)
+        );
+        let b = Bounds {
+            max: Some(4010),
+            ..b
+        };
+        assert_eq!(
+            step_value(b, Some(&Value::Integer(3950)), 1),
+            Value::Integer(4000),
+            "the highest value on the steps"
+        );
     }
 }

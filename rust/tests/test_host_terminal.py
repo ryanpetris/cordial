@@ -27,8 +27,8 @@ class Terminal(unittest.TestCase):
         self.stream = pyte.ByteStream(self.screen)
         self.transcript = bytearray()
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 38, 100, 0, 0))
-        # This path is deliberately not a TTY or a device. Enumerating the chooser
-        # may read OS metadata, but automatic reconnect is disabled after failure.
+        # This path is deliberately not a TTY or a device, so the TUI finds no adapter and
+        # the shell's open fails.
         port = str(Path(__file__).resolve().parent / "not-a-serial-device")
         assert not Path(port).exists()
         self.process = subprocess.Popen([BINARY, "--port", port] + (["tui"] if tui else []),
@@ -73,7 +73,7 @@ class Terminal(unittest.TestCase):
 
     def test_tui_ctrl_c_restores_terminal_after_failed_open(self):
         self.start(True)
-        self.wait_text("Choose Adapter")
+        self.wait_text("No Adapter Found")
         os.write(self.master, b"\x03")
         self.exited(0)
         self.assertIn(b"\x1b[?1003h", self.transcript)
@@ -83,7 +83,7 @@ class Terminal(unittest.TestCase):
         for sig in (signal.SIGINT, signal.SIGTERM):
             with self.subTest(signal=sig):
                 self.start(True)
-                self.wait_text("Choose Adapter")
+                self.wait_text("No Adapter Found")
                 self.process.send_signal(sig)
                 self.exited(0)
                 self.doCleanups()
@@ -92,7 +92,7 @@ class Terminal(unittest.TestCase):
         import fcntl
         import termios
         self.start(True)
-        self.wait_text("Choose Adapter")
+        self.wait_text("No Adapter Found")
         os.write(self.master, b"?")
         self.wait_text("Help")
         fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 10, 40, 0, 0))

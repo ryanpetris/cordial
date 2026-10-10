@@ -192,7 +192,6 @@ function trayMenu(model: TrayModel, state: AppState): Menu {
   const items: MenuItemConstructorOptions[] = [];
   for (const reason of model.attention) items.push({ label: label(reason), enabled: false });
   if (model.attention.length) items.push({ type: "separator" });
-  const anyDevices = model.groups.some((g) => g.devices.length);
   for (const group of model.groups) {
     if (group.title) items.push({ label: label(group.title), enabled: false });
     for (const d of group.devices)
@@ -206,7 +205,7 @@ function trayMenu(model: TrayModel, state: AppState): Menu {
         ],
       });
   }
-  if (!anyDevices) items.push({ label: state.adapters.length ? "No Saved Devices" : "No Adapter Connected", enabled: false });
+  if (model.empty) items.push({ label: model.empty, enabled: false });
   items.push(
     { type: "separator" },
     {

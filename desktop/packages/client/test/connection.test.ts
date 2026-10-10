@@ -160,6 +160,22 @@ describe("Connection", () => {
     await expect(all).rejects.toBeInstanceOf(UnexpectedResponseError);
   });
 
+  it("continues a listing after the last entry of a known kind", async () => {
+    const { peer, connection } = await open();
+    const all = connection.listAllDevices();
+    const devices = (entries: object[], end = false) => ({ kind: { case: "response", value: { result: { case: "devices", value: { entries, end } } } } }) as never;
+    const newer = { entry: { case: undefined } };
+    await Promise.resolve();
+    peer.send(devices([{ entry: { case: "device", value: { id: 3 } } }, newer]));
+    await new Promise((r) => setTimeout(r, 0));
+    peer.send(devices([newer, { entry: { case: "unreadable", value: 5 } }, newer]));
+    await new Promise((r) => setTimeout(r, 0));
+    peer.send(devices([newer]));
+    await expect(all).rejects.toBeInstanceOf(UnexpectedResponseError);
+    const afters = peer.requests.flatMap((r) => (r.command.case === "listDevices" ? [r.command.value.after] : []));
+    expect(afters).toEqual([0, 3, 5]);
+  });
+
   it("answers profile creation with the new ID", async () => {
     const { peer, connection } = await open();
     const created = connection.createProfile("Work");
@@ -214,6 +230,19 @@ describe("Connection", () => {
     expect(await queued).toBeInstanceOf(ConnectionClosedError);
     expect(closed).toHaveBeenCalledOnce();
     await expect(connection.getStatus()).rejects.toBeInstanceOf(ConnectionClosedError);
+  });
+
+  it("fails to open when the session ends right after the first response", async () => {
+    const peer = new Peer();
+    const closed = vi.fn();
+    peer.onRequest = () =>
+      queueMicrotask(() => {
+        peer.send(status);
+        peer.unplug();
+      });
+    await expect(Connection.open(peer, { onClose: closed })).rejects.toBeInstanceOf(ConnectionClosedError);
+    expect(peer.closed).toBe(true);
+    expect(closed).not.toHaveBeenCalled();
   });
 
   it("fails to open, closing the stream, when nothing answers", async () => {
