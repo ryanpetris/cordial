@@ -360,7 +360,7 @@ export class Connection {
     }, ruleInput);
   }
   /** Saves and forgets rules in one write, applied in order. Success means the Dongle saved exactly
-   * what was sent; a profile_rules_changed event follows when any rule changed. */
+   * what was sent. */
   setProfileRules(update: MessageInitShape<typeof SetProfileRulesSchema>): Promise<void> {
     return this.#void({ case: "setProfileRules", value: update });
   }

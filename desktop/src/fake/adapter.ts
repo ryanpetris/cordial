@@ -1,8 +1,8 @@
 // A simulated adapter speaking the serial API over an in-memory ByteStream,
 // following the firmware's behavior: every command answers at once, and
 // changes follow as events after the response. Listings come in pages of
-// `pageSize` entries, and settings, warnings and rules events carry only what
-// changed since the client last listed or heard of them. Tests and the demo
+// `pageSize` entries, and settings and warnings events carry only what changed
+// since the client last listed or heard of them. Tests and the demo
 // mode use it; all data is synthetic.
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { compareSettingRefs, compareUsages, compareWarnings, ruleInput, settingRef, type ByteStream } from "@cordial/client";
@@ -192,7 +192,6 @@ const rolesOf = (p: FakeProfile) => ROLE_ORDER.filter((r) => p.rules.some((rule)
 const sizeOf = (p: FakeProfile) => p.size ?? PROFILE_BYTES + RULE_BYTES * p.rules.length;
 const sameUsage = (a: Usage | undefined, b: Usage | undefined) => a?.usagePage === b?.usagePage && a?.usage === b?.usage;
 const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-const encodedRule = (r: ProfileRule) => hex(toBinary(ProfileRuleSchema, r));
 
 /** The page of `list`, sorted by `compare`, whose keys follow `after`, and whether it ends the list. */
 function page<E, K>(list: E[], after: K | undefined, size: number, key: (e: E) => K, compare: (a: K, b: K) => number) {
@@ -1281,16 +1280,8 @@ export class FakeAdapter implements ByteStream {
         this.#needReady();
         const roles = rolesOf(p).join();
         const loads = this.#loads();
-        const before = new Map(p.rules.map((r) => [`${r.input?.usagePage}:${r.input?.usage}`, encodedRule(r)]));
-        const keyOf = (r: ProfileRule) => `${r.input?.usagePage}:${r.input?.usage}`;
         p.rules = rules.sort((a, b) => compareUsages(ruleInput(a), ruleInput(b)));
-        const changed = p.rules.filter((r) => before.get(keyOf(r)) !== encodedRule(r));
-        const removed = [...before.keys()].filter((k) => !p.rules.some((r) => keyOf(r) === k)).map((k) => {
-          const [usagePage, usage] = k.split(":").map(Number);
-          return { usagePage: usagePage!, usage: usage! };
-        });
         this.#reply({});
-        if (changed.length || removed.length) this.#event({ case: "profileRulesChanged", value: { profile: p.id, changed, removed } });
         if (rolesOf(p).join() !== roles) this.#event({ case: "profile", value: this.#profileRecord(p) });
         this.#reloadUsers(p.id, loads);
         return;

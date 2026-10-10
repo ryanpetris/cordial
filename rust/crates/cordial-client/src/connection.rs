@@ -493,8 +493,7 @@ impl Connection {
     }
 
     /// Saves and forgets rules in one request; the changes apply in order. Success carries no
-    /// result: the Dongle holds what was sent, and a profile_rules_changed event follows when any
-    /// rule changed.
+    /// result: the Dongle holds what was sent.
     pub fn set_profile_rules(
         &self,
         profile: u32,

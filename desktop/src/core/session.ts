@@ -516,9 +516,6 @@ export class AdapterSession {
       case "profileRemoved":
         this.#profileRemoved(kind.value.id);
         break;
-      case "profileRulesChanged":
-        // This app never shows rules; a change of roles arrives as a profile event.
-        return;
       default:
         this.#hooks.event(event);
         return;

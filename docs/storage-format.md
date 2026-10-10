@@ -314,11 +314,11 @@ For change events, the serial session tracks which settings and warnings the cli
 for devices with a connection, from the session's listings and events. A device's entry stays until
 the events that follow the end of its connection have been written, so listing disabled or
 disconnected devices keeps nothing. A settings event for a device that is not tracked reports each
-changed setting it has and removes each changed setting it no longer has. A device, settings,
-profile or rules event whose record read fails stays pending and backs off on its own with the
-connection backoff before it reads again; only its own success ends the backoff. Other events, and
-events that need no read, such as those of a connection that holds its policy, go ahead
-meanwhile. An event whose record is gone is dropped, since the record's removal event follows.
+changed setting it has and removes each changed setting it no longer has. A device, settings or
+profile event whose record read fails stays pending and backs off on its own with the connection
+backoff before it reads again; only its own success ends the backoff. Other events, and events that
+need no read, such as those of a connection that holds its policy, go ahead meanwhile. An event
+whose record is gone is dropped, since the record's removal event follows.
 
 Startup reads each device policy once, keeps a reconnection entry and loads the bond for each
 enabled device on an enabled transport that the stack has room for, in ascending ID order, and

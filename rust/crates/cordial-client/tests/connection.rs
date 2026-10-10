@@ -638,7 +638,6 @@ impl Name for p::event::Kind {
             p::event::Kind::WarningsChanged(_) => "warnings_changed",
             p::event::Kind::Profile(_) => "profile",
             p::event::Kind::ProfileRemoved(_) => "profile_removed",
-            p::event::Kind::ProfileRulesChanged(_) => "profile_rules_changed",
         }
     }
 }

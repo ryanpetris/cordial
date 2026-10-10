@@ -934,23 +934,6 @@ impl Sim {
                     return self.respond(error(code));
                 }
                 self.respond(None);
-                let rules = self.rules.get(&s.profile).cloned().unwrap_or_default();
-                let mut changed = p::ProfileRulesChanged {
-                    profile: s.profile,
-                    ..Default::default()
-                };
-                for change in &s.changes {
-                    let input = match &change.change {
-                        Some(profile_rule_change::Change::Rule(r)) => r.input,
-                        Some(profile_rule_change::Change::Forget(f)) => f.input,
-                        None => None,
-                    };
-                    match rules.iter().find(|r| r.input == input) {
-                        Some(rule) => changed.changed.push(rule.clone()),
-                        None => changed.removed.extend(input),
-                    }
-                }
-                self.event(p::event::Kind::ProfileRulesChanged(changed));
                 if self.update_roles(s.profile) {
                     let profile = self
                         .profiles

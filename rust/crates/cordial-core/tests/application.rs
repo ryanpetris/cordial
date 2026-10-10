@@ -4002,25 +4002,17 @@ fn rule_changes_apply_in_order_and_invalid_requests_save_nothing() {
 }
 
 #[test]
-fn rule_changes_are_reported_with_the_profile_roles() {
+fn rule_changes_that_change_the_roles_report_the_profile() {
     let mut t = Test::new(false);
     let id = create(&mut t, "Media");
     t.events();
     set_rules(&mut t, id, vec![remap(usage(0x0c, 0xcd), &[key(5)])]);
-    let events = t.events();
-    assert!(events.contains(&Ev::Profile(p::Profile {
+    assert!(t.events().contains(&Ev::Profile(p::Profile {
         id,
         name: "Media".into(),
         roles: vec![p::Role::ConsumerControl as i32],
     })));
-    assert!(
-        events.contains(&Ev::ProfileRulesChanged(p::ProfileRulesChanged {
-            profile: id,
-            changed: rules_of(&mut t, id),
-            removed: vec![],
-        }))
-    );
-    // A change that keeps the roles reports only the rules that changed.
+    // A change that keeps the roles reports no profile.
     set_rules(
         &mut t,
         id,
@@ -4030,16 +4022,7 @@ fn rule_changes_are_reported_with_the_profile_roles() {
             forget_rule(usage(0x0c, 0xea)),
         ],
     );
-    let events = t.events();
-    assert!(events.iter().all(|e| !matches!(e, Ev::Profile(_))));
-    let rules = rules_of(&mut t, id);
-    assert!(
-        events.contains(&Ev::ProfileRulesChanged(p::ProfileRulesChanged {
-            profile: id,
-            changed: rules,
-            removed: vec![usage(0x0c, 0xcd)],
-        }))
-    );
+    assert!(t.events().iter().all(|e| !matches!(e, Ev::Profile(_))));
 }
 
 #[test]
@@ -4527,11 +4510,6 @@ fn via_edits_the_interface_profile_for_every_device_using_it() {
     );
     assert_eq!(configure(&mut t, Interface::Via, &[5, 0, 0, 0, 0, 5])[0], 5);
     assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
-    assert!(
-        t.events()
-            .iter()
-            .any(|e| matches!(e, Ev::ProfileRulesChanged(r) if r.profile == id))
-    );
     assert_eq!(press(&mut t, link, &[4]), [5]);
     assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
     // An unsupported action changes nothing.
@@ -4734,14 +4712,8 @@ fn an_undecodable_rules_file_leaves_the_profile_empty_after_the_first_input() {
     t.poll();
     assert!(t.store.records.contains_key(&rules));
     t.now += cordial_core::deferred::QUIET_MS;
-    let events = t.events();
+    t.events();
     assert!(!t.store.records.contains_key(&rules));
-    // The lost rules are unknown, so no rule change can be reported.
-    assert!(
-        events
-            .iter()
-            .all(|e| !matches!(e, Ev::ProfileRulesChanged(_)))
-    );
     assert_eq!(rules_of(&mut t, id), []);
     assert_eq!(profile(&mut t, id).roles, Vec::<i32>::new());
     assert_eq!(t.saved(SAVED).profiles, [u64::from(id)]);
@@ -5552,7 +5524,7 @@ fn failed_event_reads_are_retried_after_a_backoff() {
     let id = create(&mut t, "Map");
     t.events();
     let reads = |t: &Test, key| t.store.reads.iter().filter(|k| **k == key).count();
-    // A disconnected device's settings event and a profile's rules event each read a record.
+    // A disconnected device's settings event and a profile event each read a record.
     /// A record the event reads, a change that marks the event, and the event.
     type Case = (
         cordial_core::storage::RecordKey,
@@ -5580,17 +5552,18 @@ fn failed_event_reads_are_retried_after_a_backoff() {
             |e, _| matches!(e, Ev::SettingsChanged(s) if s.device == SAVED),
         ),
         (
-            cordial_core::storage::record_key(cordial_core::profiles::RULES, id.into()),
+            cordial_core::storage::record_key(cordial_core::profiles::METADATA, id.into()),
             |t, id| {
+                // A change of roles marks a profile event.
                 assert_eq!(
                     t.ok(Command::SetProfileRules(p::SetProfileRules {
                         profile: id,
-                        changes: vec![remap(key(4), &[key(5)])],
+                        changes: vec![remap(usage(0x0c, 0xcd), &[key(5)])],
                     })),
                     None
                 );
             },
-            |e, id| matches!(e, Ev::ProfileRulesChanged(r) if r.profile == id),
+            |e, id| matches!(e, Ev::Profile(p) if p.id == id),
         ),
     ];
     for (record, change, event) in cases {
@@ -5729,37 +5702,45 @@ fn an_unreadable_profile_does_not_hold_up_other_events() {
     let failing = create(&mut t, "Failing");
     let other = create(&mut t, "Other");
     t.events();
-    set_rules(&mut t, failing, vec![remap(key(4), &[key(5)])]);
-    let record = cordial_core::storage::record_key(cordial_core::profiles::RULES, failing.into());
+    // A change of roles marks a profile event, which reads the profile's metadata.
+    let input = usage(0x0c, 0xcd);
+    set_rules(&mut t, failing, vec![remap(input, &[key(5)])]);
+    let record =
+        cordial_core::storage::record_key(cordial_core::profiles::METADATA, failing.into());
     t.store.fail_load = Some(record);
-    let rules = |events: &[Ev], id: u32| {
+    let profile = |events: &[Ev], id: u32| {
         events
             .iter()
-            .any(|e| matches!(e, Ev::ProfileRulesChanged(r) if r.profile == id))
+            .any(|e| matches!(e, Ev::Profile(p) if p.id == id))
     };
     let reads = |t: &Test| t.store.reads.iter().filter(|k| **k == record).count();
     let base = reads(&t);
-    assert!(!rules(&t.events(), failing));
+    assert!(!profile(&t.events(), failing));
     assert_eq!(reads(&t), base + 1);
     let mut delay = FIRST_RETRY;
     for round in 0..4 {
         let before = reads(&t);
         // Another profile's change and the device's events are written at once.
-        set_rules(&mut t, other, vec![remap(key(10 + round), &[key(20)])]);
+        let change = if round % 2 == 0 {
+            remap(input, &[key(5)])
+        } else {
+            forget_rule(input)
+        };
+        set_rules(&mut t, other, vec![change]);
         let events = t.events();
-        assert!(rules(&events, other));
-        assert!(!rules(&events, failing));
-        assert!(healthy_device_events(&mut t, round.into()));
+        assert!(profile(&events, other));
+        assert!(!profile(&events, failing));
+        assert!(healthy_device_events(&mut t, round));
         // The failing profile is read again only once its backoff has passed.
         assert_eq!(reads(&t), before);
         t.now += delay;
         delay *= 2;
-        assert!(!rules(&t.events(), failing));
+        assert!(!profile(&t.events(), failing));
         assert_eq!(reads(&t), before + 1);
     }
     t.store.fail_load = None;
     t.now += delay;
-    assert!(rules(&t.events(), failing));
+    assert!(profile(&t.events(), failing));
 }
 
 #[test]
@@ -5795,7 +5776,7 @@ fn an_unreadable_device_does_not_hold_up_other_devices_events() {
 }
 
 /// Checks that the event whose read of `record` fails waits out a doubling backoff across four
-/// rounds, while `other` makes another event of the same device or profile succeed in each, then
+/// rounds, while `other` makes another event of the same device succeed in each, then
 /// that it is written once the read succeeds. `failing` and `succeeded` find the two events.
 fn backoff_grows_across_other_events(
     t: &mut Test,
@@ -5830,36 +5811,6 @@ fn backoff_grows_across_other_events(
     t.store.fail_load = None;
     t.now += delay;
     assert!(t.events().iter().any(&failing));
-}
-
-#[test]
-fn a_profile_event_backoff_grows_across_rules_events() {
-    let mut t = Test::new(false);
-    let id = create(&mut t, "Media");
-    t.events();
-    // A change of roles marks a profile event as well as a rules event.
-    assert_eq!(
-        t.ok(Command::SetProfileRules(p::SetProfileRules {
-            profile: id,
-            changes: vec![remap(usage(0x0c, 0xcd), &[key(5)])],
-        })),
-        None
-    );
-    backoff_grows_across_other_events(
-        &mut t,
-        cordial_core::storage::record_key(cordial_core::profiles::METADATA, id.into()),
-        |t, round| {
-            assert_eq!(
-                t.ok(Command::SetProfileRules(p::SetProfileRules {
-                    profile: id,
-                    changes: vec![remap(usage(0x0c, 0xe9 + round), &[key(6)])],
-                })),
-                None
-            );
-        },
-        |e| matches!(e, Ev::Profile(p) if p.id == id),
-        |e| matches!(e, Ev::ProfileRulesChanged(r) if r.profile == id),
-    );
 }
 
 #[test]
@@ -6311,31 +6262,6 @@ fn saved_pages_match_the_decoded_file_and_find_damage() {
         block_on(profiles::saved_page(&mut t.store, id, None, 10)),
         Err(cordial_core::storage::Error::Corrupt)
     );
-}
-
-#[test]
-fn a_reset_of_many_rules_is_reported_a_page_at_a_time() {
-    let mut t = Test::new(true);
-    let (id, _) = editing(&mut t);
-    // Four rows of keys all send key 0x1e.
-    for row in 0..4u8 {
-        for col in 0..16u8 {
-            let reply = configure(&mut t, Interface::Via, &[5, 0, row, col, 0, 0x1e]);
-            assert_eq!(reply[0], 5);
-        }
-    }
-    let count = rules_of(&mut t, id).len();
-    assert_eq!(count, 63, "key 0x1e at its own position is no rule");
-    t.events();
-    assert_eq!(&configure(&mut t, Interface::Via, &[6])[..2], &[6, 0]);
-    let mut removed = Vec::new();
-    for e in t.events() {
-        if let Ev::ProfileRulesChanged(r) = e {
-            assert!(r.removed.len() <= 32 && r.changed.is_empty());
-            removed.extend(r.removed);
-        }
-    }
-    assert_eq!(removed.len(), count);
 }
 
 #[test]

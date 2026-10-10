@@ -354,7 +354,6 @@ impl State {
             event::Kind::ProfileRemoved(removed) => {
                 self.profiles.remove(&removed.id);
             }
-            event::Kind::ProfileRulesChanged(_) => {}
         }
     }
 

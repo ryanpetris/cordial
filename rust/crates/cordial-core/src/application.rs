@@ -21,8 +21,8 @@
 //! once. Work that outlives a command (scanning, pairing, matching a pairing's bond with a saved
 //! device, an unpair waiting for its link to close, settings jobs) lives here and reports its
 //! progress through events. Adapter, device, profile, scan and pairing events carry the complete
-//! current state of one thing; settings, warnings and rules events carry what changed since the
-//! client last listed or was told. Changed things are marked dirty and written one frame at a
+//! current state of one thing; settings and warnings events carry what changed since the client
+//! last listed or was told. Changed things are marked dirty and written one frame at a
 //! time when the serial output is free.
 use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
 
@@ -297,7 +297,6 @@ enum EventRead {
     Device(u64),
     Settings(u64),
     Profile(u64),
-    Rules(u64),
 }
 
 /// The bit standing for setting `key` in a set of settings.
@@ -331,8 +330,6 @@ pub(crate) struct Editor {
 const DEVICE: u8 = 1;
 const SETTINGS: u8 = 2;
 const WARNINGS: u8 = 4;
-const PROFILE: u8 = 1;
-const RULES: u8 = 2;
 
 /// Entries in one page of a list held in memory. Pages of records read from flash use the
 /// page sizes of their records.
@@ -387,10 +384,8 @@ pub struct Application {
     /// The store generation free space was last counted at for the status. Writes change the
     /// generation, and a later background step counts again.
     counted: Option<u64>,
-    /// Pending profile record and rules events, by profile ID.
-    profile_dirty: Vec<(u64, u8)>,
-    /// Rule inputs that may have changed since the last rules event, by profile ID.
-    touched_rules: Vec<(u64, Vec<profiles::Usage>)>,
+    /// Profiles with a pending profile event.
+    profile_dirty: Vec<u64>,
     profile_removed: VecDeque<u64>,
     pub(crate) editor: Option<Editor>,
     pub usb_reconnect: bool,
@@ -402,7 +397,7 @@ pub struct Application {
     profiles_released: bool,
     /// The dirty entry whose events go first next time, so devices take turns.
     next_dirty: usize,
-    /// The dirty profile entry whose events go first next time, so profiles take turns.
+    /// The dirty profile entry whose event goes first next time, so profiles take turns.
     next_profile: usize,
     /// Scan results go before device events next time, so neither starves the other.
     scan_turn: bool,
@@ -555,7 +550,6 @@ impl Application {
             adapter_dirty: false,
             counted: None,
             profile_dirty: Vec::new(),
-            touched_rules: Vec::new(),
             profile_removed: VecDeque::new(),
             editor: None,
             usb_reconnect: false,
@@ -757,31 +751,10 @@ impl Application {
         }
     }
 
-    pub(crate) fn mark_profile(&mut self, id: u64, bits: u8) {
-        match self.profile_dirty.iter_mut().find(|(p, _)| *p == id) {
-            Some((_, b)) => *b |= bits,
-            None => self.profile_dirty.push((id, bits)),
+    pub(crate) fn mark_profile(&mut self, id: u64) {
+        if !self.profile_dirty.contains(&id) {
+            self.profile_dirty.push(id);
         }
-    }
-
-    /// Marks a rules event for the rules of profile `id` whose inputs are `inputs`.
-    fn touch_rules(&mut self, id: u64, inputs: impl IntoIterator<Item = profiles::Usage>) {
-        let mut inputs = inputs.into_iter().peekable();
-        if inputs.peek().is_none() {
-            return;
-        }
-        let index = match self.touched_rules.iter().position(|(p, _)| *p == id) {
-            Some(index) => index,
-            None => {
-                self.touched_rules.push((id, Vec::new()));
-                self.touched_rules.len() - 1
-            }
-        };
-        let touched = &mut self.touched_rules[index].1;
-        touched.extend(inputs);
-        touched.sort_unstable();
-        touched.dedup();
-        self.mark_profile(id, RULES);
     }
 
     fn reply(&mut self, result: Option<R>) {
@@ -1460,7 +1433,7 @@ impl Application {
         }
         match profiles::create(store, name, &rules).await {
             Ok((id, _)) => {
-                self.mark_profile(id, PROFILE);
+                self.mark_profile(id);
                 self.reply(Some(R::ProfileCreated(p::ProfileCreated {
                     profile: id as u32,
                 })));
@@ -1535,10 +1508,8 @@ impl Application {
         self.manager.profiles.forget(id);
         self.unsaved.forget_profile(id);
         self.writes_recovered();
-        self.profile_dirty.retain(|(p, _)| *p != id);
-        self.event_retries
-            .retain(|(r, _)| *r != EventRead::Profile(id) && *r != EventRead::Rules(id));
-        self.touched_rules.retain(|(p, _)| *p != id);
+        self.profile_dirty.retain(|p| *p != id);
+        self.event_retries.retain(|(r, _)| *r != EventRead::Profile(id));
         if !self.profile_removed.contains(&id) {
             self.profile_removed.push_back(id);
         }
@@ -1575,14 +1546,14 @@ impl Application {
             Some(map) => map.borrow().changed(changes),
             None => self.rules(id, store).await?.changed(changes),
         };
-        let (rules, inputs) = changed.map_err(|_| failure(Error::Capacity))?;
+        let (rules, any) = changed.map_err(|_| failure(Error::Capacity))?;
         // Rules already in RAM but not yet on flash are saved, so the response holds for them too.
         let unsaved = self.unsaved.map(id).is_some()
             || self
                 .editor
                 .as_ref()
                 .is_some_and(|e| e.profile == id && e.edited.is_some());
-        if inputs.is_empty() && !unsaved {
+        if !any && !unsaved {
             return Ok(());
         }
         let memory = rules.memory();
@@ -1605,10 +1576,9 @@ impl Application {
             editor.retry.succeeded();
         }
         self.retry_users(id);
-        self.touch_rules(id, inputs);
         self.save_roles(id, &mut meta, roles, store, now).await;
         if roles != reported {
-            self.mark_profile(id, PROFILE);
+            self.mark_profile(id);
         }
         Ok(())
     }
@@ -1624,20 +1594,16 @@ impl Application {
         now: u64,
     ) -> Result<(), ()> {
         let budget = self.manager.profile_budget.ok_or(())?;
-        let (rules, inputs) = if reset {
-            let inputs: Vec<profiles::Usage> = map.borrow().inputs().collect();
-            let (rules, mut more) = profiles::Rules::default()
+        let (rules, changed) = if reset {
+            let (rules, any) = profiles::Rules::default()
                 .changed(changes)
                 .map_err(|_| ())?;
-            more.retain(|input| inputs.binary_search(input).is_err());
-            let mut inputs = inputs;
-            inputs.extend(more);
-            inputs.sort_unstable();
-            (rules, inputs)
+            // Forgetting every rule changes each input that has one.
+            (rules, any || !map.borrow().is_empty())
         } else {
             map.borrow().changed(changes).map_err(|_| ())?
         };
-        if inputs.is_empty() {
+        if !changed {
             return Ok(());
         }
         let memory = rules.memory();
@@ -1646,11 +1612,10 @@ impl Application {
         }
         // Listings report the roles of the edited rules, so a change of them is a profile event.
         if rules.roles() != map.borrow().roles() {
-            self.mark_profile(id, PROFILE);
+            self.mark_profile(id);
         }
         *map.borrow_mut() = rules;
         self.retry_users(id);
-        self.touch_rules(id, inputs);
         if let Some(editor) = self.editor.as_mut().filter(|e| e.profile == id) {
             let first = editor.edited.map_or(now, |(first, _)| first);
             editor.edited = Some((first, now));
@@ -1675,7 +1640,7 @@ impl Application {
         }
         meta.roles = roles;
         match profiles::save_metadata(store, id, meta).await {
-            Ok(()) => self.mark_profile(id, PROFILE),
+            Ok(()) => self.mark_profile(id),
             Err(error) => {
                 if error == crate::storage::Error::Unknown {
                     let _ = self.storage_error(error);
@@ -1770,8 +1735,7 @@ impl Application {
                     profiles::save_rules(store, id, &empty)
                         .await
                         .map_err(|_| Error::StorageFailed)?;
-                    // What listings report now, and a table in RAM holding the rules a client may
-                    // have listed.
+                    // What listings report now, and the profile's table in RAM.
                     let reported = self.pending_roles(id).unwrap_or(meta.roles);
                     let map = self.loaded(id);
                     self.unsaved.rules_saved(id);
@@ -1782,19 +1746,14 @@ impl Application {
                         editor.retry.succeeded();
                     }
                     self.writes_recovered();
-                    let loaded: Vec<profiles::Usage> = match &map {
-                        Some(map) => map.borrow().inputs().collect(),
-                        None => Vec::new(),
-                    };
                     if let Some(map) = map {
                         *map.borrow_mut() = empty;
                     }
                     self.retry_users(id);
-                    self.touch_rules(id, loaded);
                     self.save_roles(id, &mut meta, devices::Roles(0), store, now)
                         .await;
                     if reported != devices::Roles(0) {
-                        self.mark_profile(id, PROFILE);
+                        self.mark_profile(id);
                     }
                     return Ok(None);
                 }
@@ -2783,7 +2742,6 @@ impl Application {
         self.reported.clear();
         self.removed.clear();
         self.profile_dirty.clear();
-        self.touched_rules.clear();
         self.profile_removed.clear();
         self.adapter_dirty = false;
         self.pairing_dirty = false;
@@ -3456,7 +3414,7 @@ impl Application {
                     if self.unsaved.lists(&Record::Roles(*id, roles)) {
                         self.unsaved.follow_rules(*id, roles);
                     } else if !self.unsaved.mark(Record::Roles(*id, roles), now) {
-                        self.mark_profile(*id, PROFILE);
+                        self.mark_profile(*id);
                     }
                 }
                 saved
@@ -3467,7 +3425,7 @@ impl Application {
                     meta.roles = *roles;
                     let saved = profiles::save_metadata(store, *id, &meta).await;
                     if saved.is_ok() {
-                        self.mark_profile(*id, PROFILE);
+                        self.mark_profile(*id);
                     }
                     saved
                 }
@@ -4343,10 +4301,9 @@ impl Application {
             .is_some_and(|l| l.policy.is_some())
     }
 
-    /// The next profile record or rules event, starting from the entry after the last one sent.
-    /// A read that fails keeps its event pending, and that event waits for its own backoff while
-    /// other events go ahead. Rules a connection or configuration
-    /// interface has loaded need no read.
+    /// The next profile record event, starting from the entry after the last one sent. A read
+    /// that fails keeps its event pending, and that event waits for its own backoff while other
+    /// events go ahead.
     async fn profile_event<S: RecordStore, B: Bluetooth>(
         &mut self,
         store: &mut S,
@@ -4356,95 +4313,26 @@ impl Application {
         let mut waiting = 0;
         while waiting < self.profile_dirty.len() {
             let index = self.next_profile % self.profile_dirty.len();
-            let (id, bits) = self.profile_dirty[index];
-            let (profile, rules) = (EventRead::Profile(id), EventRead::Rules(id));
-            let event = if bits & PROFILE != 0 && self.event_due(profile, now) {
-                let result = self.profile_record(id as u32, store, radio).await;
-                if self.event_settled(profile, result.as_ref().err(), now) {
-                    self.profile_dirty[index].1 &= !PROFILE;
-                }
-                result.ok().map(Ev::Profile)
-            } else if bits & RULES != 0 && (self.loaded(id).is_some() || self.event_due(rules, now))
-            {
-                let result = self.rules_event(id, store).await;
-                if self.event_settled(rules, result.as_ref().err(), now)
-                    && !self.touched_rules.iter().any(|(p, _)| *p == id)
-                {
-                    self.profile_dirty[index].1 &= !RULES;
-                }
-                result.ok().flatten()
-            } else if bits == 0 {
-                self.profile_dirty.remove(index);
-                continue;
-            } else {
+            let id = self.profile_dirty[index];
+            let read = EventRead::Profile(id);
+            if !self.event_due(read, now) {
                 // Only events whose reads back off are left here.
                 waiting += 1;
                 self.next_profile = index + 1;
                 continue;
-            };
-            if self.profile_dirty.get(index).is_some_and(|(_, b)| *b == 0) {
+            }
+            let result = self.profile_record(id as u32, store, radio).await;
+            if self.event_settled(read, result.as_ref().err(), now) {
                 self.profile_dirty.remove(index);
                 self.next_profile = index;
             } else {
                 self.next_profile = index + 1;
             }
-            if event.is_some() {
-                return event;
+            if let Ok(profile) = result {
+                return Some(Ev::Profile(profile));
             }
         }
         None
-    }
-
-    /// The changes to the rules of profile `id` whose inputs were touched: the current rule for
-    /// each that has one, and the input of each that does not. `None` when there is nothing to
-    /// send. An event carries at most a page of rules; touched inputs beyond it stay touched for
-    /// the next rules event of the profile, as do all of them when the rules cannot be read.
-    async fn rules_event<S: RecordStore>(
-        &mut self,
-        id: u64,
-        store: &mut S,
-    ) -> Result<Option<Ev>, p::Error> {
-        if !self.touched_rules.iter().any(|(p, _)| *p == id) {
-            return Ok(None);
-        }
-        let saved;
-        let map;
-        let rules = match self.loaded(id) {
-            Some(loaded) => {
-                map = loaded;
-                map.borrow()
-            }
-            None => {
-                saved = core::cell::RefCell::new(self.rules(id, store).await?);
-                saved.borrow()
-            }
-        };
-        let Some(index) = self.touched_rules.iter().position(|(p, _)| *p == id) else {
-            return Ok(None);
-        };
-        let (_, mut inputs) = self.touched_rules.swap_remove(index);
-        // An event carries at most a page of rules; the rest follow in the next ones.
-        if inputs.len() > RULES_PAGE {
-            let rest = inputs.split_off(RULES_PAGE);
-            self.touched_rules.push((id, rest));
-        }
-        let mut changed = Vec::new();
-        let mut removed = Vec::new();
-        for input in inputs {
-            match rules.get(input) {
-                Some(rule) => changed.push(wire_rule(rule)),
-                None => removed.push(wire_usage(input)),
-            }
-        }
-        Ok(
-            (!changed.is_empty() || !removed.is_empty()).then_some(Ev::ProfileRulesChanged(
-                p::ProfileRulesChanged {
-                    profile: id as u32,
-                    changed,
-                    removed,
-                },
-            )),
-        )
     }
 
     /// The changes to device `id`'s settings since the client last saw them: each touched

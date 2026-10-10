@@ -14,10 +14,10 @@ All three keep their view of the Dongle the same way:
   as the next request's `after`, until `end` when it needs the whole list. It never assumes a page
   size. See [Listings](compatibility.md#listings).
 - Events: `device`, `adapter` and `profile` events replace the record they carry.
-  `settings_changed`, `warnings_changed` and `profile_rules_changed` are applied to what the client
-  has listed: settings are upserted by integration and key and rules by input, warnings are kept as
-  a set, and removals of entries the client does not hold are ignored. A client lists again from
-  the start when it needs a fresh view, such as in a new session or after it lost track of a list.
+  `settings_changed` and `warnings_changed` are applied to what the client has listed: settings are
+  upserted by integration and key, warnings are kept as a set, and removals of entries the client
+  does not hold are ignored. A client lists again from the start when it needs a fresh view, such
+  as in a new session or after it lost track of a list.
 - Successful changes: a response without an error means the Dongle now holds the values sent, in
   the saved form the command defines (see [Commands](commands.md)): a trimmed adapter name, and
   normalized rules, with a rule that changes nothing forgotten. The client applies the values it

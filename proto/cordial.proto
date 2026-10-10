@@ -105,8 +105,6 @@ message Event {
     SettingsChanged settings_changed = 12;
     // A device's warnings changed.
     WarningsChanged warnings_changed = 13;
-    // Some of a profile's rules changed, appeared or went away.
-    ProfileRulesChanged profile_rules_changed = 14;
   }
 }
 
@@ -1006,14 +1004,14 @@ message ListProfileRules {
   Usage after = 2;
 }
 
-// Saves and forgets rules in one storage write and responds with no result; a profile_rules_changed
-// event follows when any rule changed. A saved rule replaces the profile's rule for the same input.
-// A rule that remaps the input to only itself, in the collection of the report that carries it, or
-// scales it by a ratio equal to 1 is forgotten instead. Every device using the profile uses the new
-// rules from its next input; a held input keeps the outputs it was pressed with until it is
-// released. If any change is invalid or the save fails, nothing is saved. A save that would make
-// the profile larger than ProfileSupport.memory_budget, or grow a loaded profile beyond what is
-// left of it, returns ERROR_CODE_NO_CAPACITY with CAPACITY_REASON_PROFILE_MEMORY.
+// Saves and forgets rules in one storage write and responds with no result. A saved rule replaces
+// the profile's rule for the same input. A rule that remaps the input to only itself, in the
+// collection of the report that carries it, or scales it by a ratio equal to 1 is forgotten
+// instead. Every device using the profile uses the new rules from its next input; a held input
+// keeps the outputs it was pressed with until it is released. If any change is invalid or the save
+// fails, nothing is saved. A save that would make the profile larger than
+// ProfileSupport.memory_budget, or grow a loaded profile beyond what is left of it, returns
+// ERROR_CODE_NO_CAPACITY with CAPACITY_REASON_PROFILE_MEMORY.
 message SetProfileRules {
   // Required.
   uint32 profile = 1;
@@ -1048,15 +1046,6 @@ message ProfileRules {
   repeated ProfileRule rules = 2;
   // Nothing follows the last rule.
   bool end = 3;
-}
-
-// Changes to a profile's rules: each rule that changed or appeared, and the input of each one that
-// went away.
-message ProfileRulesChanged {
-  // Required.
-  uint32 profile = 1;
-  repeated ProfileRule changed = 2;
-  repeated Usage removed = 3;
 }
 
 // What one input does while the profile is applied. A profile has at most one rule for each input.

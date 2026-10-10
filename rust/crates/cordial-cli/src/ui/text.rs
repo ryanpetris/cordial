@@ -1572,21 +1572,6 @@ fn event_line(
         }
         event::Kind::Profile(profile) => Some(format!("[CHG] Profile {}", profile_line(profile))),
         event::Kind::ProfileRemoved(r) => Some(format!("[DEL] Profile {}", r.id)),
-        event::Kind::ProfileRulesChanged(r) => {
-            let lines: Vec<String> = r
-                .changed
-                .iter()
-                .map(|rule| format!("[CHG] Profile {} {}", r.profile, profiles::rule_words(rule)))
-                .chain(r.removed.iter().map(|input| {
-                    format!(
-                        "[DEL] Profile {} {}",
-                        r.profile,
-                        profiles::usage_words(input)
-                    )
-                }))
-                .collect();
-            (!lines.is_empty()).then(|| lines.join("\n"))
-        }
     }
 }
 

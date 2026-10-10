@@ -652,11 +652,6 @@ profile show 2\n",
     ] {
         assert!(out.contains(line), "{line}\n{out}");
     }
-    assert!(
-        out.contains("[CHG] Profile 2 09:04 remap 09:01@01:02"),
-        "{out}"
-    );
-    assert!(out.contains("[DEL] Profile 2 01:38"), "{out}");
     let sim = dongle.0.lock().unwrap();
     assert_eq!(
         sim.devices[0].profiles,

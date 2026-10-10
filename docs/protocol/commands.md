@@ -185,7 +185,7 @@ See [HID++](../hidpp.md) for the device operations behind each HID++ setting.
 | `CopyProfile` | `ProfileCreated` | Saves a new profile with the source's rules and returns its ID; a `profile` event follows. |
 | `DeleteProfile` | none | Deletes an unused profile with its rules; `profile_removed` follows. |
 | `ListProfileRules` | `ProfileRules` | One page of the profile's rules, in ascending usage page and usage order of their inputs. |
-| `SetProfileRules` | none | Saves and forgets rules in one storage write. Each change either saves a rule or, with `forget`, removes the rule for an input. A `profile_rules_changed` event follows when any rule changed. |
+| `SetProfileRules` | none | Saves and forgets rules in one storage write. Each change either saves a rule or, with `forget`, removes the rule for an input. |
 
 A new profile is empty and passes every input through unchanged. Nothing is filled in on the
 client's behalf. A rule is refused with `ERROR_CODE_BAD_ARGS`, and nothing is saved, when its input
@@ -284,8 +284,6 @@ before the command responds. A held input keeps the outputs it was pressed with 
 released, and an output that several held inputs produce stays held until the last of them is
 released. A profile is released once no connected device or configuration interface uses it.
 
-`profile_rules_changed` events report every change, including those made through a configuration
-interface.
 See [Input profiles](../input-profiles.md) for external editors.
 
 ### Lost profiles
@@ -293,9 +291,9 @@ See [Input profiles](../input-profiles.md) for external editors.
 A profile whose `profile.pb` turns out to be missing or undecodable when the Dongle reads it is
 deleted with its rules, and `profile_removed` follows. Its references are removed first, so no
 device applies its rules once deletion begins. An undecodable rules file is removed, leaving the
-profile empty, and a `profile_rules_changed` event follows. Neither cleanup runs between a
-connection starting and its first forwarded input; the connection loads no profiles, its
-`profile_error` is `ERROR_CODE_STORAGE_FAILED`, and the cleanup follows.
+profile empty. Neither cleanup runs between a connection starting and its first forwarded input;
+the connection loads no profiles, its `profile_error` is `ERROR_CODE_STORAGE_FAILED`, and the
+cleanup follows.
 
 A saved reference to a profile that no longer exists is skipped until it is changed. Startup checks
 which profile directories exist without reading them. Before USB starts, it clears and disables a

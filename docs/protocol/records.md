@@ -62,10 +62,8 @@ no row adds none.
 | Other Generic Desktop usages (`01:xx`) | System Control (`01:80`) | System control |
 
 A `profile` event carries a profile's record when it is created or copied or its roles change, and
-`profile_removed` its ID when it is deleted. A `profile_rules_changed` event follows whenever any of
-its rules changes, including through a configuration interface: it carries each rule that changed
-or appeared, whole, and the input of each rule that went away. `ListProfileRules` lists the rules a
-page at a time in ascending usage page and usage order of their inputs.
+`profile_removed` its ID when it is deleted. `ListProfileRules` lists the rules a page at a time in
+ascending usage page and usage order of their inputs.
 
 ## Devices
 

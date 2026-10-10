@@ -72,15 +72,15 @@ An event can arrive between any two frames, including between a request and its 
 Most events carry the complete current state of one thing: the adapter, a device, a profile, a scan
 candidate, or the pairing. A client replaces what it had with the latest one.
 
-The lists that belong to a device or profile, its settings, its warnings and its rules, are listed
-in pages and change through change events instead: `settings_changed`, `warnings_changed` and
-`profile_rules_changed` carry only the entries that changed, appeared or went away. A changed
-setting or rule is carried whole, with its current state. A client applies these events to what it
-has listed, and lists again from the start when it needs a fresh view, such as in a new session or
-after losing track. Applying a change is idempotent: a client upserts settings by integration and
-key and rules by input, treats warnings as a set, and ignores the removal of an entry it does not
-hold. A change event can name an entry the client has not listed yet; one that a later page also
-holds is simply replaced. There are no revisions.
+The lists that belong to a device, its settings and its warnings, are listed in pages and change
+through change events instead: `settings_changed` and `warnings_changed` carry only the entries
+that changed, appeared or went away. A changed setting is carried whole, with its current state. A
+client applies these events to what it has listed, and lists again from the start when it needs a
+fresh view, such as in a new session or after losing track. Applying a change is idempotent: a
+client upserts settings by integration and key, treats warnings as a set, and ignores the removal of
+an entry it does not hold. A change event can name an entry the client has not listed yet; one
+that a later page also holds is simply replaced. There are no revisions. A profile's rules have no
+change event; a client lists them again when it needs a fresh view.
 
 The Dongle keeps one pending slot per thing. When a thing changes again before its event is
 written, the event that goes out carries the newer state, and a change event covers every change

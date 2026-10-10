@@ -409,10 +409,6 @@ impl Rules {
         });
         self.entries[start..].iter().map(|e| self.rule(e))
     }
-    /// The inputs that have a rule, in ascending order.
-    pub fn inputs(&self) -> impl Iterator<Item = Usage> + '_ {
-        self.entries.iter().map(|e| e.input)
-    }
     /// The rule for `input`, if it has one.
     pub fn get(&self, input: Usage) -> Option<Rule> {
         let i = self
@@ -466,24 +462,17 @@ impl Rules {
             }
         })
     }
-    /// The table after `changes`, applied in order, and the inputs whose rule they change, in
-    /// ascending order. A rule that changes nothing forgets the rule it would replace. The new
-    /// table is merged from this one and reserved at its exact size; this one is only read.
-    pub fn changed(&self, mut changes: Vec<Change>) -> Result<(Self, Vec<Usage>), Error> {
+    /// The table after `changes`, applied in order, and whether they change the rule of any
+    /// input. A rule that changes nothing forgets the rule it would replace. The new table is
+    /// merged from this one and reserved at its exact size; this one is only read.
+    pub fn changed(&self, mut changes: Vec<Change>) -> Result<(Self, bool), Error> {
         // The last change to each input is the one that applies.
         changes.reverse();
         changes.sort_by_key(Change::input);
         changes.dedup_by_key(|c| c.input());
-        let mut inputs = Vec::new();
-        inputs
-            .try_reserve_exact(changes.len())
-            .map_err(|_| Error::Capacity)?;
-        inputs.extend(
-            changes
-                .iter()
-                .filter(|c| self.lookup(c.input()) != c.rule().map(|rule| Found::of(&rule.effect)))
-                .map(Change::input),
-        );
+        let any = changes
+            .iter()
+            .any(|c| self.lookup(c.input()) != c.rule().map(|rule| Found::of(&rule.effect)));
         let (mut rules, mut outputs, mut scales) = (0, 0, 0);
         for item in self.merged(&changes) {
             rules += 1;
@@ -542,7 +531,7 @@ impl Rules {
                 count,
             });
         }
-        Ok((table, inputs))
+        Ok((table, any))
     }
 }
 
@@ -1617,23 +1606,31 @@ mod tests {
         let identity = remap(key(0x04), &[out(0x04)]).normalized().unwrap();
         assert!(identity.identity());
         let table = Rules::new(alloc::vec![remap(key(0x04), &[out(0x05)])]).unwrap();
-        let (table, inputs) = table.changed(alloc::vec![Change::Set(identity)]).unwrap();
+        let (table, any) = table.changed(alloc::vec![Change::Set(identity)]).unwrap();
         assert!(table.is_empty());
-        assert_eq!(inputs, [key(0x04)]);
+        assert!(any);
         // Rules are identified by their input alone.
         let table = Rules::new(alloc::vec![
             remap(key(0x04), &[out(0x05)]),
             remap(key(0x06), &[out(0x07)]),
         ])
         .unwrap();
-        let (table, inputs) = table
+        let (table, any) = table
             .changed(alloc::vec![
                 Change::Forget(key(0x04)),
                 Change::Set(remap(key(0x06), &[out(0x08)])),
             ])
             .unwrap();
         assert!(table.iter().eq([remap(key(0x06), &[out(0x08)])]));
-        assert_eq!(inputs, [key(0x04), key(0x06)]);
+        assert!(any);
+        // Setting a rule to what it already does, or forgetting a rule there isn't, changes nothing.
+        let (_, any) = table
+            .changed(alloc::vec![
+                Change::Set(remap(key(0x06), &[out(0x08)])),
+                Change::Forget(key(0x09)),
+            ])
+            .unwrap();
+        assert!(!any);
         assert!(
             Rules::new(alloc::vec![
                 remap(key(0x04), &[]),
