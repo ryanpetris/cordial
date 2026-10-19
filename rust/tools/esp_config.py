@@ -54,7 +54,8 @@ cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_byte
         # The partition table has no NVS partition. Calibrate the PHY fully at
         # every boot rather than loading and storing calibration data in NVS.
         "ESP_PHY_CALIBRATION_AND_DATA_STORAGE": False,
-        "FREERTOS_HZ": 1000, "ESP_MAIN_TASK_STACK_SIZE": 65536,
+        # Nested application startup frames exceed 64 KiB.
+        "FREERTOS_HZ": 1000, "ESP_MAIN_TASK_STACK_SIZE": 131072,
         f"ESPTOOLPY_FLASHSIZE_{config['flash_bytes'] // 1048576}MB": True,
         "PARTITION_TABLE_CUSTOM": True, "PARTITION_TABLE_CUSTOM_FILENAME": str(partitions.resolve()),
     }
