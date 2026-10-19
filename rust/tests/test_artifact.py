@@ -11,6 +11,55 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import firmware_artifact as artifact
 import firmware_config
 from flash_dev import inspect_uf2
+from build_firmware import esp_startup_frames
+
+
+class EspStartupStack(unittest.TestCase):
+    SMALL = """
+4203636c <cordial_esp32s3::main>:
+4203636c: 004136         entry a1, 32
+4203636f: 2cdd81         l32r a8, 420016e4
+42036372: 0008e0         callx8 a8
+42036378 <cordial_esp32s3::start>:
+42036378: 2a0136         entry a1, 0x1500
+4203637b: 080c           movi.n a8, 0
+"""
+
+    def test_inlined_construction_fits_and_unrelated_frames_are_ignored(self):
+        frames = esp_startup_frames(self.SMALL + """
+420679e8 <unrelated_function>:
+420679e8: 004136         entry a1, 32
+420679f1: 001810         movsp a1, a8
+""")
+        self.assertEqual(sum(frames.values()), 5408)
+
+    def test_extended_constructor_frame_is_rejected(self):
+        # A constructor can allocate a large frame even when its caller stays small.
+        with self.assertRaisesRegex(ValueError, "Extended ESP startup"):
+            esp_startup_frames(self.SMALL + """
+420679e8 <<cordial_core::application::Application>::new>:
+420679e8: 004136         entry a1, 32
+420679eb: 6ced81         l32r a8, 42042da0 <literal> (98d0 <size>)
+420679ee: c08180         sub a8, a1, a8
+420679f1: 001810         movsp a1, a8
+""")
+
+    def test_nested_frames_share_one_budget(self):
+        with self.assertRaisesRegex(ValueError, "exceed their budget"):
+            esp_startup_frames(self.SMALL + """
+420679e8 <<cordial_core::application::Application>::new>:
+420679e8: 600136         entry a1, 0x3000
+""")
+
+    def test_main_cannot_retain_a_large_frame(self):
+        with self.assertRaisesRegex(ValueError, "exceed their budget"):
+            esp_startup_frames(self.SMALL.replace("entry a1, 32", "entry a1, 2048"))
+
+    def test_missing_or_unrecognized_prologues_fail(self):
+        for listing in ("", self.SMALL.replace("entry a1, 32", "nop.n"),
+                        self.SMALL[:self.SMALL.index("42036378:")]):
+            with self.subTest(listing=listing), self.assertRaises(ValueError):
+                esp_startup_frames(listing)
 
 
 class Artifact(unittest.TestCase):

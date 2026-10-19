@@ -97,6 +97,12 @@ async fn secondary_task(owner: &'static App, interfaces: u8) {
 
 fn main() {
     sys::link_patches();
+    runtime::run(start);
+}
+
+// Return the construction frame before the executor starts polling tasks.
+#[inline(never)]
+fn start(spawner: embassy_executor::Spawner) {
     let mut unique = [0; 8];
     assert_eq!(
         unsafe {
@@ -134,10 +140,8 @@ fn main() {
         bootloader: None,
     });
     let owner: &'static App = Box::leak(Box::new(Owner::new(&USB_IO, app, handle, radio)));
-    runtime::run(|spawner| {
-        spawner.spawn(usb_task(serial, interfaces).unwrap());
-        radio::spawn(spawner);
-        spawner.spawn(priority_task(owner, wake, available).unwrap());
-        spawner.spawn(secondary_task(owner, interfaces).unwrap());
-    });
+    spawner.spawn(usb_task(serial, interfaces).unwrap());
+    radio::spawn(spawner);
+    spawner.spawn(priority_task(owner, wake, available).unwrap());
+    spawner.spawn(secondary_task(owner, interfaces).unwrap());
 }

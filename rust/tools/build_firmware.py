@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
@@ -87,6 +88,51 @@ def esp_partitions(data, config):
         raise ValueError("ESP partition table checksum or trailing entries are invalid")
 
 
+def esp_startup_frames(disassembly):
+    """Bound the known Rust construction frames, including constructors not inlined into start.
+
+    This is a regression check for large by-value startup temporaries, not a bound on the whole
+    call tree. SDK calls and executor workloads also need stack measurements on hardware.
+    """
+    frames = {}
+    selected = None
+    for line in disassembly.splitlines():
+        symbol = re.fullmatch(r"[0-9a-f]+ <(.+)>:", line)
+        if symbol:
+            name = symbol[1]
+            selected = name if (name in ("cordial_esp32s3::main", "cordial_esp32s3::start")
+                               or name.startswith("cordial_esp32s3::runtime::run")
+                               or any(kind in name for kind in (
+                                   "cordial_core::application::Application>",
+                                   "cordial_core::manager::Manager as core::default::Default>",
+                                   "cordial_core::forward::Forwarder as core::default::Default>",
+                                   "cordial_usb::owner::Owner<"))
+                               and name.endswith(("::new", "::default"))) else None
+            if selected:
+                frames[selected] = None
+        elif selected:
+            instruction = re.match(r"\s*[0-9a-f]+:\s+[0-9a-f]+\s+(\S+)\s*(.*)", line)
+            if not instruction:
+                continue
+            opcode, operands = instruction.groups()
+            if frames[selected] is None:
+                entry = re.fullmatch(r"a1,\s*(0x[0-9a-f]+|[0-9]+)", operands)
+                if opcode != "entry" or entry is None:
+                    raise ValueError(f"Unrecognized ESP startup prologue: {selected}")
+                frames[selected] = int(entry[1], 0)
+            elif opcode == "movsp":
+                # Xtensa extends frames beyond entry's immediate range through movsp.
+                raise ValueError(f"Extended ESP startup stack frame: {selected}")
+    for name in ("cordial_esp32s3::main", "cordial_esp32s3::start"):
+        if name not in frames:
+            raise ValueError(f"Missing ESP startup function: {name}")
+    if any(size is None for size in frames.values()):
+        raise ValueError("Missing ESP startup prologue")
+    if frames["cordial_esp32s3::main"] > 1024 or sum(frames.values()) > 16384:
+        raise ValueError(f"ESP startup stack frames exceed their budget: {frames}")
+    return frames
+
+
 def package(config, built, elf, output, name, gcc, env):
     destination = output / f"cordial-{name}"
     shutil.copy2(elf, destination.with_suffix(".elf"))
@@ -100,6 +146,10 @@ def package(config, built, elf, output, name, gcc, env):
             raise ValueError("Linked Pico metadata differs from selected build")
         destination.with_suffix(".uf2").write_bytes(uf2)
     else:
+        disassembly = subprocess.check_output(
+            [str(gcc).removesuffix("gcc") + "objdump", "-dC", str(elf)], env=env, text=True)
+        frames = esp_startup_frames(disassembly)
+        print(f"ESP startup stack frames: {frames}", flush=True)
         sdk_outputs = list(built.glob("build/esp-idf-sys-*/out/build/flasher_args.json"))
         if len(sdk_outputs) != 1:
             raise ValueError("Expected one current ESP SDK build")

@@ -137,7 +137,11 @@ Firmware packages are written under
 `build/firmware/<firmware-version>/<board>-<bluetooth-backend>-<radio-backend>/`.
 They contain the ELF, binary, artifact metadata and checksums. Pico packages also
 contain UF2; ESP packages contain bootloader and partition-table images plus
-`flash.json`. Packaging verifies image metadata and storage bounds.
+`flash.json`. Packaging verifies image metadata and storage bounds. ESP packaging
+also checks the linked Rust startup frames: `main` has at most 1 KiB, and the
+initialization frames together have at most 16 KiB. This catches large constructor
+temporaries; SDK calls and executor workloads still need stack measurements on
+hardware before reducing the FreeRTOS stack allocation.
 
 `rust/tools/flash_dev.py` inspects Pico UF2 artifacts and supports explicit
 storage-preserving development updates. See its `--help` for identity and mount
