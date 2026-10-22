@@ -28,6 +28,7 @@ import {
   type ProfileListEntry,
   type ProfileRule,
   type ProfileRules,
+  type ProfileRuleRefSchema,
   type Request,
   type Response,
   type SetAdapterSchema,
@@ -38,9 +39,8 @@ import {
   type SettingRefSchema,
   type Status,
   type Transport,
-  type UsageSchema,
 } from "@cordial/protocol";
-import { featureRef, ruleInput, settingRef } from "./order.ts";
+import { featureRef, ruleRef, settingRef } from "./order.ts";
 import type { ByteStream } from "./stream.ts";
 
 /** A request, as the command it carries. */
@@ -349,15 +349,16 @@ export class Connection {
   deleteProfile(profile: number): Promise<void> {
     return this.#void({ case: "deleteProfile", value: { profile } });
   }
-  /** One page of a profile's rules whose inputs follow `after`, the input of the last rule received. */
-  listProfileRules(profile: number, after?: MessageInitShape<typeof UsageSchema>): Promise<ProfileRules> {
+  /** One page of a profile's rules following `after`, the input and collection of the last rule
+   * received. */
+  listProfileRules(profile: number, after?: MessageInitShape<typeof ProfileRuleRefSchema>): Promise<ProfileRules> {
     return this.#call({ case: "listProfileRules", value: { profile, after } }, "profileRules");
   }
   listAllProfileRules(profile: number): Promise<ProfileRule[]> {
-    return readAll("listProfileRules", async (after: MessageInitShape<typeof UsageSchema> | undefined) => {
+    return readAll("listProfileRules", async (after: MessageInitShape<typeof ProfileRuleRefSchema> | undefined) => {
       const page = await this.listProfileRules(profile, after);
       return { entries: page.rules, end: page.end };
-    }, ruleInput);
+    }, ruleRef);
   }
   /** Saves and forgets rules in one write, applied in order. Success means the Dongle saved exactly
    * what was sent. */

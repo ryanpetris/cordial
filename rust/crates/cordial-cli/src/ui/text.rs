@@ -10,8 +10,9 @@ use crate::{
 };
 use cordial_client::{paging::Page, serial::PortInfo};
 use cordial_protocol::{
-    self as p, CapacityReason, CodeKind, DeviceState, ErrorCode, InactiveReason, Kind, Platform,
-    ReportType, Role, Transport, WarningCode, event, keys, profile_list_entry, value::Value,
+    self as p, CapacityReason, CodeKind, DeviceState, ErrorCode, InactiveReason, Kind, OutputMode,
+    OutputState, Platform, ReportType, Role, Transport, WarningCode, event, keys,
+    profile_list_entry, value::Value,
 };
 use ratatui::buffer::CellWidth;
 use std::fmt::Write;
@@ -152,6 +153,7 @@ pub fn unnamed(kinds: &[Kind]) -> &'static str {
         (true, true) => "Unnamed Keyboard/Mouse",
         (true, false) => "Unnamed Keyboard",
         (false, true) => "Unnamed Mouse",
+        (false, false) if kinds.contains(&Kind::Gamepad) => "Unnamed Gamepad",
         (false, false) => "Unnamed Device",
     }
 }
@@ -230,6 +232,36 @@ pub fn transport_token(t: Transport) -> String {
     model::token(t.as_str_name())
 }
 
+pub fn output_mode_name(m: OutputMode) -> &'static str {
+    match m {
+        OutputMode::Disabled => "Disabled",
+        OutputMode::Hid => "HID",
+        OutputMode::Xinput => "XInput",
+    }
+}
+
+/// An output mode as the CLI spells it.
+pub fn output_mode_token(m: OutputMode) -> String {
+    model::token(m.as_str_name())
+}
+
+/// An output's state for details.
+pub fn output_state_words(o: &p::OutputStatus) -> &'static str {
+    match o.state() {
+        OutputState::Unknown => "Unknown",
+        OutputState::Disabled => "Disabled",
+        OutputState::Disconnected => "Waiting to Connect",
+        OutputState::Pending => "Setting Up",
+        OutputState::Active => "Active",
+        OutputState::Unsupported => "Unsupported",
+    }
+}
+
+/// An output's zero-based slot as people count, from one.
+pub fn slot_number(slot: u32) -> String {
+    (u64::from(slot) + 1).to_string()
+}
+
 pub fn role_names(roles: &[Role]) -> String {
     roles
         .iter()
@@ -238,6 +270,7 @@ pub fn role_names(roles: &[Role]) -> String {
             Role::Mouse => Some("Mouse"),
             Role::ConsumerControl => Some("Media Keys"),
             Role::SystemControl => Some("System Keys"),
+            Role::Gamepad => Some("Gamepad"),
             Role::Unknown => None,
         })
         .collect::<Vec<_>>()
@@ -758,6 +791,21 @@ pub fn device_line(d: &p::Device, warnings: usize) -> String {
     if let Some((major, minor)) = model::hidpp_version(d) {
         let _ = write!(line, " hidpp-protocol={major}.{minor}");
     }
+    if model::gamepad(d) {
+        let mode = model::gamepad_mode(d);
+        let token = mode.map_or_else(|| "unknown".into(), output_mode_token);
+        let _ = write!(line, " gamepad-output={token}");
+        if let Some(o) = model::gamepad_output(d).filter(|_| model::gamepad_saved(d)) {
+            let _ = write!(
+                line,
+                " gamepad-state={}",
+                model::token(o.state().as_str_name())
+            );
+            if let Some(slot) = o.slot {
+                let _ = write!(line, " gamepad-slot={}", slot_number(slot));
+            }
+        }
+    }
     let layers = profiles::layers(d);
     if !layers.is_empty() {
         let ids: Vec<String> = layers.iter().map(u32::to_string).collect();
@@ -837,6 +885,16 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
         };
         field(&format!("Enabled Places ({})", transport_name(t)), &value);
     }
+    for m in model::gamepad_support(st) {
+        let value = match m.slots {
+            Some(slots) => format!("{slots} of {}", m.max_slots),
+            None => format!("at most {}", m.max_slots),
+        };
+        field(
+            &format!("Gamepad Slots ({})", output_mode_name(m.mode())),
+            &value,
+        );
+    }
     b
 }
 
@@ -873,6 +931,16 @@ pub fn device_info(d: &p::Device, warnings: &[p::DeviceWarning]) -> String {
     field("Logitech Features", on_off(model::hidpp_enabled(d)));
     field("HID++ Protocol", &hidpp_protocol_text(d));
     field("HID++ Status", &up_words(model::hidpp_up(d)));
+    if model::gamepad(d) {
+        let mode = model::gamepad_mode(d).map_or("Unknown", output_mode_name);
+        field("Gamepad Output", mode);
+        if let Some(o) = model::gamepad_output(d).filter(|_| model::gamepad_saved(d)) {
+            field("Gamepad Status", output_state_words(o));
+            if let Some(slot) = o.slot {
+                field("Gamepad Slot", &slot_number(slot));
+            }
+        }
+    }
     for warning in warnings {
         field(
             warning_label(warning.code()),
@@ -1270,6 +1338,10 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
                 Command::Set(_, Toggle::Hidpp, on) => {
                     format!("HID++ turned {} for {label}.", on_off(*on))
                 }
+                Command::GamepadOutput(_, mode) => format!(
+                    "Gamepad Output of {label} set to {}.",
+                    output_mode_name(*mode)
+                ),
                 Command::DeviceSave(..) => format!("Saved changes to {label}."),
                 Command::Layers(..) => {
                     let words = match state {
@@ -1456,13 +1528,13 @@ fn rule_saved_text(
     change: &p::ProfileRuleChange,
     rules: &[p::ProfileRule],
 ) -> String {
-    let input = profiles::change_target(change);
+    let at = profiles::change_target(change);
     let name = display(&profile.name);
-    let saved = rules.iter().find(|r| r.input.as_ref() == input);
-    match (saved, input) {
+    let saved = rules.iter().find(|r| Some(profiles::rule_ref(r)) == at);
+    match (saved, at) {
         (Some(rule), _) => format!("Saved in {name}: {}", profiles::rule_words(rule)),
-        (None, Some(input)) => {
-            format!("{name} has no rule for {}.", profiles::usage_words(input))
+        (None, Some(at)) => {
+            format!("{name} has no rule for {}.", profiles::input_words(&at))
         }
         (None, None) => String::new(),
     }
@@ -1612,6 +1684,100 @@ pub fn prompt_line(candidate: u32, prompt: &Prompt) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gamepad_output_reads_its_mode_state_and_slot() {
+        let keyboard = p::Device {
+            id: 1,
+            kinds: vec![Kind::Keyboard as i32],
+            ..Default::default()
+        };
+        assert!(!device_line(&keyboard, 0).contains("gamepad"));
+        assert!(!device_info(&keyboard, &[]).contains("Gamepad"));
+        let mut pad = p::Device {
+            id: 2,
+            roles: vec![Role::Gamepad as i32],
+            outputs: vec![p::OutputStatus {
+                role: Role::Gamepad as i32,
+                mode: OutputMode::Disabled as i32,
+                state: OutputState::Disabled as i32,
+                slot: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(model::gamepad_mode(&pad), Some(OutputMode::Disabled));
+        assert!(device_line(&pad, 0).ends_with(" gamepad-output=disabled"));
+        assert!(device_info(&pad, &[]).contains("\n  Gamepad Output: Disabled"));
+        assert!(!device_info(&pad, &[]).contains("Gamepad Status"));
+        pad.output_preferences = vec![p::OutputPreference {
+            role: Role::Gamepad as i32,
+            mode: OutputMode::Xinput as i32,
+        }];
+        pad.outputs[0] = p::OutputStatus {
+            role: Role::Gamepad as i32,
+            mode: OutputMode::Xinput as i32,
+            state: OutputState::Active as i32,
+            slot: Some(1),
+        };
+        assert!(
+            device_line(&pad, 0)
+                .ends_with(" gamepad-output=xinput gamepad-state=active gamepad-slot=2")
+        );
+        let info = device_info(&pad, &[]);
+        assert!(
+            info.contains(
+                "\n  Gamepad Output: XInput\n  Gamepad Status: Active\n  Gamepad Slot: 2"
+            )
+        );
+        // A mode this client doesn't know is neither Disabled nor hidden, even on a keyboard.
+        let mut unknown = keyboard.clone();
+        unknown.output_preferences = vec![p::OutputPreference {
+            role: Role::Gamepad as i32,
+            mode: 7,
+        }];
+        unknown.outputs = vec![p::OutputStatus {
+            role: Role::Gamepad as i32,
+            mode: 7,
+            state: OutputState::Pending as i32,
+            slot: None,
+        }];
+        assert_eq!(model::gamepad_mode(&unknown), None);
+        assert!(
+            device_line(&unknown, 0).ends_with(" gamepad-output=unknown gamepad-state=pending")
+        );
+        assert!(
+            device_info(&unknown, &[])
+                .contains("\n  Gamepad Output: Unknown\n  Gamepad Status: Setting Up")
+        );
+
+        let mut status = p::Status::default();
+        assert!(!adapter_info("", &status, &[]).contains("Gamepad"));
+        status.output_support = vec![p::OutputSupport {
+            role: Role::Gamepad as i32,
+            modes: vec![
+                p::OutputModeSupport {
+                    mode: OutputMode::Disabled as i32,
+                    max_slots: 0,
+                    slots: None,
+                },
+                p::OutputModeSupport {
+                    mode: OutputMode::Hid as i32,
+                    max_slots: 4,
+                    slots: Some(2),
+                },
+                p::OutputModeSupport {
+                    mode: OutputMode::Xinput as i32,
+                    max_slots: 4,
+                    slots: None,
+                },
+            ],
+        }];
+        let info = adapter_info("", &status, &[]);
+        assert!(
+            info.ends_with("\n  Gamepad Slots (HID): 2 of 4\n  Gamepad Slots (XInput): at most 4"),
+            "{info}"
+        );
+    }
 
     #[test]
     fn auto_off_information_reads_never_at_zero() {

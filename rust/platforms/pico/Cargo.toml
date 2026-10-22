@@ -29,7 +29,7 @@ required-features = ["firmware"]
 
 [dependencies]
 cordial-core = { path = "../../crates/cordial-core" }
-cordial-usb = { path = "../../adapters/usb" }
+cordial-usb = { path = "../../adapters/usb", features = ["gamepad"] }
 cordial-record-storage = { path = "../../adapters/record-storage" }
 cordial-btstack = { path = "../../adapters/btstack" }
 embassy-rp = { version = "=0.10.0", default-features = false, features = ["rt", "time-driver", "critical-section-impl", "unstable-pac"] }

@@ -205,12 +205,64 @@ impl Forwarder {
             mapper.layers = layers;
         }
     }
-    pub fn input(&mut self, source: usize, mut input: Input) -> Result<(), Error> {
+    pub(crate) fn profiles_assigned(&mut self, source: usize, assigned: bool) {
+        if let Some(mapper) = &mut self.mappings[source] {
+            mapper.profiles_assigned = assigned;
+        }
+    }
+    pub fn input(&mut self, source: usize, input: Input) -> Result<(), Error> {
+        self.map_input(source, input, None)
+    }
+    pub(crate) fn prepare_gamepad(
+        &mut self,
+        source: usize,
+        controls: impl FnOnce() -> usize,
+    ) -> Result<(), Error> {
+        if self.mappings[source].is_none() {
+            let mut mapper = crate::profiles::Mapper::new();
+            mapper.reserve_held(controls())?;
+            self.mappings[source] = Some(alloc::boxed::Box::new(mapper));
+        }
+        Ok(())
+    }
+    /// Maps one source once, including controls that cross USB collections.
+    pub fn input_with_gamepad(
+        &mut self,
+        source: usize,
+        input: Input,
+        gamepad: crate::hid::Gamepad,
+    ) -> Result<(), Error> {
+        self.map_input(source, input, Some(gamepad))
+    }
+    pub(crate) fn produces_gamepad(&self, source: usize) -> bool {
+        self.mappings
+            .get(source)
+            .and_then(Option::as_ref)
+            .is_some_and(|m| m.produces_gamepad())
+    }
+    /// Latest mapped state, independent of USB slot ownership.
+    pub fn gamepad(&self, source: usize) -> crate::hid::Gamepad {
+        self.mappings
+            .get(source)
+            .and_then(Option::as_ref)
+            .map_or_else(crate::hid::Gamepad::default, |mapper| mapper.gamepad_output)
+    }
+    fn map_input(
+        &mut self,
+        source: usize,
+        mut input: Input,
+        gamepad: Option<crate::hid::Gamepad>,
+    ) -> Result<(), Error> {
         if source >= SOURCES {
             return Err(Error::Invalid);
         }
+        if gamepad.is_some() && self.mappings[source].is_none() {
+            self.mappings[source] = Some(alloc::boxed::Box::new(crate::profiles::Mapper::new()));
+        }
         if let Some(mapper) = &mut self.mappings[source] {
-            input.held = mapper.held(input.held)?;
+            input.held = mapper
+                .held_with_gamepad(input.held, gamepad.unwrap_or_default())?
+                .0;
             mapper.motion(&mut input);
         }
         self.mapped_input(source, input)

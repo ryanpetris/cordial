@@ -133,6 +133,10 @@ message Policy {
   // The device's layers: the IDs of the profiles it applies, in order. Empty passes all input
   // through.
   repeated uint64 profiles = 10;
+  // Saved output choices, at most one per role. Missing Gamepad means Disabled. Writers retain
+  // settled Disabled choices while setup_pending is true and omit them otherwise.
+  // Unknown roles or modes are ignored.
+  repeated OutputPreference output_preferences = 11;
 }
 
 enum Integration {
@@ -152,6 +156,19 @@ enum Role {
   ROLE_MOUSE = 2;
   ROLE_CONSUMER_CONTROL = 3;
   ROLE_SYSTEM_CONTROL = 4;
+  ROLE_GAMEPAD = 5;
+}
+
+enum OutputMode {
+  OUTPUT_MODE_DISABLED = 0;
+  OUTPUT_MODE_HID = 1;
+  OUTPUT_MODE_XINPUT = 2;
+}
+
+message OutputPreference {
+  // Required. Only Gamepad is configurable.
+  Role role = 1;
+  OutputMode mode = 2;
 }
 
 // A complete bond in a form independent of any Bluetooth stack. Native adapters convert it at
@@ -295,8 +312,8 @@ message Profile {
 
 // /profiles/<id>/rules.pb: a profile's rules. Forgetting the last rule deletes the file.
 message Rules {
-  // Required: at least one. Sorted by input in ascending order, with at most one rule for each
-  // input, so the rules can be searched, read or skipped one entry at a time.
+  // Required: at least one. Sorted by input, then collection, with at most one rule for each
+  // input and collection together, so rules can be searched, read or skipped one at a time.
   repeated Rule rules = 1;
 }
 
@@ -304,10 +321,13 @@ message Rules {
 message Rule {
   // Required. The input usage.
   uint32 input = 1;
+  // Required. The input's HID application collection, as a packed usage. Never inferred.
+  uint32 collection = 2;
   // Required.
   oneof effect {
-    Remap remap = 2;
-    Scale scale = 3;
+    Remap remap = 3;
+    Scale scale = 4;
+    Axis axis = 5;
   }
 }
 
@@ -331,4 +351,12 @@ message Scale {
   sint32 numerator = 1;
   // Required. Nonzero.
   uint32 denominator = 2;
+}
+
+// Routes an absolute Game Pad axis within the same Game Pad application collection.
+message Axis {
+  // Required. The destination axis, as a packed usage.
+  uint32 destination = 1;
+  // Reverses the normalized axis range.
+  bool invert = 2;
 }

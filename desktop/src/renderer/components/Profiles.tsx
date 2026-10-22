@@ -9,6 +9,7 @@ import {
   ArrowUpIcon,
   CheckIcon,
   CloseIcon,
+  GamepadIcon,
   KeyboardIcon,
   MediaIcon,
   MoreIcon,
@@ -28,6 +29,7 @@ const ROLE_ICONS: Record<RoleName, (props: { size?: number }) => React.ReactNode
   mouse: MouseIcon,
   consumer_control: MediaIcon,
   system_control: PowerIcon,
+  gamepad: GamepadIcon,
 };
 
 /** An icon for each kind of input a profile changes, each named for assistive technology. */

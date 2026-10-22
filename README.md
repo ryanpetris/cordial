@@ -38,6 +38,8 @@
   another computer and your devices come with it.
 - **Nothing to keep running.** Input forwarding happens on the adapter. The app is for
   setup and status; quit it and your keyboard carries on.
+- **Gamepad outputs on Pico boards.** Choose HID or XInput for each paired controller.
+  See [gamepad setup and limits](#gamepad-outputs).
 - **Sleeps politely.** Bluetooth connections survive host sleep, and nothing you typed
   meanwhile is replayed on wake.
 - **Special keys that just work.** On Logitech HID++ keyboards and mice, media, brightness
@@ -144,11 +146,40 @@ again. See [building](docs/building.md#firmware).
 ### 3. Pair your devices
 
 1. Plug in the adapter and open **Cordial**. The adapter appears in the sidebar.
-2. Choose **Add Device**, put your keyboard or mouse into pairing mode, and select
+2. Choose **Add Device**, put your device into pairing mode, and select
    **Pair** next to it.
 3. Follow any on-screen passkey prompt.
 
 That's it. The device now reconnects to the adapter automatically.
+
+## Gamepad outputs
+
+Pico W, Pico 2 W and Waveshare RP2350B-Plus-W support HID and XInput gamepad
+outputs. ESP32-S3 does not support gamepad output. After pairing a controller,
+open its Settings tab, select **HID** or **XInput** under **Gamepad Output**,
+and save. The control appears when the adapter advertises an enabled mode or a
+saved choice needs clearing. The default is **Disabled**, including for existing
+pairings without a saved choice. Keyboard and mouse forwarding keeps its existing
+behavior.
+
+The adapter saves each controller's choice and forwards input without a Cordial
+app or host service running. HID and XInput each have an independent USB pool
+of `min(4, paired devices selecting that mode)` slots. Disconnected devices still
+count; devices with gamepad output Disabled do not. More than four paired devices
+may select a mode. The limit remains four live Bluetooth connections across all
+device types and both transports.
+
+Connecting or disconnecting a controller assigns or releases a slot without
+reconnecting USB. An empty HID slot stays visible with neutral controls; an empty
+XInput channel reports the controller absent. Pairing, unpairing or changing a
+saved mode reconnects USB when a pool's size changes. VIA/Vial behavior is
+unchanged; configuration-slot resource work is tracked in
+[issue 1](https://github.com/ryanpetris/cordial/issues/1).
+
+Controller support depends on its reported HID layout. See the
+[mapping limits](docs/protocol/hid-forwarding.md#usb-gamepad-outputs) and
+[Linux and Windows verification](docs/protocol/clients.md#gamepad-verification).
+Windows native driver binding is implemented but remains unverified on hardware.
 
 ## Prefer the terminal?
 

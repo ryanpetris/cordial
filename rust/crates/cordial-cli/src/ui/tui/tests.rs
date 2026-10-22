@@ -518,6 +518,539 @@ fn device_details_stage_until_save() {
     assert!(!app.shows("✎ Changed"));
 }
 
+/// The first adapter with a gamepad whose saved output is `saved`, active in its first slot.
+fn gamepad_adapter(saved: p::OutputMode) -> State {
+    let mut st = first_adapter();
+    let mut pad = fixture::device(4, "Example Gamepad");
+    pad.kinds = vec![p::Kind::Gamepad as i32];
+    pad.roles = vec![p::Role::Gamepad as i32];
+    pad.output_preferences = vec![p::OutputPreference {
+        role: p::Role::Gamepad as i32,
+        mode: saved as i32,
+    }];
+    pad.outputs = vec![p::OutputStatus {
+        role: p::Role::Gamepad as i32,
+        mode: saved as i32,
+        state: p::OutputState::Active as i32,
+        slot: Some(0),
+    }];
+    st.devices.push(pad);
+    st
+}
+
+/// Advertises HID and XInput gamepad output.
+fn offer_gamepads(st: &mut State) {
+    st.status.output_support = vec![p::OutputSupport {
+        role: p::Role::Gamepad as i32,
+        modes: [p::OutputMode::Hid, p::OutputMode::Xinput]
+            .into_iter()
+            .map(|mode| p::OutputModeSupport {
+                mode: mode as i32,
+                max_slots: 4,
+                slots: Some(1),
+            })
+            .collect(),
+    }];
+}
+
+impl App {
+    /// Answers the USB Reconnect Required confirmation with Save.
+    fn confirm_reconnect(&mut self) {
+        assert!(self.shows(words::RECONNECT_TITLE), "{}", self.screen());
+        self.click("[Save]");
+        assert_eq!(self.m.dialog, None);
+    }
+}
+
+#[test]
+fn gamepad_output_is_staged_on_settings_until_save() {
+    let mut st = gamepad_adapter(p::OutputMode::Hid);
+    offer_gamepads(&mut st);
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Example Keys Wireless");
+    assert!(!app.shows("Settings"));
+    app.click("Example Gamepad");
+    app.click("Settings");
+    assert!(
+        app.shows("[○ Disabled] [● HID] [○ XInput]"),
+        "{}",
+        app.screen()
+    );
+    app.click("[○ XInput]");
+    assert!(app.shows("✎ Changed"));
+    assert!(!app.ran("DeviceSave"));
+    app.ctrl('s');
+    app.confirm_reconnect();
+    assert!(app.ran("DeviceSave(4, DeviceUpdate { enabled: None, trusted: None, blocked: None, hidpp: None, gamepad: Some(Xinput), layers: None })"));
+    app.finish(Ok(Outcome::Devices));
+    assert!(!app.shows("✎ Changed"));
+    app.click("Diagnostics");
+    let screen = app.screen();
+    assert!(
+        screen.contains("Gamepad Output") && screen.contains("Active"),
+        "{screen}"
+    );
+    assert!(screen.contains("Slot                    1"), "{screen}");
+}
+
+#[test]
+fn a_saved_gamepad_output_the_adapter_lacks_can_only_be_disabled() {
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", gamepad_adapter(p::OutputMode::Hid))]);
+    app.click("Example Gamepad");
+    app.click("Settings");
+    assert!(app.shows("[○ Disabled] [● HID]"), "{}", app.screen());
+    assert!(!app.shows("XInput"));
+    app.click("[○ Disabled]");
+    assert!(app.shows("[● Disabled] [○ HID]"));
+    // The adapter has no HID pool to change.
+    app.ctrl('s');
+    assert_eq!(app.m.dialog, None);
+    assert!(app.ran("gamepad: Some(Disabled)"));
+    // Without a saved choice there is nothing to change.
+    let mut app = App::new(110, 40);
+    app.attach(vec![(
+        "/dev/ttyACM0",
+        gamepad_adapter(p::OutputMode::Disabled),
+    )]);
+    app.click("Example Gamepad");
+    assert!(!app.shows("Settings"), "{}", app.screen());
+}
+
+#[test]
+fn settings_save_before_a_gamepad_output_change() {
+    let mut st = first_adapter();
+    offer_gamepads(&mut st);
+    st.devices[1].output_preferences = vec![p::OutputPreference {
+        role: p::Role::Gamepad as i32,
+        mode: p::OutputMode::Hid as i32,
+    }];
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Example Mouse");
+    app.click("Settings");
+    app.click("[○ Freespin]");
+    app.click("[○ Disabled]");
+    assert!(app.shows("[● Disabled]"));
+    app.ctrl('s');
+    app.confirm_reconnect();
+    assert!(app.ran("SettingsSave { device: 2"));
+    assert!(!app.ran("DeviceSave"));
+    // The staged output can't change while the settings save.
+    assert!(app.find("[○ XInput]").is_none());
+    app.m.action(Action::GamepadOutput(p::OutputMode::Xinput));
+    assert!(app.shows("[● Disabled]"));
+    app.finish(Ok(Outcome::Devices));
+    assert!(app.ran("gamepad: Some(Disabled)"));
+}
+
+#[test]
+fn a_gamepad_pool_change_asks_before_saving_anything() {
+    let mut st = first_adapter();
+    offer_gamepads(&mut st);
+    st.devices[1].output_preferences = vec![p::OutputPreference {
+        role: p::Role::Gamepad as i32,
+        mode: p::OutputMode::Hid as i32,
+    }];
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Example Mouse");
+    app.click("Settings");
+    app.click("[○ Freespin]");
+    app.click("[○ Disabled]");
+    let runs = app.calls().len();
+    // Cancel, Escape and the Save button and shortcut that open the confirmation send nothing.
+    app.click("[Save]");
+    assert!(app.shows(words::RECONNECT_TITLE), "{}", app.screen());
+    app.click("[Cancel]");
+    assert_eq!(app.m.dialog, None);
+    app.render();
+    app.ctrl('s');
+    assert!(app.shows(words::RECONNECT_TITLE));
+    app.key(KeyCode::Esc);
+    assert_eq!(app.m.dialog, None);
+    assert_eq!(app.calls().len(), runs);
+    let screen = app.screen();
+    assert!(
+        screen.contains("[● Disabled]") && screen.contains("[● Freespin]"),
+        "{screen}"
+    );
+    // Save sends the settings, then Gamepad Output without asking again.
+    app.render();
+    app.ctrl('s');
+    app.confirm_reconnect();
+    assert!(app.ran("SettingsSave { device: 2"));
+    assert!(!app.ran("DeviceSave"));
+    app.finish(Ok(Outcome::Devices));
+    assert!(app.ran("gamepad: Some(Disabled)"));
+    assert_eq!(app.m.dialog, None);
+}
+
+#[test]
+fn a_save_that_keeps_the_gamepad_pools_does_not_ask() {
+    // Settings alone.
+    let mut st = first_adapter();
+    offer_gamepads(&mut st);
+    st.devices[1].output_preferences = vec![p::OutputPreference {
+        role: p::Role::Gamepad as i32,
+        mode: p::OutputMode::Hid as i32,
+    }];
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Example Mouse");
+    app.click("Settings");
+    app.click("[○ Freespin]");
+    app.render();
+    app.ctrl('s');
+    assert_eq!(app.m.dialog, None);
+    assert!(app.ran("SettingsSave { device: 2"));
+
+    // HID stays full without the gamepad: four other saved devices select it, whether disabled,
+    // blocked, not resident or on a disabled transport. The enumerated pool reports one slot.
+    let mut st = gamepad_adapter(p::OutputMode::Hid);
+    offer_gamepads(&mut st);
+    let inactive = [
+        InactiveReason::Disabled,
+        InactiveReason::Blocked,
+        InactiveReason::Capacity,
+        InactiveReason::TransportDisabled,
+    ];
+    for (id, why) in (5..).zip(inactive) {
+        st.devices.push(p::Device {
+            state: DeviceState::Disconnected as i32,
+            enabled: why != InactiveReason::Disabled,
+            blocked: why == InactiveReason::Blocked,
+            inactive: Some(why as i32),
+            output_preferences: st.devices[3].output_preferences.clone(),
+            ..fixture::device(id, "Spare Gamepad")
+        });
+    }
+    let mut four = st.clone();
+    four.devices.pop();
+    for (st, asks) in [(st, false), (four, true)] {
+        let mut app = App::new(110, 40);
+        app.attach(vec![("/dev/ttyACM0", st)]);
+        app.click("Example Gamepad");
+        app.click("Settings");
+        app.click("[○ Disabled]");
+        app.render();
+        app.ctrl('s');
+        assert_eq!(app.shows(words::RECONNECT_TITLE), asks, "{}", app.screen());
+        assert_eq!(app.ran("gamepad: Some(Disabled)"), !asks);
+    }
+}
+
+#[test]
+fn a_failed_settings_save_keeps_the_gamepad_output_change_staged() {
+    for (error, text) in [
+        (
+            Error::new("the connection to the adapter closed"),
+            words::CLOSED.trim_end_matches('.'),
+        ),
+        (Error::new("busy"), "Busy"),
+    ] {
+        let mut st = first_adapter();
+        offer_gamepads(&mut st);
+        st.devices[1].output_preferences = vec![p::OutputPreference {
+            role: p::Role::Gamepad as i32,
+            mode: p::OutputMode::Hid as i32,
+        }];
+        let mut app = App::new(110, 40);
+        app.attach(vec![("/dev/ttyACM0", st)]);
+        app.click("Example Mouse");
+        app.click("Settings");
+        app.click("[○ Freespin]");
+        app.click("[○ Disabled]");
+        app.ctrl('s');
+        app.confirm_reconnect();
+        app.finish(Err(error));
+        assert!(!app.ran("DeviceSave"));
+        let screen = app.screen();
+        assert!(screen.contains(text), "{screen}");
+        assert!(
+            screen.contains("[● Disabled]") && screen.contains("[● Freespin]"),
+            "{screen}"
+        );
+    }
+}
+
+#[test]
+fn details_save_waits_for_a_settings_save_that_saves_the_gamepad_output() {
+    let mut st = first_adapter();
+    offer_gamepads(&mut st);
+    st.devices[1].output_preferences = vec![p::OutputPreference {
+        role: p::Role::Gamepad as i32,
+        mode: p::OutputMode::Hid as i32,
+    }];
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Example Mouse");
+    app.m.action(Action::DeviceToggle(Toggle::Trusted, false));
+    app.click("Settings");
+    app.click("[○ Freespin]");
+    app.click("[○ Disabled]");
+    app.ctrl('s');
+    app.confirm_reconnect();
+    assert!(app.ran("SettingsSave { device: 2"));
+    // Saving Details now would leave the gamepad output unsent once the settings save.
+    app.m.action(Action::DetailsSave);
+    assert!(!app.ran("DeviceSave"));
+    app.finish(Ok(Outcome::Devices));
+    assert!(app.ran("DeviceSave(2, DeviceUpdate { enabled: None, trusted: None, blocked: None, hidpp: None, gamepad: Some(Disabled), layers: None })"));
+    // The other way round, Settings waits for the Details save.
+    app.finish(Ok(Outcome::Devices));
+    app.click("Example Mouse");
+    app.m.action(Action::DetailsSave);
+    assert!(app.ran("trusted: Some(false)"));
+    app.click("Settings");
+    app.click("[○ XInput]");
+    let runs = app.calls().len();
+    app.ctrl('s');
+    assert_eq!(app.calls().len(), runs);
+    assert!(app.find("[Save]").is_none(), "{}", app.screen());
+}
+
+#[test]
+fn an_unknown_saved_gamepad_output_can_be_disabled() {
+    for offered in [true, false] {
+        let mut st = first_adapter();
+        if offered {
+            offer_gamepads(&mut st);
+        }
+        st.devices[1].output_preferences = vec![p::OutputPreference {
+            role: p::Role::Gamepad as i32,
+            mode: 7,
+        }];
+        let mut app = App::new(110, 40);
+        app.attach(vec![("/dev/ttyACM0", st)]);
+        app.click("Example Mouse");
+        // An unrelated save leaves the unknown choice alone.
+        app.m.action(Action::DeviceToggle(Toggle::Trusted, false));
+        app.m.action(Action::DetailsSave);
+        assert!(app.ran("trusted: Some(false), blocked: None, hidpp: None, gamepad: None"));
+        app.finish(Ok(Outcome::Devices));
+        app.click("Settings");
+        let choices = if offered {
+            "[○ Disabled] [○ HID] [○ XInput]"
+        } else {
+            "[○ Disabled]"
+        };
+        assert!(app.shows(choices), "{}", app.screen());
+        assert!(offered || !app.shows("HID"));
+        app.click("[○ Disabled]");
+        assert!(app.shows("✎ Changed"));
+        app.ctrl('s');
+        assert!(app.ran("gamepad: Some(Disabled)"), "{:?}", app.calls());
+    }
+}
+
+/// Saves Gamepad Output XInput for the gamepad from its Settings tab.
+fn save_xinput(app: &mut App) {
+    app.click("Example Gamepad");
+    app.click("Settings");
+    app.click("[○ XInput]");
+    app.render();
+    app.ctrl('s');
+    app.confirm_reconnect();
+    assert!(app.ran("gamepad: Some(Xinput)"));
+}
+
+impl App {
+    /// The first adapter's session ends and its port goes away.
+    fn lose_first(&mut self) {
+        let slot = self.slot("00000000000FA001");
+        self.phase(slot, Phase::Lost(Error::new("gone")));
+        self.m.update(Msg::Ports(Ok(Vec::new())));
+    }
+
+    /// The first adapter returns on another port with `st`.
+    fn return_first(&mut self, st: State) -> Slot {
+        self.m
+            .update(Msg::Ports(Ok(vec![port("/dev/ttyACM2", &st.status.id)])));
+        let back = *self
+            .m
+            .probes
+            .iter()
+            .find(|(_, p)| p.as_str() == "/dev/ttyACM2")
+            .unwrap()
+            .0;
+        self.fleet.0.borrow_mut().states.insert(back, st);
+        self.phase(back, Phase::Opened);
+        self.phase(back, Phase::Ready);
+        back
+    }
+
+    /// Finishes the device save of the gamepad with a result.
+    fn finish_gamepad_save(&mut self, result: Result<Outcome, Error>) {
+        let (slot, ticket) = *self
+            .m
+            .jobs
+            .iter()
+            .find(|(_, j)| matches!(j.kind, Kind::DeviceSave { device: 4, .. }))
+            .unwrap()
+            .0;
+        self.m.update(Msg::Fleet(
+            slot,
+            Box::new(Event::Done {
+                session: 1,
+                ticket,
+                result,
+            }),
+        ));
+    }
+}
+
+#[test]
+fn a_gamepad_output_save_keeps_its_page_across_the_usb_reconnect() {
+    let page = Page::Device("00000000000FA001".into(), 4);
+    let mut st = gamepad_adapter(p::OutputMode::Hid);
+    offer_gamepads(&mut st);
+    let mut saved = st.clone();
+    saved.devices[3].output_preferences[0].mode = p::OutputMode::Xinput as i32;
+
+    // The adapter answers, then USB reconnects.
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st.clone())]);
+    save_xinput(&mut app);
+    let slot = app.slot("00000000000FA001");
+    app.edit(slot, |s| *s = saved.clone());
+    app.finish_gamepad_save(Ok(Outcome::Devices));
+    app.lose_first();
+    assert_eq!(app.m.shown(), page);
+    assert_eq!(app.m.tab, Tab::Settings);
+    assert!(app.shows("[○ HID] [● XInput]"), "{}", app.screen());
+    assert!(!app.shows("✎ Changed"));
+    assert!(app.find("[○ Disabled]").is_none(), "locked while offline");
+    app.return_first(saved.clone());
+    assert_eq!((app.m.shown(), app.m.tab), (page.clone(), Tab::Settings));
+    assert!(app.shows("[● XInput]") && !app.shows("✎ Changed"));
+
+    // USB drops before the answer, which arrives before or after the session ends.
+    for lost_first in [true, false] {
+        for after in [st.clone(), saved.clone()] {
+            let mut app = App::new(110, 40);
+            app.attach(vec![("/dev/ttyACM0", st.clone())]);
+            save_xinput(&mut app);
+            let closed = || Err(Error::new("the connection to the adapter closed"));
+            if lost_first {
+                app.lose_first();
+                app.finish_gamepad_save(closed());
+            } else {
+                app.finish_gamepad_save(closed());
+                app.lose_first();
+            }
+            assert_eq!((app.m.shown(), app.m.tab), (page.clone(), Tab::Settings));
+            assert!(app.shows(words::CLOSED) && app.shows("✎ Changed"));
+            let stored =
+                after.devices[3].output_preferences[0].mode == p::OutputMode::Xinput as i32;
+            app.return_first(after);
+            assert_eq!((app.m.shown(), app.m.tab), (page.clone(), Tab::Settings));
+            assert!(app.shows("[● XInput]"));
+            // The note stays until the device reports the change saved.
+            assert_eq!(app.shows(words::CLOSED), !stored, "{}", app.screen());
+            assert_eq!(app.shows("✎ Changed"), !stored);
+        }
+    }
+}
+
+#[test]
+fn a_late_answer_from_the_ended_session_yields_to_the_returned_record() {
+    let mut st = gamepad_adapter(p::OutputMode::Hid);
+    offer_gamepads(&mut st);
+    let mut saved = st.clone();
+    saved.devices[3].output_preferences[0].mode = p::OutputMode::Xinput as i32;
+    // The adapter returns and lists the device before the ended session answers.
+    for stored in [true, false] {
+        for failed in [true, false] {
+            let mut app = App::new(110, 40);
+            app.attach(vec![("/dev/ttyACM0", st.clone())]);
+            save_xinput(&mut app);
+            app.lose_first();
+            app.return_first(if stored { saved.clone() } else { st.clone() });
+            // The readback alone settles a stored change.
+            let key = ("00000000000FA001".to_owned(), 4);
+            assert_eq!(app.m.device_drafts.contains_key(&key), !stored);
+            app.finish_gamepad_save(if failed {
+                Err(Error::new("the connection to the adapter closed"))
+            } else {
+                Ok(Outcome::Devices)
+            });
+            let case = format!("stored {stored}, failed {failed}\n{}", app.screen());
+            // Only a failure the record doesn't contradict shows, and its change stays staged.
+            assert_eq!(app.shows(words::CLOSED), failed && !stored, "{case}");
+            assert_eq!(app.shows("✎ Changed"), failed && !stored, "{case}");
+            let mode = if stored || failed {
+                "[● XInput]"
+            } else {
+                "[● HID]"
+            };
+            assert!(app.shows(mode), "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_held_device_page_closes_when_the_device_does_not_return() {
+    let mut st = gamepad_adapter(p::OutputMode::Hid);
+    offer_gamepads(&mut st);
+    // The hold expires.
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st.clone())]);
+    save_xinput(&mut app);
+    app.finish_gamepad_save(Err(Error::new("the connection to the adapter closed")));
+    app.lose_first();
+    app.m.held.get_mut("00000000000FA001").unwrap().until = Instant::now();
+    app.m.tick();
+    assert_eq!(app.m.shown(), Page::Overview);
+    assert!(app.m.notes.is_empty());
+    // The adapter returns without the device.
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st.clone())]);
+    save_xinput(&mut app);
+    app.lose_first();
+    let mut gone = st.clone();
+    gone.devices.pop();
+    app.return_first(gone);
+    assert_eq!(app.m.shown(), Page::Overview);
+}
+
+#[test]
+fn a_settings_save_answered_after_a_reconnect_sends_nothing_to_the_new_session() {
+    let mut st = gamepad_adapter(p::OutputMode::Hid);
+    offer_gamepads(&mut st);
+    st.devices[1].output_preferences = st.devices[3].output_preferences.clone();
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st.clone())]);
+    app.click("Example Mouse");
+    app.click("Settings");
+    app.click("[○ Freespin]");
+    app.click("[○ Disabled]");
+    app.ctrl('s');
+    app.confirm_reconnect();
+    let (old, ticket) = *app
+        .m
+        .jobs
+        .iter()
+        .find(|(_, j)| matches!(j.kind, Kind::SettingsSave { .. }))
+        .unwrap()
+        .0;
+    app.lose_first();
+    let back = app.return_first(st);
+    app.fleet.0.borrow_mut().calls.clear();
+    app.m.update(Msg::Fleet(
+        old,
+        Box::new(Event::Done {
+            session: 1,
+            ticket,
+            result: Ok(Outcome::Devices),
+        }),
+    ));
+    assert!(!app.ran("DeviceSave"), "{:?}", app.calls());
+    assert_ne!(old, back);
+    assert!(app.shows("[● Disabled]") && app.shows("✎ Changed"));
+}
+
 #[test]
 fn settings_save_sends_every_change_in_one_request() {
     let mut app = App::two(110, 32);

@@ -18,7 +18,7 @@ use cordial_core::{
 };
 use cordial_pico::{DmaIrqs, board, radio, services, usb};
 use cordial_usb::{
-    Buffers, Usb,
+    Buffers, Topology, Usb,
     owner::{Owner, Shared},
 };
 use embassy_executor::Spawner;
@@ -65,21 +65,26 @@ unsafe extern "C" fn set_address(address: *const u8, command: *mut u8) {
 
 #[embassy_executor::task]
 async fn usb_task(
-    driver: embassy_rp::Peri<'static, embassy_rp::peripherals::USB>,
+    mut driver: embassy_rp::Peri<'static, embassy_rp::peripherals::USB>,
     serial: &'static str,
-    interfaces: u8,
+    mut topology: Topology,
 ) {
-    let mut buffers = Buffers::new(&USB_IO);
-    Usb::new(
-        usb::driver(driver),
-        serial,
-        board::DEFAULT_ADAPTER_NAME,
-        interfaces,
-        &USB_IO,
-        &mut buffers,
-    )
-    .run()
-    .await;
+    loop {
+        topology = {
+            let mut buffers = Buffers::new(&USB_IO);
+            Usb::new(
+                usb::driver(driver.reborrow()),
+                serial,
+                board::DEFAULT_ADAPTER_NAME,
+                topology,
+                &USB_IO,
+                &mut buffers,
+            )
+            .run_until_rebuild()
+            .await
+        };
+        Timer::after_millis(250).await;
+    }
 }
 #[embassy_executor::task]
 async fn priority_task(owner: &'static App, state: &'static State<Store>) {
@@ -141,9 +146,14 @@ async fn main(spawner: Spawner) {
         board::STORAGE_IDENTITY,
     )
     .await;
-    // USB enumerates once, with the saved configuration interfaces.
+    // USB allocates the saved pools before its first enumeration.
     let interfaces =
         cordial_usb::saved_interfaces(&mut records, board::PROFILE_MEMORY_BUDGET.is_some()).await;
+    let topology = Topology {
+        interfaces,
+        gamepads: cordial_usb::outputs::saved_plan(&mut records).await,
+    };
+    USB_IO.set_topology(topology);
     let store = Box::leak(Box::new(Storage::new(records)));
     let unique = identity.unique;
     let state = Box::leak(Box::new(
@@ -158,7 +168,7 @@ async fn main(spawner: Spawner) {
     }));
     // This is the only host instance and owner for the lifetime of the board.
     let backend = unsafe { Backend::new(state, Some(chipset)) };
-    let app = Application::new(Build {
+    let mut app = Application::new(Build {
         development: cfg!(feature = "development"),
         version: FIRMWARE_VERSION,
         board: board::HARDWARE,
@@ -172,6 +182,7 @@ async fn main(spawner: Spawner) {
         #[cfg(feature = "production")]
         bootloader: None,
     });
+    app.manager.output_support = cordial_usb::outputs::SUPPORT;
     let owner: &'static App =
         Box::leak(Box::new(Owner::new(&USB_IO, app, store.handle(), backend)));
     spawner.spawn(priority_task(owner, state).unwrap());
@@ -179,7 +190,7 @@ async fn main(spawner: Spawner) {
     // Queue USB after storage reads, immediately before radio initialization.
     // The synchronous C init finishes before this executor can poll USB;
     // the async Embassy init yields and lets USB management run during startup.
-    spawner.spawn(usb_task(p.USB, serial, interfaces).unwrap());
+    spawner.spawn(usb_task(p.USB, serial, topology).unwrap());
     let Some((mut control, mac)) = radio::init(
         spawner,
         p.PIO0,

@@ -112,6 +112,7 @@ pub fn kinds(kind: DeviceKind) -> Vec<i32> {
         DeviceKind::Keyboard => alloc::vec![p::Kind::Keyboard as i32],
         DeviceKind::Mouse => alloc::vec![p::Kind::Mouse as i32],
         DeviceKind::KeyboardMouse => alloc::vec![p::Kind::Keyboard as i32, p::Kind::Mouse as i32],
+        DeviceKind::Gamepad => alloc::vec![p::Kind::Gamepad as i32],
     }
 }
 
@@ -119,13 +120,14 @@ fn info_kinds(value: &str) -> Vec<i32> {
     match value {
         "keyboard" => kinds(DeviceKind::Keyboard),
         "mouse" => kinds(DeviceKind::Mouse),
+        "gamepad" => kinds(DeviceKind::Gamepad),
         "keyboard_mouse" => kinds(DeviceKind::KeyboardMouse),
         "other" => alloc::vec![p::Kind::Other as i32],
         _ => Vec::new(),
     }
 }
 
-/// What a device with HID descriptor `roles` is: a keyboard, a mouse or both, or other.
+/// Device kinds identified by HID descriptor roles.
 fn role_kinds(roles: u8) -> Vec<i32> {
     let mut list = Vec::new();
     if roles & crate::hid::KEYBOARD != 0 {
@@ -133,6 +135,9 @@ fn role_kinds(roles: u8) -> Vec<i32> {
     }
     if roles & crate::hid::MOUSE != 0 {
         list.push(p::Kind::Mouse as i32);
+    }
+    if roles & crate::outputs::GAMEPAD != 0 {
+        list.push(p::Kind::Gamepad as i32);
     }
     if list.is_empty() && roles != 0 {
         list.push(p::Kind::Other as i32);
@@ -143,15 +148,15 @@ fn role_kinds(roles: u8) -> Vec<i32> {
 /// The wire roles of `hid` role bits.
 pub fn roles(roles: u8) -> Vec<i32> {
     [
-        p::Role::Keyboard,
-        p::Role::Mouse,
-        p::Role::ConsumerControl,
-        p::Role::SystemControl,
+        (crate::hid::KEYBOARD, p::Role::Keyboard),
+        (crate::hid::MOUSE, p::Role::Mouse),
+        (crate::hid::CONSUMER, p::Role::ConsumerControl),
+        (crate::hid::SYSTEM, p::Role::SystemControl),
+        (crate::outputs::GAMEPAD, p::Role::Gamepad),
     ]
     .into_iter()
-    .enumerate()
-    .filter(|(i, _)| roles & (1 << i) != 0)
-    .map(|(_, r)| r as i32)
+    .filter(|(bit, _)| roles & bit != 0)
+    .map(|(_, role)| role as i32)
     .collect()
 }
 
@@ -440,6 +445,19 @@ pub fn device(manager: &Manager, policy: &Policy, slot: Option<usize>) -> p::Dev
             .map(|l| device_info(&fields, l.catalog.records()))
             .unwrap_or_default(),
         roles: roles(role_bits),
+        output_preferences: policy
+            .output_preferences
+            .iter()
+            .copied()
+            .map(crate::outputs::Preference::wire)
+            .collect(),
+        outputs: if role_bits & crate::outputs::GAMEPAD != 0
+            || !policy.output_preferences.is_empty()
+        {
+            alloc::vec![manager.gamepad_status(policy, slot)]
+        } else {
+            Vec::new()
+        },
         profiles: manager.profiles_supported().then(|| p::ProfileLayers {
             profiles: policy.profiles.iter().map(|&id| id as u32).collect(),
         }),

@@ -10,6 +10,8 @@ import type {
   InactiveReason,
   IntegrationState,
   Kind,
+  OutputMode,
+  OutputState,
   Platform,
   ReportType,
   Role,
@@ -26,10 +28,12 @@ export type TransportName = Exclude<Name<typeof Transport>, "unspecified">;
 /** What a device or candidate says it is; kinds this app doesn't know are skipped. */
 export type KindName = Exclude<Name<typeof Kind>, "unknown">;
 /** What the app shows a device or candidate as: one kind, or both a keyboard and a mouse. */
-export type DeviceKind = "keyboard" | "mouse" | "keyboard_mouse" | "other";
+export type DeviceKind = "keyboard" | "mouse" | "keyboard_mouse" | "gamepad" | "other";
 export type ConnectionState = Name<typeof DeviceState>;
 export type Inactive = Name<typeof InactiveReason>;
 export type RoleName = Exclude<Name<typeof Role>, "unknown">;
+export type OutputModeName = Name<typeof OutputMode>;
+export type OutputStateName = Name<typeof OutputState>;
 export type IntegrationStateName = Name<typeof IntegrationState>;
 export type SettingStateName = Name<typeof SettingState>;
 export type WarningName = Name<typeof WarningCode>;
@@ -68,6 +72,8 @@ export interface AdapterStatus {
   profileSupport: ProfileSupport | null;
   /** Every configuration interface the firmware supports, enabled or not. */
   interfaces: InterfaceState[];
+  /** Output modes the firmware implements, by role; a mode not listed is unsupported. */
+  outputSupport: { role: RoleName; modes: { mode: OutputModeName; maxSlots: number; slots: number | null }[] }[];
 }
 
 /** What the adapter supports for profiles. */
@@ -155,6 +161,11 @@ export interface DeviceRecord {
   profiles: number[] | null;
   /** Why the connected device's profiles aren't loaded. */
   profileError: Code | null;
+  /** Saved output choices; a missing gamepad choice means Disabled. A mode this app doesn't know
+   * is null. */
+  outputPreferences: { role: RoleName; mode: OutputModeName | null }[];
+  /** Output state, independent of the Bluetooth connection; `slot` is set only while active. */
+  outputs: { role: RoleName; mode: OutputModeName | null; state: OutputStateName; slot: number | null }[];
 }
 
 export interface DeviceWarning {
@@ -226,6 +237,7 @@ export interface DeviceChanges {
   hidpp?: boolean;
   /** The device's layers, in the order they apply. */
   profiles?: number[];
+  gamepadOutput?: OutputModeName;
 }
 
 /** Adapter settings to change; each omitted field stays as it is. */
@@ -252,6 +264,9 @@ export interface AdapterEntry {
   connectError: string | null;
   readiness: "waiting" | "ready";
   status: AdapterStatus | null;
+  /** Whether the adapter's devices are yet to be listed: it is reconnecting, or its session is
+   * still reading them for the first time. */
+  listing: boolean;
   /** Problems worth the tray's attention badge. */
   attention: string[];
   /** The Profiles list's page; null without profile support. */

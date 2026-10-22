@@ -2,8 +2,8 @@
 //! integration status, the pairing step and setting types.
 use cordial_protocol::{
     self as p, CodeKind, DeviceState, ErrorCode, InactiveReason, IntegrationKind, IntegrationState,
-    Kind, Platform, Role, SettingState, Transport, integer_setting, integration, keys, pairing,
-    setting, setting_change, value::Value,
+    Kind, OutputMode, Platform, Role, SettingState, Transport, integer_setting, integration, keys,
+    pairing, setting, setting_change, value::Value,
 };
 
 /// An enum value's name as the CLI spells it: lowercase, without the type prefix.
@@ -31,6 +31,8 @@ const PREFIXES: &[&str] = &[
     "ROLE_",
     "CODE_KIND_",
     "CONFIGURATION_INTERFACE_",
+    "OUTPUT_MODE_",
+    "OUTPUT_STATE_",
 ];
 
 pub fn code_token(code: ErrorCode) -> String {
@@ -225,6 +227,91 @@ pub fn platform(st: &p::Status) -> Platform {
     st.platform()
 }
 
+/// The gamepad output modes the adapter supports besides Disabled, with their slots.
+pub fn gamepad_support(st: &p::Status) -> Vec<&p::OutputModeSupport> {
+    st.output_support
+        .iter()
+        .filter(|s| s.role == Role::Gamepad as i32)
+        .flat_map(|s| &s.modes)
+        .filter(|m| matches!(OutputMode::try_from(m.mode), Ok(m) if m != OutputMode::Disabled))
+        .collect()
+}
+
+/// The gamepad output modes the adapter supports besides Disabled.
+pub fn gamepad_modes(st: &p::Status) -> Vec<OutputMode> {
+    gamepad_support(st).into_iter().map(|m| m.mode()).collect()
+}
+
+/// The device's saved gamepad output mode: Disabled without a saved choice, and `None` for a
+/// mode this client doesn't know.
+pub fn gamepad_mode(d: &p::Device) -> Option<OutputMode> {
+    d.output_preferences
+        .iter()
+        .rfind(|o| o.role == Role::Gamepad as i32)
+        .map_or(Some(OutputMode::Disabled), |o| {
+            OutputMode::try_from(o.mode).ok()
+        })
+}
+
+/// Whether the device has a saved gamepad output choice other than Disabled, including one this
+/// client doesn't know.
+pub fn gamepad_saved(d: &p::Device) -> bool {
+    gamepad_mode(d) != Some(OutputMode::Disabled)
+}
+
+/// The device's gamepad output state, when it reports one.
+pub fn gamepad_output(d: &p::Device) -> Option<&p::OutputStatus> {
+    d.outputs.iter().find(|o| o.role == Role::Gamepad as i32)
+}
+
+/// Whether the device has a gamepad output to choose: it is a gamepad, or has a saved gamepad
+/// output choice.
+pub fn gamepad(d: &p::Device) -> bool {
+    d.roles.contains(&(Role::Gamepad as i32))
+        || d.kinds.contains(&(Kind::Gamepad as i32))
+        || gamepad_saved(d)
+}
+
+/// The gamepad output modes the device can be given: Disabled, those the adapter supports, and
+/// its saved one even when the adapter no longer supports it.
+pub fn gamepad_choices(st: &p::Status, d: &p::Device) -> Vec<OutputMode> {
+    let saved = gamepad_mode(d);
+    let supported = gamepad_modes(st);
+    [OutputMode::Disabled, OutputMode::Hid, OutputMode::Xinput]
+        .into_iter()
+        .filter(|m| *m == OutputMode::Disabled || Some(*m) == saved || supported.contains(m))
+        .collect()
+}
+
+/// Whether giving device `id` gamepad output `mode` changes a gamepad pool the adapter offers,
+/// which reconnects USB. Each pool holds the saved devices selecting its mode, up to the mode's
+/// advertised capacity, whether or not they are connected, enabled or usable. Records the adapter couldn't read
+/// can only fill the pools further, so leaving them out never misses a change.
+pub fn gamepad_pools_change(
+    st: &p::Status,
+    devices: &[p::Device],
+    id: u32,
+    mode: OutputMode,
+) -> bool {
+    let pool = |of: &p::OutputModeSupport, changed: bool| {
+        devices
+            .iter()
+            .filter(|d| {
+                let selected = if changed && d.id == id {
+                    Some(mode)
+                } else {
+                    gamepad_mode(d)
+                };
+                selected == Some(of.mode())
+            })
+            .count()
+            .min(of.max_slots as usize)
+    };
+    gamepad_support(st)
+        .into_iter()
+        .any(|of| pool(of, false) != pool(of, true))
+}
+
 /// What a pairing asks of the user.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Prompt {
@@ -392,4 +479,86 @@ pub fn forget_change(s: &p::Setting) -> p::SettingChange {
 /// Wraps a value for the wire.
 pub fn wire_value(v: Value) -> p::Value {
     p::Value { value: Some(v) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pad(id: u32, mode: i32) -> p::Device {
+        p::Device {
+            id,
+            output_preferences: vec![p::OutputPreference {
+                role: Role::Gamepad as i32,
+                mode,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn offering(modes: &[OutputMode]) -> p::Status {
+        p::Status {
+            output_support: vec![p::OutputSupport {
+                role: Role::Gamepad as i32,
+                modes: modes
+                    .iter()
+                    .map(|&mode| p::OutputModeSupport {
+                        mode: mode as i32,
+                        max_slots: 4,
+                        slots: Some(1),
+                    })
+                    .collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gamepad_pools_count_every_saved_choice_up_to_four() {
+        use OutputMode::{Disabled, Hid, Xinput};
+        let st = offering(&[Hid, Xinput]);
+        let mut devices: Vec<_> = (1..=4).map(|id| pad(id, Hid as i32)).collect();
+        // Disabled, blocked, nonresident and transport-disabled devices still count.
+        devices[1].enabled = false;
+        devices[2].blocked = true;
+        devices[2].inactive = Some(InactiveReason::Blocked as i32);
+        devices[3].inactive = Some(InactiveReason::Capacity as i32);
+        assert!(gamepad_pools_change(&st, &devices, 1, Disabled));
+        assert!(!gamepad_pools_change(&st, &devices, 1, Hid));
+        let mut off = pad(5, Hid as i32);
+        off.inactive = Some(InactiveReason::TransportDisabled as i32);
+        devices.push(off);
+        // Five select HID: the pool stays at four without one of them.
+        assert!(!gamepad_pools_change(&st, &devices, 1, Disabled));
+        assert!(gamepad_pools_change(&st, &devices, 1, Xinput));
+        devices.extend((6..=9).map(|id| pad(id, Xinput as i32)));
+        assert!(gamepad_pools_change(&st, &devices, 6, Hid));
+        devices.push(pad(10, Xinput as i32));
+        assert!(!gamepad_pools_change(&st, &devices, 1, Disabled));
+        // Both pools stay full.
+        assert!(!gamepad_pools_change(&st, &devices, 1, Xinput));
+        assert!(!gamepad_pools_change(&st, &devices, 6, Hid));
+        // A choice this client doesn't know is in neither pool.
+        let mut few = vec![pad(1, 7), pad(2, Hid as i32)];
+        assert!(!gamepad_pools_change(&st, &few, 1, Disabled));
+        assert!(gamepad_pools_change(&st, &few, 1, Hid));
+        // Without a saved choice, a device is Disabled.
+        few[0].output_preferences.clear();
+        assert!(!gamepad_pools_change(&st, &few, 1, Disabled));
+        assert!(gamepad_pools_change(&st, &few, 1, Xinput));
+    }
+
+    #[test]
+    fn gamepad_pools_the_adapter_does_not_offer_never_change() {
+        use OutputMode::{Disabled, Hid, Xinput};
+        let devices = vec![pad(1, Hid as i32), pad(2, Xinput as i32)];
+        // Clearing a stale choice on an adapter without gamepad output.
+        let none = p::Status::default();
+        assert!(!gamepad_pools_change(&none, &devices, 1, Disabled));
+        assert!(!gamepad_pools_change(&none, &devices, 2, Disabled));
+        let hid = offering(&[Hid]);
+        assert!(!gamepad_pools_change(&hid, &devices, 2, Disabled));
+        assert!(gamepad_pools_change(&hid, &devices, 1, Disabled));
+        assert!(gamepad_pools_change(&hid, &devices, 2, Hid));
+    }
 }

@@ -9,14 +9,14 @@ use cordial_core::{
 use embassy_futures::block_on;
 use owner::{Owner, Shared};
 #[allow(dead_code)]
-mod support {
+pub(super) mod support {
     use std::vec::Vec;
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../crates/cordial-core/tests/support/mod.rs"
     ));
 }
-fn application() -> Application {
+pub(super) fn application() -> Application {
     Application::new(Build {
         development: true,
         version: "test",
@@ -519,7 +519,10 @@ fn raw_edit_from_previous_enumeration_cannot_change_the_new_target() {
         .ok()
         .unwrap();
     loops.poll(&mut s, 1);
-    assert_eq!(io.reconnect.try_take(), Some(Interface::Via.bit()));
+    assert_eq!(
+        io.reconnect.try_take().map(|t| t.interfaces),
+        Some(Interface::Via.bit())
+    );
     BusHandler(&io).configured(true);
     loops.poll(&mut s, 2);
     assert_eq!(io.raw[0].tx.try_receive().ok().unwrap().bytes[0], 255);
@@ -605,7 +608,10 @@ fn edits_are_saved_before_usb_enumerates_again() {
     // Enumerating again follows the save in the same step, however soon after the edit.
     s.app.usb_reconnect = true;
     loops.poll(&mut s, 2);
-    assert_eq!(io.reconnect.try_take(), Some(Interface::Vial.bit()));
+    assert_eq!(
+        io.reconnect.try_take().map(|t| t.interfaces),
+        Some(Interface::Vial.bit())
+    );
     assert_eq!(rules(&mut s.store, 1), 1);
 }
 
@@ -627,22 +633,31 @@ fn usb_reconnects_only_when_the_exposed_interfaces_must_change() {
     // Started without it, the saved set is applied once storage is ready.
     s.app.manager.storage_ready = true;
     loops.poll(&mut s, 2);
-    assert_eq!(io.reconnect.try_take(), Some(Interface::Vial.bit()));
+    assert_eq!(
+        io.reconnect.try_take().map(|t| t.interfaces),
+        Some(Interface::Vial.bit())
+    );
     loops.poll(&mut s, 3);
     assert!(!io.reconnect.signaled());
     // The application requests a reconnect when an enabled interface's profile changes.
     s.app.manager.preference.configuration_interfaces = std::vec![enabled(Interface::Vial, 2)];
     s.app.usb_reconnect = true;
     loops.poll(&mut s, 4);
-    assert_eq!(io.reconnect.try_take(), Some(Interface::Vial.bit()));
+    assert_eq!(
+        io.reconnect.try_take().map(|t| t.interfaces),
+        Some(Interface::Vial.bit())
+    );
     assert!(!s.app.usb_reconnect);
     // Switching interfaces changes the set.
     s.app.manager.preference.configuration_interfaces = std::vec![enabled(Interface::Via, 2)];
     loops.poll(&mut s, 5);
-    assert_eq!(io.reconnect.try_take(), Some(Interface::Via.bit()));
+    assert_eq!(
+        io.reconnect.try_take().map(|t| t.interfaces),
+        Some(Interface::Via.bit())
+    );
     s.app.manager.preference.configuration_interfaces.clear();
     loops.poll(&mut s, 6);
-    assert_eq!(io.reconnect.try_take(), Some(0));
+    assert_eq!(io.reconnect.try_take().map(|t| t.interfaces), Some(0));
     // A board without profiles exposes no interfaces whatever is saved.
     s.app.manager.preference.configuration_interfaces = std::vec![enabled(Interface::Via, 2)];
     s.app.manager.profile_budget = None;
@@ -1177,4 +1192,163 @@ fn a_step_that_writes_is_followed_by_a_rest_as_long_as_it_took() {
         // The next save starts no sooner than 20 ms after the last one ended.
         assert!(pair[1] - 20 >= pair[0] + 20, "{saved:?}");
     }
+}
+
+#[cfg(feature = "gamepad")]
+#[test]
+fn startup_pools_match_core_validation_including_nonresident_pairs() {
+    use cordial_core::{
+        devices::Policy,
+        outputs::{Plan, Preference},
+    };
+    use cordial_protocol::{OutputMode, Role};
+    let (mut manager, mut store, mut radio) = support::setup();
+    for (id, address, mode) in [
+        (1, 10, OutputMode::Hid),
+        (2, 11, OutputMode::Hid),
+        (3, 12, OutputMode::Xinput),
+        (4, 10, OutputMode::Xinput),
+        (5, 13, OutputMode::Disabled),
+    ] {
+        let mut policy = Policy::paired(id, support::peer(address), b"Controller");
+        policy.enabled = false;
+        policy.output_preferences.push(Preference {
+            role: Role::Gamepad,
+            mode,
+        });
+        block_on(cordial_core::bonds::commit(
+            &mut store,
+            &policy,
+            &support::bond(id, policy.peer),
+        ))
+        .unwrap();
+    }
+    store.records.insert(
+        cordial_core::storage::record_key(2, 6),
+        b"invalid pair".to_vec(),
+    );
+    let startup = block_on(outputs::saved_plan(&mut store));
+    assert_eq!(
+        startup,
+        Plan {
+            hid_gamepads: 2,
+            xinput_gamepads: 1
+        }
+    );
+    block_on(manager.load(&mut store, &mut radio)).unwrap();
+    assert_eq!(manager.outputs.plan(), startup);
+    assert!(manager.find(1).is_none());
+    store.fail_load = Some(cordial_core::storage::record_key(2, 3));
+    assert_eq!(block_on(outputs::saved_plan(&mut store)), Plan::default());
+}
+
+#[cfg(feature = "gamepad")]
+#[test]
+fn saved_pool_change_waits_for_successful_persistence_and_physical_response_completion() {
+    use cordial_protocol::{OutputMode, Role, request::Command};
+    for fail in [true, false] {
+        let io = Io::new();
+        let (mut app, mut store, radio) = profile_application();
+        app.manager.output_support = outputs::SUPPORT;
+        if fail {
+            store.fail_save = Some((cordial_core::storage::record_key(2, 77), false));
+        }
+        let mut shared = Shared { app, store, radio };
+        let mut loops = Loops::new(&io, 0);
+        let mut host = Host::new();
+        BusHandler(&io).configured(true);
+        io.dtr(true);
+        loops.poll(&mut shared, 0);
+        host.serve(&io);
+        loops.poll(&mut shared, 1);
+        host.send(
+            &io,
+            Command::SetDevice(cordial_protocol::SetDevice {
+                device: 77,
+                output_preferences: std::vec![cordial_protocol::OutputPreference {
+                    role: Role::Gamepad as i32,
+                    mode: OutputMode::Hid as i32,
+                }],
+                ..Default::default()
+            }),
+        );
+        for at in 2..8 {
+            loops.poll(&mut shared, at);
+        }
+        assert!(!io.reconnect.signaled());
+        assert_eq!(
+            shared.app.manager.outputs.plan().hid_gamepads,
+            u8::from(!fail)
+        );
+        let saved = block_on(outputs::saved_plan(&mut shared.store));
+        assert_eq!(saved, shared.app.manager.outputs.plan());
+        assert!(!io.serial_tx.is_empty(), "the response is waiting for USB");
+        for at in 8..40 {
+            host.serve(&io);
+            loops.poll(&mut shared, at);
+            if io.reconnect.signaled() {
+                break;
+            }
+        }
+        assert!(host.response().is_some());
+        if fail {
+            assert!(!io.reconnect.signaled());
+        } else {
+            assert_eq!(io.reconnect.try_take().unwrap().gamepads, saved);
+        }
+    }
+}
+
+#[cfg(feature = "gamepad")]
+#[test]
+fn saturated_saved_counts_do_not_reconnect_until_the_visible_pool_changes() {
+    use cordial_protocol::OutputMode;
+    let io = Io::new();
+    let (mut app, store, radio) = profile_application();
+    for id in 1..=5 {
+        app.manager.outputs.prepare(id, OutputMode::Hid).unwrap();
+        app.manager.outputs.set(id, OutputMode::Hid);
+    }
+    io.set_topology(Topology {
+        interfaces: 0,
+        gamepads: app.manager.outputs.plan(),
+    });
+    let mut shared = Shared { app, store, radio };
+    let mut loops = Loops::new(&io, 0);
+    loops.poll(&mut shared, 0);
+    assert!(!io.reconnect.signaled());
+    shared.app.manager.outputs.remove(5);
+    loops.poll(&mut shared, 1);
+    assert!(!io.reconnect.signaled());
+    shared.app.manager.outputs.remove(4);
+    loops.poll(&mut shared, 2);
+    assert_eq!(io.reconnect.try_take().unwrap().gamepads.hid_gamepads, 3);
+}
+
+#[cfg(feature = "gamepad")]
+#[test]
+fn bus_reset_and_suspend_preserve_the_allocation_generation() {
+    let io = Io::new();
+    let topology = Topology {
+        interfaces: 0,
+        gamepads: cordial_core::outputs::Plan {
+            hid_gamepads: 2,
+            xinput_gamepads: 1,
+        },
+    };
+    io.set_topology(topology);
+    let allocation = io.outputs.enumeration(false);
+    let mut bus = BusHandler(&io);
+    bus.configured(true);
+    bus.suspended(true);
+    bus.suspended(false);
+    bus.reset();
+    bus.configured(true);
+    assert_eq!(io.outputs.enumeration(false), allocation);
+    assert_ne!(io.status().generation, allocation.generation);
+    io.set_topology(topology);
+    assert_ne!(
+        io.outputs.enumeration(false).generation,
+        allocation.generation
+    );
 }

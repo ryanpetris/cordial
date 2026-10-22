@@ -45,7 +45,10 @@ async fn usb_task(serial: &'static str, interfaces: u8) {
         usb::driver(&mut out).expect("USB peripheral"),
         serial,
         board::DEFAULT_ADAPTER_NAME,
-        interfaces,
+        cordial_usb::Topology {
+            interfaces,
+            ..Default::default()
+        },
         &USB_IO,
         &mut buffers,
     )

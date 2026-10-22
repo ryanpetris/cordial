@@ -33,6 +33,10 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// What the reader thread received, passed to a handler in the order it arrived.
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Events transfer ownership to handlers without an extra heap allocation."
+)]
 pub enum Received<'a> {
     Event(p::Event),
     /// A response and the request it answers, passed to the handler before that request
@@ -470,11 +474,11 @@ impl Connection {
         self.done(Command::DeleteProfile(p::DeleteProfile { profile }))
     }
 
-    /// One page of a profile's rules after the rule for `after`; `None` starts the listing.
+    /// One page of a profile's rules after the rule `after` names; `None` starts the listing.
     pub fn list_profile_rules(
         &self,
         profile: u32,
-        after: Option<p::Usage>,
+        after: Option<p::ProfileRuleRef>,
     ) -> Result<p::ProfileRules> {
         self.page(Command::ListProfileRules(p::ListProfileRules {
             profile,

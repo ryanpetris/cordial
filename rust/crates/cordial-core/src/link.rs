@@ -15,6 +15,7 @@ use crate::{
     settings::Catalog,
 };
 use alloc::{boxed::Box, vec::Vec};
+use core::cell::Cell;
 
 /// The owner advances generation each time a connection slot is reused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +135,9 @@ pub struct Link {
     pub roles: u8,
     pub warnings: Vec<DeviceWarning>,
     profiles: Box<[Profile]>,
+    raw_gamepad: Cell<Option<hid::Gamepad>>,
+    pub(crate) gamepad_transport: crate::model::identifiers::Transport,
+    gamepad_identity: Option<(u8, u16, u16)>,
     max_output: usize,
     vendor_service: Option<ServiceId>,
     enabled: bool,
@@ -264,7 +268,8 @@ impl Link {
                     let Some(t) = control.translation(platform) else {
                         return mask;
                     };
-                    let supports = |usage| profiles.iter().any(|p| p.map.supports_usage(usage));
+                    let supports =
+                        |usage| profiles.iter().any(|p| p.map.supports_native_usage(usage));
                     let native = (t.key == 0 || supports(0x70000 | u32::from(t.key)))
                         && (t.consumer == 0 || supports(0xc0000 | u32::from(t.consumer)))
                         && (t.system == 0 || supports(0x10000 | u32::from(t.system)))
@@ -288,6 +293,9 @@ impl Link {
             roles,
             warnings,
             profiles: profiles.into_boxed_slice(),
+            raw_gamepad: Cell::new(None),
+            gamepad_transport: crate::model::identifiers::Transport::Classic,
+            gamepad_identity: None,
             max_output,
             vendor_service,
             enabled,
@@ -330,7 +338,93 @@ impl Link {
             legacy_due: 0,
         })
     }
-    fn forward(&self, mut input: Input, forward: &mut Forwarder) -> Result<(), Error> {
+    /// Current gamepad controls across this connection's independent HID services.
+    /// Report/service order chooses the first valid value for a repeated axis or hat.
+    /// Axis declarations combine across services; the first recognized layout wins.
+    pub fn gamepad(&self) -> hid::Gamepad {
+        let mut result = self.raw_gamepad.get().unwrap_or_else(|| {
+            let mut result = hid::Gamepad::default();
+            for profile in &self.profiles {
+                result.merge(profile.map.gamepad(&profile.input));
+            }
+            self.raw_gamepad.set(Some(result));
+            result
+        });
+        use hid::GamepadLayout::*;
+        // A second gamepad service makes a connection-wide convention ambiguous.
+        if self
+            .profiles
+            .iter()
+            .filter(|p| p.map.roles & hid::GAMEPAD != 0)
+            .count()
+            != 1
+        {
+            result.layout = Generic;
+        }
+        let confirmed = match (result.layout, self.gamepad_transport, self.gamepad_identity) {
+            (
+                XboxBluetooth | XboxCompact | Ds4Basic,
+                crate::model::identifiers::Transport::Classic,
+                None,
+            ) => true,
+            (LunaBluetooth, crate::model::identifiers::Transport::Classic, _) => false,
+            (_, _, Some((source, vendor, product))) => self.profiles.iter().any(|p| {
+                p.map
+                    .gamepad_identity_matches(source, vendor, product, self.gamepad_transport)
+            }),
+            _ => false,
+        };
+        if !confirmed {
+            result.layout = Generic;
+        }
+        result
+    }
+    pub(crate) fn gamepad_identity(&mut self, success: bool, bytes: &[u8]) {
+        self.gamepad_identity =
+            (success && bytes.len() == 7 && matches!(bytes[0], 1 | 2)).then(|| {
+                (
+                    bytes[0],
+                    u16::from_le_bytes([bytes[1], bytes[2]]),
+                    u16::from_le_bytes([bytes[3], bytes[4]]),
+                )
+            });
+    }
+    fn clear_gamepad(&mut self) {
+        self.raw_gamepad.set(None);
+        for profile in &mut self.profiles {
+            profile.map.clear_gamepad(&mut profile.input);
+        }
+    }
+    fn gamepad_control_count(&self) -> usize {
+        let mut consumers = heapless::Vec::<u16, 8>::new();
+        for usage in self.profiles.iter().flat_map(|p| p.map.gamepad_consumers()) {
+            if !consumers.contains(&usage) {
+                let _ = consumers.push(usage);
+                if consumers.is_full() {
+                    break;
+                }
+            }
+        }
+        let supports = |usage| {
+            self.profiles
+                .iter()
+                .any(|p| p.map.supports_gamepad_usage(usage))
+        };
+        let buttons = (0x90001..=0x90020).filter(|u| supports(*u)).count();
+        let directions = if supports(0x10039) {
+            4
+        } else {
+            (0x10090..=0x10093).filter(|u| supports(*u)).count()
+        };
+        buttons
+            + directions
+            + [0x1003d, 0x1003e, 0x10085]
+                .into_iter()
+                .filter(|u| supports(*u))
+                .count()
+            + consumers.len()
+    }
+    pub(crate) fn forward(&self, mut input: Input, forward: &mut Forwarder) -> Result<(), Error> {
         let mut held = Held::default();
         for profile in &self.profiles {
             held = held
@@ -342,12 +436,16 @@ impl Link {
                 .union(&self.client.held)
                 .map_err(|_| Error::InputOverflow)?;
         }
-        forward
-            .input(self.id.slot as usize, {
-                input.held = held;
-                input
-            })
-            .map_err(|_| Error::InputOverflow)
+        input.held = held;
+        let result = if self.roles & hid::GAMEPAD != 0 {
+            forward
+                .prepare_gamepad(self.id.slot as usize, || self.gamepad_control_count())
+                .map_err(|_| Error::InputOverflow)?;
+            forward.input_with_gamepad(self.id.slot as usize, input, self.gamepad())
+        } else {
+            forward.input(self.id.slot as usize, input)
+        };
+        result.map_err(|_| Error::InputOverflow)
     }
     fn hidpp_changed(&mut self, catalog: &mut Catalog) -> bool {
         let normalization_changed = self.normalization != self.client.status;
@@ -498,11 +596,18 @@ impl Link {
                 |instance, key, value| catalog.info.battery.hid_reading(instance, key, value),
             );
         }
+        self.raw_gamepad.set(None);
         let input = match profile.map.decode(&mut profile.input, report_id, payload) {
             Ok(input) => input,
-            Err(hid::Error::Rollover) => return Ok(false),
-            Err(hid::Error::Overflow) => return Err(Error::InputOverflow),
-            Err(_) => return Err(Error::ConnectionFailed),
+            Err(hid::Error::Rollover | hid::Error::Ignored) => return Ok(false),
+            Err(error) => {
+                self.clear_gamepad();
+                self.forward(Input::default(), forward)?;
+                return match error {
+                    hid::Error::Overflow => Err(Error::InputOverflow),
+                    _ => Err(Error::ConnectionFailed),
+                };
+            }
         };
         let numeric = profile.map.observe_numeric_indicators(
             &mut profile.indicator_cache,
@@ -534,12 +639,16 @@ impl Link {
             self.led_retry = 0;
         }
         profile.held = input.held;
-        self.forward(input, forward)?;
+        if let Err(error) = self.forward(input, forward) {
+            self.clear_gamepad();
+            let _ = self.forward(Input::default(), forward);
+            return Err(error);
+        }
         self.input_forwarded = true;
         Ok(false)
     }
     /// Whether an input report reached the forwarder since the last call. Rollover reports,
-    /// vendor reports of other services and HID++ responses forward nothing.
+    /// omitted vendor reports, vendor reports of other services and HID++ responses forward nothing.
     pub fn take_input_forwarded(&mut self) -> bool {
         core::mem::take(&mut self.input_forwarded)
     }
@@ -1334,6 +1443,7 @@ impl Link {
     /// The manager retains explicit job results until their terminal response.
     pub fn disconnected(&mut self, catalog: &mut Catalog, forward: &mut Forwarder) {
         self.settings.disconnected(catalog, &self.client);
+        self.clear_gamepad();
         forward.remove(self.id.slot as usize);
         self.writing = None;
     }

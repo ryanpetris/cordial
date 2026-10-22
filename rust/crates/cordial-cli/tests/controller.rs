@@ -729,35 +729,46 @@ fn adapter_names_are_trimmed_before_sending() {
 fn rules_are_checked_saved_and_forgotten() {
     let dongle = with_profiles();
     let (c, rx) = ready(&dongle);
-    let usage = common::usage;
+    let at = |input: &str| profiles::parse_input(input).unwrap();
     let remap = |input, outputs: &str| {
-        profiles::save_rule(p::ProfileRule {
-            input: Some(input),
-            effect: Some(p::profile_rule::Effect::Remap(p::profile_rule::Remap {
+        profiles::save_rule(profiles::rule(
+            at(input),
+            p::profile_rule::Effect::Remap(p::profile_rule::Remap {
                 outputs: profiles::parse_outputs(outputs).unwrap(),
-            })),
-        })
+            }),
+        ))
     };
+    let axis = |input, destination, invert| {
+        profiles::save_rule(profiles::rule(
+            at(input),
+            p::profile_rule::Effect::Axis(p::profile_rule::Axis {
+                destination: Some(profiles::parse_usage(destination).unwrap()),
+                invert,
+            }),
+        ))
+    };
+    let words =
+        |rules: &[p::ProfileRule]| rules.iter().map(profiles::rule_words).collect::<Vec<_>>();
     // An input the adapter can't remap is refused before sending.
     let error = run(
         &c,
         &rx,
-        Command::RuleChange(id(1), remap(usage(0x01, 0x30), "07:04")),
+        Command::RuleChange(id(1), remap("01:30@01:02", "07:04")),
     )
     .unwrap_err();
-    assert_eq!(error.message, "this adapter can't remap 01:30");
+    assert_eq!(error.message, "this adapter can't remap 01:30@01:02");
     assert!(!dongle.sent().contains(&"set_profile_rules"));
     let Outcome::Rules { profile, rules } = run(
         &c,
         &rx,
-        Command::RuleChange(name("Mouse Fix"), remap(usage(0x09, 4), "09:01")),
+        Command::RuleChange(name("Mouse Fix"), remap("09:04@01:02", "09:01")),
     )
     .unwrap() else {
         panic!()
     };
     assert_eq!(profile.id, 3);
     // The profile holds the rule sent in its saved form, with the output's collection resolved.
-    assert_eq!(profiles::rule_words(&rules[0]), "09:04 remap 09:01@01:02");
+    assert_eq!(words(&rules), ["09:04@01:02 remap 09:01@01:02"]);
     // The profile's roles follow its rules.
     eventually(&c, &rx, |st| {
         st.profile(3)
@@ -767,24 +778,66 @@ fn rules_are_checked_saved_and_forgotten() {
         panic!()
     };
     // A listing reports the output's collection the adapter resolved.
-    assert_eq!(profiles::rule_words(&rules[0]), "09:04 remap 09:01@01:02");
-    let forget = profiles::forget_rule(usage(0x09, 4));
+    assert_eq!(words(&rules), ["09:04@01:02 remap 09:01@01:02"]);
+    // The same button in the gamepad collection is a separate rule, and an axis rule is listed
+    // in order of input, then collection, across pages.
+    for change in [
+        remap("09:04@01:05", "07:04"),
+        axis("01:30@01:05", "01:31", true),
+    ] {
+        run(&c, &rx, Command::RuleChange(id(3), change)).unwrap();
+    }
+    let Outcome::Rules { rules, .. } = run(&c, &rx, Command::Rules(id(3))).unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        words(&rules),
+        [
+            "01:30@01:05 axis 01:31 invert",
+            "09:04@01:02 remap 09:01@01:02",
+            "09:04@01:05 remap 07:04@01:06",
+        ]
+    );
+    eventually(&c, &rx, |st| {
+        st.profile(3).is_some_and(|p| {
+            [p::Role::Mouse, p::Role::Gamepad]
+                .iter()
+                .all(|r| p.roles.contains(&(*r as i32)))
+        })
+    });
+    // An axis to itself without inversion forgets the axis's rule.
+    let Outcome::Rules { rules, .. } = run(
+        &c,
+        &rx,
+        Command::RuleChange(id(3), axis("01:30@01:05", "01:30", false)),
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert!(rules.is_empty());
+    // Forgetting one collection's rule keeps the other's.
+    let forget = profiles::forget_rule(at("09:04@01:05"));
     let Outcome::Rules { rules, .. } = run(&c, &rx, Command::RuleChange(id(3), forget)).unwrap()
     else {
         panic!()
     };
     assert!(rules.is_empty());
+    let Outcome::Rules { rules, .. } = run(&c, &rx, Command::Rules(id(3))).unwrap() else {
+        panic!()
+    };
+    assert_eq!(words(&rules), ["09:04@01:02 remap 09:01@01:02"]);
+    let forget = profiles::forget_rule(at("09:04@01:02"));
+    run(&c, &rx, Command::RuleChange(id(3), forget)).unwrap();
     // Outputs are shown sorted and once, as the adapter saves them.
     let Outcome::Rules { rules, .. } = run(
         &c,
         &rx,
-        Command::RuleChange(id(3), remap(usage(0x07, 0x39), "07:e0,07:04,07:e0@01:06")),
+        Command::RuleChange(id(3), remap("07:39@01:06", "07:e0,07:04,07:e0@01:06")),
     )
     .unwrap() else {
         panic!()
     };
-    let saved = "07:39 remap 07:04@01:06,07:e0@01:06";
-    assert_eq!(profiles::rule_words(&rules[0]), saved);
+    assert_eq!(words(&rules), ["07:39@01:06 remap 07:04@01:06,07:e0@01:06"]);
     let Outcome::Rules { rules: listed, .. } = run(&c, &rx, Command::Rules(id(3))).unwrap() else {
         panic!()
     };
@@ -793,7 +846,7 @@ fn rules_are_checked_saved_and_forgotten() {
     let Outcome::Rules { rules, .. } = run(
         &c,
         &rx,
-        Command::RuleChange(id(3), remap(usage(0x07, 0x39), "07:39")),
+        Command::RuleChange(id(3), remap("07:39@01:06", "07:39")),
     )
     .unwrap() else {
         panic!()
@@ -888,4 +941,66 @@ fn a_download_replaces_only_the_file_it_was_allowed_to() {
     assert!(unconverted.is_some());
     assert_eq!(std::fs::read(dir.join("device.pb")).unwrap(), [0xff]);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn gamepad_output_is_saved_only_where_the_adapter_offers_it() {
+    let dongle = Dongle::default();
+    let (c, rx) = ready(&dongle);
+    let error = run(&c, &rx, Command::GamepadOutput(id(1), p::OutputMode::Hid)).unwrap_err();
+    assert_eq!(
+        error.message,
+        "this adapter doesn't offer HID gamepad output"
+    );
+    assert!(!dongle.sent().contains(&"set_device"));
+    // Disabled is always accepted.
+    run(
+        &c,
+        &rx,
+        Command::GamepadOutput(id(1), p::OutputMode::Disabled),
+    )
+    .unwrap();
+
+    let dongle = Dongle::with(|sim| common::enable_gamepads(&mut sim.status));
+    let (c, rx) = ready(&dongle);
+    let outcome = run(
+        &c,
+        &rx,
+        Command::GamepadOutput(id(1), p::OutputMode::Xinput),
+    )
+    .unwrap();
+    let Outcome::Device { device, .. } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(
+        device.output_preferences,
+        [p::OutputPreference {
+            role: p::Role::Gamepad as i32,
+            mode: p::OutputMode::Xinput as i32,
+        }]
+    );
+    {
+        let sim = dongle.0.lock().unwrap();
+        let Some(p::request::Command::SetDevice(last)) = sim.log.last() else {
+            panic!("{:?}", sim.log.last());
+        };
+        // Only the gamepad choice is sent.
+        assert_eq!(
+            *last,
+            p::SetDevice {
+                device: 1,
+                output_preferences: device.output_preferences.clone(),
+                ..Default::default()
+            }
+        );
+    }
+    let outcome = run(
+        &c,
+        &rx,
+        Command::GamepadOutput(id(1), p::OutputMode::Disabled),
+    )
+    .unwrap();
+    assert!(
+        matches!(outcome, Outcome::Device { device, .. } if device.output_preferences.is_empty())
+    );
 }

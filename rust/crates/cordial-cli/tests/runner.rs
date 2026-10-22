@@ -618,8 +618,8 @@ fn profiles_layers_and_interfaces_from_the_shell() {
         b"profile create Work\n\
 profile copy Work 'Mouse Fix'\n\
 profile create Games\n\
-profile rule remap 'Mouse Fix' 09:04 09:01\n\
-profile rule scale 'Mouse Fix' 01:38 -1/1\n\
+profile rule remap 'Mouse Fix' 09:04@01:02 09:01\n\
+profile rule scale 'Mouse Fix' 01:38@01:02 -1/1\n\
 profile rule list 'Mouse Fix'\n\
 profile list\n\
 profile list --after 0\n\
@@ -628,7 +628,7 @@ device set 'Office Mouse' profiles Work 'Mouse Fix'\n\
 adapter set interface via on Games\n\
 device get 1\n\
 adapter status\n\
-profile rule forget 2 01:38\n\
+profile rule forget 2 01:38@01:02\n\
 profile show 2\n",
     );
     result.unwrap();
@@ -637,9 +637,9 @@ profile show 2\n",
         "Created profile Work (1).",
         "Copied profile to Mouse Fix (2).",
         "Created profile Games (3).",
-        "Saved in Mouse Fix: 09:04 remap 09:01@01:02\n",
-        "Saved in Mouse Fix: 01:38 scale -1/1",
-        "Rules of Mouse Fix\n  01:38 scale -1/1\n  09:04 remap 09:01@01:02\n",
+        "Saved in Mouse Fix: 09:04@01:02 remap 09:01@01:02\n",
+        "Saved in Mouse Fix: 01:38@01:02 scale -1/1",
+        "Rules of Mouse Fix\n  01:38@01:02 scale -1/1\n  09:04@01:02 remap 09:01@01:02\n",
         "Profiles\n  1\tnone\tWork\n  2\tmouse\tMouse Fix\n  3\tnone\tGames\n",
         "Profiles\n  1\tnone\tWork\n  2\tmouse\tMouse Fix\nNext page: profile list --after 2\n",
         "Profiles\n  3\tnone\tGames\n",
@@ -648,7 +648,7 @@ profile show 2\n",
         "  Profiles: Work (1), Mouse Fix (2)",
         "  Profile Memory: 1.0 KiB of 8.0 KiB in use\n  Profiles Per Device: 3\n  VIA: on, profile Games (3)\n  Vial: off, profile none",
         "Profile Mouse Fix\n  ID: 2\n  Roles: Mouse",
-        "Mouse Fix has no rule for 01:38.",
+        "Mouse Fix has no rule for 01:38@01:02.",
     ] {
         assert!(out.contains(line), "{line}\n{out}");
     }
@@ -756,13 +756,13 @@ fn ambiguous_names_and_unsupported_rules_are_refused() {
     assert!(result.unwrap_err().to_string().contains("ambiguous"));
     let (result, _, _) = script(
         &dongle,
-        &["profile", "rule", "scale", "1", "07:04", "2/1"],
+        &["profile", "rule", "scale", "1", "07:04@01:06", "2/1"],
         false,
         b"",
     );
     assert_eq!(
         result.unwrap_err().message,
-        "this adapter can't scale 07:04"
+        "this adapter can't scale 07:04@01:06"
     );
     let (result, _, _) = script(
         &dongle,

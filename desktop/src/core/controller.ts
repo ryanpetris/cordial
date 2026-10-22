@@ -4,7 +4,7 @@
 // knows are made here, before sending; one the adapter makes anyway is shown
 // as it is, without retrying or reading anything again.
 import { ConnectionClosedError, CordialError } from "@cordial/client";
-import { IntegrationKind, Platform, Transport, type Event, type Request, type Response } from "@cordial/protocol";
+import { IntegrationKind, OutputMode, Platform, Role, Transport, type Event, type Request, type Response } from "@cordial/protocol";
 import { adapterName } from "../shared/adapter-name.ts";
 import {
   DEFAULT_PREFERENCES,
@@ -26,6 +26,7 @@ import {
   type TransportName,
 } from "../shared/state.ts";
 import { enabledFull } from "../shared/capacity.ts";
+import { gamepadModes } from "../shared/outputs.ts";
 import { interfaceProblem, profileInUse, profileName, stagedInterfaces } from "../shared/profiles.ts";
 import { settingsBusy } from "../shared/settings.ts";
 import { PLATFORMS, TRANSPORTS, clean, codeText, displayKind, errorText, inactiveText, infoOf, storageFull, transportDisabledText } from "../shared/text.ts";
@@ -185,6 +186,7 @@ export class Controller {
         connectError: null,
         readiness: status.ready ? "ready" : "waiting",
         status,
+        listing: session.listing,
         attention,
         profilePage: session.profilePage,
         pickerPage: session.pickerPage,
@@ -200,6 +202,7 @@ export class Controller {
         connectError: null,
         readiness: "waiting",
         status: retained.status,
+        listing: true,
         attention: [],
         profilePage: retained.profilePage,
         pickerPage: retained.pickerPage,
@@ -215,6 +218,7 @@ export class Controller {
         connectError: d.error,
         readiness: "waiting",
         status: null,
+        listing: false,
         attention: [],
         profilePage: null,
         pickerPage: null,
@@ -400,8 +404,9 @@ export class Controller {
     const t = this.#target(action.key);
     if (!t) return GONE;
     const { session, id, device } = t;
-    const { enabled, trusted, blocked, hidpp, profiles } = action;
-    if (enabled === undefined && trusted === undefined && blocked === undefined && hidpp === undefined && profiles === undefined) return { ok: true };
+    const { enabled, trusted, blocked, hidpp, profiles, gamepadOutput } = action;
+    if (enabled === undefined && trusted === undefined && blocked === undefined && hidpp === undefined && profiles === undefined && gamepadOutput === undefined)
+      return { ok: true };
     if (!session.status.ready) return { ok: false, message: codeText("not_ready") };
     if (enabledFull(session.status, [...session.devices.values()], device, { enabled, trusted, blocked, hidpp, profiles }))
       return { ok: false, message: errorText({ code: "no_capacity", reason: "enabled", outcomeUnknown: false }) };
@@ -411,6 +416,7 @@ export class Controller {
       if (!support) return { ok: false, message: codeText("unsupported") };
       if (profiles.length > support.maxLayers || profiles.includes(0)) return { ok: false, message: codeText("bad_args") };
     }
+    if (gamepadOutput !== undefined && !gamepadModes(session.status).includes(gamepadOutput)) return { ok: false, message: codeText("unsupported") };
     // A change to HID++ is tracked as such, so the settings it starts or stops wait for it.
     await session.perform(id, hidpp === undefined ? "device" : "hidpp", (c) =>
       c.setDevice({
@@ -420,6 +426,7 @@ export class Controller {
         blocked,
         integrations: hidpp === undefined ? [] : [{ kind: device.hidpp?.kind ?? IntegrationKind.HIDPP, enabled: hidpp }],
         profiles: profiles === undefined ? undefined : { profiles },
+        outputPreferences: gamepadOutput === undefined ? [] : [{ role: Role.GAMEPAD, mode: convert.wire(OutputMode, gamepadOutput) }],
       }),
     );
     return { ok: true };

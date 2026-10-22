@@ -12,6 +12,21 @@ pub trait Completion: Copy {
     async fn wait(&self, endpoint: EndpointAddress) -> Result<(), EndpointError>;
 }
 
+/// Poll quickly through eight normal 1 ms host intervals, then limit wakeups for
+/// an unopened endpoint. A new transfer starts with the fast interval again.
+#[derive(Default)]
+pub struct PollDelay(u8);
+impl PollDelay {
+    pub fn micros(&mut self) -> u64 {
+        if self.0 < 64 {
+            self.0 += 1;
+            125
+        } else {
+            8_000
+        }
+    }
+}
+
 pub struct CompleteDriver<D, C> {
     pub driver: D,
     pub completion: C,
@@ -19,6 +34,7 @@ pub struct CompleteDriver<D, C> {
 pub struct CompleteEndpoint<E, C> {
     endpoint: E,
     completion: C,
+    pending: bool,
 }
 impl<'d, D: Driver<'d>, C: Completion + 'd> Driver<'d> for CompleteDriver<D, C> {
     type EndpointOut = D::EndpointOut;
@@ -48,6 +64,7 @@ impl<'d, D: Driver<'d>, C: Completion + 'd> Driver<'d> for CompleteDriver<D, C> 
                 .driver
                 .alloc_endpoint_in(kind, address, size, interval)?,
             completion: self.completion,
+            pending: false,
         })
     }
     fn start(self, control_max_packet_size: u16) -> (Self::Bus, Self::ControlPipe) {
@@ -72,8 +89,17 @@ impl<E: Endpoint, C> Endpoint for CompleteEndpoint<E, C> {
 }
 impl<E: EndpointIn, C: Completion> EndpointIn for CompleteEndpoint<E, C> {
     async fn write(&mut self, bytes: &[u8]) -> Result<(), EndpointError> {
+        // A cancelled write can still own the hardware buffer. Settle it before
+        // submitting a neutral report or another controller's input.
+        if self.pending {
+            let _ = self.completion.wait(self.endpoint.info().addr).await;
+            self.pending = false;
+        }
         self.endpoint.write(bytes).await?;
-        self.completion.wait(self.endpoint.info().addr).await
+        self.pending = true;
+        let result = self.completion.wait(self.endpoint.info().addr).await;
+        self.pending = false;
+        result
     }
 }
 
@@ -119,6 +145,23 @@ mod tests {
     use super::*;
     use core::cell::Cell;
     use embassy_futures::block_on;
+    #[test]
+    fn unopened_endpoint_has_bounded_wakeups_and_new_transfers_poll_quickly() {
+        let mut delay = PollDelay::default();
+        let mut elapsed = 0;
+        let mut polls = 0;
+        while elapsed < 1_000_000 {
+            let interval = delay.micros();
+            if elapsed < 8_000 {
+                assert_eq!(interval, 125);
+            }
+            assert!(interval <= 8_000);
+            elapsed += interval;
+            polls += 1;
+        }
+        assert_eq!(polls, 188);
+        assert_eq!(PollDelay::default().micros(), 125);
+    }
     struct IdleBus;
     impl Bus for IdleBus {
         async fn enable(&mut self) {}
@@ -162,5 +205,83 @@ mod tests {
             assert!(!disconnected.get());
             assert!(matches!(bus.poll().await, Event::Suspend));
         });
+    }
+}
+
+#[cfg(test)]
+mod inflight_tests {
+    use super::*;
+    use core::{
+        cell::{Cell, RefCell},
+        future::{Future, poll_fn},
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+
+    struct Fifo<'a> {
+        info: EndpointInfo,
+        completed: &'a Cell<bool>,
+        packets: &'a RefCell<std::vec::Vec<std::vec::Vec<u8>>>,
+    }
+    impl Endpoint for Fifo<'_> {
+        fn info(&self) -> &EndpointInfo {
+            &self.info
+        }
+        async fn wait_enabled(&mut self) {}
+    }
+    impl EndpointIn for Fifo<'_> {
+        async fn write(&mut self, bytes: &[u8]) -> Result<(), EndpointError> {
+            self.packets.borrow_mut().push(bytes.to_vec());
+            self.completed.set(false);
+            Ok(())
+        }
+    }
+    #[derive(Clone, Copy)]
+    struct Witness<'a>(&'a Cell<bool>);
+    impl Completion for Witness<'_> {
+        fn disconnect(&self, _: bool) {}
+        async fn wait(&self, _: EndpointAddress) -> Result<(), EndpointError> {
+            poll_fn(|_| {
+                if self.0.get() {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+        }
+    }
+    #[test]
+    fn cancelled_fifo_write_settles_before_the_next_occupants_neutral_report() {
+        let completed = Cell::new(true);
+        let packets = RefCell::new(std::vec::Vec::new());
+        let mut endpoint = CompleteEndpoint {
+            endpoint: Fifo {
+                info: EndpointInfo {
+                    addr: EndpointAddress::from_parts(1, embassy_usb::driver::Direction::In),
+                    ep_type: EndpointType::Interrupt,
+                    max_packet_size: 32,
+                    interval_ms: 1,
+                },
+                completed: &completed,
+                packets: &packets,
+            },
+            completion: Witness(&completed),
+            pending: false,
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut write = pin!(endpoint.write(&[1]));
+            assert!(write.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(*packets.borrow(), [std::vec![1]]);
+        let mut neutral = pin!(endpoint.write(&[0]));
+        assert!(neutral.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(*packets.borrow(), [std::vec![1]]);
+        completed.set(true);
+        assert!(neutral.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(*packets.borrow(), [std::vec![1], std::vec![0]]);
+        completed.set(true);
+        assert_eq!(neutral.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
 }

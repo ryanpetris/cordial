@@ -12,7 +12,10 @@ All three keep their view of the Dongle the same way:
 
 - Listing: a client reads a list one page at a time, passing the key of the last entry it received
   as the next request's `after`, until `end` when it needs the whole list. It never assumes a page
-  size. See [Listings](compatibility.md#listings).
+  size. Profile rules are ordered by input usage page, input usage, collection usage page, then
+  collection usage. Their `after` cursor is a `ProfileRuleRef` containing both the last rule's
+  `input` and `collection`; omitting it starts from the beginning. See
+  [Listings](compatibility.md#listings).
 - Events: `device`, `adapter` and `profile` events replace the record they carry.
   `settings_changed` and `warnings_changed` are applied to what the client has listed: settings are
   upserted by integration and key, warnings are kept as a set, and removals of entries the client
@@ -50,6 +53,7 @@ Bluetooth controllers.
 | `device list` / `device get DEV` | Saved devices and candidates, or one device with its information. |
 | `device connect DEV` / `device disconnect DEV` | Connect, or disconnect and pause reconnection. |
 | `device set DEV enabled\|trusted\|blocked\|hidpp on\|off` | Change a saved device's policy or HID++ preference. |
+| `device set DEV gamepad-output disabled\|hid\|xinput` | Save a paired device's Gamepad Output choice. |
 | `device unpair DEV` | Delete the device's bond and settings. |
 | `device refresh DEV` | Re-read a connected device's information and settings. |
 | `warning list DEV` | The device's HID warnings. |
@@ -74,9 +78,9 @@ silently between duplicate names. Setting keys are the catalog keys, such as `ke
   Saving the bond and the later connection result are reported separately.
 - Ctrl-C, Ctrl-D, end of input, SIGINT and SIGTERM quit the shell, which closes the port: a
   running scan stops and an unsaved pairing is cancelled.
-- After a configuration interface change that reconnects USB, the shell waits up to 15
+- After a configuration interface or gamepad pool change that reconnects USB, the shell waits up to 15
   seconds for the same adapter, found by the adapter ID at the start of its USB serial number, and
-  reopen it on whichever port it returns to. Only an adapter that doesn't return in time is reported
+  reopens it on whichever port it returns to. Only an adapter that doesn't return in time is reported
   as lost.
 - One-shot commands and scripts run each command after the previous one's result and exit nonzero
   on failure. `--timeout SECONDS` bounds a one-shot command and sets the length of a one-shot scan.
@@ -125,10 +129,12 @@ attached adapter; `--port` limits it to that one port.
   `GetStatus` identifies it. A port that fails to open, or whose session ends within 10 seconds
   of opening, is tried again after a wait that doubles with each failure in a row, up to a minute;
   Refresh Adapters (F5) tries it at once. An adapter that goes away keeps its page, locked, for
-  15 seconds; its devices leave the list at once. The same adapter returning, found by the adapter
-  ID that begins its USB serial number, keeps its page and tab. Disconnect, from the adapter's page or menu,
-  closes its session; the adapter stays listed while plugged in and is opened again only by
-  Connect.
+  15 seconds; its devices leave the list at once. A shown device page also stays locked, with its
+  tab, staged changes and save result, until the adapter lists its devices again. The same adapter
+  returning is found by the adapter ID that begins its USB serial number. A device missing from
+  the new list, or an expired hold, returns the page to Overview. Disconnect, from the adapter's
+  page or menu, closes its session; the adapter stays listed while plugged in and is opened again
+  only by Connect.
 - Layout: a sidebar with Overview, the saved devices of every adapter in one list, the adapters,
   and Add Device; and the selected page with its tabs and bottom bar. The Overview counts
   connected and paired devices and connected adapters, and lists what needs attention, the
@@ -145,7 +151,8 @@ attached adapter; `--port` limits it to that one port.
   on the Overview, and the most pressing one is shown in red on the status line.
 - Staging: changes stay staged, marked as changed, until Save, as in the desktop application;
   Ctrl-S presses the Save shown on screen. Discard drops the changes the shown Save would send, and
-  a failed save keeps them. Saving a change that reconnects USB asks for confirmation first.
+  a failed save keeps them. Saving adapter configuration interface changes that reconnect USB asks
+  for confirmation first.
   Connect, disconnect, rename, forget and creating, copying and deleting profiles act at once.
 - Input: every action works with the mouse, and every control has a keyboard equivalent. Tab and
   Shift-Tab move between controls, Up and Down choose in the sidebar or move between controls,
@@ -167,9 +174,11 @@ The desktop application uses the same commands and session rules as the CLI.
   The web version lists the ports the user has granted by vendor and product ID. Ports that fail
   stay hidden. An unexpectedly disconnected adapter keeps its page and last reported settings for 15
   seconds while awaiting reconnection. Its devices leave the list immediately and configuration
-  controls are disabled. Reconnecting the same adapter restores its selected tab; otherwise the
-  adapter leaves the list when the wait expires. A session that ends after running normally is
-  reopened once if its port is still present.
+  controls are disabled. The selected device page keeps its tab, staged changes and save result
+  while the adapter reconnects and reads its devices again. If that read fails, the device is no
+  longer listed, or the wait expires, the application leaves the page. A selected adapter tab also
+  stays selected.
+  A session that ends after running normally is reopened once if its port is still present.
 - Sessions: after `GetStatus` it reads every page of devices and each device's settings and
   warnings, then follows events, and lists the devices again when the adapter becomes ready.
 - Disconnect: the user can disconnect an adapter from its context menu. The application closes the
@@ -206,11 +215,110 @@ The desktop application uses the same commands and session rules as the CLI.
   marks low battery or an adapter needing attention. Its menu lists devices, grouped by adapter when
   several are connected.
 
+## Gamepad outputs
+
+Gamepad Output has the choices Disabled, HID and XInput. A missing saved gamepad
+preference means Disabled. The desktop application and TUI show this control only
+on a paired device's Settings tab. Its roles or kind must identify a gamepad and
+the adapter must advertise an enabled mode, or the device must have a saved
+gamepad choice other than Disabled. Unrelated keyboards and mice have no such
+control unless they have a saved choice to clear. Changes follow the existing
+Save and Discard behavior. The CLI saves at once:
+
+```sh
+cordial --port PORT device set DEV gamepad-output hid
+```
+
+HID and XInput use the same profiles and mapped HID state. XInput only converts canonical HID
+buttons and axes through a fixed mapping. On connection, firmware automatically selects a builtin
+controller mapping only for a device with no assigned profiles. Any assignment disables it,
+including an empty profile or one with only keyboard or mouse rules. Assigned profiles receive
+original controller inputs, not builtin-normalized inputs. Assign an empty profile for raw input
+mapping, or remove all assignments to restore automatic builtin mapping.
+
+Builtins are firmware-only mappings, never stored, listed or reported as user profiles.
+
+Clients use `Status.output_support` to offer enabled modes, rather than checking
+board names. When a backend is unavailable, clients offer no new enabled choices;
+a saved choice can still be cleared with Disabled. `max_slots` limits USB allocation,
+not the number of paired devices that may select a mode. Each change uses
+`SetDevice.output_preferences` for the Gamepad role and preserves unrelated preferences.
+
+The saved choice is separate from live output state. Clients use `Device.outputs`
+for the current mode, state and optional slot, never infer a slot from pairing
+order, and never treat a saved choice as proof of active input. Human-readable
+slots start at 1; raw JSON and protocol slots start at 0. A slot is temporary
+and is not a Windows XInput user index. Technical output states and warnings
+belong on Diagnostics. The CLI's `device get DEV` shows Gamepad Output and,
+when reported for an enabled choice, Gamepad Status and Gamepad Slot.
+`device list` uses `gamepad-output`, `gamepad-state` and `gamepad-slot` tokens.
+`adapter status` shows each advertised mode's pool, such as `Gamepad Slots (HID): 2 of 4`,
+or `at most 4` while its size is unknown. See [output states and
+pools](records.md#devices) and [controller mapping limits](hid-forwarding.md#usb-gamepad-outputs).
+
+The desktop application and TUI show the USB Reconnect Required confirmation
+before saving a Gamepad Output change that changes either pool size. Cancelling
+leaves the changes staged without sending them. Save sends other staged device
+settings before Gamepad Output, since a pool-size change may reconnect USB after
+the save response. If those settings fail to save
+or their outcome is unknown, Gamepad Output stays staged. A received success
+still means the preference was saved; USB reconnection is a separate operation.
+If the response is lost, clients report an unknown save outcome and may read the
+device again after reconnecting. The existing reconnect handling restores the
+device page. Neither mode requires a running host service or an additional USB
+configuration interface. VIA/Vial behavior stays unchanged.
+
+### Gamepad verification
+
+Hardware checks cover Waveshare RP2350B-Plus-W startup with zero gamepad slots
+and CLI readiness. Manual Windows testing confirms XInput operation in MultiPadTester
+and HIDAPI enumeration with button input. The USB descriptors implement native Windows
+binding through the receiver's `XUSB20` compatible ID; see
+[binding evidence and validation limits](hid-forwarding.md#usb-gamepad-outputs).
+Software checks run on Linux and do not establish physical controller compatibility.
+
+For a Linux hardware check:
+
+1. Start with all saved gamepad choices Disabled. Check `cordial adapter status`
+   and `lsusb -v` for zero gamepad slots while keyboard, mouse and serial remain
+   available.
+2. Pair a controller and check that Gamepad Output selects HID after first-connection
+   setup when supported and the saved HID pool has room. Otherwise it stays Disabled.
+   Test HID and XInput separately with `device set DEV gamepad-output hid` and
+   `device set DEV gamepad-output xinput` in the CLI shell. Use
+   `device get DEV` to inspect the saved choice and reported output state.
+3. Check driver binding with `lsusb -t` and input with `evtest`. Exercise buttons,
+   sticks, triggers and directional controls against the documented mapping.
+4. Disconnect and reconnect the controller. Check that the adapter stays
+   enumerated, held controls release, vacant HID slots are neutral, and XInput
+   reports absence and presence. Check keyboard, mouse and serial use alongside
+   gamepad input, then close Cordial and check that input continues.
+5. Change modes or unpair a controller so a pool size changes. Check that USB
+   reconnects, the client returns to the same adapter, and the saved choices
+   survive. With multiple saved controllers, check each mode's independent pool
+   against its paired-device count, capped at four.
+
+For a manual Windows check, configure the adapter on Linux first:
+
+1. Connect it to Windows and check native HID and XInput driver binding in Device
+   Manager, without a Cordial driver or service. Check controller input in Game
+   Controllers with `joy.cpl` and in an XInput application, using the documented
+   mapping limits.
+2. Repeat controller disconnect/reconnect, vacant-slot, held-control release and
+   keyboard/mouse coexistence checks. Check a USB unplug/replug and host
+   suspend/resume. Record the Windows version, chosen mode and observed result.
+
 ## Profile commands
 
 The desktop application and TUI manage profiles, layers and configuration interfaces, and never read
 or change a profile's rules. Remaps of keys, media and system controls, and mouse buttons are edited
-with VIA or Vial.
+with VIA or Vial. Their fixed matrix addresses Keyboard, Mouse, Consumer Control and System
+Control input and collection pairs. Ordinary writes preserve unrelated rules, including Game Pad
+rules. Keymap reset clears every rule in the selected profile, including rules outside the matrix.
+
+The adapter derives each profile's roles from the input collections its rules change, including
+Game Pad. A remap's output collection does not add a role. A Game Pad button remapped to a mouse
+button therefore gives the profile the gamepad role.
 
 These commands require `Status.profile_support`. A profile argument is its ID or a unique name; a
 name is found by reading the profile pages. A number is always taken as an ID, so a profile whose
@@ -229,21 +337,56 @@ apply, quoted as needed, or `none` for an empty list; a profile named `none` is 
 | `adapter reset interface INTERFACE profile` | Clear a disabled interface's profile. |
 | `device set DEV profiles LAYERS` | Set a device's layers. |
 
-### Advanced: profile rules
+### Profile rules
 
-These commands read and change a profile's raw HID rules. They are meant for testing and for
-people who understand HID usages; they do not prevent rules that make a keyboard or mouse hard to
-use, and a mistake is undone only by forgetting the rule or deleting the profile.
+These commands read and change a profile's HID rules. Each input is identified by both its usage
+and its application collection. Saving or forgetting a rule affects only that pair.
 
 | Command | Behavior |
 | --- | --- |
 | `profile rule list PROFILE` | Show every rule. |
 | `profile rule remap PROFILE INPUT OUTPUTS` | Remap an on/off input to the outputs, held together. |
-| `profile rule scale PROFILE INPUT N/D` | Multiply a value input by N/D; a negative N inverts it. |
+| `profile rule scale PROFILE INPUT N/D` | Multiply a relative value input by N/D; a negative N inverts it. |
+| `profile rule axis PROFILE INPUT AXIS [invert]` | Route an absolute Game Pad axis to another axis in the same Game Pad collection, optionally reversing its normalized range. |
 | `profile rule forget PROFILE INPUT` | Forget a rule so the input passes through unchanged. |
 
-A USAGE is `PAGE:USAGE` in hexadecimal, such as `07:39` for Caps Lock or `01:38` for the wheel. An
-INPUT is a USAGE. OUTPUTS is `disabled` or a comma-separated list of USAGEs, each optionally
-followed by `@PAGE:USAGE` naming the report's collection.
+A USAGE is `PAGE:USAGE` in hexadecimal, such as `07:39` for Caps Lock or `01:38` for the wheel.
+INPUT requires `USAGE@PAGE:USAGE`, with the part after `@` naming its application collection, such as
+`07:39@01:06` for Keyboard Caps Lock, `09:01@01:02` for Mouse button 1 or `09:01@01:05` for Game
+Pad button 1. The input collection is never inferred. AXIS is a USAGE in the input's Game
+Pad collection. OUTPUTS is `disabled` or a comma-separated list of USAGEs, each optionally followed
+by `@PAGE:USAGE` naming the output report's collection. An output collection may be omitted only
+when exactly one advertised collection carries that usage. For example, button 1 needs an explicit
+Mouse or Game Pad collection.
+
+Clients match usage and collection against `ProfileSupport.ranges` with `kind` set to
+`KIND_REMAP_INPUT`, `KIND_SCALE_INPUT` or `KIND_AXIS_INPUT` for the chosen effect, and to
+`KIND_REMAP_OUTPUT` or `KIND_AXIS_OUTPUT` for its outputs. Unknown kinds and `KIND_UNSPECIFIED`
+grant no capability. The same usage and collection may appear separately under several kinds. A rule that remaps an input only to itself in the same collection, scales it by 1, or
+routes an axis to itself without inversion is forgotten instead of saved.
+
+For a profile named `Controls`, remap Game Pad button 1 to Mouse button 1:
+
+```sh
+cordial --port PORT profile rule remap Controls 09:01@01:05 09:01@01:02
+```
+
+Invert the Game Pad Y axis:
+
+```sh
+cordial --port PORT profile rule axis Controls 01:31@01:05 01:31 invert
+```
+
+To swap X and Y, save two rules in the same profile:
+
+```sh
+cordial --port PORT profile rule axis Controls 01:30@01:05 01:31
+cordial --port PORT profile rule axis Controls 01:31@01:05 01:30
+```
+
+Axis routes within one profile read the values entering that profile and apply simultaneously, so
+the two swap rules retain both source values. Each route moves its source to the destination and
+takes precedence over the destination's unchanged input. Later profiles see the resulting axes.
+Axis rules add no deadzones, curves or sensitivity settings.
 
 See [Input profiles](../input-profiles.md) for external editors and hardware checks.

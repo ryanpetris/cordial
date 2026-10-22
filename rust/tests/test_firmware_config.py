@@ -28,8 +28,8 @@ class BoardConfigTests(unittest.TestCase):
                         config.load(path, "production")
 
     def test_profile_memory_budget_is_generated_without_changing_identity(self):
-        presets = {"pico_w": None, "pico2_w": 32768, "waveshare_rp2350b_plus_w": 32768,
-                   "xiao_esp32s3": 32768}
+        presets = {"pico_w": None, "pico2_w": 40960, "waveshare_rp2350b_plus_w": 40960,
+                   "xiao_esp32s3": 40960}
         for name, expected in presets.items():
             board = config.ROOT / "boards" / f"{name}.json"
             raw = json.loads(board.read_text())

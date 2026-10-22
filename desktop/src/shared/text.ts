@@ -16,6 +16,8 @@ import type {
   IntegrationStateName,
   Integration,
   KindName,
+  OutputModeName,
+  OutputStateName,
   ProfileAlert,
   ReportTypeName,
   RoleName,
@@ -191,9 +193,19 @@ export const SETTING_STATES: Record<SettingStateName | "unmanaged" | "error", st
   error: "Failed",
 };
 
+export const OUTPUT_MODES: Record<OutputModeName, string> = { disabled: "Disabled", hid: "HID", xinput: "XInput" };
+export const OUTPUT_STATES: Record<OutputStateName, string> = {
+  unknown: "Unknown",
+  disabled: "Disabled",
+  disconnected: "Waiting to Connect",
+  pending: "Setting Up",
+  active: "Active",
+  unsupported: "Unsupported",
+};
+
 export const PLATFORMS: Record<HostPlatform, string> = { linux: "Linux", windows: "Windows", mac: "macOS" };
 export const TRANSPORTS: Record<TransportName, string> = { ble: "Bluetooth LE", classic: "Bluetooth Classic" };
-export const ROLES: Record<RoleName, string> = { keyboard: "Keyboard", mouse: "Mouse", consumer_control: "Media Keys", system_control: "System Keys" };
+export const ROLES: Record<RoleName, string> = { keyboard: "Keyboard", mouse: "Mouse", consumer_control: "Media Keys", system_control: "System Keys", gamepad: "Gamepad" };
 
 /** Labels of the information keys the Information card shows, in display order. */
 export const INFO_LABELS: Record<string, string> = {
@@ -214,6 +226,7 @@ const KINDS: Record<DeviceKind, string> = {
   keyboard: "Keyboard",
   mouse: "Mouse",
   keyboard_mouse: "Keyboard and Mouse",
+  gamepad: "Gamepad",
   other: "Other",
 };
 
@@ -224,7 +237,8 @@ export const kindText = (kind: DeviceKind) => KINDS[kind];
 export function displayKind(kinds: KindName[], roles: RoleName[] = []): DeviceKind {
   const keyboard = kinds.includes("keyboard") || (!kinds.length && roles.includes("keyboard"));
   const mouse = kinds.includes("mouse") || (!kinds.length && roles.includes("mouse"));
-  return keyboard && mouse ? "keyboard_mouse" : keyboard ? "keyboard" : mouse ? "mouse" : "other";
+  const gamepad = kinds.includes("gamepad") || (!kinds.length && roles.includes("gamepad"));
+  return keyboard && mouse ? "keyboard_mouse" : keyboard ? "keyboard" : mouse ? "mouse" : gamepad ? "gamepad" : "other";
 }
 
 /** Why a connected device's profiles aren't loaded. */

@@ -14,6 +14,7 @@ type Kind =
   | "transports?"
   | "interfaces?"
   | "ids?"
+  | "mode?"
   | "page";
 const key = { key: "string" } as const;
 const FIELDS: Record<Action["type"], Record<string, Kind>> = {
@@ -29,6 +30,7 @@ const FIELDS: Record<Action["type"], Record<string, Kind>> = {
     blocked: "boolean?",
     hidpp: "boolean?",
     profiles: "ids?",
+    gamepadOutput: "mode?",
   },
   "settings.save": { key: "string", changes: "changes" },
   "adapter.name": { adapterId: "string", name: "nullable" },
@@ -97,6 +99,8 @@ function fits(value: unknown, kind: Kind): boolean {
       });
     case "page":
       return value === "first" || value === "next" || value === "previous";
+    case "mode?":
+      return value === undefined || value === "disabled" || value === "hid" || value === "xinput";
     case "ids?":
       return value === undefined || (Array.isArray(value) && value.length <= 64 && value.every(id));
     case "transports?":

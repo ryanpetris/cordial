@@ -2,11 +2,26 @@ import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } fr
 import { createPortal } from "react-dom";
 import { isLow } from "../../shared/battery.ts";
 import { enabledFull } from "../../shared/capacity.ts";
+import { gamepadModes, gamepadOutput, offersGamepadOutput, reconnectsGamepadUsb } from "../../shared/outputs.ts";
 import { settingsBusy, settingsCurrent } from "../../shared/settings.ts";
-import type { AdapterEntry, AppState, DeviceChanges, DeviceEntry, DeviceRecord, InfoEntry, Scalar, Setting, SettingsChange, SettingsSaveItem } from "../../shared/state.ts";
+import type {
+  AdapterEntry,
+  AppState,
+  DeviceChanges,
+  DeviceEntry,
+  DeviceRecord,
+  InfoEntry,
+  OutputModeName,
+  Scalar,
+  Setting,
+  SettingsChange,
+  SettingsSaveItem,
+} from "../../shared/state.ts";
 import {
   inactiveText,
   INFO_LABELS,
+  OUTPUT_MODES,
+  OUTPUT_STATES,
   READ_FAILED,
   ROLES,
   SETTING_STATES,
@@ -32,7 +47,7 @@ import {
   wheelFigures,
 } from "../../shared/text.ts";
 import { useAction } from "../api.ts";
-import { DeviceLayers } from "./Profiles.tsx";
+import { DeviceLayers, RECONNECT_TEXT, RECONNECT_TITLE } from "./Profiles.tsx";
 import { Banner, Card, Dialog, Fact, Facts, Menu, Page, Pill, Row, Segmented, Spinner, Staged, Switch, SwitchRow, TabBar, TabPanel, type MenuOption } from "./common.tsx";
 import {
   BatteryGlyph,
@@ -436,10 +451,16 @@ const starting = (entry: DeviceEntry) => entry.device.state === "connected" && e
 
 /** The settings form: every staged change goes to the device together with
  * Save. Its buttons go in the page bar, `bar`, outside the form. */
-function Settings({ entry, adapter, drafts, bar }: {
+function Settings({ entry, live, adapter, peers, drafts, details, onDetails, bar }: {
   entry: DeviceEntry;
+  /** False while the page shows the device's last state as its adapter reconnects. */
+  live: boolean;
   adapter: AdapterEntry | undefined;
+  /** The adapter's paired devices. */
+  peers: DeviceRecord[];
   drafts: Drafts;
+  details: DeviceChanges;
+  onDetails: (update: (draft: DeviceChanges) => DeviceChanges) => void;
   bar: HTMLElement | null;
 }) {
   const formId = useId();
@@ -447,13 +468,22 @@ function Settings({ entry, adapter, drafts, bar }: {
   const [saving, runSave] = useAction(true);
   const [reloading, runReload] = useAction(true);
   const [problem, setProblem] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
   const form = useRef<HTMLFormElement>(null);
   const d = entry.device;
+  const status = adapter?.status ?? null;
+  const gamepad = offersGamepadOutput(d, status);
+  const savedOutput = gamepadOutput(d);
+  // A saved mode the adapter no longer takes stays shown, so it can be turned off.
+  const available = gamepadModes(status);
+  const outputModes = (Object.keys(OUTPUT_MODES) as OutputModeName[]).filter((m) => m === savedOutput || available.includes(m));
+  const outputChange = gamepad ? pendingDetails(details, d).gamepadOutput : undefined;
+  const stageOutput = (mode: OutputModeName | undefined) => onDetails((x) => pendingDetails({ ...x, gamepadOutput: mode }, d));
   const { rows: settings, readings, figures } = settingsView(entry);
   const categories = [...new Set([...settings.map((s) => s.key), ...readings.map((f) => f.key)].sort((a, b) => settingOrder(a) - settingOrder(b)).map((k) => settingInfo(k)!.category))];
   if (figures.length && !categories.includes("Wheel")) categories.push("Wheel");
   const connected = d.state === "connected";
-  const reachable = adapter?.connection === "connected";
+  const reachable = live && adapter?.connection === "connected";
   const occupied = saving || refreshing || settingsBusy(entry);
   // Saving needs the adapter ready; refreshing a connected device doesn't.
   const busy = !reachable || !adapter.status?.ready || occupied;
@@ -463,9 +493,9 @@ function Settings({ entry, adapter, drafts, bar }: {
   const itemFor = (key: string) => items.find((i) => i.change.setting === key);
   const staged = settings.map((s) => ({ s, draft: drafts.get(s.key), ...pendingChange(s, drafts.get(s.key)) }));
   const changes = staged.filter((r) => r.change !== null);
-  const dirty = staged.some((r) => r.change !== null || r.invalid);
+  const dirty = staged.some((r) => r.change !== null || r.invalid) || outputChange !== undefined;
   const invalid = staged.some((r) => r.invalid);
-  const canSave = !busy && changes.length > 0 && !invalid;
+  const canSave = !busy && (changes.length > 0 || outputChange !== undefined) && !invalid;
   // Retry saves a failed setting's value again, which applies it again; a
   // draft of that setting stands in its way.
   const retryable = staged.filter((r) => r.s.error && saved(r.s));
@@ -480,19 +510,35 @@ function Settings({ entry, adapter, drafts, bar }: {
       if (draft && item.status === "saved") drafts.set(item.change.setting, undefined, draft);
     }
     if (!result.ok && !result.inline) setProblem(result.message);
+    return result.ok;
   };
-  const save = () => {
+  // Settings go first, since a Gamepad Output change can reconnect USB. A setting that wasn't
+  // saved, or may not have been, keeps the output change staged.
+  const save = async () => {
+    setConfirming(false);
     if (!canSave) return;
-    void submit(changes.map((r) => r.change!), changes.map((r) => [r.s.key, r.draft]));
+    setProblem(null);
+    if (changes.length && !(await submit(changes.map((r) => r.change!), changes.map((r) => [r.s.key, r.draft])))) return;
+    const sent = outputChange;
+    if (sent === undefined) return;
+    const result = await runSave({ type: "device.update", key: entry.key, gamepadOutput: sent });
+    if (result.ok) onDetails((x) => settleDetails(x, { gamepadOutput: sent }));
+    else setProblem(result.message);
+  };
+  // Saving a Gamepad Output change that reconnects USB asks first.
+  const requestSave = () => {
+    if (!canSave) return;
+    if (outputChange !== undefined && reconnectsGamepadUsb(peers, d, outputChange, status)) setConfirming(true);
+    else void save();
   };
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
-    save();
+    requestSave();
   };
 
   // Ctrl+S or Cmd+S saves while the settings form is shown and no dialog is open.
-  const saveRef = useRef(save);
-  saveRef.current = save;
+  const saveRef = useRef(requestSave);
+  saveRef.current = requestSave;
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
       if (e.key.toLowerCase() !== "s" || !(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
@@ -513,9 +559,13 @@ function Settings({ entry, adapter, drafts, bar }: {
     </>
   );
   const hidppError = d.hidpp?.error ?? null;
+  // A change whose outcome was unknown no longer is once the device reports it saved.
+  useEffect(() => {
+    if (outputChange === undefined) setProblem(null);
+  }, [outputChange]);
 
   // The tab is only offered while there are settings.
-  if (!settings.length && !readings.length && !figures.length) return null;
+  if (!settings.length && !readings.length && !figures.length && !gamepad) return null;
 
   const notSaved = items.filter((i) => i.status === "not_saved").length;
   const unknown = items.find((i) => i.status === "unknown")?.error ?? "";
@@ -550,7 +600,10 @@ function Settings({ entry, adapter, drafts, bar }: {
           <RefreshIcon /> Retry
         </button>
       ) : null}
-      <button type="button" {...guard(!saving && dirty, () => drafts.clear())}>
+      <button type="button" {...guard(!saving && dirty, () => {
+        drafts.clear();
+        stageOutput(undefined);
+      })}>
         <UndoIcon /> Discard
       </button>
       <button type="submit" form={formId} className="suggested" aria-disabled={!canSave}>
@@ -571,11 +624,43 @@ function Settings({ entry, adapter, drafts, bar }: {
           const t = e.target as HTMLElement;
           if (e.key === "Enter" && (t.tagName === "INPUT" || t.tagName === "SELECT")) {
             e.preventDefault();
-            save();
+            requestSave();
           }
         }}
       >
         <div className="settings-fields">
+          {gamepad ? (
+            <Card title={ROLES.gamepad}>
+              <div className="setting-row" role="group" aria-labelledby={`${formId}-gamepad`}>
+                <div className="setting-label">
+                  <div className="row-title" id={`${formId}-gamepad`}>
+                    Gamepad Output
+                  </div>
+                </div>
+                <fieldset className="setting-control" disabled={guards.locked}>
+                  <Segmented
+                    label="Gamepad Output"
+                    options={outputModes.map((m) => [m, OUTPUT_MODES[m]])}
+                    value={outputChange ?? savedOutput}
+                    disabled={guards.locked}
+                    onChange={stageOutput}
+                  />
+                </fieldset>
+                <div className="setting-marker">
+                  {outputChange !== undefined ? (
+                    <Marker
+                      label="Gamepad Output"
+                      state="Changed"
+                      shape="draft"
+                      options={[["Undo Change", () => stageOutput(undefined)]]}
+                      sending={saving}
+                      disabled={guards.busy}
+                    />
+                  ) : null}
+                </div>
+              </div>
+            </Card>
+          ) : null}
           {categories.map((category) => (
             <Card key={category} title={category}>
               {settings
@@ -603,6 +688,17 @@ function Settings({ entry, adapter, drafts, bar }: {
         </div>
       </form>
       {bar ? createPortal(footer, bar) : null}
+      <Dialog open={confirming} title={RECONNECT_TITLE} onClose={() => setConfirming(false)}>
+        <p className="dialog-body">{RECONNECT_TEXT}</p>
+        <footer className="dialog-footer">
+          <button onClick={() => setConfirming(false)}>
+            <CloseIcon /> Cancel
+          </button>
+          <button className="suggested" disabled={!canSave} onClick={() => void save()}>
+            <CheckIcon /> Save
+          </button>
+        </footer>
+      </Dialog>
     </>
   );
 }
@@ -613,8 +709,16 @@ function pendingDetails(draft: DeviceChanges, d: DeviceRecord): DeviceChanges {
   for (const k of ["enabled", "trusted", "blocked"] as const) if (draft[k] !== undefined && draft[k] !== d[k]) changes[k] = draft[k];
   if (draft.hidpp !== undefined && draft.hidpp !== (d.hidpp?.enabled ?? false)) changes.hidpp = draft.hidpp;
   if (draft.profiles !== undefined && d.profiles !== null && draft.profiles.join() !== d.profiles.join()) changes.profiles = draft.profiles;
+  if (draft.gamepadOutput !== undefined && draft.gamepadOutput !== gamepadOutput(d)) changes.gamepadOutput = draft.gamepadOutput;
   return changes;
 }
+
+/** The tab that stages and saves each field of the Details changes. */
+const fieldTab = (field: string): DeviceTab => (field === "profiles" ? "profiles" : field === "gamepadOutput" ? "settings" : "details");
+
+/** The fields of `changes` that `tab` stages. */
+const ofTab = (changes: DeviceChanges, tab: DeviceTab): DeviceChanges =>
+  Object.fromEntries(Object.entries(changes).filter(([k]) => fieldTab(k) === tab));
 
 /** `draft` without the values `sent` saved; values staged again since stay. */
 function settleDetails(draft: DeviceChanges, sent: DeviceChanges): DeviceChanges {
@@ -647,7 +751,8 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
   const d = entry.device;
   const adapter = state.adapters.find((a) => a.id === entry.adapterId);
   const connected = d.state === "connected";
-  const settings = hasSettings(entry);
+  const live = state.devices.some((x) => x.key === entry.key);
+  const settings = hasSettings(entry) || offersGamepadOutput(d, adapter?.status ?? null);
   useEffect(() => setFailure(null), [d.state]);
   const perform = async (at: string, runner: typeof run, action: Parameters<typeof run>[0]) => {
     setFailure(null);
@@ -662,19 +767,21 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
   const tab = (chosen === "settings" && !settings) || (chosen === "profiles" && !layered) ? "details" : chosen;
   const low = isLow(entry.battery, state.preferences.lowBatteryPercent);
   const battery = batteryText(entry.battery);
-  const ready = adapter?.connection === "connected" && !!adapter.status?.ready;
+  const ready = live && adapter?.connection === "connected" && !!adapter.status?.ready;
   const canConnect = ready && d.inactive === null && d.state === "disconnected";
   const peers = state.devices.filter((x) => x.adapterId === entry.adapterId).map((x) => x.device);
   const facts = (keys: string[]) => keys.flatMap((key) => d.info.filter((f) => f.key === key));
   const info = facts(DETAILS_INFO);
   const identifiers = facts(IDENTIFIERS);
-  // Details and Profiles edits stage in `details`; each tab's Save sends only its own changes.
+  // Details, Profiles and Gamepad Output edits stage in `details`; each tab's Save sends only its
+  // own changes.
   const changes = pendingDetails(details, d);
-  const { profiles: layerChanges, ...detailChanges } = changes;
+  const detailChanges = ofTab(changes, "details");
+  const layerChanges = changes.profiles;
   // Turning the device on or unblocking it is not offered while the adapter would refuse it for
   // want of a place for its transport.
   const full = (update: DeviceChanges) => enabledFull(adapter?.status ?? null, peers, d, { ...detailChanges, ...update });
-  const shown: DeviceChanges = tab === "profiles" ? (layerChanges !== undefined ? { profiles: layerChanges } : {}) : detailChanges;
+  const shown = ofTab(changes, tab);
   const dirty = Object.keys(shown).length > 0;
   const detailsDirty = Object.keys(detailChanges).length > 0;
   const locked = !ready || saving;
@@ -701,11 +808,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
   };
   const discard = () => {
     setSaveError(null);
-    onDetails((x) => {
-      if (tab !== "profiles") return x.profiles === undefined ? {} : { profiles: x.profiles };
-      const { profiles: _, ...rest } = x;
-      return rest;
-    });
+    onDetails((x) => Object.fromEntries(Object.entries(x).filter(([k]) => fieldTab(k) !== tab)));
   };
   const saveFailed = saveError?.tab === tab ? saveError.message : null;
   // Ctrl+S or Cmd+S saves while Details or Profiles is shown and no dialog is open; the Settings
@@ -723,6 +826,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
     return () => document.removeEventListener("keydown", key);
   }, []);
   const warningsFailed = !!entry.warningsError;
+  const gamepadStatus = d.outputs.find((o) => o.role === "gamepad");
   // A failed list read is retried by reading the lists again rather than asking the device.
   const listsFailed = warningsFailed || !!entry.settingsError;
 
@@ -772,7 +876,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
             {failed("info") ? <span className="bar-start error-text">{failed("info")}</span> : null}
             {infoBusy ? <Spinner /> : null}
             <button
-              disabled={infoBusy}
+              disabled={infoBusy || !live}
               onClick={() => void perform("info", runInfo, { type: listsFailed || !connected ? "device.reload" : "device.refresh", key: entry.key })}
             >
               <RefreshIcon /> {listsFailed || failed("info") ? "Retry" : "Refresh"}
@@ -783,6 +887,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
             <span className="bar-start">
               <button
                 className="destructive"
+                disabled={!live}
                 onClick={() => {
                   setFailure(null);
                   setForgetting(true);
@@ -794,7 +899,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
             </span>
             {busy || connectBusy || saving ? <Spinner /> : null}
             {connected || connecting ? (
-              <button disabled={busy} onClick={() => void perform("connection", run, { type: "device.disconnect", key: entry.key })}>
+              <button disabled={busy || !live} onClick={() => void perform("connection", run, { type: "device.disconnect", key: entry.key })}>
                 <UnplugIcon /> Disconnect
               </button>
             ) : (
@@ -820,7 +925,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
 
       <TabPanel id={tabs} value={tab}>
         {tab === "settings" ? (
-          <Settings entry={entry} adapter={adapter} drafts={drafts} bar={settingsBar} />
+          <Settings entry={entry} live={live} adapter={adapter} peers={peers} drafts={drafts} details={details} onDetails={onDetails} bar={settingsBar} />
         ) : tab === "profiles" ? (
           <DeviceLayers
             entry={entry}
@@ -888,6 +993,15 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
                 <Facts>
                   <Fact label="HID++ Protocol">{versionText(d.hidpp)}</Fact>
                   <Fact label="Status">{integrationText(d.hidpp)}</Fact>
+                </Facts>
+              </Card>
+            ) : null}
+
+            {gamepadStatus && gamepadStatus.state !== "disabled" ? (
+              <Card title="Gamepad Output">
+                <Facts>
+                  <Fact label="Status">{OUTPUT_STATES[gamepadStatus.state]}</Fact>
+                  {gamepadStatus.slot !== null ? <Fact label="Slot">{gamepadStatus.slot + 1}</Fact> : null}
                 </Facts>
               </Card>
             ) : null}

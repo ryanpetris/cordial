@@ -96,19 +96,37 @@ preference update rewrites the file once and commits before runtime state change
 ## Devices
 
 A device policy contains its ID, peer address/type/transport, name, trusted, blocked and
-preferred-enabled flags, `integrations`, `roles` and `profiles`. A new device's policy also sets
-`setup_pending` until its first-connection setup completes; a policy without it has completed setup.
-Connection state, effective enablement, discovery, battery readings and transient errors are not
-persisted.
+preferred-enabled flags, `integrations`, `roles`, `profiles` and `output_preferences`. A new
+device's policy also sets `setup_pending` until its first-connection setup completes; a policy
+without it has completed setup. Connection state, effective enablement, discovery, battery
+readings and transient errors are not persisted.
 
 - `integrations` lists each integration the device has a saved preference for, as `integration`
   and `enabled`. The implemented integration is HID++.
 - `roles` lists the input roles the device's HID descriptor produces: keyboard, mouse, consumer
-  control and system control. It is rewritten when a connection reads a descriptor with
+  control, system control and gamepad. It is rewritten when a connection reads a descriptor with
   different roles, once input pauses (see [when files are written](#when-files-are-written)), and
   is empty until the first descriptor is read.
+- `output_preferences` lists saved output choices as `role` and `mode`, with at most one entry per
+  role. Only gamepad is configurable. Its modes are Disabled, HID and XInput; a missing entry means
+  Disabled. Writers retain a settled Disabled choice while `setup_pending` is true so reconnects
+  and restarts preserve it while other setup steps finish. Otherwise they omit Disabled entries.
+  Unknown roles or modes are ignored, and duplicate known roles make the record undecodable.
+  Missing entries do not change keyboard or mouse behavior.
+  Preferences survive renewing an existing bond. Unpairing deletes them. Each gamepad mode's
+  desired USB pool is the number of paired records selecting it, capped at four, including
+  disabled, blocked and nonresident devices and devices whose transport is disabled. Connection
+  state does not change these counts.
 - `profiles` is the device's layers: the profile IDs it applies, in order. A new device has none,
   and an empty list passes everything through.
+
+First-connection setup chooses HID when the validated descriptor has supported gamepad controls,
+the firmware supports HID output and fewer than four saved devices select HID. Otherwise it settles
+on Disabled. A saved or explicit choice wins. Setup does not run again after completion, including
+when capacity becomes available or firmware gains HID support. The choice takes effect after its
+policy save succeeds; a failed save leaves setup pending for a later connection to retry.
+`setup_pending` clears only after both gamepad selection and HID++ detection or an explicit HID++
+choice settle.
 
 The bond holds the canonical native-independent identity and security keys: its owner, which is
 the device ID, its identity, which equals the policy's peer, and the keys of the identity's
@@ -145,15 +163,22 @@ devices.
 `profile.pb` contains `name` and `roles`, the roles the profile's rules change, worked out when
 the rules are saved. The directory supplies the profile's ID.
 
-`rules.pb` contains `rules`; an absent file means no rules. Each rule has an `input` usage and
-either `remap` or `scale`:
+`rules.pb` contains `rules`; an absent file means no rules. Each rule requires an `input` usage
+at field 1 and its application `collection` at field 2. Both are packed `uint32` usages, with the
+usage page in the high 16 bits and the usage ID in the low 16. Missing or zero input or collection
+makes the record undecodable; no collection is inferred. The required `effect` is one of `remap`
+at field 3, `scale` at field 4 or `axis` at field 5:
 
 - `remap` holds a list of `outputs`, each a `usage` with the `collection` of the report that carries
   it. An empty list disables the input.
 - `scale` holds a `numerator` and a `denominator`.
+- `axis` holds a packed `destination` usage at field 1 and an `invert` boolean at field 2. It
+  routes an absolute Game Pad axis within the input's Game Pad collection; inversion reverses the
+  normalized axis range. It has no deadzones, curves or sensitivity settings.
 
-The list is sorted by input, with at most one rule for each input, so a loaded profile can be
-searched without sorting; a file that is not is undecodable. Each rule is its own entry of the
+The list is sorted by input usage, then collection, with at most one rule for each pair, so a
+loaded profile can be searched without sorting; a file that is not is undecodable. Packed usage
+order is usage page followed by usage ID. Each rule is its own entry of the
 repeated field, so a reader can decode or skip the rules one at a time, and loading fills the
 lookup table entry by entry without holding the decoded list. Saving encodes each rule in turn into
 a buffer of exactly the file's length. Forgetting the last rule deletes the file.

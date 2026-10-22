@@ -285,6 +285,13 @@ impl State {
         if let Some(layers) = &update.profiles {
             d.profiles = Some(layers.clone());
         }
+        // Disabled clears a saved choice.
+        for o in &update.output_preferences {
+            d.output_preferences.retain(|saved| saved.role != o.role);
+            if o.mode != p::OutputMode::Disabled as i32 {
+                d.output_preferences.push(*o);
+            }
+        }
     }
 
     /// Takes the values an accepted SetSettings saved and forgot, for a device whose settings
@@ -723,6 +730,24 @@ mod tests {
         assert!(d.enabled && d.trusted && !d.blocked);
         assert!(d.integrations[0].enabled);
         assert_eq!(d.profiles.as_ref().unwrap().profiles, [2, 1]);
+        let gamepad = |mode: p::OutputMode| p::OutputPreference {
+            role: p::Role::Gamepad as i32,
+            mode: mode as i32,
+        };
+        for (mode, saved) in [
+            (p::OutputMode::Hid, vec![gamepad(p::OutputMode::Hid)]),
+            (p::OutputMode::Xinput, vec![gamepad(p::OutputMode::Xinput)]),
+            // Disabled clears the saved choice.
+            (p::OutputMode::Disabled, Vec::new()),
+        ] {
+            let (request, response) = accepted(Command::SetDevice(p::SetDevice {
+                device: 1,
+                output_preferences: vec![gamepad(mode)],
+                ..Default::default()
+            }));
+            st.response(&request, &response);
+            assert_eq!(st.device(1).unwrap().output_preferences, saved);
+        }
         let (request, response) = accepted(Command::SetSettings(p::SetSettings {
             device: 1,
             changes: vec![

@@ -7,10 +7,10 @@ use crate::{
     profiles,
     ui::{
         catalog::{self, value_string},
-        text::{Filter, quote, safe},
+        text::{self, Filter, quote, safe},
     },
 };
-use cordial_protocol::{self as p, Platform, Transport, profile_rule};
+use cordial_protocol::{self as p, OutputMode, Platform, Transport, profile_rule};
 use std::path::PathBuf;
 
 /// A shell command: its words, argument syntax and description, in help order.
@@ -48,6 +48,7 @@ const PROFILE_COMMANDS: &[&str] = &[
     "profile rule list",
     "profile rule remap",
     "profile rule scale",
+    "profile rule axis",
     "profile rule forget",
 ];
 
@@ -148,6 +149,11 @@ const SPECS: &[Spec] = &[
         "Multiply a value input by N/D; a negative N inverts it",
     ),
     spec(
+        "profile rule axis",
+        "PROFILE INPUT AXIS [invert]",
+        "Move a gamepad axis to another axis, optionally inverted",
+    ),
+    spec(
         "profile rule forget",
         "PROFILE INPUT",
         "Forget a rule so the input passes through unchanged",
@@ -219,7 +225,7 @@ const NOTES: &[(&[&str], &str)] = &[
     ),
     (
         &["profile rule"],
-        "A USAGE is PAGE:USAGE in hexadecimal, such as 07:39 for Caps Lock or 01:38 for the wheel. An INPUT is a USAGE. OUTPUTS is disabled or a comma-separated list of USAGEs, each optionally followed by @PAGE:USAGE naming the report's collection.",
+        "A USAGE is PAGE:USAGE in hexadecimal, such as 07:39 for Caps Lock or 01:38 for the wheel. An INPUT is a USAGE followed by @PAGE:USAGE naming its collection, such as 07:39@01:06 or 09:01@01:05. An AXIS is a USAGE. OUTPUTS is disabled or a comma-separated list of USAGEs, each optionally followed by @PAGE:USAGE naming the report's collection.",
     ),
     (
         &["pair accept"],
@@ -338,6 +344,15 @@ pub fn help_on(st: Option<&State>, topic: Option<&str>) -> String {
             out.push(format!(
                 "{:<32} Set a device's layers",
                 "device set DEV profiles LAYERS"
+            ));
+        }
+        if r.words == DEVICE_SET && gamepad_offered(st) {
+            out.push(format!(
+                "{:<32} Set a device's gamepad output",
+                format!(
+                    "device set DEV gamepad-output {}",
+                    gamepad_words(st).join(" | ")
+                )
             ));
         }
     }
@@ -463,6 +478,36 @@ fn interface_words(st: Option<&State>) -> Vec<&'static str> {
 /// Whether profile commands are offered: always without an adapter to describe.
 fn profiles_offered(st: Option<&State>) -> bool {
     st.is_none_or(|st| profiles::available(&st.status))
+}
+
+/// Whether gamepad output can be chosen: always without an adapter to describe, and otherwise
+/// when the adapter supports a gamepad mode or a device has a saved choice to clear.
+fn gamepad_offered(st: Option<&State>) -> bool {
+    st.is_none_or(|st| {
+        !model::gamepad_modes(&st.status).is_empty() || st.devices.iter().any(model::gamepad_saved)
+    })
+}
+
+/// The gamepad output modes that can be named: Disabled and those the adapter supports, or every
+/// one without an adapter to describe.
+fn gamepad_words(st: Option<&State>) -> Vec<String> {
+    let modes = match st {
+        Some(st) => model::gamepad_modes(&st.status),
+        None => vec![OutputMode::Hid, OutputMode::Xinput],
+    };
+    std::iter::once(OutputMode::Disabled)
+        .chain(modes)
+        .map(text::output_mode_token)
+        .collect()
+}
+
+fn output_mode(word: &str) -> Option<OutputMode> {
+    match word {
+        "disabled" => Some(OutputMode::Disabled),
+        "hid" => Some(OutputMode::Hid),
+        "xinput" => Some(OutputMode::Xinput),
+        _ => None,
+    }
 }
 
 /// Whether the connected adapter offers a shell command. Local commands are
@@ -737,27 +782,33 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
         ("profile copy", 2) => Line::Run(Command::ProfileCopy(target(0)?, arg(1))),
         ("profile delete", 1) => Line::Run(Command::ProfileDelete(target(0)?)),
         ("profile rule list", 1) => Line::Run(Command::Rules(target(0)?)),
-        ("profile rule remap", 3) => {
-            let rule = p::ProfileRule {
-                input: Some(profiles::parse_usage(words[1])?),
-                effect: Some(profile_rule::Effect::Remap(profile_rule::Remap {
-                    outputs: profiles::parse_outputs(words[2])?,
-                })),
+        ("profile rule remap" | "profile rule scale" | "profile rule axis", 3 | 4) => {
+            let at = profiles::parse_input(words[1])?;
+            let effect = match (cmd, &words[2..]) {
+                ("profile rule remap", [outputs]) => {
+                    profile_rule::Effect::Remap(profile_rule::Remap {
+                        outputs: profiles::parse_outputs(outputs)?,
+                    })
+                }
+                ("profile rule scale", [ratio]) => {
+                    profile_rule::Effect::Scale(profiles::parse_ratio(ratio)?)
+                }
+                ("profile rule axis", [axis, rest @ ..]) if matches!(rest, [] | ["invert"]) => {
+                    profile_rule::Effect::Axis(profile_rule::Axis {
+                        destination: Some(profiles::parse_usage(axis)?),
+                        invert: !rest.is_empty(),
+                    })
+                }
+                _ => return usage(),
             };
-            Line::Run(Command::RuleChange(target(0)?, profiles::save_rule(rule)))
-        }
-        ("profile rule scale", 3) => {
-            let rule = p::ProfileRule {
-                input: Some(profiles::parse_usage(words[1])?),
-                effect: Some(profile_rule::Effect::Scale(profiles::parse_ratio(
-                    words[2],
-                )?)),
-            };
-            Line::Run(Command::RuleChange(target(0)?, profiles::save_rule(rule)))
+            Line::Run(Command::RuleChange(
+                target(0)?,
+                profiles::save_rule(profiles::rule(at, effect)),
+            ))
         }
         ("profile rule forget", 2) => Line::Run(Command::RuleChange(
             target(0)?,
-            profiles::forget_rule(profiles::parse_usage(words[1])?),
+            profiles::forget_rule(profiles::parse_input(words[1])?),
         )),
         (DEVICE_SET, 3..) if words[1] == "profiles" => {
             let layers = match &words[2..] {
@@ -804,6 +855,10 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
         ("device disconnect", 1) => Line::Run(Command::Disconnect(target(0)?)),
         ("device unpair", 1) => Line::Run(Command::Unpair(target(0)?)),
         ("device refresh", 1) => Line::Run(Command::Refresh(target(0)?)),
+        (DEVICE_SET, 3) if words[1] == "gamepad-output" => match output_mode(words[2]) {
+            Some(mode) => Line::Run(Command::GamepadOutput(target(0)?, mode)),
+            None => return usage(),
+        },
         ("device set", 3) => match (toggle(words[1]), on_off(words[2])) {
             (Some(t), Some(on)) => Line::Run(Command::Set(target(0)?, t, on)),
             _ => return usage(),
@@ -1044,6 +1099,7 @@ const PROFILE_TARGETS: &[&str] = &[
     "profile rule list",
     "profile rule remap",
     "profile rule scale",
+    "profile rule axis",
     "profile rule forget",
 ];
 
@@ -1155,7 +1211,21 @@ fn completions(words: &[String], st: Option<&State>) -> Vec<String> {
             if profiles_offered(st) {
                 words.push("profiles".into());
             }
+            if gamepad_offered(st) {
+                words.push("gamepad-output".into());
+            }
             words
+        }
+        (DEVICE_SET, 2) if args[1] == "gamepad-output" => {
+            // The device's saved mode isn't offered: choosing it changes nothing.
+            let saved = st
+                .and_then(|st| st.device(resolve(&args[0], st)?))
+                .and_then(model::gamepad_mode)
+                .map(text::output_mode_token);
+            gamepad_words(st)
+                .into_iter()
+                .filter(|w| Some(w) != saved.as_ref())
+                .collect()
         }
         (DEVICE_SET, 2) if args[1] == "profiles" => {
             let mut words = owned(&["none"]);
@@ -1290,13 +1360,15 @@ pub(crate) mod tests {
             }],
             profile_support: None,
             configuration_interfaces: Vec::new(),
+            output_support: Vec::new(),
         }
     }
 
     /// Profile support with VIA and Vial, which conflict, both disabled.
     pub fn with_profiles(status: &mut p::Status) {
         status.profile_support = Some(p::ProfileSupport {
-            remap_inputs: vec![p::UsageRange {
+            ranges: vec![p::UsageRange {
+                kind: p::usage_range::Kind::RemapInput as i32,
                 collection: None,
                 usage_page: 7,
                 min: 4,
@@ -1567,6 +1639,113 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn gamepad_output_follows_the_modes_the_adapter_offers() {
+        assert_eq!(
+            run("device set 1 gamepad-output xinput"),
+            Command::GamepadOutput(Target::Id(1), OutputMode::Xinput)
+        );
+        assert!(parse(&words("device set 1 gamepad-output on")).is_err());
+        assert!(help(None).contains("device set DEV gamepad-output disabled | hid | xinput"));
+        let mut st = state();
+        assert!(!help(Some(&st)).contains("gamepad-output"));
+        let xinput = Command::GamepadOutput(Target::Id(1), OutputMode::Xinput);
+        assert_eq!(
+            offer(xinput.clone(), &st),
+            Err("this adapter doesn't offer XInput gamepad output".into())
+        );
+        let disabled = Command::GamepadOutput(Target::Id(1), OutputMode::Disabled);
+        assert!(offer(disabled, &st).is_ok());
+
+        st.status.output_support = vec![p::OutputSupport {
+            role: p::Role::Gamepad as i32,
+            modes: vec![p::OutputModeSupport {
+                mode: OutputMode::Hid as i32,
+                max_slots: 4,
+                slots: Some(1),
+            }],
+        }];
+        assert!(
+            help(Some(&st)).contains("device set DEV gamepad-output disabled | hid "),
+            "{}",
+            help(Some(&st))
+        );
+        assert!(offer(xinput, &st).is_err());
+        assert!(
+            complete("device set 1 ", Some(&st))
+                .contains(&"device set 1 gamepad-output".to_owned())
+        );
+        assert_eq!(
+            complete("device set 2 gamepad-output ", Some(&st)),
+            ["device set 2 gamepad-output hid"]
+        );
+        assert_eq!(
+            complete("device set Nobody gamepad-output ", Some(&st)),
+            [
+                "device set Nobody gamepad-output disabled",
+                "device set Nobody gamepad-output hid"
+            ]
+        );
+        // The saved mode changes nothing, so it isn't offered.
+        st.devices[0].output_preferences = vec![p::OutputPreference {
+            role: p::Role::Gamepad as i32,
+            mode: OutputMode::Hid as i32,
+        }];
+        assert_eq!(
+            complete("device set 1 gamepad-output ", Some(&st)),
+            ["device set 1 gamepad-output disabled"]
+        );
+    }
+
+    #[test]
+    fn a_stale_or_unknown_gamepad_output_can_be_cleared() {
+        let gamepad = |mode: i32| {
+            vec![p::OutputPreference {
+                role: p::Role::Gamepad as i32,
+                mode,
+            }]
+        };
+        // An adapter without gamepad output still offers clearing a saved choice.
+        for mode in [OutputMode::Hid as i32, 7] {
+            let mut st = state();
+            st.devices[1].output_preferences = gamepad(mode);
+            assert!(
+                help(Some(&st)).contains("device set DEV gamepad-output disabled "),
+                "{}",
+                help(Some(&st))
+            );
+            assert!(!help(Some(&st)).contains("disabled | hid"));
+            assert!(
+                complete("device set 2 ", Some(&st))
+                    .contains(&"device set 2 gamepad-output".to_owned())
+            );
+            assert_eq!(
+                complete("device set 2 gamepad-output ", Some(&st)),
+                ["device set 2 gamepad-output disabled"]
+            );
+            let hid = Command::GamepadOutput(Target::Id(2), OutputMode::Hid);
+            assert!(offer(hid, &st).is_err());
+        }
+        // Beside the modes the adapter offers, an unknown saved mode leaves every choice open.
+        let mut st = state();
+        st.status.output_support = vec![p::OutputSupport {
+            role: p::Role::Gamepad as i32,
+            modes: vec![p::OutputModeSupport {
+                mode: OutputMode::Hid as i32,
+                max_slots: 4,
+                slots: None,
+            }],
+        }];
+        st.devices[1].output_preferences = gamepad(7);
+        assert_eq!(
+            complete("device set 2 gamepad-output ", Some(&st)),
+            [
+                "device set 2 gamepad-output disabled",
+                "device set 2 gamepad-output hid"
+            ]
+        );
+    }
+
+    #[test]
     fn help_for_a_command_shows_its_rows_and_notes() {
         let st = state();
         assert!(matches!(
@@ -1779,38 +1958,74 @@ pub(crate) mod tests {
 
     #[test]
     fn rule_commands_parse_usages() {
-        let usage = |usage_page, usage| p::Usage { usage_page, usage };
-        let Command::RuleChange(Target::Name(name), change) =
-            run("profile rule remap Work 07:39 07:e0,07:04@01:06")
+        let saved = |line: &str| {
+            let Command::RuleChange(_, change) = run(line) else {
+                panic!("{line}")
+            };
+            let Some(p::profile_rule_change::Change::Rule(rule)) = change.change else {
+                panic!("{line}")
+            };
+            profiles::rule_words(&rule)
+        };
+        let Command::RuleChange(Target::Name(name), _) =
+            run("profile rule remap Work 07:39@01:06 07:e0,07:04@01:06")
         else {
             panic!()
         };
         assert_eq!(name, "Work");
-        let Some(p::profile_rule_change::Change::Rule(rule)) = change.change else {
+        for (line, words) in [
+            (
+                "profile rule remap Work 07:39@01:06 07:e0,07:04@01:06",
+                "07:39@01:06 remap 07:e0,07:04@01:06",
+            ),
+            (
+                "profile rule scale 2 01:38@01:02 -1/1",
+                "01:38@01:02 scale -1/1",
+            ),
+            (
+                "profile rule axis 2 01:30@01:05 01:33",
+                "01:30@01:05 axis 01:33",
+            ),
+            (
+                "profile rule axis 2 01:31@01:05 01:31 invert",
+                "01:31@01:05 axis 01:31 invert",
+            ),
+        ] {
+            assert_eq!(saved(line), words);
+        }
+        let Command::RuleChange(_, change) = run("profile rule forget 2 09:01@01:05") else {
             panic!()
         };
-        assert_eq!(rule.input, Some(usage(7, 0x39)));
-        assert_eq!(profiles::rule_words(&rule), "07:39 remap 07:e0,07:04@01:06");
-        let Command::RuleChange(_, change) = run("profile rule scale 2 01:38 -1/1") else {
-            panic!()
-        };
-        let Some(p::profile_rule_change::Change::Rule(rule)) = change.change else {
-            panic!()
-        };
-        assert_eq!(profiles::rule_words(&rule), "01:38 scale -1/1");
-        let Command::RuleChange(_, change) = run("profile rule forget 2 09:01") else {
-            panic!()
-        };
-        assert_eq!(profiles::change_target(&change), Some(&usage(9, 1)));
+        assert_eq!(
+            profiles::change_target(&change),
+            Some(p::ProfileRuleRef {
+                input: Some(p::Usage {
+                    usage_page: 9,
+                    usage: 1
+                }),
+                collection: Some(p::Usage {
+                    usage_page: 1,
+                    usage: 5
+                }),
+            })
+        );
         assert_eq!(
             run("profile rule list Work"),
             Command::Rules(Target::Name("Work".into()))
         );
         for bad in [
-            "profile rule remap 2 07:39",
-            "profile rule remap 2 7x:39 07:04",
-            "profile rule scale 2 01:38 0/1",
-            "profile rule forget 2 09:01 --collection 01:02",
+            "profile rule remap 2 07:39@01:06",
+            "profile rule remap 2 07:39 07:04",
+            "profile rule remap 2 7x:39@01:06 07:04",
+            "profile rule remap 2 07:39@01:06 07:04 invert",
+            "profile rule scale 2 01:38@01:02 0/1",
+            "profile rule scale 2 01:38 -1/1",
+            "profile rule axis 2 01:30@01:05",
+            "profile rule axis 2 01:30 01:31",
+            "profile rule axis 2 01:30@01:05 01:31 inverted",
+            "profile rule axis 2 01:30@01:05 01:31 invert invert",
+            "profile rule forget 2 09:01",
+            "profile rule forget 2 09:01@01:02 --collection 01:02",
             "profile rule list 2 --collection 01:02",
         ] {
             assert!(parse(&words(bad)).is_err(), "{bad}");

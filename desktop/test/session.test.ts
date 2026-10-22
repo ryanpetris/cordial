@@ -1,4 +1,4 @@
-import { IntegrationState } from "@cordial/protocol";
+import { ErrorCode, IntegrationState, OutputMode, Role } from "@cordial/protocol";
 import { describe, expect, it } from "vitest";
 import { FakeAdapter, device, setting } from "../src/fake/adapter.ts";
 import { AdapterSession } from "../src/core/session.ts";
@@ -101,6 +101,12 @@ describe("AdapterSession", () => {
     expect(session.devices.get(1)).toMatchObject({ enabled: false, inactive: "disabled" });
     await session.connection.setDevice({ device: 1, blocked: true });
     expect(session.devices.get(1)).toMatchObject({ blocked: true, inactive: "blocked" });
+    // Output updates apply in order, and Disabled leaves no saved entry.
+    const gamepad = (...modes: OutputMode[]) => modes.map((mode) => ({ role: Role.GAMEPAD, mode }));
+    await session.connection.setDevice({ device: 2, outputPreferences: gamepad(OutputMode.XINPUT, OutputMode.DISABLED) });
+    expect(session.devices.get(2)!.outputPreferences).toEqual([]);
+    await session.connection.setDevice({ device: 2, outputPreferences: gamepad(OutputMode.XINPUT, OutputMode.HID) });
+    expect(session.devices.get(2)!.outputPreferences).toEqual([{ role: "gamepad", mode: "hid" }]);
     await session.close();
   });
 
@@ -174,7 +180,7 @@ describe("AdapterSession", () => {
           settings: [
             setting("backlight.level", { type: "integer", min: 0, max: 7, step: 1, value: 3, saved: 5, state: "changed_on_device" }),
             setting("pointer.sensor.1.dpi", { type: "integer", choices: [400, 800], value: 800 }),
-            setting("wheel.mode", { type: "enum", choices: ["freespin", "ratchet"], value: "ratchet", saved: "freespin", error: 33 }),
+            setting("wheel.mode", { type: "enum", choices: ["freespin", "ratchet"], value: "ratchet", saved: "freespin", error: ErrorCode.TIMEOUT }),
           ],
         }),
       ],
@@ -194,7 +200,7 @@ describe("AdapterSession", () => {
     await until(() => session.devices.get(1)!.hidpp?.state === "starting");
     expect(settingsCurrent(entry())).toBe(false);
     expect(integrationText(entry().device.hidpp!)).toBe("Setting Up");
-    fake.changeDevice(1, { hidppState: null, hidppError: 50 });
+    fake.changeDevice(1, { hidppState: null, hidppError: ErrorCode.PROTOCOL_UNSUPPORTED });
     await until(() => session.devices.get(1)!.hidpp?.error === "protocol_unsupported");
     expect(integrationText(entry().device.hidpp!)).toBe("Failed: This device doesn't support this feature");
     // While disconnected, the list holds the saved settings, with their limits and without readings.

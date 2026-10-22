@@ -193,13 +193,44 @@ impl<F: Fleet> Model<F> {
                 .then_with(|| a.adapter.cmp(&b.adapter))
                 .then(a.d.id.cmp(&b.d.id))
         });
-        // A device's connection errors belong to its state at the time.
         for d in &devices {
             let key = (d.adapter.clone(), d.d.id);
+            // A device's connection errors belong to its state at the time.
             if self.device_states.insert(key.clone(), d.d.state) != Some(d.d.state) {
-                self.notes.remove(&super::Spot::DeviceBar(key.0, key.1));
+                self.notes
+                    .remove(&super::Spot::DeviceBar(key.0.clone(), key.1));
+            }
+            // A Gamepad Output change whose outcome was unknown no longer is once the device
+            // reports it saved.
+            if let Some(draft) = self.device_drafts.get_mut(&key)
+                && draft.gamepad.is_some()
+                && draft.gamepad == model::gamepad_mode(&d.d)
+            {
+                draft.gamepad = None;
+                if draft.is_empty() {
+                    self.device_drafts.remove(&key);
+                }
+                self.notes.remove(&super::Spot::SettingsNote(key.0, key.1));
             }
         }
+        // The shown device keeps its page, locked, while its adapter is held and until the
+        // adapter lists its devices again, as across the USB reconnect a gamepad pool change
+        // causes.
+        let kept = self.kept.take();
+        self.kept = match &self.page {
+            Page::Device(a, id) => devices
+                .iter()
+                .find(|d| d.adapter == *a && d.d.id == *id)
+                .cloned()
+                .or_else(|| {
+                    let relisting = match self.session_of(a) {
+                        Some(s) => !s.listed && s.unready.is_none(),
+                        None => self.held.contains_key(a),
+                    };
+                    kept.filter(|k| relisting && k.adapter == *a && k.d.id == *id)
+                }),
+            _ => None,
+        };
         self.devices = devices;
 
         if self.exists(&self.page) {
@@ -237,6 +268,7 @@ impl<F: Fleet> Model<F> {
     pub(super) fn device(&self, adapter: &str, id: u32) -> Option<&DeviceView> {
         self.devices
             .iter()
+            .chain(&self.kept)
             .find(|d| d.adapter == adapter && d.d.id == id)
     }
 

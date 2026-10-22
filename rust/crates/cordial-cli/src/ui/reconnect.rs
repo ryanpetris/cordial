@@ -1,11 +1,13 @@
-//! Follows an adapter through the USB reconnect that saving a configuration interface change
-//! causes. The adapter leaves USB and returns, possibly on another port because its USB serial
-//! number gains or loses a suffix, so it is found again by its adapter ID and reopened without
-//! reporting the expected loss. An adapter that doesn't return in time is reported as lost.
+//! Follows an adapter through the USB reconnect that saving a configuration interface change or
+//! a gamepad pool change causes. The adapter leaves USB and returns, possibly on another port
+//! because its USB serial number gains or loses a suffix, so it is found again by its adapter ID
+//! and reopened without reporting the expected loss. An adapter that doesn't return in time is
+//! reported as lost.
 use crate::{
-    controller::{Command, Outcome, SessionId, Ticket},
+    commands,
+    controller::{Command, DeviceUpdate, Outcome, SessionId, State, Target, Ticket},
     error::Error,
-    profiles,
+    model, profiles,
 };
 use cordial_client::serial::PortInfo;
 use cordial_protocol as p;
@@ -17,10 +19,30 @@ const WINDOW: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(500);
 
 /// Whether running `command` may reconnect USB.
-pub(crate) fn may_reconnect(command: &Command) -> bool {
+pub(crate) fn may_reconnect(st: &State, command: &Command) -> bool {
     match command {
         Command::Interface { .. } => true,
         Command::AdapterSave(update) => !update.interfaces.is_empty(),
+        _ => changes_pools(st, command),
+    }
+}
+
+/// Whether `command` may change a gamepad pool: it changes a device's saved gamepad output mode,
+/// or unpairs a device with a saved choice.
+fn changes_pools(st: &State, command: &Command) -> bool {
+    let changes = |target: &Target, mode: Option<p::OutputMode>| {
+        commands::resolve_device(st, target).is_ok_and(|d| model::gamepad_mode(&d) != mode)
+    };
+    match command {
+        Command::GamepadOutput(target, mode) => changes(target, Some(*mode)),
+        Command::DeviceSave(
+            id,
+            DeviceUpdate {
+                gamepad: Some(mode),
+                ..
+            },
+        ) => changes(&Target::Id(*id), Some(*mode)),
+        Command::Unpair(target) => changes(target, Some(p::OutputMode::Disabled)),
         _ => false,
     }
 }
@@ -34,6 +56,9 @@ pub(crate) struct Reconnect {
     ticket: Ticket,
     /// The configuration interfaces before the save.
     before: Vec<p::ConfigurationInterfaceSupport>,
+    /// The save may change a gamepad pool. The response doesn't tell, so any success may
+    /// reconnect.
+    pools: bool,
     stage: Stage,
 }
 
@@ -62,13 +87,14 @@ pub(crate) enum Step {
 }
 
 impl Reconnect {
-    /// Follows a save that may reconnect USB, sent to the adapter with `status`.
-    pub(crate) fn new(session: SessionId, ticket: Ticket, status: &p::Status) -> Self {
+    /// Follows `command`, which may reconnect USB, sent to the adapter described by `st`.
+    pub(crate) fn new(session: SessionId, ticket: Ticket, st: &State, command: &Command) -> Self {
         Self {
-            id: status.id.clone(),
+            id: st.status.id.clone(),
             session,
             ticket,
-            before: status.configuration_interfaces.clone(),
+            before: st.status.configuration_interfaces.clone(),
+            pools: changes_pools(st, command),
             stage: Stage::Saving,
         }
     }
@@ -88,6 +114,10 @@ impl Reconnect {
             Ok(Outcome::AdapterSaved(after) | Outcome::Interface(_, after))
                 if profiles::reconnected(&self.before, &after.configuration_interfaces) =>
             {
+                self.stage = Stage::Saved(Instant::now() + WINDOW);
+                true
+            }
+            Ok(_) if self.pools => {
                 self.stage = Stage::Saved(Instant::now() + WINDOW);
                 true
             }

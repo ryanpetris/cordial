@@ -1,3 +1,5 @@
+#[path = "application/gamepad_setup.rs"]
+mod gamepad_setup;
 mod support;
 use cordial_core::model::{
     errors::ErrorCode,
@@ -38,9 +40,17 @@ const FIRST_RETRY: u64 = cordial_core::devices::RETRY_DELAY_MS as u64;
 thread_local! {
     /// How many of the next allocations on this thread fail.
     static FAILS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_LAYOUT: std::cell::Cell<Option<std::alloc::Layout>> = const { std::cell::Cell::new(None) };
 }
 /// Whether this allocation is one asked to fail.
-fn fails() -> bool {
+fn fails(layout: std::alloc::Layout) -> bool {
+    if FAIL_LAYOUT
+        .try_with(|f| f.get() == Some(layout))
+        .unwrap_or(false)
+    {
+        FAIL_LAYOUT.with(|f| f.set(None));
+        return true;
+    }
     FAILS
         .try_with(|f| {
             let fails = f.get();
@@ -2030,7 +2040,7 @@ thread_local! {
 }
 unsafe impl std::alloc::GlobalAlloc for CountAllocations {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if fails() {
+        if fails(layout) {
             return std::ptr::null_mut();
         }
         if TRACK.try_with(|v| v.get()).unwrap_or(false) {
@@ -2042,7 +2052,7 @@ unsafe impl std::alloc::GlobalAlloc for CountAllocations {
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
-        if fails() {
+        if fails(std::alloc::Layout::from_size_align(size, layout.align()).unwrap()) {
             return std::ptr::null_mut();
         }
         if TRACK.try_with(|v| v.get()).unwrap_or(false) {
@@ -3194,7 +3204,7 @@ fn free_space_is_counted_after_writes_in_a_later_step() {
     assert_eq!(
         t.ok(Command::SetProfileRules(p::SetProfileRules {
             profile: id,
-            changes: vec![remap(key(4), &[key(5)])],
+            changes: vec![remap(KEYBOARD_COLLECTION, key(4), &[key(5)])],
         })),
         None
     );
@@ -3475,17 +3485,35 @@ const KEYBOARD_COLLECTION: p::Usage = p::Usage {
     usage_page: 1,
     usage: 6,
 };
-fn rule(input: p::Usage, effect: p::profile_rule::Effect) -> p::ProfileRuleChange {
+const MOUSE_COLLECTION: p::Usage = p::Usage {
+    usage_page: 1,
+    usage: 2,
+};
+const CONSUMER_COLLECTION: p::Usage = p::Usage {
+    usage_page: 0x0c,
+    usage: 1,
+};
+const SYSTEM_COLLECTION: p::Usage = p::Usage {
+    usage_page: 1,
+    usage: 0x80,
+};
+fn rule(
+    collection: p::Usage,
+    input: p::Usage,
+    effect: p::profile_rule::Effect,
+) -> p::ProfileRuleChange {
     p::ProfileRuleChange {
         change: Some(p::profile_rule_change::Change::Rule(p::ProfileRule {
             input: Some(input),
+            collection: Some(collection),
             effect: Some(effect),
         })),
     }
 }
 /// A rule that makes `input` hold `outputs`, whose collections the adapter resolves.
-fn remap(input: p::Usage, outputs: &[p::Usage]) -> p::ProfileRuleChange {
+fn remap(collection: p::Usage, input: p::Usage, outputs: &[p::Usage]) -> p::ProfileRuleChange {
     rule(
+        collection,
         input,
         p::profile_rule::Effect::Remap(p::profile_rule::Remap {
             outputs: outputs
@@ -3498,8 +3526,14 @@ fn remap(input: p::Usage, outputs: &[p::Usage]) -> p::ProfileRuleChange {
         }),
     )
 }
-fn scale(input: p::Usage, numerator: i32, denominator: u32) -> p::ProfileRuleChange {
+fn scale(
+    collection: p::Usage,
+    input: p::Usage,
+    numerator: i32,
+    denominator: u32,
+) -> p::ProfileRuleChange {
     rule(
+        collection,
         input,
         p::profile_rule::Effect::Scale(p::profile_rule::Scale {
             numerator,
@@ -3507,17 +3541,19 @@ fn scale(input: p::Usage, numerator: i32, denominator: u32) -> p::ProfileRuleCha
         }),
     )
 }
-fn forget_rule(input: p::Usage) -> p::ProfileRuleChange {
+fn forget_rule(collection: p::Usage, input: p::Usage) -> p::ProfileRuleChange {
     p::ProfileRuleChange {
         change: Some(p::profile_rule_change::Change::Forget(p::ProfileRuleRef {
             input: Some(input),
+            collection: Some(collection),
         })),
     }
 }
 /// The saved form of a remap of `input` to keyboard keys.
-fn saved_remap(input: p::Usage, keys: &[u32]) -> p::ProfileRule {
+fn saved_remap(collection: p::Usage, input: p::Usage, keys: &[u32]) -> p::ProfileRule {
     p::ProfileRule {
         input: Some(input),
+        collection: Some(collection),
         effect: Some(p::profile_rule::Effect::Remap(p::profile_rule::Remap {
             outputs: keys
                 .iter()
@@ -3569,10 +3605,11 @@ fn saved_rules(t: &mut Test, profile: u32) -> Vec<cordial_core::profiles::Rule> 
     .unwrap()
 }
 /// A remap of `input` to keyboard `keys`.
-fn remap_rule(input: p::Usage, keys: &[u32]) -> cordial_core::profiles::Rule {
+fn remap_rule(collection: p::Usage, input: p::Usage, keys: &[u32]) -> cordial_core::profiles::Rule {
     use cordial_core::profiles;
     profiles::Rule {
         input: profiles::usage(input.usage_page as u16, input.usage as u16),
+        collection: profiles::usage(collection.usage_page as u16, collection.usage as u16),
         effect: profiles::Effect::Remap(
             keys.iter()
                 .map(|k| profiles::Output {
@@ -3586,7 +3623,10 @@ fn remap_rule(input: p::Usage, keys: &[u32]) -> cordial_core::profiles::Rule {
 fn rules_of(t: &mut Test, profile: u32) -> Vec<p::ProfileRule> {
     let mut rules: Vec<p::ProfileRule> = Vec::new();
     loop {
-        let after = rules.last().and_then(|r| r.input);
+        let after = rules.last().map(|r| p::ProfileRuleRef {
+            input: r.input,
+            collection: r.collection,
+        });
         match t.ok(Command::ListProfileRules(p::ListProfileRules {
             profile,
             after,
@@ -3608,10 +3648,12 @@ fn profile_with(t: &mut Test, name: &str, keys: impl IntoIterator<Item = u32>) -
     let id = create(t, name);
     let changes: Vec<_> = keys
         .into_iter()
-        .map(|k| remap(key(k), &[key(k + 1)]))
+        .map(|k| remap(KEYBOARD_COLLECTION, key(k), &[key(k + 1)]))
         .collect();
     if !changes.is_empty() {
-        set_rules(t, id, changes);
+        for changes in changes.chunks(16) {
+            set_rules(t, id, changes.to_vec());
+        }
     }
     id
 }
@@ -3678,7 +3720,12 @@ fn status_reports_profile_support_and_configuration_interfaces() {
     assert_eq!(support.memory_used, 0);
     assert_eq!(support.max_layers, 8);
     assert_eq!(support.max_remap_outputs, 8);
-    assert!(!support.remap_inputs.is_empty() && !support.scale_inputs.is_empty());
+    for kind in [
+        p::usage_range::Kind::RemapInput,
+        p::usage_range::Kind::ScaleInput,
+    ] {
+        assert!(support.ranges.iter().any(|r| r.kind == kind as i32));
+    }
     let via = p::ConfigurationInterface::Via as i32;
     let vial = p::ConfigurationInterface::Vial as i32;
     assert_eq!(
@@ -3721,7 +3768,7 @@ fn a_board_without_profile_support_refuses_profile_work() {
         }),
         Command::SetProfileRules(p::SetProfileRules {
             profile: 1,
-            changes: vec![forget_rule(key(4))],
+            changes: vec![forget_rule(KEYBOARD_COLLECTION, key(4))],
         }),
     ] {
         assert_eq!(t.code(command), p::ErrorCode::UnknownCommand);
@@ -3764,7 +3811,11 @@ fn profiles_are_created_copied_read_and_deleted() {
             p::ErrorCode::BadArgs
         );
     }
-    set_rules(&mut t, first, vec![remap(key(4), &[key(5)])]);
+    set_rules(
+        &mut t,
+        first,
+        vec![remap(KEYBOARD_COLLECTION, key(4), &[key(5)])],
+    );
     assert_eq!(profile(&mut t, first).roles, [p::Role::Keyboard as i32]);
     let copy = match t.ok(Command::CopyProfile(p::CopyProfile {
         profile: first,
@@ -3777,9 +3828,16 @@ fn profiles_are_created_copied_read_and_deleted() {
     assert_eq!(copy.roles, [p::Role::Keyboard as i32]);
     assert_eq!(rules_of(&mut t, copy.id), rules_of(&mut t, first));
     // The copy is independent.
-    set_rules(&mut t, copy.id, vec![forget_rule(key(4))]);
+    set_rules(
+        &mut t,
+        copy.id,
+        vec![forget_rule(KEYBOARD_COLLECTION, key(4))],
+    );
     assert!(rules_of(&mut t, copy.id).is_empty());
-    assert_eq!(rules_of(&mut t, first), [saved_remap(key(4), &[5])]);
+    assert_eq!(
+        rules_of(&mut t, first),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
     assert_eq!(profile(&mut t, copy.id).roles, Vec::<i32>::new());
     for command in [
         Command::GetProfile(p::GetProfile { profile: 99 }),
@@ -3887,6 +3945,7 @@ fn set_profile_rules_normalizes_rules_and_forgets_identities() {
         &mut t,
         id,
         vec![rule(
+            KEYBOARD_COLLECTION,
             key(4),
             p::profile_rule::Effect::Remap(p::profile_rule::Remap {
                 outputs: vec![
@@ -3906,9 +3965,19 @@ fn set_profile_rules_normalizes_rules_and_forgets_identities() {
             }),
         )],
     );
-    assert_eq!(rules, [saved_remap(key(4), &[5, 0xe0])]);
+    assert_eq!(
+        rules,
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[5, 0xe0])]
+    );
     // A remap of an input to only itself forgets its rule.
-    assert!(set_rules(&mut t, id, vec![remap(key(4), &[key(4)])]).is_empty());
+    assert!(
+        set_rules(
+            &mut t,
+            id,
+            vec![remap(KEYBOARD_COLLECTION, key(4), &[key(4)])]
+        )
+        .is_empty()
+    );
     // Ratios are kept in lowest terms; a ratio of 1 forgets the rule; a negative one inverts.
     let x = usage(1, 0x30);
     let wheel = usage(1, 0x38);
@@ -3916,9 +3985,9 @@ fn set_profile_rules_normalizes_rules_and_forgets_identities() {
         &mut t,
         id,
         vec![
-            scale(x, 4, 8),
-            scale(wheel, -2, 2),
-            scale(usage(1, 0x31), 3, 3),
+            scale(MOUSE_COLLECTION, x, 4, 8),
+            scale(MOUSE_COLLECTION, wheel, -2, 2),
+            scale(MOUSE_COLLECTION, usage(1, 0x31), 3, 3),
         ],
     );
     let scales: Vec<_> = rules
@@ -3932,7 +4001,7 @@ fn set_profile_rules_normalizes_rules_and_forgets_identities() {
         .collect();
     assert_eq!(scales, [(x, 1, 2), (wheel, -1, 1)]);
     assert_eq!(profile(&mut t, id).roles, [p::Role::Mouse as i32]);
-    assert!(set_rules(&mut t, id, vec![scale(x, 5, 5)]).len() == 1);
+    assert!(set_rules(&mut t, id, vec![scale(MOUSE_COLLECTION, x, 5, 5)]).len() == 1);
 }
 
 #[test]
@@ -3940,17 +4009,44 @@ fn rule_changes_apply_in_order_and_invalid_requests_save_nothing() {
     let mut t = Test::new(false);
     let id = create(&mut t, "Rules");
     let c = key(6);
-    assert!(set_rules(&mut t, id, vec![remap(c, &[key(7)]), forget_rule(c)]).is_empty());
-    assert_eq!(
-        set_rules(&mut t, id, vec![forget_rule(c), remap(c, &[key(7)])]),
-        [saved_remap(c, &[7])]
+    assert!(
+        set_rules(
+            &mut t,
+            id,
+            vec![
+                remap(KEYBOARD_COLLECTION, c, &[key(7)]),
+                forget_rule(KEYBOARD_COLLECTION, c)
+            ]
+        )
+        .is_empty()
     );
     assert_eq!(
-        set_rules(&mut t, id, vec![remap(c, &[key(8)]), remap(c, &[key(9)])]),
-        [saved_remap(c, &[9])]
+        set_rules(
+            &mut t,
+            id,
+            vec![
+                forget_rule(KEYBOARD_COLLECTION, c),
+                remap(KEYBOARD_COLLECTION, c, &[key(7)])
+            ]
+        ),
+        [saved_remap(KEYBOARD_COLLECTION, c, &[7])]
+    );
+    assert_eq!(
+        set_rules(
+            &mut t,
+            id,
+            vec![
+                remap(KEYBOARD_COLLECTION, c, &[key(8)]),
+                remap(KEYBOARD_COLLECTION, c, &[key(9)])
+            ]
+        ),
+        [saved_remap(KEYBOARD_COLLECTION, c, &[9])]
     );
     // Forgetting a rule that does not exist is accepted.
-    assert_eq!(set_rules(&mut t, id, vec![forget_rule(key(30))]).len(), 1);
+    assert_eq!(
+        set_rules(&mut t, id, vec![forget_rule(KEYBOARD_COLLECTION, key(30))]).len(),
+        1
+    );
     t.events();
     let saved = t.store.records.clone();
     let nine: Vec<_> = (4..13).map(key).collect();
@@ -3958,28 +4054,33 @@ fn rule_changes_apply_in_order_and_invalid_requests_save_nothing() {
         vec![],
         vec![p::ProfileRuleChange { change: None }],
         // An input outside the remap inputs, or a key as a scale input.
-        vec![remap(key(2), &[key(5)])],
-        vec![scale(key(5), 1, 2)],
+        vec![remap(KEYBOARD_COLLECTION, key(2), &[key(5)])],
+        vec![scale(KEYBOARD_COLLECTION, key(5), 1, 2)],
         // An output outside the remap outputs, or too many outputs.
-        vec![remap(key(5), &[key(2)])],
-        vec![remap(key(5), &nine)],
+        vec![remap(KEYBOARD_COLLECTION, key(5), &[key(2)])],
+        vec![remap(KEYBOARD_COLLECTION, key(5), &nine)],
         // A zero ratio.
-        vec![scale(usage(1, 0x30), 0, 1)],
-        vec![scale(usage(1, 0x30), 1, 0)],
+        vec![scale(MOUSE_COLLECTION, usage(1, 0x30), 0, 1)],
+        vec![scale(MOUSE_COLLECTION, usage(1, 0x30), 1, 0)],
         // A missing effect or input.
         vec![p::ProfileRuleChange {
             change: Some(p::profile_rule_change::Change::Rule(p::ProfileRule {
                 input: Some(key(5)),
+                collection: Some(KEYBOARD_COLLECTION),
                 ..Default::default()
             })),
         }],
         vec![p::ProfileRuleChange {
             change: Some(p::profile_rule_change::Change::Forget(p::ProfileRuleRef {
                 input: None,
+                collection: Some(KEYBOARD_COLLECTION),
             })),
         }],
         // One invalid change refuses every change in the request.
-        vec![remap(key(10), &[key(11)]), remap(key(2), &[key(5)])],
+        vec![
+            remap(KEYBOARD_COLLECTION, key(10), &[key(11)]),
+            remap(KEYBOARD_COLLECTION, key(2), &[key(5)]),
+        ],
     ] {
         assert_eq!(
             t.code(Command::SetProfileRules(p::SetProfileRules {
@@ -3990,12 +4091,15 @@ fn rule_changes_apply_in_order_and_invalid_requests_save_nothing() {
         );
     }
     assert_eq!(t.store.records, saved);
-    assert_eq!(rules_of(&mut t, id), [saved_remap(c, &[9])]);
+    assert_eq!(
+        rules_of(&mut t, id),
+        [saved_remap(KEYBOARD_COLLECTION, c, &[9])]
+    );
     assert!(t.events().is_empty());
     assert_eq!(
         t.code(Command::SetProfileRules(p::SetProfileRules {
             profile: 99,
-            changes: vec![forget_rule(c)],
+            changes: vec![forget_rule(KEYBOARD_COLLECTION, c)],
         })),
         p::ErrorCode::NotFound
     );
@@ -4006,7 +4110,11 @@ fn rule_changes_that_change_the_roles_report_the_profile() {
     let mut t = Test::new(false);
     let id = create(&mut t, "Media");
     t.events();
-    set_rules(&mut t, id, vec![remap(usage(0x0c, 0xcd), &[key(5)])]);
+    set_rules(
+        &mut t,
+        id,
+        vec![remap(CONSUMER_COLLECTION, usage(0x0c, 0xcd), &[key(5)])],
+    );
     assert!(t.events().contains(&Ev::Profile(p::Profile {
         id,
         name: "Media".into(),
@@ -4017,9 +4125,9 @@ fn rule_changes_that_change_the_roles_report_the_profile() {
         &mut t,
         id,
         vec![
-            remap(usage(0x0c, 0xe9), &[key(6)]),
-            forget_rule(usage(0x0c, 0xcd)),
-            forget_rule(usage(0x0c, 0xea)),
+            remap(CONSUMER_COLLECTION, usage(0x0c, 0xe9), &[key(6)]),
+            forget_rule(CONSUMER_COLLECTION, usage(0x0c, 0xcd)),
+            forget_rule(CONSUMER_COLLECTION, usage(0x0c, 0xea)),
         ],
     );
     assert!(t.events().iter().all(|e| !matches!(e, Ev::Profile(_))));
@@ -4031,15 +4139,23 @@ fn system_controls_are_rule_inputs_and_outputs() {
     let support = t.status().profile_support.unwrap();
     let power = usage(1, 0x81);
     let system = usage(1, 0x80);
-    let collection = |ranges: &[p::UsageRange], u: p::Usage| {
-        ranges
+    let collection = |kind: p::usage_range::Kind, u: p::Usage| {
+        support
+            .ranges
             .iter()
-            .find(|r| r.usage_page == u.usage_page && (r.min..=r.max).contains(&u.usage))
+            .find(|r| {
+                r.kind == kind as i32
+                    && r.usage_page == u.usage_page
+                    && (r.min..=r.max).contains(&u.usage)
+            })
             .map(|r| r.collection)
     };
-    assert_eq!(collection(&support.remap_inputs, power), Some(None));
     assert_eq!(
-        collection(&support.remap_outputs, power),
+        collection(p::usage_range::Kind::RemapInput, power),
+        Some(Some(system))
+    );
+    assert_eq!(
+        collection(p::usage_range::Kind::RemapOutput, power),
         Some(Some(system))
     );
     let id = create(&mut t, "Power");
@@ -4047,9 +4163,12 @@ fn system_controls_are_rule_inputs_and_outputs() {
     let rules = set_rules(
         &mut t,
         id,
-        vec![remap(power, &[key(0x45)]), remap(key(0x39), &[power])],
+        vec![
+            remap(SYSTEM_COLLECTION, power, &[key(0x45)]),
+            remap(KEYBOARD_COLLECTION, key(0x39), &[power]),
+        ],
     );
-    assert_eq!(rules[0], saved_remap(power, &[0x45]));
+    assert_eq!(rules[0], saved_remap(SYSTEM_COLLECTION, power, &[0x45]));
     assert_eq!(
         rules[1].effect,
         Some(p::profile_rule::Effect::Remap(p::profile_rule::Remap {
@@ -4067,21 +4186,23 @@ fn system_controls_are_rule_inputs_and_outputs() {
 
 #[test]
 fn a_profile_larger_than_the_memory_budget_cannot_be_saved() {
-    // An empty table takes 64 bytes and each single-output remap 16 more.
-    let mut t = Test::with_budget(false, Some(170));
+    // An empty table takes 80 bytes and each single-output remap 20 more.
+    let mut t = Test::with_budget(false, Some(210));
     let id = create(&mut t, "Big");
     assert_eq!(
         set_rules(
             &mut t,
             id,
-            (4..10).map(|k| remap(key(k), &[key(k + 1)])).collect()
+            (4..10)
+                .map(|k| remap(KEYBOARD_COLLECTION, key(k), &[key(k + 1)]))
+                .collect()
         )
         .len(),
         6
     );
     let error = t.error(Command::SetProfileRules(p::SetProfileRules {
         profile: id,
-        changes: vec![remap(key(20), &[key(21)])],
+        changes: vec![remap(KEYBOARD_COLLECTION, key(20), &[key(21)])],
     }));
     assert_eq!(error.code, p::ErrorCode::NoCapacity as i32);
     assert_eq!(error.reason, p::CapacityReason::ProfileMemory as i32);
@@ -4130,9 +4251,17 @@ fn layers_load_when_a_device_connects_and_apply_in_order() {
     let mut t = Test::new(true);
     // A -> B, then B -> C: A produces C, B produces C.
     let first = create(&mut t, "First");
-    set_rules(&mut t, first, vec![remap(key(4), &[key(5)])]);
+    set_rules(
+        &mut t,
+        first,
+        vec![remap(KEYBOARD_COLLECTION, key(4), &[key(5)])],
+    );
     let second = create(&mut t, "Second");
-    set_rules(&mut t, second, vec![remap(key(5), &[key(6)])]);
+    set_rules(
+        &mut t,
+        second,
+        vec![remap(KEYBOARD_COLLECTION, key(5), &[key(6)])],
+    );
     set_layers(&mut t, SAVED, &[first, second]);
     assert_eq!(memory_used(&mut t), 0, "nothing loads while disconnected");
     t.poll();
@@ -4161,7 +4290,7 @@ fn layers_load_when_a_device_connects_and_apply_in_order() {
 
 #[test]
 fn a_device_whose_layers_do_not_fit_loads_none_of_them() {
-    // 192 bytes for eight rules and 144 for five: either fits, both do not.
+    // 240 bytes for eight rules and 180 for five: either fits, both do not.
     let mut t = Test::with_budget(true, Some(300));
     let big = profile_with(&mut t, "Big", 4..12);
     let small = profile_with(&mut t, "Small", [4, 6, 8, 10, 20]);
@@ -4184,11 +4313,11 @@ fn a_device_whose_layers_do_not_fit_loads_none_of_them() {
     let d = set_layers(&mut t, SAVED, &[small]);
     assert_eq!(profile_error(&d), None);
     assert_eq!(press(&mut t, link, &[4]), [5]);
-    assert_eq!(memory_used(&mut t), 144);
+    assert_eq!(memory_used(&mut t), 180);
     // The device's old layers count as released before its new ones are checked.
     let d = set_layers(&mut t, SAVED, &[big]);
     assert_eq!(profile_error(&d), None);
-    assert_eq!(memory_used(&mut t), 192);
+    assert_eq!(memory_used(&mut t), 240);
 }
 
 #[test]
@@ -4236,7 +4365,7 @@ fn a_device_retries_its_layers_once_memory_is_released() {
     t.events();
     assert_eq!(profile_error(&t.device(78)), None);
     assert_eq!(press(&mut t, link, &[4]), [5]);
-    assert_eq!(memory_used(&mut t), 144);
+    assert_eq!(memory_used(&mut t), 180);
 }
 
 #[test]
@@ -4280,7 +4409,11 @@ fn edits_apply_from_the_next_input_and_held_inputs_keep_their_outputs() {
     let link = connect_saved(&mut t, descriptor());
     t.events();
     assert_eq!(press(&mut t, link, &[4]), [5]);
-    set_rules(&mut t, id, vec![remap(key(4), &[key(6)])]);
+    set_rules(
+        &mut t,
+        id,
+        vec![remap(KEYBOARD_COLLECTION, key(4), &[key(6)])],
+    );
     assert_eq!(
         press(&mut t, link, &[4]),
         [5],
@@ -4298,7 +4431,10 @@ fn edits_apply_from_the_next_input_and_held_inputs_keep_their_outputs() {
     set_rules(
         &mut t,
         id,
-        vec![remap(key(4), &[key(6)]), remap(key(5), &[key(6)])],
+        vec![
+            remap(KEYBOARD_COLLECTION, key(4), &[key(6)]),
+            remap(KEYBOARD_COLLECTION, key(5), &[key(6)]),
+        ],
     );
     set_layers(&mut t, SAVED, &[id]);
     assert_eq!(press(&mut t, link, &[4, 5]), [6]);
@@ -4308,24 +4444,28 @@ fn edits_apply_from_the_next_input_and_held_inputs_keep_their_outputs() {
 
 #[test]
 fn an_edit_that_would_overflow_loaded_profiles_is_refused() {
-    let mut t = Test::with_budget(true, Some(260));
-    // 192 + 64 bytes loaded.
+    let mut t = Test::with_budget(true, Some(330));
+    // 240 + 80 bytes loaded.
     let big = profile_with(&mut t, "Big", 4..12);
     let empty = create(&mut t, "Empty");
     set_layers(&mut t, SAVED, &[big, empty]);
     connect_saved(&mut t, descriptor());
-    assert_eq!(memory_used(&mut t), 256);
+    assert_eq!(memory_used(&mut t), 320);
     let error = t.error(Command::SetProfileRules(p::SetProfileRules {
         profile: empty,
-        changes: vec![remap(key(20), &[key(21)])],
+        changes: vec![remap(KEYBOARD_COLLECTION, key(20), &[key(21)])],
     }));
     assert_eq!(error.code, p::ErrorCode::NoCapacity as i32);
     assert_eq!(error.reason, p::CapacityReason::ProfileMemory as i32);
     assert!(rules_of(&mut t, empty).is_empty());
     assert_eq!(profile_error(&t.device(SAVED)), None);
     // Shrinking a loaded profile, and growing one that is not loaded, are fine.
-    set_rules(&mut t, big, vec![forget_rule(key(4))]);
-    set_rules(&mut t, empty, vec![remap(key(20), &[key(21)])]);
+    set_rules(&mut t, big, vec![forget_rule(KEYBOARD_COLLECTION, key(4))]);
+    set_rules(
+        &mut t,
+        empty,
+        vec![remap(KEYBOARD_COLLECTION, key(20), &[key(21)])],
+    );
     let unused = profile_with(&mut t, "Unused", 4..15);
     assert_eq!(rules_of(&mut t, unused).len(), 11);
 }
@@ -4509,7 +4649,10 @@ fn via_edits_the_interface_profile_for_every_device_using_it() {
         &[0, 4]
     );
     assert_eq!(configure(&mut t, Interface::Via, &[5, 0, 0, 0, 0, 5])[0], 5);
-    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
+    assert_eq!(
+        rules_of(&mut t, id),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
     assert_eq!(press(&mut t, link, &[4]), [5]);
     assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
     // An unsupported action changes nothing.
@@ -4517,11 +4660,17 @@ fn via_edits_the_interface_profile_for_every_device_using_it() {
         configure(&mut t, Interface::Via, &[5, 0, 0, 0, 0x52, 0])[0],
         0xff
     );
-    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
+    assert_eq!(
+        rules_of(&mut t, id),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
     // The edit reaches flash once the editor and input pause.
     t.now += cordial_core::application::EDITOR_BATCH_MS;
     t.quiet();
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
     // A save that fails after the echo keeps the edit in use and is retried.
     let rules = cordial_core::storage::record_key(9, id.into());
     t.store.fail_save = Some((rules, false));
@@ -4531,14 +4680,20 @@ fn via_edits_the_interface_profile_for_every_device_using_it() {
     t.now += cordial_core::application::EDITOR_BATCH_MS;
     t.quiet();
     assert!(t.status().ready);
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
     assert_eq!(press(&mut t, link, &[4]), [6]);
     assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
     t.store.fail_save = None;
     t.now += FIRST_RETRY;
     t.quiet();
     assert!(t.status().ready);
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[6])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[6])]
+    );
     // Writing an input's own usage forgets its rule.
     assert_eq!(configure(&mut t, Interface::Via, &[5, 0, 0, 0, 0, 4])[0], 5);
     assert!(rules_of(&mut t, id).is_empty());
@@ -4630,7 +4785,7 @@ fn an_idle_editor_releases_its_profile() {
         &configure(&mut t, Interface::Vial, &[0xfe, 0])[..4],
         &[6, 0, 0, 0]
     );
-    assert_eq!(memory_used(&mut t), 64);
+    assert_eq!(memory_used(&mut t), 80);
     t.now += 5000;
     t.poll();
     assert_eq!(memory_used(&mut t), 0);
@@ -4742,7 +4897,7 @@ fn commands_read_each_record_once() {
     assert_eq!(
         t.ok(Command::SetProfileRules(p::SetProfileRules {
             profile: id,
-            changes: vec![remap(key(4), &[key(5)])],
+            changes: vec![remap(KEYBOARD_COLLECTION, key(4), &[key(5)])],
         })),
         None
     );
@@ -4998,7 +5153,11 @@ fn a_full_two_byte_editor_write_replaces_a_rule_the_editor_cannot_show() {
     let mut t = Test::new(false);
     let id = create(&mut t, "Keys");
     // Mouse button 9 has no VIA keycode.
-    set_rules(&mut t, id, vec![remap(key(4), &[usage(9, 9)])]);
+    set_rules(
+        &mut t,
+        id,
+        vec![remap(KEYBOARD_COLLECTION, key(4), &[usage(9, 9)])],
+    );
     set_interfaces(
         &mut t,
         vec![interface(
@@ -5017,7 +5176,10 @@ fn a_full_two_byte_editor_write_replaces_a_rule_the_editor_cannot_show() {
         configure(&mut t, Interface::Via, &[0x13, 0, 0, 2, 0, 5])[0],
         0x13
     );
-    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
+    assert_eq!(
+        rules_of(&mut t, id),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
 }
 
 #[test]
@@ -5035,7 +5197,10 @@ fn editors_change_rules_while_a_pairing_runs() {
     let candidate = t.candidate(peer(3), peer(3));
     t.pair(candidate);
     assert_eq!(configure(&mut t, Interface::Via, &[5, 0, 0, 0, 0, 5])[0], 5);
-    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
+    assert_eq!(
+        rules_of(&mut t, id),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
 }
 
 #[test]
@@ -5048,10 +5213,17 @@ fn rules_saved_without_their_roles_summary_take_effect_and_the_summary_is_repair
     let record = record_key(8, id);
     t.store.fail_save = Some((record, false));
     t.store.writes.clear();
-    set_rules(&mut t, id, vec![remap(key(4), &[key(5)])]);
+    set_rules(
+        &mut t,
+        id,
+        vec![remap(KEYBOARD_COLLECTION, key(4), &[key(5)])],
+    );
     assert_eq!(press(&mut t, link, &[4]), [5]);
     assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
-    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
+    assert_eq!(
+        rules_of(&mut t, id),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
     // The profile reports its rules' roles while the summary waits to be saved.
     assert_eq!(profile(&mut t, id).roles, [p::Role::Keyboard as i32]);
     assert!(
@@ -5395,7 +5567,13 @@ fn rule_listings_are_paged_in_input_order() {
     };
     let first = page(&mut t, None);
     assert!(!first.end && !first.rules.is_empty() && first.rules.len() < 40);
-    let last = page(&mut t, rules[38].input);
+    let last = page(
+        &mut t,
+        Some(p::ProfileRuleRef {
+            input: rules[38].input,
+            collection: rules[38].collection,
+        }),
+    );
     assert_eq!(last.rules, rules[39..]);
     assert!(last.end);
 }
@@ -5436,7 +5614,7 @@ fn set_commands_respond_with_no_result_and_creation_with_the_id() {
     assert_eq!(
         t.ok(Command::SetProfileRules(p::SetProfileRules {
             profile: id,
-            changes: vec![remap(key(4), &[key(5)])],
+            changes: vec![remap(KEYBOARD_COLLECTION, key(4), &[key(5)])],
         })),
         None
     );
@@ -5558,7 +5736,7 @@ fn failed_event_reads_are_retried_after_a_backoff() {
                 assert_eq!(
                     t.ok(Command::SetProfileRules(p::SetProfileRules {
                         profile: id,
-                        changes: vec![remap(usage(0x0c, 0xcd), &[key(5)])],
+                        changes: vec![remap(CONSUMER_COLLECTION, usage(0x0c, 0xcd), &[key(5)])],
                     })),
                     None
                 );
@@ -5704,7 +5882,11 @@ fn an_unreadable_profile_does_not_hold_up_other_events() {
     t.events();
     // A change of roles marks a profile event, which reads the profile's metadata.
     let input = usage(0x0c, 0xcd);
-    set_rules(&mut t, failing, vec![remap(input, &[key(5)])]);
+    set_rules(
+        &mut t,
+        failing,
+        vec![remap(CONSUMER_COLLECTION, input, &[key(5)])],
+    );
     let record =
         cordial_core::storage::record_key(cordial_core::profiles::METADATA, failing.into());
     t.store.fail_load = Some(record);
@@ -5722,9 +5904,9 @@ fn an_unreadable_profile_does_not_hold_up_other_events() {
         let before = reads(&t);
         // Another profile's change and the device's events are written at once.
         let change = if round % 2 == 0 {
-            remap(input, &[key(5)])
+            remap(CONSUMER_COLLECTION, input, &[key(5)])
         } else {
-            forget_rule(input)
+            forget_rule(CONSUMER_COLLECTION, input)
         };
         set_rules(&mut t, other, vec![change]);
         let events = t.events();
@@ -5891,14 +6073,20 @@ fn editor_edits_are_echoed_at_once_and_saved_in_one_write() {
         t.poll();
     }
     assert!(t.store.writes.is_empty());
-    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[20])]);
+    assert_eq!(
+        rules_of(&mut t, id),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[20])]
+    );
     assert_eq!(profile(&mut t, id).roles, [p::Role::Keyboard as i32]);
     // Once the editor and input pause, the edits are written once, then the roles summary.
     t.now += cordial_core::application::EDITOR_BATCH_MS;
     t.events();
     assert_eq!(rules_writes(&t, id), 1);
     assert_eq!(t.store.writes, [record_key(9, id), record_key(8, id)]);
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[20])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[20])]
+    );
     assert_eq!(profile(&mut t, id).roles, [p::Role::Keyboard as i32]);
     // Nothing more is written.
     t.now += cordial_core::deferred::MAX_DELAY_MS;
@@ -5940,7 +6128,10 @@ fn edits_are_saved_once_input_pauses_or_after_the_longest_wait() {
     tap(&mut t, link);
     t.poll();
     assert_eq!(rules_writes(&t, id), 2);
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[6])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[6])]
+    );
 }
 
 #[test]
@@ -6031,7 +6222,10 @@ fn a_failed_deferred_save_is_reported_and_retried_with_a_backoff() {
     assert_eq!(rules_writes(&t, id), 4);
     assert!(events.iter().any(|e| matches!(e, Ev::Adapter(s)
         if s.ready && s.info.iter().all(|i| i.key != p::keys::STORAGE_FULL))));
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[6])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[6])]
+    );
     assert_eq!(set_first_key(&mut t, 7), 5);
 }
 
@@ -6050,13 +6244,20 @@ fn a_rules_file_that_keeps_failing_can_be_overwritten_or_deleted() {
     assert_eq!(
         t.code(Command::SetProfileRules(p::SetProfileRules {
             profile: id,
-            changes: vec![remap(key(4), &[key(8)])],
+            changes: vec![remap(KEYBOARD_COLLECTION, key(4), &[key(8)])],
         })),
         p::ErrorCode::StorageFailed
     );
     t.store.fail_save = None;
-    set_rules(&mut t, id, vec![remap(key(4), &[key(9)])]);
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[9])]);
+    set_rules(
+        &mut t,
+        id,
+        vec![remap(KEYBOARD_COLLECTION, key(4), &[key(9)])],
+    );
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[9])]
+    );
     assert_eq!(press(&mut t, link, &[4]), [9]);
     press(&mut t, link, &[]);
     // Nothing is left to write.
@@ -6113,7 +6314,10 @@ fn a_released_editor_saves_its_edits_at_once() {
     // Releasing the idle editor saves at once.
     t.poll();
     assert_eq!(rules_writes(&t, id), 3);
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
 }
 
 #[test]
@@ -6131,8 +6335,14 @@ fn space_is_checked_after_deferred_saves_are_written() {
         r => panic!("{r:?}"),
     };
     assert_eq!(t.store.writes[0], record_key(9, id));
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
-    assert_eq!(rules_of(&mut t, copy), [saved_remap(key(4), &[5])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
+    assert_eq!(
+        rules_of(&mut t, copy),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
 }
 
 #[cfg(feature = "development")]
@@ -6163,15 +6373,18 @@ fn bootloader_entry_saves_edits_first() {
         }
     }));
     assert!(rebooted.is_err() && REBOOTED.load(Ordering::SeqCst));
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
 }
 
 #[test]
 fn rules_pages_read_only_as_far_as_the_page() {
-    let mut t = Test::new(false);
+    let mut t = Test::with_budget(false, Some(8192));
     let id = create(&mut t, "Many");
     let changes: Vec<_> = (4..=0xa4)
-        .map(|k| remap(key(k), &[key(0xe0), key(4)]))
+        .map(|k| remap(KEYBOARD_COLLECTION, key(k), &[key(0xe0), key(4)]))
         .collect();
     let count = changes.len();
     for chunk in changes.chunks(16) {
@@ -6210,8 +6423,10 @@ fn saved_pages_match_the_decoded_file_and_find_damage() {
     use cordial_core::profiles;
     let mut t = Test::new(false);
     let id = create(&mut t, "Mixed");
-    let mut changes: Vec<_> = (4..=60).map(|k| remap(key(k), &[key(k + 1)])).collect();
-    changes.push(remap(key(61), &[]));
+    let mut changes: Vec<_> = (4..=60)
+        .map(|k| remap(KEYBOARD_COLLECTION, key(k), &[key(k + 1)]))
+        .collect();
+    changes.push(remap(KEYBOARD_COLLECTION, key(61), &[]));
     for chunk in changes.chunks(16) {
         set_rules(&mut t, id, chunk.to_vec());
     }
@@ -6222,15 +6437,18 @@ fn saved_pages_match_the_decoded_file_and_find_damage() {
         .collect();
     for after in [
         None,
-        Some(all[0].input),
-        Some(all[30].input),
-        Some(u32::MAX),
+        Some(all[0].reference()),
+        Some(all[30].reference()),
+        Some(profiles::RuleRef {
+            input: u32::MAX,
+            collection: u32::MAX,
+        }),
     ] {
         for count in [1, 7, 33, 1000] {
             let page = block_on(profiles::saved_page(&mut t.store, id, after, count)).unwrap();
             let expected: Vec<_> = all
                 .iter()
-                .filter(|r| after.is_none_or(|a| r.input > a))
+                .filter(|r| after.is_none_or(|a| r.reference() > a))
                 .take(count)
                 .cloned()
                 .collect();
@@ -6250,6 +6468,7 @@ fn saved_pages_match_the_decoded_file_and_find_damage() {
     );
     let rule = |input| storage::Rule {
         input,
+        collection: profiles::KEYBOARD,
         effect: Some(storage::rule::Effect::Remap(storage::Remap {
             outputs: vec![],
         })),
@@ -6272,8 +6491,15 @@ fn a_command_that_matches_unsaved_edits_saves_them_before_it_responds() {
     tap(&mut t, link);
     // The same rule through the serial API changes nothing in RAM, but its response promises
     // it is on flash.
-    set_rules(&mut t, id, vec![remap(key(4), &[key(5)])]);
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    set_rules(
+        &mut t,
+        id,
+        vec![remap(KEYBOARD_COLLECTION, key(4), &[key(5)])],
+    );
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
     assert_eq!(rules_writes(&t, id), 1);
     // Nothing is left to write once the editor pauses.
     t.now += cordial_core::deferred::MAX_DELAY_MS;
@@ -6326,9 +6552,18 @@ fn an_editor_moving_to_another_profile_saves_its_edits_first() {
     // though input has not paused.
     assert_eq!(set_first_key(&mut t, 6), 5);
     assert_eq!(rules_writes(&t, id), 1);
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
-    assert_eq!(rules_of(&mut t, other), [saved_remap(key(4), &[6])]);
-    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
+    assert_eq!(
+        rules_of(&mut t, other),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[6])]
+    );
+    assert_eq!(
+        rules_of(&mut t, id),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
 }
 
 #[test]
@@ -6362,7 +6597,10 @@ fn storage_is_ready_again_once_no_rules_file_has_an_unknown_outcome() {
     assert!(rules_writes(&t, id) > 1);
     assert!(t.status().ready);
     assert!(t.app.has_unsaved());
-    assert_eq!(saved_rules(&mut t, other), [remap_rule(key(4), &[6])]);
+    assert_eq!(
+        saved_rules(&mut t, other),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[6])]
+    );
 }
 
 /// A VIA editor on a new profile with no device connected, so nothing has been listed to save
@@ -6400,7 +6638,10 @@ fn edits_there_is_no_memory_to_list_are_written_from_the_editor() {
     fail_next_allocation();
     block_on(t.app.save_all(&mut t.store, t.now));
     assert!(allocation_failed());
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
     assert_eq!(
         block_on(cordial_core::profiles::metadata(&mut t.store, id.into()))
             .unwrap()
@@ -6432,7 +6673,10 @@ fn an_editor_kept_for_lack_of_memory_does_not_outlive_its_deleted_profile() {
     t.events();
     assert!(!t.store.records.contains_key(&record_key(9, id)));
     assert_eq!(set_first_key(&mut t, 6), 5);
-    assert_eq!(rules_of(&mut t, other), [saved_remap(key(4), &[6])]);
+    assert_eq!(
+        rules_of(&mut t, other),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[6])]
+    );
 }
 
 #[test]
@@ -6474,7 +6718,10 @@ fn an_unknown_outcome_ends_only_once_the_file_is_read() {
     t.store.fail_save = None;
     retry(&mut t);
     t.events();
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
     assert!(!t.app.has_unsaved());
 }
 
@@ -6496,7 +6743,10 @@ fn a_failed_retry_of_a_file_that_holds_the_edits_counts_as_saved() {
     assert_eq!(rules_writes(&t, id), 2);
     assert!(t.status().ready);
     assert!(!t.app.has_unsaved());
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
 }
 
 #[test]
@@ -6523,7 +6773,10 @@ fn reloading_storage_keeps_edits_not_yet_saved() {
     t.events();
     assert!(t.status().ready);
     assert!(!t.store.records.contains_key(&rules));
-    assert_eq!(rules_of(&mut t, id), [saved_remap(key(4), &[5])]);
+    assert_eq!(
+        rules_of(&mut t, id),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
     // A device that connects uses the edited table, and further edits change that same table.
     let link = connect_saved(&mut t, descriptor());
     t.events();
@@ -6536,7 +6789,7 @@ fn reloading_storage_keeps_edits_not_yet_saved() {
     t.events();
     let saved = saved_rules(&mut t, id);
     assert_eq!(saved.len(), 2);
-    assert!(saved.contains(&remap_rule(key(4), &[5])));
+    assert!(saved.contains(&remap_rule(KEYBOARD_COLLECTION, key(4), &[5])));
     assert_eq!(press(&mut t, link, &[4]), [5]);
 }
 
@@ -6589,8 +6842,14 @@ fn an_editor_moving_on_without_memory_writes_its_edits_from_the_table() {
     fail_next_allocation();
     assert_eq!(set_first_key(&mut t, 6), 5);
     assert!(allocation_failed());
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
-    assert_eq!(rules_of(&mut t, other), [saved_remap(key(4), &[6])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
+    assert_eq!(
+        rules_of(&mut t, other),
+        [saved_remap(KEYBOARD_COLLECTION, key(4), &[6])]
+    );
     // The roles summary follows the rules written.
     t.now += cordial_core::application::EDITOR_BATCH_MS;
     t.events();
@@ -6620,5 +6879,1163 @@ fn a_full_filesystem_for_edits_written_from_the_editor_is_reported() {
     t.store.full = None;
     block_on(t.app.save_all(&mut t.store, t.now));
     assert!(!full(&t.status()));
-    assert_eq!(saved_rules(&mut t, id), [remap_rule(key(4), &[5])]);
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
+}
+
+fn output(mode: p::OutputMode) -> p::OutputPreference {
+    p::OutputPreference {
+        role: p::Role::Gamepad as i32,
+        mode: mode as i32,
+    }
+}
+
+#[test]
+fn output_planner_allocation_failure_has_no_enabled_device_capacity_reason() {
+    use cordial_core::outputs::Support;
+    let mut t = Test::new(true);
+    t.app.manager.output_support = &[Support {
+        role: p::Role::Gamepad,
+        modes: &[p::OutputMode::Hid],
+    }];
+    let original = t.saved(SAVED);
+    let request = p::Request {
+        command: Some(Command::SetDevice(p::SetDevice {
+            device: SAVED,
+            output_preferences: vec![output(p::OutputMode::Hid)],
+            ..Default::default()
+        })),
+    };
+    t.store.writes.clear();
+    FAIL_LAYOUT.with(|f| {
+        f.set(Some(
+            std::alloc::Layout::array::<(u64, p::OutputMode)>(4).unwrap(),
+        ));
+    });
+    block_on(t.app.dispatch(request, &mut t.store, &mut t.radio, t.now));
+    assert!(FAIL_LAYOUT.with(|f| f.get()).is_none());
+    let Some(R::Error(error)) = t.response().result else {
+        panic!("output selection succeeded without planner memory");
+    };
+    assert_eq!(error.code, p::ErrorCode::NoCapacity as i32);
+    assert_eq!(error.reason, p::CapacityReason::Unknown as i32);
+    assert!(t.store.writes.is_empty());
+    assert_eq!(t.saved(SAVED), original);
+    assert_eq!(t.app.manager.outputs.plan(), Default::default());
+}
+
+#[test]
+fn a_lost_record_awaiting_cleanup_is_not_available_to_device_commands() {
+    let mut t = nonresident_gamepad_output();
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        enabled: Some(true),
+        ..Default::default()
+    });
+    let key = record_key(2, SAVED);
+    let mut record = storage::Device::decode(t.store.records[&key].as_slice()).unwrap();
+    record.bond.as_mut().unwrap().owner += 1;
+    t.store.records.insert(key, record.encode_to_vec());
+    let slot = t.app.manager.find(SAVED.into()).unwrap();
+    t.store.fail_remove = Some(key);
+    assert_eq!(
+        block_on(t.app.manager.import(slot, &mut t.store, &mut t.radio)),
+        Err(ErrorCode::StorageFailed)
+    );
+    assert_eq!(t.app.manager.lost_devices, [u64::from(SAVED)]);
+    for command in [
+        Command::GetDevice(p::GetDevice { device: SAVED }),
+        Command::SetDevice(p::SetDevice {
+            device: SAVED,
+            trusted: Some(false),
+            ..Default::default()
+        }),
+    ] {
+        assert_eq!(t.code(command), p::ErrorCode::NotFound);
+        assert!(t.app.manager.find(SAVED.into()).is_none());
+        assert_eq!(t.app.manager.outputs.plan(), Default::default());
+    }
+}
+
+#[test]
+fn output_selections_require_advertised_support_and_exact_enum_values() {
+    let mut t = Test::new(true);
+    assert!(t.status().output_support.is_empty());
+    let original = t.saved(SAVED);
+    for mode in [p::OutputMode::Hid, p::OutputMode::Xinput] {
+        assert_eq!(
+            t.code(Command::SetDevice(p::SetDevice {
+                device: SAVED,
+                output_preferences: vec![output(mode)],
+                ..Default::default()
+            })),
+            p::ErrorCode::Unsupported
+        );
+    }
+    for update in [
+        p::OutputPreference { role: 261, mode: 1 },
+        p::OutputPreference {
+            role: p::Role::Gamepad as i32,
+            mode: 257,
+        },
+        p::OutputPreference {
+            role: p::Role::Gamepad as i32,
+            mode: -1,
+        },
+        p::OutputPreference {
+            role: p::Role::Unknown as i32,
+            mode: 0,
+        },
+    ] {
+        assert_eq!(
+            t.code(Command::SetDevice(p::SetDevice {
+                device: SAVED,
+                output_preferences: vec![update],
+                ..Default::default()
+            })),
+            p::ErrorCode::BadArgs
+        );
+    }
+    assert_eq!(
+        t.code(Command::SetDevice(p::SetDevice {
+            device: SAVED,
+            output_preferences: vec![p::OutputPreference {
+                role: p::Role::Keyboard as i32,
+                mode: 0
+            }],
+            ..Default::default()
+        })),
+        p::ErrorCode::Unsupported
+    );
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        output_preferences: vec![output(p::OutputMode::Disabled)],
+        ..Default::default()
+    });
+    assert_eq!(t.saved(SAVED), original);
+}
+
+#[test]
+fn output_updates_save_once_in_order_and_failed_saves_leave_runtime_unchanged() {
+    use cordial_core::{
+        outputs::{Plan, Support},
+        storage::record_key,
+    };
+    let mut t = Test::new(true);
+    t.app.manager.output_support = &[Support {
+        role: p::Role::Gamepad,
+        modes: &[
+            p::OutputMode::Disabled,
+            p::OutputMode::Hid,
+            p::OutputMode::Xinput,
+        ],
+    }];
+    let advertised = t.status().output_support;
+    assert_eq!(advertised.len(), 1);
+    assert!(advertised[0].modes.iter().all(|m| m.slots.is_none()));
+    let key = record_key(2, SAVED.into());
+    t.store.writes.clear();
+    let d = t.set_device(p::SetDevice {
+        device: SAVED,
+        output_preferences: vec![
+            output(p::OutputMode::Hid),
+            output(p::OutputMode::Disabled),
+            output(p::OutputMode::Xinput),
+        ],
+        ..Default::default()
+    });
+    assert_eq!(d.output_preferences, [output(p::OutputMode::Xinput)]);
+    assert_eq!(d.outputs[0].state, p::OutputState::Disconnected as i32);
+    assert_eq!(d.outputs[0].slot, None);
+    assert_eq!(t.store.writes.iter().filter(|&&k| k == key).count(), 1);
+    assert_eq!(
+        t.app.manager.outputs.plan(),
+        Plan {
+            hid_gamepads: 0,
+            xinput_gamepads: 1
+        }
+    );
+    let before = t.saved(SAVED);
+    let writes = t.store.writes.len();
+    assert_eq!(
+        t.code(Command::SetDevice(p::SetDevice {
+            device: SAVED,
+            output_preferences: vec![
+                output(p::OutputMode::Hid),
+                p::OutputPreference {
+                    role: p::Role::Gamepad as i32,
+                    mode: 257,
+                }
+            ],
+            ..Default::default()
+        })),
+        p::ErrorCode::BadArgs
+    );
+    assert_eq!(t.store.writes.len(), writes);
+    assert_eq!(t.saved(SAVED), before);
+    t.store.fail_save = Some((key, false));
+    assert_eq!(
+        t.code(Command::SetDevice(p::SetDevice {
+            device: SAVED,
+            output_preferences: vec![output(p::OutputMode::Hid)],
+            ..Default::default()
+        })),
+        p::ErrorCode::StorageFailed
+    );
+    t.store.fail_save = None;
+    assert_eq!(t.saved(SAVED), before);
+    assert_eq!(
+        t.device(SAVED).output_preferences,
+        [output(p::OutputMode::Xinput)]
+    );
+    assert_eq!(
+        t.app.manager.outputs.plan(),
+        Plan {
+            hid_gamepads: 0,
+            xinput_gamepads: 1
+        }
+    );
+    let connected = connect_saved(&mut t, descriptor());
+    let d = t.device(SAVED);
+    assert_eq!(d.state, p::DeviceState::Connected as i32);
+    assert_eq!(d.outputs[0].state, p::OutputState::Unsupported as i32);
+    assert_eq!(d.outputs[0].slot, None);
+    assert!(t.app.manager.connection(connected).is_some());
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        output_preferences: vec![output(p::OutputMode::Disabled)],
+        ..Default::default()
+    });
+    assert!(t.saved(SAVED).output_preferences.is_empty());
+    assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+}
+
+#[test]
+fn disabling_a_connected_device_keeps_the_committed_policy_until_disconnect() {
+    use cordial_core::outputs::{Plan, Support};
+    let mut t = Test::new(true);
+    t.app.manager.output_support = &[Support {
+        role: p::Role::Gamepad,
+        modes: &[p::OutputMode::Hid],
+    }];
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        output_preferences: vec![output(p::OutputMode::Hid)],
+        ..Default::default()
+    });
+    let profile = create(&mut t, "Keys");
+    let link = connect_saved(&mut t, hidpp_descriptor());
+    t.event(Event::Input(
+        InputReport::new(link, ServiceId(7), 1, &[1]).unwrap(),
+    ));
+    t.events();
+    assert!(t.live(SAVED).policy.is_some());
+    let device = t.set_device(p::SetDevice {
+        device: SAVED,
+        enabled: Some(false),
+        trusted: Some(false),
+        integrations: vec![p::IntegrationUpdate {
+            kind: p::IntegrationKind::Hidpp as i32,
+            enabled: Some(false),
+        }],
+        profiles: Some(p::ProfileLayers {
+            profiles: vec![profile],
+        }),
+        output_preferences: vec![output(p::OutputMode::Disabled)],
+        ..Default::default()
+    });
+    assert!(!device.enabled && !device.trusted && !hidpp(&device).enabled);
+    assert_eq!(
+        device.profiles,
+        Some(p::ProfileLayers {
+            profiles: vec![profile],
+        })
+    );
+    assert!(device.output_preferences.is_empty());
+    assert_eq!(device.state, p::DeviceState::Disconnecting as i32);
+    let saved = t.saved(SAVED);
+    assert_eq!(t.live(SAVED).policy.as_ref(), Some(&saved));
+    assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+    assert!(t.app.manager.connection(link).unwrap().closing);
+    assert_eq!(t.radio.closes, [link]);
+
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        blocked: Some(true),
+        ..Default::default()
+    });
+    let saved = t.saved(SAVED);
+    assert!(saved.blocked && !saved.enabled && !saved.trusted && !saved.hidpp_enabled());
+    assert_eq!(saved.profiles, [u64::from(profile)]);
+    assert!(saved.output_preferences.is_empty());
+    assert_eq!(t.live(SAVED).policy.as_ref(), Some(&saved));
+    assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+    assert_eq!(t.radio.closes, [link]);
+}
+
+#[test]
+fn get_device_cleans_up_a_missing_nonresident_output_selection() {
+    use cordial_core::outputs::{Plan, Support};
+    let mut t = Test::new(true);
+    t.app.manager.output_support = &[Support {
+        role: p::Role::Gamepad,
+        modes: &[p::OutputMode::Xinput],
+    }];
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        enabled: Some(false),
+        output_preferences: vec![output(p::OutputMode::Xinput)],
+        ..Default::default()
+    });
+    t.events();
+    assert!(t.app.manager.find(SAVED.into()).is_none());
+    let expected = Plan {
+        hid_gamepads: 0,
+        xinput_gamepads: 1,
+    };
+    assert_eq!(t.app.manager.outputs.plan(), expected);
+    let key = record_key(2, SAVED);
+    t.store.fail_load = Some(key);
+    assert_eq!(
+        t.code(Command::GetDevice(p::GetDevice { device: SAVED })),
+        p::ErrorCode::StorageFailed
+    );
+    assert_eq!(t.app.manager.outputs.plan(), expected);
+    assert!(t.store.records.contains_key(&key));
+    assert!(!t.events().iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+    t.store.fail_load = None;
+
+    t.store.records.remove(&key);
+    assert_eq!(
+        t.code(Command::GetDevice(p::GetDevice { device: SAVED })),
+        p::ErrorCode::NotFound
+    );
+    assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+    assert!(
+        t.events()
+            .contains(&Ev::DeviceRemoved(p::DeviceRemoved { id: SAVED }))
+    );
+    for id in [0, SAVED, 999] {
+        assert_eq!(
+            t.code(Command::GetDevice(p::GetDevice { device: id })),
+            p::ErrorCode::NotFound
+        );
+    }
+    assert!(!t.events().iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+}
+
+#[test]
+fn profile_cleanup_removes_lost_nonresident_output_selections() {
+    use cordial_core::outputs::{Plan, Support};
+    for missing in [true, false] {
+        let mut t = Test::new(true);
+        t.app.manager.output_support = &[Support {
+            role: p::Role::Gamepad,
+            modes: &[p::OutputMode::Hid],
+        }];
+        let lost = create(&mut t, "Lost");
+        t.set_device(p::SetDevice {
+            device: SAVED,
+            enabled: Some(false),
+            profiles: Some(p::ProfileLayers {
+                profiles: vec![lost],
+            }),
+            output_preferences: vec![output(p::OutputMode::Hid)],
+            ..Default::default()
+        });
+        t.events();
+        assert!(t.app.manager.find(SAVED.into()).is_none());
+        assert_eq!(t.app.manager.outputs.plan().hid_gamepads, 1);
+        lose_profile(&mut t, lost);
+        for _ in 0..2 {
+            assert!(block_on(t.app.work(&mut t.store, &mut t.radio, t.now)));
+        }
+        // The scan has read its page of IDs, but not the device record.
+        let key = record_key(2, SAVED);
+        if missing {
+            t.store.records.remove(&key);
+        } else {
+            t.store.records.insert(key, UNDECODABLE.to_vec());
+        }
+        let events = t.events();
+        assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+        assert!(!t.store.records.contains_key(&key));
+        assert!(events.contains(&Ev::DeviceRemoved(p::DeviceRemoved { id: SAVED })));
+        assert!(events.contains(&Ev::ProfileRemoved(p::ProfileRemoved { id: lost })));
+    }
+}
+
+fn nonresident_gamepad_output() -> Test {
+    use cordial_core::outputs::Support;
+    let mut t = Test::new(true);
+    t.app.manager.output_support = &[Support {
+        role: p::Role::Gamepad,
+        modes: &[p::OutputMode::Hid],
+    }];
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        enabled: Some(false),
+        output_preferences: vec![output(p::OutputMode::Hid)],
+        ..Default::default()
+    });
+    t.events();
+    assert!(t.app.manager.find(SAVED.into()).is_none());
+    assert_eq!(t.app.manager.outputs.plan().hid_gamepads, 1);
+    t
+}
+
+/// Starts a command and reads its first page of device IDs, before reading any device record.
+fn begin_device_scan(t: &mut Test, command: Command) {
+    t.store.reads.clear();
+    block_on(t.app.begin(
+        p::Request {
+            command: Some(command),
+        },
+        &mut t.store,
+        &mut t.radio,
+        t.now,
+    ));
+    assert!(t.app.command_pending());
+    block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+    assert!(t.app.command_pending());
+    assert!(!t.store.reads.contains(&record_key(2, SAVED)));
+}
+
+fn finish_device_scan(t: &mut Test) {
+    while t.app.command_pending() {
+        block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+    }
+    assert_eq!(t.response().result, None);
+}
+
+#[test]
+fn deleting_a_profile_cleans_up_lost_device_output_selections() {
+    use cordial_core::outputs::Plan;
+    for missing in [true, false] {
+        let mut t = nonresident_gamepad_output();
+        let profile = create(&mut t, "Unused");
+        t.events();
+        let command = Command::DeleteProfile(p::DeleteProfile { profile });
+        let key = record_key(2, SAVED);
+        t.store.fail_load = Some(key);
+        assert_eq!(t.code(command.clone()), p::ErrorCode::StorageFailed);
+        assert_eq!(t.app.manager.outputs.plan().hid_gamepads, 1);
+        assert!(t.store.records.contains_key(&record_key(8, profile)));
+        assert!(!t.events().iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+        t.store.fail_load = None;
+
+        begin_device_scan(&mut t, command);
+        if missing {
+            t.store.records.remove(&key);
+        } else {
+            t.store.records.insert(key, UNDECODABLE.to_vec());
+        }
+        finish_device_scan(&mut t);
+        assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+        assert!(!t.store.records.contains_key(&key));
+        assert!(!t.store.records.contains_key(&record_key(8, profile)));
+        assert!(
+            t.events()
+                .contains(&Ev::DeviceRemoved(p::DeviceRemoved { id: SAVED }))
+        );
+    }
+}
+
+#[test]
+fn starting_pairing_cleans_up_lost_device_output_selections() {
+    use cordial_core::outputs::Plan;
+    for missing in [true, false] {
+        let mut t = nonresident_gamepad_output();
+        let candidate = t.candidate(peer(2), peer(2));
+        let command = Command::StartPairing(p::StartPairing { candidate });
+        let key = record_key(2, SAVED);
+        t.store.fail_load = Some(key);
+        assert_eq!(t.code(command.clone()), p::ErrorCode::StorageFailed);
+        assert_eq!(t.app.manager.outputs.plan().hid_gamepads, 1);
+        assert!(!t.events().iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+        t.store.fail_load = None;
+
+        begin_device_scan(&mut t, command);
+        if missing {
+            t.store.records.remove(&key);
+        } else {
+            t.store.records.insert(key, UNDECODABLE.to_vec());
+        }
+        finish_device_scan(&mut t);
+        assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+        assert!(!t.store.records.contains_key(&key));
+        assert!(
+            t.events()
+                .contains(&Ev::DeviceRemoved(p::DeviceRemoved { id: SAVED }))
+        );
+    }
+}
+
+#[test]
+fn matching_a_bond_cleans_up_lost_device_output_selections() {
+    use cordial_core::outputs::Plan;
+    for direct in [true, false] {
+        for missing in [true, false] {
+            let mut t = nonresident_gamepad_output();
+            if direct {
+                t.set_device(p::SetDevice {
+                    device: SAVED,
+                    enabled: Some(true),
+                    ..Default::default()
+                });
+                t.entry(SAVED).paused = true;
+            }
+            let identity = peer(if direct { 1 } else { 2 });
+            let candidate = t.candidate(identity, identity);
+            t.pair(candidate);
+            t.poll();
+            let link = t.radio.connects.last().unwrap().0;
+            t.events();
+            t.radio.forgotten.clear();
+            t.radio.bonds.push(identity);
+            t.event(Event::Bonded { link, identity });
+            let key = record_key(2, SAVED);
+            if !direct {
+                // The first match step reads the scan's page of IDs.
+                block_on(t.app.work(&mut t.store, &mut t.radio, t.now));
+            }
+            if missing {
+                t.store.records.remove(&key);
+            } else {
+                t.store.records.insert(key, UNDECODABLE.to_vec());
+            }
+            let events = t.events();
+            assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+            assert!(!t.store.records.contains_key(&key));
+            assert!(t.radio.bonds.contains(&identity));
+            assert!(!t.radio.forgotten.contains(&identity));
+            assert!(events.contains(&Ev::DeviceRemoved(p::DeviceRemoved { id: SAVED })));
+            assert!(matches!(
+                pairing_steps(&events).last(),
+                Some(p::pairing::Step::Done(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn ble_repair_preserves_the_new_bond_when_the_resident_record_is_lost() {
+    use cordial_core::outputs::Plan;
+    for missing in [true, false] {
+        let mut t = nonresident_gamepad_output();
+        t.set_device(p::SetDevice {
+            device: SAVED,
+            enabled: Some(true),
+            ..Default::default()
+        });
+        t.entry(SAVED).paused = true;
+        let identity = saved_ble(&mut t);
+        let rpa = Peer {
+            transport: Transport::Ble,
+            random: true,
+            ..peer(2)
+        };
+        let candidate = t.candidate(rpa, rpa);
+        t.pair(candidate);
+        t.poll();
+        let link = t.radio.connects.last().unwrap().0;
+        assert_eq!(t.app.manager.connection(link).unwrap().peer, rpa);
+        t.events();
+        t.radio.forgotten.clear();
+        t.radio.bonds.push(identity);
+        t.event(Event::Bonded { link, identity });
+        let key = record_key(2, SAVED);
+        if missing {
+            t.store.records.remove(&key);
+        } else {
+            t.store.records.insert(key, UNDECODABLE.to_vec());
+        }
+        let events = t.events();
+        assert!(t.radio.bonds.contains(&identity));
+        assert!(!t.radio.forgotten.contains(&identity));
+        assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+        assert!(!t.store.records.contains_key(&key));
+        assert!(events.contains(&Ev::DeviceRemoved(p::DeviceRemoved { id: SAVED })));
+        let steps = pairing_steps(&events);
+        let Some(p::pairing::Step::Done(done)) = steps.last() else {
+            panic!("pairing did not finish: {steps:?}");
+        };
+        assert_ne!(done.device, SAVED);
+        assert_eq!(t.saved(done.device).peer, identity);
+        assert!(!t.app.manager.connection(link).unwrap().closing);
+    }
+}
+
+#[test]
+fn lost_device_cleanup_retries_a_failed_native_bond_removal() {
+    use cordial_core::outputs::Plan;
+    let mut t = nonresident_gamepad_output();
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        enabled: Some(true),
+        ..Default::default()
+    });
+    t.entry(SAVED).paused = true;
+    t.events();
+    assert!(!t.app.manager.bonds_pending);
+    assert!(t.app.manager.connections.iter().all(Option::is_none));
+    let key = record_key(2, SAVED);
+    t.store.records.insert(key, UNDECODABLE.to_vec());
+    t.radio.reject_forget = true;
+    assert_eq!(
+        t.code(Command::GetDevice(p::GetDevice { device: SAVED })),
+        p::ErrorCode::NotFound
+    );
+    assert!(t.app.manager.find(SAVED.into()).is_none());
+    assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+    assert!(!t.store.records.contains_key(&key));
+    assert!(t.radio.bonds.contains(&peer(1)));
+    assert!(
+        t.events()
+            .contains(&Ev::DeviceRemoved(p::DeviceRemoved { id: SAVED }))
+    );
+    assert!(t.app.manager.lost_devices.is_empty());
+    assert!(t.radio.bonds.contains(&peer(1)));
+
+    t.radio.reject_forget = false;
+    t.now += FIRST_RETRY;
+    let events = t.events();
+    assert!(!t.radio.bonds.contains(&peer(1)));
+    assert!(t.radio.forgotten.contains(&peer(1)));
+    assert!(!events.iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+    assert!(!t.app.manager.bonds_pending);
+}
+
+#[test]
+fn profile_cleanup_removes_a_nonresident_device_with_another_devices_bond() {
+    use cordial_core::outputs::Plan;
+    let mut t = nonresident_gamepad_output();
+    let profile = create(&mut t, "Lost");
+    set_layers(&mut t, SAVED, &[profile]);
+    t.events();
+    let key = record_key(2, SAVED);
+    let mut record = storage::Device::decode(t.store.records[&key].as_slice()).unwrap();
+    record.bond.as_mut().unwrap().owner += 1;
+    t.store.records.insert(key, record.encode_to_vec());
+    lose_profile(&mut t, profile);
+    let events = t.events();
+    assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+    assert!(!t.store.records.contains_key(&key));
+    assert!(!t.store.records.contains_key(&record_key(8, profile)));
+    assert!(events.contains(&Ev::DeviceRemoved(p::DeviceRemoved { id: SAVED })));
+    assert!(events.contains(&Ev::ProfileRemoved(p::ProfileRemoved { id: profile })));
+}
+
+#[test]
+fn matching_a_bond_keeps_output_selections_on_read_failure() {
+    for direct in [true, false] {
+        let mut t = nonresident_gamepad_output();
+        let identity = peer(if direct { 1 } else { 2 });
+        let candidate = t.candidate(identity, identity);
+        t.pair(candidate);
+        t.poll();
+        let link = t.radio.connects.last().unwrap().0;
+        t.events();
+        t.store.fail_load = Some(record_key(2, SAVED));
+        t.radio.bonds.push(identity);
+        t.event(Event::Bonded { link, identity });
+        let mut events = t.events();
+        t.finish_disconnects();
+        events.extend(t.events());
+        assert_eq!(t.app.manager.outputs.plan().hid_gamepads, 1);
+        assert!(!events.iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+        assert_eq!(
+            pairing_steps(&events).last(),
+            Some(&p::pairing::Step::Failed(
+                p::ErrorCode::StorageFailed as i32
+            ))
+        );
+    }
+}
+
+#[test]
+fn profile_cleanup_finishes_when_lost_device_cleanup_fails() {
+    use cordial_core::outputs::Plan;
+    let mut t = nonresident_gamepad_output();
+    let profile = create(&mut t, "Lost");
+    t.events();
+    lose_profile(&mut t, profile);
+    let key = record_key(2, SAVED);
+    t.store.records.insert(key, UNDECODABLE.to_vec());
+    t.store.fail_remove = Some(key);
+    let events = t.events();
+    assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+    assert!(t.store.records.contains_key(&key));
+    assert!(!t.store.records.contains_key(&record_key(8, profile)));
+    assert!(t.app.manager.lost_profiles.is_empty());
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Ev::DeviceRemoved(_)))
+            .count(),
+        1
+    );
+    assert!(events.contains(&Ev::ProfileRemoved(p::ProfileRemoved { id: profile })));
+    for _ in 0..3 {
+        t.now += FIRST_RETRY * 4;
+        assert!(!t.events().iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+        assert!(t.app.manager.lost_profiles.is_empty());
+    }
+}
+
+#[test]
+fn profile_cleanup_keeps_output_selections_on_device_read_failure() {
+    let mut t = nonresident_gamepad_output();
+    let profile = create(&mut t, "Lost");
+    t.events();
+    lose_profile(&mut t, profile);
+    t.store.fail_load = Some(record_key(2, SAVED));
+    let events = t.events();
+    assert_eq!(t.app.manager.outputs.plan().hid_gamepads, 1);
+    assert!(!events.iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+    assert_eq!(t.app.manager.lost_profiles, [u64::from(profile)]);
+    assert!(t.store.records.contains_key(&record_key(8, profile)));
+    t.store.fail_load = None;
+    t.now += FIRST_RETRY;
+    assert!(
+        t.events()
+            .contains(&Ev::ProfileRemoved(p::ProfileRemoved { id: profile }))
+    );
+    assert_eq!(t.app.manager.outputs.plan().hid_gamepads, 1);
+}
+
+#[test]
+fn deferred_device_roles_clean_up_lost_output_selections() {
+    use cordial_core::outputs::Plan;
+    for missing in [true, false] {
+        let mut t = nonresident_gamepad_output();
+        t.set_device(p::SetDevice {
+            device: SAVED,
+            enabled: Some(true),
+            ..Default::default()
+        });
+        let link = connect_saved(&mut t, descriptor());
+        press(&mut t, link, &[4]);
+        t.poll();
+        assert!(t.live(SAVED).policy.is_some());
+        assert!(t.app.has_unsaved());
+        assert_eq!(t.saved(SAVED).roles, cordial_core::devices::Roles(0));
+        let key = record_key(2, SAVED);
+        t.store.fail_load = Some(key);
+        block_on(t.app.save_all(&mut t.store, t.now));
+        assert_eq!(t.app.manager.outputs.plan().hid_gamepads, 1);
+        assert!(t.app.manager.lost_devices.is_empty());
+        assert!(t.app.has_unsaved());
+        assert!(!t.events().iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+        t.store.fail_load = None;
+
+        if missing {
+            t.store.records.remove(&key);
+        } else {
+            t.store.records.insert(key, UNDECODABLE.to_vec());
+        }
+        t.store.fail_remove = Some(key);
+        block_on(t.app.save_all(&mut t.store, t.now));
+        assert_eq!(t.app.manager.lost_devices, [u64::from(SAVED)]);
+        t.now += cordial_core::deferred::QUIET_MS;
+        let events = t.events();
+        assert_eq!(t.app.manager.outputs.plan(), Plan::default());
+        assert!(t.app.manager.find(SAVED.into()).is_none());
+        assert!(t.app.manager.connection(link).unwrap().closing);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Ev::DeviceRemoved(_)))
+                .count(),
+            1
+        );
+        t.now += FIRST_RETRY;
+        assert!(!t.events().iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+        t.store.fail_remove = None;
+        t.now += FIRST_RETRY * 2;
+        t.events();
+        assert!(t.app.manager.lost_devices.is_empty());
+        assert!(!t.store.records.contains_key(&key));
+    }
+}
+
+#[test]
+fn gamepad_enumeration_reports_capacity_and_device_state_changes() {
+    use cordial_core::{
+        bluetooth::Descriptor,
+        outputs::{Enumeration, Plan, Support},
+    };
+    let mut t = Test::new(true);
+    t.app.manager.output_support = &[Support {
+        role: p::Role::Gamepad,
+        modes: &[
+            p::OutputMode::Disabled,
+            p::OutputMode::Hid,
+            p::OutputMode::Xinput,
+        ],
+    }];
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        output_preferences: vec![output(p::OutputMode::Hid)],
+        ..Default::default()
+    });
+    let descriptor = Descriptor::from_slice(
+        ServiceId(8),
+        &[
+            5, 1, 9, 5, 0xa1, 1, 5, 9, 0x19, 1, 0x29, 8, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8, 0x81,
+            2, 0xc0,
+        ],
+    )
+    .unwrap();
+    let link = connect_saved(&mut t, vec![descriptor]);
+    t.event(Event::Input(
+        InputReport::new(link, ServiceId(8), 0, &[0]).unwrap(),
+    ));
+    t.events();
+    let before = t.device(SAVED);
+    assert_eq!(before.outputs[0].state, p::OutputState::Pending as i32);
+    let status_before = t.status();
+    t.events();
+    let mut enumeration = Enumeration {
+        plan: Plan {
+            hid_gamepads: 1,
+            xinput_gamepads: 2,
+        },
+        generation: 4,
+        ready: true,
+    };
+    t.app.set_output_enumeration(Some(enumeration));
+    let events = t.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Ev::Device(d) if d.id == SAVED
+        && d.outputs[0].state == p::OutputState::Active as i32 && d.outputs[0].slot == Some(0)))
+    );
+    assert!(events.iter().any(|e| matches!(e, Ev::Adapter(_))));
+    let mut active = t.device(SAVED);
+    active.outputs.clone_from(&before.outputs);
+    assert_eq!(active, before);
+    let mut status = t.status();
+    assert_eq!(status.output_support[0].modes[0].slots, None);
+    assert_eq!(status.output_support[0].modes[1].slots, Some(1));
+    assert_eq!(status.output_support[0].modes[2].slots, Some(2));
+    status.output_support = status_before.output_support.clone();
+    assert_eq!(status, status_before);
+    let held = t.app.gamepad_outputs();
+    enumeration.ready = false;
+    t.app.set_output_enumeration(Some(enumeration));
+    assert_eq!(t.app.gamepad_outputs(), held);
+    assert!(t.events().iter().any(|e| matches!(e, Ev::Device(d)
+        if d.outputs[0].state == p::OutputState::Pending as i32 && d.outputs[0].slot.is_none())));
+    enumeration.ready = true;
+    t.app.set_output_enumeration(Some(enumeration));
+    assert!(t.events().iter().any(|e| matches!(e, Ev::Device(d)
+        if d.outputs[0].state == p::OutputState::Active as i32)));
+    t.app.set_output_enumeration(Some(enumeration));
+    assert!(
+        !t.events()
+            .iter()
+            .any(|e| matches!(e, Ev::Adapter(_) | Ev::Device(_)))
+    );
+    t.settle();
+    t.app.session(false, &mut t.radio);
+    ALLOCS.set(0);
+    TRACK.set(true);
+    for buttons in 0..200 {
+        t.event(Event::Input(
+            InputReport::new(link, ServiceId(8), 0, &[buttons]).unwrap(),
+        ));
+        assert_eq!(
+            t.app.gamepad_outputs().hid[0].gamepad.buttons,
+            u32::from(buttons)
+        );
+        t.poll();
+    }
+    TRACK.set(false);
+    assert_eq!(ALLOCS.get(), 0);
+    t.app.session(true, &mut t.radio);
+    t.app.set_output_enumeration(None);
+    assert!(
+        t.app
+            .gamepad_outputs()
+            .hid
+            .iter()
+            .all(|s| s.occupant.is_none())
+    );
+    assert!(
+        t.status().output_support[0]
+            .modes
+            .iter()
+            .all(|m| m.slots.is_none())
+    );
+}
+
+#[test]
+fn gamepad_profile_capabilities_follow_the_board_output_support() {
+    use cordial_core::{outputs::Support, profiles};
+    let gamepad = usage(1, 5);
+    let mut t = Test::new(false);
+    let unsupported = t.status().profile_support.unwrap();
+    assert!(unsupported.ranges.iter().all(|r| {
+        r.kind != p::usage_range::Kind::AxisInput as i32
+            && r.kind != p::usage_range::Kind::AxisOutput as i32
+    }));
+    assert!(
+        unsupported
+            .ranges
+            .iter()
+            .all(|range| range.collection.is_some())
+    );
+    assert!(
+        unsupported
+            .ranges
+            .iter()
+            .filter(|r| r.kind == p::usage_range::Kind::RemapOutput as i32)
+            .all(|range| range.collection != Some(gamepad))
+    );
+    let id = create(&mut t, "Controls");
+    let route = rule(
+        gamepad,
+        usage(1, 0x30),
+        p::profile_rule::Effect::Axis(p::profile_rule::Axis {
+            destination: Some(usage(1, 0x31)),
+            invert: true,
+        }),
+    );
+    assert_eq!(
+        t.code(Command::SetProfileRules(p::SetProfileRules {
+            profile: id,
+            changes: vec![route.clone()]
+        })),
+        p::ErrorCode::BadArgs
+    );
+    // Gamepad input can produce keyboard output without a gamepad USB backend.
+    set_rules(&mut t, id, vec![remap(gamepad, usage(9, 1), &[key(5)])]);
+    assert_eq!(profile(&mut t, id).roles, [p::Role::Gamepad as i32]);
+    t.app.manager.output_support = &[Support {
+        role: p::Role::Gamepad,
+        modes: &[p::OutputMode::Hid, p::OutputMode::Xinput],
+    }];
+    let supported = t.status().profile_support.unwrap();
+    let axes = |kind: p::usage_range::Kind| {
+        supported
+            .ranges
+            .iter()
+            .filter(|r| r.kind == kind as i32)
+            .map(|r| (r.collection, r.usage_page, r.min, r.max))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        axes(p::usage_range::Kind::AxisInput).len(),
+        profiles::AXIS_INPUTS.len()
+    );
+    assert_eq!(
+        axes(p::usage_range::Kind::AxisInput),
+        axes(p::usage_range::Kind::AxisOutput)
+    );
+    assert!(
+        supported
+            .ranges
+            .iter()
+            .filter(|r| r.kind == p::usage_range::Kind::RemapOutput as i32)
+            .any(|range| range.collection == Some(gamepad))
+    );
+    let listed = set_rules(&mut t, id, vec![route.clone()]);
+    assert_eq!(listed[0].collection, Some(gamepad));
+    assert!(matches!(
+        listed[0].effect,
+        Some(p::profile_rule::Effect::Axis(p::profile_rule::Axis {
+            invert: true,
+            ..
+        }))
+    ));
+    assert_eq!(
+        saved_rules(&mut t, id)[0].effect,
+        profiles::Effect::Axis(profiles::usage(1, 0x31), true)
+    );
+    // The same button usage has two possible USB destinations on this board.
+    assert_eq!(
+        t.code(Command::SetProfileRules(p::SetProfileRules {
+            profile: id,
+            changes: vec![remap(KEYBOARD_COLLECTION, key(4), &[usage(9, 1)])]
+        })),
+        p::ErrorCode::BadArgs
+    );
+    let explicit = rule(
+        KEYBOARD_COLLECTION,
+        key(4),
+        p::profile_rule::Effect::Remap(p::profile_rule::Remap {
+            outputs: vec![p::profile_rule::Output {
+                usage: Some(usage(9, 1)),
+                collection: Some(gamepad),
+            }],
+        }),
+    );
+    set_rules(&mut t, id, vec![explicit]);
+    t.app.manager.profile_budget = None;
+    assert!(t.status().profile_support.is_none());
+}
+
+#[test]
+fn rule_commands_require_collections_and_keep_same_usage_rules_separate() {
+    let mut t = Test::new(false);
+    let id = create(&mut t, "Buttons");
+    let gamepad = usage(1, 5);
+    let button = usage(9, 1);
+    set_rules(
+        &mut t,
+        id,
+        vec![
+            remap(gamepad, button, &[key(5)]),
+            remap(MOUSE_COLLECTION, button, &[key(4)]),
+        ],
+    );
+    let listed = rules_of(&mut t, id);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].collection, Some(MOUSE_COLLECTION));
+    assert_eq!(listed[1].collection, Some(gamepad));
+    let after = p::ProfileRuleRef {
+        input: Some(button),
+        collection: Some(MOUSE_COLLECTION),
+    };
+    let Some(R::ProfileRules(page)) = t.ok(Command::ListProfileRules(p::ListProfileRules {
+        profile: id,
+        after: Some(after),
+    })) else {
+        panic!("missing rules page");
+    };
+    assert_eq!(page.rules, listed[1..]);
+    for collection in [None, Some(usage(0, 0))] {
+        let change = p::ProfileRuleChange {
+            change: Some(p::profile_rule_change::Change::Rule(p::ProfileRule {
+                input: Some(button),
+                collection,
+                effect: Some(p::profile_rule::Effect::Remap(p::profile_rule::Remap {
+                    outputs: vec![],
+                })),
+            })),
+        };
+        assert_eq!(
+            t.code(Command::SetProfileRules(p::SetProfileRules {
+                profile: id,
+                changes: vec![change]
+            })),
+            p::ErrorCode::BadArgs
+        );
+        let reference = p::ProfileRuleRef {
+            input: Some(button),
+            collection,
+        };
+        assert_eq!(
+            t.code(Command::ListProfileRules(p::ListProfileRules {
+                profile: id,
+                after: Some(reference)
+            })),
+            p::ErrorCode::BadArgs
+        );
+        assert_eq!(
+            t.code(Command::SetProfileRules(p::SetProfileRules {
+                profile: id,
+                changes: vec![p::ProfileRuleChange {
+                    change: Some(p::profile_rule_change::Change::Forget(reference))
+                }]
+            })),
+            p::ErrorCode::BadArgs
+        );
+    }
+    assert_eq!(rules_of(&mut t, id), listed);
+    assert_eq!(
+        set_rules(&mut t, id, vec![forget_rule(MOUSE_COLLECTION, button)]),
+        listed[1..]
+    );
+}
+
+#[test]
+fn configuration_editors_preserve_unrelated_rules_on_writes_and_reset_the_whole_profile() {
+    for (interface_kind, wire_kind) in [
+        (Interface::Via, p::ConfigurationInterface::Via),
+        (Interface::Vial, p::ConfigurationInterface::Vial),
+    ] {
+        let mut t = Test::new(true);
+        let id = create(&mut t, "Mixed");
+        let gamepad = usage(1, 5);
+        t.app.manager.output_support = &[cordial_core::outputs::Support {
+            role: p::Role::Gamepad,
+            modes: &[p::OutputMode::Hid],
+        }];
+        let route = rule(
+            gamepad,
+            usage(1, 0x30),
+            p::profile_rule::Effect::Axis(p::profile_rule::Axis {
+                destination: Some(usage(1, 0x31)),
+                invert: false,
+            }),
+        );
+        let original = set_rules(
+            &mut t,
+            id,
+            vec![
+                route,
+                remap(gamepad, usage(9, 1), &[key(5)]),
+                scale(MOUSE_COLLECTION, usage(1, 0x38), -1, 1),
+            ],
+        );
+        let other = profile_with(&mut t, "Other", [4, 5]);
+        let other_rules = rules_of(&mut t, other);
+        set_interfaces(&mut t, vec![interface(wire_kind, Some(true), Some(id))]);
+        // Matrix position 195 names Mouse Button 1, even when a gamepad uses the same usage.
+        assert_eq!(
+            configure(&mut t, interface_kind, &[5, 0, 12, 3, 0, 4])[0],
+            5
+        );
+        let listed = rules_of(&mut t, id);
+        assert_eq!(listed.len(), original.len() + 1);
+        assert!(original.iter().all(|rule| listed.contains(rule)));
+        // A buffer write of Mouse Button 1's own keycode forgets only its mouse rule.
+        let own = match interface_kind {
+            Interface::Via => 0xf4,
+            Interface::Vial => 0xd1,
+        };
+        assert_eq!(
+            configure(&mut t, interface_kind, &[0x13, 1, 0x86, 2, 0, own])[0],
+            0x13
+        );
+        assert_eq!(rules_of(&mut t, id), original);
+        assert_eq!(configure(&mut t, interface_kind, &[5, 0, 0, 0, 0, 5])[0], 5);
+        set_layers(&mut t, SAVED, &[id]);
+        let link = connect_saved(&mut t, descriptor());
+        t.events();
+        assert_eq!(press(&mut t, link, &[4]), [5]);
+        let before_reset = rules_of(&mut t, id);
+        t.app.manager.profile_budget = Some(0);
+        assert_eq!(configure(&mut t, interface_kind, &[6])[0], 0xff);
+        assert_eq!(rules_of(&mut t, id), before_reset);
+        t.app.manager.profile_budget = Some(80);
+        assert_eq!(
+            configure(&mut t, interface_kind, &[5, 0, 0, 0, 0, 6])[0],
+            0xff
+        );
+        assert_eq!(rules_of(&mut t, id), before_reset);
+        ALLOCS.set(0);
+        TRACK.set(true);
+        let reply = configure(&mut t, interface_kind, &[6]);
+        TRACK.set(false);
+        assert_eq!(reply[0], 6);
+        assert_eq!(ALLOCS.get(), 0);
+        t.app.manager.profile_budget = Some(PROFILE_BUDGET as usize);
+        assert!(rules_of(&mut t, id).is_empty());
+        assert_eq!(rules_of(&mut t, other), other_rules);
+        assert_eq!(press(&mut t, link, &[4]), [5]);
+        assert!(press(&mut t, link, &[]).is_empty());
+        assert_eq!(press(&mut t, link, &[4]), [4]);
+        assert!(t.events().iter().any(|event| {
+            matches!(event, Ev::Profile(profile) if profile.id == id && profile.roles.is_empty())
+        }));
+        t.now += cordial_core::deferred::MAX_DELAY_MS;
+        t.quiet();
+        assert!(saved_rules(&mut t, id).is_empty());
+    }
 }

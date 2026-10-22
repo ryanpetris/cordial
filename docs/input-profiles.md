@@ -1,32 +1,69 @@
 # Input profiles
 
 Cordial translates HID usages on the adapter, before combining input from connected devices. The
-Host's language layout still interprets the resulting usages. A profile does not need the physical
-switch layout of the connected keyboard, and using it requires no Host software after
+Host's language layout still interprets the resulting keyboard usages. A profile does not need the
+physical switch layout of the connected keyboard, and using it requires no Host software after
 configuration.
 
 A profile is a named set of rules on HID usages, the numbers USB and Bluetooth devices use to
 identify each key, button, axis and media control. It is not tied to keyboards, mice or any other
 kind of device: the adapter applies whichever rules match the input a device produces.
 
-- A remap rule makes an on/off input, such as a key, a mouse button or a media key, hold a fixed
-  set of outputs instead, such as a key with modifiers, a media control, a mouse button or
-  modifiers alone, or disables it.
-- A scale rule multiplies a relative value, such as pointer motion or a scroll wheel, by a ratio; a
-  negative ratio inverts it. Absolute positions are unchanged, and hardware DPI and wheel modes
+- A remap rule makes an on/off input, such as a key, mouse button, media key or Game Pad button,
+  hold a fixed set of outputs instead, or disables it. Outputs can belong to different application
+  collections, such as a Game Pad button holding a mouse button or a keyboard key with modifiers.
+- A scale rule multiplies a relative value, such as pointer motion or a scroll wheel, by a ratio.
+  A negative ratio inverts it. It does not change absolute positions. Hardware DPI and wheel modes
   remain physical-device settings.
+- An axis rule routes an absolute Game Pad axis to a destination axis in the same Game Pad
+  collection. Its `invert` flag reverses the normalized axis range. It has no deadzones, curves or
+  sensitivity settings.
 
-A profile has at most one rule for each input usage. A new profile is empty: every input passes
-through unchanged until a rule applies to it. The adapter reports which inputs each rule type can name, which outputs it can
-produce, and how much memory loaded profiles can use. It also records which kinds of input each
-profile changes, so clients can show it as a keyboard, mouse or media profile, or several.
+A rule identifies its input by both its HID usage and its application collection. Mouse button 1,
+`09:01` in Mouse collection `01:02`, and Game Pad button 1, `09:01` in Game Pad collection `01:05`,
+are separate inputs. Every rule requires its input collection; the adapter never infers it from the
+usage. A profile has at most one rule for each input usage and collection together.
+
+A new profile is empty: every input passes through unchanged until a rule applies to it. The
+adapter reports which usages and collections each rule type can name, which outputs it can produce,
+and how much memory loaded profiles can use. It derives the profile's roles from its rules' input
+collections, so clients can label it as keyboard, mouse, media, system control or gamepad, or several.
+Outputs do not add roles. A Game Pad button remapped to a Mouse output gives the profile the gamepad
+role.
+
+Remaps cover Game Pad buttons, Start, Select and directional controls. Axis rules cover the advertised
+absolute Game Pad axes. Clients match `ProfileSupport.ranges` by capability kind, collection and
+usage to determine what the adapter accepts. `UsageRange.Kind` distinguishes remap inputs and
+outputs, scale inputs, and axis inputs and outputs. Unknown and unspecified kinds grant no
+capability. The same usage and collection may appear separately under several kinds. A remap output may omit its collection only when exactly one advertised output
+collection carries that usage. The adapter saves and reports the selected collection.
+
+## Builtin controller mappings
+
+On connection, firmware automatically selects a builtin controller mapping only when the device
+has no assigned profiles. Any assigned profile disables the builtin, including an empty profile
+or one with only keyboard or mouse rules. Assigning an empty profile gives raw input mapping;
+removing all assignments restores automatic builtin mapping. Assigned profiles process the
+device's original controller inputs, not builtin-normalized inputs.
+
+HID and XInput share the same profiles and mapped HID state. XInput applies only a fixed conversion
+of the canonical HID buttons and axes. Builtins exist only in firmware and are never stored,
+listed or reported as user profiles.
 
 ## Layers and editing
 
 Each device has its own layers: an ordered list of profiles, empty when the device is first paired.
 Each profile applies to the input as the profile before it left it: if the first remaps C to B and
 the second remaps B to A, pressing C sends A. Separate keyboard and mouse profiles combine by
-listing both. Saved profiles are limited only by flash.
+listing both. A remapped output reaches the next profile with its output usage and collection.
+Saved profiles are limited only by flash.
+
+Axis routes within one profile apply simultaneously to the values entering that profile. Two rules
+routing X to Y and Y to X swap the axes without one route overwriting the other's source value. A
+route moves its source value and whether that axis is present to the destination, taking precedence
+over the destination's unchanged input. The next profile sees the resulting axes. Mapping an axis to
+itself without inversion forgets its rule, as does remapping an input only to itself in the same
+collection or scaling it by a ratio equal to 1.
 
 A profile occupies memory only while a connected device or a configuration interface uses it. Loaded
 profiles share a memory budget set by the board configuration and reported to clients, sized so that
@@ -40,8 +77,8 @@ devices from their next input; a held input keeps the outputs it was pressed wit
 released.
 
 Cordial's desktop app and TUI manage profiles and their layers but do not show or edit rules. Remaps
-of keys, media and system controls, and mouse buttons are edited with VIA or Vial; the CLI's rule
-commands are an advanced interface for everything else. Configuration interfaces expose one profile
+of keys, media and system controls, and mouse buttons are edited with VIA or Vial. The CLI edits all
+supported rule types, including Game Pad controls and axes. Configuration interfaces expose one profile
 each to an external editor over USB, each with its own switch and profile. The protocol allows
 several interfaces to be enabled at once, and the adapter reports which ones it cannot run together:
 VIA and Vial share a Raw HID usage, so this firmware lists them as conflicting. With every interface
@@ -69,13 +106,17 @@ Down), the System Power Down, Sleep and Wake Up controls, the other 16 Consumer 
 basic keycodes name (Media Select, Eject, Mail, Calculator, My Computer, the seven browser
 controls, Fast Forward, Rewind, Brightness Up and Brightness Down), and mouse buttons 1..16. The
 familiar main block is followed by additional usage selectors. Its 14 by 16 matrix is stable and
-identifies input usages, not Bluetooth keyboard switch locations; its last 13 positions select
+identifies input usage and collection pairs, not Bluetooth keyboard switch locations. Keyboard
+positions use Keyboard collection `01:06`, mouse buttons use Mouse `01:02`, media controls use
+Consumer Control `0c:01`, and system controls use System Control `01:80`. Its last 13 positions select
 nothing, read as disabled and ignore writes. The editor shows the selected profile's own remap
-rules, not the result of a device's layers. Rules for other inputs, or that scale, stay in the
-profile but are not exposed by this editor geometry. An input without a rule reads as its own usage, or as transparent when the editor's keycode table cannot
-name that usage. An editor write that maps an input to its own usage alone, or to transparent,
-forgets the input's rule, as it does through the serial API; any other write saves a remap rule.
-Resetting the keymap forgets every rule in the profile, including rules the editor does not show.
+rules, not the result of a device's layers. Rules for other inputs, including all Game Pad rules,
+and scale or axis rules stay in the profile but are not exposed by this editor geometry. Ordinary
+writes preserve unrelated rules. An input without a rule reads as its own usage, or as transparent
+when the editor's keycode table cannot name that usage. An editor write that maps an input to its
+own usage alone in the same collection, or to transparent, forgets the input's rule, as it does
+through the serial API; any other write saves a remap rule. Resetting the keymap forgets every rule
+in the selected profile, including Game Pad rules and rules outside the matrix.
 
 Each editor uses QMK's keycode table for its protocol: VIA protocol 9 uses QMK's original
 keycodes and Vial protocol 6 its current ones. Supported actions are disabled input, a single
@@ -128,8 +169,9 @@ VIA, Vial and Remap sessions still require hardware verification.
    keyboards and disconnect one keyboard while it holds a key.
 5. Disable VIA and enable Vial with the same profile, select the automatically discovered adapter,
    then repeat edits and a whole-map export/import, including mouse buttons 6..8. Try Remap with
-   VIA enabled. Confirm a keymap reset empties the profile, and unsupported macro, layer and
-   whole-adapter reset actions fail without erasing the map or any pairing.
+   VIA enabled. Confirm a keymap reset clears every rule in the selected profile, including Game Pad
+   rules and rules outside the matrix. Confirm unsupported macro, layer and whole-adapter reset
+   actions fail without erasing the map or any pairing.
 6. With the CLI, create a second profile that remaps a mouse button and inverts the wheel, and add
    it after the first in both devices' layers. Verify both devices use both profiles, that chained
    remaps apply in order, and that the second profile shows the mouse role.
@@ -159,3 +201,9 @@ The Arch and Debian packages install [`50-cordial.rules`](../configs/50-cordial.
 the active seat user access to the adapter's serial port and HID nodes. Without the packages, copy
 `50-cordial.rules` from the release archive to `/etc/udev/rules.d/`, reload udev rules, and
 reconnect the adapter. The rule does not change access to other keyboards or serial devices.
+
+## Controller research credits
+
+Controller descriptor research uses [ControllersInfo](https://github.com/DJm00n/ControllersInfo)
+by [DJm00n](https://github.com/DJm00n) and its contributors. Their published HID descriptor captures
+and controller documentation inform Cordial's gamepad mappings.

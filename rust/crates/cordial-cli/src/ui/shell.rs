@@ -152,10 +152,10 @@ impl<B: Backend> Model<B> {
     fn run(&mut self, command: Command, filter: Option<Filter>) {
         let ticket = self.backend.run(command.clone());
         let session = self.session;
-        if reconnect::may_reconnect(&command)
-            && let (Some(session), Some(st)) = (session, self.state())
+        if let (Some(session), Some(st)) = (session, self.state())
+            && reconnect::may_reconnect(&st, &command)
         {
-            self.reconnect = Some(Reconnect::new(session, ticket, &st.status));
+            self.reconnect = Some(Reconnect::new(session, ticket, &st, &command));
         }
         self.jobs.insert(
             ticket,
@@ -642,9 +642,12 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::{
-        command::tests as fixture,
-        fake::{Call, Fake},
+    use crate::{
+        controller::Subject,
+        ui::{
+            command::tests as fixture,
+            fake::{Call, Fake},
+        },
     };
     use cordial_protocol::{self as p, CodeKind, ErrorCode};
 
@@ -892,12 +895,132 @@ mod tests {
                 p::ConfigurationInterface::Via,
                 saved,
             )));
+            self.lose_usb();
+        }
+        /// Drops the connection as the adapter does when it reconnects USB.
+        fn lose_usb(&mut self) {
             self.fake.state.borrow_mut().as_mut().unwrap().available = false;
             self.fake.calls.borrow_mut().clear();
             self.m.output.clear();
             let session = self.m.session.unwrap();
             self.connection(session, Phase::Lost(Error::new("unplugged")));
         }
+        /// Advertises HID gamepad output, with device 2's saved gamepad output choice.
+        fn offer_hid(&mut self, saved: Option<p::OutputMode>) {
+            let mut st = self.fake.state.borrow_mut();
+            let st = st.as_mut().unwrap();
+            st.status.id = "0123456789ABCDEF".into();
+            st.status.output_support = vec![p::OutputSupport {
+                role: p::Role::Gamepad as i32,
+                modes: vec![p::OutputModeSupport {
+                    mode: p::OutputMode::Hid as i32,
+                    max_slots: 4,
+                    slots: Some(0),
+                }],
+            }];
+            st.devices[1].output_preferences = saved
+                .map(|mode| p::OutputPreference {
+                    role: p::Role::Gamepad as i32,
+                    mode: mode as i32,
+                })
+                .into_iter()
+                .collect();
+        }
+    }
+
+    fn mouse() -> Subject {
+        Subject {
+            id: 2,
+            name: "Mouse".into(),
+        }
+    }
+
+    #[test]
+    fn a_gamepad_pool_change_reopens_the_adapter_when_it_returns() {
+        let set = Outcome::Device {
+            subject: mouse(),
+            device: fixture::state().devices[1].clone(),
+        };
+        for (saved, line, outcome) in [
+            (None, "device set 2 gamepad-output hid", set),
+            // Unpairing the last device with a choice empties its pool.
+            (
+                Some(p::OutputMode::Hid),
+                "device unpair 2",
+                Outcome::Unpaired(mouse()),
+            ),
+        ] {
+            let mut app = App::new();
+            app.offer_hid(saved);
+            app.typed(line);
+            app.done(Ok(outcome));
+            app.lose_usb();
+            assert!(app.m.output.is_empty(), "{line}: {:?}", app.m.output);
+            assert_eq!(app.calls(), [Call::List]);
+            app.m.update(Msg::Ports(Ok(vec![PortInfo {
+                port: "/dev/ttyACM1".into(),
+                serial: "0123456789ABCDEF".into(),
+            }])));
+            assert_eq!(app.calls().last(), Some(&Call::Open("/dev/ttyACM1".into())));
+            let session = app.fake.next.get();
+            app.connection(session, Phase::Opened);
+            assert!(app.m.reconnect.is_none());
+            assert_eq!(app.m.session, Some(session));
+        }
+    }
+
+    #[test]
+    fn a_gamepad_pool_change_that_doesnt_return_is_reported_unavailable() {
+        let mut app = App::new();
+        app.offer_hid(None);
+        app.typed("device set 2 gamepad-output hid");
+        // The connection dropped before the reply, so the save may have been stored.
+        app.lose_usb();
+        app.done(Err(Error::new("the connection to the adapter closed")));
+        assert!(app.m.reconnect.as_ref().is_some_and(Reconnect::waiting));
+        app.m.output.clear();
+        app.m.reconnect.as_mut().unwrap().expire();
+        app.m.tick();
+        assert_eq!(app.m.output, ["Adapter unavailable: unplugged"]);
+        assert!(app.m.reconnect.is_none());
+    }
+
+    #[test]
+    fn a_gamepad_change_that_keeps_the_pools_leaves_the_shell_as_it_was() {
+        // Neither choosing the saved mode nor unpairing a device without a choice changes a
+        // pool, so a later loss is reported at once.
+        for line in ["device set 2 gamepad-output hid", "device unpair 1"] {
+            let mut app = App::new();
+            app.offer_hid(Some(p::OutputMode::Hid));
+            app.typed(line);
+            assert!(app.m.reconnect.is_none(), "{line}");
+            app.lose_usb();
+            assert_eq!(app.m.output, ["Adapter unavailable: unplugged"]);
+        }
+        // A save the adapter refused while connected reconnects nothing.
+        let mut app = App::new();
+        app.offer_hid(None);
+        app.typed("device set 2 gamepad-output hid");
+        app.done(Err(Error::code(ErrorCode::Busy, Some("device set"))));
+        assert!(app.m.reconnect.is_none());
+        // A saved change whose pool count stays the same never drops the connection: other
+        // commands run meanwhile, and the expected reconnect lapses.
+        let mut app = App::new();
+        app.offer_hid(None);
+        app.typed("device set 2 gamepad-output hid");
+        app.done(Ok(Outcome::Device {
+            subject: mouse(),
+            device: fixture::state().devices[1].clone(),
+        }));
+        assert!(app.m.reconnect.is_some());
+        app.typed("adapter status");
+        assert_eq!(app.runs().last().unwrap(), "Status");
+        assert_eq!(app.m.tick_interval(), Duration::from_secs(1));
+        app.m.reconnect.as_mut().unwrap().expire();
+        app.m.tick();
+        assert!(app.m.reconnect.is_none());
+        app.lose_usb();
+        assert_eq!(app.m.output, ["Adapter unavailable: unplugged"]);
     }
 
     #[test]

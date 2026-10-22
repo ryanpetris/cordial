@@ -109,6 +109,7 @@ class Terminal(unittest.TestCase):
         while b"Device settings are saved only when you set them" not in self.transcript and time.monotonic() < end:
             self.read()
         self.assertIn(b"Device settings are saved only when you set them", self.transcript)
+        self.assertIn(b"device set DEV gamepad-output disabled | hid | xinput", self.transcript)
         os.write(self.master, b"unfinished\x03")
         self.exited(0)
         self.doCleanups()

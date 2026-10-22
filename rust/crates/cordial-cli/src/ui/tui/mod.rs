@@ -31,7 +31,9 @@ use crate::{
 };
 use add::AddDevice;
 use cordial_client::serial::PortInfo;
-use cordial_protocol::{self as p, ConfigurationInterface, Platform, Transport, value::Value};
+use cordial_protocol::{
+    self as p, ConfigurationInterface, OutputMode, Platform, Transport, value::Value,
+};
 use fleet::{Fleet, Slot};
 use layout::Hit;
 use profiles::{ProfilePage, Step};
@@ -137,6 +139,8 @@ pub enum Action {
     Bootloader,
 
     DeviceToggle(Toggle, bool),
+    /// Stages the device's gamepad output mode.
+    GamepadOutput(OutputMode),
     Connect,
     Disconnect,
     Forget,
@@ -225,6 +229,8 @@ pub enum Dialog {
     },
     /// Confirming an adapter save that reconnects USB.
     SaveAdapter(String),
+    /// Confirming a device's Settings save whose Gamepad Output change reconnects USB.
+    SaveSettings(String, u32),
     AddDevice,
     Bootloader(String),
     Files(String),
@@ -285,11 +291,14 @@ pub(super) enum Kind {
     DeviceSave {
         device: u32,
         sent: DeviceUpdate,
-        layers: bool,
+        /// The tab whose changes it saves.
+        tab: Tab,
     },
     SettingsSave {
         device: u32,
         sent: Vec<(String, Draft)>,
+        /// The staged gamepad output is saved once this finishes.
+        gamepad: bool,
     },
     /// Creating, copying or deleting a profile, from its dialog.
     Profile,
@@ -387,6 +396,8 @@ pub(crate) struct Model<F: Fleet> {
     states: HashMap<Slot, State>,
     adapters: Vec<AdapterView>,
     devices: Vec<DeviceView>,
+    /// The shown device as last listed, kept while its adapter reconnects.
+    kept: Option<DeviceView>,
 
     page: Page,
     /// The page's target has been shown, so its disappearing returns to the Overview.
@@ -459,6 +470,7 @@ impl<F: Fleet> Model<F> {
             states: HashMap::new(),
             adapters: Vec::new(),
             devices: Vec::new(),
+            kept: None,
             page: Page::Overview,
             page_shown: true,
             tab: Tab::Details,
@@ -942,6 +954,7 @@ impl<F: Fleet> Model<F> {
                 | Dialog::ProfileName(a, _)
                 | Dialog::ProfileDelete(a, _)
                 | Dialog::SaveAdapter(a)
+                | Dialog::SaveSettings(a, _)
                 | Dialog::Pick { adapter: a, .. },
             ) => a == id,
             _ => false,
@@ -1124,8 +1137,11 @@ impl<F: Fleet> Model<F> {
     }
 
     fn finish(&mut self, job: Job, result: Result<Outcome, Error>) {
-        // A result from a session that has since ended belongs to nothing shown now.
-        if self.session_of(&job.adapter).map(|s| s.slot) != Some(job.slot) {
+        // A result from a session that has since ended belongs to nothing shown now, except a
+        // device save's: device IDs are never reused, and a save that reconnects USB, such as a
+        // Gamepad Output change, may answer only after its session ended.
+        let current = self.session_of(&job.adapter).map(|s| s.slot) == Some(job.slot);
+        if !current && !matches!(job.kind, Kind::DeviceSave { .. }) {
             return;
         }
         let id = job.adapter.clone();

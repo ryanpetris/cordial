@@ -11,6 +11,7 @@ const adapter = (id: string, patch: Partial<AdapterEntry> = {}): AdapterEntry =>
   connectError: null,
   readiness: "ready",
   status: null,
+  listing: false,
   attention: [],
   profilePage: null,
   pickerPage: null,

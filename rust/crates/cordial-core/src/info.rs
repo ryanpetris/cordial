@@ -42,6 +42,7 @@ impl Information {
         let hint = match kind {
             crate::model::link::DeviceKind::Keyboard => Some("keyboard"),
             crate::model::link::DeviceKind::Mouse => Some("mouse"),
+            crate::model::link::DeviceKind::Gamepad => Some("gamepad"),
             crate::model::link::DeviceKind::KeyboardMouse => Some("keyboard_mouse"),
             _ => None,
         };
@@ -226,6 +227,7 @@ pub fn standard(info: &mut Information, uuid: u16, instance: u8, bytes: &[u8]) {
                 let kind = match bytes {
                     [0xc1, 3] => V::Text("keyboard".into()),
                     [0xc2, 3] => V::Text("mouse".into()),
+                    [0xc4, 3] => V::Text("gamepad".into()),
                     _ => V::Null,
                 };
                 info.observe(false, K::Kind, 0, kind);

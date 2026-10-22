@@ -38,12 +38,21 @@ export const compareWarnings = (a: WarningKey, b: WarningKey) =>
   || compareOptional(a.usage, b.usage)
   || compareNumbers(a.code, b.code);
 
-/** Rules order: usage page, then usage of the input. */
-export const compareUsages = (a: Pick<Usage, "usagePage" | "usage">, b: Pick<Usage, "usagePage" | "usage">) =>
-  compareNumbers(a.usagePage, b.usagePage) || compareNumbers(a.usage, b.usage);
+type UsageKey = Pick<Usage, "usagePage" | "usage">;
 
-/** The input a rule is listed by; a rule without one orders first. */
-export const ruleInput = (r: Pick<ProfileRule, "input">): Pick<Usage, "usagePage" | "usage"> => ({ usagePage: r.input?.usagePage ?? 0, usage: r.input?.usage ?? 0 });
+/** Usages order: usage page, then usage. */
+export const compareUsages = (a: UsageKey, b: UsageKey) => compareNumbers(a.usagePage, b.usagePage) || compareNumbers(a.usage, b.usage);
+
+/** The key a rule is listed by: its input and the input's collection, a missing usage reading as
+ * usage 0 of page 0. */
+export const ruleRef = (r: Pick<ProfileRule, "input" | "collection">): { input: UsageKey; collection: UsageKey } => ({
+  input: { usagePage: r.input?.usagePage ?? 0, usage: r.input?.usage ?? 0 },
+  collection: { usagePage: r.collection?.usagePage ?? 0, usage: r.collection?.usage ?? 0 },
+});
+
+/** Rules order: input usage page, input usage, collection usage page, then collection usage. */
+export const compareRuleRefs = (a: ReturnType<typeof ruleRef>, b: ReturnType<typeof ruleRef>) =>
+  compareUsages(a.input, b.input) || compareUsages(a.collection, b.collection);
 
 /** The key a feature is listed by. */
 export const featureRef = (f: Feature): Pick<FeatureRef, "integration" | "index"> => ({

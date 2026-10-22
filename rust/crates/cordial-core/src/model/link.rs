@@ -22,6 +22,7 @@ pub enum DeviceKind {
     Keyboard,
     Mouse,
     KeyboardMouse,
+    Gamepad,
 }
 
 /// How pairing authenticates: the user enters, confirms or reads a code.

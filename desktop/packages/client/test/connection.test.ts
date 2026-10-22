@@ -1,5 +1,5 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
-import { ErrorCode, FrameDecoder, MessageSchema, RequestSchema, Transport, encodeFrame, type Request } from "@cordial/protocol";
+import { ErrorCode, FrameDecoder, MessageSchema, RequestSchema, Transport, UsageRange_Kind, encodeFrame, type Request } from "@cordial/protocol";
 import { describe, expect, it, vi } from "vitest";
 import { Connection, ConnectionClosedError, CordialError, UnexpectedResponseError, type ByteStream } from "../src/index.ts";
 
@@ -72,6 +72,21 @@ describe("Connection", () => {
     expect(peer.requests[0]!.command.case).toBe("getStatus");
     expect(connection.status.id).toBe("A1");
     expect(events).not.toHaveBeenCalled();
+  });
+
+  it("preserves capability kinds and collection-qualified ranges in status", async () => {
+    const peer = new Peer();
+    const ranges = [UsageRange_Kind.REMAP_INPUT, UsageRange_Kind.REMAP_OUTPUT, UsageRange_Kind.UNSPECIFIED, 99].map((kind) => ({
+      kind, collection: { usagePage: 1, usage: 5 }, usagePage: 9, min: 1, max: 32,
+    }));
+    peer.onRequest = () => queueMicrotask(() => peer.send({
+      kind: { case: "response", value: { result: { case: "status", value: {
+        id: "A1", profileSupport: { ranges, memoryBudget: 4096, memoryUsed: 128, maxLayers: 8, maxRemapOutputs: 8 },
+      } } } },
+    }));
+    const connection = await Connection.open(peer);
+    expect(connection.status.profileSupport).toMatchObject({ ranges, memoryBudget: 4096, memoryUsed: 128, maxLayers: 8, maxRemapOutputs: 8 });
+    await connection.close();
   });
 
   it("sends one request at a time and answers them in order", async () => {

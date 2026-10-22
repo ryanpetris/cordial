@@ -21,5 +21,5 @@
   "storage_backend": "littlefs",
   "radio_backend": "pico-sdk-cyw43",
   "firmware_bytes": 1048576,
-  "profile_memory_budget": 32768
+  "profile_memory_budget": 40960
 }

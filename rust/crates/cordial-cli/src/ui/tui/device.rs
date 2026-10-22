@@ -16,7 +16,7 @@ use crate::{
     model, profiles,
     ui::text,
 };
-use cordial_protocol::{self as p, DeviceState, ErrorCode, InactiveReason, keys};
+use cordial_protocol::{self as p, DeviceState, ErrorCode, InactiveReason, OutputMode, keys};
 use ratatui::{style::Style, text::Line};
 
 /// The staged values in `draft` that differ from the device's saved ones.
@@ -26,6 +26,7 @@ pub fn device_pending(draft: &DeviceUpdate, d: &p::Device) -> DeviceUpdate {
         trusted: draft.trusted.filter(|v| *v != d.trusted),
         blocked: draft.blocked.filter(|v| *v != d.blocked),
         hidpp: draft.hidpp.filter(|v| *v != model::hidpp_enabled(d)),
+        gamepad: draft.gamepad.filter(|m| Some(*m) != model::gamepad_mode(d)),
         layers: draft
             .layers
             .clone()
@@ -73,15 +74,18 @@ impl<F: Fleet> Model<F> {
             trusted: Some(c.trusted.unwrap_or(d.d.trusted)),
             blocked: Some(c.blocked.unwrap_or(d.d.blocked)),
             hidpp: Some(c.hidpp.unwrap_or_else(|| model::hidpp_enabled(&d.d))),
+            gamepad: c.gamepad.or_else(|| model::gamepad_mode(&d.d)),
             layers: Some(c.layers.unwrap_or_else(|| profiles::layers(&d.d).to_vec())),
         }
     }
 
-    pub(super) fn device_saving(&self, d: &DeviceView, layers: bool) -> bool {
+    /// Whether the device's changes from `tab` are being saved.
+    pub(super) fn device_saving(&self, d: &DeviceView, tab: Tab) -> bool {
         let id = d.d.id;
-        self.running(&d.adapter, |k| {
-            matches!(k, Kind::DeviceSave { device, layers: l, .. } if *device == id && *l == layers)
-        })
+        self.running(
+            &d.adapter,
+            |k| matches!(k, Kind::DeviceSave { device, tab: t, .. } if *device == id && *t == tab),
+        )
     }
 
     fn device_busy(&self, d: &DeviceView) -> bool {
@@ -92,8 +96,18 @@ impl<F: Fleet> Model<F> {
         })
     }
 
-    fn device_locked(&self, d: &DeviceView) -> bool {
-        !self.adapter_ready(d) || self.device_saving(d, false) || self.device_saving(d, true)
+    /// Whether the device's preferences take no changes now: a save is running, including a
+    /// settings save that saves the staged gamepad output once it finishes.
+    pub(super) fn device_locked(&self, d: &DeviceView) -> bool {
+        let id = d.d.id;
+        !self.adapter_ready(d)
+            || self.running(&d.adapter, |k| match k {
+                Kind::DeviceSave { device, .. } => *device == id,
+                Kind::SettingsSave {
+                    device, gamepad, ..
+                } => *device == id && *gamepad,
+                _ => false,
+            })
     }
 
     /// Whether the device's Logitech Features or settings are busy.
@@ -106,10 +120,11 @@ impl<F: Fleet> Model<F> {
         saving || hidpp
     }
 
-    fn stage_device(
+    /// Stages a change made on `tab`.
+    pub(super) fn stage_device(
         &mut self,
         d: &DeviceView,
-        layers: bool,
+        tab: Tab,
         change: impl FnOnce(&mut DeviceUpdate),
     ) {
         let key = Self::device_key(d);
@@ -119,12 +134,7 @@ impl<F: Fleet> Model<F> {
         if !draft.is_empty() {
             self.device_drafts.insert(key.clone(), draft);
         }
-        let spot = if layers {
-            Spot::LayersSave(key.0, key.1)
-        } else {
-            Spot::DetailsSave(key.0, key.1)
-        };
-        self.notes.remove(&spot);
+        self.notes.remove(&save_spot(tab, key.0, key.1));
     }
 
     /// Runs a device command whose failure shows at `spot`.
@@ -145,11 +155,17 @@ impl<F: Fleet> Model<F> {
             Action::DeviceToggle(toggle, on) if !locked => {
                 let on = *on;
                 match toggle {
-                    Toggle::Enabled => self.stage_device(&d, false, |u| u.enabled = Some(on)),
-                    Toggle::Trusted => self.stage_device(&d, false, |u| u.trusted = Some(on)),
-                    Toggle::Blocked => self.stage_device(&d, false, |u| u.blocked = Some(on)),
+                    Toggle::Enabled => {
+                        self.stage_device(&d, Tab::Details, |u| u.enabled = Some(on))
+                    }
+                    Toggle::Trusted => {
+                        self.stage_device(&d, Tab::Details, |u| u.trusted = Some(on))
+                    }
+                    Toggle::Blocked => {
+                        self.stage_device(&d, Tab::Details, |u| u.blocked = Some(on))
+                    }
                     Toggle::Hidpp if !self.settings_busy(&d) => {
-                        self.stage_device(&d, false, |u| u.hidpp = Some(on))
+                        self.stage_device(&d, Tab::Details, |u| u.hidpp = Some(on))
                     }
                     Toggle::Hidpp => {}
                 }
@@ -175,12 +191,13 @@ impl<F: Fleet> Model<F> {
                 self.notes.remove(&Spot::Dialog);
                 self.dialog = Some(Dialog::Forget(key.0, key.1));
             }
-            Action::DetailsSave => self.save_device(&d, false),
-            Action::LayersSave => self.save_device(&d, true),
-            Action::DetailsDiscard if !self.device_saving(&d, false) => {
+            Action::DetailsSave => self.save_device(&d, Tab::Details),
+            Action::LayersSave => self.save_device(&d, Tab::Profiles),
+            Action::DetailsDiscard if !self.device_saving(&d, Tab::Details) => {
                 if let Some(draft) = self.device_drafts.get_mut(&key) {
                     *draft = DeviceUpdate {
                         layers: draft.layers.take(),
+                        gamepad: draft.gamepad,
                         ..DeviceUpdate::default()
                     };
                     if draft.is_empty() {
@@ -189,7 +206,7 @@ impl<F: Fleet> Model<F> {
                 }
                 self.notes.remove(&Spot::DetailsSave(key.0, key.1));
             }
-            Action::LayersDiscard if !self.device_saving(&d, true) => {
+            Action::LayersDiscard if !self.device_saving(&d, Tab::Profiles) => {
                 if let Some(draft) = self.device_drafts.get_mut(&key) {
                     draft.layers = None;
                     if draft.is_empty() {
@@ -203,7 +220,7 @@ impl<F: Fleet> Model<F> {
                 let mut layers = self.device_values(&d).layers.unwrap_or_default();
                 if i > 0 && i < layers.len() {
                     layers.swap(i, i - 1);
-                    self.stage_device(&d, true, |u| u.layers = Some(layers));
+                    self.stage_device(&d, Tab::Profiles, |u| u.layers = Some(layers));
                 }
             }
             Action::LayerDown(i) if !locked => {
@@ -211,7 +228,7 @@ impl<F: Fleet> Model<F> {
                 let mut layers = self.device_values(&d).layers.unwrap_or_default();
                 if i + 1 < layers.len() {
                     layers.swap(i, i + 1);
-                    self.stage_device(&d, true, |u| u.layers = Some(layers));
+                    self.stage_device(&d, Tab::Profiles, |u| u.layers = Some(layers));
                 }
             }
             Action::LayerRemove(i) if !locked => {
@@ -219,7 +236,7 @@ impl<F: Fleet> Model<F> {
                 let mut layers = self.device_values(&d).layers.unwrap_or_default();
                 if i < layers.len() {
                     layers.remove(i);
-                    self.stage_device(&d, true, |u| u.layers = Some(layers));
+                    self.stage_device(&d, Tab::Profiles, |u| u.layers = Some(layers));
                 }
             }
             Action::LayerAdd if !locked => {
@@ -256,32 +273,17 @@ impl<F: Fleet> Model<F> {
         };
         let mut layers = self.device_values(&d).layers.unwrap_or_default();
         layers.push(profile);
-        self.stage_device(&d, true, |u| u.layers = Some(layers));
+        self.stage_device(&d, Tab::Profiles, |u| u.layers = Some(layers));
     }
 
-    /// Saves a device's staged details, or its layers when `layers`.
-    fn save_device(&mut self, d: &DeviceView, layers: bool) {
-        let changes = self.device_changes(d);
-        let sent = if layers {
-            DeviceUpdate {
-                layers: changes.layers,
-                ..DeviceUpdate::default()
-            }
-        } else {
-            DeviceUpdate {
-                layers: None,
-                ..changes
-            }
-        };
+    /// Saves the device's changes staged on `tab`.
+    pub(super) fn save_device(&mut self, d: &DeviceView, tab: Tab) {
+        let sent = tab_changes(&self.device_changes(d), tab);
         if sent.is_empty() || self.device_locked(d) {
             return;
         }
         let (a, id) = Self::device_key(d);
-        let spot = if layers {
-            Spot::LayersSave(a.clone(), id)
-        } else {
-            Spot::DetailsSave(a.clone(), id)
-        };
+        let spot = save_spot(tab, a.clone(), id);
         let refusal = self.state_of(&a).and_then(|st| {
             let enabled = sent.enabled.unwrap_or(d.d.enabled);
             let blocked = sent.blocked.unwrap_or(d.d.blocked);
@@ -294,6 +296,12 @@ impl<F: Fleet> Model<F> {
             }
             if sent.hidpp.is_some() && self.settings_busy(d) {
                 return Some(words::code_text(ErrorCode::Busy));
+            }
+            if let Some(mode) = sent.gamepad
+                && mode != OutputMode::Disabled
+                && !model::gamepad_modes(&st.status).contains(&mode)
+            {
+                return Some(words::code_text(ErrorCode::Unsupported));
             }
             if let Some(l) = &sent.layers {
                 let max = profiles::max_layers(&st.status).unwrap_or(0) as usize;
@@ -316,7 +324,7 @@ impl<F: Fleet> Model<F> {
             Kind::DeviceSave {
                 device: id,
                 sent: sent.clone(),
-                layers,
+                tab,
             },
             Command::DeviceSave(id, sent),
         );
@@ -340,6 +348,9 @@ impl<F: Fleet> Model<F> {
                     if draft.hidpp == sent.hidpp {
                         draft.hidpp = None;
                     }
+                    if draft.gamepad == sent.gamepad {
+                        draft.gamepad = None;
+                    }
                     if draft.layers == sent.layers {
                         draft.layers = None;
                     }
@@ -348,13 +359,19 @@ impl<F: Fleet> Model<F> {
                     }
                 }
             }
-            (Kind::DeviceSave { device, layers, .. }, Err(e)) => {
-                let spot = if *layers {
-                    Spot::LayersSave(adapter, *device)
-                } else {
-                    Spot::DetailsSave(adapter, *device)
-                };
-                self.notes.insert(spot, words::failure(e));
+            (Kind::DeviceSave { device, sent, tab }, Err(e)) => {
+                let spot = save_spot(*tab, adapter.clone(), *device);
+                // A failure that an ended session reports late no longer applies once the
+                // device's listed record shows the change saved.
+                let ended = self.session_of(&adapter).map(|s| s.slot) != Some(job.slot);
+                let saved = self
+                    .devices
+                    .iter()
+                    .find(|d| d.adapter == adapter && d.d.id == *device)
+                    .is_some_and(|d| device_pending(sent, &d.d).is_empty());
+                if !(ended && saved) {
+                    self.notes.insert(spot, words::failure(e));
+                }
             }
             (Kind::Forget(device), Ok(_)) => {
                 if self.dialog == Some(Dialog::Forget(adapter.clone(), *device)) {
@@ -476,7 +493,7 @@ impl<F: Fleet> Model<F> {
         let mut v = PageView::new(title, w);
         let st = self.state_of(adapter).cloned();
         v.tabs = vec![Tab::Details];
-        if has_settings(st.as_ref(), &d.d) {
+        if has_settings(st.as_ref(), &d.d) || !self.gamepad_choices(&d).is_empty() {
             v.tabs.push(Tab::Settings);
         }
         let profile_support = self.adapter(adapter).is_some_and(|a| a.profile_support());
@@ -596,7 +613,7 @@ impl<F: Fleet> Model<F> {
         if let Some(e) = note {
             bar.para(e, err());
         }
-        let saving = self.device_saving(d, false);
+        let saving = self.device_saving(d, Tab::Details);
         let busy_now = self.device_busy(d);
         let connect_running = self.running(
             &d.adapter,
@@ -606,11 +623,7 @@ impl<F: Fleet> Model<F> {
         if busy_now || saving || connecting {
             bar.label(&format!("{}", super::spinner()), layout::accent());
         }
-        let dirty = !DeviceUpdate {
-            layers: None,
-            ..changes
-        }
-        .is_empty();
+        let dirty = !tab_changes(&changes, Tab::Details).is_empty();
         let mut right = Layout::new(bar.width);
         if d.connected() || connecting {
             button_if(
@@ -714,7 +727,7 @@ impl<F: Fleet> Model<F> {
         if let Some(e) = self.notes.get(&Spot::LayersSave(a, id)) {
             bar.para(e, err());
         }
-        let saving = self.device_saving(d, true);
+        let saving = self.device_saving(d, Tab::Profiles);
         if saving {
             bar.label(&format!("{}", super::spinner()), layout::accent());
         }
@@ -800,6 +813,13 @@ impl<F: Fleet> Model<F> {
             );
             b.fact("Status", &words::integration_text(i), layout::plain());
         }
+        if let Some(o) = model::gamepad_output(&d.d).filter(|_| model::gamepad_saved(&d.d)) {
+            b.section("Gamepad Output");
+            b.fact("Status", text::output_state_words(o), layout::plain());
+            if let Some(slot) = o.slot {
+                b.fact("Slot", &text::slot_number(slot), layout::plain());
+            }
+        }
         if d.connected()
             && let Some(security) = &d.d.security
         {
@@ -838,6 +858,36 @@ impl<F: Fleet> Model<F> {
             !busy_now && self.adapter_ready(d),
         );
         bar.align_right(right);
+    }
+}
+
+/// The changes in `changes` that `tab` stages and saves: Profiles the layers, Settings the gamepad
+/// output, and Details the rest.
+pub fn tab_changes(changes: &DeviceUpdate, tab: Tab) -> DeviceUpdate {
+    match tab {
+        Tab::Profiles => DeviceUpdate {
+            layers: changes.layers.clone(),
+            ..DeviceUpdate::default()
+        },
+        Tab::Settings => DeviceUpdate {
+            gamepad: changes.gamepad,
+            ..DeviceUpdate::default()
+        },
+        Tab::Details => DeviceUpdate {
+            layers: None,
+            gamepad: None,
+            ..changes.clone()
+        },
+        Tab::Diagnostics => DeviceUpdate::default(),
+    }
+}
+
+/// Where a failed save of `tab`'s changes shows.
+fn save_spot(tab: Tab, adapter: String, id: u32) -> Spot {
+    match tab {
+        Tab::Profiles => Spot::LayersSave(adapter, id),
+        Tab::Settings => Spot::SettingsNote(adapter, id),
+        _ => Spot::DetailsSave(adapter, id),
     }
 }
 

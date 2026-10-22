@@ -273,6 +273,21 @@ pub fn parse_usage(word: &str) -> Result<p::Usage, String> {
         })
 }
 
+/// Parses a rule input: its usage, then `@PAGE:USAGE` naming the collection it arrives in, such
+/// as `07:39@01:06`.
+pub fn parse_input(word: &str) -> Result<p::ProfileRuleRef, String> {
+    let (input, collection) = word.split_once('@').ok_or_else(|| {
+        format!(
+            "{} has no collection; add @PAGE:USAGE, such as 07:39@01:06",
+            crate::ui::text::quote(word)
+        )
+    })?;
+    Ok(p::ProfileRuleRef {
+        input: Some(parse_usage(input)?),
+        collection: Some(parse_usage(collection)?),
+    })
+}
+
 /// Parses remap outputs: `disabled`, or a comma-separated list of usages, each optionally
 /// followed by `@PAGE:USAGE` naming the collection of the report that carries it.
 pub fn parse_outputs(word: &str) -> Result<Vec<profile_rule::Output>, String> {
@@ -314,6 +329,23 @@ pub fn parse_ratio(word: &str) -> Result<profile_rule::Scale, String> {
     })
 }
 
+/// A rule for the input `at` with `effect`.
+pub fn rule(at: p::ProfileRuleRef, effect: profile_rule::Effect) -> p::ProfileRule {
+    p::ProfileRule {
+        input: at.input,
+        collection: at.collection,
+        effect: Some(effect),
+    }
+}
+
+/// The input and collection a rule is for.
+pub fn rule_ref(rule: &p::ProfileRule) -> p::ProfileRuleRef {
+    p::ProfileRuleRef {
+        input: rule.input,
+        collection: rule.collection,
+    }
+}
+
 /// A change that saves `rule`.
 pub fn save_rule(rule: p::ProfileRule) -> p::ProfileRuleChange {
     p::ProfileRuleChange {
@@ -321,37 +353,45 @@ pub fn save_rule(rule: p::ProfileRule) -> p::ProfileRuleChange {
     }
 }
 
-/// A change that forgets the rule for `input`.
-pub fn forget_rule(input: p::Usage) -> p::ProfileRuleChange {
+/// A change that forgets the rule for the input `at`.
+pub fn forget_rule(at: p::ProfileRuleRef) -> p::ProfileRuleChange {
     p::ProfileRuleChange {
-        change: Some(profile_rule_change::Change::Forget(p::ProfileRuleRef {
-            input: Some(input),
-        })),
+        change: Some(profile_rule_change::Change::Forget(at)),
     }
 }
 
-/// The input a change names.
-pub fn change_target(change: &p::ProfileRuleChange) -> Option<&p::Usage> {
+/// The input and collection a change names.
+pub fn change_target(change: &p::ProfileRuleChange) -> Option<p::ProfileRuleRef> {
     match &change.change {
-        Some(profile_rule_change::Change::Rule(r)) => r.input.as_ref(),
-        Some(profile_rule_change::Change::Forget(f)) => f.input.as_ref(),
+        Some(profile_rule_change::Change::Rule(r)) => Some(rule_ref(r)),
+        Some(profile_rule_change::Change::Forget(f)) => Some(*f),
         None => None,
     }
 }
 
-/// An output as the CLI spells it: its usage, then `@` and its report's collection.
-fn output_words(o: &profile_rule::Output) -> String {
-    let usage = o.usage.as_ref().map_or_else(String::new, usage_words);
-    match &o.collection {
+/// A usage, then `@` and its collection when there is one.
+fn qualified_words(usage: Option<&p::Usage>, collection: Option<&p::Usage>) -> String {
+    let usage = usage.map_or_else(String::new, usage_words);
+    match collection {
         Some(c) => format!("{usage}@{}", usage_words(c)),
         None => usage,
     }
 }
 
-/// A rule as the CLI spells it, in the form `profile rule` takes: `INPUT remap OUTPUTS` or
-/// `INPUT scale N/D`.
+/// A rule input as the CLI spells it: `USAGE@COLLECTION`.
+pub fn input_words(at: &p::ProfileRuleRef) -> String {
+    qualified_words(at.input.as_ref(), at.collection.as_ref())
+}
+
+/// An output as the CLI spells it: its usage, then `@` and its report's collection.
+fn output_words(o: &profile_rule::Output) -> String {
+    qualified_words(o.usage.as_ref(), o.collection.as_ref())
+}
+
+/// A rule as the CLI spells it, in the form `profile rule` takes: `INPUT remap OUTPUTS`,
+/// `INPUT scale N/D` or `INPUT axis AXIS [invert]`.
 pub fn rule_words(rule: &p::ProfileRule) -> String {
-    let input = rule.input.as_ref().map_or_else(String::new, usage_words);
+    let input = input_words(&rule_ref(rule));
     let effect = match &rule.effect {
         Some(profile_rule::Effect::Remap(r)) if r.outputs.is_empty() => "remap disabled".into(),
         Some(profile_rule::Effect::Remap(r)) => format!(
@@ -363,6 +403,11 @@ pub fn rule_words(rule: &p::ProfileRule) -> String {
                 .join(",")
         ),
         Some(profile_rule::Effect::Scale(s)) => format!("scale {}/{}", s.numerator, s.denominator),
+        Some(profile_rule::Effect::Axis(a)) => format!(
+            "axis {}{}",
+            a.destination.as_ref().map_or_else(String::new, usage_words),
+            if a.invert { " invert" } else { "" }
+        ),
         None => "unknown".into(),
     };
     format!("{input} {effect}")
@@ -372,9 +417,16 @@ fn in_range(r: &p::UsageRange, u: &p::Usage) -> bool {
     r.usage_page == u.usage_page && (r.min..=r.max).contains(&u.usage)
 }
 
-/// Whether a rule input is within `ranges`.
-fn accepts_input(ranges: &[p::UsageRange], input: &p::Usage) -> bool {
-    ranges.iter().any(|r| in_range(r, input))
+/// Whether `ranges` grant `kind` for `usage` in `collection`.
+fn accepts(
+    ranges: &[p::UsageRange],
+    kind: p::usage_range::Kind,
+    usage: &p::Usage,
+    collection: Option<&p::Usage>,
+) -> bool {
+    ranges
+        .iter()
+        .any(|r| r.kind == kind as i32 && r.collection.as_ref() == collection && in_range(r, usage))
 }
 
 /// The collection of the report that carries an output: the one named, or the only one whose
@@ -384,45 +436,53 @@ fn output_collection(
     o: &profile_rule::Output,
 ) -> Result<Option<p::Usage>, String> {
     let usage = o.usage.unwrap_or_default();
-    let mut matching = support
-        .remap_outputs
+    if o.collection.is_some() {
+        return accepts(
+            &support.ranges,
+            p::usage_range::Kind::RemapOutput,
+            &usage,
+            o.collection.as_ref(),
+        )
+        .then_some(o.collection)
+        .ok_or_else(|| format!("this adapter can't produce {}", output_words(o)));
+    }
+    let mut found: Vec<Option<p::Usage>> = Vec::new();
+    for r in support
+        .ranges
         .iter()
-        .filter(|r| in_range(r, &usage))
-        .map(|r| r.collection);
-    match &o.collection {
-        Some(c) => matching
-            .any(|r| r.as_ref().is_none_or(|r| r == c))
-            .then_some(Some(*c))
-            .ok_or_else(|| format!("this adapter can't produce {}", output_words(o))),
-        None => {
-            let mut found: Vec<Option<p::Usage>> = Vec::new();
-            for c in matching {
-                if !found.contains(&c) {
-                    found.push(c);
-                }
-            }
-            match found.len() {
-                0 => Err(format!(
-                    "this adapter can't produce {}",
-                    usage_words(&usage)
-                )),
-                1 => Ok(found.remove(0)),
-                _ => Err(format!(
-                    "several reports carry {}; add @PAGE:USAGE to choose one",
-                    usage_words(&usage)
-                )),
-            }
+        .filter(|r| r.kind == p::usage_range::Kind::RemapOutput as i32 && in_range(r, &usage))
+    {
+        if !found.contains(&r.collection) {
+            found.push(r.collection);
         }
+    }
+    match found.len() {
+        0 => Err(format!(
+            "this adapter can't produce {}",
+            usage_words(&usage)
+        )),
+        1 => Ok(found.remove(0)),
+        _ => Err(format!(
+            "several reports carry {}; add @PAGE:USAGE to choose one",
+            usage_words(&usage)
+        )),
     }
 }
 
 /// Why the adapter would refuse to save `rule`, as far as its profile support tells.
 pub fn rule_refusal(support: &p::ProfileSupport, rule: &p::ProfileRule) -> Option<String> {
     let input = rule.input.unwrap_or_default();
+    let collection = rule.collection.as_ref();
+    let named = input_words(&rule_ref(rule));
     match &rule.effect {
         Some(profile_rule::Effect::Remap(remap)) => {
-            if !accepts_input(&support.remap_inputs, &input) {
-                return Some(format!("this adapter can't remap {}", usage_words(&input)));
+            if !accepts(
+                &support.ranges,
+                p::usage_range::Kind::RemapInput,
+                &input,
+                collection,
+            ) {
+                return Some(format!("this adapter can't remap {named}"));
             }
             // The adapter keeps each output once, so a repeated output doesn't count twice.
             let mut seen: Vec<(p::Usage, Option<p::Usage>)> = Vec::new();
@@ -443,13 +503,41 @@ pub fn rule_refusal(support: &p::ProfileSupport, rule: &p::ProfileRule) -> Optio
             })
         }
         Some(profile_rule::Effect::Scale(scale)) => {
-            if !accepts_input(&support.scale_inputs, &input) {
-                return Some(format!("this adapter can't scale {}", usage_words(&input)));
+            if !accepts(
+                &support.ranges,
+                p::usage_range::Kind::ScaleInput,
+                &input,
+                collection,
+            ) {
+                return Some(format!("this adapter can't scale {named}"));
             }
             (scale.numerator == 0 || scale.denominator == 0)
                 .then(|| "a scale needs a nonzero numerator and denominator".into())
         }
-        None => Some("a rule needs a remap or a scale".into()),
+        Some(profile_rule::Effect::Axis(axis)) => {
+            if !accepts(
+                &support.ranges,
+                p::usage_range::Kind::AxisInput,
+                &input,
+                collection,
+            ) {
+                return Some(format!("this adapter can't map {named} to an axis"));
+            }
+            let destination = axis.destination.unwrap_or_default();
+            (!accepts(
+                &support.ranges,
+                p::usage_range::Kind::AxisOutput,
+                &destination,
+                collection,
+            ))
+            .then(|| {
+                format!(
+                    "this adapter can't produce {}",
+                    qualified_words(Some(&destination), collection)
+                )
+            })
+        }
+        None => Some("a rule needs a remap, a scale or an axis".into()),
     }
 }
 
@@ -461,9 +549,29 @@ mod tests {
         p::Usage { usage_page, usage }
     }
 
-    fn range(page: u32, min: u32, max: u32, collection: Option<p::Usage>) -> p::UsageRange {
+    const KEYBOARD: p::Usage = p::Usage {
+        usage_page: 1,
+        usage: 6,
+    };
+    const MOUSE: p::Usage = p::Usage {
+        usage_page: 1,
+        usage: 2,
+    };
+    const GAMEPAD: p::Usage = p::Usage {
+        usage_page: 1,
+        usage: 5,
+    };
+
+    fn range(
+        kind: p::usage_range::Kind,
+        page: u32,
+        min: u32,
+        max: u32,
+        collection: p::Usage,
+    ) -> p::UsageRange {
         p::UsageRange {
-            collection,
+            kind: kind as i32,
+            collection: Some(collection),
             usage_page: page,
             min,
             max,
@@ -472,12 +580,22 @@ mod tests {
 
     fn support() -> p::ProfileSupport {
         p::ProfileSupport {
-            remap_inputs: vec![range(0x07, 0x04, 0xe7, None), range(0x09, 1, 16, None)],
-            scale_inputs: vec![range(0x01, 0x30, 0x38, None)],
-            remap_outputs: vec![
-                range(0x07, 0x04, 0xe7, Some(usage(1, 6))),
-                range(0x09, 1, 8, Some(usage(1, 2))),
-                range(0x09, 1, 8, Some(usage(1, 6))),
+            ranges: vec![
+                range(p::usage_range::Kind::RemapInput, 0x07, 0x04, 0xe7, KEYBOARD),
+                range(p::usage_range::Kind::RemapInput, 0x09, 1, 16, MOUSE),
+                range(p::usage_range::Kind::RemapInput, 0x09, 1, 16, GAMEPAD),
+                range(p::usage_range::Kind::ScaleInput, 0x01, 0x30, 0x38, MOUSE),
+                range(
+                    p::usage_range::Kind::RemapOutput,
+                    0x07,
+                    0x04,
+                    0xe7,
+                    KEYBOARD,
+                ),
+                range(p::usage_range::Kind::RemapOutput, 0x09, 1, 8, MOUSE),
+                range(p::usage_range::Kind::RemapOutput, 0x09, 1, 8, KEYBOARD),
+                range(p::usage_range::Kind::AxisInput, 0x01, 0x30, 0x35, GAMEPAD),
+                range(p::usage_range::Kind::AxisOutput, 0x01, 0x30, 0x35, GAMEPAD),
             ],
             memory_budget: 4096,
             max_remap_outputs: 2,
@@ -486,13 +604,33 @@ mod tests {
         }
     }
 
-    fn remap(input: p::Usage, outputs: &str) -> p::ProfileRule {
-        p::ProfileRule {
-            input: Some(input),
-            effect: Some(profile_rule::Effect::Remap(profile_rule::Remap {
+    fn remap(input: &str, outputs: &str) -> p::ProfileRule {
+        rule(
+            parse_input(input).unwrap(),
+            profile_rule::Effect::Remap(profile_rule::Remap {
                 outputs: parse_outputs(outputs).unwrap(),
-            })),
-        }
+            }),
+        )
+    }
+
+    fn scale(input: &str, numerator: i32) -> p::ProfileRule {
+        rule(
+            parse_input(input).unwrap(),
+            profile_rule::Effect::Scale(profile_rule::Scale {
+                numerator,
+                denominator: 1,
+            }),
+        )
+    }
+
+    fn axis(input: &str, destination: p::Usage, invert: bool) -> p::ProfileRule {
+        rule(
+            parse_input(input).unwrap(),
+            profile_rule::Effect::Axis(profile_rule::Axis {
+                destination: Some(destination),
+                invert,
+            }),
+        )
     }
 
     #[test]
@@ -510,12 +648,29 @@ mod tests {
     }
 
     #[test]
+    fn inputs_name_their_collection() {
+        let at = parse_input("09:01@01:05").unwrap();
+        assert_eq!(
+            (at.input, at.collection),
+            (Some(usage(9, 1)), Some(GAMEPAD))
+        );
+        assert_eq!(input_words(&at), "09:01@01:05");
+        assert_eq!(
+            parse_input("09:01").unwrap_err(),
+            "\"09:01\" has no collection; add @PAGE:USAGE, such as 07:39@01:06"
+        );
+        for bad in ["09:01@", "09:01@01", "@01:05", "09:01@01:05@01:02"] {
+            assert!(parse_input(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn outputs_and_ratios_parse() {
         assert!(parse_outputs("disabled").unwrap().is_empty());
         let outputs = parse_outputs("07:e0,07:04@01:06").unwrap();
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0].collection, None);
-        assert_eq!(outputs[1].collection, Some(usage(1, 6)));
+        assert_eq!(outputs[1].collection, Some(KEYBOARD));
         assert!(parse_outputs("07:e0,").is_err());
         let scale = parse_ratio("-1/1").unwrap();
         assert_eq!((scale.numerator, scale.denominator), (-1, 1));
@@ -526,52 +681,113 @@ mod tests {
 
     #[test]
     fn rules_read_as_the_commands_that_make_them() {
-        let rule = remap(usage(9, 1), "09:02@01:02");
-        assert_eq!(rule_words(&rule), "09:01 remap 09:02@01:02");
-        let disabled = remap(usage(7, 0x39), "disabled");
-        assert_eq!(rule_words(&disabled), "07:39 remap disabled");
-        let scale = p::ProfileRule {
-            input: Some(usage(1, 0x38)),
-            effect: Some(profile_rule::Effect::Scale(profile_rule::Scale {
-                numerator: -1,
-                denominator: 1,
-            })),
-        };
-        assert_eq!(rule_words(&scale), "01:38 scale -1/1");
+        let rule = remap("09:01@01:02", "09:02@01:02");
+        assert_eq!(rule_words(&rule), "09:01@01:02 remap 09:02@01:02");
+        let disabled = remap("07:39@01:06", "disabled");
+        assert_eq!(rule_words(&disabled), "07:39@01:06 remap disabled");
+        assert_eq!(
+            rule_words(&scale("01:38@01:02", -1)),
+            "01:38@01:02 scale -1/1"
+        );
+        assert_eq!(
+            rule_words(&axis("01:30@01:05", usage(1, 0x33), true)),
+            "01:30@01:05 axis 01:33 invert"
+        );
+        assert_eq!(
+            rule_words(&axis("01:31@01:05", usage(1, 0x31), false)),
+            "01:31@01:05 axis 01:31"
+        );
     }
 
     #[test]
     fn rules_are_checked_against_the_support() {
         let s = support();
-        assert_eq!(rule_refusal(&s, &remap(usage(7, 0x39), "07:04")), None);
-        assert_eq!(rule_refusal(&s, &remap(usage(9, 1), "09:02@01:02")), None);
-        assert!(rule_refusal(&s, &remap(usage(9, 17), "09:02@01:02")).is_some());
+        assert_eq!(rule_refusal(&s, &remap("07:39@01:06", "07:04")), None);
+        // A button is a separate input in each collection the adapter accepts it in.
+        assert_eq!(rule_refusal(&s, &remap("09:01@01:02", "09:02@01:02")), None);
+        assert_eq!(rule_refusal(&s, &remap("09:01@01:05", "07:04")), None);
+        assert_eq!(
+            rule_refusal(&s, &remap("07:39@01:02", "07:04")).unwrap(),
+            "this adapter can't remap 07:39@01:02"
+        );
+        assert!(rule_refusal(&s, &remap("09:11@01:02", "09:02@01:02")).is_some());
         // An output carried by several reports needs its collection.
         assert_eq!(
-            rule_refusal(&s, &remap(usage(7, 4), "09:02")).unwrap(),
+            rule_refusal(&s, &remap("07:04@01:06", "09:02")).unwrap(),
             "several reports carry 09:02; add @PAGE:USAGE to choose one"
         );
-        assert!(rule_refusal(&s, &remap(usage(7, 4), "09:02@01:0a")).is_some());
-        assert!(rule_refusal(&s, &remap(usage(7, 4), "0c:e9")).is_some());
         assert_eq!(
-            rule_refusal(&s, &remap(usage(7, 4), "07:e0,07:e1,07:04")).unwrap(),
+            rule_refusal(&s, &remap("07:04@01:06", "09:02@01:05")).unwrap(),
+            "this adapter can't produce 09:02@01:05"
+        );
+        assert!(rule_refusal(&s, &remap("07:04@01:06", "0c:e9")).is_some());
+        assert_eq!(
+            rule_refusal(&s, &remap("07:04@01:06", "07:e0,07:e1,07:04")).unwrap(),
             "a remap holds at most 2 outputs"
         );
         // Repeated outputs count once, as the adapter keeps each once.
         assert_eq!(
-            rule_refusal(&s, &remap(usage(7, 4), "07:05,07:05@01:06,07:06")),
+            rule_refusal(&s, &remap("07:04@01:06", "07:05,07:05@01:06,07:06")),
             None
         );
-        assert_eq!(rule_refusal(&s, &remap(usage(7, 4), "disabled")), None);
-        let scale = |input: p::Usage| p::ProfileRule {
-            input: Some(input),
-            effect: Some(profile_rule::Effect::Scale(profile_rule::Scale {
-                numerator: 2,
-                denominator: 1,
-            })),
-        };
-        assert_eq!(rule_refusal(&s, &scale(usage(1, 0x38))), None);
-        assert!(rule_refusal(&s, &scale(usage(7, 4))).is_some());
+        assert_eq!(rule_refusal(&s, &remap("07:04@01:06", "disabled")), None);
+        assert_eq!(rule_refusal(&s, &scale("01:38@01:02", 2)), None);
+        assert!(rule_refusal(&s, &scale("07:04@01:06", 2)).is_some());
+        // A Game Pad axis is not a mouse value to scale, nor a mouse value an axis.
+        assert!(rule_refusal(&s, &scale("01:30@01:05", 2)).is_some());
+        assert_eq!(
+            rule_refusal(&s, &axis("01:30@01:02", usage(1, 0x31), false)).unwrap(),
+            "this adapter can't map 01:30@01:02 to an axis"
+        );
+        assert_eq!(
+            rule_refusal(&s, &axis("01:30@01:05", usage(1, 0x35), true)),
+            None
+        );
+        assert_eq!(
+            rule_refusal(&s, &axis("01:30@01:05", usage(1, 0x38), false)).unwrap(),
+            "this adapter can't produce 01:38@01:05"
+        );
+    }
+
+    #[test]
+    fn capability_ranges_grant_only_their_kind() {
+        use p::usage_range::Kind;
+        let kinds = [
+            Kind::RemapInput,
+            Kind::RemapOutput,
+            Kind::ScaleInput,
+            Kind::AxisInput,
+            Kind::AxisOutput,
+        ];
+        for (required, rule) in [
+            (Kind::RemapInput, remap("07:04@01:06", "disabled")),
+            (Kind::RemapOutput, remap("07:04@01:06", "07:05")),
+            (Kind::RemapOutput, remap("07:04@01:06", "07:05@01:06")),
+            (Kind::ScaleInput, scale("01:30@01:02", 2)),
+            (Kind::AxisInput, axis("01:30@01:05", usage(1, 0x31), true)),
+            (Kind::AxisOutput, axis("01:30@01:05", usage(1, 0x31), true)),
+        ] {
+            assert_eq!(rule_refusal(&support(), &rule), None);
+            for other in kinds
+                .into_iter()
+                .map(|k| k as i32)
+                .chain([Kind::Unspecified as i32, i32::MAX])
+            {
+                if other == required as i32 {
+                    continue;
+                }
+                let mut s = support();
+                for range in &mut s.ranges {
+                    if range.kind == required as i32 {
+                        range.kind = other;
+                    }
+                }
+                assert!(
+                    rule_refusal(&s, &rule).is_some(),
+                    "{required:?} granted by {other}"
+                );
+            }
+        }
     }
 
     fn interface_support(

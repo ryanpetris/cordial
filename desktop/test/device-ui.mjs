@@ -169,6 +169,171 @@ try {
   await tab("Settings").click();
   assert.equal(await backlight.isChecked(), false);
 
+  // A controller's Gamepad Output stages on Settings apart from the Details changes.
+  const pad = state.devices.find((d) => d.name === "Example Controller");
+  await page.getByRole("button", { name: /Example Controller/ }).first().click();
+  await tab("Settings").click();
+  const output = page.getByRole("radiogroup", { name: "Gamepad Output" });
+  const outputMode = (name) => output.getByRole("radio", { name, exact: true });
+  assert.deepEqual(await output.getByRole("radio").allTextContents(), ["Disabled", "HID", "XInput"]);
+  assert.equal(await outputMode("XInput").getAttribute("aria-checked"), "true");
+  await outputMode("HID").click();
+  const outputMarker = page.getByRole("button", { name: "Gamepad Output, Changed, Options", exact: true });
+  await outputMarker.waitFor();
+  await tab("Details").click();
+  await page.getByRole("switch", { name: "Automatic Connections" }).click();
+  await bar.getByRole("button", { name: "Discard", exact: true }).click();
+  await tab("Settings").click();
+  assert.equal(await outputMode("HID").getAttribute("aria-checked"), "true");
+  // A change to a pool's size asks before anything is saved. Cancel and Escape send nothing and
+  // keep every staged change.
+  const padSettings = pad.settings;
+  pad.settings = [structuredClone(row("backlight.delay.hands_out"))];
+  await publish();
+  const padHands = page.getByRole("spinbutton", { name: "Timeout With Hands Away" });
+  await padHands.fill("40");
+  await fail("settings.save");
+  const outputStart = (await actions()).length;
+  const confirm = page.getByRole("dialog", { name: "USB Reconnect Required" });
+  const confirmSave = confirm.getByRole("button", { name: "Save", exact: true });
+  await save.click();
+  await confirm.getByText("The adapter will disconnect from this computer for a moment after it saves these changes.", { exact: true }).waitFor();
+  await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+  await confirm.waitFor({ state: "hidden" });
+  await page.keyboard.press("Control+s");
+  await confirm.waitFor();
+  await page.keyboard.press("Escape");
+  await confirm.waitFor({ state: "hidden" });
+  assert.equal((await actions()).length, outputStart);
+  assert.equal(await outputMarker.count(), 1);
+  assert.equal(await padHands.inputValue(), "40");
+  // It saves after the device's settings, and only once they saved.
+  await page.keyboard.press("Control+s");
+  await confirmSave.click();
+  await page.getByText("Couldn't save this value.", { exact: true }).waitFor();
+  assert.deepEqual((await actions()).slice(outputStart).map((a) => a.type), ["settings.save"]);
+  assert.equal(await outputMarker.count(), 1);
+  await fail(null);
+  await save.click();
+  await confirmSave.click();
+  await outputMarker.waitFor({ state: "detached" });
+  assert.equal(await confirm.isVisible(), false);
+  assert.deepEqual((await actions()).slice(outputStart + 1).map((a) => a.type), ["settings.save", "device.update"]);
+  assert.deepEqual((await actions()).at(-1), { type: "device.update", key: pad.key, gamepadOutput: "hid" });
+  pad.settings = padSettings;
+  await publish();
+  // Pools already full before and after the change keep their sizes, so it saves without asking.
+  const unspared = state.devices;
+  const spares = [1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({
+    ...structuredClone(pad),
+    key: `${pad.adapterId}/${100 + n}`,
+    name: `Spare Pad ${n}`,
+    device: { ...structuredClone(pad.device), id: 100 + n, outputPreferences: [{ role: "gamepad", mode: n > 4 ? "xinput" : "hid" }] },
+  }));
+  state.devices = [...unspared, ...spares];
+  await publish();
+  await outputMode("HID").click();
+  const quiet = (await actions()).length;
+  await save.click();
+  await outputMarker.waitFor({ state: "detached" });
+  assert.equal(await confirm.isVisible(), false);
+  assert.deepEqual((await actions()).slice(quiet), [{ type: "device.update", key: pad.key, gamepadOutput: "hid" }]);
+  // With three others choosing XInput, leaving it shrinks XInput.
+  state.devices = [...unspared, ...spares.slice(0, -1)];
+  await publish();
+  await outputMode("HID").click();
+  await save.click();
+  await confirm.waitFor();
+  await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
+  await confirm.waitFor({ state: "hidden" });
+  assert.equal((await actions()).length, quiet + 1);
+  await discard.click();
+  await outputMarker.waitFor({ state: "detached" });
+  state.devices = unspared;
+  await publish();
+  // Without the adapter's support only Disabled is offered, besides the saved choice.
+  const padStatus = state.adapters.find((a) => a.id === pad.adapterId).status;
+  const advertised = padStatus.outputSupport;
+  padStatus.outputSupport = [];
+  await publish();
+  await output.getByRole("radio").nth(1).filter({ hasText: "XInput" }).waitFor();
+  assert.deepEqual(await output.getByRole("radio").allTextContents(), ["Disabled", "XInput"]);
+  // Clearing that choice changes no pool the adapter offers, so it saves without asking.
+  await outputMode("Disabled").click();
+  const stale = (await actions()).length;
+  await save.click();
+  await outputMarker.waitFor({ state: "detached" });
+  assert.equal(await confirm.isVisible(), false);
+  assert.deepEqual((await actions()).slice(stale), [{ type: "device.update", key: pad.key, gamepadOutput: "disabled" }]);
+  padStatus.outputSupport = advertised;
+  await publish();
+  await tab("Diagnostics").click();
+  const outputFacts = page.locator("section").filter({ has: page.getByRole("heading", { name: "Gamepad Output" }) });
+  assert.equal(await outputFacts.locator("dd").allTextContents().then((t) => t.join()), "Active,1");
+
+  // A Gamepad Output change can re-enumerate USB. While the adapter reconnects and lists its
+  // devices again, the page keeps its tab and staged choice with its controls disabled, and a
+  // save cut short stays reported until the device shows the choice saved.
+  const padAdapter = state.adapters.find((a) => a.id === pad.adapterId);
+  const reconnect = async (adapter, devices) => {
+    const all = state.devices;
+    Object.assign(padAdapter, adapter);
+    state.devices = devices;
+    await publish();
+    state.devices = all;
+  };
+  const others = state.devices.filter((d) => d.adapterId !== pad.adapterId);
+  const unlisted = { connection: "connected", readiness: "ready", listing: true };
+  const usable = { connection: "connected", readiness: "ready", listing: false };
+  await tab("Settings").click();
+  await outputMode("HID").click();
+  await app.evaluate(() => { globalThis.uiHold = "device.update"; });
+  await save.click();
+  await confirmSave.click();
+  await reconnect({ connection: "connecting", readiness: "waiting", listing: true }, others);
+  await output.locator("xpath=ancestor::fieldset[1][@disabled]").waitFor();
+  assert.equal(await tab("Settings").getAttribute("aria-selected"), "true");
+  assert.equal(await save.getAttribute("aria-disabled"), "true");
+  const lost = "The adapter disconnected before the change finished.";
+  await app.evaluate((_electron, message) => {
+    globalThis.uiHold = null;
+    globalThis.uiReply({ ok: false, message });
+  }, lost);
+  await page.getByText(lost, { exact: true }).waitFor();
+  await reconnect(unlisted, others);
+  await reconnect(usable, state.devices);
+  await output.locator("xpath=ancestor::fieldset[1][not(@disabled)]").waitFor();
+  assert.equal(await tab("Settings").getAttribute("aria-selected"), "true");
+  assert.equal(await outputMode("HID").getAttribute("aria-checked"), "true");
+  await outputMarker.waitFor();
+  await page.getByText(lost, { exact: true }).waitFor();
+  assert.equal(await save.getAttribute("aria-disabled"), "false");
+  const padOutput = pad.device.outputPreferences.find((p) => p.role === "gamepad");
+  padOutput.mode = "hid";
+  await publish();
+  await outputMarker.waitFor({ state: "detached" });
+  await page.getByText(lost, { exact: true }).waitFor({ state: "detached" });
+  // A save the adapter confirmed before USB dropped shows the saved choice throughout.
+  await outputMode("XInput").click();
+  await save.click();
+  await confirmSave.click();
+  await outputMarker.waitFor({ state: "detached" });
+  padOutput.mode = "xinput";
+  await publish();
+  await reconnect({ connection: "connecting", readiness: "waiting", listing: true }, others);
+  await output.locator("xpath=ancestor::fieldset[1][@disabled]").waitFor();
+  assert.equal(await outputMode("XInput").getAttribute("aria-checked"), "true");
+  await reconnect(usable, state.devices);
+  await output.locator("xpath=ancestor::fieldset[1][not(@disabled)]").waitFor();
+  assert.equal(await tab("Settings").getAttribute("aria-selected"), "true");
+  assert.equal(await outputMode("XInput").getAttribute("aria-checked"), "true");
+  assert.equal(await outputMarker.count(), 0);
+  assert.equal(await page.locator(".page-bar .error-text").count(), 0);
+  // A device the adapter no longer lists once it has read its devices again isn't shown.
+  await reconnect(usable, others);
+  await output.waitFor({ state: "detached" });
+  await publish();
+
   // A device with no settings to show has no Settings tab.
   await page.getByRole("button", { name: /Travel Keyboard/ }).first().click();
   await tab("Settings").waitFor({ state: "detached" });

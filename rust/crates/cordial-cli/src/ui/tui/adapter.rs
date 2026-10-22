@@ -305,13 +305,10 @@ impl<F: Fleet> Model<F> {
         }
     }
 
-    pub(super) fn reconnect_dialog(&mut self, id: &str, w: usize) -> DialogView {
+    /// The USB Reconnect Required confirmation, with Save enabled when `can_save`.
+    pub(super) fn reconnect_dialog(&self, can_save: bool, w: usize) -> DialogView {
         let mut body = Layout::new(w);
         body.para(words::RECONNECT_TEXT, layout::plain());
-        let can_save = self
-            .adapter(id)
-            .cloned()
-            .is_some_and(|a| !self.adapter_locked(&a) && !self.adapter_changes(&a).is_empty());
         let mut buttons = Layout::new(w);
         let mut right = Layout::new(w);
         right.button("Cancel", Action::Cancel, Tone::Normal);

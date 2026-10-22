@@ -242,6 +242,7 @@ pub enum DisplayKind {
     Keyboard,
     Mouse,
     KeyboardMouse,
+    Gamepad,
     Other,
 }
 
@@ -253,10 +254,13 @@ pub fn display_kind(kinds: &[i32], roles: &[i32]) -> DisplayKind {
     let keyboard =
         kinds.contains(&Kind::Keyboard) || (kinds.is_empty() && roles.contains(&Role::Keyboard));
     let mouse = kinds.contains(&Kind::Mouse) || (kinds.is_empty() && roles.contains(&Role::Mouse));
+    let gamepad =
+        kinds.contains(&Kind::Gamepad) || (kinds.is_empty() && roles.contains(&Role::Gamepad));
     match (keyboard, mouse) {
         (true, true) => DisplayKind::KeyboardMouse,
         (true, false) => DisplayKind::Keyboard,
         (false, true) => DisplayKind::Mouse,
+        _ if gamepad => DisplayKind::Gamepad,
         _ => DisplayKind::Other,
     }
 }
@@ -266,6 +270,7 @@ pub fn kind_text(kind: DisplayKind) -> &'static str {
         DisplayKind::Keyboard => "Keyboard",
         DisplayKind::Mouse => "Mouse",
         DisplayKind::KeyboardMouse => "Keyboard and Mouse",
+        DisplayKind::Gamepad => "Gamepad",
         DisplayKind::Other => "Other",
     }
 }
@@ -276,6 +281,7 @@ pub fn role_text(r: Role) -> Option<&'static str> {
         Role::Mouse => "Mouse",
         Role::ConsumerControl => "Media Keys",
         Role::SystemControl => "System Keys",
+        Role::Gamepad => "Gamepad",
         Role::Unknown => return None,
     })
 }
@@ -536,6 +542,22 @@ mod tests {
             other_adapter("Desk"),
             "Cordial couldn't connect to Desk. Another adapter answered on its port."
         );
+    }
+
+    #[test]
+    fn gamepads_show_as_gamepads() {
+        let gamepad = Kind::Gamepad as i32;
+        assert_eq!(display_kind(&[gamepad], &[]), DisplayKind::Gamepad);
+        assert_eq!(
+            display_kind(&[], &[Role::Gamepad as i32]),
+            DisplayKind::Gamepad
+        );
+        assert_eq!(
+            display_kind(&[Kind::Keyboard as i32, gamepad], &[]),
+            DisplayKind::Keyboard
+        );
+        assert_eq!(role_text(Role::Gamepad), Some("Gamepad"));
+        assert_eq!(text::unnamed(&[Kind::Gamepad]), "Unnamed Gamepad");
     }
 
     #[test]

@@ -177,6 +177,7 @@ pub struct DeviceUpdate {
     pub trusted: Option<bool>,
     pub blocked: Option<bool>,
     pub hidpp: Option<bool>,
+    pub gamepad: Option<p::OutputMode>,
     /// The device's layers: profile IDs in the order they apply.
     pub layers: Option<Vec<u32>>,
 }
@@ -237,6 +238,7 @@ pub enum Command {
     Unpair(Target),
     Refresh(Target),
     Set(Target, Toggle, bool),
+    GamepadOutput(Target, p::OutputMode),
     /// Sets a device's layers: profiles in the order they apply, or none.
     Layers(Target, Vec<Target>),
     Warnings(Target),

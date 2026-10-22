@@ -12,6 +12,8 @@ import {
   IntegrationKind,
   IntegrationState,
   Kind,
+  OutputMode,
+  OutputState,
   Platform,
   ReportType,
   Role,
@@ -38,6 +40,7 @@ import type {
   InfoEntry,
   Integration,
   KindName,
+  OutputModeName,
   PairingPrompt,
   Profile,
   RoleName,
@@ -118,8 +121,20 @@ export function status(s: Status): AdapterStatus {
       ? s.configurationInterfaces.flatMap((i) =>
           i.interface ? [{ interface: i.interface, enabled: i.enabled, profile: i.profile, conflicts: [...i.conflicts] }] : [])
       : [],
+    outputSupport: s.outputSupport.flatMap((o) => {
+      const r = role(o.role);
+      const modes = o.modes.flatMap((m) => {
+        const n = outputMode(m.mode);
+        return n ? [{ mode: n, maxSlots: m.maxSlots, slots: optional(m.slots) }] : [];
+      });
+      return r ? [{ role: r, modes }] : [];
+    }),
   };
 }
+
+/** A known role or output mode, or null for one this app doesn't know. */
+export const role = (r: Role): RoleName | null => (r in Role && r !== Role.UNKNOWN ? (name(Role, r) as RoleName) : null);
+export const outputMode = (m: OutputMode): OutputModeName | null => (m in OutputMode ? name(OutputMode, m) : null);
 
 /** Distinct known values of a repeated enum, by lower-case name. */
 function known<E extends Record<string, string | number>, N extends string>(e: E, values: number[]): N[] {
@@ -172,6 +187,14 @@ export function device(d: Device): DeviceRecord {
     roles: roles(d.roles),
     profiles: d.profiles ? [...d.profiles.profiles] : null,
     profileError: d.profileError === undefined ? null : errorCode(d.profileError),
+    outputPreferences: d.outputPreferences.flatMap((p) => {
+      const r = role(p.role);
+      return r ? [{ role: r, mode: outputMode(p.mode) }] : [];
+    }),
+    outputs: d.outputs.flatMap((o) => {
+      const r = role(o.role);
+      return r ? [{ role: r, mode: outputMode(o.mode), state: name(OutputState, o.state), slot: optional(o.slot) }] : [];
+    }),
   };
 }
 

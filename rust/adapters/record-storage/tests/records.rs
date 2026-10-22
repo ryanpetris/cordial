@@ -1265,3 +1265,72 @@ impl NorFlash for UnreadableBlocks {
         self.flash.erase(from, to).await
     }
 }
+
+#[test]
+fn device_output_preferences_share_the_existing_record_and_layout() {
+    use cordial_core::{
+        bonds::{Bond, Keys},
+        devices::{Peer, Policies, Policy},
+        model::identifiers::Transport,
+        outputs::{self, Preference},
+        storage::{RecordStore, record_key},
+    };
+    use cordial_protocol::{OutputMode, Role};
+    use prost::Message;
+    block_on(async {
+        let flash = Flash::blank();
+        let range = 4096..128 * 1024;
+        let layout = [1; 32];
+        let mut store = Storage::provision_blank(flash.clone(), range.clone(), layout)
+            .await
+            .unwrap();
+        let peer = Peer {
+            address: [1; 6],
+            random: false,
+            transport: Transport::Classic,
+        };
+        let mut policy = Policy::paired(1, peer, b"Gamepad");
+        policy.bond = 1;
+        let bond = Bond {
+            owner: 1,
+            identity: peer,
+            complete: true,
+            keys: Keys::Classic {
+                key: [42; 16],
+                kind: 4,
+            },
+        };
+        cordial_core::bonds::commit(&mut store, &policy, &bond)
+            .await
+            .unwrap();
+        let legacy = store.load_owned(record_key(2, 1)).await.unwrap().unwrap();
+        drop(store);
+        let mut store = Storage::open(flash.clone(), range.clone(), layout)
+            .await
+            .unwrap();
+        let old = Policies { store: &mut store }.load(1).await.unwrap();
+        assert!(old.output_preferences.is_empty());
+        assert_eq!(
+            outputs::gamepad(&old.output_preferences),
+            OutputMode::Disabled
+        );
+        Policies { store: &mut store }.save(&old).await.unwrap();
+        assert_eq!(
+            store.load_owned(record_key(2, 1)).await.unwrap().unwrap(),
+            legacy
+        );
+        policy.output_preferences.push(Preference {
+            role: Role::Gamepad,
+            mode: OutputMode::Xinput,
+        });
+        Policies { store: &mut store }.save(&policy).await.unwrap();
+        drop(store);
+        let mut store = Storage::open(flash, range, layout).await.unwrap();
+        let restored = Policies { store: &mut store }.load(1).await.unwrap();
+        assert_eq!(restored, policy);
+        assert_eq!(store.keys().await.unwrap(), [record_key(2, 1)]);
+        let bytes = store.load_owned(record_key(2, 1)).await.unwrap().unwrap();
+        let saved = cordial_protocol::storage::Device::decode(bytes.as_slice()).unwrap();
+        assert_eq!(saved.policy.unwrap().output_preferences.len(), 1);
+    });
+}

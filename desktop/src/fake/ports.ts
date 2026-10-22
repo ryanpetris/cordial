@@ -1,13 +1,21 @@
 // Ports of simulated adapters, standing in for real ones in every host's
 // demo mode.
 import type { ByteStream, PortInfo } from "@cordial/client";
-import { FakeAdapter, demoCandidatesBle, demoDevices, demoDevicesBle, demoProfiles } from "./adapter.ts";
+import { FakeAdapter, demoCandidatesBle, demoDevices, demoDevicesBle, demoProfiles, device } from "./adapter.ts";
 
-/** The demo devices with layers using the demo profiles. */
+/** The demo devices with layers using the demo profiles, and a controller with gamepad output. */
 function devicesWithLayers() {
   const devices = demoDevices();
   devices[0]!.profiles = [1];
   devices[1]!.profiles = [2];
+  devices.push(device(5, {
+    name: "Example Controller",
+    kinds: ["gamepad"],
+    state: "connected",
+    roles: ["gamepad"],
+    gamepadOutput: "xinput",
+    info: { "device.manufacturer": "Example Co", "battery.level": 64, "battery.charging": false },
+  }));
   return devices;
 }
 

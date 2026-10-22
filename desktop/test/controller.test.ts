@@ -104,7 +104,7 @@ describe("Controller", () => {
       if (source === "session") a.unplug();
       else await c.manager.rescan();
       await vi.advanceTimersByTimeAsync(0);
-      expect(c.state().adapters).toEqual([{ ...before, connection: "connecting", readiness: "waiting", attention: [] }]);
+      expect(c.state().adapters).toEqual([{ ...before, connection: "connecting", readiness: "waiting", listing: true, attention: [] }]);
       expect(c.state().devices).toEqual([]);
       expect(await c.act({ type: "profile.delete", adapterId: a.id, profile: 1 })).toMatchObject({ ok: false });
       expect(a.profiles).toHaveLength(1);
@@ -118,6 +118,26 @@ describe("Controller", () => {
       await c.stop();
       vi.useRealTimers();
     }
+  });
+
+  it("waits for a returning adapter's devices only while it is listing them", async () => {
+    const a = new FakeAdapter({ adapterId: "AAAA0001" });
+    const { c, deps, ports, state } = controller({ "/a": a });
+    ports.list = async () => Object.keys(deps.ports).map((path) => ({ path, serial: null }));
+    await c.manager.rescan();
+    await until(() => loaded(state(), 4));
+    expect(c.state().adapters[0]!.listing).toBe(false);
+    delete deps.ports["/a"];
+    a.unplug();
+    await until(() => c.state().adapters[0]?.connection === "connecting");
+    expect(c.state().adapters[0]!.listing).toBe(true);
+    a.failures.listDevices = [ErrorCode.STORAGE_FAILED];
+    deps.ports["/b"] = a;
+    await c.manager.rescan();
+    await until(() => c.state().adapters[0]?.connection === "connected" && !c.state().adapters[0]!.listing);
+    expect(c.state().adapters[0]!.connection).toBe("connected");
+    expect(c.state().devices).toEqual([]);
+    await c.stop();
   });
 
   it("reconnects by adapter identity on a new port and cancels the expiry", async () => {

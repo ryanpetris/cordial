@@ -84,7 +84,7 @@ its own; there is no separate connect step.
 | --- | --- | --- |
 | `ListDevices` | `DeviceList` | One page of saved devices in ascending ID order. A device whose record cannot be read is listed by ID as `unreadable` and the listing continues past it. |
 | `GetDevice` | `Device` | One saved device. |
-| `SetDevice` | none | Partial update of `enabled`, `trusted`, `blocked`, integration preferences and profile layers, saved in one write. Integration updates apply in order. Turning `enabled` off or `blocked` on closes the device's link. |
+| `SetDevice` | none | Partial update of `enabled`, `trusted`, `blocked`, integration preferences, output preferences and profile layers, saved in one write. Integration and output updates apply in order. Turning `enabled` off or `blocked` on closes the device's link. |
 | `ConnectDevice` | `Device` | Clears a disconnect pause and starts connecting, or joins an attempt already running. Refused for a disabled or blocked device and while a pairing runs. |
 | `DisconnectDevice` | `Device` | Closes the link and pauses automatic reconnection until `ConnectDevice` or a restart. |
 | `UnpairDevice` | none | Pauses and disconnects the device, then deletes its bond and settings once the link is gone; `device_removed` follows. |
@@ -140,6 +140,28 @@ A storage read that fails is an error, never proof that data is missing: the ope
 the data fails with `ERROR_CODE_STORAGE_FAILED` and nothing is deleted. A read error while loading at
 startup leaves storage not ready, so `Status.ready` stays false.
 
+### Output preferences
+
+`SetDevice.output_preferences` changes only the listed roles. Entries apply in order, with the last
+entry for a role winning, and the complete policy is saved once before runtime state changes.
+Only Gamepad is configurable. Disabled clears its saved enabled choice and works without backend
+support. HID and XInput require that role and mode in `Status.output_support`; otherwise the command
+returns `ERROR_CODE_UNSUPPORTED`. Unknown numeric roles or modes and an unspecified role return
+`ERROR_CODE_BAD_ARGS`. Other known roles return `ERROR_CODE_UNSUPPORTED`. Invalid updates and
+failed saves leave the previous policy and desired pools unchanged. An empty list changes nothing.
+Clients gate these writes on advertised support because older firmware ignores unknown fields.
+
+A missing Gamepad preference means Disabled. Saving HID or XInput contributes to
+that mode's desired USB pool even while the device is disconnected, disabled or
+blocked. Each pool is independently capped at four; `max_slots` is not a limit
+on how many paired devices may save the choice. Pairing, unpairing or a saved
+mode change reconnects USB after the response when a pool count changes.
+Connecting and disconnecting devices only assigns or releases existing slots.
+See [live output states and pool rules](records.md#devices) and
+[USB gamepad behavior](hid-forwarding.md#usb-gamepad-outputs). Client controls,
+CLI commands and human-readable slot numbering are described in
+[Gamepad outputs](clients.md#gamepad-outputs).
+
 ## Settings
 
 | Command | Result | Behavior |
@@ -184,35 +206,42 @@ See [HID++](../hidpp.md) for the device operations behind each HID++ setting.
 | `CreateProfile` | `ProfileCreated` | Saves a new, empty profile and returns its ID; a `profile` event follows. |
 | `CopyProfile` | `ProfileCreated` | Saves a new profile with the source's rules and returns its ID; a `profile` event follows. |
 | `DeleteProfile` | none | Deletes an unused profile with its rules; `profile_removed` follows. |
-| `ListProfileRules` | `ProfileRules` | One page of the profile's rules, in ascending usage page and usage order of their inputs. |
-| `SetProfileRules` | none | Saves and forgets rules in one storage write. Each change either saves a rule or, with `forget`, removes the rule for an input. |
+| `ListProfileRules` | `ProfileRules` | One page of the profile's rules, ordered by input usage page, input usage, collection usage page, then collection usage. `after` is the last rule's `ProfileRuleRef`, containing both `input` and `collection`. |
+| `SetProfileRules` | none | Saves and forgets rules in one storage write. Each change either saves a rule or, with `forget`, removes the rule for an input and collection. |
 
 A new profile is empty and passes every input through unchanged. Nothing is filled in on the
-client's behalf. A rule is refused with `ERROR_CODE_BAD_ARGS`, and nothing is saved, when its input
-is outside `ProfileSupport.remap_inputs` for a remap or `scale_inputs` for a scale, when a remap
-has an output outside `remap_outputs` or more than `max_remap_outputs` outputs, or when a scale has
-a zero numerator or denominator. A save that would make the profile larger than `memory_budget`
-returns `ERROR_CODE_NO_CAPACITY` with `CAPACITY_REASON_PROFILE_MEMORY`, since it could never be
-loaded. The Dongle applies every rule it accepts to every device that uses the profile, whatever
+client's behalf. Every rule and `ProfileRuleRef` requires both an `input` usage and its application
+`collection`; the collection is never inferred from the usage. Each capability range includes its
+collection, so the same usage in Mouse and Game Pad collections identifies different inputs.
+A rule is refused with `ERROR_CODE_BAD_ARGS`, and nothing is saved, when its input and collection
+are outside `ProfileSupport.ranges` of kind `KIND_REMAP_INPUT` for a remap, `KIND_SCALE_INPUT`
+for a scale or `KIND_AXIS_INPUT` for an axis rule, when a remap has an output outside ranges of
+kind `KIND_REMAP_OUTPUT` or more than `max_remap_outputs` outputs, or when a scale has a zero
+numerator or denominator. An axis rule's `destination` must be within ranges of kind
+`KIND_AXIS_OUTPUT` in the input's Game Pad collection. Unknown and unspecified kinds grant no
+capability. Axis rules apply only to absolute Game Pad axes; `invert` reverses the normalized
+axis range. They add no deadzones, curves or sensitivity settings. A save that would make the
+profile larger than `memory_budget` returns `ERROR_CODE_NO_CAPACITY` with
+`CAPACITY_REASON_PROFILE_MEMORY`, since it could never be loaded. The Dongle applies every rule it accepts to every device that uses the profile, whatever
 kind of device it is. The number of saved profiles is limited only by flash; creating or copying one
 that does not fit returns `ERROR_CODE_NO_CAPACITY` with `CAPACITY_REASON_STORAGE`.
 
-A profile has at most one rule for each input. Changes in one `SetProfileRules` apply in order, so a
-later save or forget for the same input replaces an earlier one; forgetting a rule that does not
-exist is accepted. Rules stay sparse. A rule is saved and reported in its normalized form:
+A profile has at most one rule for each input and collection together. Changes in one
+`SetProfileRules` apply in order, so a later save or forget for the same input and collection
+replaces an earlier one; forgetting a rule that does not exist is accepted. Rules stay sparse. A
+rule is saved and reported in its normalized form:
 
 - A missing output collection is resolved to the only report that carries the usage.
 - A remap keeps each output, a usage with its collection, once, sorted by usage page, usage, then
   collection usage page and usage.
 - A scale's ratio is reduced to lowest terms.
 
-A normalized rule that remaps its input to only itself, in the collection the input arrives in, or
-scales it by a ratio equal to 1, changes nothing, so saving it forgets the input's rule, through the
-serial API and through a configuration interface alike. An input arrives in the Keyboard collection
-(`01:06`) from the Keyboard page, in the Mouse collection (`01:02`) from the Button page and as AC
-Pan (`0c:238`) or a Generic Desktop X, Y or Wheel value, in the Consumer Control collection
-(`0c:01`) from the rest of the Consumer page, and in the System Control collection (`01:80`) from
-the rest of the Generic Desktop page.
+A normalized rule that remaps its input to only itself in the same collection, scales it by a
+ratio equal to 1, or maps an axis to itself without inversion changes nothing. Saving it forgets
+the rule for that input and collection, through the serial API and through a configuration
+interface alike. An input keeps the application collection of its report. Game Pad inputs use
+Game Pad (`01:05`), independently of Mouse (`01:02`), Keyboard (`01:06`), Consumer Control
+(`0c:01`) and System Control (`01:80`) inputs with the same usage.
 
 These limits apply to saves. A saved profile that a later firmware's limits no longer allow is kept
 as saved: a rule whose input or output the firmware does not support has no effect, only the first

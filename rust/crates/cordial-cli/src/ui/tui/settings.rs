@@ -1,10 +1,11 @@
-//! A device's Settings tab: its settings grouped by category, each with the control its type
-//! calls for and a marker for its saved state, and the readings that belong beside them. Every
-//! control stages a change; Save sends every staged change of the device in one request.
+//! A device's Settings tab: its gamepad output, its settings grouped by category, each with the
+//! control its type calls for and a marker for its saved state, and the readings that belong beside
+//! them. Every control stages a change; Save sends every staged setting of the device in one
+//! request, then a staged gamepad output in another.
 use super::{
-    Action, Job, Kind, Menu, Model, Spot, Submission,
+    Action, Dialog, Job, Kind, Menu, Model, Spot, Submission, Tab,
     fleet::Fleet,
-    layout::{self, Layout, Tone, accent, dim, err, ok, span, styled, warn},
+    layout::{self, Choice, Layout, Tone, accent, dim, err, ok, span, styled, warn},
     render::{PageView, button_if},
     words,
     world::DeviceView,
@@ -15,7 +16,7 @@ use crate::{
     model::{self, Type},
     ui::{catalog, text},
 };
-use cordial_protocol::{self as p, ErrorCode, SettingState, keys, value::Value};
+use cordial_protocol::{self as p, ErrorCode, OutputMode, SettingState, keys, value::Value};
 use ratatui::{style::Style, text::Line};
 use std::collections::BTreeMap;
 
@@ -248,7 +249,28 @@ impl<F: Fleet> Model<F> {
 
     /// Whether the settings form takes no changes now.
     fn form_busy(&self, d: &DeviceView) -> bool {
-        !self.adapter_ready(d) || self.refreshing(d) || self.settings_busy(d)
+        !self.adapter_ready(d)
+            || self.device_saving(d, Tab::Settings)
+            || self.refreshing(d)
+            || self.settings_busy(d)
+    }
+
+    /// The gamepad output modes the Settings tab offers the device; none when it has no Gamepad
+    /// Output to choose or no choice differs from the saved one.
+    pub(super) fn gamepad_choices(&self, d: &DeviceView) -> Vec<OutputMode> {
+        // The adapter's last known status, so the control stays while the adapter reconnects.
+        let choices = self
+            .adapter(&d.adapter)
+            .and_then(|a| a.status.as_ref())
+            .filter(|_| model::gamepad(&d.d))
+            .map(|status| model::gamepad_choices(status, &d.d))
+            .unwrap_or_default();
+        let saved = model::gamepad_mode(&d.d);
+        if choices.iter().any(|m| Some(*m) != saved) {
+            choices
+        } else {
+            Vec::new()
+        }
     }
 
     /// Whether the device's adapter is connected and ready, so it can save settings.
@@ -342,6 +364,10 @@ impl<F: Fleet> Model<F> {
         let busy = self.form_busy(&d);
         let key = (adapter.to_owned(), id);
         match action {
+            Action::GamepadOutput(mode) if !busy => {
+                let mode = *mode;
+                self.stage_device(&d, Tab::Settings, |u| u.gamepad = Some(mode));
+            }
             Action::SettingBool(k, v) if !busy => {
                 if let Some(s) = self.setting(&d, k) {
                     self.edit(&d, &s, Value::Bool(*v));
@@ -485,39 +511,74 @@ impl<F: Fleet> Model<F> {
                         ))
                     })
                     .collect();
-                self.send_settings(&d, sent);
+                self.send_settings(&d, sent, false);
             }
-            Action::SettingsDiscard if !self.submitting(&d) => {
+            Action::SettingsDiscard
+                if !self.submitting(&d) && !self.device_saving(&d, Tab::Settings) =>
+            {
                 self.setting_drafts.remove(&key);
+                if let Some(draft) = self.device_drafts.get_mut(&key) {
+                    draft.gamepad = None;
+                    if draft.is_empty() {
+                        self.device_drafts.remove(&key);
+                    }
+                }
                 self.editing = None;
                 self.notes.remove(&Spot::SettingsNote(key.0, key.1));
             }
             Action::SettingsSave => {
                 self.commit_editing();
-                self.save_settings(adapter, id);
+                self.save_settings(adapter, id, false);
             }
             _ => return false,
         }
         true
     }
 
-    /// Saves the device's staged settings.
-    pub(super) fn save_settings(&mut self, adapter: &str, id: u32) {
+    /// Whether the device's staged settings or gamepad output can be saved now.
+    pub(super) fn settings_savable(&self, d: &DeviceView) -> bool {
+        let (changes, invalid) = self.setting_changes(d);
+        let gamepad = self.device_changes(d).gamepad;
+        !self.form_busy(d)
+            && !invalid
+            && (!changes.is_empty() || gamepad.is_some())
+            && !(gamepad.is_some() && self.device_locked(d))
+    }
+
+    /// Saves the device's staged settings, then its staged gamepad output, asking first when the
+    /// gamepad output change reconnects USB.
+    pub(super) fn save_settings(&mut self, adapter: &str, id: u32, confirmed: bool) {
         let Some(d) = self.device(adapter, id).cloned() else {
             return;
         };
-        let (changes, invalid) = self.setting_changes(&d);
-        if self.form_busy(&d) || invalid || changes.is_empty() {
+        if !self.settings_savable(&d) {
             return;
         }
+        let gamepad = self.device_changes(&d).gamepad;
+        if !confirmed
+            && let Some(mode) = gamepad
+            && self
+                .state_of(adapter)
+                .is_some_and(|st| model::gamepad_pools_change(&st.status, &st.devices, id, mode))
+        {
+            self.dialog = Some(Dialog::SaveSettings(adapter.to_owned(), id));
+            return;
+        }
+        let (changes, _) = self.setting_changes(&d);
         let sent: Vec<(String, Draft)> = changes
             .into_iter()
             .filter_map(|(k, _)| Some((k.clone(), self.draft_of(&d, &k)?.clone())))
             .collect();
-        self.send_settings(&d, sent);
+        if sent.is_empty() {
+            self.save_device(&d, Tab::Settings);
+        } else {
+            self.send_settings(&d, sent, gamepad.is_some());
+        }
     }
 
-    fn send_settings(&mut self, d: &DeviceView, sent: Vec<(String, Draft)>) {
+    /// Sends staged settings, and once they save the staged gamepad output when `gamepad`. A
+    /// gamepad output save can reconnect USB, so nothing else is in flight when it is sent.
+    fn send_settings(&mut self, d: &DeviceView, sent: Vec<(String, Draft)>, gamepad: bool) {
         if sent.is_empty() {
             return;
         }
@@ -550,6 +611,7 @@ impl<F: Fleet> Model<F> {
             Kind::SettingsSave {
                 device: key.1,
                 sent,
+                gamepad,
             },
             Command::SettingsSave {
                 device: key.1,
@@ -560,7 +622,12 @@ impl<F: Fleet> Model<F> {
     }
 
     pub(super) fn settings_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
-        let Kind::SettingsSave { device, sent } = &job.kind else {
+        let Kind::SettingsSave {
+            device,
+            sent,
+            gamepad,
+        } = &job.kind
+        else {
             return;
         };
         let key = (job.adapter.clone(), *device);
@@ -577,6 +644,9 @@ impl<F: Fleet> Model<F> {
                     if drafts.is_empty() {
                         self.setting_drafts.remove(&key);
                     }
+                }
+                if *gamepad && let Some(d) = self.device(&key.0, key.1).cloned() {
+                    self.save_device(&d, Tab::Settings);
                 }
             }
             Err(e) => {
@@ -894,7 +964,35 @@ impl<F: Fleet> Model<F> {
             categories.push("Wheel");
         }
         let w = v.body.width;
+        let gamepad = self.gamepad_choices(d);
+        let gamepad_change = self.device_changes(d).gamepad;
+        let gamepad_saving = self.device_saving(d, Tab::Settings);
         let b = &mut v.body;
+        if !gamepad.is_empty() {
+            let shown = gamepad_change.or_else(|| model::gamepad_mode(&d.d));
+            let options = gamepad
+                .into_iter()
+                .map(|mode| Choice {
+                    label: text::output_mode_name(mode).into(),
+                    action: Action::GamepadOutput(mode),
+                    chosen: Some(mode) == shown,
+                })
+                .collect();
+            b.section("Gamepad");
+            let mut group = Layout::new(w.saturating_sub(4));
+            group.choice_if("", 0, options, !busy);
+            let mark = match () {
+                _ if gamepad_saving => Some(format!("{} Sending", super::spinner())),
+                _ if gamepad_change.is_some() => Some("✎ Changed".to_owned()),
+                _ => None,
+            };
+            if let Some(mark) = mark {
+                let mut m = Layout::new(group.width);
+                m.lines.push(Line::from(span(format!(" {mark}"), accent())));
+                group.append(m);
+            }
+            b.labelled(Line::from(span("Gamepad Output", Style::new())), group);
+        }
         for category in categories {
             b.section(category);
             for s in settings
@@ -1007,7 +1105,7 @@ impl<F: Fleet> Model<F> {
 
         // The bar.
         let bar = &mut v.bar;
-        let saving = submission.as_ref().is_some_and(|s| s.running);
+        let saving = submission.as_ref().is_some_and(|s| s.running) || gamepad_saving;
         let starting = d.connected() && model::hidpp_up(&d.d) == model::Up::Starting;
         if saving || self.refreshing(d) || starting {
             bar.label(&format!("{}", super::spinner()), accent());
@@ -1066,21 +1164,24 @@ impl<F: Fleet> Model<F> {
                 !busy && any_free,
             );
         }
-        let dirty = self.settings_dirty(d);
+        let dirty = self.settings_dirty(d) || gamepad_change.is_some();
         let (changes, invalid) = self.setting_changes(d);
         button_if(
             &mut right,
             "Discard",
             Action::SettingsDiscard,
             Tone::Normal,
-            !self.submitting(d) && dirty,
+            !self.submitting(d) && !gamepad_saving && dirty,
         );
         button_if(
             &mut right,
             "Save",
             Action::SettingsSave,
             Tone::Primary,
-            !busy && !changes.is_empty() && !invalid,
+            !busy
+                && (!changes.is_empty() || gamepad_change.is_some())
+                && !invalid
+                && !(gamepad_change.is_some() && self.device_locked(d)),
         );
         bar.align_right(right);
     }

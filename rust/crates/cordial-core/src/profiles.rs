@@ -2,7 +2,7 @@
 //! device's layers or a configuration interface use it, and loaded profiles share a memory budget.
 use crate::{
     devices::Roles,
-    hid::{Error, Held, Input, ROTATION_STATE, SYSTEM_USAGES},
+    hid::{Error, Gamepad, Held, Input, ROTATION_STATE, SYSTEM_USAGES},
     storage::{self, RecordStore, record_key},
 };
 use alloc::{
@@ -13,6 +13,9 @@ use alloc::{
 use cordial_protocol::storage as saved;
 use core::cell::RefCell;
 use prost::Message;
+
+#[path = "gamepad_profiles.rs"]
+mod builtin;
 
 /// A HID usage as `(usage page << 16) | usage`. Zero names nothing.
 pub type Usage = u32;
@@ -35,6 +38,18 @@ pub const KEYBOARD: Usage = usage(DESKTOP_PAGE, 0x06);
 pub const MOUSE: Usage = usage(DESKTOP_PAGE, 0x02);
 pub const CONSUMER: Usage = usage(CONSUMER_PAGE, 0x01);
 pub const SYSTEM: Usage = usage(DESKTOP_PAGE, 0x80);
+pub const GAMEPAD: Usage = usage(DESKTOP_PAGE, 0x05);
+/// Absolute axes in `Gamepad::axes` order.
+pub const GAMEPAD_AXES: [Usage; 8] = [
+    usage(DESKTOP_PAGE, 0x30),
+    usage(DESKTOP_PAGE, 0x31),
+    usage(DESKTOP_PAGE, 0x32),
+    usage(DESKTOP_PAGE, 0x33),
+    usage(DESKTOP_PAGE, 0x34),
+    usage(DESKTOP_PAGE, 0x35),
+    usage(0x02, 0xc5),
+    usage(0x02, 0xc4),
+];
 /// Consumer AC Pan, the horizontal wheel a mouse reports.
 pub const PAN: Usage = usage(CONSUMER_PAGE, 0x238);
 /// The relative values in `Input::motion`, in order: X, Y, wheel and pan.
@@ -52,8 +67,7 @@ pub const MAX_LAYERS: usize = 8;
 /// Profiles returned by one listing page.
 pub const PAGE_SIZE: usize = 16;
 
-/// A contiguous range of usages on one page. `collection` names the application collection of the
-/// adapter's USB report that carries an output range, and is 0 for input ranges.
+/// A contiguous range of usages on one page in one application collection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Range {
     pub collection: Usage,
@@ -77,25 +91,7 @@ impl Range {
 /// On/off controls a remap can name: keys, held Consumer controls, mouse buttons and the System
 /// Control buttons the adapter's System Control report carries. The display rotation lock slider
 /// (`01:ca`) reports a switch position rather than a press, so rules do not name it.
-pub const REMAP_INPUTS: [Range; 9] = [
-    Range::new(0, KEYBOARD_PAGE, 0x04, 0xff),
-    Range::new(0, CONSUMER_PAGE, 0x0001, 0x0237),
-    Range::new(0, CONSUMER_PAGE, 0x0239, 0xffff),
-    Range::new(0, BUTTON_PAGE, 1, 16),
-    Range::new(0, DESKTOP_PAGE, 0x81, 0x8f),
-    Range::new(0, DESKTOP_PAGE, 0x9b, 0x9b),
-    Range::new(0, DESKTOP_PAGE, 0xa0, 0xaa),
-    Range::new(0, DESKTOP_PAGE, 0xb0, 0xb7),
-    Range::new(0, DESKTOP_PAGE, 0xc9, 0xc9),
-];
-/// Relative values a scale can name.
-pub const SCALE_INPUTS: [Range; 3] = [
-    Range::new(0, DESKTOP_PAGE, 0x30, 0x31),
-    Range::new(0, DESKTOP_PAGE, 0x38, 0x38),
-    Range::new(0, CONSUMER_PAGE, 0x0238, 0x0238),
-];
-/// What the adapter's USB reports carry, by the application collection of each report.
-pub const REMAP_OUTPUTS: [Range; 9] = [
+pub const REMAP_INPUTS: [Range; 14] = [
     Range::new(KEYBOARD, KEYBOARD_PAGE, 0x04, 0xff),
     Range::new(CONSUMER, CONSUMER_PAGE, 0x0001, 0x0237),
     Range::new(CONSUMER, CONSUMER_PAGE, 0x0239, 0xffff),
@@ -105,7 +101,39 @@ pub const REMAP_OUTPUTS: [Range; 9] = [
     Range::new(SYSTEM, DESKTOP_PAGE, 0xa0, 0xaa),
     Range::new(SYSTEM, DESKTOP_PAGE, 0xb0, 0xb7),
     Range::new(SYSTEM, DESKTOP_PAGE, 0xc9, 0xc9),
+    Range::new(GAMEPAD, CONSUMER_PAGE, 1, 0xffff),
+    Range::new(GAMEPAD, DESKTOP_PAGE, 0x85, 0x85),
+    Range::new(GAMEPAD, BUTTON_PAGE, 1, 32),
+    Range::new(GAMEPAD, DESKTOP_PAGE, 0x3d, 0x3e),
+    Range::new(GAMEPAD, DESKTOP_PAGE, 0x90, 0x93),
 ];
+/// Relative values a scale can name.
+pub const SCALE_INPUTS: [Range; 3] = [
+    Range::new(MOUSE, DESKTOP_PAGE, 0x30, 0x31),
+    Range::new(MOUSE, DESKTOP_PAGE, 0x38, 0x38),
+    Range::new(MOUSE, CONSUMER_PAGE, 0x0238, 0x0238),
+];
+/// What the adapter's USB reports carry, by the application collection of each report.
+pub const REMAP_OUTPUTS: [Range; 12] = [
+    Range::new(KEYBOARD, KEYBOARD_PAGE, 0x04, 0xff),
+    Range::new(CONSUMER, CONSUMER_PAGE, 0x0001, 0x0237),
+    Range::new(CONSUMER, CONSUMER_PAGE, 0x0239, 0xffff),
+    Range::new(MOUSE, BUTTON_PAGE, 1, 16),
+    Range::new(SYSTEM, DESKTOP_PAGE, 0x81, 0x8f),
+    Range::new(SYSTEM, DESKTOP_PAGE, 0x9b, 0x9b),
+    Range::new(SYSTEM, DESKTOP_PAGE, 0xa0, 0xaa),
+    Range::new(SYSTEM, DESKTOP_PAGE, 0xb0, 0xb7),
+    Range::new(SYSTEM, DESKTOP_PAGE, 0xc9, 0xc9),
+    Range::new(GAMEPAD, BUTTON_PAGE, 1, 32),
+    Range::new(GAMEPAD, DESKTOP_PAGE, 0x3d, 0x3e),
+    Range::new(GAMEPAD, DESKTOP_PAGE, 0x90, 0x93),
+];
+/// Absolute values an axis rule can route within the Game Pad collection.
+pub const AXIS_INPUTS: [Range; 2] = [
+    Range::new(GAMEPAD, DESKTOP_PAGE, 0x30, 0x35),
+    Range::new(GAMEPAD, 0x02, 0xc4, 0xc5),
+];
+pub const AXIS_OUTPUTS: [Range; 2] = AXIS_INPUTS;
 /// The `Held::system` bits, indexed by `SYSTEM_USAGES`, of the System Control buttons rules name.
 /// Other bits carry the rotation lock slider and pass through unchanged.
 const SYSTEM_BUTTONS: u64 = ((1 << SYSTEM_USAGES.len()) - 1) & !ROTATION_STATE;
@@ -118,19 +146,6 @@ fn system_bit(id: u16) -> Option<u64> {
         .filter(|bit| bit & SYSTEM_BUTTONS != 0)
 }
 
-/// The application collection device input of `usage` arrives in. The HID decoder groups held
-/// input by role, so each usage page reaches one collection.
-pub fn input_collection(usage: Usage) -> Usage {
-    match page(usage) {
-        KEYBOARD_PAGE => KEYBOARD,
-        BUTTON_PAGE => MOUSE,
-        CONSUMER_PAGE if usage == PAN => MOUSE,
-        CONSUMER_PAGE => CONSUMER,
-        DESKTOP_PAGE if AXES.contains(&usage) => MOUSE,
-        DESKTOP_PAGE => SYSTEM,
-        _ => 0,
-    }
-}
 /// The collection of the only report that carries `usage`, if exactly one does.
 pub fn output_collection(usage: Usage) -> Option<Usage> {
     let mut found = REMAP_OUTPUTS.iter().filter(|r| r.contains(usage));
@@ -149,12 +164,28 @@ pub struct Output {
 pub enum Effect {
     Remap(Vec<Output>),
     Scale(i32, u32),
+    Axis(Usage, bool),
 }
 
-/// One rule as clients see it. A profile has at most one rule for each input.
+/// Identifies one input by usage first, then application collection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub struct RuleRef {
+    pub input: Usage,
+    pub collection: Usage,
+}
+impl From<Output> for RuleRef {
+    fn from(output: Output) -> Self {
+        Self {
+            input: output.usage,
+            collection: output.collection,
+        }
+    }
+}
+/// One rule as clients see it. A profile has at most one rule for each input and collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Rule {
     pub input: Usage,
+    pub collection: Usage,
     pub effect: Effect,
 }
 
@@ -164,6 +195,7 @@ pub enum Invalid {
     Input,
     Output,
     Scale,
+    Axis,
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -174,14 +206,24 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 }
 
 impl Rule {
+    pub fn reference(&self) -> RuleRef {
+        RuleRef {
+            input: self.input,
+            collection: self.collection,
+        }
+    }
     /// Checks a rule against what the firmware supports and puts it in its saved form: output
     /// collections resolved, outputs sorted without duplicates and ratios in lowest terms.
     pub fn normalized(mut self) -> Result<Self, Invalid> {
         let ranges: &[Range] = match self.effect {
             Effect::Remap(_) => &REMAP_INPUTS,
             Effect::Scale(..) => &SCALE_INPUTS,
+            Effect::Axis(..) => &AXIS_INPUTS,
         };
-        if !ranges.iter().any(|r| r.contains(self.input)) {
+        if !ranges
+            .iter()
+            .any(|r| r.collection == self.collection && r.contains(self.input))
+        {
             return Err(Invalid::Input);
         }
         match &mut self.effect {
@@ -213,6 +255,14 @@ impl Rule {
                 resolved.sort();
                 *outputs = resolved;
             }
+            Effect::Axis(destination, _) => {
+                if !AXIS_OUTPUTS
+                    .iter()
+                    .any(|r| r.collection == self.collection && r.contains(*destination))
+                {
+                    return Err(Invalid::Axis);
+                }
+            }
             Effect::Scale(numerator, denominator) => {
                 if *numerator == 0 || *denominator == 0 {
                     return Err(Invalid::Scale);
@@ -227,33 +277,35 @@ impl Rule {
         }
         Ok(self)
     }
-    /// A rule that changes nothing: a remap of the input to only itself in the collection it
-    /// arrives in, or a scale by 1.
+    /// A rule that changes nothing: a remap to itself in its collection, a scale by 1, or an
+    /// uninverted axis route to itself.
     pub fn identity(&self) -> bool {
         match &self.effect {
             Effect::Remap(outputs) => {
                 outputs.as_slice()
                     == [Output {
                         usage: self.input,
-                        collection: input_collection(self.input),
+                        collection: self.collection,
                     }]
             }
             Effect::Scale(n, d) => *n > 0 && n.unsigned_abs() == *d,
+            Effect::Axis(destination, invert) => *destination == self.input && !invert,
         }
     }
     /// The role of the input this rule changes, as a `hid` role bit.
     #[cfg(test)]
     fn role(&self) -> u8 {
-        role(self.input)
+        role(self.collection)
     }
 }
-/// The role of `input`, as a `hid` role bit.
-fn role(input: Usage) -> u8 {
-    match input_collection(input) {
+/// The role of an application collection, as a `hid` role bit.
+fn role(collection: Usage) -> u8 {
+    match collection {
         KEYBOARD => crate::hid::KEYBOARD,
         MOUSE => crate::hid::MOUSE,
         CONSUMER => crate::hid::CONSUMER,
         SYSTEM => crate::hid::SYSTEM,
+        GAMEPAD => crate::hid::GAMEPAD,
         _ => 0,
     }
 }
@@ -262,12 +314,12 @@ fn role(input: Usage) -> u8 {
 pub enum Change {
     Set(Rule),
     /// Forgets the rule for this input.
-    Forget(Usage),
+    Forget(RuleRef),
 }
 impl Change {
-    fn input(&self) -> Usage {
+    fn input(&self) -> RuleRef {
         match self {
-            Self::Set(rule) => rule.input,
+            Self::Set(rule) => rule.reference(),
             Self::Forget(input) => *input,
         }
     }
@@ -284,23 +336,35 @@ impl Change {
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     input: Usage,
-    /// Index of the first output, or of the scale.
+    collection: Usage,
+    /// Index of the first output, scale, or axis route.
     first: u16,
-    /// Outputs of a remap; `SCALE` for a scale.
+    /// Outputs of a remap; `SCALE` or `AXIS` for the other effects.
     count: u8,
 }
 const SCALE: u8 = u8::MAX;
+const AXIS: u8 = SCALE - 1;
+impl Entry {
+    fn reference(&self) -> RuleRef {
+        RuleRef {
+            input: self.input,
+            collection: self.collection,
+        }
+    }
+}
 
 #[derive(PartialEq)]
 enum Found<'a> {
     Remap(&'a [Output]),
     Scale(i32, u32),
+    Axis(Usage, bool),
 }
 impl<'a> Found<'a> {
     fn of(effect: &'a Effect) -> Self {
         match effect {
             Effect::Remap(outputs) => Self::Remap(outputs),
             Effect::Scale(n, d) => Self::Scale(*n, *d),
+            Effect::Axis(destination, invert) => Self::Axis(*destination, *invert),
         }
     }
 }
@@ -310,12 +374,13 @@ enum Merged<'a> {
     Set(&'a Rule),
 }
 
-/// A profile's rules, sorted by input for lookup.
+/// A profile's rules, sorted by input usage and collection for lookup.
 #[derive(Clone, Debug, Default)]
 pub struct Rules {
     entries: Vec<Entry>,
     outputs: Vec<Output>,
     scales: Vec<(i32, u32)>,
+    axes: Vec<(Usage, bool)>,
 }
 impl PartialEq for Rules {
     fn eq(&self, other: &Self) -> bool {
@@ -323,10 +388,17 @@ impl PartialEq for Rules {
     }
 }
 impl Rules {
-    /// Builds the table from saved rules. Each input appears at most once.
+    /// Builds the table from rules. Each input and collection pair appears at most once.
     pub fn new(mut rules: Vec<Rule>) -> Result<Self, Error> {
-        rules.sort_by_key(|r| r.input);
-        if rules.windows(2).any(|w| w[0].input == w[1].input) {
+        rules.sort_by_key(Rule::reference);
+        if rules.iter().any(|r| {
+            r.input == 0
+                || r.collection == 0
+                || matches!(&r.effect, Effect::Remap(outputs) if outputs.len() >= usize::from(AXIS))
+        }) || rules
+            .windows(2)
+            .any(|w| w[0].reference() == w[1].reference())
+        {
             return Err(Error::Invalid);
         }
         let mut table = Self::default();
@@ -334,15 +406,17 @@ impl Rules {
             .iter()
             .map(|r| match &r.effect {
                 Effect::Remap(o) => o.len(),
-                Effect::Scale(..) => 0,
+                Effect::Scale(..) | Effect::Axis(..) => 0,
             })
             .sum();
-        let scales = rules.len().saturating_sub(
-            rules
-                .iter()
-                .filter(|r| matches!(r.effect, Effect::Remap(_)))
-                .count(),
-        );
+        let scales = rules
+            .iter()
+            .filter(|r| matches!(r.effect, Effect::Scale(..)))
+            .count();
+        let axes = rules
+            .iter()
+            .filter(|r| matches!(r.effect, Effect::Axis(..)))
+            .count();
         table
             .entries
             .try_reserve_exact(rules.len())
@@ -355,8 +429,16 @@ impl Rules {
             .scales
             .try_reserve_exact(scales)
             .map_err(|_| Error::Capacity)?;
+        table
+            .axes
+            .try_reserve_exact(axes)
+            .map_err(|_| Error::Capacity)?;
         for rule in rules {
             let (first, count) = match rule.effect {
+                Effect::Axis(destination, invert) => {
+                    table.axes.push((destination, invert));
+                    (table.axes.len() - 1, AXIS)
+                }
                 Effect::Remap(outputs) => {
                     let first = table.outputs.len();
                     table.outputs.extend(outputs);
@@ -369,6 +451,7 @@ impl Rules {
             };
             table.entries.push(Entry {
                 input: rule.input,
+                collection: rule.collection,
                 first: u16::try_from(first).map_err(|_| Error::Limit)?,
                 count,
             });
@@ -383,7 +466,10 @@ impl Rules {
     }
     fn found(&self, entry: &Entry) -> Found<'_> {
         let first = usize::from(entry.first);
-        if entry.count == SCALE {
+        if entry.count == AXIS {
+            let (destination, invert) = self.axes[first];
+            Found::Axis(destination, invert)
+        } else if entry.count == SCALE {
             let (n, d) = self.scales[first];
             Found::Scale(n, d)
         } else {
@@ -393,52 +479,55 @@ impl Rules {
     fn rule(&self, entry: &Entry) -> Rule {
         Rule {
             input: entry.input,
+            collection: entry.collection,
             effect: match self.found(entry) {
                 Found::Remap(outputs) => Effect::Remap(outputs.to_vec()),
                 Found::Scale(n, d) => Effect::Scale(n, d),
+                Found::Axis(destination, invert) => Effect::Axis(destination, invert),
             },
         }
     }
     pub fn iter(&self) -> impl Iterator<Item = Rule> + '_ {
         self.entries.iter().map(|e| self.rule(e))
     }
-    /// The rules for inputs above `after`, in ascending input order.
-    pub fn after(&self, after: Option<Usage>) -> impl Iterator<Item = Rule> + '_ {
+    /// The rules above `after`, ordered by input usage first and collection second.
+    pub fn after(&self, after: Option<RuleRef>) -> impl Iterator<Item = Rule> + '_ {
         let start = after.map_or(0, |after| {
-            self.entries.partition_point(|e| e.input <= after)
+            self.entries.partition_point(|e| e.reference() <= after)
         });
         self.entries[start..].iter().map(|e| self.rule(e))
     }
     /// The rule for `input`, if it has one.
-    pub fn get(&self, input: Usage) -> Option<Rule> {
+    pub fn get(&self, input: RuleRef) -> Option<Rule> {
         let i = self
             .entries
-            .binary_search_by_key(&input, |e| e.input)
+            .binary_search_by_key(&input, Entry::reference)
             .ok()?;
         Some(self.rule(&self.entries[i]))
     }
     /// The rule for `input`.
-    fn lookup(&self, input: Usage) -> Option<Found<'_>> {
+    fn lookup(&self, input: RuleRef) -> Option<Found<'_>> {
         let i = self
             .entries
-            .binary_search_by_key(&input, |e| e.input)
+            .binary_search_by_key(&input, Entry::reference)
             .ok()?;
         Some(self.found(&self.entries[i]))
     }
     /// Bytes the table occupies while loaded.
     pub fn memory(&self) -> usize {
-        64 + self.entries.capacity() * core::mem::size_of::<Entry>()
+        80 + self.entries.capacity() * core::mem::size_of::<Entry>()
             + self.outputs.capacity() * core::mem::size_of::<Output>()
             + self.scales.capacity() * core::mem::size_of::<(i32, u32)>()
+            + self.axes.capacity() * core::mem::size_of::<(Usage, bool)>()
     }
     /// The roles of the input the rules change, as `hid` role bits.
     pub fn roles(&self) -> u8 {
         self.entries
             .iter()
-            .fold(0, |roles, e| roles | role(e.input))
+            .fold(0, |roles, e| roles | role(e.collection))
     }
-    /// The rules of this table and `changes` sorted by input with one change per input, merged
-    /// in input order: a change replaces the rule for its input.
+    /// Merges this table with changes sorted by input usage and collection. A change replaces
+    /// only the rule for that pair.
     fn merged<'a>(&'a self, changes: &'a [Change]) -> impl Iterator<Item = Merged<'a>> + 'a {
         let (mut kept, mut changed) = (0, 0);
         core::iter::from_fn(move || {
@@ -448,11 +537,11 @@ impl Rules {
                     kept += 1;
                     return entry.map(Merged::Kept);
                 };
-                if let Some(entry) = entry.filter(|e| e.input < change.input()) {
+                if let Some(entry) = entry.filter(|e| e.reference() < change.input()) {
                     kept += 1;
                     return Some(Merged::Kept(entry));
                 }
-                if entry.is_some_and(|e| e.input == change.input()) {
+                if entry.is_some_and(|e| e.reference() == change.input()) {
                     kept += 1;
                 }
                 changed += 1;
@@ -473,12 +562,17 @@ impl Rules {
         let any = changes
             .iter()
             .any(|c| self.lookup(c.input()) != c.rule().map(|rule| Found::of(&rule.effect)));
-        let (mut rules, mut outputs, mut scales) = (0, 0, 0);
+        let (mut rules, mut outputs, mut scales, mut axes) = (0, 0, 0, 0);
         for item in self.merged(&changes) {
             rules += 1;
             match item {
+                Merged::Kept(entry) if entry.count == AXIS => axes += 1,
                 Merged::Kept(entry) if entry.count == SCALE => scales += 1,
                 Merged::Kept(entry) => outputs += usize::from(entry.count),
+                Merged::Set(Rule {
+                    effect: Effect::Axis(..),
+                    ..
+                }) => axes += 1,
                 Merged::Set(Rule {
                     effect: Effect::Scale(..),
                     ..
@@ -489,7 +583,10 @@ impl Rules {
                 }) => outputs += o.len(),
             }
         }
-        if outputs > usize::from(u16::MAX) || scales > usize::from(u16::MAX) {
+        if outputs > usize::from(u16::MAX)
+            || scales > usize::from(u16::MAX)
+            || axes > usize::from(u16::MAX)
+        {
             return Err(Error::Limit);
         }
         let mut table = Self::default();
@@ -505,16 +602,24 @@ impl Rules {
             .scales
             .try_reserve_exact(scales)
             .map_err(|_| Error::Capacity)?;
+        table
+            .axes
+            .try_reserve_exact(axes)
+            .map_err(|_| Error::Capacity)?;
         for item in self.merged(&changes) {
             let (input, found) = match item {
-                Merged::Kept(entry) => (entry.input, self.found(entry)),
+                Merged::Kept(entry) => (entry.reference(), self.found(entry)),
                 Merged::Set(rule) => match &rule.effect {
                     // A rule a change sets holds what a remap may; one kept is left as it is.
                     Effect::Remap(o) if o.len() > MAX_REMAP_OUTPUTS => return Err(Error::Limit),
-                    effect => (rule.input, Found::of(effect)),
+                    effect => (rule.reference(), Found::of(effect)),
                 },
             };
             let (first, count) = match found {
+                Found::Axis(destination, invert) => {
+                    table.axes.push((destination, invert));
+                    (table.axes.len() - 1, AXIS)
+                }
                 Found::Remap(o) => {
                     table.outputs.extend_from_slice(o);
                     (table.outputs.len() - o.len(), o.len() as u8)
@@ -525,8 +630,9 @@ impl Rules {
                 }
             };
             table.entries.push(Entry {
-                input,
-                // Both lists hold at most `u16::MAX` items, checked above.
+                input: input.input,
+                collection: input.collection,
+                // The lists hold at most `u16::MAX` items, checked above.
                 first: first as u16,
                 count,
             });
@@ -569,19 +675,21 @@ fn fields(mut bytes: &[u8], tag: u32) -> impl Iterator<Item = Result<&[u8], stor
     })
 }
 impl Rules {
-    /// The table a saved rules file holds. A first pass counts the rules, outputs and scales from
+    /// The table a saved rules file holds. A first pass counts entries and effect data from
     /// the file's framing so the table is reserved once, exactly. The file lists each rule once,
-    /// sorted by input, so the table is filled in file order; a file that does not is undecodable.
+    /// sorted by input usage and collection, so the table is filled in file order; a file that
+    /// does not is undecodable.
     fn decode(bytes: &[u8]) -> Result<Self, storage::Error> {
         let count = |bytes, tag| fields(bytes, tag).try_fold(0usize, |n, e| e.map(|_| n + 1));
-        let (mut rules, mut outputs, mut scales) = (0, 0, 0);
+        let (mut rules, mut outputs, mut scales, mut axes) = (0, 0, 0, 0);
         for rule in fields(bytes, 1) {
             let rule = rule?;
             rules += 1;
-            for remap in fields(rule, 2) {
+            for remap in fields(rule, 3) {
                 outputs += count(remap?, 1)?;
             }
-            scales += count(rule, 3)?;
+            scales += count(rule, 4)?;
+            axes += count(rule, 5)?;
         }
         let mut table = Self::default();
         let unavailable = |_| storage::Error::Unavailable;
@@ -597,12 +705,32 @@ impl Rules {
             .scales
             .try_reserve_exact(scales)
             .map_err(unavailable)?;
+        table.axes.try_reserve_exact(axes).map_err(unavailable)?;
         for entry in fields(bytes, 1) {
             let rule = saved::Rule::decode(entry?).map_err(|_| storage::Error::Corrupt)?;
-            if rule.input == 0 || table.entries.last().is_some_and(|e| e.input >= rule.input) {
+            if rule.input == 0
+                || rule.collection == 0
+                || table.entries.last().is_some_and(|e| {
+                    e.reference()
+                        >= (RuleRef {
+                            input: rule.input,
+                            collection: rule.collection,
+                        })
+                })
+            {
                 return Err(storage::Error::Corrupt);
             }
             let (first, count) = match rule.effect.ok_or(storage::Error::Corrupt)? {
+                saved::rule::Effect::Axis(axis) => {
+                    if rule.collection != GAMEPAD
+                        || !GAMEPAD_AXES.contains(&rule.input)
+                        || !GAMEPAD_AXES.contains(&axis.destination)
+                    {
+                        return Err(storage::Error::Corrupt);
+                    }
+                    table.axes.push((axis.destination, axis.invert));
+                    (table.axes.len() - 1, AXIS)
+                }
                 saved::rule::Effect::Remap(remap) => {
                     if !valid_outputs(&remap.outputs) {
                         return Err(storage::Error::Corrupt);
@@ -624,6 +752,7 @@ impl Rules {
             };
             table.entries.push(Entry {
                 input: rule.input,
+                collection: rule.collection,
                 first: u16::try_from(first).map_err(|_| storage::Error::Corrupt)?,
                 count,
             });
@@ -635,6 +764,7 @@ impl Rules {
     fn saved_rule(&self, entry: &Entry) -> saved::Rule {
         saved::Rule {
             input: entry.input,
+            collection: entry.collection,
             effect: Some(match self.found(entry) {
                 Found::Remap(outputs) => saved::rule::Effect::Remap(saved::Remap {
                     outputs: outputs
@@ -644,6 +774,10 @@ impl Rules {
                             collection: o.collection,
                         })
                         .collect(),
+                }),
+                Found::Axis(destination, invert) => saved::rule::Effect::Axis(saved::Axis {
+                    destination,
+                    invert,
                 }),
                 Found::Scale(numerator, denominator) => saved::rule::Effect::Scale(saved::Scale {
                     numerator,
@@ -664,8 +798,11 @@ impl Rules {
         };
         let field = |tag, len: usize| key_len(tag) + encoded_len_varint(len as u64) + len;
         let effect = match self.found(entry) {
+            Found::Axis(destination, invert) => {
+                field(5, scalar(1, destination) + if invert { 2 } else { 0 })
+            }
             Found::Remap(outputs) => field(
-                2,
+                3,
                 outputs
                     .iter()
                     .map(|o| field(1, scalar(1, o.usage) + scalar(2, o.collection)))
@@ -677,10 +814,10 @@ impl Rules {
                 } else {
                     sint32::encoded_len(1, &numerator)
                 };
-                field(3, numerator + scalar(2, denominator))
+                field(4, numerator + scalar(2, denominator))
             }
         };
-        scalar(1, entry.input) + effect
+        scalar(1, entry.input) + scalar(2, entry.collection) + effect
     }
     /// The saved form of the table: its rules in order, each converted and encoded on its own
     /// into a buffer of exactly the file's length, which the table gives.
@@ -801,15 +938,23 @@ fn next_field(bytes: &[u8]) -> Result<Option<Field>, storage::Error> {
     let end = at.checked_add(len).ok_or(corrupt)?;
     Ok((end <= bytes.len()).then(|| (end, contents.filter(|_| tag == 1))))
 }
-/// The input of a saved rule, read without decoding the rest of it.
-fn saved_input(mut rule: &[u8]) -> Result<Usage, storage::Error> {
+/// The input and collection of a saved rule, read without decoding its effect.
+fn saved_input(mut rule: &[u8]) -> Result<RuleRef, storage::Error> {
     use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
     let corrupt = |_| storage::Error::Corrupt;
-    let mut input = 0;
+    let mut input = RuleRef::default();
     while !rule.is_empty() {
         match decode_key(&mut rule).map_err(corrupt)? {
-            (1, WireType::Varint) => input = decode_varint(&mut rule).map_err(corrupt)? as u32,
-            (1, _) => return Err(storage::Error::Corrupt),
+            (tag @ (1 | 2), WireType::Varint) => {
+                let value = u32::try_from(decode_varint(&mut rule).map_err(corrupt)?)
+                    .map_err(|_| storage::Error::Corrupt)?;
+                if tag == 1 {
+                    input.input = value;
+                } else {
+                    input.collection = value;
+                }
+            }
+            (1 | 2, _) => return Err(storage::Error::Corrupt),
             (tag, wire) => {
                 skip_field(wire, tag, &mut rule, DecodeContext::default()).map_err(corrupt)?
             }
@@ -819,16 +964,28 @@ fn saved_input(mut rule: &[u8]) -> Result<Usage, storage::Error> {
 }
 /// Whether a saved remap's outputs are ones the firmware can hold.
 fn valid_outputs(outputs: &[saved::Output]) -> bool {
-    outputs.len() < usize::from(SCALE) && outputs.iter().all(|o| o.usage != 0 && o.collection != 0)
+    outputs.len() < usize::from(AXIS)
+        && outputs.iter().all(|o| {
+            REMAP_OUTPUTS
+                .iter()
+                .any(|r| r.collection == o.collection && r.contains(o.usage))
+        })
 }
 /// The rule a saved rule's bytes hold.
 fn loaded_rule(bytes: &[u8]) -> Result<Rule, storage::Error> {
     let corrupt = storage::Error::Corrupt;
     let rule = saved::Rule::decode(bytes).map_err(|_| corrupt)?;
-    if rule.input == 0 {
+    if rule.input == 0 || rule.collection == 0 {
         return Err(corrupt);
     }
     let effect = match rule.effect.ok_or(corrupt)? {
+        saved::rule::Effect::Axis(axis)
+            if rule.collection == GAMEPAD
+                && GAMEPAD_AXES.contains(&rule.input)
+                && GAMEPAD_AXES.contains(&axis.destination) =>
+        {
+            Effect::Axis(axis.destination, axis.invert)
+        }
         saved::rule::Effect::Remap(remap) if valid_outputs(&remap.outputs) => Effect::Remap(
             remap
                 .outputs
@@ -846,16 +1003,17 @@ fn loaded_rule(bytes: &[u8]) -> Result<Rule, storage::Error> {
     };
     Ok(Rule {
         input: rule.input,
+        collection: rule.collection,
         effect,
     })
 }
 /// Collects a page of rules from the parts of a rules file as they are read.
 struct Pager {
-    after: Option<Usage>,
+    after: Option<RuleRef>,
     count: usize,
     rules: Vec<Rule>,
-    /// The input of the last rule read, so rules out of order are found.
-    last: Usage,
+    /// The last input and collection read, so rules out of order are found.
+    last: RuleRef,
     /// The start of a rule that continues in the next part.
     pending: Vec<u8>,
     error: Option<storage::Error>,
@@ -872,7 +1030,7 @@ impl Pager {
             if let Some(contents) = contents {
                 let rule = &bytes[at..][contents];
                 let input = saved_input(rule)?;
-                if input == 0 || input <= self.last {
+                if input.input == 0 || input.collection == 0 || input <= self.last {
                     return Err(storage::Error::Corrupt);
                 }
                 self.last = input;
@@ -925,14 +1083,14 @@ impl Pager {
 pub async fn saved_page<S: RecordStore>(
     store: &mut S,
     id: u64,
-    after: Option<Usage>,
+    after: Option<RuleRef>,
     count: usize,
 ) -> Result<Vec<Rule>, storage::Error> {
     let mut pager = Pager {
         after,
         count,
         rules: Vec::new(),
-        last: 0,
+        last: RuleRef::default(),
         pending: Vec::new(),
         error: None,
     };
@@ -1184,10 +1342,44 @@ impl Cache {
     }
 }
 
+/// A held control uses an 8-bit usage page and one of the supported application collections.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Control {
+    id: u16,
+    page: u8,
+    collection: u8,
+}
+impl From<Output> for Control {
+    fn from(output: Output) -> Self {
+        debug_assert!(page(output.usage) <= u16::from(u8::MAX));
+        debug_assert!(matches!(
+            output.collection,
+            KEYBOARD | MOUSE | CONSUMER | SYSTEM | GAMEPAD
+        ));
+        Self {
+            id: id(output.usage),
+            page: page(output.usage) as u8,
+            collection: id(output.collection) as u8,
+        }
+    }
+}
+impl From<Control> for Output {
+    fn from(control: Control) -> Self {
+        Self {
+            usage: usage(u16::from(control.page), control.id),
+            collection: if control.collection == id(CONSUMER) as u8 {
+                CONSUMER
+            } else {
+                usage(DESKTOP_PAGE, u16::from(control.collection))
+            },
+        }
+    }
+}
+
 /// Outputs of one input, at most `MAX_REMAP_OUTPUTS`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Outputs {
-    items: [Output; MAX_REMAP_OUTPUTS],
+    items: [Control; MAX_REMAP_OUTPUTS],
     len: u8,
 }
 impl Outputs {
@@ -1196,11 +1388,17 @@ impl Outputs {
         outputs.push(output);
         outputs
     }
-    fn as_slice(&self) -> &[Output] {
-        &self.items[..usize::from(self.len)]
+    fn iter(&self) -> impl Iterator<Item = Output> + '_ {
+        self.items[..usize::from(self.len)]
+            .iter()
+            .copied()
+            .map(Output::from)
     }
     fn push(&mut self, output: Output) {
-        if usize::from(self.len) < MAX_REMAP_OUTPUTS && !self.as_slice().contains(&output) {
+        let output = Control::from(output);
+        if usize::from(self.len) < MAX_REMAP_OUTPUTS
+            && !self.items[..usize::from(self.len)].contains(&output)
+        {
             self.items[usize::from(self.len)] = output;
             self.len += 1;
         }
@@ -1211,9 +1409,13 @@ impl Outputs {
 /// until they are released.
 pub struct Mapper {
     pub layers: Vec<Map>,
-    held: Vec<(Usage, Outputs)>,
+    pub(crate) profiles_assigned: bool,
+    held: Vec<(Control, Outputs)>,
     remainder: [i64; 4],
     ratio: [(i64, i64); 4],
+    source_layout: crate::hid::GamepadLayout,
+    builtin: crate::hid::GamepadLayout,
+    pub(crate) gamepad_output: Gamepad,
 }
 impl Default for Mapper {
     fn default() -> Self {
@@ -1224,28 +1426,55 @@ impl Mapper {
     pub fn new() -> Self {
         Self {
             layers: Vec::new(),
+            profiles_assigned: false,
             held: Vec::new(),
             remainder: [0; 4],
             ratio: [(1, 1); 4],
+            source_layout: crate::hid::GamepadLayout::Generic,
+            builtin: crate::hid::GamepadLayout::Generic,
+            gamepad_output: Gamepad::default(),
         }
     }
+    pub(crate) fn reserve_held(&mut self, controls: usize) -> Result<(), Error> {
+        self.held
+            .try_reserve_exact(controls.saturating_sub(self.held.len()))
+            .map_err(|_| Error::Capacity)
+    }
+    pub(crate) fn produces_gamepad(&self) -> bool {
+        self.layers.iter().any(|layer| {
+            layer
+                .borrow()
+                .outputs
+                .iter()
+                .any(|o| o.collection == GAMEPAD)
+        }) || self
+            .held
+            .iter()
+            .any(|(_, outputs)| outputs.iter().any(|o| o.collection == GAMEPAD))
+    }
     /// The outputs of `input` after every layer.
-    fn resolve(&self, input: Usage) -> Outputs {
-        let mut current = Outputs::one(Output {
-            usage: input,
-            collection: input_collection(input),
-        });
+    fn resolve(&self, input: Output) -> Outputs {
+        let mut current = match builtin::lookup(self.builtin, input.into()) {
+            Some(Found::Remap(outputs)) => {
+                let mut mapped = Outputs::default();
+                for output in outputs {
+                    mapped.push(*output);
+                }
+                mapped
+            }
+            _ => Outputs::one(input),
+        };
         for layer in &self.layers {
             let layer = layer.borrow();
             let mut next = Outputs::default();
-            for output in current.as_slice() {
-                match layer.lookup(output.usage) {
+            for output in current.iter() {
+                match layer.lookup(output.into()) {
                     Some(Found::Remap(outputs)) => {
                         for o in outputs {
                             next.push(*o);
                         }
                     }
-                    _ => next.push(*output),
+                    _ => next.push(output),
                 }
             }
             current = next;
@@ -1255,60 +1484,184 @@ impl Mapper {
         }
         current
     }
-    fn pressed(input: &Held) -> impl Iterator<Item = Usage> + '_ {
+    fn directions(gamepad: &Gamepad) -> u8 {
+        gamepad.dpad
+            | gamepad
+                .hat
+                .and_then(|hat| [1, 5, 4, 6, 2, 10, 8, 9].get(usize::from(hat)).copied())
+                .unwrap_or(0)
+    }
+    fn is_pressed(control: Output, input: &Held, gamepad: &Gamepad) -> bool {
+        let id = id(control.usage);
+        match (control.collection, page(control.usage)) {
+            (KEYBOARD, KEYBOARD_PAGE) if (4..=255).contains(&id) => {
+                input.keys[usize::from(id / 8)] & (1 << (id % 8)) != 0
+            }
+            (CONSUMER, CONSUMER_PAGE) => input.consumers.contains(&id),
+            (MOUSE, BUTTON_PAGE) if (1..=16).contains(&id) => input.buttons & (1 << (id - 1)) != 0,
+            (SYSTEM, DESKTOP_PAGE) => system_bit(id).is_some_and(|bit| input.system & bit != 0),
+            (GAMEPAD, BUTTON_PAGE) if (1..=32).contains(&id) => {
+                gamepad.buttons & (1 << (id - 1)) != 0
+            }
+            (GAMEPAD, CONSUMER_PAGE) => gamepad.consumers.contains(&id),
+            (GAMEPAD, DESKTOP_PAGE) => match id {
+                0x3d => gamepad.start,
+                0x3e => gamepad.select,
+                0x85 => gamepad.menu,
+                0x90..=0x93 => Self::directions(gamepad) & (1 << (id - 0x90)) != 0,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    fn pressed<'a>(input: &'a Held, gamepad: &'a Gamepad) -> impl Iterator<Item = Output> + 'a {
         let keys = (4..256u16)
             .filter(|k| input.keys[usize::from(k / 8)] & (1 << (k % 8)) != 0)
-            .map(|k| usage(KEYBOARD_PAGE, k));
-        let consumers = input
-            .consumers
-            .iter()
-            .filter(|u| **u != 0)
-            .map(|u| usage(CONSUMER_PAGE, *u));
+            .map(|k| Output {
+                usage: usage(KEYBOARD_PAGE, k),
+                collection: KEYBOARD,
+            });
+        let consumers = input.consumers.iter().filter(|u| **u != 0).map(|u| Output {
+            usage: usage(CONSUMER_PAGE, *u),
+            collection: CONSUMER,
+        });
         let buttons = (0..16u16)
             .filter(|b| input.buttons & (1 << b) != 0)
-            .map(|b| usage(BUTTON_PAGE, b + 1));
+            .map(|b| Output {
+                usage: usage(BUTTON_PAGE, b + 1),
+                collection: MOUSE,
+            });
         let system = SYSTEM_USAGES
             .iter()
             .enumerate()
             .filter(|(i, _)| input.system & SYSTEM_BUTTONS & (1 << i) != 0)
-            .map(|(_, u)| usage(DESKTOP_PAGE, *u));
-        keys.chain(consumers).chain(buttons).chain(system)
+            .map(|(_, u)| Output {
+                usage: usage(DESKTOP_PAGE, *u),
+                collection: SYSTEM,
+            });
+        let gamepad_buttons = (0..32u16)
+            .filter(|b| gamepad.buttons & (1 << b) != 0)
+            .map(|b| Output {
+                usage: usage(BUTTON_PAGE, b + 1),
+                collection: GAMEPAD,
+            });
+        let directions = Self::directions(gamepad);
+        let dpad = (0..4u16)
+            .filter(move |b| directions & (1 << b) != 0)
+            .map(|b| Output {
+                usage: usage(DESKTOP_PAGE, 0x90 + b),
+                collection: GAMEPAD,
+            });
+        let controls = [
+            (0x3d, gamepad.start),
+            (0x3e, gamepad.select),
+            (0x85, gamepad.menu),
+        ]
+        .into_iter()
+        .filter(|(_, pressed)| *pressed)
+        .map(|(id, _)| Output {
+            usage: usage(DESKTOP_PAGE, id),
+            collection: GAMEPAD,
+        });
+        keys.chain(consumers)
+            .chain(buttons)
+            .chain(system)
+            .chain(gamepad_buttons)
+            .chain(dpad)
+            .chain(controls)
+            .chain(
+                gamepad
+                    .consumers
+                    .iter()
+                    .filter(|u| **u != 0)
+                    .map(|u| Output {
+                        usage: usage(CONSUMER_PAGE, *u),
+                        collection: GAMEPAD,
+                    }),
+            )
     }
+    /// Maps keyboard and mouse held controls when the source has no gamepad state.
+    /// Sources with gamepad controls use `held_with_gamepad` for every update instead.
     pub fn held(&mut self, input: Held) -> Result<Held, Error> {
+        self.held_with_gamepad(input, Gamepad::default())
+            .map(|(held, _)| held)
+    }
+    /// Maps all held controls from one source together, including cross-collection outputs, and
+    /// routes its absolute axes. The caller forwards both returned states to their USB outputs.
+    pub fn held_with_gamepad(
+        &mut self,
+        input: Held,
+        gamepad: Gamepad,
+    ) -> Result<(Held, Gamepad), Error> {
+        let builtin = if self.profiles_assigned || !self.layers.is_empty() {
+            crate::hid::GamepadLayout::Generic
+        } else {
+            gamepad.layout
+        };
+        if self.source_layout != gamepad.layout && self.builtin != builtin {
+            self.held
+                .retain(|(input, _)| input.collection != id(GAMEPAD) as u8);
+        }
+        self.source_layout = gamepad.layout;
+        self.builtin = builtin;
         let mut output = Held {
             system: input.system & !SYSTEM_BUTTONS,
             radio: input.radio,
             ..Held::default()
         };
-        let count = Self::pressed(&input).count();
-        // Validate and reserve before mutating press-time state. Retain the allocation between
-        // reports; only a larger simultaneous chord needs another allocation.
+        let mut mapped = Gamepad {
+            buttons: 0,
+            consumers: [0; 8],
+            menu: false,
+            hat: None,
+            dpad: 0,
+            start: false,
+            select: false,
+            ..gamepad
+        };
+        let count = Self::pressed(&input, &gamepad).count();
+        // Retain press-time outputs until the same usage and collection is released.
         self.held
             .try_reserve(count.saturating_sub(self.held.len()))
             .map_err(|_| Error::Capacity)?;
         self.held
-            .retain(|(usage, _)| Self::pressed(&input).any(|u| u == *usage));
-        for input in Self::pressed(&input) {
-            let outputs = match self.held.iter().find(|(u, _)| *u == input) {
+            .retain(|(control, _)| Self::is_pressed((*control).into(), &input, &gamepad));
+        for control in Self::pressed(&input, &gamepad) {
+            let cached = Control::from(control);
+            let outputs = match self.held.iter().find(|(u, _)| *u == cached) {
                 Some((_, outputs)) => *outputs,
                 None => {
-                    let outputs = self.resolve(input);
-                    self.held.push((input, outputs));
+                    let outputs = self.resolve(control);
+                    self.held.push((cached, outputs));
                     outputs
                 }
             };
-            for o in outputs.as_slice() {
-                emit(&mut output, *o)?;
+            for o in outputs.iter() {
+                emit(&mut output, &mut mapped, o)?;
             }
         }
-        Ok(output)
+        self.axes(&mut mapped);
+        self.gamepad_output = mapped;
+        Ok((output, mapped))
+    }
+    /// Applies each layer's axis routes simultaneously, carrying validity and declarations with
+    /// their source values. Explicit routes take precedence over destination passthrough values.
+    pub fn axes(&self, gamepad: &mut Gamepad) {
+        route_axes(gamepad, |input| builtin::lookup(self.builtin, input));
+        for layer in &self.layers {
+            let layer = layer.borrow();
+            route_axes(gamepad, |input| layer.lookup(input));
+        }
     }
     /// The combined ratio every layer applies to `axis`, in lowest terms.
     fn ratio(&self, axis: Usage) -> (i64, i64) {
         let limit = i64::from(i32::MAX);
         let mut ratio = (1i64, 1i64);
         for layer in &self.layers {
-            if let Some(Found::Scale(n, d)) = layer.borrow().lookup(axis) {
+            if let Some(Found::Scale(n, d)) = layer.borrow().lookup(RuleRef {
+                input: axis,
+                collection: MOUSE,
+            }) {
                 let numerator = ratio.0.saturating_mul(n.into());
                 let denominator = ratio.1.saturating_mul(d.into());
                 let divisor = gcd(numerator.unsigned_abs(), denominator.unsigned_abs()).max(1);
@@ -1339,12 +1692,57 @@ impl Mapper {
         }
     }
 }
-fn emit(output: &mut Held, o: Output) -> Result<(), Error> {
+fn route_axes<'a>(gamepad: &mut Gamepad, lookup: impl Fn(RuleRef) -> Option<Found<'a>>) {
+    let source = *gamepad;
+    for (i, axis) in GAMEPAD_AXES.into_iter().enumerate() {
+        if matches!(
+            lookup(RuleRef {
+                input: axis,
+                collection: GAMEPAD
+            }),
+            Some(Found::Axis(..))
+        ) {
+            gamepad.axes[i] = 0;
+            gamepad.axes_valid &= !(1 << i);
+            gamepad.axes_declared &= !(1 << i);
+        }
+    }
+    for (i, axis) in GAMEPAD_AXES.into_iter().enumerate() {
+        if let Some(Found::Axis(destination, invert)) = lookup(RuleRef {
+            input: axis,
+            collection: GAMEPAD,
+        }) {
+            let Some(j) = GAMEPAD_AXES.iter().position(|&axis| axis == destination) else {
+                continue;
+            };
+            gamepad.axes[j] = if invert {
+                u16::MAX - source.axes[i]
+            } else {
+                source.axes[i]
+            };
+            gamepad.axes_valid =
+                (gamepad.axes_valid & !(1 << j)) | (((source.axes_valid >> i) & 1) << j);
+            gamepad.axes_declared =
+                (gamepad.axes_declared & !(1 << j)) | (((source.axes_declared >> i) & 1) << j);
+        }
+    }
+}
+
+fn emit(output: &mut Held, gamepad: &mut Gamepad, o: Output) -> Result<(), Error> {
     match (o.collection, page(o.usage)) {
-        (KEYBOARD, KEYBOARD_PAGE) => {
+        (KEYBOARD, KEYBOARD_PAGE) if (4..=255).contains(&id(o.usage)) => {
             let key = usize::from(id(o.usage));
             output.keys[key / 8] |= 1 << (key % 8);
         }
+        (GAMEPAD, BUTTON_PAGE) if (1..=32).contains(&id(o.usage)) => {
+            gamepad.buttons |= 1 << (id(o.usage) - 1)
+        }
+        (GAMEPAD, DESKTOP_PAGE) => match id(o.usage) {
+            0x3d => gamepad.start = true,
+            0x3e => gamepad.select = true,
+            id @ 0x90..=0x93 => gamepad.dpad |= 1 << (id - 0x90),
+            _ => {}
+        },
         (CONSUMER, CONSUMER_PAGE) => output.consumer(id(o.usage))?,
         (MOUSE, BUTTON_PAGE) if (1..=16).contains(&id(o.usage)) => {
             output.buttons |= 1 << (id(o.usage) - 1)
@@ -1362,6 +1760,57 @@ fn emit(output: &mut Held, o: Output) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn held_controls_preserve_supported_collection_and_usage_boundaries() {
+        assert!(core::mem::size_of::<(Control, Outputs)>() <= 40);
+        for range in REMAP_INPUTS.iter().chain(&REMAP_OUTPUTS) {
+            for id in [range.min, range.max] {
+                let output = Output {
+                    usage: usage(range.page, id),
+                    collection: range.collection,
+                };
+                assert_eq!(Output::from(Control::from(output)), output);
+            }
+        }
+    }
+    #[test]
+    fn direct_membership_matches_pressed_controls() {
+        let full = Held {
+            keys: [255; 32],
+            buttons: u16::MAX,
+            consumers: [1, 9, 0x81, 0x223, 0x238, 0xff, 0xff00, u16::MAX],
+            system: u64::MAX,
+            ..Held::default()
+        };
+        let full_pad = Gamepad {
+            buttons: u32::MAX,
+            dpad: 15,
+            start: true,
+            select: true,
+            menu: true,
+            consumers: full.consumers,
+            ..Gamepad::default()
+        };
+        let controls = Mapper::pressed(&full, &full_pad).collect::<Vec<_>>();
+        for active in [false, true] {
+            for hat in (0..=9).map(Some).chain([None]) {
+                let input = if active { full } else { Held::default() };
+                let pad = Gamepad {
+                    hat,
+                    dpad: if active { 5 } else { 0 },
+                    ..if active { full_pad } else { Gamepad::default() }
+                };
+                let pressed = Mapper::pressed(&input, &pad).collect::<Vec<_>>();
+                for control in &controls {
+                    assert_eq!(
+                        Mapper::is_pressed(*control, &input, &pad),
+                        pressed.contains(control),
+                        "{control:?} with hat {hat:?} and active {active}"
+                    );
+                }
+            }
+        }
+    }
     fn key(k: u16) -> Usage {
         usage(KEYBOARD_PAGE, k)
     }
@@ -1371,9 +1820,10 @@ mod tests {
             collection: KEYBOARD,
         }
     }
-    fn remap(input: Usage, outputs: &[Output]) -> Rule {
+    fn remap(collection: Usage, input: Usage, outputs: &[Output]) -> Rule {
         Rule {
             input,
+            collection,
             effect: Effect::Remap(outputs.to_vec()),
         }
     }
@@ -1412,7 +1862,11 @@ mod tests {
         for range in SCALE_INPUTS {
             for id in range.min..=range.max {
                 let input = usage(range.page, id);
-                assert!(!REMAP_INPUTS.iter().any(|r| r.contains(input)));
+                assert!(
+                    !REMAP_INPUTS
+                        .iter()
+                        .any(|r| r.collection == range.collection && r.contains(input))
+                );
                 assert!(!REMAP_OUTPUTS.iter().any(|r| r.contains(input)));
             }
         }
@@ -1421,10 +1875,11 @@ mod tests {
     fn system_controls_remap_to_and_from_keys_through_layers() {
         // Sleep sends F12, Caps Lock sends Power, and a later layer turns Power into Wake.
         let first = map(alloc::vec![
-            remap(usage(DESKTOP_PAGE, 0x82), &[out(0x45)]),
-            remap(key(0x39), &[system(0x81)]),
+            remap(SYSTEM, usage(DESKTOP_PAGE, 0x82), &[out(0x45)]),
+            remap(KEYBOARD, key(0x39), &[system(0x81)]),
         ]);
         let second = map(alloc::vec![remap(
+            SYSTEM,
             usage(DESKTOP_PAGE, 0x81),
             &[system(0x83), out(0xe0)]
         )]);
@@ -1448,8 +1903,8 @@ mod tests {
     #[test]
     fn remapping_keeps_rotation_lock_and_radio_state() {
         let layer = map(alloc::vec![
-            remap(usage(DESKTOP_PAGE, 0x81), &[]),
-            remap(key(0x04), &[system(0x82)]),
+            remap(SYSTEM, usage(DESKTOP_PAGE, 0x81), &[]),
+            remap(KEYBOARD, key(0x04), &[system(0x82)]),
         ]);
         let mut mapper = Mapper::new();
         mapper.layers = alloc::vec![layer];
@@ -1467,6 +1922,7 @@ mod tests {
     fn system_rules_normalize_and_report_the_system_role() {
         let power = usage(DESKTOP_PAGE, 0x81);
         let rule = remap(
+            KEYBOARD,
             key(0x39),
             &[Output {
                 usage: power,
@@ -1477,24 +1933,28 @@ mod tests {
         .unwrap();
         assert_eq!(rule.effect, Effect::Remap(alloc::vec![system(0x81)]));
         assert_eq!(
-            remap(power, &[out(0x45)]).normalized().unwrap().role(),
+            remap(SYSTEM, power, &[out(0x45)])
+                .normalized()
+                .unwrap()
+                .role(),
             crate::hid::SYSTEM
         );
         let rotation = usage(DESKTOP_PAGE, 0xc9);
         assert_eq!(
-            remap(rotation, &[]).normalized().unwrap().role(),
+            remap(SYSTEM, rotation, &[]).normalized().unwrap().role(),
             crate::hid::SYSTEM
         );
         assert!(
-            remap(power, &[system(0x81)])
+            remap(SYSTEM, power, &[system(0x81)])
                 .normalized()
                 .unwrap()
                 .identity()
         );
         let slider = usage(DESKTOP_PAGE, 0xca);
-        assert_eq!(remap(slider, &[]).normalized(), Err(Invalid::Input));
+        assert_eq!(remap(SYSTEM, slider, &[]).normalized(), Err(Invalid::Input));
         assert_eq!(
             remap(
+                KEYBOARD,
                 key(0x39),
                 &[Output {
                     usage: slider,
@@ -1506,6 +1966,7 @@ mod tests {
         );
         assert_eq!(
             remap(
+                KEYBOARD,
                 key(0x39),
                 &[Output {
                     usage: power,
@@ -1519,8 +1980,16 @@ mod tests {
     #[test]
     fn layers_chain_and_fan_out() {
         // A -> Ctrl+C, then C -> Alt+D: A sends Ctrl+Alt+D, and C alone sends Alt+D.
-        let first = map(alloc::vec![remap(key(0x04), &[out(0xe0), out(0x06)])]);
-        let second = map(alloc::vec![remap(key(0x06), &[out(0xe2), out(0x07)])]);
+        let first = map(alloc::vec![remap(
+            KEYBOARD,
+            key(0x04),
+            &[out(0xe0), out(0x06)]
+        )]);
+        let second = map(alloc::vec![remap(
+            KEYBOARD,
+            key(0x06),
+            &[out(0xe2), out(0x07)]
+        )]);
         let mut mapper = Mapper::new();
         mapper.layers = alloc::vec![first, second];
         assert_eq!(
@@ -1532,11 +2001,12 @@ mod tests {
     }
     #[test]
     fn held_inputs_keep_press_time_outputs_across_live_edits() {
-        let layer = map(alloc::vec![remap(key(0x04), &[out(0x1c)])]);
+        let layer = map(alloc::vec![remap(KEYBOARD, key(0x04), &[out(0x1c)])]);
         let mut mapper = Mapper::new();
         mapper.layers = alloc::vec![layer.clone()];
         assert_eq!(mapper.held(keys(&[0x04])).unwrap(), keys(&[0x1c]));
-        *layer.borrow_mut() = Rules::new(alloc::vec![remap(key(0x04), &[out(0x29)])]).unwrap();
+        *layer.borrow_mut() =
+            Rules::new(alloc::vec![remap(KEYBOARD, key(0x04), &[out(0x29)])]).unwrap();
         assert_eq!(mapper.held(keys(&[0x04])).unwrap(), keys(&[0x1c]));
         assert_eq!(mapper.held(keys(&[])).unwrap(), Held::default());
         assert_eq!(mapper.held(keys(&[0x04])).unwrap(), keys(&[0x29]));
@@ -1545,8 +2015,8 @@ mod tests {
     fn disabling_stops_the_chain() {
         let button = usage(BUTTON_PAGE, 1);
         let layer = map(alloc::vec![
-            remap(key(0x04), &[]),
-            remap(button, &[out(0x06)])
+            remap(KEYBOARD, key(0x04), &[]),
+            remap(MOUSE, button, &[out(0x06)])
         ]);
         let mut mapper = Mapper::new();
         mapper.layers = alloc::vec![layer];
@@ -1563,6 +2033,7 @@ mod tests {
         let wheel = AXES[2];
         let scale = |input, n, d| Rule {
             input,
+            collection: MOUSE,
             effect: Effect::Scale(n, d),
         };
         let mut mapper = Mapper::new();
@@ -1583,6 +2054,7 @@ mod tests {
     #[test]
     fn rules_normalize_and_identity_forgets() {
         let rule = remap(
+            KEYBOARD,
             key(0x04),
             &[
                 Output {
@@ -1596,50 +2068,59 @@ mod tests {
         .unwrap();
         assert_eq!(rule.effect, Effect::Remap(alloc::vec![out(0x05)]));
         assert_eq!(
-            remap(key(0x02), &[out(0x05)]).normalized(),
+            remap(KEYBOARD, key(0x02), &[out(0x05)]).normalized(),
             Err(Invalid::Input)
         );
         assert_eq!(
-            remap(key(0x04), &[out(0x02)]).normalized(),
+            remap(KEYBOARD, key(0x04), &[out(0x02)]).normalized(),
             Err(Invalid::Output)
         );
-        let identity = remap(key(0x04), &[out(0x04)]).normalized().unwrap();
+        let identity = remap(KEYBOARD, key(0x04), &[out(0x04)])
+            .normalized()
+            .unwrap();
         assert!(identity.identity());
-        let table = Rules::new(alloc::vec![remap(key(0x04), &[out(0x05)])]).unwrap();
+        let table = Rules::new(alloc::vec![remap(KEYBOARD, key(0x04), &[out(0x05)])]).unwrap();
         let (table, any) = table.changed(alloc::vec![Change::Set(identity)]).unwrap();
         assert!(table.is_empty());
         assert!(any);
-        // Rules are identified by their input alone.
+        // Rules are identified by their input and collection.
         let table = Rules::new(alloc::vec![
-            remap(key(0x04), &[out(0x05)]),
-            remap(key(0x06), &[out(0x07)]),
+            remap(KEYBOARD, key(0x04), &[out(0x05)]),
+            remap(KEYBOARD, key(0x06), &[out(0x07)]),
         ])
         .unwrap();
         let (table, any) = table
             .changed(alloc::vec![
-                Change::Forget(key(0x04)),
-                Change::Set(remap(key(0x06), &[out(0x08)])),
+                Change::Forget(RuleRef {
+                    input: key(0x04),
+                    collection: KEYBOARD
+                }),
+                Change::Set(remap(KEYBOARD, key(0x06), &[out(0x08)])),
             ])
             .unwrap();
-        assert!(table.iter().eq([remap(key(0x06), &[out(0x08)])]));
+        assert!(table.iter().eq([remap(KEYBOARD, key(0x06), &[out(0x08)])]));
         assert!(any);
         // Setting a rule to what it already does, or forgetting a rule there isn't, changes nothing.
         let (_, any) = table
             .changed(alloc::vec![
-                Change::Set(remap(key(0x06), &[out(0x08)])),
-                Change::Forget(key(0x09)),
+                Change::Set(remap(KEYBOARD, key(0x06), &[out(0x08)])),
+                Change::Forget(RuleRef {
+                    input: key(0x09),
+                    collection: KEYBOARD
+                }),
             ])
             .unwrap();
         assert!(!any);
         assert!(
             Rules::new(alloc::vec![
-                remap(key(0x04), &[]),
-                remap(key(0x04), &[out(0x05)])
+                remap(KEYBOARD, key(0x04), &[]),
+                remap(KEYBOARD, key(0x04), &[out(0x05)])
             ])
             .is_err()
         );
         let scaled = Rule {
             input: AXES[0],
+            collection: MOUSE,
             effect: Effect::Scale(4, 4),
         }
         .normalized()
@@ -1649,6 +2130,7 @@ mod tests {
         // The divisor of i32::MIN and 2^31 does not fit in i32; the inversion stays one.
         let inverted = Rule {
             input: AXES[2],
+            collection: MOUSE,
             effect: Effect::Scale(i32::MIN, 1 << 31),
         }
         .normalized()
@@ -1659,8 +2141,9 @@ mod tests {
     #[test]
     fn rules_files_roundtrip_and_report_roles() {
         let table = Rules::new(alloc::vec![
-            remap(key(0x39), &[out(0xe0)]),
+            remap(KEYBOARD, key(0x39), &[out(0xe0)]),
             remap(
+                CONSUMER,
                 usage(CONSUMER_PAGE, 0xcd),
                 &[Output {
                     usage: usage(BUTTON_PAGE, 1),
@@ -1669,6 +2152,7 @@ mod tests {
             ),
             Rule {
                 input: AXES[2],
+                collection: MOUSE,
                 effect: Effect::Scale(-1, 1),
             },
         ])
@@ -1694,7 +2178,7 @@ mod tests {
             assert_eq!(rule.encoded_len(), table.rule_len(entry));
         }
         // An empty remap disables its input.
-        let disabled = Rules::new(alloc::vec![remap(key(0x39), &[])]).unwrap();
+        let disabled = Rules::new(alloc::vec![remap(KEYBOARD, key(0x39), &[])]).unwrap();
         let encoded = disabled.encode().unwrap();
         assert_eq!(encoded.capacity(), encoded.len());
         assert_eq!(Rules::decode(&encoded).unwrap(), disabled);
@@ -1705,6 +2189,7 @@ mod tests {
         let encode = |rules: Vec<saved::Rule>| saved::Rules { rules }.encode_to_vec();
         let scale = |input| saved::Rule {
             input,
+            collection: MOUSE,
             effect: Some(saved::rule::Effect::Scale(saved::Scale {
                 numerator: -1,
                 denominator: 1,
@@ -1714,6 +2199,7 @@ mod tests {
         // truncated bytes are undecodable.
         let effectless = saved::Rule {
             input: key(4),
+            collection: KEYBOARD,
             effect: None,
         };
         assert!(Rules::decode(&encode(alloc::vec![effectless])).is_err());
@@ -1731,5 +2217,267 @@ mod tests {
         let mut extended = bytes.clone();
         prost::encoding::uint32::encode(2, &7, &mut extended);
         assert_eq!(Rules::decode(&extended).unwrap(), table);
+    }
+    fn axis(input: Usage, destination: Usage, invert: bool) -> Rule {
+        Rule {
+            input,
+            collection: GAMEPAD,
+            effect: Effect::Axis(destination, invert),
+        }
+    }
+    fn gamepad_button(id: u16) -> Output {
+        Output {
+            usage: usage(BUTTON_PAGE, id),
+            collection: GAMEPAD,
+        }
+    }
+    #[test]
+    fn collection_qualified_rules_merge_lookup_and_page_in_usage_order() {
+        let button = usage(BUTTON_PAGE, 1);
+        let mouse = remap(MOUSE, button, &[out(4)]);
+        let pad = remap(GAMEPAD, button, &[out(5)]);
+        let route = axis(GAMEPAD_AXES[0], GAMEPAD_AXES[1], true);
+        let table = Rules::new(alloc::vec![pad.clone(), mouse.clone(), route.clone()]).unwrap();
+        assert_eq!(
+            table.iter().collect::<Vec<_>>(),
+            [route, mouse.clone(), pad.clone()]
+        );
+        assert_eq!(table.get(mouse.reference()), Some(mouse.clone()));
+        assert_eq!(
+            table.after(Some(mouse.reference())).collect::<Vec<_>>(),
+            core::slice::from_ref(&pad)
+        );
+        assert_eq!(table.roles(), crate::hid::MOUSE | crate::hid::GAMEPAD);
+        let (changed, any) = table
+            .changed(alloc::vec![
+                Change::Forget(pad.reference()),
+                Change::Set(remap(MOUSE, button, &[out(6)])),
+                Change::Set(pad.clone()),
+                Change::Forget(mouse.reference()),
+            ])
+            .unwrap();
+        assert!(any);
+        assert_eq!(changed.get(mouse.reference()), None);
+        assert_eq!(changed.get(pad.reference()), Some(pad));
+        assert_eq!(changed.roles(), crate::hid::GAMEPAD);
+        let identity = remap(GAMEPAD, button, &[gamepad_button(1)])
+            .normalized()
+            .unwrap();
+        assert!(identity.identity());
+        assert!(
+            !remap(MOUSE, button, &[gamepad_button(1)])
+                .normalized()
+                .unwrap()
+                .identity()
+        );
+        assert_eq!(remap(0, button, &[]).normalized(), Err(Invalid::Input));
+        assert_eq!(
+            remap(KEYBOARD, button, &[]).normalized(),
+            Err(Invalid::Input)
+        );
+        assert!(output_collection(button).is_none());
+        assert!(axis(GAMEPAD_AXES[0], GAMEPAD_AXES[0], false).identity());
+        assert!(!axis(GAMEPAD_AXES[0], GAMEPAD_AXES[0], true).identity());
+        assert_eq!(
+            axis(GAMEPAD_AXES[0], AXES[2], false).normalized(),
+            Err(Invalid::Axis)
+        );
+    }
+    #[test]
+    fn collection_and_axis_storage_roundtrips_with_exact_memory_and_stream_pages() {
+        let button = usage(BUTTON_PAGE, 1);
+        let rules = alloc::vec![
+            remap(GAMEPAD, button, &[out(5)]),
+            remap(MOUSE, button, &[]),
+            axis(GAMEPAD_AXES[0], GAMEPAD_AXES[1], false),
+            axis(GAMEPAD_AXES[1], GAMEPAD_AXES[0], true),
+        ];
+        let table = Rules::new(rules).unwrap();
+        let bytes = table.encode().unwrap();
+        let decoded = Rules::decode(&bytes).unwrap();
+        assert_eq!(decoded, table);
+        assert_eq!(decoded.memory(), table.memory());
+        assert_eq!(decoded.axes.capacity(), 2);
+        assert_eq!(bytes.capacity(), bytes.len());
+        let saved = saved::Rules::decode(bytes.as_slice()).unwrap();
+        for (entry, saved) in table.entries.iter().zip(&saved.rules) {
+            assert_eq!(table.rule_len(entry), saved.encoded_len());
+            assert_ne!(saved.collection, 0);
+        }
+        let after = RuleRef {
+            input: button,
+            collection: MOUSE,
+        };
+        let mut pager = Pager {
+            after: Some(after),
+            count: 1,
+            rules: Vec::new(),
+            last: RuleRef::default(),
+            pending: Vec::new(),
+            error: None,
+        };
+        for part in bytes.chunks(1) {
+            if !pager.feed(part) {
+                break;
+            }
+        }
+        assert_eq!(pager.error, None);
+        assert_eq!(
+            pager.rules,
+            table.after(Some(after)).take(1).collect::<Vec<_>>()
+        );
+        let mut missing = saved.clone();
+        missing.rules.last_mut().unwrap().collection = 0;
+        let missing = missing.encode_to_vec();
+        assert!(Rules::decode(&missing).is_err());
+        let mut pager = Pager {
+            after: Some(after),
+            count: 8,
+            rules: Vec::new(),
+            last: RuleRef::default(),
+            pending: Vec::new(),
+            error: None,
+        };
+        pager.feed(&missing);
+        assert_eq!(pager.error, Some(storage::Error::Corrupt));
+        let mut reversed = saved.clone();
+        reversed.rules.reverse();
+        assert!(Rules::decode(&reversed.encode_to_vec()).is_err());
+        let mut missing_output = saved;
+        if let Some(saved::rule::Effect::Remap(remap)) =
+            &mut missing_output.rules.last_mut().unwrap().effect
+        {
+            remap.outputs[0].collection = 0;
+        }
+        assert!(Rules::decode(&missing_output.encode_to_vec()).is_err());
+    }
+    #[test]
+    fn gamepad_and_mouse_buttons_keep_distinct_press_time_outputs_through_layers() {
+        let button = usage(BUTTON_PAGE, 1);
+        let first = map(alloc::vec![
+            remap(MOUSE, button, &[out(4)]),
+            remap(
+                GAMEPAD,
+                button,
+                &[Output {
+                    usage: button,
+                    collection: MOUSE
+                }]
+            ),
+        ]);
+        let second = map(alloc::vec![
+            remap(MOUSE, button, &[out(5)]),
+            remap(GAMEPAD, button, &[out(6)]),
+        ]);
+        let mut mapper = Mapper::new();
+        mapper.layers = alloc::vec![first.clone(), second];
+        let mouse = Held {
+            buttons: 1,
+            ..Held::default()
+        };
+        let pad = Gamepad {
+            buttons: 1,
+            ..Gamepad::default()
+        };
+        let (held, mapped) = mapper.held_with_gamepad(mouse, pad).unwrap();
+        assert_eq!(held, keys(&[4, 5]));
+        assert_eq!(mapped.buttons, 0);
+        *first.borrow_mut() = Rules::new(alloc::vec![remap(GAMEPAD, button, &[out(7)])]).unwrap();
+        assert_eq!(
+            mapper.held_with_gamepad(Held::default(), pad).unwrap().0,
+            keys(&[5])
+        );
+        mapper
+            .held_with_gamepad(Held::default(), Gamepad::default())
+            .unwrap();
+        assert_eq!(
+            mapper.held_with_gamepad(Held::default(), pad).unwrap().0,
+            keys(&[7])
+        );
+    }
+    #[test]
+    fn gamepad_outputs_hold_chords_and_standard_digital_controls() {
+        let mut mapper = Mapper::new();
+        mapper.layers = alloc::vec![map(alloc::vec![
+            remap(
+                KEYBOARD,
+                key(4),
+                &[
+                    gamepad_button(32),
+                    Output {
+                        usage: usage(DESKTOP_PAGE, 0x3d),
+                        collection: GAMEPAD
+                    }
+                ]
+            ),
+            remap(
+                GAMEPAD,
+                usage(BUTTON_PAGE, 1),
+                &[gamepad_button(32), out(5)]
+            ),
+        ])];
+        let pad = Gamepad {
+            buttons: 1,
+            dpad: 9,
+            select: true,
+            hat: Some(3),
+            hat_valid: true,
+            ..Gamepad::default()
+        };
+        let (held, mapped) = mapper.held_with_gamepad(keys(&[4]), pad).unwrap();
+        assert_eq!(held, keys(&[5]));
+        assert_eq!(mapped.buttons, 1 << 31);
+        assert!(mapped.start && mapped.select);
+        assert_eq!(mapped.dpad, 15);
+        assert_eq!(mapped.hat, None);
+        let (_, mapped) = mapper.held_with_gamepad(Held::default(), pad).unwrap();
+        assert_eq!(mapped.buttons, 1 << 31);
+        assert!(!mapped.start);
+        assert_eq!(
+            mapper
+                .held_with_gamepad(Held::default(), Gamepad::default())
+                .unwrap(),
+            (Held::default(), Gamepad::default())
+        );
+    }
+    #[test]
+    fn absolute_axis_layers_swap_and_invert_snapshot_values_and_validity() {
+        let mut mapper = Mapper::new();
+        mapper.layers = alloc::vec![map(alloc::vec![
+            axis(GAMEPAD_AXES[0], GAMEPAD_AXES[1], true),
+            axis(GAMEPAD_AXES[1], GAMEPAD_AXES[0], false),
+        ])];
+        let mut input = Gamepad {
+            axes: [100, 200, 300, 400, 500, 600, 700, 800],
+            axes_valid: 0xfd,
+            axes_declared: 0xfd,
+            ..Gamepad::default()
+        };
+        mapper.axes(&mut input);
+        assert_eq!(input.axes, [200, 65435, 300, 400, 500, 600, 700, 800]);
+        assert_eq!(input.axes_valid, 0xfe);
+        assert_eq!(input.axes_declared, 0xfe);
+        mapper.layers.push(map(alloc::vec![axis(
+            GAMEPAD_AXES[1],
+            GAMEPAD_AXES[6],
+            true
+        )]));
+        let mut input = Gamepad {
+            axes: [0, 65535, 0, 0, 0, 0, 22, 0],
+            axes_valid: 3,
+            axes_declared: 3,
+            ..Gamepad::default()
+        };
+        mapper.axes(&mut input);
+        assert_eq!(input.axes[0], 65535);
+        assert_eq!(input.axes[6], 0);
+        assert_eq!(input.axes_valid, 0x41);
+        assert_eq!(input.axes_declared, 0x41);
+        let mut mouse = Input {
+            motion: [10, 20, 0, 0],
+            ..Input::default()
+        };
+        mapper.motion(&mut mouse);
+        assert_eq!(mouse.motion, [10, 20, 0, 0]);
     }
 }

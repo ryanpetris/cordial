@@ -23,6 +23,7 @@ import {
 } from "@cordial/client";
 import {
   ErrorCode,
+  OutputMode,
   Platform,
   SettingSchema,
   SettingState,
@@ -204,6 +205,11 @@ export class AdapterSession {
     }
   }
 
+  /** Whether this session is still reading its devices for the first time. */
+  get listing(): boolean {
+    return !this.listed && this.#syncing !== null;
+  }
+
   pendingFor(id: number): string[] {
     return [...(this.#pending.get(id) ?? [])];
   }
@@ -234,6 +240,7 @@ export class AdapterSession {
         }
       } while (this.#syncAgain && !this.closed);
       this.#syncing = null;
+      this.#hooks.changed();
     })();
   }
 
@@ -462,6 +469,13 @@ export class AdapterSession {
     if (update.profiles) next.profiles = [...update.profiles.profiles];
     for (const i of update.integrations)
       if (i.enabled !== undefined && next.hidpp && i.kind === next.hidpp.kind) next.hidpp = { ...next.hidpp, enabled: i.enabled };
+    // The adapter keeps no entry for Disabled. Output state follows in the device event.
+    for (const p of update.outputPreferences) {
+      const role = convert.role(p.role);
+      if (!role) continue;
+      const rest = next.outputPreferences.filter((x) => x.role !== role);
+      next.outputPreferences = p.mode === OutputMode.DISABLED ? rest : [...rest, { role, mode: convert.outputMode(p.mode) }];
+    }
     this.devices.set(next.id, next);
     void this.#nameReferences();
   }

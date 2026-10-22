@@ -114,6 +114,21 @@ pub fn unsupported(st: &State, command: &Command) -> Option<String> {
             Some("this adapter doesn't offer development functions".into())
         }
         Command::Scan { transports, .. } => scan_transports(st, transports).err(),
+        Command::GamepadOutput(_, mode)
+        | Command::DeviceSave(
+            _,
+            DeviceUpdate {
+                gamepad: Some(mode),
+                ..
+            },
+        ) if *mode != p::OutputMode::Disabled
+            && !model::gamepad_modes(&st.status).contains(mode) =>
+        {
+            Some(format!(
+                "this adapter doesn't offer {} gamepad output",
+                text::output_mode_name(*mode)
+            ))
+        }
         _ if uses_profiles(command) && !profiles::available(&st.status) => Some(NO_PROFILES.into()),
         _ => None,
     }
@@ -459,6 +474,7 @@ pub(crate) fn execute(
         | Command::Unpair(target)
         | Command::Refresh(target)
         | Command::Set(target, ..)
+        | Command::GamepadOutput(target, _)
         | Command::Layers(target, _)
         | Command::Warnings(target)
         | Command::Settings(target)
@@ -1009,6 +1025,20 @@ fn device_command(
             };
             save_device(session, st, &d, subject, &update, pending_name(*toggle))
         }
+        Command::GamepadOutput(_, mode) => {
+            let update = DeviceUpdate {
+                gamepad: Some(*mode),
+                ..Default::default()
+            };
+            save_device(
+                session,
+                st,
+                &d,
+                subject,
+                &update,
+                "device set gamepad-output",
+            )
+        }
         Command::Layers(_, targets) => {
             let layers = resolve_profiles(session, st, targets)?;
             let update = DeviceUpdate {
@@ -1100,6 +1130,9 @@ fn save_device(
         || update.trusted.is_some_and(|v| v != d.trusted)
         || update.hidpp.is_some_and(|v| v != model::hidpp_enabled(d))
         || update
+            .gamepad
+            .is_some_and(|m| Some(m) != model::gamepad_mode(d))
+        || update
             .layers
             .as_ref()
             .is_some_and(|l| l.as_slice() != profiles::layers(d));
@@ -1133,6 +1166,14 @@ fn save_device(
             .layers
             .clone()
             .map(|profiles| p::ProfileLayers { profiles }),
+        output_preferences: update
+            .gamepad
+            .map(|mode| p::OutputPreference {
+                role: p::Role::Gamepad as i32,
+                mode: mode as i32,
+            })
+            .into_iter()
+            .collect(),
     };
     // A missing profile and a missing device are told apart by what the request carried.
     let name = if request.profiles.is_some() {

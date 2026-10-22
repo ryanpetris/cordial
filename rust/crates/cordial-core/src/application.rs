@@ -225,7 +225,7 @@ enum Pending {
     /// A page of a disconnected device's saved settings, once its policy has been read.
     Settings(Policy, Option<p::SettingRef>),
     /// A page of a profile's rules, once its record has been read.
-    Rules(u32, Option<profiles::Usage>),
+    Rules(u32, Option<profiles::RuleRef>),
     Files(FileListing),
     /// Deleting a profile once no saved device refers to it.
     DeleteProfile(u64, Records),
@@ -448,21 +448,29 @@ fn usage(usage: &p::Usage) -> Option<profiles::Usage> {
     ))
     .filter(|u| *u != 0)
 }
-fn ranges(ranges: &[profiles::Range]) -> Vec<p::UsageRange> {
-    ranges
-        .iter()
-        .map(|r| p::UsageRange {
-            collection: (r.collection != 0).then(|| wire_usage(r.collection)),
-            usage_page: r.page.into(),
-            min: r.min.into(),
-            max: r.max.into(),
-        })
-        .collect()
+fn rule_reference(reference: &p::ProfileRuleRef) -> Option<profiles::RuleRef> {
+    Some(profiles::RuleRef {
+        input: usage(reference.input.as_ref()?)?,
+        collection: usage(reference.collection.as_ref()?)?,
+    })
+}
+fn ranges(
+    ranges: &[profiles::Range],
+    kind: p::usage_range::Kind,
+) -> impl Iterator<Item = p::UsageRange> + '_ {
+    ranges.iter().map(move |r| p::UsageRange {
+        kind: kind as i32,
+        collection: (r.collection != 0).then(|| wire_usage(r.collection)),
+        usage_page: r.page.into(),
+        min: r.min.into(),
+        max: r.max.into(),
+    })
 }
 fn wire_rule(rule: profiles::Rule) -> p::ProfileRule {
-    use p::profile_rule::{Effect, Output, Remap, Scale};
+    use p::profile_rule::{Axis, Effect, Output, Remap, Scale};
     p::ProfileRule {
         input: Some(wire_usage(rule.input)),
+        collection: Some(wire_usage(rule.collection)),
         effect: Some(match rule.effect {
             profiles::Effect::Remap(outputs) => Effect::Remap(Remap {
                 outputs: outputs
@@ -472,6 +480,10 @@ fn wire_rule(rule: profiles::Rule) -> p::ProfileRule {
                         collection: Some(wire_usage(o.collection)),
                     })
                     .collect(),
+            }),
+            profiles::Effect::Axis(destination, invert) => Effect::Axis(Axis {
+                destination: Some(wire_usage(destination)),
+                invert,
             }),
             profiles::Effect::Scale(numerator, denominator) => Effect::Scale(Scale {
                 numerator,
@@ -484,6 +496,7 @@ fn wire_rule(rule: profiles::Rule) -> p::ProfileRule {
 fn rule(value: &p::ProfileRule) -> Option<profiles::Rule> {
     use p::profile_rule::Effect;
     let input = usage(value.input.as_ref()?)?;
+    let collection = usage(value.collection.as_ref()?)?;
     let effect = match value.effect.as_ref()? {
         Effect::Remap(remap) => profiles::Effect::Remap(
             remap
@@ -500,9 +513,16 @@ fn rule(value: &p::ProfileRule) -> Option<profiles::Rule> {
                 })
                 .collect::<Option<_>>()?,
         ),
+        Effect::Axis(axis) => {
+            profiles::Effect::Axis(usage(axis.destination.as_ref()?)?, axis.invert)
+        }
         Effect::Scale(scale) => profiles::Effect::Scale(scale.numerator, scale.denominator),
     };
-    Some(profiles::Rule { input, effect })
+    Some(profiles::Rule {
+        input,
+        collection,
+        effect,
+    })
 }
 /// One page of the settings `catalog` holds, after `after`, and whether nothing follows it.
 fn settings_page(catalog: &Catalog, after: Option<&p::SettingRef>) -> (Vec<p::Setting>, bool) {
@@ -605,10 +625,30 @@ impl Application {
         {
             fact(p::keys::STORAGE_FULL, p::value::Value::Bool(true));
         }
+        let gamepad = self.gamepad_profiles_supported();
         let profile_support = self.manager.profile_budget.map(|budget| p::ProfileSupport {
-            remap_inputs: ranges(&profiles::REMAP_INPUTS),
-            scale_inputs: ranges(&profiles::SCALE_INPUTS),
-            remap_outputs: ranges(&profiles::REMAP_OUTPUTS),
+            ranges: ranges(&profiles::REMAP_INPUTS, p::usage_range::Kind::RemapInput)
+                .chain(ranges(
+                    &profiles::SCALE_INPUTS,
+                    p::usage_range::Kind::ScaleInput,
+                ))
+                .chain(
+                    ranges(&profiles::REMAP_OUTPUTS, p::usage_range::Kind::RemapOutput)
+                        .filter(|r| gamepad || r.collection != Some(wire_usage(profiles::GAMEPAD))),
+                )
+                .chain(ranges(
+                    if gamepad { &profiles::AXIS_INPUTS } else { &[] },
+                    p::usage_range::Kind::AxisInput,
+                ))
+                .chain(ranges(
+                    if gamepad {
+                        &profiles::AXIS_OUTPUTS
+                    } else {
+                        &[]
+                    },
+                    p::usage_range::Kind::AxisOutput,
+                ))
+                .collect(),
             memory_budget: budget as u32,
             max_remap_outputs: profiles::MAX_REMAP_OUTPUTS as u32,
             max_layers: profiles::MAX_LAYERS as u32,
@@ -657,7 +697,40 @@ impl Application {
             info,
             profile_support,
             configuration_interfaces,
+            output_support: self
+                .manager
+                .output_support
+                .iter()
+                .map(|support| p::OutputSupport {
+                    role: support.role as i32,
+                    modes: support
+                        .modes
+                        .iter()
+                        .map(|&mode| p::OutputModeSupport {
+                            mode: mode as i32,
+                            max_slots: if mode == p::OutputMode::Disabled {
+                                0
+                            } else {
+                                crate::outputs::MAX_SLOTS.into()
+                            },
+                            slots: self.manager.output_slots(mode),
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
+    }
+
+    /// Supplies actual USB capacity and readiness, then marks changed status records.
+    pub fn set_output_enumeration(&mut self, enumeration: Option<crate::outputs::Enumeration>) {
+        self.adapter_dirty |= self.manager.set_output_enumeration(enumeration);
+        self.collect_changes();
+    }
+
+    /// Current per-slot gamepad controls for USB class workers. Snapshots remain readable on
+    /// reset and resume. Workers discard stale identities and neutralize replaced occupants.
+    pub fn gamepad_outputs(&mut self) -> crate::outputs::Snapshots {
+        self.manager.gamepad_outputs()
     }
 
     fn development(&self) -> bool {
@@ -817,11 +890,9 @@ impl Application {
         if !self.manager.storage_ready {
             return Err(failure(Error::RadioUnavailable));
         }
-        match (Policies { store }).load_record(id).await {
+        match self.manager.policy_record(id, store, radio).await {
             Ok((policy, bond)) => Ok((policy, slot, Some(bond))),
-            Err(crate::storage::Error::Missing) => Err(failure(Error::NotFound)),
-            Err(crate::storage::Error::Corrupt) => {
-                let _ = self.manager.lose(id, store, radio).await;
+            Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
                 Err(failure(Error::NotFound))
             }
             Err(_) => Err(failure(Error::StorageFailed)),
@@ -946,7 +1017,9 @@ impl Application {
                 Err(e) => self.fail(e),
             },
             Some(Pending::Files(listing)) => self.list_files(listing, store).await,
-            Some(Pending::DeleteProfile(id, scan)) => self.delete_profile(id, scan, store).await,
+            Some(Pending::DeleteProfile(id, scan)) => {
+                self.delete_profile(id, scan, store, radio).await
+            }
             Some(Pending::Pairing(start, scan)) => {
                 self.find_pairing_device(start, scan, store, radio, now)
                     .await
@@ -1009,7 +1082,7 @@ impl Application {
             Command::ListProfileRules(args) if profiles => {
                 let after = match &args.after {
                     None => None,
-                    Some(after) => match usage(after) {
+                    Some(after) => match rule_reference(after) {
                         Some(after) => Some(after),
                         None => return self.fail(bad_args()),
                     },
@@ -1368,7 +1441,7 @@ impl Application {
     async fn rules_page<S: RecordStore>(
         &mut self,
         id: u64,
-        after: Option<profiles::Usage>,
+        after: Option<profiles::RuleRef>,
         store: &mut S,
     ) -> Result<Vec<profiles::Rule>, p::Error> {
         if let Some(map) = self.loaded(id) {
@@ -1476,17 +1549,26 @@ impl Application {
     /// until this command responds, and the priority loop never adds a reference: pairing saves a
     /// new device without layers and keeps a re-paired device's saved layers. Background work
     /// paused between its own steps, such as cleaning up a lost profile, only removes references.
-    async fn delete_profile<S: RecordStore>(&mut self, id: u64, mut scan: Records, store: &mut S) {
+    async fn delete_profile<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u64,
+        mut scan: Records,
+        store: &mut S,
+        radio: &mut B,
+    ) {
         match scan.next(store).await {
             Err(code) => return self.fail(failure(code)),
             Ok(Visit::Page) => {}
-            Ok(Visit::Record(device)) => match (Policies { store }).load(device).await {
-                Ok(policy) if policy.profiles.contains(&id) => {
-                    return self.fail(failure(Error::InUse));
+            Ok(Visit::Record(device)) => {
+                match self.manager.policy_record(device, store, radio).await {
+                    Ok((policy, _)) if policy.profiles.contains(&id) => {
+                        return self.fail(failure(Error::InUse));
+                    }
+                    Ok(_)
+                    | Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {}
+                    Err(_) => return self.fail(failure(Error::StorageFailed)),
                 }
-                Ok(_) | Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {}
-                Err(_) => return self.fail(failure(Error::StorageFailed)),
-            },
+            }
             Ok(Visit::Done) => {
                 if let Err(error) = profiles::remove(store, id).await {
                     let error = self.storage_error(error);
@@ -1509,7 +1591,8 @@ impl Application {
         self.unsaved.forget_profile(id);
         self.writes_recovered();
         self.profile_dirty.retain(|p| *p != id);
-        self.event_retries.retain(|(r, _)| *r != EventRead::Profile(id));
+        self.event_retries
+            .retain(|(r, _)| *r != EventRead::Profile(id));
         if !self.profile_removed.contains(&id) {
             self.profile_removed.push_back(id);
         }
@@ -1598,7 +1681,6 @@ impl Application {
             let (rules, any) = profiles::Rules::default()
                 .changed(changes)
                 .map_err(|_| ())?;
-            // Forgetting every rule changes each input that has one.
             (rules, any || !map.borrow().is_empty())
         } else {
             map.borrow().changed(changes).map_err(|_| ())?
@@ -1666,6 +1748,16 @@ impl Application {
         }
     }
 
+    fn gamepad_profiles_supported(&self) -> bool {
+        self.manager.output_support.iter().any(|support| {
+            support.role == p::Role::Gamepad
+                && support
+                    .modes
+                    .iter()
+                    .any(|mode| *mode != p::OutputMode::Disabled)
+        })
+    }
+
     async fn set_profile_rules<S: RecordStore>(
         &mut self,
         args: p::SetProfileRules,
@@ -1680,16 +1772,41 @@ impl Application {
             use p::profile_rule_change::Change as C;
             let change = match &change.change {
                 Some(C::Rule(value)) => {
-                    let Some(rule) = rule(value) else {
+                    let Some(mut rule) = rule(value) else {
                         return self.fail(bad_args());
                     };
+                    let gamepad = self.gamepad_profiles_supported();
+                    if let profiles::Effect::Remap(outputs) = &mut rule.effect {
+                        for output in outputs {
+                            if output.collection == 0 {
+                                let mut ranges = profiles::REMAP_OUTPUTS.iter().filter(|r| {
+                                    (gamepad || r.collection != profiles::GAMEPAD)
+                                        && r.contains(output.usage)
+                                });
+                                let Some(first) = ranges.next() else {
+                                    return self.fail(bad_args());
+                                };
+                                let collection = first.collection;
+                                if ranges.any(|r| r.collection != collection) {
+                                    return self.fail(bad_args());
+                                }
+                                output.collection = collection;
+                            }
+                            if !gamepad && output.collection == profiles::GAMEPAD {
+                                return self.fail(bad_args());
+                            }
+                        }
+                    }
+                    if !gamepad && matches!(rule.effect, profiles::Effect::Axis(..)) {
+                        return self.fail(bad_args());
+                    }
                     match rule.normalized() {
                         Ok(rule) => profiles::Change::Set(rule),
                         Err(_) => return self.fail(bad_args()),
                     }
                 }
                 Some(C::Forget(reference)) => {
-                    let Some(input) = reference.input.as_ref().and_then(usage) else {
+                    let Some(input) = rule_reference(reference) else {
                         return self.fail(bad_args());
                     };
                     profiles::Change::Forget(input)
@@ -1783,13 +1900,14 @@ impl Application {
         match scan.next(store).await? {
             Visit::Page => {}
             Visit::Record(device) => {
-                let (mut policy, bond) = match (Policies { store }).load_record(device).await {
-                    Ok(record) => record,
-                    Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
-                        return Ok(Some(scan));
-                    }
-                    Err(_) => return Err(Error::StorageFailed),
-                };
+                let (mut policy, bond) =
+                    match self.manager.policy_record(device, store, radio).await {
+                        Ok(record) => record,
+                        Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
+                            return Ok(Some(scan));
+                        }
+                        Err(_) => return Err(Error::StorageFailed),
+                    };
                 if policy.profiles.contains(&id) {
                     policy.profiles.retain(|p| *p != id);
                     if self.manager.find(device).is_some() {
@@ -1800,7 +1918,11 @@ impl Application {
                         // Nothing is resident for this device, so only its record changes. It
                         // takes no room in the stack, whether or not it is enabled.
                         match (Policies { store }).save_with(&policy, &bond).await {
-                            Ok(()) | Err(crate::storage::Error::Missing) => {}
+                            Ok(()) => {}
+                            Err(crate::storage::Error::Missing) => {
+                                let _ = self.manager.lose(device, store, radio).await;
+                                return Ok(Some(scan));
+                            }
                             Err(_) => return Err(Error::StorageFailed),
                         }
                     }
@@ -2120,11 +2242,11 @@ impl Application {
         let saved = match scan.next(store).await {
             Err(code) => return self.fail(failure(code)),
             Ok(Visit::Page) => None,
-            Ok(Visit::Record(id)) => match (Policies { store }).load(id).await {
-                Ok(policy) if policy.peer == start.peer && policy.blocked => {
+            Ok(Visit::Record(id)) => match self.manager.policy_record(id, store, radio).await {
+                Ok((policy, _)) if policy.peer == start.peer && policy.blocked => {
                     return self.fail(failure(Error::Blocked));
                 }
-                Ok(policy) if policy.peer == start.peer => Some(Some(policy.id)),
+                Ok((policy, _)) if policy.peer == start.peer => Some(Some(policy.id)),
                 Ok(_) | Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
                     None
                 }
@@ -2292,10 +2414,31 @@ impl Application {
             Err(e) => return self.fail(e),
         };
         let mut policy = original.clone();
+        if let Err(code) = crate::outputs::update(
+            &mut policy.output_preferences,
+            &args.output_preferences,
+            self.manager.output_support,
+        ) {
+            return self.fail(failure(code));
+        }
         let mut setup = slot
             .and_then(|s| self.manager.devices[s].as_ref())
             .and_then(|d| d.live.as_ref())
             .map(|l| l.setup);
+        if !args.output_preferences.is_empty() {
+            if let Some(setup) = &mut setup {
+                setup.gamepad = true;
+            }
+            if policy.setup_pending
+                && crate::outputs::gamepad(&policy.output_preferences) == p::OutputMode::Disabled
+            {
+                // Keep an explicit choice until every initial setup step has finished.
+                policy.output_preferences.push(crate::outputs::Preference {
+                    role: p::Role::Gamepad,
+                    mode: p::OutputMode::Disabled,
+                });
+            }
+        }
         if let Some(layers) = &args.profiles {
             if !self.manager.profiles_supported() {
                 return self.fail(failure(Error::UnsupportedTransport));
@@ -2322,9 +2465,9 @@ impl Application {
                 if let Some(setup) = &mut setup {
                     setup.hidpp = true;
                 }
-                policy.setup_pending &= !setup.is_some_and(|s| s.complete());
             }
         }
+        policy.setup_pending &= !setup.is_some_and(|s| s.complete());
         if let Some(enabled) = args.enabled {
             policy.enabled = enabled;
         }
@@ -2347,17 +2490,21 @@ impl Application {
         }
         let id = policy.id;
         let hidpp = policy.hidpp_enabled();
+        let capacity_reason = if slot.is_none()
+            && self.manager.eligible(&policy)
+            && !self.manager.room(policy.peer.transport)
+        {
+            p::CapacityReason::Enabled
+        } else {
+            p::CapacityReason::Unknown
+        };
         if let Err(code) = self
             .manager
             .save_policy(policy, bond.as_ref(), store, radio)
             .await
         {
-            if code == Error::NotFound {
-                // The device's record was lost; it is deleted as at startup.
-                let _ = self.manager.lose(id, store, radio).await;
-            }
             let error = if code == Error::Capacity {
-                capacity(p::CapacityReason::Enabled)
+                capacity(capacity_reason)
             } else {
                 wire::error(code, None, self.manager.write_uncertain)
             };
@@ -2949,6 +3096,12 @@ impl Application {
                         crate::info::standard_failed(info, uuid, instance);
                     }
                 }
+                if uuid == 0x2a50
+                    && instance == 0
+                    && let Err(error) = self.manager.gamepad_identity(link, success, &bytes)
+                {
+                    self.close(link, Some(error), radio);
+                }
             }
             Event::Read {
                 id,
@@ -3437,15 +3590,25 @@ impl Application {
                 }
                 Err(error) => Err(error),
             },
-            Record::DeviceRoles(id, roles) => match (Policies { store }).load_record(*id).await {
-                Ok((mut policy, bond)) if policy.roles != *roles => {
-                    policy.roles = *roles;
-                    Policies { store }.save_with(&policy, &bond).await
+            Record::DeviceRoles(id, roles) => {
+                let saved = match (Policies { store }).load_record(*id).await {
+                    Ok((mut policy, bond)) if policy.roles != *roles => {
+                        policy.roles = *roles;
+                        Policies { store }.save_with(&policy, &bond).await
+                    }
+                    Ok(_) => Ok(()),
+                    Err(E::Missing | E::Corrupt) => Err(E::Missing),
+                    Err(error) => Err(error),
+                };
+                if saved == Err(E::Missing) {
+                    if !self.manager.lost_devices.contains(id) {
+                        self.manager.lost_devices.push(*id);
+                    }
+                    Ok(())
+                } else {
+                    saved
                 }
-                // A record that is gone or lost is dealt with when it is next read.
-                Ok(_) | Err(E::Missing | E::Corrupt) => Ok(()),
-                Err(error) => Err(error),
-            },
+            }
         };
         match result {
             Ok(()) => {
@@ -3552,6 +3715,8 @@ impl Application {
             scan: Records::new(2),
             direct: false,
         });
+        // Lost-record cleanup keeps the link's new bond while the saved identity is matched.
+        self.manager.connection_mut(link).unwrap().peer = identity;
     }
 
     /// Ends the attempt whose bond could not be saved.
@@ -3589,8 +3754,8 @@ impl Application {
                 .or(pair.saved.filter(|_| pair.expected == Some(identity)));
             self.pair.as_mut().unwrap().bonding.as_mut().unwrap().direct = true;
             if let Some(id) = known {
-                match (Policies { store }).load(id).await {
-                    Ok(policy) if policy.peer == identity => {
+                match self.manager.policy_record(id, store, radio).await {
+                    Ok((policy, _)) if policy.peer == identity => {
                         return self
                             .finish_bond(link, identity, Some(policy), store, radio, now)
                             .await;
@@ -3606,8 +3771,8 @@ impl Application {
         let saved = match scan.next(store).await {
             Err(error) => return self.bond_failed(identity, error, radio),
             Ok(Visit::Page) => return,
-            Ok(Visit::Record(id)) => match (Policies { store }).load(id).await {
-                Ok(policy) if policy.peer == identity => Some(policy),
+            Ok(Visit::Record(id)) => match self.manager.policy_record(id, store, radio).await {
+                Ok((policy, _)) if policy.peer == identity => Some(policy),
                 Ok(_) | Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
                     return;
                 }
@@ -3909,8 +4074,13 @@ impl Application {
             && self.lost_retry.due(now)
             && self.write_allowed(now)
         {
-            if (Policies { store }).remove(id).await.is_ok() {
-                self.manager.lost_devices.remove(0);
+            let removed = if self.manager.find(id).is_some() || self.manager.outputs.contains(id) {
+                self.manager.lose(id, store, radio).await.is_ok()
+            } else {
+                (Policies { store }).remove(id).await.is_ok()
+            };
+            if removed {
+                self.manager.lost_devices.retain(|lost| *lost != id);
                 self.lost_retry.succeeded();
             } else {
                 // Kept, behind any others, until a cleanup succeeds.
@@ -4002,7 +4172,7 @@ impl Application {
                 Err(error) => self.filled(Err(error), radio, now),
                 Ok(Visit::Done) => self.filled(Ok(changed), radio, now),
                 Ok(Visit::Page) => self.work = Some(Work::Fill { scan, changed }),
-                Ok(Visit::Record(id)) => match self.manager.fill_record(id, store).await {
+                Ok(Visit::Record(id)) => match self.manager.fill_record(id, store, radio).await {
                     Ok(added) => {
                         self.work = Some(Work::Fill {
                             scan,
@@ -4154,6 +4324,7 @@ impl Application {
 
     /// Marks devices whose settings, information or warnings changed since the last check.
     fn collect_changes(&mut self) {
+        self.manager.reconcile_outputs();
         for slot in 0..self.manager.devices.len() {
             let Some(d) = self.manager.devices[slot].as_mut() else {
                 continue;

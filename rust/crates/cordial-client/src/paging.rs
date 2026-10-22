@@ -146,9 +146,19 @@ pub fn usage_order(a: &p::Usage, b: &p::Usage) -> Ordering {
     (a.usage_page, a.usage).cmp(&(b.usage_page, b.usage))
 }
 
-/// The input a rule is for; a rule without one reads as usage 0 of page 0.
-pub fn rule_input(rule: &p::ProfileRule) -> p::Usage {
-    rule.input.unwrap_or_default()
+/// What identifies a rule: its input and the input's collection.
+pub fn rule_ref(rule: &p::ProfileRule) -> p::ProfileRuleRef {
+    p::ProfileRuleRef {
+        input: rule.input,
+        collection: rule.collection,
+    }
+}
+
+/// The order of rules: input, then collection, a missing usage reading as usage 0 of page 0.
+pub fn rule_order(a: &p::ProfileRuleRef, b: &p::ProfileRuleRef) -> Ordering {
+    let key = |u: &Option<p::Usage>| u.unwrap_or_default();
+    usage_order(&key(&a.input), &key(&b.input))
+        .then_with(|| usage_order(&key(&a.collection), &key(&b.collection)))
 }
 
 /// What identifies a feature table entry.
@@ -222,7 +232,7 @@ impl Page for p::ProfileList {
 
 impl Page for p::ProfileRules {
     type Entry = p::ProfileRule;
-    type Key = p::Usage;
+    type Key = p::ProfileRuleRef;
     fn from_result(result: response::Result) -> Option<Self> {
         match result {
             response::Result::ProfileRules(rules) => Some(rules),
@@ -238,11 +248,11 @@ impl Page for p::ProfileRules {
     fn end(&self) -> bool {
         self.end
     }
-    fn key(entry: &Self::Entry) -> p::Usage {
-        rule_input(entry)
+    fn key(entry: &Self::Entry) -> p::ProfileRuleRef {
+        rule_ref(entry)
     }
-    fn order(a: &p::Usage, b: &p::Usage) -> Ordering {
-        usage_order(a, b)
+    fn order(a: &p::ProfileRuleRef, b: &p::ProfileRuleRef) -> Ordering {
+        rule_order(a, b)
     }
 }
 

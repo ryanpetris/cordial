@@ -18,37 +18,37 @@ message Request {
     SetAdapter set_adapter = 2;
     EnterBootloader enter_bootloader = 3;
 
-    StartScan start_scan = 10;
-    StopScan stop_scan = 11;
-    StartPairing start_pairing = 12;
-    AcceptPrompt accept_prompt = 13;
-    RejectPrompt reject_prompt = 14;
-    CancelPairing cancel_pairing = 15;
+    StartScan start_scan = 4;
+    StopScan stop_scan = 5;
+    StartPairing start_pairing = 6;
+    AcceptPrompt accept_prompt = 7;
+    RejectPrompt reject_prompt = 8;
+    CancelPairing cancel_pairing = 9;
 
-    ListDevices list_devices = 20;
-    GetDevice get_device = 21;
-    SetDevice set_device = 22;
-    ConnectDevice connect_device = 23;
-    DisconnectDevice disconnect_device = 24;
-    UnpairDevice unpair_device = 25;
-    RefreshDevice refresh_device = 26;
-    ListWarnings list_warnings = 27;
+    ListDevices list_devices = 10;
+    GetDevice get_device = 11;
+    SetDevice set_device = 12;
+    ConnectDevice connect_device = 13;
+    DisconnectDevice disconnect_device = 14;
+    UnpairDevice unpair_device = 15;
+    RefreshDevice refresh_device = 16;
+    ListWarnings list_warnings = 17;
 
-    ListSettings list_settings = 30;
-    SetSettings set_settings = 31;
+    ListSettings list_settings = 18;
+    SetSettings set_settings = 19;
 
-    ListProfiles list_profiles = 50;
-    GetProfile get_profile = 51;
-    CreateProfile create_profile = 52;
-    CopyProfile copy_profile = 53;
-    DeleteProfile delete_profile = 54;
-    ListProfileRules list_profile_rules = 55;
-    SetProfileRules set_profile_rules = 56;
+    ListProfiles list_profiles = 20;
+    GetProfile get_profile = 21;
+    CreateProfile create_profile = 22;
+    CopyProfile copy_profile = 23;
+    DeleteProfile delete_profile = 24;
+    ListProfileRules list_profile_rules = 25;
+    SetProfileRules set_profile_rules = 26;
 
     // Development firmware only.
-    ListFeatures list_features = 40;
-    ListFiles list_files = 41;
-    ReadFile read_file = 42;
+    ListFeatures list_features = 27;
+    ListFiles list_files = 28;
+    ReadFile read_file = 29;
   }
 }
 
@@ -67,23 +67,21 @@ message Response {
     Status status = 2;
     Device device = 3;
     DeviceList devices = 4;
-    DeviceSettings settings = 6;
-    FeatureList features = 7;
-    FileList files = 8;
-    FileData file = 9;
-    DeviceWarnings warnings = 10;
-    Profile profile = 11;
-    ProfileList profiles = 12;
-    ProfileRules profile_rules = 13;
-    ProfileCreated profile_created = 14;
+    DeviceSettings settings = 5;
+    FeatureList features = 6;
+    FileList files = 7;
+    FileData file = 8;
+    DeviceWarnings warnings = 9;
+    Profile profile = 10;
+    ProfileList profiles = 11;
+    ProfileRules profile_rules = 12;
+    ProfileCreated profile_created = 13;
   }
 }
 
 // Change events carry only what changed. A client applies them to what it has listed, and lists
 // again from the start when it needs a fresh view, such as in a new session.
 message Event {
-  reserved 4, 8, 11;
-  reserved "settings", "warnings", "profile_rules";
   oneof kind {
     // An adapter preference, readiness or an adapter info value changed.
     Status adapter = 1;
@@ -92,19 +90,19 @@ message Event {
     // A device has been unpaired.
     DeviceRemoved device_removed = 3;
     // A scan found a candidate, or a candidate's name or signal changed.
-    Candidate scan_found = 5;
+    Candidate scan_found = 4;
     // A scan ended, by timeout or StopScan.
-    ScanDone scan_done = 6;
+    ScanDone scan_done = 5;
     // The pairing changed state.
-    Pairing pairing = 7;
+    Pairing pairing = 6;
     // A profile was created or copied, or its roles changed.
-    Profile profile = 9;
+    Profile profile = 7;
     // A profile has been deleted.
-    ProfileRemoved profile_removed = 10;
+    ProfileRemoved profile_removed = 8;
     // Some of a device's settings changed, appeared or went away.
-    SettingsChanged settings_changed = 12;
+    SettingsChanged settings_changed = 9;
     // A device's warnings changed.
-    WarningsChanged warnings_changed = 13;
+    WarningsChanged warnings_changed = 10;
   }
 }
 
@@ -125,7 +123,7 @@ message SetAdapter {
   repeated TransportUpdate transports = 3;
   // Configuration interface preferences to change, applied in order. Interfaces not listed are
   // left unchanged. An interface this firmware does not support returns ERROR_CODE_UNSUPPORTED.
-  repeated ConfigurationInterfaceUpdate configuration_interfaces = 5;
+  repeated ConfigurationInterfaceUpdate configuration_interfaces = 4;
 }
 
 // Partial update of one configuration interface's preferences. Enabling or disabling an interface,
@@ -176,6 +174,9 @@ message Status {
   // One entry per configuration interface this firmware supports, whether enabled or not. An
   // interface that is not listed is not supported.
   repeated ConfigurationInterfaceSupport configuration_interfaces = 8;
+  // Implemented output backends. Unlisted enabled modes are unsupported. Gamepad Disabled is
+  // always accepted, including when no output backends are listed.
+  repeated OutputSupport output_support = 9;
 }
 
 // What the Dongle supports for one transport. Per-transport limits and capabilities are added here
@@ -349,11 +350,9 @@ message ListDevices {
 // `end` is set. A client passes the key of the last entry it received as the next request's
 // `after`.
 message DeviceList {
-  reserved 1, 2, 3;
-  reserved "devices", "next", "unreadable";
-  repeated DeviceListEntry entries = 4;
+  repeated DeviceListEntry entries = 1;
   // Nothing follows the last entry.
-  bool end = 5;
+  bool end = 2;
 }
 
 message DeviceListEntry {
@@ -391,6 +390,10 @@ message SetDevice {
   // The device's profile layers. Missing leaves them unchanged. Without profile support it returns
   // ERROR_CODE_UNSUPPORTED. A connected device uses the new layers from its next input.
   ProfileLayers profiles = 6;
+  // Changes applied in order, with the last entry for a role winning. Missing leaves preferences
+  // unchanged. Enabled modes require Status.output_support to advertise them. Gamepad Disabled
+  // is always accepted.
+  repeated OutputPreference output_preferences = 7;
 }
 
 // Partial update of one integration's preferences.
@@ -456,24 +459,28 @@ message Device {
   // connection, and missing once the device is disabled or the Dongle restarts.
   optional ErrorCode error = 11;
   // Link security while connected.
-  Security security = 13;
+  Security security = 12;
   // Every integration the device has a saved preference for or is detected with on the current
   // link.
-  repeated Integration integrations = 14;
+  repeated Integration integrations = 13;
   // What the device reports about itself on the current connection. Empty while disconnected. A
   // key whose value is unknown is left out.
-  repeated Info info = 15;
+  repeated Info info = 14;
   // The kinds of input the device produces, learned from its HID descriptor and saved. Empty until
   // the descriptor has first been read. A client skips roles it does not know.
-  repeated Role roles = 16;
+  repeated Role roles = 15;
   // The device's saved profile layers. A new device has none. Missing when the board has no
   // profile support.
-  ProfileLayers profiles = 17;
+  ProfileLayers profiles = 16;
   // Set while the device is connected and its profiles are not loaded, so its input passes through
   // unchanged: ERROR_CODE_NO_CAPACITY when they do not fit in what is left of
   // ProfileSupport.memory_budget, or ERROR_CODE_STORAGE_FAILED when one could not be read or
   // decoded.
-  optional ErrorCode profile_error = 18;
+  optional ErrorCode profile_error = 17;
+  // Saved output choices. A missing gamepad choice means Disabled.
+  repeated OutputPreference output_preferences = 18;
+  // Current output state, independent of Bluetooth connection admission.
+  repeated OutputStatus outputs = 19;
 }
 
 enum Role {
@@ -487,6 +494,51 @@ enum Role {
   ROLE_CONSUMER_CONTROL = 3;
   // Power, sleep and wake keys.
   ROLE_SYSTEM_CONTROL = 4;
+  ROLE_GAMEPAD = 5;
+}
+
+enum OutputMode {
+  OUTPUT_MODE_DISABLED = 0;
+  OUTPUT_MODE_HID = 1;
+  OUTPUT_MODE_XINPUT = 2;
+}
+
+message OutputPreference {
+  // Required. Only Gamepad is configurable.
+  Role role = 1;
+  OutputMode mode = 2;
+}
+
+message OutputSupport {
+  // Required.
+  Role role = 1;
+  repeated OutputModeSupport modes = 2;
+}
+
+message OutputModeSupport {
+  OutputMode mode = 1;
+  // At most four for each gamepad mode; zero for Disabled.
+  uint32 max_slots = 2;
+  // Enumerated slots, absent until known. Disabled has no slots.
+  optional uint32 slots = 3;
+}
+
+message OutputStatus {
+  // Required.
+  Role role = 1;
+  OutputMode mode = 2;
+  OutputState state = 3;
+  // Zero-based temporary slot within the role and mode, only while Active.
+  optional uint32 slot = 4;
+}
+
+enum OutputState {
+  OUTPUT_STATE_UNKNOWN = 0;
+  OUTPUT_STATE_DISABLED = 1;
+  OUTPUT_STATE_DISCONNECTED = 2;
+  OUTPUT_STATE_PENDING = 3;
+  OUTPUT_STATE_ACTIVE = 4;
+  OUTPUT_STATE_UNSUPPORTED = 5;
 }
 
 enum Transport {
@@ -500,8 +552,9 @@ enum Kind {
   KIND_UNKNOWN = 0;
   KIND_KEYBOARD = 1;
   KIND_MOUSE = 2;
-  // Known, and neither a keyboard nor a mouse.
+  // Known, without a more specific kind.
   KIND_OTHER = 3;
+  KIND_GAMEPAD = 4;
 }
 
 enum DeviceState {
@@ -587,21 +640,21 @@ enum WarningCode {
   WARNING_CODE_BUFFERED_INPUT_UNSUPPORTED = 3;
 
   // Lock indicator limitations.
-  WARNING_CODE_INDICATOR_READ_UNSUPPORTED = 20;
-  WARNING_CODE_INDICATOR_WRITE_UNSUPPORTED = 21;
-  WARNING_CODE_INDICATOR_REPORT_TOO_LARGE = 22;
-  WARNING_CODE_BUFFERED_INDICATOR_UNSUPPORTED = 23;
-  WARNING_CODE_INDICATOR_ARRAY_FULL = 24;
-  WARNING_CODE_INDICATOR_RELATIVE_SELECTOR_UNSUPPORTED = 25;
-  WARNING_CODE_INDICATOR_RANGE_UNSUPPORTED = 26;
-  WARNING_CODE_INDICATOR_MODE_UNSUPPORTED = 27;
-  WARNING_CODE_INDICATOR_NONLINEAR_UNSUPPORTED = 28;
-  WARNING_CODE_INDICATOR_SCALE_UNSUPPORTED = 29;
+  WARNING_CODE_INDICATOR_READ_UNSUPPORTED = 4;
+  WARNING_CODE_INDICATOR_WRITE_UNSUPPORTED = 5;
+  WARNING_CODE_INDICATOR_REPORT_TOO_LARGE = 6;
+  WARNING_CODE_BUFFERED_INDICATOR_UNSUPPORTED = 7;
+  WARNING_CODE_INDICATOR_ARRAY_FULL = 8;
+  WARNING_CODE_INDICATOR_RELATIVE_SELECTOR_UNSUPPORTED = 9;
+  WARNING_CODE_INDICATOR_RANGE_UNSUPPORTED = 10;
+  WARNING_CODE_INDICATOR_MODE_UNSUPPORTED = 11;
+  WARNING_CODE_INDICATOR_NONLINEAR_UNSUPPORTED = 12;
+  WARNING_CODE_INDICATOR_SCALE_UNSUPPORTED = 13;
 
   // Lock indicator failures. Cleared by the next successful update.
-  WARNING_CODE_INDICATOR_STATE_UNKNOWN = 40;
-  WARNING_CODE_INDICATOR_READ_FAILED = 41;
-  WARNING_CODE_INDICATOR_WRITE_FAILED = 42;
+  WARNING_CODE_INDICATOR_STATE_UNKNOWN = 14;
+  WARNING_CODE_INDICATOR_READ_FAILED = 15;
+  WARNING_CODE_INDICATOR_WRITE_FAILED = 16;
 }
 
 // Each field is missing when the Bluetooth stack does not report it.
@@ -773,11 +826,11 @@ message Setting {
   // device is connected in any other state it is the last reading, which a client shows as possibly
   // out of date. It is missing when the setting has not been read on the current connection.
   oneof type {
-    BoolSetting bool = 10;
-    IntegerSetting integer = 11;
-    EnumSetting enum = 12;
-    TextSetting text = 13;
-    ColorSetting color = 14;
+    BoolSetting bool = 5;
+    IntegerSetting integer = 6;
+    EnumSetting enum = 7;
+    TextSetting text = 8;
+    ColorSetting color = 9;
   }
 
   // Fields 20 and up carry details specific to one integration, which a client never needs in
@@ -862,40 +915,51 @@ enum SettingState {
 // What the Dongle supports for profiles. Profile limits and capabilities are added here as
 // fields, never as profile fields on Status.
 message ProfileSupport {
-  // The inputs a remap rule can name: on/off controls such as keys, buttons and media keys.
-  repeated UsageRange remap_inputs = 1;
-  // The inputs a scale rule can name: relative values such as pointer motion and wheels, in the
-  // same form. No usage is in both remap_inputs and scale_inputs, or in both remap_outputs and
-  // scale_inputs.
-  repeated UsageRange scale_inputs = 2;
-  // The outputs a remap can produce. Each range names the application collection of the Dongle's
-  // USB report that carries it.
-  repeated UsageRange remap_outputs = 3;
+  // Supported inputs and outputs, qualified by capability kind and application collection.
+  repeated UsageRange ranges = 1;
   // Bytes of memory for loaded profiles, shared by every connected device and configuration
   // interface. A device whose layers do not fit in what is left loads none of them; see
   // Device.profile_error. A profile larger than the whole budget cannot be saved.
-  uint32 memory_budget = 4;
+  uint32 memory_budget = 2;
   // The most outputs one remap can hold, and the most outputs one held input produces after every
   // layer has applied.
-  uint32 max_remap_outputs = 5;
+  uint32 max_remap_outputs = 3;
   // The most profiles one ProfileLayers can list, which bounds the layers each enabled device keeps
   // in its resident reconnection entry.
-  uint32 max_layers = 6;
+  uint32 max_layers = 4;
   // Bytes of memory_budget in use by loaded profiles.
-  uint32 memory_used = 7;
+  uint32 memory_used = 5;
 }
 
-// A contiguous range of HID usages on one usage page.
+// A contiguous range of HID usages on one usage page, in one application collection, for one
+// capability kind. The same usage and collection may occur separately under several kinds.
 message UsageRange {
-  // The HID application collection of the Dongle's USB report that carries the range, such as
-  // Generic Desktop Mouse. Set in ProfileSupport.remap_outputs and missing in input ranges.
-  Usage collection = 1;
+  enum Kind {
+    // Unknown and unspecified kinds grant no capability.
+    KIND_UNSPECIFIED = 0;
+    // On/off controls such as keys, buttons and media keys a remap rule can name.
+    KIND_REMAP_INPUT = 1;
+    // Outputs a remap can produce in the Dongle's USB report for the collection.
+    KIND_REMAP_OUTPUT = 2;
+    // Relative values such as pointer motion and wheels a scale rule can name.
+    KIND_SCALE_INPUT = 3;
+    // Absolute Game Pad axes an axis rule can name as inputs.
+    KIND_AXIS_INPUT = 4;
+    // Absolute Game Pad axes an axis rule can produce in the input's collection.
+    KIND_AXIS_OUTPUT = 5;
+  }
+
+  // Required. Selects the capability this range grants.
+  Kind kind = 1;
+  // Required. The HID application collection of the input or output report that carries the
+  // range, such as Generic Desktop Mouse or Game Pad.
+  Usage collection = 2;
   // Required.
-  uint32 usage_page = 2;
+  uint32 usage_page = 3;
   // Inclusive.
-  uint32 min = 3;
+  uint32 min = 4;
   // Required. Inclusive.
-  uint32 max = 4;
+  uint32 max = 5;
 }
 
 // One HID usage.
@@ -924,11 +988,9 @@ message ListProfiles {
 
 // One page of saved profiles, paged as DeviceList.
 message ProfileList {
-  reserved 1, 2, 3;
-  reserved "profiles", "next", "unreadable";
-  repeated ProfileListEntry entries = 4;
+  repeated ProfileListEntry entries = 1;
   // Nothing follows the last entry.
-  bool end = 5;
+  bool end = 2;
 }
 
 message ProfileListEntry {
@@ -995,28 +1057,29 @@ message Profile {
   repeated Role roles = 3;
 }
 
-// One page of the profile's rules, in ascending usage page and usage order of their inputs.
+// One page of the profile's rules, ordered by input usage page, input usage, collection usage
+// page, then collection usage.
 // Responds with ProfileRules.
 message ListProfileRules {
   // Required.
   uint32 profile = 1;
-  // The input of the last rule received. Missing starts from the beginning.
-  Usage after = 2;
+  // The input and collection of the last rule received. Missing starts from the beginning.
+  ProfileRuleRef after = 2;
 }
 
 // Saves and forgets rules in one storage write and responds with no result. A saved rule replaces
-// the profile's rule for the same input. A rule that remaps the input to only itself, in the
-// collection of the report that carries it, or scales it by a ratio equal to 1 is forgotten
-// instead. Every device using the profile uses the new rules from its next input; a held input
-// keeps the outputs it was pressed with until it is released. If any change is invalid or the save
+// the profile's rule for the same input and collection. A rule that remaps the input to only
+// itself in the same collection, scales it by a ratio equal to 1, or maps an axis to itself without
+// inversion is forgotten instead. Every device using the profile uses the new rules from its next
+// input; a held input keeps the outputs it was pressed with until it is released. If any change is invalid or the save
 // fails, nothing is saved. A save that would make the profile larger than
 // ProfileSupport.memory_budget, or grow a loaded profile beyond what is left of it, returns
 // ERROR_CODE_NO_CAPACITY with CAPACITY_REASON_PROFILE_MEMORY.
 message SetProfileRules {
   // Required.
   uint32 profile = 1;
-  // Required, at least one. Applied in order; a later change for the same input replaces an earlier
-  // one.
+  // Required, at least one. Applied in order; a later change for the same input and collection
+  // replaces an earlier one.
   repeated ProfileRuleChange changes = 2;
 }
 
@@ -1032,39 +1095,43 @@ message ProfileRuleChange {
 }
 
 message ProfileRuleRef {
-  reserved 2;
-  reserved "collection";
   // Required.
   Usage input = 1;
+  // Required. The input's HID application collection.
+  Usage collection = 2;
 }
 
 // One page of a profile's rules, paged as DeviceList.
 message ProfileRules {
   // Required.
   uint32 profile = 1;
-  // In ascending usage page and usage order of their inputs.
+  // Ordered by input usage page, input usage, collection usage page, then collection usage.
   repeated ProfileRule rules = 2;
   // Nothing follows the last rule.
   bool end = 3;
 }
 
-// What one input does while the profile is applied. A profile has at most one rule for each input.
+// What one input does while the profile is applied. A profile has at most one rule for each
+// input usage and application collection together.
 message ProfileRule {
-  reserved 2;
-  reserved "collection";
-  // Required. Within ProfileSupport.remap_inputs for a remap or scale_inputs for a scale.
+  // Required. Within ProfileSupport.ranges of kind KIND_REMAP_INPUT, KIND_SCALE_INPUT or
+  // KIND_AXIS_INPUT for the effect, together with collection.
   Usage input = 1;
+  // Required. The input's HID application collection. Never inferred from the input usage.
+  Usage collection = 2;
   // Required.
   oneof effect {
     Remap remap = 3;
     Scale scale = 4;
+    Axis axis = 5;
   }
 
   // Fixed outputs, all held together for as long as the input is held. No outputs disables the
   // input. A keyboard modifier is an output like any other key. A remap applies when the device
   // reports the input as a held control; other forms of the same usage keep their usual behavior.
   message Remap {
-    // Each within ProfileSupport.remap_outputs, at most max_remap_outputs, each at most once.
+    // Each within ProfileSupport.ranges of kind KIND_REMAP_OUTPUT, at most max_remap_outputs,
+    // each at most once.
     repeated Output outputs = 1;
   }
 
@@ -1086,6 +1153,14 @@ message ProfileRule {
     sint32 numerator = 1;
     // Required. Positive.
     uint32 denominator = 2;
+  }
+
+  // Routes an absolute Game Pad axis to another absolute axis in the same Game Pad application
+  // collection. Inversion reverses the normalized axis range. No deadzones, curves or sensitivity.
+  message Axis {
+    // Required. Within ProfileSupport.ranges of kind KIND_AXIS_OUTPUT for the input's collection.
+    Usage destination = 1;
+    bool invert = 2;
   }
 }
 
@@ -1126,7 +1201,7 @@ message Feature {
   // The integration's own description of the feature. A client that does not know the variant
   // shows the entry without details.
   oneof detail {
-    HidppFeature hidpp = 10;
+    HidppFeature hidpp = 3;
   }
 }
 
@@ -1203,21 +1278,21 @@ enum ErrorCode {
   ERROR_CODE_IN_USE = 16;          // A saved preference refers to the profile.
 
   // Pairing and connection failures.
-  ERROR_CODE_CANDIDATE_EXPIRED = 30;
-  ERROR_CODE_AUTH_FAILED = 31;
-  ERROR_CODE_REJECTED = 32;
-  ERROR_CODE_TIMEOUT = 33;
-  ERROR_CODE_CANCELLED = 34;
-  ERROR_CODE_CONNECTION_FAILED = 35;
-  ERROR_CODE_UNSUPPORTED_HID = 36;
+  ERROR_CODE_CANDIDATE_EXPIRED = 17;
+  ERROR_CODE_AUTH_FAILED = 18;
+  ERROR_CODE_REJECTED = 19;
+  ERROR_CODE_TIMEOUT = 20;
+  ERROR_CODE_CANCELLED = 21;
+  ERROR_CODE_CONNECTION_FAILED = 22;
+  ERROR_CODE_UNSUPPORTED_HID = 23;
 
   // Integration and setting failures, for any integration. Timeouts use ERROR_CODE_TIMEOUT.
-  ERROR_CODE_PROTOCOL_UNSUPPORTED = 50;  // The device lacks a supported protocol version or the reports it needs.
-  ERROR_CODE_FEATURE_UNAVAILABLE = 51;   // A feature the integration needs is missing.
-  ERROR_CODE_TRANSPORT_ERROR = 52;       // Exchanging messages with the device failed.
-  ERROR_CODE_DEVICE_ERROR = 53;          // The device answered with an error.
-  ERROR_CODE_INVALID_RESPONSE = 54;      // The device's answer could not be understood.
-  ERROR_CODE_READBACK_MISMATCH = 55;     // A written value did not read back.
+  ERROR_CODE_PROTOCOL_UNSUPPORTED = 24;  // The device lacks a supported protocol version or the reports it needs.
+  ERROR_CODE_FEATURE_UNAVAILABLE = 25;   // A feature the integration needs is missing.
+  ERROR_CODE_TRANSPORT_ERROR = 26;       // Exchanging messages with the device failed.
+  ERROR_CODE_DEVICE_ERROR = 27;          // The device answered with an error.
+  ERROR_CODE_INVALID_RESPONSE = 28;      // The device's answer could not be understood.
+  ERROR_CODE_READBACK_MISMATCH = 29;     // A written value did not read back.
 }
 
 enum CapacityReason {

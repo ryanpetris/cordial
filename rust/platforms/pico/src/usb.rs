@@ -1,5 +1,5 @@
 use cordial_usb::completion::CompleteDriver;
-use cordial_usb::completion::Completion;
+use cordial_usb::completion::{Completion, PollDelay};
 use embassy_rp::pac;
 use embassy_rp::peripherals::USB;
 use embassy_rp::usb::Driver;
@@ -40,10 +40,13 @@ pub unsafe extern "C" fn __wrap_memcpy(dst: *mut u8, src: *const u8, len: usize)
 pub struct TransferCompletion;
 impl Completion for TransferCompletion {
     fn disconnect(&self, disconnected: bool) {
-        pac::USB.sie_ctrl().modify(|r| r.set_pullup_en(!disconnected));
+        pac::USB
+            .sie_ctrl()
+            .modify(|r| r.set_pullup_en(!disconnected));
     }
     async fn wait(&self, endpoint: EndpointAddress) -> Result<(), EndpointError> {
         let index = endpoint.index();
+        let mut delay = PollDelay::default();
         loop {
             if !pac::USB_DPRAM.ep_in_control(index - 1).read().enable()
                 || pac::USB.sie_status().read().bus_reset()
@@ -59,11 +62,11 @@ impl Completion for TransferCompletion {
             }
             // Embassy owns the IRQ. Observe its endpoint buffer ownership rather
             // than registering a competing completion interrupt handler.
-            Timer::after_micros(125).await;
+            Timer::after_micros(delay.micros()).await;
         }
     }
 }
-pub fn driver(usb: Peri<'static, USB>) -> CompleteDriver<Driver<'static, USB>, TransferCompletion> {
+pub fn driver(usb: Peri<'_, USB>) -> CompleteDriver<Driver<'_, USB>, TransferCompletion> {
     CompleteDriver {
         driver: Driver::new(usb, Irqs),
         completion: TransferCompletion,

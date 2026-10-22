@@ -22,12 +22,20 @@ The host platform selects special-key translation and survives removing every de
 saved adapter settings have loaded, the platform reads as Linux, Classic as disabled and BLE as
 enabled.
 
-`Status.profile_support` says what profile rules this firmware can apply: the input usages a remap
-or a scale can name, the outputs a remap can produce, how many outputs a remap and profiles a layer
-list can hold, the memory budget for loaded profiles and how much of it is in use. It is missing on
+`Status.profile_support` says what profile rules this firmware can apply: the input usages and
+collections a remap, scale or absolute axis rule can name, the outputs a remap or axis rule can
+produce, how many outputs a remap and profiles a layer list can hold, the memory budget for loaded profiles and how much of it is in use. It is missing on
 a board configured without profile support, such as the Pico W. `Status.configuration_interfaces`
 has one `ConfigurationInterfaceSupport` per configuration interface the firmware supports, enabled
 or not: whether it is enabled, its profile, and the interfaces it cannot be enabled alongside.
+
+`Status.output_support` lists implemented USB output backends by role and mode. Unlisted enabled
+modes are unsupported. Gamepad Disabled is always accepted, including when no backends are listed.
+Each mode reports `max_slots`; `slots` is the enumerated pool size, absent
+until known. Disabled has zero capacity and no enumerated slots. Each gamepad HID or XInput pool
+has at most four slots. Board compositions advertise modes only when their USB backends are usable.
+An actual enumerated pool can differ from the desired pool while USB is being configured. Reset
+or suspend makes selected outputs Pending while the enumerated pool sizes remain known.
 
 ## Profiles
 
@@ -35,12 +43,15 @@ A profile is a named set of rules on HID usages. Its ID is a positive integer fr
 separate from device IDs, stays the same for the profile's life and is never reused. Its name is a
 label, not an identity; names need not be unique.
 
-Each rule names an input usage and an effect, and a profile has at most one rule for each input:
+Each rule requires an input usage, its application collection and an effect. A profile has at
+most one rule for each input usage and collection together:
 
 - A remap makes an on/off input, such as a key, button, media key or power key, hold a fixed set
   of outputs instead, such as a key with modifiers, a sleep key, or nothing at all.
 - A scale multiplies a relative value, such as pointer motion or a wheel, by a ratio; a negative
   ratio inverts it.
+- An axis rule routes an absolute Game Pad axis to `destination` in the same Game Pad collection.
+  Its `invert` flag reverses the normalized range. It has no deadzones, curves or sensitivity.
 
 An input without a rule passes through unchanged, so a new profile changes nothing.
 
@@ -50,9 +61,9 @@ one that remaps B to A makes C produce A. Scales multiply, and a disabled input 
 profile. An empty list passes everything through.
 
 `Profile.roles` summarizes what a profile's rules change, so a client can show it as a keyboard,
-mouse, media or system control profile, or several, without reading its rules. Each rule adds one
-role, from the application collection its input arrives in; outputs do not count. A rule matching
-no row adds none.
+mouse, media, system control or gamepad profile, or several, without reading its rules. Each rule
+adds one role, from its explicit input collection; outputs do not count. A rule matching no row
+adds none.
 
 | Rule input | Collection | Role |
 | --- | --- | --- |
@@ -60,10 +71,13 @@ no row adds none.
 | Button usages (`09:xx`), Generic Desktop X, Y or Wheel (`01:30`, `01:31`, `01:38`) or Consumer AC Pan (`0c:238`) | Mouse (`01:02`) | Mouse |
 | Other Consumer usages (`0c:xx`) | Consumer Control (`0c:01`) | Consumer control |
 | Other Generic Desktop usages (`01:xx`) | System Control (`01:80`) | System control |
+| Supported Game Pad controls and absolute axes | Game Pad (`01:05`) | Gamepad |
 
 A `profile` event carries a profile's record when it is created or copied or its roles change, and
 `profile_removed` its ID when it is deleted. `ListProfileRules` lists the rules a page at a time in
-ascending usage page and usage order of their inputs.
+input usage page, input usage, collection usage page, then collection usage order. Its `after`
+cursor is a `ProfileRuleRef` with both the last rule's `input` and `collection`; omitting the cursor
+starts from the beginning.
 
 ## Devices
 
@@ -75,8 +89,9 @@ peripheral paired over both Classic and BLE has two records. Names are labels, n
 - `name` is the name the device reports when it has reported one, otherwise the name seen at
   pairing. A missing or blank report never replaces a known name.
 - `kinds` lists what the device is, such as both a keyboard and a mouse. It comes from the device's
-  saved roles when known, where a keyboard role gives keyboard, a mouse role mouse, and other roles
-  alone other; otherwise from information the device reports on the current connection.
+  saved roles when known, where a keyboard role gives keyboard, a mouse role mouse, a gamepad role
+  gamepad, and other roles alone other; otherwise from information the device reports on the
+  current connection.
 - `state` is `connected` only once security, HID report setup and input forwarding are all ready,
   not merely when a radio link exists.
 - `inactive` says why the Dongle will not use the device, in this order: its transport is not
@@ -89,8 +104,8 @@ peripheral paired over both Classic and BLE has two records. Names are labels, n
   requested policy; for example, Secure Connections Just Works reports `encrypted`,
   `secure_connections` and a 16-byte key but not `authenticated`.
 - `roles` lists the kinds of input the HID descriptor produces: keyboard, mouse, consumer controls
-  such as media and volume keys, and system controls such as power and sleep. They are saved when
-  the descriptor is read, so they are known while the device is disconnected.
+  such as media and volume keys, system controls such as power and sleep, and gamepads. They are
+  saved when the descriptor is read, so they are known while the device is disconnected.
 - `profiles` is the device's saved layers, empty for a new device.
 - `profile_error` is set while the device is connected without its profiles loaded, because they do
   not fit in the memory budget or one could not be read. Its input then passes through unchanged.
@@ -99,6 +114,66 @@ A `device` event carries the whole record whenever anything in it changes, inclu
 other information; `device_removed` follows an unpair or a lost record. `ListDevices` returns saved
 devices a page at a time in ascending ID order; a device whose record cannot be read is listed by
 ID as an `unreadable` entry.
+
+`Device.output_preferences` holds saved output choices as `role` and `mode`. Only Gamepad is
+configurable, with Disabled, HID and XInput choices. A missing gamepad choice means Disabled.
+Keyboard and mouse behavior does not depend on this list. Saved choices survive renewing an
+existing bond. Unpairing deletes them.
+
+During first-connection setup, a newly paired device with validated gamepad controls automatically
+selects HID if the firmware supports it and the saved HID pool has room. Disconnected, disabled,
+blocked and nonresident saved HID choices count toward its four-slot limit. Otherwise setup settles
+on Disabled. Explicit choices take precedence. Setup saves the choice before applying it and retries
+a failed save on a later connection. Completed setup never automatically enables output later.
+Gamepad selection does not finish pending HID++ detection. See the
+[storage rules](../storage-format.md#devices) for setup persistence.
+
+`Device.outputs` reports output state independently of Bluetooth state and `inactive`:
+
+| State | Meaning |
+| --- | --- |
+| Unknown | The output state is unknown. |
+| Disabled | The selected mode is Disabled. |
+| Disconnected | The selected backend is supported and the device has no live connection. |
+| Pending | Connection setup or required USB enumeration is incomplete. |
+| Active | A supported translation owns an enumerated slot. |
+| Unsupported | The selected backend or connected device layout cannot provide translation. |
+
+Only Active carries `slot`, a zero-based temporary slot within its role and mode pool. It is not a
+Windows XInput user index. A saved enabled choice whose backend is unavailable reports Unsupported.
+A connected layout without supported gamepad controls also reports Unsupported. Connection setup,
+unavailable storage and USB setup report Pending. Disabled or blocked devices have no assignment.
+Active requires a supported layout, an assigned slot and a ready USB backend.
+
+Each gamepad mode's desired USB pool is the number of paired devices selecting it, capped at four.
+HID and XInput have independent pools. Disabled output choices contribute nothing. Disabled or
+blocked devices, disabled transports and nonresident records still contribute their saved enabled
+choices. Connections and disconnections do not change the desired pools. Pool sizes describe USB
+allocation, not the number of Bluetooth connections or support for a particular device layout.
+
+Runtime assignments use the lowest free slot in the selected mode's actual enumerated pool.
+Surviving assignments keep their slots when other devices connect or disconnect. Closing a link,
+changing its mode, replacing its layout or losing storage readiness releases its controls. A mode
+change can move an assignment even when both desired pools remain capped at four. It does not
+require USB enumeration when the desired counts stay the same.
+
+The USB owner supplies `outputs::Enumeration` through `Application::set_output_enumeration`, with
+an actual `Plan`, a generation that changes when endpoints are rebuilt, and USB readiness. No
+capacity is assumed before that call. `Application::gamepad_outputs` reconciles connections and
+returns fixed arrays of four HID and four XInput `SlotSnapshot` values. Each has an optional
+`LinkId` occupant, a nonwrapping assignment generation and normalized `hid::Gamepad` controls.
+An empty slot has neutral controls. Assignment generations change when a slot is assigned again,
+including when the same link receives a replacement layout. They are separate from enumeration
+generations.
+
+USB class workers own report encoding and transmission. Before sending queued controls, they
+compare the current occupant and assignment generation, discard stale work, and send neutral
+controls before a replacement occupant's controls. Reading snapshots consumes nothing, so workers
+can resend current controls after reset or resume. The application caches controls when reports
+arrive and when a slot is assigned. Reconciliation checks at most four connections and eight
+slots; surviving assignments do not walk HID fields on each priority poll. The decoder permits
+at most sixteen reports and ninety-six fields per map. No USB queues or per-report allocations
+are needed by the runtime pools.
 
 ## Integrations
 

@@ -882,3 +882,582 @@ fn only_forwarded_input_ends_the_first_input_wait() {
     manager.input(&key, 3).unwrap();
     assert!(!manager.starting(4));
 }
+
+#[test]
+fn output_pools_count_nonresident_selections_and_keep_uncapped_counts() {
+    use cordial_core::outputs::{Plan, Preference};
+    use p::{OutputMode, Role};
+    let (mut manager, mut store, mut radio) = setup();
+    for n in 2..=6 {
+        add(&mut store, n.into(), peer(n), |p| {
+            p.enabled = false;
+            p.roles = cordial_core::devices::Roles(cordial_core::outputs::GAMEPAD);
+            p.output_preferences.push(Preference {
+                role: Role::Gamepad,
+                mode: OutputMode::Hid,
+            });
+        });
+    }
+    add(&mut store, 7, peer(7), |p| {
+        p.blocked = true;
+        p.output_preferences.push(Preference {
+            role: Role::Gamepad,
+            mode: OutputMode::Xinput,
+        });
+    });
+    block_on(manager.load(&mut store, &mut radio)).unwrap();
+    assert_eq!(resident(&manager), [77]);
+    assert_eq!(
+        manager.outputs.plan(),
+        Plan {
+            hid_gamepads: 4,
+            xinput_gamepads: 1
+        }
+    );
+    let d = record(&manager, &mut store, 2);
+    assert_eq!(d.kinds, [p::Kind::Gamepad as i32]);
+    assert_eq!(d.outputs[0].state, p::OutputState::Unsupported as i32);
+    assert_eq!(d.outputs[0].slot, None);
+    store.fail_remove = Some(record_key(2, 2));
+    assert!(block_on(manager.unpair(2, peer(2), &mut store, &mut radio)).is_err());
+    assert_eq!(manager.outputs.plan().hid_gamepads, 4);
+    store.fail_remove = None;
+    block_on(manager.unpair(2, peer(2), &mut store, &mut radio)).unwrap();
+    assert_eq!(manager.outputs.plan().hid_gamepads, 4);
+    change(&mut manager, &mut store, &mut radio, 3, |p| {
+        p.output_preferences.clear()
+    })
+    .unwrap();
+    assert_eq!(manager.outputs.plan().hid_gamepads, 3);
+    // Lost nonresident records also release their saved selection.
+    store.records.remove(&record_key(2, 4));
+    block_on(manager.lose(4, &mut store, &mut radio)).unwrap();
+    assert_eq!(manager.outputs.plan().hid_gamepads, 2);
+    let transports = cordial_core::devices::Transports::NONE;
+    let preference = AdapterPreference {
+        transports,
+        ..manager.preference.clone()
+    };
+    block_on(manager.adapter(preference, &mut store)).unwrap();
+    block_on(manager.load(&mut store, &mut radio)).unwrap();
+    assert!(resident(&manager).is_empty());
+    assert_eq!(
+        manager.outputs.plan(),
+        Plan {
+            hid_gamepads: 2,
+            xinput_gamepads: 1
+        }
+    );
+}
+
+#[test]
+fn renewed_pairing_preserves_output_preferences_without_counting_twice() {
+    use cordial_core::outputs::Preference;
+    let (mut manager, mut store, mut radio) = setup();
+    change(&mut manager, &mut store, &mut radio, 77, |p| {
+        p.output_preferences.push(Preference {
+            role: p::Role::Gamepad,
+            mode: p::OutputMode::Hid,
+        });
+    })
+    .unwrap();
+    block_on(manager.prepare_pair(peer(1), Some(peer(1)), &mut store, &mut radio)).unwrap();
+    let link = manager.pair(peer(1), 90_000, &mut radio).unwrap();
+    block_on(manager.bonded(
+        link,
+        peer(1),
+        saved_peer(&mut store, peer(1)),
+        b"Gamepad",
+        &mut store,
+        &mut radio,
+    ))
+    .unwrap();
+    assert_eq!(
+        policy(&mut store, 77).output_preferences[0].mode,
+        p::OutputMode::Hid
+    );
+    assert_eq!(manager.outputs.plan().hid_gamepads, 1);
+    let mut reboot = Manager::default();
+    block_on(reboot.load(&mut store, &mut radio)).unwrap();
+    assert_eq!(reboot.outputs.plan(), manager.outputs.plan());
+}
+
+#[test]
+fn filling_lost_nonresident_records_releases_output_counts() {
+    use cordial_core::outputs::{Plan, Preference};
+    for missing in [true, false] {
+        let (mut manager, mut store, mut radio) = setup();
+        add(&mut store, 2, peer(2), |policy| {
+            policy.enabled = false;
+            policy.output_preferences.push(Preference {
+                role: p::Role::Gamepad,
+                mode: p::OutputMode::Hid,
+            });
+        });
+        block_on(manager.load(&mut store, &mut radio)).unwrap();
+        assert!(manager.find(2).is_none());
+        let key = record_key(2, 2);
+        store.fail_load = Some(key);
+        assert_eq!(
+            block_on(manager.fill_record(2, &mut store, &mut radio)),
+            Err(Error::StorageFailed)
+        );
+        assert_eq!(manager.outputs.plan().hid_gamepads, 1);
+        assert!(manager.removed.is_empty());
+        store.fail_load = None;
+        if missing {
+            store.records.remove(&key);
+        } else {
+            store.records.insert(key, UNDECODABLE.to_vec());
+            block_on(manager.fill(&mut store, &mut radio)).unwrap();
+        }
+        for id in [2, 0, 999] {
+            assert!(!block_on(manager.fill_record(id, &mut store, &mut radio)).unwrap());
+        }
+        assert_eq!(manager.outputs.plan(), Plan::default());
+        assert_eq!(manager.removed, [2]);
+        assert!(!store.records.contains_key(&key));
+    }
+}
+
+#[test]
+fn saving_a_policy_with_a_lost_bond_releases_output_counts() {
+    use cordial_core::outputs::{Plan, Preference};
+    for missing in [true, false] {
+        let (mut manager, mut store, mut radio) = setup();
+        change(&mut manager, &mut store, &mut radio, 77, |policy| {
+            policy.output_preferences.push(Preference {
+                role: p::Role::Gamepad,
+                mode: p::OutputMode::Xinput,
+            });
+        })
+        .unwrap();
+        let saved = policy(&mut store, 77);
+        let key = record_key(2, 77);
+        store.fail_load = Some(key);
+        assert_eq!(
+            block_on(manager.save_policy(saved.clone(), None, &mut store, &mut radio)),
+            Err(Error::StorageFailed)
+        );
+        assert_eq!(manager.outputs.plan().xinput_gamepads, 1);
+        assert!(manager.removed.is_empty());
+        store.fail_load = None;
+        if missing {
+            store.records.remove(&key);
+        } else {
+            lose_bond(&mut store.records, key);
+        }
+        assert_eq!(
+            block_on(manager.save_policy(saved, None, &mut store, &mut radio)),
+            Err(Error::NotFound)
+        );
+        assert_eq!(manager.outputs.plan(), Plan::default());
+        assert_eq!(manager.removed, [77]);
+        assert!(manager.find(77).is_none());
+        assert!(!store.records.contains_key(&key));
+    }
+}
+
+#[test]
+fn a_lost_device_with_failed_cleanup_cannot_become_resident_again() {
+    use cordial_core::outputs::{Plan, Preference};
+    let (mut manager, mut store, mut radio) = setup();
+    change(&mut manager, &mut store, &mut radio, 77, |policy| {
+        policy.output_preferences.push(Preference {
+            role: p::Role::Gamepad,
+            mode: p::OutputMode::Hid,
+        });
+    })
+    .unwrap();
+    let key = record_key(2, 77);
+    lose_bond(&mut store.records, key);
+    store.fail_remove = Some(key);
+    assert_eq!(
+        block_on(manager.import(0, &mut store, &mut radio)),
+        Err(Error::StorageFailed)
+    );
+    assert!(manager.find(77).is_none());
+    assert_eq!(manager.outputs.plan(), Plan::default());
+    assert_eq!(manager.lost_devices, [77]);
+    // The policy still decodes even though its bond does not belong to it.
+    assert!(block_on(Policies { store: &mut store }.load_record(77)).is_ok());
+    for _ in 0..2 {
+        assert!(!block_on(manager.fill_record(77, &mut store, &mut radio)).unwrap());
+        assert!(!block_on(manager.fill(&mut store, &mut radio)).unwrap());
+        assert!(manager.find(77).is_none());
+        assert_eq!(manager.outputs.plan(), Plan::default());
+        assert_eq!(manager.removed, [77]);
+        assert_eq!(manager.lost_devices, [77]);
+    }
+    store.fail_remove = None;
+    block_on(manager.lose(77, &mut store, &mut radio)).unwrap();
+    assert!(manager.lost_devices.is_empty());
+    assert!(!store.records.contains_key(&key));
+    assert_eq!(manager.removed, [77]);
+}
+
+fn pad_descriptor() -> Vec<cordial_core::bluetooth::Descriptor> {
+    use cordial_core::{bluetooth::Descriptor, hid::Map};
+    // Eight buttons, one unsigned axis and a nullable hat.
+    let bytes = [
+        5, 1, 9, 5, 0xa1, 1, 5, 9, 0x19, 1, 0x29, 8, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8, 0x81, 2,
+        5, 1, 9, 0x30, 0x15, 0, 0x26, 255, 0, 0x75, 8, 0x95, 1, 0x81, 2, 9, 0x39, 0x15, 1, 0x25, 8,
+        0x81, 0x42, 0xc0,
+    ];
+    vec![Descriptor {
+        service: ServiceId(7),
+        map: Map::compile(&bytes).unwrap(),
+    }]
+}
+
+fn output_manager(modes: &[p::OutputMode]) -> (Manager, Store, Radio) {
+    use cordial_core::outputs::{Preference, Support};
+    let (_, mut store, mut radio) = setup();
+    for (index, &mode) in modes.iter().enumerate() {
+        add(
+            &mut store,
+            77 + index as u64,
+            peer(1 + index as u8),
+            |policy| {
+                policy.roles.0 = cordial_core::outputs::GAMEPAD;
+                if mode != p::OutputMode::Disabled {
+                    policy.output_preferences.push(Preference {
+                        role: p::Role::Gamepad,
+                        mode,
+                    });
+                }
+            },
+        );
+    }
+    let mut manager = Manager::default();
+    block_on(manager.load(&mut store, &mut radio)).unwrap();
+    manager.radio_ready = true;
+    manager.output_support = &[Support {
+        role: p::Role::Gamepad,
+        modes: &[p::OutputMode::Hid, p::OutputMode::Xinput],
+    }];
+    (manager, store, radio)
+}
+
+fn connect_pad(manager: &mut Manager, radio: &mut Radio, id: u64) -> cordial_core::link::LinkId {
+    let slot = manager.find(id).unwrap();
+    let link = manager
+        .connect(slot, true, 30_000, None, radio)
+        .unwrap()
+        .unwrap();
+    manager.connected(link, pad_descriptor(), 255, 0).unwrap();
+    link
+}
+
+fn enumerate_outputs(manager: &mut Manager, hid: u8, xinput: u8, generation: u64, ready: bool) {
+    use cordial_core::outputs::{Enumeration, Plan};
+    manager.set_output_enumeration(Some(Enumeration {
+        plan: Plan {
+            hid_gamepads: hid,
+            xinput_gamepads: xinput,
+        },
+        generation,
+        ready,
+    }));
+}
+
+#[test]
+fn gamepad_pools_use_actual_enumeration_and_stable_independent_slots() {
+    use p::OutputMode::{Hid, Xinput};
+    let (mut manager, mut store, mut radio) = output_manager(&[Hid, Xinput, Hid, Xinput]);
+    let desired = manager.outputs.plan();
+    let a = connect_pad(&mut manager, &mut radio, 77);
+    let b = connect_pad(&mut manager, &mut radio, 78);
+    let c = connect_pad(&mut manager, &mut radio, 79);
+    let d = connect_pad(&mut manager, &mut radio, 80);
+    assert_eq!(manager.connections.iter().flatten().count(), 4);
+    assert_eq!(manager.gamepad_outputs(), Default::default());
+    assert_eq!(
+        record(&manager, &mut store, 77).outputs[0].state,
+        p::OutputState::Pending as i32
+    );
+    enumerate_outputs(&mut manager, 1, 2, 1, true);
+    let snapshots = manager.gamepad_outputs();
+    assert_eq!(snapshots.hid[0].occupant, Some(a));
+    assert_eq!(snapshots.hid[1].occupant, None);
+    assert_eq!(snapshots.xinput[0].occupant, Some(b));
+    assert_eq!(snapshots.xinput[1].occupant, Some(d));
+    assert_eq!(
+        record(&manager, &mut store, 79).outputs[0].state,
+        p::OutputState::Pending as i32
+    );
+    assert_eq!(record(&manager, &mut store, 80).outputs[0].slot, Some(1));
+    manager.close(a, None, &mut radio);
+    let replacement = manager.gamepad_outputs();
+    assert_eq!(replacement.hid[0].occupant, Some(c));
+    assert!(replacement.hid[0].generation > snapshots.hid[0].generation);
+    assert_eq!(replacement.xinput, snapshots.xinput);
+    assert_eq!(manager.outputs.plan(), desired);
+    manager.disconnected(a, None, 2).unwrap();
+    let reconnected = connect_pad(&mut manager, &mut radio, 77);
+    assert_ne!(reconnected, a);
+    assert_eq!(manager.gamepad_outputs().hid[0], replacement.hid[0]);
+    assert_eq!(
+        record(&manager, &mut store, 77).outputs[0].state,
+        p::OutputState::Pending as i32
+    );
+    enumerate_outputs(&mut manager, 2, 2, 2, true);
+    let rebuilt = manager.gamepad_outputs();
+    assert!(rebuilt.hid.iter().any(|s| s.occupant == Some(reconnected)));
+    assert!(rebuilt.hid.iter().any(|s| s.occupant == Some(c)));
+    assert!(rebuilt.hid[0].generation > replacement.hid[0].generation);
+    assert_eq!(manager.outputs.plan(), desired);
+}
+
+#[test]
+fn output_controls_refresh_on_input_and_survive_suspend_without_stale_occupants() {
+    use cordial_core::hid::Gamepad;
+    use p::OutputMode::Hid;
+    let (mut manager, mut store, mut radio) = output_manager(&[Hid, Hid]);
+    enumerate_outputs(&mut manager, 2, 0, 7, true);
+    let a = connect_pad(&mut manager, &mut radio, 77);
+    let b = connect_pad(&mut manager, &mut radio, 78);
+    let neutral = manager.gamepad_outputs().hid[0];
+    assert_eq!(
+        neutral.gamepad,
+        Gamepad {
+            axes_declared: 1,
+            ..Gamepad::default()
+        }
+    );
+    manager
+        .input(
+            &InputReport::new(a, ServiceId(7), 0, &[5, 128, 3]).unwrap(),
+            1,
+        )
+        .unwrap();
+    let held = manager.gamepad_outputs().hid[0];
+    assert_eq!(held.gamepad.buttons, 5);
+    assert_eq!(held.gamepad.axes[0], 32896);
+    assert_eq!(held.gamepad.axes_valid, 1);
+    assert_eq!(held.gamepad.hat, None);
+    assert_eq!(held.gamepad.dpad, 4);
+    assert_eq!(held.generation, neutral.generation);
+    enumerate_outputs(&mut manager, 2, 0, 7, false);
+    assert_eq!(
+        record(&manager, &mut store, 77).outputs[0].state,
+        p::OutputState::Pending as i32
+    );
+    assert_eq!(record(&manager, &mut store, 77).outputs[0].slot, None);
+    assert_eq!(manager.gamepad_outputs().hid[0], held);
+    enumerate_outputs(&mut manager, 2, 0, 7, true);
+    assert_eq!(manager.gamepad_outputs().hid[0], held);
+    manager
+        .input(
+            &InputReport::new(a, ServiceId(7), 0, &[0, 0, 0]).unwrap(),
+            2,
+        )
+        .unwrap();
+    let released = manager.gamepad_outputs().hid[0].gamepad;
+    assert_eq!(released.buttons, 0);
+    assert_eq!(released.hat, None);
+    assert!(released.hat_valid);
+    manager.close(a, None, &mut radio);
+    let empty = manager.gamepad_outputs();
+    assert_eq!(empty.hid[0].occupant, None);
+    assert_eq!(empty.hid[0].gamepad, Gamepad::default());
+    assert_eq!(empty.hid[1].occupant, Some(b));
+    manager.disconnected(a, None, 3).unwrap();
+    let new = connect_pad(&mut manager, &mut radio, 77);
+    let replaced = manager.gamepad_outputs().hid[0];
+    assert_eq!(replaced.occupant, Some(new));
+    assert_ne!(
+        (held.occupant, held.generation),
+        (replaced.occupant, replaced.generation)
+    );
+    assert_eq!(
+        replaced.gamepad,
+        Gamepad {
+            axes_declared: 1,
+            ..Gamepad::default()
+        }
+    );
+    assert!(
+        !manager
+            .input(
+                &InputReport::new(a, ServiceId(7), 0, &[255, 255, 8]).unwrap(),
+                4
+            )
+            .unwrap()
+    );
+    assert_eq!(manager.gamepad_outputs().hid[0], replaced);
+}
+
+#[test]
+fn saturated_mode_changes_reassign_without_changing_the_usb_plan() {
+    use cordial_core::outputs::{Plan, Preference};
+    use p::OutputMode::{Disabled, Hid, Xinput};
+    let (mut manager, mut store, mut radio) =
+        output_manager(&[Hid, Hid, Hid, Hid, Hid, Xinput, Xinput, Xinput, Xinput]);
+    let a = connect_pad(&mut manager, &mut radio, 77);
+    enumerate_outputs(&mut manager, 4, 4, 1, true);
+    let original = manager.gamepad_outputs().hid[0];
+    let desired = Plan {
+        hid_gamepads: 4,
+        xinput_gamepads: 4,
+    };
+    assert_eq!(manager.outputs.plan(), desired);
+    store.fail_save = Some((record_key(2, 77), false));
+    assert_eq!(
+        change(&mut manager, &mut store, &mut radio, 77, |p| p
+            .output_preferences[0]
+            .mode =
+            Xinput),
+        Err(Error::StorageFailed)
+    );
+    assert_eq!(manager.outputs.plan(), desired);
+    assert_eq!(manager.gamepad_outputs().hid[0], original);
+    store.fail_save = None;
+    change(&mut manager, &mut store, &mut radio, 77, |p| {
+        p.output_preferences[0].mode = Xinput
+    })
+    .unwrap();
+    assert_eq!(manager.outputs.plan(), desired);
+    let switched = manager.gamepad_outputs();
+    assert_eq!(switched.hid[0].occupant, None);
+    assert_eq!(switched.xinput[0].occupant, Some(a));
+    assert!(switched.xinput[0].generation > original.generation);
+    assert_eq!(
+        record(&manager, &mut store, 77).outputs[0].mode,
+        Xinput as i32
+    );
+    change(&mut manager, &mut store, &mut radio, 77, |p| {
+        p.output_preferences = vec![Preference {
+            role: p::Role::Gamepad,
+            mode: Disabled,
+        }]
+    })
+    .unwrap();
+    assert_eq!(
+        record(&manager, &mut store, 77).outputs[0].state,
+        p::OutputState::Disabled as i32
+    );
+    assert_eq!(manager.gamepad_outputs().xinput[0].occupant, None);
+}
+
+#[test]
+fn gamepad_assignments_release_for_layout_storage_policy_and_backend_failures() {
+    use p::OutputMode::Hid;
+    let (mut manager, mut store, mut radio) = output_manager(&[Hid]);
+    enumerate_outputs(&mut manager, 1, 0, 1, true);
+    let a = connect_pad(&mut manager, &mut radio, 77);
+    let original = manager.gamepad_outputs().hid[0];
+    manager.relayout(a, descriptor()).unwrap();
+    assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
+    assert_eq!(
+        record(&manager, &mut store, 77).outputs[0].state,
+        p::OutputState::Unsupported as i32
+    );
+    manager.relayout(a, pad_descriptor()).unwrap();
+    assert!(manager.gamepad_outputs().hid[0].generation > original.generation);
+    manager.fail_storage();
+    assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
+    assert_eq!(
+        record(&manager, &mut store, 77).outputs[0].state,
+        p::OutputState::Pending as i32
+    );
+    manager.storage_ready = true;
+    let resumed = manager.gamepad_outputs().hid[0];
+    manager.output_support = &[];
+    assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
+    assert_eq!(
+        record(&manager, &mut store, 77).outputs[0].state,
+        p::OutputState::Unsupported as i32
+    );
+    manager.output_support = &[cordial_core::outputs::Support {
+        role: p::Role::Gamepad,
+        modes: &[Hid],
+    }];
+    assert!(manager.gamepad_outputs().hid[0].generation > resumed.generation);
+    change(&mut manager, &mut store, &mut radio, 77, |p| {
+        p.blocked = true
+    })
+    .unwrap();
+    assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
+    assert_eq!(
+        record(&manager, &mut store, 77).outputs[0].state,
+        p::OutputState::Disconnected as i32
+    );
+    manager.disconnected(a, None, 3).unwrap();
+    block_on(manager.unpair(77, peer(1), &mut store, &mut radio)).unwrap();
+    assert_eq!(manager.outputs.plan(), Default::default());
+    assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
+}
+
+#[test]
+fn failed_relayout_releases_gamepad_controls_before_the_caller_closes() {
+    use cordial_core::hid::Gamepad;
+    let (mut manager, _, mut radio) = output_manager(&[p::OutputMode::Hid]);
+    enumerate_outputs(&mut manager, 1, 0, 1, true);
+    let a = connect_pad(&mut manager, &mut radio, 77);
+    manager
+        .input(
+            &InputReport::new(a, ServiceId(7), 0, &[1, 255, 8]).unwrap(),
+            1,
+        )
+        .unwrap();
+    assert!(manager.relayout(a, Vec::new()).is_err());
+    assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
+    assert_eq!(manager.gamepad_outputs().hid[0].gamepad, Gamepad::default());
+}
+
+#[test]
+fn disabled_gamepad_output_preserves_keyboard_forwarding_and_existing_wire_fields() {
+    use p::OutputMode::{Disabled, Hid};
+    let (mut manager, mut store, mut radio) = output_manager(&[Disabled]);
+    enumerate_outputs(&mut manager, 1, 0, 1, true);
+    let slot = manager.find(77).unwrap();
+    let link = manager
+        .connect(slot, true, 30_000, None, &mut radio)
+        .unwrap()
+        .unwrap();
+    let mut descriptors = descriptor();
+    let mut pads = pad_descriptor();
+    pads[0].service = ServiceId(8);
+    descriptors.extend(pads);
+    manager.connected(link, descriptors, 255, 0).unwrap();
+    while manager.forward.packet().is_some() {
+        manager.forward.complete();
+    }
+    manager
+        .input(&InputReport::new(link, ServiceId(7), 0, &[1]).unwrap(), 1)
+        .unwrap();
+    assert_eq!(manager.forward.packet().unwrap().bytes()[0], 16);
+    assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
+    let before = record(&manager, &mut store, 77);
+    assert_eq!(before.outputs[0].state, p::OutputState::Disabled as i32);
+    change(&mut manager, &mut store, &mut radio, 77, |policy| {
+        policy
+            .output_preferences
+            .push(cordial_core::outputs::Preference {
+                role: p::Role::Gamepad,
+                mode: Hid,
+            });
+    })
+    .unwrap();
+    let mut after = record(&manager, &mut store, 77);
+    assert_eq!(after.outputs[0].state, p::OutputState::Active as i32);
+    after.outputs = before.outputs.clone();
+    after.output_preferences = before.output_preferences.clone();
+    assert_eq!(after, before);
+    assert_eq!(manager.forward.packet().unwrap().bytes()[0], 16);
+}
+
+#[test]
+fn losing_a_connected_gamepad_record_releases_its_slot_and_pending_notifications() {
+    let (mut manager, mut store, mut radio) = output_manager(&[p::OutputMode::Hid]);
+    enumerate_outputs(&mut manager, 1, 0, 1, true);
+    connect_pad(&mut manager, &mut radio, 77);
+    assert!(manager.gamepad_outputs().hid[0].occupant.is_some());
+    assert!(manager.changed.contains(&77));
+    block_on(manager.lose(77, &mut store, &mut radio)).unwrap();
+    assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
+    assert_eq!(manager.outputs.plan(), Default::default());
+    assert_eq!(manager.removed, [77]);
+    assert!(!manager.changed.contains(&77));
+}

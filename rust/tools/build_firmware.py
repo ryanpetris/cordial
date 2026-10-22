@@ -198,7 +198,8 @@ def build(config_path, profile, output, clippy=False):
     # whenever they change. It keeps the result under its own Cargo OUT_DIR.
     firmware_config.generate(config, generated)
     (generated / "board.json").write_text(json.dumps(raw, sort_keys=True))
-    env = dict(os.environ, CORDIAL_PYTHON=sys.executable)
+    env = dict(os.environ, CORDIAL_PYTHON=sys.executable,
+               EMBASSY_USB_MAX_INTERFACE_COUNT="12", EMBASSY_USB_MAX_HANDLER_COUNT="10")
     env["CORDIAL_VERSION"] = artifact.resolve()
     temporary = ROOT.parent / "target/tmp"
     temporary.mkdir(parents=True, exist_ok=True)

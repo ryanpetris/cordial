@@ -13,9 +13,10 @@ Board definitions live in `rust/boards/`. They specify pins, flash allocation, c
 backends and `profile_memory_budget`: the bytes of RAM for loaded [input
 profiles](input-profiles.md), or `null` for a board without profile support. Without profile support
 the firmware omits profiles and configuration interfaces, so VIA and Vial are unavailable. The Pico
-W preset leaves profiles out to keep its limited RAM for connections; the other presets budget room
-for two fully remapped VIA profiles per connected device. Pico presets use `pico-sdk-cyw43`;
-`embassy-cyw43` is also supported. The XIAO preset uses `esp-nimble` and `esp-idf`.
+W preset leaves profiles out to keep its limited RAM for connections. The other presets budget
+40 KiB for eight distinct fully remapped VIA profiles, two per connected device across four
+connections. Pico presets use `pico-sdk-cyw43`; `embassy-cyw43` is also supported. The XIAO preset
+uses `esp-nimble` and `esp-idf`.
 
 To use custom wiring or another backend, copy a preset, edit it and pass its path
 to `python3 rust/tools/build_firmware.py`. USB and Bluetooth identities are
@@ -275,9 +276,14 @@ heap bounds. It runs in the Pico firmware image, which includes QEMU:
 make check-memory
 ```
 
-The allocation check runs simulated device workloads on QEMU without accessing
-hardware. Clippy for the firmware platform crates also runs in the firmware
-images, for one board and profile or for all of them:
+The allocation check runs simulated device workloads on QEMU without accessing hardware. Boards
+with profile support load eight distinct full VIA profiles across four connected devices and verify
+their memory accounting against the configured budget. It also includes four live gamepads with
+2,048-byte descriptors, 96 fields, 16 report IDs and 512-byte payloads per map. It exercises
+normalization, slot assignment and digital queue overflow through the priority loop without
+per-report allocation. Static USB queues are included in each linked firmware's memory
+use. Clippy for the firmware platform crates also runs in the firmware images, for one board and
+profile or for all of them:
 
 ```sh
 make check-firmware BOARD=xiao_esp32s3 PROFILE=production
@@ -306,3 +312,33 @@ Adapter names are stored on the adapter. Rename through adapter settings in the 
 
 `make all` builds desktop, CLI and the selected firmware. `make clean` removes
 build outputs while preserving downloaded dependencies and toolchains.
+
+## USB gamepad builds
+
+Pico W, Pico 2 W and Waveshare RP2350B-Plus-W enable the `cordial-usb/gamepad`
+feature. ESP32-S3 omits its classes and worker storage. The Pico builds advertise
+Disabled, HID and XInput gamepad output modes. All boards retain the existing
+Bluetooth connection limit.
+
+The largest USB allocation needs 12 interfaces and 10 handlers. The firmware
+build script sets `EMBASSY_USB_MAX_INTERFACE_COUNT=12` and
+`EMBASSY_USB_MAX_HANDLER_COUNT=10` for Cargo. Workspace checks run from `rust/`
+and read the same values from `rust/.cargo/config.toml`. Cargo does not discover
+that file when invoked from the repository root with only `--manifest-path`.
+For a targeted check from the root, pass it explicitly:
+
+```sh
+cargo test --manifest-path rust/Cargo.toml --config rust/.cargo/config.toml -p cordial-usb --all-features
+cargo clippy --manifest-path rust/Cargo.toml --config rust/.cargo/config.toml -p cordial-usb --all-targets --all-features -- -D warnings
+```
+
+USB fixtures exercise all 25 HID/XInput pool combinations through the actual
+composite builder, including the VIA/Vial descriptor variants. The descriptor
+buffers hold 512 configuration bytes, 64 BOS bytes, 64 Microsoft OS descriptor
+bytes and 256 control bytes. The maximum configuration uses 455 bytes, and the
+receiver's Microsoft OS descriptor uses 46 bytes.
+
+Windows driver binding uses the receiver function's `XUSB20` compatible ID and
+does not require a Cordial service. Manual Windows testing confirms XInput
+operation in MultiPadTester for the tested setup. Automated software checks run
+on Linux; see the [hardware validation limits](protocol/hid-forwarding.md#usb-gamepad-outputs).

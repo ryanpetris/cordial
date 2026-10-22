@@ -145,45 +145,87 @@ pub fn status(ready: bool) -> p::Status {
         ],
         profile_support: None,
         configuration_interfaces: Vec::new(),
+        output_support: Vec::new(),
     }
+}
+
+/// Advertises HID and XInput gamepad output, four slots each.
+pub fn enable_gamepads(status: &mut p::Status) {
+    let mode = |mode: p::OutputMode, max_slots: u32| p::OutputModeSupport {
+        mode: mode as i32,
+        max_slots,
+        slots: None,
+    };
+    status.output_support = vec![p::OutputSupport {
+        role: Role::Gamepad as i32,
+        modes: vec![
+            mode(p::OutputMode::Disabled, 0),
+            mode(p::OutputMode::Hid, 4),
+            mode(p::OutputMode::Xinput, 4),
+        ],
+    }];
 }
 
 pub fn usage(usage_page: u32, usage: u32) -> p::Usage {
     p::Usage { usage_page, usage }
 }
 
-fn range(page: u32, min: u32, max: u32, collection: Option<p::Usage>) -> p::UsageRange {
+fn range(
+    kind: p::usage_range::Kind,
+    page: u32,
+    min: u32,
+    max: u32,
+    collection: (u32, u32),
+) -> p::UsageRange {
     p::UsageRange {
-        collection,
+        kind: kind as i32,
+        collection: Some(usage(collection.0, collection.1)),
         usage_page: page,
         min,
         max,
     }
 }
 
-/// Generic Desktop Keyboard, Mouse, and Consumer Control.
+/// Generic Desktop Keyboard, Mouse, Game Pad, and Consumer Control.
 pub const KEYBOARD: (u32, u32) = (0x01, 0x06);
 pub const MOUSE: (u32, u32) = (0x01, 0x02);
+pub const GAMEPAD: (u32, u32) = (0x01, 0x05);
 pub const CONSUMER: (u32, u32) = (0x0c, 0x01);
 
-fn collection(c: (u32, u32)) -> Option<p::Usage> {
-    Some(usage(c.0, c.1))
-}
-
-/// Firmware with profiles: keys, buttons and media controls remap, pointer motion and wheels
-/// scale, and VIA and Vial are offered, conflicting and disabled.
+/// Firmware with profiles: keys, mouse and gamepad buttons, and media controls remap, pointer
+/// motion and wheels scale, gamepad axes move to other axes, and VIA and Vial are offered,
+/// conflicting and disabled.
 pub fn enable_profiles(status: &mut p::Status) {
     status.profile_support = Some(p::ProfileSupport {
-        remap_inputs: vec![
-            range(0x07, 0x04, 0xe7, None),
-            range(0x09, 1, 16, None),
-            range(0x0c, 0x00, 0x3ff, None),
-        ],
-        scale_inputs: vec![range(0x01, 0x30, 0x38, None)],
-        remap_outputs: vec![
-            range(0x07, 0x04, 0xe7, collection(KEYBOARD)),
-            range(0x09, 1, 8, collection(MOUSE)),
-            range(0x0c, 0x00, 0x3ff, collection(CONSUMER)),
+        ranges: vec![
+            range(p::usage_range::Kind::RemapInput, 0x07, 0x04, 0xe7, KEYBOARD),
+            range(p::usage_range::Kind::RemapInput, 0x09, 1, 16, MOUSE),
+            range(p::usage_range::Kind::RemapInput, 0x09, 1, 16, GAMEPAD),
+            range(
+                p::usage_range::Kind::RemapInput,
+                0x0c,
+                0x00,
+                0x3ff,
+                CONSUMER,
+            ),
+            range(p::usage_range::Kind::ScaleInput, 0x01, 0x30, 0x38, MOUSE),
+            range(
+                p::usage_range::Kind::RemapOutput,
+                0x07,
+                0x04,
+                0xe7,
+                KEYBOARD,
+            ),
+            range(p::usage_range::Kind::RemapOutput, 0x09, 1, 8, MOUSE),
+            range(
+                p::usage_range::Kind::RemapOutput,
+                0x0c,
+                0x00,
+                0x3ff,
+                CONSUMER,
+            ),
+            range(p::usage_range::Kind::AxisInput, 0x01, 0x30, 0x35, GAMEPAD),
+            range(p::usage_range::Kind::AxisOutput, 0x01, 0x30, 0x35, GAMEPAD),
         ],
         memory_budget: 8192,
         max_remap_outputs: 4,
@@ -375,19 +417,25 @@ fn warning_key(w: &p::DeviceWarning) -> impl Ord + use<> {
     )
 }
 
-fn rule_key(r: &p::ProfileRule) -> (u32, u32) {
-    let i = r.input.unwrap_or_default();
-    (i.usage_page, i.usage)
+/// Rules in order of input, then collection.
+fn ref_key(input: Option<p::Usage>, collection: Option<p::Usage>) -> (u32, u32, u32, u32) {
+    let (i, c) = (input.unwrap_or_default(), collection.unwrap_or_default());
+    (i.usage_page, i.usage, c.usage_page, c.usage)
 }
 
-/// The role a rule adds, from its input.
+fn rule_key(r: &p::ProfileRule) -> (u32, u32, u32, u32) {
+    ref_key(r.input, r.collection)
+}
+
+/// The role a rule adds, from its input's collection.
 fn rule_role(rule: &p::ProfileRule) -> Option<Role> {
-    let by = rule.input?;
-    Some(match (by.usage_page, by.usage) {
-        (0x07, _) => Role::Keyboard,
-        (0x09, _) | (0x01, 0x30 | 0x31 | 0x38) | (0x0c, 0x238) => Role::Mouse,
-        (0x0c, _) => Role::ConsumerControl,
-        (0x01, 0x80..=0xb7) => Role::SystemControl,
+    let c = rule.collection?;
+    Some(match (c.usage_page, c.usage) {
+        KEYBOARD => Role::Keyboard,
+        MOUSE => Role::Mouse,
+        GAMEPAD => Role::Gamepad,
+        CONSUMER => Role::ConsumerControl,
+        (0x01, 0x80) => Role::SystemControl,
         _ => return None,
     })
 }
@@ -549,7 +597,8 @@ impl Sim {
     }
 
     /// Applies rule changes in order, as SetProfileRules does: a saved rule replaces the one
-    /// for the same input in its saved form, and a rule that changes nothing forgets it.
+    /// for the same input and collection in its saved form, and a rule that changes nothing
+    /// forgets it.
     fn set_rules(&mut self, id: u32, changes: &[p::ProfileRuleChange]) -> Option<ErrorCode> {
         let support = self.status.profile_support.clone().unwrap_or_default();
         let mut rules = self.rules.get(&id).cloned().unwrap_or_default();
@@ -564,10 +613,11 @@ impl Sim {
                         for o in &mut remap.outputs {
                             let u = o.usage.unwrap_or_default();
                             let carried: Vec<Option<p::Usage>> = support
-                                .remap_outputs
+                                .ranges
                                 .iter()
                                 .filter(|r| {
-                                    r.usage_page == u.usage_page
+                                    r.kind == p::usage_range::Kind::RemapOutput as i32
+                                        && r.usage_page == u.usage_page
                                         && (r.min..=r.max).contains(&u.usage)
                                 })
                                 .map(|r| r.collection)
@@ -579,20 +629,16 @@ impl Sim {
                             }
                         }
                     }
-                    rules.retain(|r| r.input != rule.input);
+                    rules.retain(|r| rule_key(r) != rule_key(&rule));
                     rules.extend(cordial_client::rules::normalized(&support, &rule));
                 }
                 Some(profile_rule_change::Change::Forget(f)) => {
-                    rules.retain(|r| r.input != f.input);
+                    rules.retain(|r| rule_key(r) != ref_key(f.input, f.collection));
                 }
                 None => return Some(ErrorCode::BadArgs),
             }
         }
-        let key = |r: &p::ProfileRule| {
-            let i = r.input.unwrap_or_default();
-            (i.usage_page, i.usage)
-        };
-        rules.sort_by_key(key);
+        rules.sort_by_key(rule_key);
         self.rules.insert(id, rules);
         None
     }
@@ -771,6 +817,16 @@ impl Sim {
                         return self.respond(error(ErrorCode::NotFound));
                     }
                 }
+                let supported =
+                    |o: &p::OutputPreference| {
+                        o.mode == p::OutputMode::Disabled as i32
+                            || self.status.output_support.iter().any(|s| {
+                                s.role == o.role && s.modes.iter().any(|m| m.mode == o.mode)
+                            })
+                    };
+                if !update.output_preferences.iter().all(supported) {
+                    return self.respond(error(ErrorCode::Unsupported));
+                }
                 let Some(d) = self.device_mut(update.device) else {
                     return self.respond(error(ErrorCode::NotFound));
                 };
@@ -793,6 +849,12 @@ impl Sim {
                 }
                 if let Some(layers) = update.profiles {
                     d.profiles = Some(layers);
+                }
+                for o in update.output_preferences {
+                    d.output_preferences.retain(|saved| saved.role != o.role);
+                    if o.mode != p::OutputMode::Disabled as i32 {
+                        d.output_preferences.push(o);
+                    }
                 }
                 for i in &update.integrations {
                     if let Some(on) = i.enabled
@@ -918,7 +980,7 @@ impl Sim {
                     return self.respond(error(ErrorCode::NotFound));
                 }
                 let all = self.rules.get(&l.profile).cloned().unwrap_or_default();
-                let after = l.after.map(|u| (u.usage_page, u.usage));
+                let after = l.after.map(|r| ref_key(r.input, r.collection));
                 let (rules, end) = page(&all, rule_key, after, self.page_size);
                 self.respond(Some(response::Result::ProfileRules(p::ProfileRules {
                     profile: l.profile,

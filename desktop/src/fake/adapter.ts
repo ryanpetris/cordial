@@ -5,7 +5,7 @@
 // since the client last listed or heard of them. Tests and the demo
 // mode use it; all data is synthetic.
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
-import { compareSettingRefs, compareUsages, compareWarnings, ruleInput, settingRef, type ByteStream } from "@cordial/client";
+import { compareRuleRefs, compareSettingRefs, compareWarnings, ruleRef, settingRef, type ByteStream } from "@cordial/client";
 import {
   CapacityReason,
   CodeKind,
@@ -21,6 +21,8 @@ import {
   IntegrationState,
   Kind,
   MessageSchema,
+  OutputMode,
+  OutputState,
   Platform,
   ProfileRuleSchema,
   ReportType,
@@ -40,11 +42,13 @@ import {
   type Setting,
   type ResponseSchema,
   type Usage,
+  UsageSchema,
+  UsageRange_Kind,
   type Value,
   type ValueSchema,
 } from "@cordial/protocol";
 import { adapterName } from "../shared/adapter-name.ts";
-import type { Candidate, DeviceWarning, KindName, RoleName, Scalar, ValueType } from "../shared/state.ts";
+import type { Candidate, DeviceWarning, KindName, OutputModeName, RoleName, Scalar, ValueType } from "../shared/state.ts";
 
 type MessageInit = MessageInitShape<typeof MessageSchema>;
 type ValueInit = MessageInitShape<typeof ValueSchema>;
@@ -93,6 +97,8 @@ export interface FakeDevice {
   profiles: number[];
   /** Why the connected device's profiles aren't loaded; the fake works it out. */
   profileError: ErrorCode | null;
+  /** The saved Gamepad Output mode. */
+  gamepadOutput: OutputModeName;
 }
 
 /** A saved profile with its rules. */
@@ -137,6 +143,8 @@ export interface FakeOptions {
   maxLayers?: number;
   /** Entries per listed page. */
   pageSize?: number;
+  /** Whether the board has HID and XInput gamepad outputs; every board but the ESP32-S3 does. */
+  gamepadOutputs?: boolean;
 }
 
 /** The memory in use and each device's profile error, before a change that may load profiles. */
@@ -149,27 +157,80 @@ interface Loads {
 const PROFILE_BYTES = 64;
 const RULE_BYTES = 16;
 
+type Pair = [number, number];
+
 const usage = (usagePage: number, u: number) => ({ usagePage, usage: u });
 
-/** A remap rule from one HID usage to others. */
-export function remap(input: [number, number], outputs: [number, number][]): ProfileRule {
+const KEYBOARD = usage(0x01, 0x06);
+const MOUSE = usage(0x01, 0x02);
+const CONSUMER = usage(0x0c, 0x01);
+const SYSTEM = usage(0x01, 0x80);
+const GAME_PAD = usage(0x01, 0x05);
+
+const REMAP_INPUTS = [
+  { collection: KEYBOARD, usagePage: 0x07, min: 0x04, max: 0xa4 },
+  { collection: KEYBOARD, usagePage: 0x07, min: 0xe0, max: 0xe7 },
+  { collection: MOUSE, usagePage: 0x09, min: 0x01, max: 0x10 },
+  { collection: CONSUMER, usagePage: 0x0c, min: 0x01, max: 0x29c },
+  { collection: SYSTEM, usagePage: 0x01, min: 0x81, max: 0xb7 },
+  { collection: GAME_PAD, usagePage: 0x09, min: 0x01, max: 0x20 },
+  { collection: GAME_PAD, usagePage: 0x01, min: 0x3d, max: 0x3e },
+  { collection: GAME_PAD, usagePage: 0x01, min: 0x90, max: 0x93 },
+].map((r) => ({ ...r, kind: UsageRange_Kind.REMAP_INPUT }));
+const SCALE_INPUTS = [
+  { collection: MOUSE, usagePage: 0x01, min: 0x30, max: 0x31 },
+  { collection: MOUSE, usagePage: 0x01, min: 0x38, max: 0x38 },
+  { collection: MOUSE, usagePage: 0x0c, min: 0x238, max: 0x238 },
+].map((r) => ({ ...r, kind: UsageRange_Kind.SCALE_INPUT }));
+const REMAP_OUTPUTS = [
+  { collection: KEYBOARD, usagePage: 0x07, min: 0x04, max: 0xe7 },
+  { collection: MOUSE, usagePage: 0x09, min: 0x01, max: 0x05 },
+  { collection: CONSUMER, usagePage: 0x0c, min: 0x01, max: 0x29c },
+].map((r) => ({ ...r, kind: UsageRange_Kind.REMAP_OUTPUT }));
+/** Game Pad buttons, Start, Select and D-pad, which only a board with gamepad outputs sends. */
+const GAME_PAD_OUTPUTS = REMAP_INPUTS.filter((r) => r.collection === GAME_PAD).map((r) => ({ ...r, kind: UsageRange_Kind.REMAP_OUTPUT }));
+/** Game Pad X, Y, Z, Rx, Ry and Rz, and the Simulation page's Brake and Accelerator. */
+const GAME_PAD_AXES = [
+  { collection: GAME_PAD, usagePage: 0x01, min: 0x30, max: 0x35 },
+  { collection: GAME_PAD, usagePage: 0x02, min: 0xc4, max: 0xc5 },
+];
+
+type Range = (typeof REMAP_INPUTS)[number];
+type UsageKey = Pick<Usage, "usagePage" | "usage">;
+const sameUsage = (a: UsageKey | undefined, b: UsageKey | undefined) => a?.usagePage === b?.usagePage && a?.usage === b?.usage;
+/** Whether one of `ranges` grants `kind` for `u` in `collection`. */
+const within = (ranges: Range[], kind: UsageRange_Kind, u: UsageKey | undefined, collection: UsageKey | undefined) =>
+  ranges.some((r) => r.kind === kind && sameUsage(r.collection, collection) && r.usagePage === u?.usagePage && u.usage >= r.min && u.usage <= r.max);
+
+/** A remap rule from one HID usage in `collection` to others, in `outputCollection` when given. */
+export function remap(input: Pair, collection: Pair, outputs: Pair[], outputCollection?: Pair): ProfileRule {
   return create(ProfileRuleSchema, {
     input: usage(...input),
-    effect: { case: "remap", value: { outputs: outputs.map((o) => ({ usage: usage(...o) })) } },
+    collection: usage(...collection),
+    effect: {
+      case: "remap",
+      value: { outputs: outputs.map((o) => ({ usage: usage(...o), ...(outputCollection ? { collection: usage(...outputCollection) } : {}) })) },
+    },
   });
 }
 
-/** A scale rule on a relative HID usage. */
-export function scale(input: [number, number], numerator: number, denominator = 1): ProfileRule {
-  return create(ProfileRuleSchema, { input: usage(...input), effect: { case: "scale", value: { numerator, denominator } } });
+/** A scale rule on a relative HID usage in `collection`. */
+export function scale(input: Pair, collection: Pair, numerator: number, denominator = 1): ProfileRule {
+  return create(ProfileRuleSchema, { input: usage(...input), collection: usage(...collection), effect: { case: "scale", value: { numerator, denominator } } });
+}
+
+/** An axis rule routing a Game Pad axis to another. */
+export function axis(input: Pair, destination: Pair, invert = false): ProfileRule {
+  return create(ProfileRuleSchema, { input: usage(...input), collection: GAME_PAD, effect: { case: "axis", value: { destination: usage(...destination), invert } } });
 }
 
 /** One rule giving each role, for tests and demos. */
 const ROLE_RULES: Record<RoleName, ProfileRule> = {
-  keyboard: remap([0x07, 0x39], [[0x07, 0x29]]),
-  mouse: scale([0x01, 0x38], -1),
-  consumer_control: remap([0x0c, 0xe9], [[0x0c, 0xea]]),
-  system_control: remap([0x01, 0x82], []),
+  keyboard: remap([0x07, 0x39], [0x01, 0x06], [[0x07, 0x29]]),
+  mouse: scale([0x01, 0x38], [0x01, 0x02], -1),
+  consumer_control: remap([0x0c, 0xe9], [0x0c, 0x01], [[0x0c, 0xea]]),
+  system_control: remap([0x01, 0x82], [0x01, 0x80], []),
+  gamepad: axis([0x01, 0x30], [0x01, 0x31]),
 };
 
 /** A profile whose rules give it `roles`, for tests and demos. */
@@ -177,20 +238,14 @@ export function profile(id: number, name: string, roles: RoleName[] = [], size?:
   return { id, name, rules: roles.map((r) => ROLE_RULES[r]), ...(size === undefined ? {} : { size }) };
 }
 
-/** The role one rule adds, from its input. */
-function ruleRole(rule: ProfileRule): RoleName | null {
-  const { usagePage: page, usage: u } = rule.input ?? { usagePage: 0, usage: 0 };
-  if (page === 0x07) return "keyboard";
-  if (page === 0x09 || (page === 0x01 && [0x30, 0x31, 0x38].includes(u)) || (page === 0x0c && u === 0x238)) return "mouse";
-  if (page === 0x0c) return "consumer_control";
-  if (page === 0x01 && u >= 0x81 && u <= 0xb7) return "system_control";
-  return null;
-}
+/** The role one rule adds, from its input's collection. */
+const ruleRole = (rule: ProfileRule): RoleName | null =>
+  ([[KEYBOARD, "keyboard"], [MOUSE, "mouse"], [CONSUMER, "consumer_control"], [SYSTEM, "system_control"], [GAME_PAD, "gamepad"]] as const)
+    .find(([c]) => sameUsage(c, rule.collection))?.[1] ?? null;
 
-const ROLE_ORDER: RoleName[] = ["keyboard", "mouse", "consumer_control", "system_control"];
+const ROLE_ORDER: RoleName[] = ["keyboard", "mouse", "consumer_control", "system_control", "gamepad"];
 const rolesOf = (p: FakeProfile) => ROLE_ORDER.filter((r) => p.rules.some((rule) => ruleRole(rule) === r));
 const sizeOf = (p: FakeProfile) => p.size ?? PROFILE_BYTES + RULE_BYTES * p.rules.length;
-const sameUsage = (a: Usage | undefined, b: Usage | undefined) => a?.usagePage === b?.usagePage && a?.usage === b?.usage;
 const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 
 /** The page of `list`, sorted by `compare`, whose keys follow `after`, and whether it ends the list. */
@@ -222,6 +277,7 @@ export function device(id: number, patch: Partial<FakeDevice> = {}): FakeDevice 
     warnings: [],
     profiles: [],
     profileError: null,
+    gamepadOutput: "disabled",
     ...patch,
   };
 }
@@ -330,6 +386,9 @@ export function demoCandidates(): Candidate[] {
 const BOARDS: Record<string, string> = { pico_w: "Pico W", pico2_w: "Pico 2 W", xiao_esp32s3: "XIAO ESP32-S3", waveshare_rp2350b_plus_w: "RP2350B-Plus-W" };
 const TRANSPORT = { classic: Transport.CLASSIC, ble: Transport.BLE } as const;
 const INTERFACE = { via: ConfigurationInterface.VIA, vial: ConfigurationInterface.VIAL } as const;
+const OUTPUT = { disabled: OutputMode.DISABLED, hid: OutputMode.HID, xinput: OutputMode.XINPUT } as const;
+/** Slots in each gamepad mode's pool at most. */
+const MAX_SLOTS = 4;
 /** The marker Vial looks for after the adapter ID in the USB serial number. */
 const VIAL_SERIAL = "-vial:f64c2b3c";
 const upper = <E>(e: E, name: string) => (e as Record<string, number>)[name.toUpperCase()]!;
@@ -386,6 +445,7 @@ export class FakeAdapter implements ByteStream {
   /** Apply failures for settings that are saved anyway. */
   settingFailures: Record<string, ErrorCode> = {};
   readonly profileSupport: boolean;
+  readonly gamepadOutputs: boolean;
   profiles: FakeProfile[];
   /** Saved configuration interface preferences, in ConfigurationInterface order. */
   interfaces: Record<InterfaceName, { enabled: boolean; profile: number }>;
@@ -398,7 +458,7 @@ export class FakeAdapter implements ByteStream {
   /** Records listed as entries of a kind newer than the client, which it reads as unset. */
   newerDevices = new Set<number>();
   newerProfiles = new Set<number>();
-  /** How often USB reconnected for a configuration interface change. */
+  /** How often USB reconnected for a configuration interface or gamepad pool change. */
   usbReconnects = 0;
   /** Whether the USB device is attached; false briefly while it reconnects. */
   present = true;
@@ -408,6 +468,8 @@ export class FakeAdapter implements ByteStream {
   readonly #hotplug: (() => void)[] = [];
   /** Profiles loaded for each connected device, by device ID. */
   readonly #loaded = new Map<number, number[]>();
+  /** The gamepad slot each connected device holds in its mode's pool, by device ID. */
+  readonly #slots = new Map<number, { mode: OutputModeName; slot: number }>();
   #nextProfile: number;
   readonly #latency: number;
   readonly #settingJobMs: number;
@@ -445,6 +507,7 @@ export class FakeAdapter implements ByteStream {
     this.#latency = options.latency ?? 0;
     this.#settingJobMs = options.settingJobMs ?? 0;
     this.profileSupport = options.profileSupport ?? this.board !== "pico_w";
+    this.gamepadOutputs = options.gamepadOutputs ?? this.board !== "xiao_esp32s3";
     this.profiles = this.profileSupport ? (options.profiles ?? []) : [];
     if (!this.profileSupport) for (const d of this.devices) d.profiles = [];
     this.interfaces = {
@@ -626,26 +689,17 @@ export class FakeAdapter implements ByteStream {
       ready: this.ready,
       transports: this.transports.map((t) => ({ transport: TRANSPORT[t], maxEnabled: this.maxEnabled, enabled: this.enabled[t] })),
       info,
+      outputSupport: this.gamepadOutputs
+        ? [{
+            role: Role.GAMEPAD,
+            modes: (["disabled", "hid", "xinput"] as const).map((m) =>
+              m === "disabled" ? { mode: OUTPUT[m] } : { mode: OUTPUT[m], maxSlots: MAX_SLOTS, slots: this.pool(m) }),
+          }]
+        : [],
       ...(this.profileSupport
         ? {
             profileSupport: {
-              remapInputs: [
-                { usagePage: 0x07, min: 0x04, max: 0xa4 },
-                { usagePage: 0x07, min: 0xe0, max: 0xe7 },
-                { usagePage: 0x09, min: 0x01, max: 0x10 },
-                { usagePage: 0x0c, min: 0x01, max: 0x29c },
-                { usagePage: 0x01, min: 0x81, max: 0xb7 },
-              ],
-              scaleInputs: [
-                { usagePage: 0x01, min: 0x30, max: 0x31 },
-                { usagePage: 0x01, min: 0x38, max: 0x38 },
-                { usagePage: 0x0c, min: 0x238, max: 0x238 },
-              ],
-              remapOutputs: [
-                { collection: usage(0x01, 0x06), usagePage: 0x07, min: 0x04, max: 0xe7 },
-                { collection: usage(0x01, 0x02), usagePage: 0x09, min: 0x01, max: 0x05 },
-                { collection: usage(0x0c, 0x01), usagePage: 0x0c, min: 0x01, max: 0x29c },
-              ],
+              ranges: this.#ranges(),
               memoryBudget: this.memoryBudget,
               maxRemapOutputs: 8,
               maxLayers: this.maxLayers,
@@ -670,6 +724,32 @@ export class FakeAdapter implements ByteStream {
     if (!d.enabled) return InactiveReason.DISABLED;
     const before = this.devices.filter((x) => x.transport === d.transport && x.enabled && !x.blocked);
     return before.indexOf(d) >= this.maxEnabled ? InactiveReason.CAPACITY : undefined;
+  }
+
+  /** The size of a gamepad mode's pool: the paired devices selecting it, up to four. */
+  pool(mode: OutputModeName) {
+    return Math.min(MAX_SLOTS, this.devices.filter((d) => d.gamepadOutput === mode).length);
+  }
+
+  /** The gamepad output's state, as the firmware works it out: a connected device with a gamepad
+   * role and a supported mode keeps its slot, or takes the lowest free one in its mode's pool. */
+  #gamepad(d: FakeDevice) {
+    const mode = d.gamepadOutput;
+    const held = this.#slots.get(d.id);
+    this.#slots.delete(d.id);
+    let state: OutputState;
+    let slot: number | undefined;
+    if (mode === "disabled") state = OutputState.DISABLED;
+    else if (!this.gamepadOutputs) state = OutputState.UNSUPPORTED;
+    else if (d.state !== "connected" || this.inactive(d) !== undefined) state = OutputState.DISCONNECTED;
+    else if (!d.roles.includes("gamepad")) state = OutputState.UNSUPPORTED;
+    else {
+      const taken = [...this.#slots.values()].filter((s) => s.mode === mode).map((s) => s.slot);
+      slot = held?.mode === mode && held.slot < this.pool(mode) ? held.slot : [...Array(this.pool(mode)).keys()].find((n) => !taken.includes(n));
+      if (slot !== undefined) this.#slots.set(d.id, { mode, slot });
+      state = slot === undefined ? OutputState.PENDING : OutputState.ACTIVE;
+    }
+    return { role: Role.GAMEPAD, mode: OUTPUT[mode], state, slot };
   }
 
   #hidpp(d: FakeDevice) {
@@ -714,6 +794,9 @@ export class FakeAdapter implements ByteStream {
       roles: d.roles.map((r) => upper(Role, r)),
       profiles: this.profileSupport ? { profiles: d.profiles } : undefined,
       profileError: connected ? (d.profileError ?? undefined) : undefined,
+      // The adapter keeps no entry for Disabled, and reports a gamepad's output state.
+      outputPreferences: d.gamepadOutput === "disabled" ? [] : [{ role: Role.GAMEPAD, mode: OUTPUT[d.gamepadOutput] }],
+      outputs: d.roles.includes("gamepad") || d.gamepadOutput !== "disabled" ? [this.#gamepad(d)] : [],
     });
   }
 
@@ -782,6 +865,19 @@ export class FakeAdapter implements ByteStream {
     const removed = [...seen].filter(([k]) => !now.has(k)).map(([, w]) => w);
     this.#seenWarnings.set(d.id, now);
     if (added.length || removed.length) this.#event({ case: "warningsChanged", value: { device: d.id, added, removed } });
+  }
+
+  /** Capabilities advertised by this board, qualified by rule kind and collection. */
+  #ranges() {
+    return [
+      ...REMAP_INPUTS,
+      ...SCALE_INPUTS,
+      ...REMAP_OUTPUTS,
+      ...(this.gamepadOutputs ? [
+        ...GAME_PAD_OUTPUTS,
+        ...GAME_PAD_AXES.flatMap((r) => [UsageRange_Kind.AXIS_INPUT, UsageRange_Kind.AXIS_OUTPUT].map((kind) => ({ ...r, kind }))),
+      ] : []),
+    ];
   }
 
   #profileRecord(p: FakeProfile) {
@@ -1048,10 +1144,13 @@ export class FakeAdapter implements ByteStream {
       case "unpairDevice": {
         const d = this.find(command.value.device);
         this.#needReady();
+        const pools = this.#pools();
         this.devices = this.devices.filter((x) => x !== d);
+        this.#slots.delete(d.id);
         this.#reply({});
         this.#event({ case: "deviceRemoved", value: { id: d.id } });
         this.#load();
+        if (this.#pools() !== pools) this.#reconnectUsb();
         return;
       }
       case "refreshDevice": {
@@ -1145,6 +1244,14 @@ export class FakeAdapter implements ByteStream {
     const { enabled, trusted, blocked, integrations } = update;
     const kinds = integrations.map((i) => i.kind);
     if (kinds.some((k) => k !== IntegrationKind.HIDPP)) throw new Refusal(ErrorCode.UNSUPPORTED);
+    // Output updates apply in order, with the last one for a role winning.
+    let gamepadOutput = d.gamepadOutput;
+    for (const o of update.outputPreferences) {
+      const mode = (Object.keys(OUTPUT) as OutputModeName[]).find((m) => OUTPUT[m] === o.mode);
+      if (o.role === Role.UNKNOWN || !(o.role in Role) || !mode) throw new Refusal(ErrorCode.BAD_ARGS);
+      if (o.role !== Role.GAMEPAD || (mode !== "disabled" && !this.gamepadOutputs)) throw new Refusal(ErrorCode.UNSUPPORTED);
+      gamepadOutput = mode;
+    }
     const layers = update.profiles?.profiles;
     if (layers) {
       if (!this.profileSupport) throw new Refusal(ErrorCode.UNSUPPORTED);
@@ -1155,7 +1262,8 @@ export class FakeAdapter implements ByteStream {
     // An update to what the adapter already holds succeeds without checking anything more.
     const same = (enabled === undefined || enabled === d.enabled) && (trusted === undefined || trusted === d.trusted)
       && (blocked === undefined || blocked === d.blocked) && integrations.every((i) => i.enabled === undefined || i.enabled === d.hidppEnabled)
-      && (!layers || (layers.length === d.profiles.length && layers.every((id, i) => id === d.profiles[i])));
+      && (!layers || (layers.length === d.profiles.length && layers.every((id, i) => id === d.profiles[i])))
+      && gamepadOutput === d.gamepadOutput;
     if (same) return this.#reply({});
     // As the firmware does, a change that leaves an unused device enabled and not blocked needs a place.
     const unused = [InactiveReason.DISABLED, InactiveReason.BLOCKED, InactiveReason.CAPACITY].includes(this.inactive(d)!);
@@ -1168,16 +1276,26 @@ export class FakeAdapter implements ByteStream {
     if (trusted !== undefined) patch.trusted = trusted;
     if (blocked !== undefined) patch.blocked = blocked;
     if (layers) patch.profiles = [...layers];
+    patch.gamepadOutput = gamepadOutput;
     // Integration updates apply in order; the last one for HID++ wins.
     for (const i of integrations) if (i.enabled !== undefined) patch.hidppEnabled = i.enabled;
     if ((patch.blocked || patch.enabled === false) && d.state !== "disconnected") patch.state = "disconnected";
     const before = this.#snapshot(d);
     const loads = this.#loads();
+    const pools = this.#pools();
     Object.assign(d, patch);
     // Loading follows the new layers before the response, as the firmware's does.
     this.#load(null);
     this.#reply({});
     this.#changed(d, before, loads);
+    // USB is rebuilt with the new gamepad pools once the response has gone out.
+    if (this.#pools() !== pools) this.#reconnectUsb();
+  }
+
+  /** The gamepad pool sizes, compared to see whether a change rebuilds USB; a board without
+   * gamepad outputs has no pools. */
+  #pools() {
+    return this.gamepadOutputs ? `${this.pool("hid")} ${this.pool("xinput")}` : "";
   }
 
   #setSettings({ device: id, changes }: Command<"setSettings">) {
@@ -1248,7 +1366,8 @@ export class FakeAdapter implements ByteStream {
       }
       case "listProfileRules": {
         const p = this.#profile(command.value.profile);
-        const { entries, end } = page(p.rules, command.value.after, this.pageSize, ruleInput, compareUsages);
+        const after = command.value.after && ruleRef(command.value.after);
+        const { entries, end } = page(p.rules, after, this.pageSize, ruleRef, compareRuleRefs);
         return this.#reply({ result: { case: "profileRules", value: { profile: p.id, rules: entries, end } } });
       }
       case "setProfileRules": {
@@ -1258,19 +1377,34 @@ export class FakeAdapter implements ByteStream {
         for (const change of command.value.changes) {
           const c = change.change;
           if (c.case === undefined) throw new Refusal(ErrorCode.BAD_ARGS);
-          const ref = c.value;
-          if (!ref.input) throw new Refusal(ErrorCode.BAD_ARGS);
-          const i = rules.findIndex((r) => sameUsage(r.input, ref.input));
+          const { input, collection } = c.value;
+          if (!input || !collection) throw new Refusal(ErrorCode.BAD_ARGS);
+          const i = rules.findIndex((r) => sameUsage(r.input, input) && sameUsage(r.collection, collection));
           if (i !== -1) rules.splice(i, 1);
           if (c.case === "forget") continue;
           const effect = c.value.effect;
           if (effect.case === undefined) throw new Refusal(ErrorCode.BAD_ARGS);
-          if (effect.case === "remap" && effect.value.outputs.length > 8) throw new Refusal(ErrorCode.BAD_ARGS);
+          const ranges = this.#ranges();
+          const kind = { remap: UsageRange_Kind.REMAP_INPUT, scale: UsageRange_Kind.SCALE_INPUT, axis: UsageRange_Kind.AXIS_INPUT }[effect.case];
+          if (!within(ranges, kind, input, collection)) throw new Refusal(ErrorCode.BAD_ARGS);
+          if (effect.case === "remap") {
+            if (effect.value.outputs.length > 8) throw new Refusal(ErrorCode.BAD_ARGS);
+            // An output without a collection takes the one collection that sends it.
+            for (const o of effect.value.outputs) {
+              const found = ranges.filter((r) => (!o.collection || sameUsage(r.collection, o.collection)) && within([r], UsageRange_Kind.REMAP_OUTPUT, o.usage, r.collection));
+              if (!found.length || found.some((r) => !sameUsage(r.collection, found[0]!.collection))) throw new Refusal(ErrorCode.BAD_ARGS);
+              o.collection = create(UsageSchema, found[0]!.collection);
+            }
+          }
           if (effect.case === "scale" && (effect.value.numerator === 0 || effect.value.denominator === 0)) throw new Refusal(ErrorCode.BAD_ARGS);
+          if (effect.case === "axis" && !within(ranges, UsageRange_Kind.AXIS_OUTPUT, effect.value.destination, collection)) throw new Refusal(ErrorCode.BAD_ARGS);
           // A rule that changes nothing is forgotten instead.
+          const only = effect.case === "remap" && effect.value.outputs.length === 1 ? effect.value.outputs[0]! : undefined;
           const identity = effect.case === "remap"
-            ? effect.value.outputs.length === 1 && sameUsage(effect.value.outputs[0]!.usage, c.value.input)
-            : effect.value.numerator === effect.value.denominator;
+            ? !!only && sameUsage(only.usage, input) && sameUsage(only.collection, collection)
+            : effect.case === "scale"
+              ? effect.value.numerator === effect.value.denominator
+              : sameUsage(effect.value.destination, input) && !effect.value.invert;
           if (!identity) rules.push(create(ProfileRuleSchema, c.value));
         }
         const grown = { ...p, rules };
@@ -1280,7 +1414,7 @@ export class FakeAdapter implements ByteStream {
         this.#needReady();
         const roles = rolesOf(p).join();
         const loads = this.#loads();
-        p.rules = rules.sort((a, b) => compareUsages(ruleInput(a), ruleInput(b)));
+        p.rules = rules.sort((a, b) => compareRuleRefs(ruleRef(a), ruleRef(b)));
         this.#reply({});
         if (rolesOf(p).join() !== roles) this.#event({ case: "profile", value: this.#profileRecord(p) });
         this.#reloadUsers(p.id, loads);

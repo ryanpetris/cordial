@@ -123,11 +123,12 @@ pub struct SavedIntegration {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Roles(pub u8);
 impl Roles {
-    const SAVED: [(u8, saved::Role); 4] = [
+    const SAVED: [(u8, saved::Role); 5] = [
         (crate::hid::KEYBOARD, saved::Role::Keyboard),
         (crate::hid::MOUSE, saved::Role::Mouse),
         (crate::hid::CONSUMER, saved::Role::ConsumerControl),
         (crate::hid::SYSTEM, saved::Role::SystemControl),
+        (crate::outputs::GAMEPAD, saved::Role::Gamepad),
     ];
     pub fn saved(self) -> Vec<i32> {
         Self::SAVED
@@ -161,6 +162,7 @@ pub struct Policy {
     pub roles: Roles,
     /// The device's profile layers, applied in order.
     pub profiles: Vec<u64>,
+    pub output_preferences: Vec<crate::outputs::Preference>,
     /// The ID of the bond the policy's record holds; not saved, since it is the record's own.
     pub bond: u64,
 }
@@ -187,10 +189,17 @@ impl Policy {
                 .collect(),
             roles: self.roles.saved(),
             profiles: self.profiles.clone(),
+            output_preferences: self
+                .output_preferences
+                .iter()
+                .copied()
+                .filter(|p| p.mode != cordial_protocol::OutputMode::Disabled || self.setup_pending)
+                .map(crate::outputs::Preference::saved)
+                .collect(),
         }
     }
-    /// The policy a record holds, not yet validated. Entries for integrations this firmware does
-    /// not know are left out.
+    /// The policy a record holds, not yet validated. Unknown integrations, output roles and modes
+    /// are left out.
     pub fn from_saved(policy: Option<saved::Policy>) -> Result<Self, storage::Error> {
         let policy = policy.ok_or(storage::Error::Corrupt)?;
         let mut integrations = Vec::new();
@@ -213,6 +222,11 @@ impl Policy {
             integrations,
             roles: Roles::from_saved(&policy.roles),
             profiles: policy.profiles,
+            output_preferences: policy
+                .output_preferences
+                .into_iter()
+                .filter_map(crate::outputs::Preference::from_saved)
+                .collect(),
             bond: 0,
         })
     }
@@ -228,6 +242,7 @@ impl Policy {
             integrations: Vec::new(),
             roles: Roles::default(),
             profiles: Vec::new(),
+            output_preferences: Vec::new(),
             bond: 0,
         }
     }
@@ -243,6 +258,12 @@ impl Policy {
                 .enumerate()
                 .all(|(i, a)| !self.integrations[..i].iter().any(|b| b.kind == a.kind))
             && self.profiles.iter().all(|&id| id != 0)
+            && self.output_preferences.iter().enumerate().all(|(i, p)| {
+                p.role == cordial_protocol::Role::Gamepad
+                    && !self.output_preferences[..i]
+                        .iter()
+                        .any(|other| other.role == p.role)
+            })
     }
     pub fn hidpp_enabled(&self) -> bool {
         self.integrations
@@ -292,10 +313,12 @@ pub struct Setup {
     /// HID++ detection, which turns HID++ on for a device that answers as HID++
     /// 2.0, or a user choice of HID++ made first.
     pub hidpp: bool,
+    /// Gamepad detection and the initial USB mode, or a user choice made first.
+    pub gamepad: bool,
 }
 impl Setup {
     pub fn complete(self) -> bool {
-        self.hidpp
+        self.hidpp && self.gamepad
     }
 }
 

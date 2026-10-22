@@ -15,7 +15,7 @@
 //! configuration editor's profile is released and before free space is counted to admit new
 //! data. Input waits for one step at a time. A step that wrote flash is followed by a rest at least
 //! as long as the step took, so input keeps at least half the time while writes continue.
-use crate::{HidTx, Io, RawPacket, SerialRx, SerialTx, Status};
+use crate::{HidTx, Io, RawPacket, SerialRx, SerialTx, Status, Topology};
 use cordial_core::{
     application::Application, bluetooth::EventSource, interfaces, storage::RecordStore,
 };
@@ -150,10 +150,16 @@ impl<'a> Priority<'a> {
     ) -> bool {
         let Shared { app, store, radio } = shared;
         EventSource::poll(radio).await;
+        let status = self.io.status();
+        #[cfg(feature = "gamepad")]
+        app.set_output_enumeration(Some(self.io.outputs.enumeration(status.input_ready())));
         while let Some(event) = radio.next_event() {
             app.event(event, store, radio, now).await;
+            #[cfg(feature = "gamepad")]
+            self.io
+                .outputs
+                .publish(status.generation, app.gamepad_outputs());
         }
-        let status = self.io.status();
         if status.generation != self.seen.generation {
             self.hid_pending = None;
             self.hid_since = None;
@@ -170,7 +176,13 @@ impl<'a> Priority<'a> {
                 }
             }
         }
+        #[cfg(feature = "gamepad")]
+        app.set_output_enumeration(Some(self.io.outputs.enumeration(status.input_ready())));
         app.operate(store, radio, status.leds, now).await;
+        #[cfg(feature = "gamepad")]
+        self.io
+            .outputs
+            .publish(status.generation, app.gamepad_outputs());
         if status.input_ready()
             && self.hid_pending.is_none()
             && !self.io.hid_tx.is_full()
@@ -208,6 +220,7 @@ pub struct Secondary<'a> {
     offset: usize,
     /// The configuration interface set last requested from USB.
     interfaces: u8,
+    gamepads: cordial_core::outputs::Plan,
 }
 impl<'a> Secondary<'a> {
     /// `interfaces` is the configuration interface set USB started with.
@@ -220,6 +233,7 @@ impl<'a> Secondary<'a> {
             input: None,
             offset: 0,
             interfaces,
+            gamepads: io.topology().gamepads,
         }
     }
     /// Follows the serial port opening and closing. A command in progress belongs to the session
@@ -304,6 +318,17 @@ impl<'a> Secondary<'a> {
             0
         }
     }
+    fn wanted_gamepads(app: &Application) -> cordial_core::outputs::Plan {
+        #[cfg(feature = "gamepad")]
+        {
+            app.manager.outputs.plan()
+        }
+        #[cfg(not(feature = "gamepad"))]
+        {
+            let _ = app;
+            Default::default()
+        }
+    }
     /// Answers one configuration editor packet. Returns whether there was one.
     async fn edit<S: RecordStore>(
         &mut self,
@@ -346,7 +371,9 @@ impl<'a> Secondary<'a> {
     /// and its output has been sent.
     fn reconnect_due(&self, app: &Application) -> bool {
         app.manager.storage_ready
-            && (Self::wanted(app) != self.interfaces || app.usb_reconnect)
+            && (Self::wanted(app) != self.interfaces
+                || Self::wanted_gamepads(app) != self.gamepads
+                || app.usb_reconnect)
             && !app.command_pending()
             && app.serial.queued() == 0
             && !self.serial_pending
@@ -357,7 +384,11 @@ impl<'a> Secondary<'a> {
         self.interfaces = wanted;
         app.usb_reconnect = false;
         self.io.reset(false);
-        self.io.reconnect.signal(wanted);
+        self.gamepads = Self::wanted_gamepads(app);
+        self.io.reconnect.signal(Topology {
+            interfaces: wanted,
+            gamepads: self.gamepads,
+        });
     }
     /// Hands the next chunk of serial output to USB, while the application follows the session
     /// USB has open.

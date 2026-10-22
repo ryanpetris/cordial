@@ -36,6 +36,15 @@ export const ComboIcon = ({ size = 24 }: Props) =>
     </>,
   );
 
+export const GamepadIcon = ({ size = 24 }: Props) =>
+  svg(
+    size,
+    <>
+      <path d="M7 7.5h10a4.5 4.5 0 0 1 4.4 5.4l-.7 3.6a2.4 2.4 0 0 1-4.2 1L14.8 15H9.2l-1.7 2.5a2.4 2.4 0 0 1-4.2-1l-.7-3.6A4.5 4.5 0 0 1 7 7.5z" />
+      <path d="M7.5 10.5v3M6 12h3M15.5 11h.01M17.5 13h.01" />
+    </>,
+  );
+
 /** Media and volume keys. */
 export const MediaIcon = ({ size = 24 }: Props) =>
   svg(size, <path d="M4 9.5h3.5L12 6v12l-4.5-3.5H4zM15.5 9.5a3.5 3.5 0 0 1 0 5M18 7a7 7 0 0 1 0 10" />);
@@ -142,6 +151,8 @@ export function DeviceIcon({ kind, size = 24 }: { kind: DeviceKind; size?: numbe
       return <MouseIcon size={size} />;
     case "keyboard_mouse":
       return <ComboIcon size={size} />;
+    case "gamepad":
+      return <GamepadIcon size={size} />;
     default:
       return <UnknownDeviceIcon size={size} />;
   }

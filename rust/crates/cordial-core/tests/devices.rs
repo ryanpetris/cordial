@@ -484,3 +484,74 @@ fn failures_double_from_the_first_delay_up_to_the_cap() {
     }
     assert_eq!(expected, u64::from(RETRY_DELAY_MAX_MS));
 }
+
+#[test]
+fn output_preferences_default_safely_and_round_trip_known_choices() {
+    use cordial_core::outputs::{self, Preference};
+    use cordial_protocol::{OutputMode, Role, storage as s};
+    let original = Policy::paired(1, peer(1), b"Gamepad");
+    let bytes = original.saved().encode_to_vec();
+    let decoded = Policy::from_saved(Some(s::Policy::decode(bytes.as_slice()).unwrap())).unwrap();
+    assert!(decoded.output_preferences.is_empty());
+    assert_eq!(
+        outputs::gamepad(&decoded.output_preferences),
+        OutputMode::Disabled
+    );
+    assert_eq!(decoded.saved().encode_to_vec(), bytes);
+    for mode in [OutputMode::Hid, OutputMode::Xinput] {
+        let mut policy = original.clone();
+        policy.output_preferences.push(Preference {
+            role: Role::Gamepad,
+            mode,
+        });
+        let saved = policy.saved();
+        let restored = Policy::from_saved(Some(saved)).unwrap();
+        assert_eq!(restored, policy);
+        assert!(restored.valid());
+    }
+    let mut saved = original.saved();
+    saved.output_preferences = vec![
+        s::OutputPreference {
+            role: s::Role::Gamepad as i32,
+            mode: 256,
+        },
+        s::OutputPreference {
+            role: 261,
+            mode: s::OutputMode::Hid as i32,
+        },
+        s::OutputPreference {
+            role: s::Role::Keyboard as i32,
+            mode: s::OutputMode::Hid as i32,
+        },
+    ];
+    let restored = Policy::from_saved(Some(saved)).unwrap();
+    assert!(restored.valid());
+    assert!(restored.output_preferences.is_empty());
+    let mut policy = original;
+    policy.output_preferences = vec![
+        Preference {
+            role: Role::Gamepad,
+            mode: OutputMode::Hid
+        };
+        2
+    ];
+    assert!(!policy.valid());
+}
+
+#[test]
+fn gamepad_roles_use_explicit_bits() {
+    use cordial_core::{hid, outputs, wire};
+    use cordial_protocol::Role;
+    assert_eq!(hid::RADIO, 16);
+    assert_eq!(outputs::GAMEPAD, 32);
+    assert!(wire::roles(hid::RADIO).is_empty());
+    let bits = hid::RADIO | hid::KEYBOARD | outputs::GAMEPAD;
+    assert_eq!(
+        wire::roles(bits),
+        [Role::Keyboard as i32, Role::Gamepad as i32]
+    );
+    assert_eq!(
+        Roles::from_saved(&Roles(bits).saved()),
+        Roles(hid::KEYBOARD | outputs::GAMEPAD)
+    );
+}

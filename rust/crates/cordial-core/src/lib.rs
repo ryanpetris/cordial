@@ -21,6 +21,7 @@ pub mod layouts;
 pub mod link;
 pub mod manager;
 pub mod model;
+pub mod outputs;
 pub mod profiles;
 pub mod settings;
 pub mod storage;

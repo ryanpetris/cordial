@@ -2,7 +2,7 @@ import { CapacityReason, ErrorCode } from "@cordial/protocol";
 import { ConnectionClosedError, CordialError } from "@cordial/client";
 import { describe, expect, it } from "vitest";
 import { failure } from "../src/core/session.ts";
-import { READ_FAILED, asSentence, codeText, errorText, reasonText } from "../src/shared/text.ts";
+import { READ_FAILED, ROLES, asSentence, codeText, displayKind, errorText, kindText, reasonText } from "../src/shared/text.ts";
 
 describe("error wording", () => {
   it("shows messages as sentences and inserts them as reasons without the period", () => {
@@ -21,5 +21,12 @@ describe("error wording", () => {
     expect(failure(storage)).toBe("The adapter couldn't save the change. Your saved data hasn't changed.");
     expect(failure(new ConnectionClosedError(), true)).toBe("The adapter disconnected before it answered.");
     expect(failure(new ConnectionClosedError())).toBe("The adapter disconnected before the change finished.");
+  });
+
+  it("names gamepads by kind, or by role without a kind", () => {
+    expect(kindText(displayKind(["gamepad"]))).toBe("Gamepad");
+    expect(displayKind([], ["gamepad"])).toBe("gamepad");
+    expect(displayKind(["keyboard", "gamepad"])).toBe("keyboard");
+    expect(ROLES.gamepad).toBe("Gamepad");
   });
 });

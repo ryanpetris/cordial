@@ -740,7 +740,19 @@ impl<F: Fleet> Model<F> {
                 purpose,
                 chosen,
             } => self.pick_dialog(adapter, *purpose, *chosen, w),
-            Dialog::SaveAdapter(id) => self.reconnect_dialog(id, w),
+            Dialog::SaveAdapter(id) => {
+                let can_save = self.adapter(id).cloned().is_some_and(|a| {
+                    !self.adapter_locked(&a) && !self.adapter_changes(&a).is_empty()
+                });
+                self.reconnect_dialog(can_save, w)
+            }
+            Dialog::SaveSettings(a, id) => {
+                let can_save = self
+                    .device(a, *id)
+                    .cloned()
+                    .is_some_and(|d| self.settings_savable(&d));
+                self.reconnect_dialog(can_save, w)
+            }
             Dialog::AddDevice => self.add_dialog(w),
             Dialog::Bootloader(_) => self.bootloader_dialog(w),
             Dialog::Files(id) => self.files_dialog(id, (self.width.saturating_sub(8)).min(90)),

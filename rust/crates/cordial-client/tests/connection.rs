@@ -263,6 +263,10 @@ fn profile_commands_carry_their_fields_and_results() {
             usage_page: 9,
             usage: 1,
         }),
+        collection: Some(p::Usage {
+            usage_page: 1,
+            usage: 2,
+        }),
         effect: Some(p::profile_rule::Effect::Remap(p::profile_rule::Remap {
             outputs: vec![p::profile_rule::Output {
                 usage: Some(p::Usage {
@@ -328,6 +332,10 @@ fn profile_commands_carry_their_fields_and_results() {
             input: Some(p::Usage {
                 usage_page: 9,
                 usage: 1,
+            }),
+            collection: Some(p::Usage {
+                usage_page: 1,
+                usage: 2,
             }),
         })),
     };

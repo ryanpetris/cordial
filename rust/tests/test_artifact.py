@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ import firmware_artifact as artifact
 import firmware_config
 from flash_dev import inspect_uf2
 from build_firmware import esp_startup_frames
+import build_firmware
 
 
 class EspStartupStack(unittest.TestCase):
@@ -103,6 +105,21 @@ class Artifact(unittest.TestCase):
         for value in ('1.2.3-rc1', '1.2.3-debug-dev', 'v1.2.3'):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 artifact.inspect(blob(value))
+
+
+class UsbBuildCapacity(unittest.TestCase):
+    def test_firmware_cargo_receives_composite_capacity_without_cargo_config_discovery(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(build_firmware, "ROOT", Path(directory) / "rust"), \
+                patch.object(build_firmware.firmware_dependencies, "prepare_btstack"), \
+                patch.object(build_firmware, "tool", side_effect=Path), \
+                patch.object(build_firmware, "command") as command, \
+                patch.dict(os.environ, EMBASSY_USB_MAX_INTERFACE_COUNT="4",
+                           EMBASSY_USB_MAX_HANDLER_COUNT="5", CORDIAL_VERSION="0.0.0"):
+            build_firmware.build(ROOT / "boards/pico2_w.json", "production", directory, clippy=True)
+            environment = command.call_args.args[1]
+            self.assertEqual(environment["EMBASSY_USB_MAX_INTERFACE_COUNT"], "12")
+            self.assertEqual(environment["EMBASSY_USB_MAX_HANDLER_COUNT"], "10")
 
 
 if __name__ == '__main__':

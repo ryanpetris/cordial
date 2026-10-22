@@ -20,10 +20,12 @@ pub const MOUSE: u8 = 2;
 pub const CONSUMER: u8 = 4;
 pub const SYSTEM: u8 = 8;
 pub const RADIO: u8 = 16;
+pub use crate::outputs::GAMEPAD;
 pub const ROTATION_KNOWN: u64 = 1 << 63;
 pub const ROTATION_STATE: u64 = 1 << 36;
 const SYSTEM_APPLICATION: u8 = 3;
 const RADIO_APPLICATION: u8 = 5;
+const GAMEPAD_APPLICATION: u8 = 6;
 /// Standard keyboard-related Generic Desktop System usages, in USB bitmap order.
 pub const SYSTEM_USAGES: &[u16] = &[
     0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x9b,
@@ -45,6 +47,8 @@ pub enum Error {
     Capacity,
     Unsupported,
     Rollover,
+    /// A declared vendor-only input report has no standard interpretation or state change.
+    Ignored,
     Overflow,
 }
 
@@ -122,6 +126,84 @@ impl Default for Input {
             sliders: [None; 2],
             position: [None; 3],
             consumer_values: [None; CONSUMER_AXES.len()],
+        }
+    }
+}
+/// Fixed button and axis conventions for verified input layouts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GamepadLayout {
+    #[default]
+    Generic,
+    XboxBluetooth,
+    XboxCompact,
+    LunaBluetooth,
+    Ds4Basic,
+}
+
+/// Current standard gamepad controls, retaining their HID usage identity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Gamepad {
+    /// Button-page usages 1 through 32, in bits 0 through 31.
+    pub buttons: u32,
+    /// Up to eight distinct active Consumer controls inside the Game Pad application.
+    pub consumers: [u16; 8],
+    /// Nested System Main Menu control used by the compact Xbox report.
+    pub menu: bool,
+    /// X, Y, Z, Rx, Ry, Rz, Brake and Accelerator, scaled to 0 through 65,535.
+    pub axes: [u16; 8],
+    /// Descriptor declarations, independent of received or null samples.
+    pub axes_declared: u8,
+    /// Descriptor-selected convention, retained even while controls are released.
+    pub layout: GamepadLayout,
+    /// An axis is usable only when its corresponding bit is set.
+    pub axes_valid: u8,
+    /// Clockwise directions from north, 0 through 7. None is neutral.
+    pub hat: Option<u8>,
+    /// Distinguishes an observed hat, including neutral, from an absent hat.
+    pub hat_valid: bool,
+    /// Explicit D-pad Up, Down, Right and Left usages, in bits 0 through 3.
+    pub dpad: u8,
+    /// Explicit Generic Desktop Start control.
+    pub start: bool,
+    /// Explicit Generic Desktop Select control.
+    pub select: bool,
+}
+impl Gamepad {
+    // Retain the first eight distinct active Consumer usages in field,
+    // report and service order. Rebuilding from stored reports releases absent
+    // controls and lets previously omitted controls use the available slots.
+    fn consumer(&mut self, usage: u16) {
+        if usage != 0
+            && !self.consumers.contains(&usage)
+            && let Some(slot) = self.consumers.iter_mut().find(|u| **u == 0)
+        {
+            *slot = usage;
+        }
+    }
+    // Buttons compose across reports/services. The first observed scalar wins
+    // when a device repeats an axis or hat in several reports/services.
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.buttons |= other.buttons;
+        self.menu |= other.menu;
+        for usage in other.consumers.into_iter().filter(|u| *u != 0) {
+            self.consumer(usage);
+        }
+        self.dpad |= other.dpad;
+        self.start |= other.start;
+        self.select |= other.select;
+        self.axes_declared |= other.axes_declared;
+        if self.layout == GamepadLayout::Generic {
+            self.layout = other.layout;
+        }
+        for i in 0..8 {
+            if self.axes_valid & (1 << i) == 0 && other.axes_valid & (1 << i) != 0 {
+                self.axes[i] = other.axes[i];
+            }
+        }
+        self.axes_valid |= other.axes_valid;
+        if !self.hat_valid && other.hat_valid {
+            self.hat = other.hat;
+            self.hat_valid = true;
         }
     }
 }
@@ -332,6 +414,9 @@ pub struct Map {
     pub roles: u8,
     pub hidpp_reports: u8,
     pub numbered: bool,
+    ignored_inputs: [u8; 32],
+    gamepad_axes: u8,
+    gamepad_layout: GamepadLayout,
     state_bits: usize,
     array_fields: usize,
     indicator_units: usize,
@@ -425,6 +510,19 @@ fn usage_kind(usage: u32, app: u8, output: bool, relative: bool) -> u8 {
     if output {
         return if page == 8 && (1..=5).contains(&code) {
             KEYBOARD
+        } else {
+            0
+        };
+    }
+    if app == GAMEPAD_APPLICATION {
+        return if !relative
+            && ((page == 9 && (1..=32).contains(&code))
+                || (page == 1
+                    && matches!(code, 0x30..=0x35 | 0x39 | 0x3d | 0x3e | 0x85 | 0x90..=0x93))
+                || (page == 12 && code != 0)
+                || (page == 2 && matches!(code, 0xc4 | 0xc5)))
+        {
+            GAMEPAD
         } else {
             0
         };
@@ -569,7 +667,7 @@ impl Map {
 
     /// Allocate once at admission; decoding and clearing never allocate.
     pub fn state(&self) -> Result<State, Error> {
-        let reports = zeros(self.reports().iter().map(held_bytes).sum())?;
+        let reports = zeros(self.reports().iter().map(stored_bytes).sum())?;
         let mut arrays = Vec::new();
         arrays
             .try_reserve_exact(self.array_fields)
@@ -761,6 +859,10 @@ fn walk_descriptor(
     while pos < descriptor.len() {
         let prefix = descriptor[pos];
         pos += 1;
+        // Xbox One S descriptors include one NUL after the final collection.
+        if prefix == 0 && pos == descriptor.len() && collection == 0 && pos > 1 {
+            break;
+        }
         if prefix == 0xfe {
             return Err(Error::Unsupported);
         }
@@ -886,7 +988,9 @@ fn walk_descriptor(
                             next_battery = next_battery.saturating_add(1);
                         }
                         collection += 1;
-                        if value == 1 {
+                        // Nested application collections remain part of their gamepad.
+                        // Consumer controls there must not become host keyboard shortcuts.
+                        if value == 1 && app != GAMEPAD_APPLICATION {
                             next_instance = next_instance.checked_add(1).ok_or(Error::Limit)?;
                             instance = next_instance;
                             indicator = 0;
@@ -898,6 +1002,7 @@ fn walk_descriptor(
                             app = match u {
                                 0x10006 | 0x10007 => KEYBOARD,
                                 0x10002 => MOUSE,
+                                0x10004 | 0x10005 => GAMEPAD_APPLICATION,
                                 0xc0001 => CONSUMER,
                                 0x10080 => SYSTEM_APPLICATION,
                                 0x1000c => RADIO_APPLICATION,
@@ -987,7 +1092,22 @@ impl Compiler {
     fn compile(descriptor: &[u8]) -> Result<Map, Error> {
         let mut indicator_reports = [0u8; 256];
         let mut numeric_indicators = false;
+        let mut retained_reports = [0u8; 256];
+        let mut gamepad_instance = None;
+        let mut ambiguous_gamepads = false;
         walk_descriptor(descriptor, |g, local, context, kind, flags| {
+            if context.app == GAMEPAD_APPLICATION && kind == 0 {
+                if let Some(instance) = gamepad_instance {
+                    ambiguous_gamepads |= instance != context.instance;
+                } else {
+                    gamepad_instance = Some(context.instance);
+                }
+            }
+            // Wholly vendor-defined gamepad reports have no standard input or
+            // configuration behavior. They need no layout or state allocation.
+            if context.app != GAMEPAD_APPLICATION || local.iter().any(|s| s.page < 0xff00) {
+                retained_reports[usize::from(g.id)] |= 1 << kind;
+            }
             numeric_indicators |= kind != 0 && context.mode == 3 && flags & 7 == 6;
             if kind != 0
                 && flags & 1 == 0
@@ -1004,7 +1124,14 @@ impl Compiler {
             Ok(())
         })?;
         let mut map = Self::default();
+        let mut ignored_inputs = [0; 32];
         map.numbered = walk_descriptor(descriptor, |g, local, context, kind, flags| {
+            if retained_reports[usize::from(g.id)] & (1 << kind) == 0 {
+                if kind == 0 {
+                    ignored_inputs[usize::from(g.id) / 8] |= 1 << (g.id % 8);
+                }
+                return Ok(());
+            }
             map.compile_field(
                 g,
                 local,
@@ -1078,18 +1205,36 @@ impl Compiler {
             retain(4, map.reports.as_ptr().cast(), map.reports.len())?;
             retain(5, map.limitations.as_ptr().cast(), map.limitations.len())?;
             retain(6, map.scales.as_ptr().cast(), map.scales.len())?;
-            Ok(Map {
+            let mut compiled = Map {
                 storage: storage.into_boxed_slice(),
                 sections,
                 roles: map.roles,
                 hidpp_reports: map.hidpp_reports,
                 numbered: map.numbered,
+                ignored_inputs,
+                gamepad_axes: 0,
+                gamepad_layout: GamepadLayout::Generic,
                 state_bits: map.state_bits,
                 array_fields: map.array_fields,
                 indicator_units: map.indicator_units,
                 retained_values: map.retained_values,
                 numeric_values: map.numeric_values,
-            })
+            };
+            for usage in [
+                0x10030, 0x10031, 0x10032, 0x10033, 0x10034, 0x10035, 0x200c5, 0x200c4,
+            ] {
+                if compiled.fields().iter().any(|f| {
+                    f.app() == GAMEPAD_APPLICATION
+                        && f.flags & 7 == 2
+                        && (0..f.count()).any(|j| compiled.field_usage(f, j) == usage)
+                }) {
+                    compiled.gamepad_axes |= 1 << gamepad_axis(usage).unwrap();
+                }
+            }
+            if !ambiguous_gamepads {
+                compiled.gamepad_layout = compiled.recognize_gamepad();
+            }
+            Ok(compiled)
         }
     }
     fn store_usages(&mut self, local: &[Span]) -> Result<u8, Error> {
@@ -1353,9 +1498,11 @@ impl Compiler {
             let page = span.first() >> 16;
             let cap = match page {
                 7 => 255,
+                9 if app == GAMEPAD_APPLICATION => 32,
                 9 => 16,
                 12 => 65535,
                 1 => 0xca,
+                2 if app == GAMEPAD_APPLICATION => 0xc5,
                 8 => 5,
                 _ => 0,
             };
@@ -1425,7 +1572,7 @@ impl Compiler {
             None => self.store_usages(local)?,
         };
         debug_assert!(app < 8);
-        let history = variable && (relative || flags & 0x40 != 0);
+        let history = app != GAMEPAD_APPLICATION && variable && (relative || flags & 0x40 != 0);
         if roles & KEYBOARD != 0 {
             let report = &mut self.reports[ri];
             if variable {
@@ -1480,11 +1627,206 @@ impl Compiler {
         Ok(())
     }
 }
+fn gamepad_axis(usage: u32) -> Option<usize> {
+    match usage {
+        0x10030..=0x10035 => Some((usage - 0x10030) as usize),
+        0x200c5 => Some(6),
+        0x200c4 => Some(7),
+        _ => None,
+    }
+}
+
+impl Map {
+    fn field_usage(&self, f: &Field, index: usize) -> u32 {
+        let spans = &self.usages()[usize::from(f.span)..usize::from(f.span) + usize::from(f.spans)];
+        usage_at(spans, index as u32, true)
+    }
+
+    pub(crate) fn gamepad_consumers(&self) -> impl Iterator<Item = u16> + '_ {
+        self.fields()
+            .iter()
+            .filter(|f| f.app() == GAMEPAD_APPLICATION)
+            .flat_map(|f| {
+                &self.usages()[usize::from(f.span)..usize::from(f.span) + usize::from(f.spans)]
+            })
+            .filter(|span| span.page == 12)
+            .flat_map(|span| span.first.max(1)..=span.last)
+    }
+
+    pub(crate) fn gamepad_identity_matches(
+        &self,
+        source: u8,
+        vendor: u16,
+        product: u16,
+        transport: crate::model::identifiers::Transport,
+    ) -> bool {
+        match self.gamepad_layout {
+            GamepadLayout::LunaBluetooth => (source, vendor, product) == (1, 0x0171, 0x0419),
+            GamepadLayout::XboxBluetooth => {
+                source == 2
+                    && vendor == 0x045e
+                    && if self.supports_gamepad_usage(0xc00b2) {
+                        product == 0x0b13
+                            || (product == 0x0b20
+                                && transport == crate::model::identifiers::Transport::Ble)
+                    } else {
+                        product == 0x02fd
+                    }
+            }
+            GamepadLayout::XboxCompact => (source, vendor, product) == (2, 0x045e, 0x02fd),
+            GamepadLayout::Ds4Basic => {
+                source == 2 && vendor == 0x054c && matches!(product, 0x05c4 | 0x09cc)
+            }
+            GamepadLayout::Generic => false,
+        }
+    }
+
+    fn recognize_gamepad(&self) -> GamepadLayout {
+        // Bounded input geometry from xpadneo v0.10.5, hid-tools, and
+        // DJm00n/ControllersInfo research. Fixture comments pin the descriptors.
+        // Vendor-only tails do not affect the standard report 1 mapping.
+        let matches = |layout| {
+            let mut fields = self
+                .fields()
+                .iter()
+                .filter(|f| f.app() == GAMEPAD_APPLICATION);
+            let mut field = |id, bits, bit, size, minimum, maximum, flags, usages: &[u32]| {
+                let matched = fields.clone().next().is_some_and(|f| {
+                    let report = &self.reports()[usize::from(f.report)];
+                    report.id == id
+                        && report.bits[0] == bits
+                        && f.bit() == bit
+                        && f.size() == size
+                        && f.minimum == minimum
+                        && f.maximum == maximum
+                        && f.flags == flags
+                        && f.count() == usages.len()
+                        && usages
+                            .iter()
+                            .enumerate()
+                            .all(|(j, &u)| self.field_usage(f, j) == u)
+                });
+                if matched {
+                    fields.next();
+                }
+                matched
+            };
+            let matched = match layout {
+                GamepadLayout::Ds4Basic => {
+                    field(
+                        1,
+                        72,
+                        0,
+                        8,
+                        0,
+                        255,
+                        2,
+                        &[0x10030, 0x10031, 0x10032, 0x10035],
+                    ) && field(1, 72, 32, 4, 0, 7, 0x42, &[0x10039])
+                        && field(
+                            1,
+                            72,
+                            36,
+                            1,
+                            0,
+                            1,
+                            2,
+                            &core::array::from_fn::<_, 14, _>(|i| 0x90001 + i as u32),
+                        )
+                        && field(1, 72, 56, 8, 0, 255, 2, &[0x10033, 0x10034])
+                }
+                GamepadLayout::XboxCompact => {
+                    field(1, 120, 0, 16, 0, 65535, 2, &[0x10030, 0x10031])
+                        && field(1, 120, 32, 16, 0, 65535, 2, &[0x10033, 0x10034])
+                        && field(1, 120, 64, 10, 0, 1023, 2, &[0x10032])
+                        && field(1, 120, 80, 10, 0, 1023, 2, &[0x10035])
+                        && field(1, 120, 96, 4, 1, 8, 0x42, &[0x10039])
+                        && field(
+                            1,
+                            120,
+                            104,
+                            1,
+                            0,
+                            1,
+                            2,
+                            &core::array::from_fn::<_, 10, _>(|i| 0x90001 + i as u32),
+                        )
+                        && field(2, 8, 0, 1, 0, 1, 2, &[0x10085])
+                }
+                GamepadLayout::XboxBluetooth | GamepadLayout::LunaBluetooth => {
+                    let axes = field(1, 128, 0, 16, 0, 65535, 2, &[0x10030, 0x10031])
+                        && field(1, 128, 32, 16, 0, 65535, 2, &[0x10032, 0x10035])
+                        && field(1, 128, 64, 10, 0, 1023, 2, &[0x200c5])
+                        && field(1, 128, 80, 10, 0, 1023, 2, &[0x200c4])
+                        && field(1, 128, 96, 4, 1, 8, 0x42, &[0x10039]);
+                    if layout == GamepadLayout::LunaBluetooth {
+                        axes && field(1, 128, 104, 1, 0, 1, 2, &[0x90001, 0x90002])
+                            && field(1, 128, 107, 1, 0, 1, 2, &[0x90004, 0x90005])
+                            && field(1, 128, 110, 1, 0, 1, 2, &[0x90007, 0x90008])
+                            && field(1, 128, 115, 1, 0, 1, 2, &[0x9000c])
+                            && field(1, 128, 117, 1, 0, 1, 2, &[0x9000e, 0x9000f])
+                            && field(1, 128, 120, 1, 0, 1, 2, &[0xc0224, 0xc0221])
+                            && field(2, 8, 0, 1, 0, 1, 2, &[0xc0223])
+                    } else {
+                        axes && field(
+                            1,
+                            128,
+                            104,
+                            1,
+                            0,
+                            1,
+                            2,
+                            &core::array::from_fn::<_, 15, _>(|i| 0x90001 + i as u32),
+                        ) && (field(1, 128, 120, 1, 0, 1, 2, &[0xc00b2])
+                            || field(1, 128, 120, 1, 0, 1, 2, &[0xc0224])
+                                && field(2, 8, 0, 1, 0, 1, 2, &[0xc0223]))
+                    }
+                }
+                GamepadLayout::Generic => false,
+            };
+            matched && fields.next().is_none()
+        };
+        let mut found = GamepadLayout::Generic;
+        for layout in [
+            GamepadLayout::Ds4Basic,
+            GamepadLayout::XboxBluetooth,
+            GamepadLayout::XboxCompact,
+            GamepadLayout::LunaBluetooth,
+        ] {
+            if matches(layout) {
+                if found != GamepadLayout::Generic {
+                    return GamepadLayout::Generic;
+                }
+                found = layout;
+            }
+        }
+        found
+    }
+}
+
 impl Map {
     /// Whether an input field can represent a standard usage on this connection.
     pub fn supports_usage(&self, usage: u32) -> bool {
+        self.supports_input(usage, None)
+    }
+    pub(crate) fn supports_gamepad_usage(&self, usage: u32) -> bool {
+        self.supports_input(usage, Some(true))
+    }
+    pub(crate) fn supports_native_usage(&self, usage: u32) -> bool {
+        self.supports_input(usage, Some(false))
+    }
+    fn supports_input(&self, usage: u32, gamepad: Option<bool>) -> bool {
         self.fields().iter().any(|f| {
-            if f.flags & 1 != 0 || usage_kind(usage, f.app(), false, f.flags & 4 != 0) == 0 {
+            if gamepad.is_some_and(|want| (f.app() == GAMEPAD_APPLICATION) != want) {
+                return false;
+            }
+
+            if f.flags & 1 != 0
+                || usage_kind(usage, f.app(), false, f.flags & 4 != 0) == 0
+                || (f.app() == GAMEPAD_APPLICATION
+                    && f.flags & 2 == 0
+                    && matches!(usage, 0x10030..=0x10035 | 0x10039 | 0x200c4 | 0x200c5))
+            {
                 return false;
             }
             let spans =
@@ -1503,9 +1845,153 @@ impl Map {
         })
     }
 
+    /// Decodes ordinary HID input and retains gamepad reports separately.
+    /// Omitted vendor reports preserve held controls without producing new input.
+    /// Invalid input clears gamepad controls. Keyboard rollover retains them.
     pub fn decode(&self, state: &mut State, report_id: u8, payload: &[u8]) -> Result<Input, Error> {
-        if state.reports.len() != self.reports().iter().map(held_bytes).sum::<usize>() {
+        match self.decode_input(state, report_id, payload) {
+            Ok(input) => {
+                let mut offset = 0;
+                for report in self.reports() {
+                    if report.id == report_id && report.held_roles & GAMEPAD != 0 {
+                        let start = offset + held_bytes(report);
+                        let length = usize::from(report.bits[0]).div_ceil(8);
+                        state.reports[start] = 1;
+                        state.reports[start + 1..start + 1 + length]
+                            .copy_from_slice(&payload[..length]);
+                        break;
+                    }
+                    offset += stored_bytes(report);
+                }
+                Ok(input)
+            }
+            Err(error) => {
+                if !matches!(error, Error::Rollover | Error::Ignored) {
+                    self.clear_gamepad(state);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn clear_gamepad(&self, state: &mut State) {
+        let mut offset = 0;
+        for report in self.reports() {
+            let end = offset + stored_bytes(report);
+            if report.held_roles & GAMEPAD != 0
+                && let Some(bytes) = state.reports.get_mut(offset + held_bytes(report)..end)
+            {
+                bytes.fill(0);
+            }
+            offset = end;
+        }
+    }
+
+    /// Reconstructs current controls from accepted reports without allocating.
+    /// Missing and null axes have their validity bit cleared.
+    pub fn gamepad(&self, state: &State) -> Gamepad {
+        let mut result = Gamepad {
+            axes_declared: self.gamepad_axes,
+            layout: self.gamepad_layout,
+            ..Gamepad::default()
+        };
+        let mut offset = 0;
+        for (ri, report) in self.reports().iter().enumerate() {
+            let end = offset + stored_bytes(report);
+            let raw = state.reports.get(offset + held_bytes(report)..end);
+            offset = end;
+            let Some(raw) = raw.filter(|b| b.first() == Some(&1)) else {
+                continue;
+            };
+            let mut next = Gamepad::default();
+            for f in self
+                .fields()
+                .iter()
+                .filter(|f| usize::from(f.report) == ri && f.app() == GAMEPAD_APPLICATION)
+            {
+                let spans =
+                    &self.usages()[usize::from(f.span)..usize::from(f.span) + usize::from(f.spans)];
+                let variable = f.flags & 2 != 0;
+                let minimum = i64::from(f.minimum);
+                let maximum = if f.minimum < 0 {
+                    i64::from(f.maximum as i32)
+                } else {
+                    i64::from(f.maximum)
+                };
+                for j in 0..f.count() {
+                    let mut value = field_value(f, &raw[1..], j);
+                    let null = value < minimum || value > maximum;
+                    if null
+                        && (!variable
+                            || f.flags & 0x40 != 0
+                            || usage_at(spans, j as u32, true) == 0x10039)
+                    {
+                        // A hat's null sample releases its direction.
+                        if variable
+                            && usage_at(spans, j as u32, true) == 0x10039
+                            && matches!(maximum - minimum + 1, 4 | 8)
+                        {
+                            next.hat_valid = true;
+                        }
+                        continue;
+                    }
+                    value = value.clamp(minimum, maximum);
+                    let usage = usage_at(
+                        spans,
+                        if variable {
+                            j as u32
+                        } else {
+                            (value - minimum) as u32
+                        },
+                        variable,
+                    );
+                    if usage_kind(usage, f.app(), false, false) == 0 {
+                        continue;
+                    }
+                    if let Some(axis) = gamepad_axis(usage).filter(|_| variable) {
+                        if maximum > minimum {
+                            let span = maximum - minimum;
+                            next.axes[axis] =
+                                (((value - minimum) * 65_535 + span / 2) / span) as u16;
+                            next.axes_valid |= 1 << axis;
+                        }
+                    } else if variable && usage == 0x10039 {
+                        let count = maximum - minimum + 1;
+                        if count == 4 || count == 8 {
+                            next.hat = Some(((value - minimum) * (8 / count)) as u8);
+                            next.hat_valid = true;
+                        }
+                    } else if !variable || value != 0 {
+                        match usage {
+                            0x90001..=0x90020 => next.buttons |= 1 << (usage - 0x90001),
+                            0x10090..=0x10093 => next.dpad |= 1 << (usage - 0x10090),
+                            0x1003d => next.start = true,
+                            0x1003e => next.select = true,
+                            0x10085 => next.menu = true,
+                            u if u >> 16 == 12 => {
+                                next.consumer(u as u16);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            result.merge(next);
+        }
+        result
+    }
+
+    fn decode_input(
+        &self,
+        state: &mut State,
+        report_id: u8,
+        payload: &[u8],
+    ) -> Result<Input, Error> {
+        if state.reports.len() != self.reports().iter().map(stored_bytes).sum::<usize>() {
             return Err(Error::Invalid);
+        }
+        if self.ignored_inputs[usize::from(report_id) / 8] & (1 << (report_id % 8)) != 0 {
+            return Err(Error::Ignored);
         }
         let ri = self
             .reports()
@@ -1517,9 +2003,9 @@ impl Map {
             return Err(Error::Invalid);
         }
         let mut next = Input::default();
-        let held_offset: usize = self.reports()[..ri].iter().map(held_bytes).sum();
+        let held_offset: usize = self.reports()[..ri].iter().map(stored_bytes).sum();
         let previous_held = load_held(
-            &state.reports[held_offset..held_offset + held_bytes(&self.reports()[ri])],
+            &state.reports[held_offset..held_offset + stored_bytes(&self.reports()[ri])],
             &self.reports()[ri],
         );
         let slider_known = |usage| match usage {
@@ -1535,7 +2021,10 @@ impl Map {
             i64::from(state.previous[bit / 8] & (1 << (bit % 8)) != 0)
         };
         for field in self.fields() {
-            if field.report as usize != ri || field.flags & 1 != 0 {
+            if field.report as usize != ri
+                || field.flags & 1 != 0
+                || field.app() == GAMEPAD_APPLICATION
+            {
                 continue;
             }
             let variable = field.flags & 2 != 0;
@@ -1761,13 +2250,13 @@ impl Map {
         // This report is valid on its own. Retain its releases even when other
         // report IDs temporarily put the aggregate over the consumer limit.
         store_held(
-            &mut state.reports[held_offset..held_offset + held_bytes(&self.reports()[ri])],
+            &mut state.reports[held_offset..held_offset + stored_bytes(&self.reports()[ri])],
             &self.reports()[ri],
             &next.held,
         );
         let mut offset = 0;
         for (i, report) in self.reports().iter().enumerate() {
-            let length = held_bytes(report);
+            let length = stored_bytes(report);
             if i != ri {
                 next.held = next
                     .held
@@ -3447,6 +3936,14 @@ fn keyboard_bits(report: &Layout) -> usize {
         usize::from(report.key_last) - usize::from(report.key_first) + 1
     }
 }
+fn stored_bytes(report: &Layout) -> usize {
+    held_bytes(report)
+        + if report.held_roles & GAMEPAD != 0 {
+            1 + usize::from(report.bits[0]).div_ceil(8)
+        } else {
+            0
+        }
+}
 fn held_bytes(report: &Layout) -> usize {
     keyboard_bits(report).div_ceil(8)
         + usize::from(report.held_roles & MOUSE != 0) * 2
@@ -3683,5 +4180,50 @@ impl Input {
             self.held.consumer(code as u16)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gamepad_memory_tests {
+    use super::*;
+
+    #[test]
+    fn gamepad_state_retains_only_raw_reports_and_no_edge_history() {
+        let mut descriptor = alloc::vec![5, 1, 9, 5, 0xa1, 1, 5, 9, 0x15, 0, 0x25, 1, 0x75, 1];
+        for id in 1..=REPORTS as u8 {
+            descriptor.extend_from_slice(&[
+                0x85, id, 0x96, 0xff, 0x0f, 0x81, 3, 0x95, 1, 9, 32, 0x81, 0x42,
+            ]);
+        }
+        descriptor.push(0xc0);
+        let useful = Map::compile(&descriptor).unwrap();
+        descriptor.pop();
+        descriptor.extend_from_slice(&[6, 0, 0xff, 0x75, 8, 0x96, 0, 4]);
+        for id in REPORTS as u8 + 1..=255 {
+            descriptor.extend_from_slice(&[0x85, id, 9, 1, 0x81, 2]);
+        }
+        descriptor.push(0xc0);
+        let map = Map::compile(&descriptor).unwrap();
+        assert_eq!(map.storage.len(), useful.storage.len());
+        assert_eq!(map.reports().len(), REPORTS);
+        let mut state = map.state().unwrap();
+        assert_eq!(state.reports.len(), REPORTS * (REPORT_BYTES + 1));
+        assert!(state.previous.is_empty() && state.latches.is_empty() && state.arrays.is_empty());
+        assert_eq!(
+            core::mem::size_of::<State>(),
+            8 * core::mem::size_of::<usize>()
+        );
+        assert_eq!(core::mem::size_of::<Gamepad>(), 48);
+        let mut report = [0; REPORT_BYTES];
+        report[REPORT_BYTES - 1] = 0x80;
+        map.decode(&mut state, REPORTS as u8, &report).unwrap();
+        assert_eq!(map.gamepad(&state).buttons, 1 << 31);
+        let held = map.gamepad(&state);
+        for id in REPORTS as u8 + 1..=255 {
+            assert_eq!(map.decode(&mut state, id, &[0; 1024]), Err(Error::Ignored));
+            assert_eq!(map.gamepad(&state), held);
+        }
+        state.clear();
+        assert_eq!(map.gamepad(&state), Gamepad::default());
     }
 }

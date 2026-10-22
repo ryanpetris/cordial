@@ -1,2 +1,6 @@
+[env]
+EMBASSY_USB_MAX_INTERFACE_COUNT = "12"
+EMBASSY_USB_MAX_HANDLER_COUNT = "10"
+
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"

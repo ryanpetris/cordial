@@ -361,6 +361,7 @@ fn profile_records_round_trip() {
     let mut store = support::Store::default();
     block_on(Identity::initialize(&mut store, [1; 6], || 3)).unwrap();
     let rules = profiles::Rules::new(vec![profiles::Rule {
+        collection: profiles::KEYBOARD,
         input: profiles::usage(profiles::KEYBOARD_PAGE, 0x39),
         effect: profiles::Effect::Remap(vec![profiles::Output {
             usage: profiles::usage(profiles::KEYBOARD_PAGE, 0xe0),
@@ -388,4 +389,72 @@ fn profile_records_round_trip() {
     );
     assert!(block_on(profiles::metadata(&mut store, id)).is_err());
     assert!(block_on(store.load_owned(record_key(profiles::RULES, id))).is_ok());
+}
+
+#[test]
+fn saved_remaps_reject_outputs_that_alias_supported_controls() {
+    for output in [
+        saved::Output {
+            collection: 0x000c_0002,
+            usage: profiles::usage(profiles::BUTTON_PAGE, 1),
+        },
+        saved::Output {
+            collection: profiles::KEYBOARD,
+            usage: 0x0107_0004,
+        },
+    ] {
+        let mut store = support::Store::default();
+        let id = 23;
+        store.records.insert(
+            record_key(profiles::RULES, id),
+            saved::Rules {
+                rules: vec![saved::Rule {
+                    input: profiles::usage(profiles::KEYBOARD_PAGE, 4),
+                    collection: profiles::KEYBOARD,
+                    effect: Some(saved::rule::Effect::Remap(saved::Remap {
+                        outputs: vec![output],
+                    })),
+                }],
+            }
+            .encode_to_vec(),
+        );
+        assert_eq!(
+            block_on(profiles::rules(&mut store, id)),
+            Err(storage::Error::Corrupt)
+        );
+        assert_eq!(
+            block_on(profiles::saved_page(&mut store, id, None, 1)),
+            Err(storage::Error::Corrupt)
+        );
+        let mut cache = profiles::Cache::default();
+        assert_eq!(
+            block_on(cache.load(&mut store, &[id], usize::MAX, &[])).unwrap_err(),
+            profiles::LoadError::Lost(id)
+        );
+        assert!(cache.get(id).is_none());
+    }
+}
+
+#[test]
+fn saved_remaps_preserve_supported_output_range_endpoints() {
+    let mut store = support::Store::default();
+    for range in profiles::REMAP_OUTPUTS {
+        for endpoint in [range.min, range.max] {
+            let rule = profiles::Rule {
+                input: profiles::usage(profiles::KEYBOARD_PAGE, 4),
+                collection: profiles::KEYBOARD,
+                effect: profiles::Effect::Remap(vec![profiles::Output {
+                    usage: profiles::usage(range.page, endpoint),
+                    collection: range.collection,
+                }]),
+            };
+            let rules = profiles::Rules::new(vec![rule.clone()]).unwrap();
+            block_on(profiles::save_rules(&mut store, 23, &rules)).unwrap();
+            assert_eq!(block_on(profiles::rules(&mut store, 23)), Ok(rules));
+            assert_eq!(
+                block_on(profiles::saved_page(&mut store, 23, None, 1)),
+                Ok(vec![rule])
+            );
+        }
+    }
 }

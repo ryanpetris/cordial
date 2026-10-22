@@ -8,10 +8,20 @@ extern crate std;
 pub mod completion;
 mod configuration;
 mod descriptor;
+#[cfg(feature = "gamepad")]
+pub mod gamepad;
+#[cfg(feature = "gamepad")]
+pub mod outputs;
+#[cfg(feature = "gamepad")]
+extern crate alloc;
+#[cfg(all(test, feature = "gamepad"))]
+mod gamepad_tests;
 pub mod owner;
 mod serial;
 #[cfg(test)]
 mod tests;
+#[cfg(feature = "gamepad")]
+pub mod xinput;
 
 use cordial_core::{
     control::OutputToken,
@@ -24,8 +34,10 @@ use core::{
     cell::RefCell,
     sync::atomic::{AtomicU8, Ordering},
 };
+#[cfg(feature = "gamepad")]
+use embassy_futures::join::join;
 use embassy_futures::{
-    join::{join, join_array, join4},
+    join::{join_array, join4},
     select::{Either, select},
 };
 use embassy_sync::{
@@ -58,6 +70,15 @@ impl Status {
         self.configured && self.dtr
     }
 }
+/// Interfaces and saved gamepad pool sizes for one USB allocation.
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+pub struct Topology {
+    pub interfaces: u8,
+    pub gamepads: cordial_core::outputs::Plan,
+}
+
+const STATUS_RECEIVERS: usize = 3 + SLOTS + if cfg!(feature = "gamepad") { 12 } else { 0 };
+
 /// One 32-byte Raw HID report and the configuration interface it belongs to.
 struct RawPacket {
     generation: u64,
@@ -160,8 +181,8 @@ const fn idle_reports() -> [[u8; 68]; 10] {
 
 /// USB tasks exchange bounded owned packets with the application owner.
 pub struct Io {
-    // Receivers: input HID, serial transmit, serial receive and one per Raw HID slot.
-    status: Watch<CS, Status, { 3 + SLOTS }>,
+    // Input HID, CDC TX/RX, Raw HID, four gamepad writers and four receiver IN/OUT pairs.
+    status: Watch<CS, Status, STATUS_RECEIVERS>,
     reports: Mutex<CS, RefCell<[[u8; 68]; 10]>>,
     changed: Signal<CS, ()>,
     hid_tx: Channel<CS, HidTx, 1>,
@@ -173,7 +194,9 @@ pub struct Io {
     raw: [RawQueue; SLOTS],
     /// The enabled configuration interfaces the current enumeration exposes.
     interfaces: AtomicU8,
-    reconnect: Signal<CS, u8>,
+    reconnect: Signal<CS, Topology>,
+    #[cfg(feature = "gamepad")]
+    outputs: outputs::Outputs,
 }
 impl Default for Io {
     fn default() -> Self {
@@ -207,6 +230,25 @@ impl Io {
             }; SLOTS],
             interfaces: AtomicU8::new(0),
             reconnect: Signal::new(),
+            #[cfg(feature = "gamepad")]
+            outputs: outputs::Outputs::new(),
+        }
+    }
+    /// Set the allocation before starting the owner and when rebuilding USB.
+    pub fn set_topology(&self, topology: Topology) {
+        self.set_interfaces(topology.interfaces);
+        #[cfg(feature = "gamepad")]
+        self.outputs.enumerate(topology.gamepads);
+        #[cfg(not(feature = "gamepad"))]
+        assert_eq!(topology.gamepads, Default::default());
+    }
+    pub fn topology(&self) -> Topology {
+        Topology {
+            interfaces: self.interfaces(),
+            #[cfg(feature = "gamepad")]
+            gamepads: self.outputs.plan(),
+            #[cfg(not(feature = "gamepad"))]
+            gamepads: Default::default(),
         }
     }
     fn interfaces(&self) -> u8 {
@@ -232,6 +274,8 @@ impl Io {
         self.changed.signal(());
     }
     fn reset(&self, configured: bool) {
+        #[cfg(feature = "gamepad")]
+        self.outputs.reset();
         self.reports.lock(|r| *r.borrow_mut() = idle_reports());
         self.update(|s| {
             s.generation = s.generation.wrapping_add(1);
@@ -319,7 +363,12 @@ impl hid::RequestHandler for ReportHandler<'_> {
 
 /// Borrowed descriptor/class storage has the same lifetime as the USB tasks.
 pub struct Buffers<'a> {
-    pub config: [u8; 256],
+    pub config: [u8; 512],
+    pub msos: [u8; 64],
+    #[cfg(feature = "gamepad")]
+    gamepads: [gamepad::State<'a>; 4],
+    #[cfg(feature = "gamepad")]
+    receiver: xinput::Control,
     pub bos: [u8; 64],
     // USB strings use UTF-16; board default names allow up to 64 UTF-8 bytes.
     pub control: [u8; 256],
@@ -334,7 +383,12 @@ pub struct Buffers<'a> {
 impl<'a> Buffers<'a> {
     pub fn new(io: &'a Io) -> Self {
         Self {
-            config: [0; 256],
+            config: [0; 512],
+            msos: [0; 64],
+            #[cfg(feature = "gamepad")]
+            gamepads: core::array::from_fn(|i| gamepad::State::new(io.outputs.reports(i))),
+            #[cfg(feature = "gamepad")]
+            receiver: xinput::Control::new([0; 7]),
             bos: [0; 64],
             control: [0; 256],
             cdc: cdc_acm::State::new(),
@@ -356,6 +410,10 @@ pub struct Usb<'d, D: Driver<'d>> {
     tx: cdc_acm::Sender<'d, serial::SessionDriver<'d, D>>,
     rx: cdc_acm::Receiver<'d, serial::SessionDriver<'d, D>>,
     io: &'d Io,
+    #[cfg(feature = "gamepad")]
+    gamepads: [Option<gamepad::Gamepad<'d, serial::SessionDriver<'d, D>>>; 4],
+    #[cfg(feature = "gamepad")]
+    receiver: [Option<xinput::Channel<'d, serial::SessionDriver<'d, D>>>; 4],
     raw: [hid::HidReaderWriter<'d, serial::SessionDriver<'d, D>, 32, 32>; SLOTS],
 }
 impl<'d, D: Driver<'d>> Usb<'d, D> {
@@ -366,7 +424,7 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         driver: D,
         serial: &'d str,
         default_adapter_name: &'d str,
-        interfaces: u8,
+        topology: Topology,
         io: &'d Io,
         buffers: &'d mut Buffers<'d>,
     ) -> Self {
@@ -382,13 +440,13 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         config.max_power = 100;
         buffers.serial_number.bytes[..16].copy_from_slice(serial.as_bytes());
         buffers.serial_number.bytes[16..].copy_from_slice(configuration::VIAL_SERIAL_SUFFIX);
-        io.set_interfaces(interfaces);
+        io.set_topology(topology);
         let mut builder = Builder::new(
             serial::SessionDriver { driver, io },
             config,
             &mut buffers.config,
             &mut buffers.bos,
-            &mut [],
+            &mut buffers.msos,
             &mut buffers.control,
         );
         assert_eq!(u8::from(builder.string()), configuration::SERIAL_INDEX);
@@ -407,6 +465,21 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
                 hid_boot_protocol: hid::HidBootProtocol::None,
             },
         );
+        #[cfg(feature = "gamepad")]
+        let (gamepads, receiver) = {
+            assert!(topology.gamepads.hid_gamepads <= 4);
+            let mut states = buffers.gamepads.iter_mut();
+            let gamepads = core::array::from_fn(|i| {
+                (i < topology.gamepads.hid_gamepads as usize)
+                    .then(|| gamepad::Gamepad::new(&mut builder, states.next().unwrap()))
+            });
+            let receiver = xinput::new(
+                &mut builder,
+                &mut buffers.receiver,
+                topology.gamepads.xinput_gamepads as usize,
+            );
+            (gamepads, receiver)
+        };
         let mut slots = buffers.raw.iter_mut().zip(&mut buffers.raw_report_handlers);
         let raw = core::array::from_fn(|_| {
             let (state, handler) = slots.next().unwrap();
@@ -425,6 +498,10 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         });
         let (tx, rx) = cdc.split();
         Self {
+            #[cfg(feature = "gamepad")]
+            gamepads,
+            #[cfg(feature = "gamepad")]
+            receiver,
             raw,
             device: builder.build(),
             hid,
@@ -433,9 +510,23 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
             io,
         }
     }
+    /// Run a fixed allocation, preserving the configuration-interface reconnect behavior.
     pub async fn run(self) -> ! {
+        self.run_inner(false).await;
+        unreachable!()
+    }
+    /// Disable USB and drop all workers before returning the requested allocation.
+    #[cfg(feature = "gamepad")]
+    pub async fn run_until_rebuild(self) -> Topology {
+        self.run_inner(true).await
+    }
+    async fn run_inner(self, rebuild: bool) -> Topology {
         let Self {
             mut device,
+            #[cfg(feature = "gamepad")]
+            gamepads,
+            #[cfg(feature = "gamepad")]
+            receiver,
             raw,
             mut hid,
             mut tx,
@@ -444,27 +535,28 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         } = self;
         let mut hid_status = io.status.receiver().unwrap();
         let mut tx_status = io.status.receiver().unwrap();
-        join4(
-            join(
-                async {
-                    loop {
-                        let set = match select(device.run(), io.reconnect.wait()).await {
-                            Either::Second(set) => set,
-                            Either::First(_) => unreachable!(),
-                        };
-                        device.disable().await;
-                        io.set_interfaces(set);
-                        embassy_time::Timer::after_millis(250).await;
-                    }
-                },
-                {
-                    let mut slot = 0;
-                    join_array(raw.map(|raw| {
-                        slot += 1;
-                        configuration::run(raw, io, slot - 1)
-                    }))
-                },
-            ),
+        let bus = async {
+            loop {
+                let topology = match select(device.run(), io.reconnect.wait()).await {
+                    Either::Second(topology) => topology,
+                    Either::First(_) => unreachable!(),
+                };
+                if rebuild {
+                    return topology;
+                }
+                device.disable().await;
+                io.set_interfaces(topology.interfaces);
+                embassy_time::Timer::after_millis(250).await;
+            }
+        };
+        let workers = join4(
+            {
+                let mut slot = 0;
+                join_array(raw.map(|raw| {
+                    slot += 1;
+                    configuration::run(raw, io, slot - 1)
+                }))
+            },
             async {
                 loop {
                     let packet = io.hid_tx.receive().await;
@@ -535,8 +627,14 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
                 }
             },
             serial::receive(rx, io),
-        )
-        .await;
-        unreachable!()
+        );
+        #[cfg(feature = "gamepad")]
+        let workers = join(workers, outputs::run(gamepads, receiver, io));
+        let topology = match select(bus, workers).await {
+            Either::First(topology) => topology,
+            Either::Second(_) => unreachable!(),
+        };
+        device.disable().await;
+        topology
     }
 }

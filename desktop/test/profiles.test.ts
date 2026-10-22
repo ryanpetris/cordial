@@ -1,7 +1,8 @@
-import { ErrorCode } from "@cordial/protocol";
+import { create } from "@bufbuild/protobuf";
+import { ErrorCode, ProfileRuleSchema, UsageRange_Kind } from "@cordial/protocol";
 import { describe, expect, it } from "vitest";
 import { isAction } from "../src/core/actions.ts";
-import { FakeAdapter, device, profile, scale } from "../src/fake/adapter.ts";
+import { FakeAdapter, axis, device, profile, remap, scale } from "../src/fake/adapter.ts";
 import { canEnable, copyName, interfaceProblem, profileInUse, reconnectsUsb, stagedInterfaces } from "../src/shared/profiles.ts";
 import type { AdapterStatus, AppState, DeviceEntry } from "../src/shared/state.ts";
 import { profileAlertText } from "../src/shared/text.ts";
@@ -173,10 +174,71 @@ describe("Profiles", () => {
     expect(page(state).profiles[0]!.roles).toEqual(["keyboard", "consumer_control"]);
     // Another client adds a scale rule on the wheel.
     const session = c.manager.connected.get(ID)!.session;
-    await session.connection.setProfileRules({ profile: 1, changes: [{ change: { case: "rule", value: scale([0x01, 0x38], 2) } }] });
+    await session.connection.setProfileRules({ profile: 1, changes: [{ change: { case: "rule", value: scale([0x01, 0x38], [0x01, 0x02], 2) } }] });
     await until(() => page(state).profiles[0]!.roles.length === 3);
     expect(page(state).profiles[0]!.roles).toEqual(["keyboard", "mouse", "consumer_control"]);
     expect(fake.profiles[0]!.rules).toHaveLength(3);
+    await c.stop();
+  });
+
+  it("keys rules by input and collection", async () => {
+    const { fake, c, state } = await start({ profiles: [profile(1, "A")], pageSize: 1 });
+    const { connection } = c.manager.connected.get(ID)!.session;
+    const save = (...rules: ReturnType<typeof remap>[]) => connection.setProfileRules({ profile: 1, changes: rules.map((value) => ({ change: { case: "rule" as const, value } })) });
+    const list = async () => (await connection.listAllProfileRules(1)).map((r) => [r.input?.usagePage, r.input?.usage, r.collection?.usage]);
+    // Mouse Button 1 and Game Pad Button 1 share a usage but are different inputs.
+    await save(
+      remap([0x09, 0x01], [0x01, 0x02], [[0x07, 0x04]]),
+      remap([0x09, 0x01], [0x01, 0x05], [[0x09, 0x01]], [0x01, 0x02]),
+      axis([0x02, 0xc5], [0x02, 0xc4], true),
+    );
+    const sent = fake.received.length;
+    const listed = await connection.listAllProfileRules(1);
+    expect(listed.map((r) => [r.input?.usagePage, r.input?.usage, r.collection?.usage])).toEqual([[0x02, 0xc5, 0x05], [0x09, 0x01, 0x02], [0x09, 0x01, 0x05]]);
+    expect(listed[0]!.effect).toMatchObject({ case: "axis", value: { destination: { usagePage: 0x02, usage: 0xc4 }, invert: true } });
+    expect(listed[1]!.effect).toMatchObject({ case: "remap", value: { outputs: [{ usage: { usagePage: 0x07, usage: 0x04 }, collection: { usagePage: 0x01, usage: 0x06 } }] } });
+    expect(listed[2]!.effect).toMatchObject({ case: "remap", value: { outputs: [{ usage: { usagePage: 0x09, usage: 0x01 }, collection: { usagePage: 0x01, usage: 0x02 } }] } });
+    // A page can end between the two inputs that share a usage.
+    const cursors = fake.received.slice(sent).flatMap((r) => (r.command.case === "listProfileRules" ? [r.command.value.after] : []));
+    expect(cursors.map((a) => a && [a.input?.usage, a.collection?.usage])).toEqual([undefined, [0xc5, 0x05], [0x01, 0x02]]);
+    await until(() => page(state).profiles[0]!.roles.length === 2);
+    expect(page(state).profiles[0]!.roles).toEqual(["mouse", "gamepad"]);
+    // Forgetting one leaves the other.
+    await connection.setProfileRules({ profile: 1, changes: [{ change: { case: "forget", value: { input: { usagePage: 0x09, usage: 0x01 }, collection: { usagePage: 0x01, usage: 0x05 } } } }] });
+    expect(await list()).toEqual([[0x02, 0xc5, 0x05], [0x09, 0x01, 0x02]]);
+    // Inputs and outputs need their capability kind and collection.
+    for (const bad of [
+      remap([0x01, 0x30], [0x01, 0x02], []),
+      scale([0x07, 0x04], [0x01, 0x06], 2),
+      remap([0x07, 0x04], [0x01, 0x06], [[0x01, 0x30]], [0x01, 0x02]),
+      axis([0x01, 0x3d], [0x01, 0x30]),
+      axis([0x01, 0x30], [0x01, 0x3d]),
+      remap([0x09, 0x01], [0x0c, 0x01], []),
+      remap([0x09, 0x21], [0x01, 0x05], []),
+      remap([0x07, 0x04], [0x01, 0x06], [[0x09, 0x01]]),
+      create(ProfileRuleSchema, { input: { usagePage: 0x09, usage: 0x01 }, effect: { case: "remap", value: {} } }),
+    ]) {
+      await expect(save(bad)).rejects.toMatchObject({ code: ErrorCode.BAD_ARGS });
+    }
+    expect(await list()).toEqual([[0x02, 0xc5, 0x05], [0x09, 0x01, 0x02]]);
+    await c.stop();
+  });
+
+  it("remaps Game Pad input without gamepad outputs", async () => {
+    const { c } = await start({ board: "xiao_esp32s3", profiles: [profile(1, "A")] });
+    const { connection } = c.manager.connected.get(ID)!.session;
+    const support = connection.status.profileSupport!;
+    expect(support.ranges.some((r) => r.kind === UsageRange_Kind.REMAP_INPUT && r.collection?.usage === 0x05)).toBe(true);
+    expect(support.ranges.some((r) => r.kind === UsageRange_Kind.REMAP_OUTPUT && r.collection?.usage === 0x05)).toBe(false);
+    expect(support.ranges.some((r) => r.kind === UsageRange_Kind.AXIS_INPUT || r.kind === UsageRange_Kind.AXIS_OUTPUT)).toBe(false);
+    const save = (value: ReturnType<typeof remap>) => connection.setProfileRules({ profile: 1, changes: [{ change: { case: "rule", value } }] });
+    // Only the Mouse collection sends Button 1 here.
+    await save(remap([0x09, 0x01], [0x01, 0x05], [[0x07, 0x04], [0x09, 0x01]]));
+    const [rule] = await connection.listAllProfileRules(1);
+    expect(rule!.effect.value).toMatchObject({ outputs: [{ collection: { usage: 0x06 } }, { collection: { usage: 0x02 } }] });
+    for (const bad of [remap([0x07, 0x04], [0x01, 0x06], [[0x09, 0x01]], [0x01, 0x05]), axis([0x01, 0x30], [0x01, 0x31])]) {
+      await expect(save(bad)).rejects.toMatchObject({ code: ErrorCode.BAD_ARGS });
+    }
     await c.stop();
   });
 
@@ -340,6 +402,7 @@ describe("Configuration interface checks", () => {
     info: [],
     profileSupport: { memoryBudget: 100, memoryUsed: 0, maxLayers: 4 },
     interfaces,
+    outputSupport: [],
   });
   const via = { interface: 1, enabled: false, profile: 0, conflicts: [2] };
   const vial = { interface: 2, enabled: false, profile: 0, conflicts: [1] };

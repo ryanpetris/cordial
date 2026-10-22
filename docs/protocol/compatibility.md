@@ -107,10 +107,17 @@ client needs to show, enable and edit them.
 ## Profiles
 
 Profiles are not tied to keyboards, mice or any other kind of device. A profile is a set of rules
-keyed by HID usage, and the Dongle applies whichever of them match the input a device produces. A
-new kind of input or output, such as a joystick axis or a gamepad report, is a new usage range in
-`ProfileSupport`, never a new field, message or command. HID usages and collections are typed
-fields, decoded by the Dongle, as for warnings.
+keyed by HID usage and application collection, and the Dongle applies whichever of them match the
+input a device produces. A new kind of input or output, such as a joystick axis or a gamepad report,
+is a new usage range in `ProfileSupport`, never a new field, message or command. HID usages and
+collections are typed fields, decoded by the Dongle, as for warnings.
+
+Each rule and rule reference requires both input usage and collection. Capability ranges in
+`ProfileSupport.ranges` include a `UsageRange.Kind` and collection for inputs and outputs.
+`KIND_REMAP_INPUT`, `KIND_SCALE_INPUT` and `KIND_AXIS_INPUT` describe on/off, relative and absolute
+axis rules; `KIND_REMAP_OUTPUT` and `KIND_AXIS_OUTPUT` describe their destinations. Clients match
+kind, collection and usage together. Unknown kinds and `KIND_UNSPECIFIED` grant no capability.
+A usage and collection may appear separately under several kinds.
 
 Configuration interfaces follow the transport pattern. Each is a `ConfigurationInterface` value
 that reports itself as a `ConfigurationInterfaceSupport` entry with its preferences and the
@@ -144,7 +151,7 @@ Every `List` command reads its list in pages, the same way:
 | --- | --- | --- |
 | `ListDevices` | Device ID | Ascending ID |
 | `ListProfiles` | Profile ID | Ascending ID |
-| `ListProfileRules` | The rule's input `Usage` | Usage page, then usage |
+| `ListProfileRules` | `ProfileRuleRef`: input usage and collection | Input usage page, input usage, collection usage page, then collection usage |
 | `ListSettings` | `SettingRef`: integration and key | Integration, then key compared bytewise |
 | `ListWarnings` | The last `DeviceWarning` itself | Service, report type, report ID, bit offset, usage page, usage, then code; a missing field orders before any value |
 | `ListFeatures` | `FeatureRef`: integration and index | Integration, then index |

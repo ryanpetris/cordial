@@ -47,11 +47,22 @@ const SCAN_PAGE: usize = 16;
 /// preferences, waits for a new connection's first input before going ahead.
 pub const FIRST_INPUT_WAIT_MS: u64 = 1000;
 
+type OutputObservation = (
+    u64,
+    cordial_protocol::OutputMode,
+    cordial_protocol::OutputState,
+    Option<u32>,
+);
+
 pub struct Manager {
     /// Resident reconnection entries.
     pub devices: Vec<Option<Device>>,
     pub connections: [Option<Connection>; ACTIVE_CONNECTIONS],
     pub forward: Forwarder,
+    pub outputs: crate::outputs::Planner,
+    output_runtime: crate::outputs::Runtime,
+    output_states: [Option<OutputObservation>; ACTIVE_CONNECTIONS],
+    pub output_support: &'static [crate::outputs::Support],
     pub profiles: profiles::Cache,
     /// Bytes of memory for loaded profiles, or `None` on a board without profile support.
     pub profile_budget: Option<usize>,
@@ -80,7 +91,7 @@ pub struct Manager {
     pub changed: Vec<u64>,
     /// Profiles found undecodable, to delete once no connection is starting.
     pub lost_profiles: Vec<u64>,
-    /// Undecodable device records startup could not remove, to remove in the background.
+    /// Lost device records waiting for background cleanup.
     pub lost_devices: Vec<u64>,
     /// A resident entry left, so another enabled device may now fit in the stack.
     pub vacated: bool,
@@ -93,6 +104,10 @@ impl Default for Manager {
             devices: Vec::new(),
             connections: core::array::from_fn(|_| None),
             forward: Forwarder::default(),
+            outputs: crate::outputs::Planner::default(),
+            output_runtime: crate::outputs::Runtime::default(),
+            output_states: [None; ACTIVE_CONNECTIONS],
+            output_support: &[],
             profiles: profiles::Cache::default(),
             profile_budget: None,
             preference: AdapterPreference::default(),
@@ -144,6 +159,216 @@ async fn profile_ids<S: RecordStore>(store: &mut S) -> Result<Vec<u64>, Error> {
     }
 }
 impl Manager {
+    /// Publishes the USB owner's actual configuration. None means enumeration is unknown.
+    /// A new enumeration generation invalidates every assignment, even when counts are equal.
+    pub fn set_output_enumeration(
+        &mut self,
+        enumeration: Option<crate::outputs::Enumeration>,
+    ) -> bool {
+        let old = self.output_runtime.enumeration;
+        if old.map(|e| (e.generation, e.plan)) != enumeration.map(|e| (e.generation, e.plan)) {
+            for c in self.connections.iter().flatten() {
+                self.output_runtime.release(c.id);
+            }
+        }
+        self.output_runtime.enumeration = enumeration;
+        self.reconcile_outputs();
+        old != enumeration
+    }
+
+    /// Actual enumerated capacity, independent of saved choices and USB readiness.
+    pub fn output_slots(&self, mode: cordial_protocol::OutputMode) -> Option<u32> {
+        self.output_runtime.slots(mode)
+    }
+
+    /// Reconciles connections and current profile rules before returning mapped controls.
+    /// The USB worker owns neutral-before-replacement ordering and checks snapshot identity
+    /// immediately before transmission. The application never queues USB gamepad reports.
+    pub fn gamepad_outputs(&mut self) -> crate::outputs::Snapshots {
+        self.reconcile_outputs();
+        self.output_runtime.snapshots
+    }
+
+    fn gamepad_source(&self, c: &Connection) -> bool {
+        c.runtime
+            .as_ref()
+            .is_some_and(|r| r.roles & crate::outputs::GAMEPAD != 0)
+            || self.forward.produces_gamepad(c.id.slot as usize)
+    }
+    fn output_candidate(&self, c: &Connection) -> bool {
+        self.storage_ready
+            && self.radio_ready
+            && !c.closing
+            && self.gamepad_source(c)
+            && c.device
+                .and_then(|s| self.devices.get(s)?.as_ref())
+                .is_some_and(|d| {
+                    !d.retiring
+                        && !d.deleting
+                        && !d.paused
+                        && d.state == State::Connected
+                        && self.supports(d.peer.transport)
+                        && self.preference.transports.contains(d.peer.transport)
+                })
+    }
+
+    /// Selected gamepad state for a device, including setup and backend readiness.
+    pub fn gamepad_status(
+        &self,
+        policy: &Policy,
+        slot: Option<usize>,
+    ) -> cordial_protocol::OutputStatus {
+        use cordial_protocol::{OutputState, Role};
+        let mode = crate::outputs::gamepad(&policy.output_preferences);
+        let (mut state, mut assigned) = self.gamepad_state(mode, slot);
+        if (!policy.enabled || policy.blocked)
+            && !matches!(state, OutputState::Disabled | OutputState::Unsupported)
+        {
+            state = OutputState::Disconnected;
+            assigned = None;
+        }
+        cordial_protocol::OutputStatus {
+            role: Role::Gamepad as i32,
+            mode: mode as i32,
+            state: state as i32,
+            slot: assigned,
+        }
+    }
+
+    fn gamepad_state(
+        &self,
+        mode: cordial_protocol::OutputMode,
+        slot: Option<usize>,
+    ) -> (cordial_protocol::OutputState, Option<u32>) {
+        use cordial_protocol::{OutputMode, OutputState, Role};
+        let d = slot.and_then(|s| self.devices.get(s)?.as_ref());
+        let c = slot.and_then(|s| {
+            self.connections
+                .iter()
+                .flatten()
+                .find(|c| c.device == Some(s))
+        });
+        let state = if mode == OutputMode::Disabled {
+            OutputState::Disabled
+        } else if !crate::outputs::supports(self.output_support, Role::Gamepad, mode) {
+            OutputState::Unsupported
+        } else if c.is_none_or(|c| c.closing)
+            || d.is_none_or(|d| d.state == State::Disconnected)
+            || d.is_some_and(|d| {
+                d.retiring
+                    || d.deleting
+                    || d.paused
+                    || !self.preference.transports.contains(d.peer.transport)
+            })
+        {
+            OutputState::Disconnected
+        } else if c.is_some_and(|c| c.runtime.is_some() && !self.gamepad_source(c)) {
+            OutputState::Unsupported
+        } else if c.is_some_and(|c| self.output_candidate(c))
+            && self.output_runtime.enumeration.is_some_and(|e| e.ready)
+        {
+            let assigned = self
+                .output_runtime
+                .pool(mode)
+                .iter()
+                .position(|s| s.occupant == c.map(|c| c.id))
+                .map(|s| s as u32);
+            return (
+                if assigned.is_some() {
+                    OutputState::Active
+                } else {
+                    OutputState::Pending
+                },
+                assigned,
+            );
+        } else {
+            OutputState::Pending
+        };
+        (state, None)
+    }
+
+    /// Keeps surviving assignments and fills each mode's lowest available slot.
+    pub fn reconcile_outputs(&mut self) {
+        use cordial_protocol::{OutputMode, Role};
+        for c in self.connections.iter_mut().flatten().filter(|c| !c.closing) {
+            let assigned = c
+                .device
+                .and_then(|slot| self.devices[slot].as_ref())
+                .is_some_and(|device| !device.layers.is_empty());
+            self.forward.profiles_assigned(c.id.slot as usize, assigned);
+            if let Some(link) = &mut c.runtime
+                && link
+                    .forward(crate::hid::Input::default(), &mut self.forward)
+                    .is_ok()
+            {
+                self.output_runtime
+                    .update(c.id, self.forward.gamepad(c.id.slot as usize));
+            }
+        }
+        let candidates = self.connections.each_ref().map(|entry| {
+            let c = entry.as_ref()?;
+            let d = self.devices[c.device?].as_ref()?;
+            let mode = self.outputs.mode(d.id);
+            (self.output_candidate(c)
+                && mode != OutputMode::Disabled
+                && crate::outputs::supports(self.output_support, Role::Gamepad, mode))
+            .then_some((c.id, mode))
+        });
+        for mode in [OutputMode::Hid, OutputMode::Xinput] {
+            let capacity = self.output_runtime.slots(mode).unwrap_or(0) as usize;
+            for index in 0..crate::outputs::MAX_SLOTS as usize {
+                if let Some(link) = self.output_runtime.pool(mode)[index].occupant
+                    && (index >= capacity || !candidates.contains(&Some((link, mode))))
+                {
+                    self.output_runtime.release(link);
+                }
+            }
+        }
+        for (link, mode) in candidates.into_iter().flatten() {
+            if !self
+                .output_runtime
+                .pool(mode)
+                .iter()
+                .any(|s| s.occupant == Some(link))
+                && self
+                    .output_runtime
+                    .pool(mode)
+                    .iter()
+                    .take(self.output_runtime.slots(mode).unwrap_or(0) as usize)
+                    .any(|s| s.occupant.is_none())
+            {
+                let gamepad = self.forward.gamepad(link.slot as usize);
+                self.output_runtime.assign(mode, link, gamepad);
+            }
+        }
+        for index in 0..ACTIVE_CONNECTIONS {
+            let state = self.connections[index].as_ref().and_then(|c| {
+                let d = self.devices[c.device?].as_ref()?;
+                let mode = self.outputs.mode(d.id);
+                if mode == OutputMode::Disabled
+                    && c.runtime
+                        .as_ref()
+                        .is_none_or(|r| r.roles & crate::outputs::GAMEPAD == 0)
+                {
+                    return None;
+                }
+                let (state, slot) = self.gamepad_state(mode, c.device);
+                Some((d.id, mode, state, slot))
+            });
+            if self.output_states[index] != state {
+                for id in [self.output_states[index].map(|s| s.0), state.map(|s| s.0)]
+                    .into_iter()
+                    .flatten()
+                {
+                    if self.find(id).is_some() && !self.changed.contains(&id) {
+                        self.changed.push(id);
+                    }
+                }
+                self.output_states[index] = state;
+            }
+        }
+    }
+
     /// Whether the board supports profiles.
     pub fn profiles_supported(&self) -> bool {
         self.profile_budget.is_some()
@@ -200,6 +425,7 @@ impl Manager {
         let existing = profile_ids(store).await?;
         self.clear_interfaces(store, &existing).await;
         self.devices = Vec::new();
+        self.outputs = crate::outputs::Planner::default();
         // Tables still held, such as ones with edits not yet saved, are newer than their files.
         self.profiles.prune();
         // Startup reads every saved policy once: it deletes lost records, removes references to
@@ -232,6 +458,9 @@ impl Manager {
                 }
                 peers.try_reserve(1).map_err(|_| Error::Capacity)?;
                 peers.push(policy.peer);
+                let mode = crate::outputs::gamepad(&policy.output_preferences);
+                self.outputs.prepare(policy.id, mode)?;
+                self.outputs.set(policy.id, mode);
                 // A reference that cannot be removed now is skipped, and removed again at the
                 // next startup.
                 if policy.profiles.iter().any(|p| !existing.contains(p)) {
@@ -325,7 +554,7 @@ impl Manager {
                     .map_err(|_| Error::StorageFailed)?;
                 for &id in &ids {
                     after = id;
-                    changed |= self.fill_record(id, store).await?;
+                    changed |= self.fill_record(id, store, radio).await?;
                 }
                 if ids.len() < SCAN_PAGE {
                     break;
@@ -364,16 +593,17 @@ impl Manager {
     }
     /// Reads saved device `id` and makes it resident when it is enabled and fits. Returns whether
     /// it became resident.
-    pub async fn fill_record<S: RecordStore>(
+    pub async fn fill_record<S: RecordStore, B: Bluetooth>(
         &mut self,
         id: u64,
         store: &mut S,
+        radio: &mut B,
     ) -> Result<bool, Error> {
         if self.find(id).is_some() {
             return Ok(false);
         }
-        let policy = match (Policies { store }).load(id).await {
-            Ok(policy) => policy,
+        let policy = match self.policy_record(id, store, radio).await {
+            Ok((policy, _)) => policy,
             Err(crate::storage::Error::Missing | crate::storage::Error::Corrupt) => {
                 return Ok(false);
             }
@@ -437,6 +667,7 @@ impl Manager {
     pub fn fail_storage(&mut self) {
         self.storage_ready = false;
         self.unsaved_unready = false;
+        self.reconcile_outputs();
     }
     /// Whether free space, as last counted, leaves no room to pair another device.
     pub fn storage_full(&self) -> bool {
@@ -647,6 +878,31 @@ impl Manager {
             Err(_) => Err(Error::StorageFailed),
         }
     }
+    /// Reads a saved policy and bond, removing a device whose record is confirmed lost.
+    /// Cleanup failure does not change the read result or restore the device to the model.
+    pub(crate) async fn policy_record<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        id: u64,
+        store: &mut S,
+        radio: &mut B,
+    ) -> Result<(Policy, crate::bonds::Bond), crate::storage::Error> {
+        if self.lost_devices.contains(&id) {
+            return Err(crate::storage::Error::Missing);
+        }
+        let record = (Policies { store }).load_record(id).await;
+        match record {
+            Err(crate::storage::Error::Missing)
+                if self.find(id).is_some() || self.outputs.contains(id) =>
+            {
+                let _ = self.lose(id, store, radio).await;
+            }
+            Err(crate::storage::Error::Corrupt) => {
+                let _ = self.lose(id, store, radio).await;
+            }
+            _ => {}
+        }
+        record
+    }
     /// Deletes a device whose saved record was lost, as an unpair would, and
     /// queues its removal for the client.
     pub async fn lose<S: RecordStore, B: Bluetooth>(
@@ -655,6 +911,10 @@ impl Manager {
         store: &mut S,
         radio: &mut B,
     ) -> Result<(), Error> {
+        let known = self.find(id).is_some() || self.outputs.contains(id);
+        let pending = self.lost_devices.contains(&id);
+        self.outputs.remove(id);
+        self.reconcile_outputs();
         let mut peer = None;
         if let Some(slot) = self.find(id) {
             if let Some(link) = self.link_for(slot) {
@@ -667,18 +927,27 @@ impl Manager {
             }
             peer = self.devices[slot].as_ref().map(|d| d.peer);
             self.drop_entry(slot);
+            self.bonds_pending = true;
         }
-        // The device leaves the model whether or not cleanup succeeds; a record left on flash is
-        // deleted again at the next startup.
+        // The device leaves the model whether or not cleanup succeeds. Failed cleanup is retried
+        // without reporting another removal for the same lost record.
         let removal = Policies { store }.remove(id).await;
         let result = match (removal, peer) {
             (Err(_), _) => Err(Error::StorageFailed),
             (Ok(()), Some(peer)) if radio.capabilities().supports(peer.transport) => {
-                radio.forget(peer).await
+                self.forget_stale(peer, radio).await
             }
             (Ok(()), _) => Ok(()),
         };
-        self.removed.push(id);
+        if result.is_ok() {
+            self.lost_devices.retain(|lost| *lost != id);
+        } else if !pending {
+            self.lost_devices.push(id);
+        }
+        if known || !pending {
+            self.removed.push(id);
+        }
+        self.changed.retain(|changed| *changed != id);
         result
     }
     /// Reserves storage and an ID for a pairing, and removes any bond the stack holds for the
@@ -792,6 +1061,7 @@ impl Manager {
                 live.catalog.connection(false, hidpp);
             }
         }
+        self.reconcile_outputs();
     }
     pub fn disconnect<B: Bluetooth>(&mut self, slot: usize, radio: &mut B) -> Result<(), Error> {
         let d = self
@@ -852,6 +1122,8 @@ impl Manager {
         bond.identity = identity;
         bond.complete = true;
         policy.bond = policy.id;
+        let mode = crate::outputs::gamepad(&policy.output_preferences);
+        self.outputs.prepare(policy.id, mode)?;
         // Adopt before commit; a failed commit is restored from the old record
         // after teardown. Resolve ambiguous write errors by reading the record.
         radio.adopt(id)?;
@@ -866,6 +1138,8 @@ impl Manager {
                 Error::StorageFailed
             });
         }
+        self.outputs.set(policy.id, mode);
+        self.reconcile_outputs();
         if retained {
             // The new bond's connection discovers the device and saves its layout again.
             crate::layouts::remove(store, policy.id).await;
@@ -928,7 +1202,7 @@ impl Manager {
             return Err(Error::Disabled);
         }
         let mut live = Box::new(Live::new(d.peer.transport, d.hidpp_enabled));
-        let runtime = runtime(
+        let mut runtime = runtime(
             id,
             d.hidpp_enabled,
             &mut live,
@@ -936,12 +1210,15 @@ impl Manager {
             max_output,
             self.preference.host_platform,
         )?;
+        runtime.gamepad_transport = d.peer.transport;
+        runtime.forward(crate::hid::Input::default(), &mut self.forward)?;
         d.live = Some(live);
         d.connection(State::Connected, None, now);
         let c = self.connections[id.slot as usize].as_mut().unwrap();
         c.runtime = Some(runtime);
         c.deadline = 0;
         c.starting = Some(now.saturating_add(FIRST_INPUT_WAIT_MS));
+        self.reconcile_outputs();
         Ok(Some(slot))
     }
     /// Moves a connected link to the layout its backend now routes reports by.
@@ -959,13 +1236,14 @@ impl Manager {
         let (Some(slot), Some(_), false) = (c.device, &c.runtime, c.closing) else {
             return Ok(None);
         };
-        let profiles = parsed(descriptors)?;
+        self.output_runtime.release(id);
         let c = self.connections[id.slot as usize].as_mut().unwrap();
         let d = self.devices[slot].as_mut().ok_or(Error::NotFound)?;
         let live = d.live.as_mut().ok_or(Error::NotConnected)?;
         let mut old = c.runtime.take().unwrap();
         old.disconnected(&mut live.catalog, &mut self.forward);
         old.settings.release(&mut live.catalog);
+        let profiles = parsed(descriptors)?;
         let mut runtime = runtime(
             id,
             d.hidpp_enabled,
@@ -974,10 +1252,13 @@ impl Manager {
             old.max_output(),
             self.preference.host_platform,
         )?;
+        runtime.gamepad_transport = d.peer.transport;
+        runtime.forward(crate::hid::Input::default(), &mut self.forward)?;
         runtime.continue_sequence(&old);
         // Reconnecting the catalog cleared its standard information and battery readings.
         runtime.info_refresh_pending = d.peer.transport == Transport::Ble;
         c.runtime = Some(runtime);
+        self.reconcile_outputs();
         Ok(Some(slot))
     }
     /// Ends a connection: releases its runtime's held input and settings work, and drops what
@@ -1011,7 +1292,31 @@ impl Manager {
             }
         }
         self.forward.remove(id.slot as usize);
+        self.reconcile_outputs();
         Some(c.device)
+    }
+    /// Uses only the current connection's PnP observation for built-in selection.
+    pub fn gamepad_identity(
+        &mut self,
+        id: LinkId,
+        success: bool,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        let Some(c) = self
+            .connections
+            .get_mut(id.slot as usize)
+            .and_then(Option::as_mut)
+            .filter(|c| c.id == id && !c.closing)
+        else {
+            return Ok(());
+        };
+        if let Some(link) = &mut c.runtime {
+            link.gamepad_identity(success, bytes);
+            link.forward(crate::hid::Input::default(), &mut self.forward)?;
+            self.output_runtime
+                .update(id, self.forward.gamepad(id.slot as usize));
+        }
+        Ok(())
     }
     pub fn input(
         &mut self,
@@ -1032,14 +1337,26 @@ impl Manager {
             return Ok(false);
         };
         let link = c.runtime.as_mut().unwrap();
-        let changed = link.input(
+        let result = link.input(
             report.service,
             report.report_id,
             report.payload(),
             &mut live.catalog,
             &mut self.forward,
             now,
-        )?;
+        );
+        if self
+            .output_runtime
+            .snapshots
+            .hid
+            .iter()
+            .chain(&self.output_runtime.snapshots.xinput)
+            .any(|s| s.occupant == Some(report.link))
+        {
+            self.output_runtime
+                .update(report.link, self.forward.gamepad(report.link.slot as usize));
+        }
+        let changed = result?;
         // The first-input wait ends with input that reached the forwarder.
         if link.take_input_forwarded() {
             c.starting = None;
@@ -1229,6 +1546,7 @@ impl Manager {
                 return None;
             }
             let mut setup = live.setup;
+            setup.gamepad = true;
             let mut hidpp = false;
             if !setup.hidpp
                 && let Some(found) = link.hidpp_found()
@@ -1240,6 +1558,32 @@ impl Manager {
                 return None;
             }
             let mut policy = saved.clone();
+            if !live.setup.gamepad {
+                use cordial_protocol::{OutputMode, Role};
+                if !policy
+                    .output_preferences
+                    .iter()
+                    .any(|p| p.role == Role::Gamepad)
+                {
+                    let mode = if link.roles & crate::outputs::GAMEPAD != 0
+                        && crate::outputs::supports(
+                            self.output_support,
+                            Role::Gamepad,
+                            OutputMode::Hid,
+                        )
+                        && self.outputs.plan().hid_gamepads < crate::outputs::MAX_SLOTS
+                    {
+                        OutputMode::Hid
+                    } else {
+                        OutputMode::Disabled
+                    };
+                    // A settled choice survives reconnects while HID++ detection is pending.
+                    policy.output_preferences.push(crate::outputs::Preference {
+                        role: Role::Gamepad,
+                        mode,
+                    });
+                }
+            }
             if hidpp {
                 policy.set_hidpp(true);
             }
@@ -1254,7 +1598,7 @@ impl Manager {
     /// it.
     pub async fn save_policy<S: RecordStore, B: Bluetooth>(
         &mut self,
-        policy: Policy,
+        mut policy: Policy,
         bond: Option<&crate::bonds::Bond>,
         store: &mut S,
         radio: &mut B,
@@ -1271,10 +1615,20 @@ impl Manager {
         if slot.is_some_and(|s| self.devices[s].as_ref().unwrap().deleting) {
             return Err(Error::Busy);
         }
+        policy
+            .output_preferences
+            .retain(|p| p.mode != cordial_protocol::OutputMode::Disabled || policy.setup_pending);
+        let mode = crate::outputs::gamepad(&policy.output_preferences);
+        self.outputs.prepare(policy.id, mode)?;
         let saved = match bond {
             Some(bond) => Policies { store }.save_with(&policy, bond).await,
             None => Policies { store }.save(&policy).await,
         };
+        if saved == Err(crate::storage::Error::Missing) {
+            // The saved record is missing, undecodable or holds another device's bond.
+            let _ = self.lose(policy.id, store, radio).await;
+            return Err(Error::NotFound);
+        }
         saved.map_err(|error| {
             self.write_uncertain = error == crate::storage::Error::Unknown;
             if self.write_uncertain {
@@ -1282,11 +1636,11 @@ impl Manager {
             }
             match error {
                 crate::storage::Error::Full => Error::StorageFull,
-                // The saved record is missing, undecodable or holds another device's bond.
-                crate::storage::Error::Missing => Error::NotFound,
                 _ => Error::StorageFailed,
             }
         })?;
+        self.outputs.set(policy.id, mode);
+        self.reconcile_outputs();
         match slot {
             None if eligible => {
                 let slot = self.add(&policy)?;
@@ -1299,7 +1653,9 @@ impl Manager {
             None => {}
             Some(slot) if !eligible => match self.link_for(slot) {
                 Some(link) => {
-                    self.devices[slot].as_mut().unwrap().retiring = true;
+                    let d = self.devices[slot].as_mut().unwrap();
+                    d.update(&policy);
+                    d.retiring = true;
                     self.close(link, None, radio);
                 }
                 None => {
@@ -1342,6 +1698,7 @@ impl Manager {
                 }
             }
         }
+        self.reconcile_outputs();
         Ok(())
     }
     /// Loads a connected device's layers, all or none, within the profile memory budget, and
@@ -1387,6 +1744,7 @@ impl Manager {
             return false;
         };
         self.forward.apply_maps(update);
+        self.reconcile_outputs();
         let live = self.devices[slot].as_mut().unwrap().live.as_mut().unwrap();
         let changed = live.profile_error != error;
         live.profile_error = error;
@@ -1551,6 +1909,8 @@ impl Manager {
         if let Some(slot) = slot {
             self.drop_entry(slot);
         }
+        self.outputs.remove(id);
+        self.reconcile_outputs();
         // Deletion is committed. Reclamation failure cannot turn it into a failed removal.
         match store.available().await {
             Ok(bytes) => self.available_bytes = bytes,

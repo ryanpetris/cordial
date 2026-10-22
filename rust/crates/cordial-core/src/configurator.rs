@@ -5,7 +5,7 @@ use crate::{
     interfaces::{self, Interface},
     profiles::{
         self, BUTTON_PAGE, CONSUMER, CONSUMER_PAGE, DESKTOP_PAGE, KEYBOARD, KEYBOARD_PAGE, MOUSE,
-        Output, SYSTEM, Usage, usage,
+        Output, SYSTEM, usage,
     },
     storage::RecordStore,
 };
@@ -75,15 +75,18 @@ const MORE_CONTROLS: usize = 10;
 /// The held Consumer controls the virtual keyboard's media positions select, in matrix order.
 const MEDIA_INPUTS: [u16; 7] = [0xb5, 0xb6, 0xb7, 0xcd, 0xe2, 0xe9, 0xea];
 
-/// The input usage a matrix position selects.
-pub fn input(index: usize) -> Option<Usage> {
+/// The usage and collection a matrix position selects.
+pub fn input(index: usize) -> Option<Output> {
     match index {
-        0..161 => Some(usage(KEYBOARD_PAGE, index as u16 + 4)),
-        161..169 => Some(usage(KEYBOARD_PAGE, (index - 161) as u16 + 0xe0)),
-        169..176 => Some(usage(CONSUMER_PAGE, MEDIA_INPUTS[index - 169])),
-        176..179 => Some(CONTROLS[index - 176].1.usage),
-        179..195 => Some(CONTROLS[index - 179 + MORE_CONTROLS].1.usage),
-        195..211 => Some(usage(BUTTON_PAGE, (index - 194) as u16)),
+        0..161 => Some(key(index as u16 + 4)),
+        161..169 => Some(key((index - 161) as u16 + 0xe0)),
+        169..176 => Some(consumer(0, MEDIA_INPUTS[index - 169]).1),
+        176..179 => Some(CONTROLS[index - 176].1),
+        179..195 => Some(CONTROLS[index - 179 + MORE_CONTROLS].1),
+        195..211 => Some(Output {
+            usage: usage(BUTTON_PAGE, (index - 194) as u16),
+            collection: MOUSE,
+        }),
         _ => None,
     }
 }
@@ -95,18 +98,11 @@ fn buttons(interface: Interface) -> (u16, u16) {
         Interface::Vial => (0xd1, 8),
     }
 }
-/// The output an input produces without a rule.
-fn own(input: Usage) -> Output {
-    Output {
-        usage: input,
-        collection: profiles::input_collection(input),
-    }
-}
 /// The outputs writing `code` for `input` sets in `interface`'s table, or `None` when Cordial has
 /// no equivalent.
-fn written(interface: Interface, input: Usage, code: u16) -> Option<Vec<Output>> {
+fn written(interface: Interface, input: Output, code: u16) -> Option<Vec<Output>> {
     if code == TRANSPARENT {
-        Some(alloc::vec![own(input)])
+        Some(alloc::vec![input])
     } else {
         decode(interface, code)
     }
@@ -297,15 +293,15 @@ impl Application {
             let Some(input) = input(index) else {
                 return Some(0);
             };
-            match map.borrow().get(input) {
-                None => Some(encode(interface, &[own(input)]).unwrap_or(TRANSPARENT)),
+            match map.borrow().get(input.into()) {
+                None => Some(encode(interface, &[input]).unwrap_or(TRANSPARENT)),
                 Some(rule) => match rule.effect {
                     profiles::Effect::Remap(outputs) => encode(interface, &outputs),
-                    profiles::Effect::Scale(..) => None,
+                    profiles::Effect::Scale(..) | profiles::Effect::Axis(..) => None,
                 },
             }
         };
-        let mut edits: Vec<(Usage, Vec<Output>)> = Vec::new();
+        let mut edits: Vec<(Output, Vec<Output>)> = Vec::new();
         let mut reset = false;
         let valid = match data[0] {
             0x01 => {
@@ -352,7 +348,7 @@ impl Application {
                     None => false,
                 }
             }
-            // Resetting the keymap forgets every rule in the profile, leaving it empty as created.
+            // Resetting the keymap forgets every rule in the selected profile.
             0x06 => {
                 reset = true;
                 true
@@ -465,9 +461,14 @@ impl Application {
         }
         if reset || !edits.is_empty() {
             let mut changes = Vec::new();
+            if changes.try_reserve_exact(edits.len()).is_err() {
+                data[0] = 0xff;
+                return data;
+            }
             for (input, outputs) in edits {
                 let rule = profiles::Rule {
-                    input,
+                    input: input.usage,
+                    collection: input.collection,
                     effect: profiles::Effect::Remap(outputs),
                 };
                 match rule.normalized() {
@@ -508,6 +509,7 @@ mod tests {
                     assert_eq!(again, outputs, "{interface:?} keycode {code:#06x}");
                     let rule = profiles::Rule {
                         input: usage(KEYBOARD_PAGE, 4),
+                        collection: KEYBOARD,
                         effect: profiles::Effect::Remap(outputs),
                     };
                     assert!(
@@ -566,33 +568,34 @@ mod tests {
     }
     #[test]
     fn matrix_positions_select_remappable_inputs() {
-        let inputs: Vec<Usage> = (0..KEYS).map_while(input).collect();
+        let inputs: Vec<Output> = (0..KEYS).map_while(input).collect();
         assert_eq!(inputs.len(), 211);
         assert!((inputs.len()..KEYS).all(|i| input(i).is_none()));
         let mut unique = inputs.clone();
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), inputs.len());
-        assert_eq!(input(169), Some(usage(CONSUMER_PAGE, 0xb5)));
-        assert_eq!(input(176), Some(usage(DESKTOP_PAGE, 0x81)));
-        assert_eq!(input(178), Some(usage(DESKTOP_PAGE, 0x83)));
-        assert_eq!(input(179), Some(usage(CONSUMER_PAGE, 0x183)));
-        assert_eq!(input(194), Some(usage(CONSUMER_PAGE, 0x70)));
-        assert_eq!(input(195), Some(usage(BUTTON_PAGE, 1)));
-        assert_eq!(input(210), Some(usage(BUTTON_PAGE, 16)));
+        assert_eq!(input(169), Some(consumer(0, 0xb5).1));
+        assert_eq!(input(176), Some(system(0, 0x81).1));
+        assert_eq!(input(178), Some(system(0, 0x83).1));
+        assert_eq!(input(179), Some(consumer(0, 0x183).1));
+        assert_eq!(input(194), Some(consumer(0, 0x70).1));
+        assert_eq!(input(195), Some(button(1)));
+        assert_eq!(input(210), Some(button(16)));
         for input in inputs {
             let rule = profiles::Rule {
-                input,
-                effect: profiles::Effect::Remap(alloc::vec![own(input)]),
+                input: input.usage,
+                collection: input.collection,
+                effect: profiles::Effect::Remap(alloc::vec![input]),
             };
-            assert!(rule.normalized().is_ok(), "{input:#x}");
+            assert!(rule.normalized().is_ok(), "{input:?}");
             // An input reads as its own keycode when the table has one.
             let buttons = |interface| buttons(interface).1;
             for interface in Interface::ALL {
-                let own = encode(interface, &[own(input)]);
-                let unrepresentable = profiles::page(input) == BUTTON_PAGE
-                    && profiles::id(input) > buttons(interface);
-                assert_eq!(own.is_none(), unrepresentable, "{interface:?} {input:#x}");
+                let own = encode(interface, &[input]);
+                let unrepresentable = profiles::page(input.usage) == BUTTON_PAGE
+                    && profiles::id(input.usage) > buttons(interface);
+                assert_eq!(own.is_none(), unrepresentable, "{interface:?} {input:?}");
             }
         }
     }

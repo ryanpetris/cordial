@@ -10,8 +10,6 @@ const fn usage(usage_page: u32, usage: u32) -> p::Usage {
 }
 
 const DESKTOP_PAGE: u32 = 0x01;
-const BUTTON_PAGE: u32 = 0x09;
-const KEYBOARD_PAGE: u32 = 0x07;
 const CONSUMER_PAGE: u32 = 0x0c;
 
 /// The application collections of the Dongle's USB reports.
@@ -20,33 +18,16 @@ pub const MOUSE: p::Usage = usage(DESKTOP_PAGE, 0x02);
 pub const CONSUMER: p::Usage = usage(CONSUMER_PAGE, 0x01);
 pub const SYSTEM: p::Usage = usage(DESKTOP_PAGE, 0x80);
 
-/// The relative values a mouse reports: X, Y, wheel and AC Pan.
-const AXES: [p::Usage; 4] = [
-    usage(DESKTOP_PAGE, 0x30),
-    usage(DESKTOP_PAGE, 0x31),
-    usage(DESKTOP_PAGE, 0x38),
-    usage(CONSUMER_PAGE, 0x238),
-];
-
-/// The application collection device input of `input` arrives in, or `None` for a usage page
-/// the Dongle does not forward.
-pub fn input_collection(input: &p::Usage) -> Option<p::Usage> {
-    match input.usage_page {
-        _ if AXES.contains(input) => Some(MOUSE),
-        KEYBOARD_PAGE => Some(KEYBOARD),
-        BUTTON_PAGE => Some(MOUSE),
-        CONSUMER_PAGE => Some(CONSUMER),
-        DESKTOP_PAGE => Some(SYSTEM),
-        _ => None,
-    }
-}
-
-/// The collection of the only report in `support.remap_outputs` that carries `output`.
+/// The only report collection with a `RemapOutput` range in `support.ranges` carrying `output`.
 pub fn output_collection(support: &p::ProfileSupport, output: &p::Usage) -> Option<p::Usage> {
     let mut found = support
-        .remap_outputs
+        .ranges
         .iter()
-        .filter(|r| r.usage_page == output.usage_page && (r.min..=r.max).contains(&output.usage))
+        .filter(|r| {
+            r.kind == p::usage_range::Kind::RemapOutput as i32
+                && r.usage_page == output.usage_page
+                && (r.min..=r.max).contains(&output.usage)
+        })
         .map(|r| r.collection);
     let first = found.next()??;
     found.all(|c| c == Some(first)).then_some(first)
@@ -67,11 +48,12 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 
 /// `rule` as the Dongle saves it: a missing output collection resolved to the only report that
 /// carries the usage, each output kept once in ascending order, and a scale in lowest terms.
-/// `None` when the rule changes nothing, a remap of its input to only itself in the collection
-/// the input arrives in or a scale by 1, since saving such a rule forgets the input's rule.
+/// `None` when the rule changes nothing, since saving such a rule forgets the rule for its input
+/// and collection: a remap of its input to only itself in the input's collection, a scale by 1,
+/// or an axis routed to itself without inversion.
 pub fn normalized(support: &p::ProfileSupport, rule: &p::ProfileRule) -> Option<p::ProfileRule> {
     let mut rule = rule.clone();
-    let input = rule.input.unwrap_or_default();
+    let (input, collection) = (rule.input, rule.collection);
     let identity = match &mut rule.effect {
         Some(profile_rule::Effect::Remap(remap)) => {
             for o in &mut remap.outputs {
@@ -82,10 +64,10 @@ pub fn normalized(support: &p::ProfileSupport, rule: &p::ProfileRule) -> Option<
             remap.outputs.sort_by(output_order);
             remap.outputs.dedup();
             let itself = profile_rule::Output {
-                usage: Some(input),
-                collection: input_collection(&input),
+                usage: input,
+                collection,
             };
-            itself.collection.is_some() && remap.outputs == [itself]
+            input.is_some() && collection.is_some() && remap.outputs == [itself]
         }
         Some(profile_rule::Effect::Scale(scale)) => {
             let n = i64::from(scale.numerator);
@@ -98,6 +80,9 @@ pub fn normalized(support: &p::ProfileSupport, rule: &p::ProfileRule) -> Option<
             }
             scale.numerator == 1 && scale.denominator == 1
         }
+        Some(profile_rule::Effect::Axis(axis)) => {
+            input.is_some() && axis.destination == input && !axis.invert
+        }
         None => false,
     };
     (!identity).then_some(rule)
@@ -107,8 +92,13 @@ pub fn normalized(support: &p::ProfileSupport, rule: &p::ProfileRule) -> Option<
 mod tests {
     use super::*;
 
+    const BUTTON_PAGE: u32 = 0x09;
+    const KEYBOARD_PAGE: u32 = 0x07;
+    const GAME_PAD: p::Usage = usage(DESKTOP_PAGE, 0x05);
+
     fn range(collection: p::Usage, page: u32, min: u32, max: u32) -> p::UsageRange {
         p::UsageRange {
+            kind: p::usage_range::Kind::RemapOutput as i32,
             collection: Some(collection),
             usage_page: page,
             min,
@@ -118,7 +108,7 @@ mod tests {
 
     fn support() -> p::ProfileSupport {
         p::ProfileSupport {
-            remap_outputs: vec![
+            ranges: vec![
                 range(KEYBOARD, KEYBOARD_PAGE, 0x04, 0xff),
                 range(CONSUMER, CONSUMER_PAGE, 0x01, 0x237),
                 range(MOUSE, BUTTON_PAGE, 1, 16),
@@ -138,27 +128,78 @@ mod tests {
         }
     }
 
-    fn remap(input: p::Usage, outputs: Vec<profile_rule::Output>) -> p::ProfileRule {
+    fn rule(input: p::Usage, collection: p::Usage, effect: profile_rule::Effect) -> p::ProfileRule {
         p::ProfileRule {
             input: Some(input),
-            effect: Some(profile_rule::Effect::Remap(profile_rule::Remap { outputs })),
+            collection: Some(collection),
+            effect: Some(effect),
         }
     }
 
+    fn remap(
+        input: p::Usage,
+        collection: p::Usage,
+        outputs: Vec<profile_rule::Output>,
+    ) -> p::ProfileRule {
+        rule(
+            input,
+            collection,
+            profile_rule::Effect::Remap(profile_rule::Remap { outputs }),
+        )
+    }
+
     fn scale(input: p::Usage, numerator: i32, denominator: u32) -> p::ProfileRule {
-        p::ProfileRule {
-            input: Some(input),
-            effect: Some(profile_rule::Effect::Scale(profile_rule::Scale {
+        rule(
+            input,
+            MOUSE,
+            profile_rule::Effect::Scale(profile_rule::Scale {
                 numerator,
                 denominator,
-            })),
+            }),
+        )
+    }
+
+    fn axis(input: p::Usage, destination: p::Usage, invert: bool) -> p::ProfileRule {
+        rule(
+            input,
+            GAME_PAD,
+            profile_rule::Effect::Axis(profile_rule::Axis {
+                destination: Some(destination),
+                invert,
+            }),
+        )
+    }
+
+    #[test]
+    fn output_collection_matches_only_remap_output_ranges() {
+        use p::usage_range::Kind;
+        let button = usage(BUTTON_PAGE, 1);
+        let mut s = p::ProfileSupport::default();
+        for kind in [
+            Kind::Unspecified as i32,
+            Kind::RemapInput as i32,
+            Kind::ScaleInput as i32,
+            Kind::AxisInput as i32,
+            Kind::AxisOutput as i32,
+            i32::MAX,
+        ] {
+            let mut r = range(GAME_PAD, BUTTON_PAGE, 1, 16);
+            r.kind = kind;
+            s.ranges.push(r);
+            assert_eq!(output_collection(&s, &button), None);
         }
+        s.ranges.push(range(MOUSE, BUTTON_PAGE, 1, 16));
+        assert_eq!(output_collection(&s, &button), Some(MOUSE));
+        s.ranges.push(range(GAME_PAD, BUTTON_PAGE, 1, 16));
+        assert_eq!(output_collection(&s, &button), None);
     }
 
     #[test]
     fn remaps_fill_collections_and_sort_outputs_once() {
+        let space = usage(KEYBOARD_PAGE, 0x39);
         let rule = remap(
-            usage(KEYBOARD_PAGE, 0x39),
+            space,
+            KEYBOARD,
             vec![
                 out(KEYBOARD_PAGE, 0xe0, None),
                 out(CONSUMER_PAGE, 0xe9, None),
@@ -170,7 +211,8 @@ mod tests {
         assert_eq!(
             normalized(&support(), &rule),
             Some(remap(
-                usage(KEYBOARD_PAGE, 0x39),
+                space,
+                KEYBOARD,
                 vec![
                     out(KEYBOARD_PAGE, 0x04, Some(KEYBOARD)),
                     out(KEYBOARD_PAGE, 0xe0, Some(KEYBOARD)),
@@ -179,7 +221,7 @@ mod tests {
                 ],
             ))
         );
-        let disabled = remap(usage(KEYBOARD_PAGE, 0x39), Vec::new());
+        let disabled = remap(space, KEYBOARD, Vec::new());
         assert_eq!(normalized(&support(), &disabled), Some(disabled));
     }
 
@@ -189,7 +231,7 @@ mod tests {
         assert_eq!(
             normalized(
                 &support(),
-                &remap(key, vec![out(KEYBOARD_PAGE, 0x39, None)])
+                &remap(key, KEYBOARD, vec![out(KEYBOARD_PAGE, 0x39, None)])
             ),
             None
         );
@@ -197,19 +239,28 @@ mod tests {
             out(KEYBOARD_PAGE, 0x39, Some(KEYBOARD)),
             out(KEYBOARD_PAGE, 0x39, None),
         ];
-        assert_eq!(normalized(&support(), &remap(key, twice)), None);
-        // A System Control button the System report carries.
+        assert_eq!(normalized(&support(), &remap(key, KEYBOARD, twice)), None);
         let sleep = usage(DESKTOP_PAGE, 0x82);
         assert_eq!(
             normalized(
                 &support(),
-                &remap(sleep, vec![out(DESKTOP_PAGE, 0x82, None)])
+                &remap(sleep, SYSTEM, vec![out(DESKTOP_PAGE, 0x82, None)])
             ),
             None
         );
-        // The same usage in another report changes the input.
-        let other = remap(key, vec![out(KEYBOARD_PAGE, 0x39, Some(MOUSE))]);
+        // The same usage in another collection changes the input.
+        let other = remap(key, KEYBOARD, vec![out(KEYBOARD_PAGE, 0x39, Some(MOUSE))]);
         assert_eq!(normalized(&support(), &other), Some(other));
+        let button = usage(BUTTON_PAGE, 1);
+        let gamepad = remap(button, GAME_PAD, vec![out(BUTTON_PAGE, 1, None)]);
+        assert_eq!(
+            normalized(&support(), &gamepad),
+            Some(remap(
+                button,
+                GAME_PAD,
+                vec![out(BUTTON_PAGE, 1, Some(MOUSE))]
+            ))
+        );
         assert_eq!(
             normalized(&support(), &scale(usage(DESKTOP_PAGE, 0x38), 3, 3)),
             None
@@ -219,6 +270,16 @@ mod tests {
             normalized(&support(), &invert),
             Some(scale(usage(DESKTOP_PAGE, 0x38), -1, 1))
         );
+    }
+
+    #[test]
+    fn axis_rules_round_trip_unless_they_change_nothing() {
+        let x = usage(DESKTOP_PAGE, 0x30);
+        let y = usage(DESKTOP_PAGE, 0x31);
+        assert_eq!(normalized(&support(), &axis(x, x, false)), None);
+        for kept in [axis(x, x, true), axis(x, y, false), axis(x, y, true)] {
+            assert_eq!(normalized(&support(), &kept), Some(kept));
+        }
     }
 
     #[test]
@@ -235,16 +296,24 @@ mod tests {
     }
 
     #[test]
-    fn inputs_arrive_in_their_collections() {
-        assert_eq!(input_collection(&usage(KEYBOARD_PAGE, 4)), Some(KEYBOARD));
-        assert_eq!(input_collection(&usage(BUTTON_PAGE, 1)), Some(MOUSE));
-        assert_eq!(input_collection(&usage(CONSUMER_PAGE, 0x238)), Some(MOUSE));
+    fn rules_order_by_input_then_collection() {
+        use crate::paging::{rule_order, rule_ref};
+        let key = usage(KEYBOARD_PAGE, 0x39);
+        let button = usage(BUTTON_PAGE, 1);
+        let mut rules = [
+            remap(button, GAME_PAD, Vec::new()),
+            remap(button, MOUSE, Vec::new()),
+            remap(key, KEYBOARD, Vec::new()),
+        ];
+        rules.sort_by(|a, b| rule_order(&rule_ref(a), &rule_ref(b)));
+        let order: Vec<_> = rules.iter().map(|r| (r.input, r.collection)).collect();
         assert_eq!(
-            input_collection(&usage(CONSUMER_PAGE, 0xe9)),
-            Some(CONSUMER)
+            order,
+            [
+                (Some(key), Some(KEYBOARD)),
+                (Some(button), Some(MOUSE)),
+                (Some(button), Some(GAME_PAD)),
+            ]
         );
-        assert_eq!(input_collection(&usage(DESKTOP_PAGE, 0x38)), Some(MOUSE));
-        assert_eq!(input_collection(&usage(DESKTOP_PAGE, 0x81)), Some(SYSTEM));
-        assert_eq!(input_collection(&usage(0xff00, 1)), None);
     }
 }

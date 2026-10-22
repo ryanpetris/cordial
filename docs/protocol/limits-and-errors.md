@@ -16,8 +16,9 @@
 | Loaded profiles | Each profile in a connected device's layers, plus each enabled configuration interface's profile while a Host editor uses it; shared by ID, within the memory budget |
 | Profiles per layer list | `ProfileSupport.max_layers`, so that every enabled device's layers fit in memory |
 | List pages | Chosen by the Dongle for every `List` command and every page; at least one entry unless `end` is set |
-| Rule inputs | `ProfileSupport.remap_inputs` and `scale_inputs` |
-| Remap outputs | `ProfileSupport.remap_outputs`, the keys, Consumer controls, mouse buttons and System Control buttons the Dongle's USB reports carry, and at most `max_remap_outputs` per remap and per held input |
+| Rule inputs | `ProfileSupport.ranges` of kind `KIND_REMAP_INPUT`, `KIND_SCALE_INPUT` or `KIND_AXIS_INPUT`, matching both usage and collection |
+| Remap outputs | `ProfileSupport.ranges` of kind `KIND_REMAP_OUTPUT`, and at most `max_remap_outputs` per remap and per held input |
+| Absolute axis outputs | `ProfileSupport.ranges` of kind `KIND_AXIS_OUTPUT`, in the input's Game Pad collection |
 | Loaded profile memory | `ProfileSupport.memory_budget` bytes, shared by every loaded profile; a device whose layers do not fit loads none of them |
 | Profile name | 1..64 UTF-8 bytes |
 | Text information values | 64 UTF-8 bytes |
@@ -60,7 +61,7 @@ refuses, the client shows the error and does nothing else, since events bring it
 | A setting value out of range or too long: `BAD_ARGS` | The setting type's limits |
 | Profile commands on a board without profile support: `UNKNOWN_COMMAND` | `Status.profile_support` |
 | Device layers on a board without profile support: `UNSUPPORTED` | `Status.profile_support` |
-| A rule input or output out of range, too many outputs, or a zero scale: `BAD_ARGS` | `ProfileSupport.remap_inputs`, `scale_inputs`, `remap_outputs` and `max_remap_outputs` |
+| A missing rule input or collection, an input or output out of range, too many outputs, or a zero scale: `BAD_ARGS` | `ProfileSupport.ranges`, matching kind, usage and collection, and `max_remap_outputs` |
 | A profile larger than the memory budget: `NO_CAPACITY`, `CAPACITY_REASON_PROFILE_MEMORY` | None; the size of a saved profile is the Dongle's |
 | Too many layers: `BAD_ARGS` | `ProfileSupport.max_layers` |
 | An enabled configuration interface without a profile: `BAD_ARGS` | The resulting `enabled` and `profile` of each interface |

@@ -33,6 +33,8 @@ export function record(id: number, patch: Partial<DeviceRecord> = {}): DeviceRec
     roles: [],
     profiles: [],
     profileError: null,
+    outputPreferences: [],
+    outputs: [],
     ...patch,
   };
 }

@@ -10,7 +10,7 @@
 #![no_main]
 extern crate alloc;
 mod discovery;
-use alloc::{boxed::Box, format, vec, vec::Vec};
+use alloc::{boxed::Box, format, rc::Rc, vec, vec::Vec};
 use cordial_core::model::{
     errors::ErrorCode as Error, hidpp::*, identifiers::Transport, link::PromptMethod, settings::*,
 };
@@ -221,10 +221,10 @@ const RESIDENT: usize = 14;
 /// input the editor's matrix selects.
 const PROFILES: u64 = 12;
 /// Connected devices and their layers on a board with profiles; the VIA editor uses profile 1.
-/// Together they load profiles 1..=7, within the budget. `OVER_BUDGET` gives device 9 layers that
-/// need all twelve, which do not fit.
-const CONNECTED: [(u64, [u64; 2]); 4] = [(1, [1, 2]), (2, [2, 3]), (3, [4, 5]), (9, [6, 7])];
-const OVER_BUDGET: core::ops::RangeInclusive<u32> = 6..=12;
+/// Together they load eight distinct profiles, 1..=8, within the budget. `OVER_BUDGET` gives device
+/// 9 layers that need all twelve, which do not fit.
+const CONNECTED: [(u64, [u64; 2]); 4] = [(1, [1, 2]), (2, [3, 4]), (3, [5, 6]), (9, [7, 8])];
+const OVER_BUDGET: core::ops::RangeInclusive<u32> = 5..=12;
 const EDITOR_PROFILE: u64 = 1;
 
 /// The board's record storage: LittleFS over flash. The flash is a static array outside the
@@ -277,6 +277,7 @@ type Disk = cordial_btstack::storage::Handle<'static, Store>;
 
 #[derive(Default)]
 struct Radio {
+    input: Option<InputReport>,
     /// The link the last incoming connection was admitted as.
     accepted: Option<LinkId>,
     /// Whether that connection was given a saved layout.
@@ -288,6 +289,23 @@ struct Radio {
     /// layout against the device or the link ends.
     layouts: [Option<HidLayout>; cordial_core::devices::ACTIVE_CONNECTIONS],
 }
+impl cordial_core::bluetooth::EventSource for Radio {
+    async fn poll(&mut self) {}
+    fn next_event(&mut self) -> Option<Event> {
+        self.input.take().map(Event::Input)
+    }
+    async fn changed(&self) {
+        core::future::pending().await
+    }
+}
+// QEMU runs this fixture on one core with interrupts disabled at entry.
+struct CriticalSection;
+critical_section::set_impl!(CriticalSection);
+unsafe impl critical_section::Impl for CriticalSection {
+    unsafe fn acquire() -> critical_section::RawRestoreState {}
+    unsafe fn release(_: critical_section::RawRestoreState) {}
+}
+
 impl Radio {
     /// The backend keeps a copy of a saved layout it starts a link with.
     fn keep(&mut self, link: LinkId, layout: Option<&HidLayout>) {
@@ -472,7 +490,8 @@ fn via_rules(profile: u64) -> Rules {
                 outputs.push(key(0xe0));
             }
             Rule {
-                input,
+                input: input.usage,
+                collection: input.collection,
                 effect: Effect::Remap(outputs),
             }
             .normalized()
@@ -640,6 +659,29 @@ fn descriptor(maximum: bool, reports: usize) -> Vec<u8> {
     descriptor.push(0xc0);
     descriptor
 }
+/// Six fields in each of sixteen full-size reports exercise the raw gamepad cache.
+fn gamepad_descriptor() -> Vec<u8> {
+    let mut descriptor = vec![5, 1, 9, 5, 0xa1, 1];
+    for id in 1..=16 {
+        descriptor.extend_from_slice(&[
+            0x85, id, 5, 1, 0x19, 0x30, 0x29, 0x35, 0x15, 0, 0x27, 255, 255, 255, 255, 0x75, 32,
+            0x95, 6, 0x81, 2, 5, 9, 0x19, 1, 0x29, 32, 0x25, 1, 0x75, 1, 0x95, 32, 0x81, 2, 5, 1,
+            9, 0x39, 0x25, 7, 0x75, 4, 0x95, 1, 0x81, 2, 0x19, 0x90, 0x29, 0x93, 0x25, 1, 0x75, 1,
+            0x95, 4, 0x81, 2, 9, 0x3d, 0x95, 1, 0x81, 2, 9, 0x3e, 0x81, 2, 0x96, 0x16, 0x0f, 0x81,
+            3,
+        ]);
+    }
+    while descriptor.len() + 3 <= 2048 {
+        descriptor.extend_from_slice(&[5, 1]);
+    }
+    if descriptor.len() == 2046 {
+        descriptor.push(0x04);
+    }
+    descriptor.push(0xc0);
+    assert_eq!(descriptor.len(), 2048);
+    descriptor
+}
+
 static mut MAX_DESCRIPTOR: [u8; 2048] = [0; 2048];
 /// The real C callback supplies its descriptors from static storage.
 fn max_descriptor() -> &'static [u8] {
@@ -792,7 +834,10 @@ impl Fixture {
                             *next = Some(Command::ListProfileRules(
                                 cordial_protocol::ListProfileRules {
                                     profile: page.profile,
-                                    after: Some(last.input.expect("a rule's input")),
+                                    after: Some(cordial_protocol::ProfileRuleRef {
+                                        input: last.input,
+                                        collection: last.collection,
+                                    }),
                                 },
                             ));
                         }
@@ -1030,17 +1075,18 @@ impl Fixture {
     }
     /// Loaded profiles stay within the budget, and a device whose layers do not fit passes its
     /// input through until they do.
-    fn budget(&mut self) {
+    fn budget(&mut self, profile: usize) {
         let budget = board::PROFILE_MEMORY_BUDGET.unwrap() as usize;
-        assert!(self.app.manager.profiles.used() <= budget);
+        assert_eq!(self.app.manager.profiles.used(), 8 * profile);
+        assert!(8 * profile <= budget);
         self.app.session(true, &mut self.radio);
         self.layers(9, OVER_BUDGET);
         assert_eq!(self.live(9).profile_error, Some(Error::Capacity));
-        assert!(self.app.manager.profiles.used() <= budget);
+        assert_eq!(self.app.manager.profiles.used(), 6 * profile);
         stats("layers over budget");
         self.layers(9, CONNECTED[3].1.map(|id| id as u32));
         assert_eq!(self.live(9).profile_error, None);
-        assert!(self.app.manager.profiles.used() <= budget);
+        assert_eq!(self.app.manager.profiles.used(), 8 * profile);
         self.app.session(false, &mut self.radio);
     }
     /// Reconnects connected devices: Classic device 9 and one BLE device in turn. A BLE link
@@ -1058,14 +1104,14 @@ impl Fixture {
         }
     }
     /// A profile that fills the memory budget with disabled Consumer controls, leaving room for a
-    /// row of VIA edits: saved through the serial API in requests of the largest size, listed from
+    /// row of VIA edits: saved through the serial API in requests near its size limit, listed from
     /// flash, edited with VIA and loaded by a connecting device.
     fn large_profile(&mut self) {
         use cordial_protocol::{profile_rule, profile_rule_change};
         let budget = board::PROFILE_MEMORY_BUDGET.unwrap() as usize;
-        // A disabled input's rule takes one 8-byte table entry; a VIA edit to a key, two.
+        // A disabled input takes a 12-byte entry; a VIA edit also holds an 8-byte output.
         let edits = cordial_core::configurator::COLS;
-        let count = (budget - 64 - edits * 16) / 8;
+        let count = (budget - 80 - edits * 20) / 12;
         // The workload's own peak, from what is live as it starts.
         unsafe {
             let h = &mut *HEAP.0.get();
@@ -1078,15 +1124,21 @@ impl Fixture {
         }));
         let id = PROFILES as u32 + 1;
         assert!(block_on(profiles::metadata(&mut self.store, id.into())).is_ok());
-        for start in (0..count).step_by(64) {
+        // These rules fit 53 changes in a 1,013-byte request; 54 exceed the 1,024-byte limit.
+        const BATCH: usize = 53;
+        for start in (0..count).step_by(BATCH) {
             let changes = host(|| {
-                (start..count.min(start + 64))
+                (start..count.min(start + BATCH))
                     .map(|i| cordial_protocol::ProfileRuleChange {
                         change: Some(profile_rule_change::Change::Rule(
                             cordial_protocol::ProfileRule {
                                 input: Some(cordial_protocol::Usage {
                                     usage_page: u32::from(profiles::CONSUMER_PAGE),
                                     usage: 0x239 + i as u32,
+                                }),
+                                collection: Some(cordial_protocol::Usage {
+                                    usage_page: 0x0c,
+                                    usage: 1,
                                 }),
                                 effect: Some(profile_rule::Effect::Remap(
                                     profile_rule::Remap::default(),
@@ -1096,10 +1148,12 @@ impl Fixture {
                     })
                     .collect()
             });
-            self.send(Command::SetProfileRules(cordial_protocol::SetProfileRules {
-                profile: id,
-                changes,
-            }));
+            self.send(Command::SetProfileRules(
+                cordial_protocol::SetProfileRules {
+                    profile: id,
+                    changes,
+                },
+            ));
         }
         stats("large profile saved");
         self.list(Command::ListProfileRules(
@@ -1123,7 +1177,7 @@ impl Fixture {
             assert_ne!(self.via(&[0x05, 0, 0, col, 0, 0x1e + col])[0], 0xff);
         }
         let used = self.app.manager.profiles.used();
-        assert!(used <= budget && used + 16 > budget, "{used} of {budget}");
+        assert!(used <= budget && used + 12 > budget, "{used} of {budget}");
         self.now += cordial_core::application::EDITOR_BATCH_MS;
         self.poll(4);
         assert!(!self.app.has_unsaved());
@@ -1143,6 +1197,165 @@ impl Fixture {
         self.app.session(true, &mut self.radio);
         self.layers(device, layers.map(|id| id as u32));
         self.app.session(false, &mut self.radio);
+    }
+    /// Four live gamepads use maximum report maps and all eight static USB queues.
+    fn gamepads(mut self) {
+        use cordial_core::outputs::{Enumeration, Plan};
+        use cordial_protocol::{OutputMode, Role};
+        use embassy_usb::Handler;
+        self.app.manager.output_support = cordial_usb::outputs::SUPPORT;
+        let descriptor = gamepad_descriptor();
+        let ids = CONNECTED.map(|(id, _)| id);
+        self.app.session(true, &mut self.radio);
+        for (i, &id) in ids.iter().chain(&[4, 5, 6, 7]).enumerate() {
+            self.send(Command::SetDevice(cordial_protocol::SetDevice {
+                device: id as u32,
+                output_preferences: vec![cordial_protocol::OutputPreference {
+                    role: Role::Gamepad as i32,
+                    mode: if i % 4 < 2 {
+                        OutputMode::Hid
+                    } else {
+                        OutputMode::Xinput
+                    } as i32,
+                }],
+                ..Default::default()
+            }));
+        }
+        self.app.session(false, &mut self.radio);
+        let plan = Plan {
+            hid_gamepads: 4,
+            xinput_gamepads: 4,
+        };
+        assert_eq!(self.app.manager.outputs.plan(), plan);
+        self.app.set_output_enumeration(Some(Enumeration {
+            plan,
+            generation: 1,
+            ready: true,
+        }));
+        for &id in &ids {
+            self.event(Event::Incoming {
+                attempt: id as u32,
+                peer: peer(id),
+            });
+            let link = self.radio.accepted.take().unwrap();
+            self.event(Event::Connected {
+                link,
+                descriptors: vec![Descriptor::from_slice(ServiceId(0), &descriptor).unwrap()],
+                max_output: 512,
+                layout: None,
+            });
+            let report = InputReport::new(link, ServiceId(0), 1, &[0; 512]).unwrap();
+            self.event(Event::Input(report));
+            self.poll(8);
+            assert_eq!(
+                self.app
+                    .manager
+                    .connections
+                    .iter()
+                    .flatten()
+                    .find(|c| c.id == link)
+                    .unwrap()
+                    .runtime
+                    .as_ref()
+                    .unwrap()
+                    .roles,
+                cordial_core::hid::GAMEPAD
+            );
+        }
+        drop(descriptor);
+        stats("four gamepads with maximum maps");
+        // USB_IO is static in the firmware and already deducted from the ELF heap.
+        static USB_IO: cordial_usb::Io = cordial_usb::Io::new();
+        USB_IO.set_topology(cordial_usb::Topology {
+            interfaces: 0,
+            gamepads: plan,
+        });
+        cordial_usb::BusHandler(&USB_IO).configured(true);
+        let mut shared = {
+            let app = self.app;
+            Box::new(cordial_usb::owner::Shared {
+                app: *app,
+                store: self.store,
+                radio: self.radio,
+            })
+        };
+        let links = ids.map(|id| {
+            shared
+                .app
+                .manager
+                .link_for(shared.app.manager.find(id).unwrap())
+                .unwrap()
+        });
+        let mut priority = cordial_usb::owner::Priority::new(&USB_IO);
+        block_on(priority.pass(&mut shared, self.now));
+        let baseline = stats("gamepad queues ready");
+        let largest = largest_block(unsafe { &*HEAP.0.get() });
+        assert!(largest >= 4096, "largest free block is {largest} bytes");
+        let allocations = unsafe { (*HEAP.0.get()).talc.counters().total_allocation_count };
+        for turn in 0..64u32 {
+            for &link in &links {
+                for id in 1..=16 {
+                    let mut payload = [0; 512];
+                    for axis in payload[..24].chunks_exact_mut(4) {
+                        axis.copy_from_slice(&u32::MAX.to_le_bytes());
+                    }
+                    payload[24..28].copy_from_slice(&(turn & 1).to_le_bytes());
+                    payload[28] = if turn & 1 != 0 { 0x53 } else { 15 };
+                    payload[29] = if turn & 1 != 0 { 3 } else { 0 };
+                    shared.radio.input =
+                        Some(InputReport::new(link, ServiceId(0), id, &payload).unwrap());
+                    block_on(priority.pass(&mut shared, self.now));
+                }
+            }
+            let pressed = turn & 1 != 0;
+            for connection in shared.app.manager.connections.iter().flatten() {
+                let raw = connection.runtime.as_ref().unwrap().gamepad();
+                assert_eq!(raw.hat, pressed.then_some(3));
+                assert_eq!(raw.dpad, if pressed { 5 } else { 0 });
+            }
+            let snapshots = shared.app.gamepad_outputs();
+            for slot in snapshots.hid[..2].iter().chain(&snapshots.xinput[..2]) {
+                assert!(slot.occupant.is_some());
+                assert_eq!(
+                    slot.gamepad.axes,
+                    [65535, 65535, 65535, 65535, 65535, 65535, 0, 0]
+                );
+                assert_eq!(slot.gamepad.axes_valid, 0x3f);
+                assert_eq!(slot.gamepad.buttons, u32::from(pressed));
+                assert_eq!(slot.gamepad.hat, None);
+                assert_eq!(slot.gamepad.dpad, if pressed { 7 } else { 0 });
+                assert_eq!(slot.gamepad.start, pressed);
+                assert_eq!(slot.gamepad.select, pressed);
+            }
+            assert_eq!(
+                unsafe { (*HEAP.0.get()).talc.counters().total_allocation_count },
+                allocations,
+                "gamepad turn {turn}"
+            );
+        }
+        assert_eq!(stats("gamepad queues after overflow"), baseline);
+        let largest = largest_block(unsafe { &*HEAP.0.get() });
+        assert!(largest >= 4096, "largest free block is {largest} bytes");
+        for link in links {
+            let cordial_usb::owner::Shared { app, store, radio } = &mut *shared;
+            block_on(app.event(
+                Event::Disconnected { link, error: None },
+                store,
+                radio,
+                self.now,
+            ));
+        }
+        block_on(priority.pass(&mut shared, self.now));
+        assert!(
+            shared
+                .app
+                .gamepad_outputs()
+                .hid
+                .iter()
+                .chain(&shared.app.gamepad_outputs().xinput)
+                .all(|s| s.occupant.is_none())
+        );
+        stats("gamepads disconnected");
     }
     fn commands(&mut self, ids: &[u64], maximum: bool, turn: usize) {
         // Long enough for the idle editor to release its profile, and for no drop to be rapid.
@@ -1189,7 +1402,7 @@ impl Fixture {
             ));
             // The VIA editor reads a key, changes one and reads a block of the keymap.
             assert_ne!(self.via(&[0x04, 0, 0, 0])[0], 0xff);
-            let code = 4 + (turn % 2) as u8;
+            let code = 0x1e + (turn % 2) as u8;
             assert_ne!(self.via(&[0x05, 0, 0, 1, 0, code])[0], 0xff);
             assert_ne!(self.via(&[0x12, 0, 0, 28])[0], 0xff);
         } else {
@@ -1265,10 +1478,10 @@ fn main() -> ! {
     )
     .unwrap();
     if let Some(budget) = board::PROFILE_MEMORY_BUDGET {
-        // Profiles 1..=7 fit in the budget together and all twelve do not.
+        // Eight distinct full VIA profiles fit in the budget together and all twelve do not.
         let budget = budget as usize;
         assert!(
-            7 * profile <= budget && budget < PROFILES as usize * profile,
+            8 * profile <= budget && budget < PROFILES as usize * profile,
             "a full VIA profile takes {profile} bytes; the budget scenario needs another layout"
         );
     }
@@ -1380,16 +1593,25 @@ fn main() -> ! {
             for (index, &id) in ids.iter().enumerate() {
                 let slot = fixture.slot(id);
                 let link = fixture.app.manager.link_for(slot).unwrap();
-                assert_eq!(
-                    fixture.app.manager.forward.layers(link.slot as usize).len(),
-                    2
-                );
+                let layers = fixture.app.manager.forward.layers(link.slot as usize);
+                assert_eq!(layers.len(), 2);
+                for (map, profile_id) in layers.iter().zip(CONNECTED[index].1) {
+                    let cached = fixture.app.manager.profiles.get(profile_id).unwrap();
+                    assert!(Rc::ptr_eq(map, &cached));
+                    assert_eq!(map.borrow().memory(), profile);
+                    for other_id in 1..profile_id {
+                        let other = fixture.app.manager.profiles.get(other_id).unwrap();
+                        assert!(!Rc::ptr_eq(map, &other));
+                    }
+                }
                 assert_eq!(fixture.live(id).profile_error, None, "device {index}");
             }
+            assert_eq!(fixture.app.manager.profiles.used(), ids.len() * 2 * profile);
             assert!(fixture.app.manager.profiles.used() <= budget as usize);
             stats("profiles loaded");
             if maximum {
-                fixture.budget();
+                writeln!(Output, "eight distinct VIA profiles: {} bytes", 8 * profile).unwrap();
+                fixture.budget(profile);
             }
         }
         fixture.verify(&ids);
@@ -1415,7 +1637,7 @@ fn main() -> ! {
     if PROFILES_SUPPORTED {
         fixture.large_profile();
     }
-    drop(fixture);
+    fixture.gamepads();
     drop(owner);
     drop(chipset);
     drop(backend);
