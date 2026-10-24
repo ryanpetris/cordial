@@ -55,6 +55,31 @@ out-of-range array entries allow other keys to be released. A rejected report
 does not change relative edge or held-key state. Valid releases remain recorded
 when a cross-report Consumer-key union temporarily exceeds its capacity.
 
+## USB interfaces and boot keyboard
+
+The adapter presents one composite USB device. Its serial port uses two interfaces. A shared
+HID interface carries keyboard, mouse, Consumer, system and radio reports. Each HID gamepad
+slot uses a separate interface and IN endpoint with a 22-byte input report. XInput uses
+separate receiver channels.
+
+The desktop HID interface advertises the boot keyboard subclass and protocol. In normal report
+protocol, it sends the full keyboard bitmap and the other desktop reports. When the Host selects
+boot protocol, it sends only the standard eight-byte keyboard report, without a report ID. The
+report contains modifiers and up to six other keys. More held keys produce ErrorRollOver in all
+six key positions until the held keys fit again; modifiers remain reported. The underlying
+bitmap remains intact. Switching protocols reconciles current input, and USB reset restores
+report protocol. Lock LEDs and host-requested idle reporting work in both modes. Boot mouse
+protocol is not provided.
+
+VIA or Vial adds one interface with an IN and an OUT endpoint only while enabled. Disabling the
+editor reconnects USB and releases that allocation. Bluetooth connection counts and whether an
+editor application is open do not control this interface.
+
+USB fixtures exercise descriptor and endpoint counts, independent controller reports and
+transitions, boot/report switching, rollover, lock LEDs, and idle reports. Hardware verification
+must also cover pre-OS keyboard input, separate gamepad recognition in host applications, and
+repeated editor enable/disable cycles on both Pico and ESP32-S3 boards.
+
 ## Gamepad output preferences
 
 Gamepad output has a separate saved choice per paired device. First-connection setup automatically
@@ -335,7 +360,6 @@ X-to-L1, L1-to-Back and R1-to-Start labels. Those labels do not establish a firm
 Browser XInput visibility and right-stick visualization remain unresolved. Full HID axis and trigger
 behavior and multiple simultaneous channels have not been manually verified.
 
-The existing Raw HID configuration slot remains allocated after the gamepad
-functions. Its descriptor filtering, VIA/Vial behavior and serial suffix are
-unchanged. Reclaiming that slot's resources is tracked separately in
-[issue 1](https://github.com/ryanpetris/cordial/issues/1).
+When VIA or Vial is enabled, its Raw HID configuration interface follows the gamepad
+functions. Disabling the editor rebuilds the USB device without that interface or its
+endpoints. Vial's serial suffix follows the selected editor.

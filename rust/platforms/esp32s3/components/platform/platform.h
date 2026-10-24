@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 #include "sdkconfig.h"
 #include "ble.h"
@@ -12,6 +13,7 @@ void cordial_esp_wait(void);
 esp_err_t cordial_esp_usb_phy(void);
 void *cordial_esp_usb_registers(void);
 esp_err_t cordial_esp_usb_interrupt(void (*handler)(void *), void *context);
+esp_err_t cordial_esp_usb_interrupt_enable(bool enabled);
 #if CONFIG_CORDIAL_DEVELOPMENT
 void cordial_esp_bootloader(void) __attribute__((noreturn));
 #endif

@@ -1,5 +1,5 @@
 //! Raw HID configuration interfaces and the USB serial marker that follows them.
-use crate::{Interface, Io, RawPacket, SLOTS};
+use crate::{Interface, Io, RawPacket};
 use embassy_futures::select::{Either, select};
 use embassy_usb::{class::hid, driver::Driver};
 
@@ -74,49 +74,6 @@ pub const REPORT_DESCRIPTOR: &[u8] = &[
     0x06, 0x60, 0xff, 0x09, 0x61, 0xa1, 0x01, 0x09, 0x62, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08,
     0x95, 0x20, 0x81, 0x02, 0x09, 0x63, 0x95, 0x20, 0x91, 0x02, 0xc0,
 ];
-/// IAD, interface, HID descriptor and two endpoint descriptors.
-pub const INTERFACE_BYTES: usize = 8 + 9 + 9 + 7 + 7;
-
-/// Trims unused trailing Raw HID slots from configuration descriptor transfers. Endpoints remain
-/// allocated to avoid rebuilding the peripheral driver at run time.
-#[derive(Default)]
-pub struct DescriptorFilter {
-    /// The number of trailing Raw HID interfaces to omit from the current transfer.
-    pub hide: usize,
-    remaining: usize,
-    ended: bool,
-}
-impl DescriptorFilter {
-    /// The number of slots to omit while `set` is enabled.
-    pub fn hidden(set: u8) -> usize {
-        SLOTS - crate::used_slots(set)
-    }
-    pub fn packet(&mut self, bytes: &mut [u8], first: bool, last: bool) -> Option<(usize, bool)> {
-        if self.hide == 0 {
-            return Some((bytes.len(), last));
-        }
-        if first {
-            if bytes.len() < 9 {
-                return Some((bytes.len(), last));
-            }
-            self.remaining =
-                usize::from(u16::from_le_bytes([bytes[2], bytes[3]])) - self.hide * INTERFACE_BYTES;
-            bytes[2..4].copy_from_slice(&(self.remaining as u16).to_le_bytes());
-            bytes[4] -= self.hide as u8;
-            self.ended = false;
-        }
-        if self.ended {
-            return None;
-        }
-        let size = bytes.len().min(self.remaining);
-        self.remaining -= size;
-        // A full packet at the shortened boundary needs a following zero-length packet
-        // when the Host requested more. The omitted interface supplies that next call.
-        let last = last || (self.remaining == 0 && size < 64);
-        self.ended = last;
-        Some((size, last))
-    }
-}
 /// Moves `slot`'s reports between its Raw HID endpoints and the application owner.
 pub async fn run<'d, D: Driver<'d>>(
     hid: hid::HidReaderWriter<'d, D, 32, 32>,

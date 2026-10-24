@@ -82,7 +82,8 @@ supported rule types, including Game Pad controls and axes. Configuration interf
 each to an external editor over USB, each with its own switch and profile. The protocol allows
 several interfaces to be enabled at once, and the adapter reports which ones it cannot run together:
 VIA and Vial share a Raw HID usage, so this firmware lists them as conflicting. With every interface
-disabled, no editor interface is exposed and every profile keeps translating input. The adapter
+disabled, no editor interface or its endpoints are allocated and every profile keeps translating input.
+Changing the enabled interface rebuilds USB and reconnects the adapter on every board. The adapter
 starts USB with its saved interfaces, so an enabled interface adds no reconnect at startup.
 Selecting a profile for an interface does not apply it to any device, and deleting a profile is
 refused while it is in a device's layers or selected by an interface.
@@ -152,7 +153,7 @@ failure and disconnects the source; the adapter does not silently drop part of a
 
 Software fixtures cover persistence, layers, shared live edits, held-key release, media keys,
 both editors' keycode tables, keymap reset, packet validation, unsupported actions and USB
-descriptor filtering. Real USB enumeration and
+conditional interface allocation. Real USB enumeration and
 VIA, Vial and Remap sessions still require hardware verification.
 
 1. Flash an adapter and reset its storage. Pair a keyboard and mouse. Confirm every configuration

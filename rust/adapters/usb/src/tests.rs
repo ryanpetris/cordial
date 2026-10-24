@@ -265,6 +265,80 @@ fn suspend_completion_cannot_consume_resumed_input_and_leds_use_standard_report(
 }
 
 #[test]
+fn protocol_switch_replays_held_keys_and_ignores_pending_completion() {
+    use hid::RequestHandler;
+    let io = Io::new();
+    let mut loops = Loops::new(&io, 0);
+    let mut s = shared(application(), support::Store::default());
+    BusHandler(&io).configured(true);
+    loops.poll(&mut s, 1);
+    let old = io.hid_tx.try_receive().unwrap();
+    let mut held = Held::default();
+    held.keys[0] = 1 << 4;
+    s.app
+        .manager
+        .forward
+        .input(
+            0,
+            Input {
+                held,
+                ..Input::default()
+            },
+        )
+        .unwrap();
+    ReportHandler(&io).set_protocol(hid::HidProtocolMode::Boot);
+    loops.poll(&mut s, 2);
+    let new = io.hid_tx.try_receive().unwrap();
+    assert_eq!(new.generation, old.generation);
+    assert_ne!(new.sequence, old.sequence);
+    assert_eq!(&new.bytes[..3], &[1, 16, 0]);
+    io.hid_done
+        .try_send(HidDone {
+            generation: old.generation,
+            sequence: old.sequence,
+            success: true,
+        })
+        .ok()
+        .unwrap();
+    loops.poll(&mut s, 3);
+    assert!(io.hid_tx.is_empty());
+    assert_eq!(s.app.manager.forward.packet().unwrap().id, 1);
+    s.app.manager.forward.input(0, Input::default()).unwrap();
+    io.hid_done
+        .try_send(HidDone {
+            generation: new.generation,
+            sequence: new.sequence,
+            success: true,
+        })
+        .ok()
+        .unwrap();
+    let mut released = false;
+    for now in 4..20 {
+        loops.poll(&mut s, now);
+        if let Ok(packet) = io.hid_tx.try_receive() {
+            if packet.bytes[0] == 1 {
+                assert!(packet.bytes[1..packet.length].iter().all(|&byte| byte == 0));
+                released = true;
+            }
+            io.hid_done
+                .try_send(HidDone {
+                    generation: packet.generation,
+                    sequence: packet.sequence,
+                    success: true,
+                })
+                .ok()
+                .unwrap();
+        }
+    }
+    assert!(released);
+    ReportHandler(&io).set_protocol(hid::HidProtocolMode::Report);
+    loops.poll(&mut s, 20);
+    let packet = io.hid_tx.try_receive().unwrap();
+    assert_eq!(packet.bytes[0], 1);
+    assert!(packet.bytes[1..packet.length].iter().all(|&byte| byte == 0));
+}
+
+#[test]
 fn hid_control_reports_include_the_report_id() {
     use hid::RequestHandler;
     let io = Io::new();
@@ -457,42 +531,6 @@ fn system_and_radio_reports_round_trip_and_start_with_unknown_sliders() {
         forward.complete();
     }
     assert_eq!(output, held);
-}
-
-#[test]
-fn disabled_interfaces_are_omitted_from_both_descriptor_reads() {
-    use crate::configuration::{DescriptorFilter, INTERFACE_BYTES};
-    assert_eq!(DescriptorFilter::hidden(0), 1);
-    for interface in Interface::ALL {
-        assert_eq!(DescriptorFilter::hidden(interface.bit()), 0);
-        let mut filter = DescriptorFilter::default();
-        let mut bytes = [9, 2, 173, 0, 4, 1, 0, 0x80, 50];
-        assert_eq!(filter.packet(&mut bytes, true, true), Some((9, true)));
-        assert_eq!(bytes, [9, 2, 173, 0, 4, 1, 0, 0x80, 50]);
-    }
-    // The class builder's final Raw HID function consists of these descriptors.
-    let total = 173usize;
-    let visible = total - INTERFACE_BYTES;
-    for requested in [9, 255] {
-        let mut descriptor = std::vec![0; total];
-        descriptor[..9].copy_from_slice(&[9, 2, total as u8, 0, 4, 1, 0, 0x80, 50]);
-        let mut filter = DescriptorFilter::default();
-        filter.hide = DescriptorFilter::hidden(0);
-        let mut response = std::vec::Vec::new();
-        let size = requested.min(total);
-        for (i, data) in descriptor[..size].chunks(64).enumerate() {
-            let mut data = data.to_vec();
-            if let Some((len, _)) = filter.packet(&mut data, i == 0, (i + 1) * 64 >= size) {
-                response.extend_from_slice(&data[..len]);
-            }
-        }
-        assert_eq!(response.len(), requested.min(visible));
-        assert_eq!(
-            u16::from_le_bytes([response[2], response[3]]) as usize,
-            visible
-        );
-        assert_eq!(response[4], 3);
-    }
 }
 
 #[test]
@@ -690,17 +728,6 @@ fn usb_starts_with_saved_interfaces_whose_profiles_exist() {
         b"not a preference".to_vec(),
     );
     assert_eq!(block_on(saved_interfaces(&mut store, true)), 0);
-}
-
-#[test]
-fn hidden_interface_descriptor_ends_full_packets_with_a_zlp() {
-    let mut filter = crate::configuration::DescriptorFilter::default();
-    filter.hide = 1;
-    let mut first = [0; 64];
-    first[..9].copy_from_slice(&[9, 2, 168, 0, 4, 1, 0, 0x80, 50]);
-    assert_eq!(filter.packet(&mut first, true, false), Some((64, false)));
-    assert_eq!(filter.packet(&mut [0; 64], false, false), Some((64, false)));
-    assert_eq!(filter.packet(&mut [0; 40], false, true), Some((0, true)));
 }
 
 #[test]
@@ -1352,3 +1379,15 @@ fn bus_reset_and_suspend_preserve_the_allocation_generation() {
         allocation.generation
     );
 }
+
+// These fixtures poll futures explicitly. Timers use a fixed clock unless a test
+// advances it, so endpoint scheduling does not depend on wall-clock timing.
+struct Clock;
+std::thread_local! { pub(super) static TICKS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) }; }
+impl embassy_time_driver::Driver for Clock {
+    fn now(&self) -> u64 {
+        TICKS.with(core::cell::Cell::get)
+    }
+    fn schedule_wake(&self, _: u64, _: &core::task::Waker) {}
+}
+embassy_time_driver::time_driver_impl!(static CLOCK: Clock = Clock);

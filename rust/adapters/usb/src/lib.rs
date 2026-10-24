@@ -8,6 +8,8 @@ extern crate std;
 pub mod completion;
 mod configuration;
 mod descriptor;
+mod desktop;
+pub use desktop::ReportHandler;
 #[cfg(feature = "gamepad")]
 pub mod gamepad;
 #[cfg(feature = "gamepad")]
@@ -61,6 +63,7 @@ pub struct Status {
     pub suspended: bool,
     pub dtr: bool,
     pub leds: u8,
+    pub boot_keyboard: bool,
 }
 impl Status {
     pub fn input_ready(self) -> bool {
@@ -85,9 +88,7 @@ struct RawPacket {
     interface: Interface,
     bytes: [u8; 32],
 }
-/// Raw HID interfaces allocated after input HID: the most configuration interfaces that can be
-/// enabled together. Each enabled interface takes the next slot in `Interface::ALL` order, and
-/// configuration descriptors omit the unused trailing slots.
+/// Maximum number of configuration editors that can be enabled together.
 const SLOTS: usize = 1;
 /// The enabled interface at `slot` for an enabled set, if that slot is in use.
 fn slot_interface(set: u8, slot: usize) -> Option<Interface> {
@@ -184,6 +185,8 @@ pub struct Io {
     // Input HID, CDC TX/RX, Raw HID, four gamepad writers and four receiver IN/OUT pairs.
     status: Watch<CS, Status, STATUS_RECEIVERS>,
     reports: Mutex<CS, RefCell<[[u8; 68]; 10]>>,
+    hid_idle: Mutex<CS, core::cell::Cell<[u32; 10]>>,
+    hid_settings: Signal<CS, ()>,
     changed: Signal<CS, ()>,
     hid_tx: Channel<CS, HidTx, 1>,
     hid_done: Channel<CS, HidDone, 1>,
@@ -213,8 +216,11 @@ impl Io {
                 suspended: false,
                 dtr: false,
                 leds: 0,
+                boot_keyboard: false,
             }),
             reports: Mutex::new(RefCell::new(idle_reports())),
+            hid_idle: Mutex::new(core::cell::Cell::new([u32::MAX; 10])),
+            hid_settings: Signal::new(),
             changed: Signal::new(),
             hid_tx: Channel::new(),
             hid_done: Channel::new(),
@@ -277,6 +283,8 @@ impl Io {
         #[cfg(feature = "gamepad")]
         self.outputs.reset();
         self.reports.lock(|r| *r.borrow_mut() = idle_reports());
+        self.hid_idle.lock(|idle| idle.set([u32::MAX; 10]));
+        self.hid_settings.signal(());
         self.update(|s| {
             s.generation = s.generation.wrapping_add(1);
             s.session = s.session.wrapping_add(1);
@@ -284,6 +292,7 @@ impl Io {
             s.suspended = false;
             s.dtr = false;
             s.leds = 0;
+            s.boot_keyboard = false;
         });
     }
     fn dtr(&self, dtr: bool) {
@@ -326,41 +335,6 @@ impl Handler for BusHandler<'_> {
         });
     }
 }
-pub struct ReportHandler<'a>(pub &'a Io);
-impl hid::RequestHandler for ReportHandler<'_> {
-    fn get_report(&mut self, id: hid::ReportId, buf: &mut [u8]) -> Option<usize> {
-        match id {
-            hid::ReportId::Out(1) if !buf.is_empty() => {
-                let size = buf.len().min(2);
-                buf[..size].copy_from_slice(&[1, self.0.status().leds][..size]);
-                Some(size)
-            }
-            hid::ReportId::In(id @ 1..=10) if !buf.is_empty() => {
-                buf[0] = id;
-                let size = [32, 10, 16, 68, 5, 9, 6, 34, 8, 1][id as usize - 1].min(buf.len() - 1);
-                self.0.reports.lock(|r| {
-                    buf[1..1 + size].copy_from_slice(&r.borrow()[id as usize - 1][..size])
-                });
-                if id == 2 && size > 2 {
-                    buf[3..1 + size].fill(0);
-                } else if (4..=6).contains(&id) {
-                    buf[1..1 + size].fill(0);
-                }
-                Some(1 + size)
-            }
-            _ => None,
-        }
-    }
-    fn set_report(&mut self, id: hid::ReportId, data: &[u8]) -> OutResponse {
-        if id == hid::ReportId::Out(1) && data.len() == 2 && data[0] == 1 {
-            self.0.update(|s| s.leds = data[1] & 0x1f);
-            OutResponse::Accepted
-        } else {
-            OutResponse::Rejected
-        }
-    }
-}
-
 /// Borrowed descriptor/class storage has the same lifetime as the USB tasks.
 pub struct Buffers<'a> {
     pub config: [u8; 512],
@@ -414,7 +388,7 @@ pub struct Usb<'d, D: Driver<'d>> {
     gamepads: [Option<gamepad::Gamepad<'d, serial::SessionDriver<'d, D>>>; 4],
     #[cfg(feature = "gamepad")]
     receiver: [Option<xinput::Channel<'d, serial::SessionDriver<'d, D>>>; 4],
-    raw: [hid::HidReaderWriter<'d, serial::SessionDriver<'d, D>, 32, 32>; SLOTS],
+    raw: [Option<hid::HidReaderWriter<'d, serial::SessionDriver<'d, D>, 32, 32>>; SLOTS],
 }
 impl<'d, D: Driver<'d>> Usb<'d, D> {
     /// D's IN writes must await physical completion, using CompleteDriver when
@@ -461,8 +435,8 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
                 request_handler: Some(&mut buffers.report_handler),
                 poll_ms: 1,
                 max_packet_size: 64,
-                hid_subclass: hid::HidSubclass::No,
-                hid_boot_protocol: hid::HidBootProtocol::None,
+                hid_subclass: hid::HidSubclass::Boot,
+                hid_boot_protocol: hid::HidBootProtocol::Keyboard,
             },
         );
         #[cfg(feature = "gamepad")]
@@ -481,20 +455,22 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
             (gamepads, receiver)
         };
         let mut slots = buffers.raw.iter_mut().zip(&mut buffers.raw_report_handlers);
-        let raw = core::array::from_fn(|_| {
+        let raw = core::array::from_fn(|index| {
             let (state, handler) = slots.next().unwrap();
-            hid::HidReaderWriter::new(
-                &mut builder,
-                state,
-                hid::Config {
-                    report_descriptor: configuration::REPORT_DESCRIPTOR,
-                    request_handler: Some(handler),
-                    poll_ms: 1,
-                    max_packet_size: 32,
-                    hid_subclass: hid::HidSubclass::No,
-                    hid_boot_protocol: hid::HidBootProtocol::None,
-                },
-            )
+            (index < used_slots(topology.interfaces)).then(|| {
+                hid::HidReaderWriter::new(
+                    &mut builder,
+                    state,
+                    hid::Config {
+                        report_descriptor: configuration::REPORT_DESCRIPTOR,
+                        request_handler: Some(handler),
+                        poll_ms: 1,
+                        max_packet_size: 32,
+                        hid_subclass: hid::HidSubclass::No,
+                        hid_boot_protocol: hid::HidBootProtocol::None,
+                    },
+                )
+            })
         });
         let (tx, rx) = cdc.split();
         Self {
@@ -510,17 +486,8 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
             io,
         }
     }
-    /// Run a fixed allocation, preserving the configuration-interface reconnect behavior.
-    pub async fn run(self) -> ! {
-        self.run_inner(false).await;
-        unreachable!()
-    }
     /// Disable USB and drop all workers before returning the requested allocation.
-    #[cfg(feature = "gamepad")]
     pub async fn run_until_rebuild(self) -> Topology {
-        self.run_inner(true).await
-    }
-    async fn run_inner(self, rebuild: bool) -> Topology {
         let Self {
             mut device,
             #[cfg(feature = "gamepad")]
@@ -528,25 +495,16 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
             #[cfg(feature = "gamepad")]
             receiver,
             raw,
-            mut hid,
+            hid,
             mut tx,
             rx,
             io,
         } = self;
-        let mut hid_status = io.status.receiver().unwrap();
         let mut tx_status = io.status.receiver().unwrap();
         let bus = async {
-            loop {
-                let topology = match select(device.run(), io.reconnect.wait()).await {
-                    Either::Second(topology) => topology,
-                    Either::First(_) => unreachable!(),
-                };
-                if rebuild {
-                    return topology;
-                }
-                device.disable().await;
-                io.set_interfaces(topology.interfaces);
-                embassy_time::Timer::after_millis(250).await;
+            match select(device.run(), io.reconnect.wait()).await {
+                Either::Second(topology) => topology,
+                Either::First(_) => unreachable!(),
             }
         };
         let workers = join4(
@@ -554,54 +512,15 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
                 let mut slot = 0;
                 join_array(raw.map(|raw| {
                     slot += 1;
-                    configuration::run(raw, io, slot - 1)
+                    let index = slot - 1;
+                    async move {
+                        if let Some(raw) = raw {
+                            configuration::run(raw, io, index).await;
+                        }
+                    }
                 }))
             },
-            async {
-                loop {
-                    let packet = io.hid_tx.receive().await;
-                    let status = io.status();
-                    let success = status.input_ready()
-                        && status.generation == packet.generation
-                        && matches!(
-                            select(
-                                hid.write(&packet.bytes[..packet.length]),
-                                hid_status.changed_and(|s| s.generation != packet.generation)
-                            )
-                            .await,
-                            Either::First(Ok(()))
-                        );
-                    if success && io.status().generation == packet.generation {
-                        io.reports.lock(|r| {
-                            let mut reports = r.borrow_mut();
-                            let target = &mut reports[packet.bytes[0] as usize - 1];
-                            let data = &packet.bytes[1..packet.length];
-                            if matches!(packet.bytes[0], 7 | 8) {
-                                for (old, value) in target[..data.len()]
-                                    .as_chunks_mut::<2>()
-                                    .0
-                                    .iter_mut()
-                                    .zip(data.as_chunks::<2>().0.iter())
-                                {
-                                    if *value != [0xff, 0xff] {
-                                        old.copy_from_slice(value);
-                                    }
-                                }
-                            } else {
-                                target[..data.len()].copy_from_slice(data);
-                            }
-                        });
-                    }
-                    io.hid_done
-                        .send(HidDone {
-                            generation: packet.generation,
-                            sequence: packet.sequence,
-                            success,
-                        })
-                        .await;
-                    io.changed.signal(());
-                }
-            },
+            desktop::run(hid, io),
             async {
                 loop {
                     let packet = io.serial_tx.receive().await;

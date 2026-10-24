@@ -160,7 +160,9 @@ impl<'a> Priority<'a> {
                 .outputs
                 .publish(status.generation, app.gamepad_outputs());
         }
-        if status.generation != self.seen.generation {
+        if status.generation != self.seen.generation
+            || status.boot_keyboard != self.seen.boot_keyboard
+        {
             self.hid_pending = None;
             self.hid_since = None;
             app.manager.forward.resync();

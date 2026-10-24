@@ -16,10 +16,13 @@ struct Traffic {
     endpoint_reads: VecDeque<(u8, Vec<u8>)>,
     setup: VecDeque<[u8; 8]>,
     response: Vec<u8>,
+    control_data: VecDeque<Vec<u8>>,
     rejected: bool,
     fail_write: bool,
     block_write: bool,
     blocked_endpoint: Option<u8>,
+    write_budget: Option<usize>,
+    write_ticks: u64,
     live: usize,
     disabled: usize,
 }
@@ -144,7 +147,10 @@ impl EndpointIn for MockEndpoint {
         }
         poll_fn(|_| {
             let traffic = self.host.0.borrow();
-            if traffic.block_write || traffic.blocked_endpoint == Some(self.info.addr.into()) {
+            if traffic.block_write
+                || traffic.blocked_endpoint == Some(self.info.addr.into())
+                || traffic.write_budget == Some(0)
+            {
                 Poll::Pending
             } else {
                 Poll::Ready(())
@@ -152,11 +158,12 @@ impl EndpointIn for MockEndpoint {
         })
         .await;
         assert!(bytes.len() <= self.info.max_packet_size as usize);
-        self.host
-            .0
-            .borrow_mut()
-            .writes
-            .push((self.info.addr.into(), bytes.to_vec()));
+        let mut traffic = self.host.0.borrow_mut();
+        if let Some(budget) = &mut traffic.write_budget {
+            *budget -= 1;
+        }
+        crate::tests::TICKS.with(|ticks| ticks.set(ticks.get() + traffic.write_ticks));
+        traffic.writes.push((self.info.addr.into(), bytes.to_vec()));
         Ok(())
     }
 }
@@ -195,8 +202,15 @@ impl ControlPipe for Host {
         })
         .await
     }
-    async fn data_out(&mut self, _: &mut [u8], _: bool, _: bool) -> Result<usize, EndpointError> {
-        panic!("unexpected control data out")
+    async fn data_out(&mut self, buf: &mut [u8], _: bool, _: bool) -> Result<usize, EndpointError> {
+        let bytes = self
+            .0
+            .borrow_mut()
+            .control_data
+            .pop_front()
+            .expect("control payload");
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
     }
     async fn data_in(&mut self, bytes: &[u8], _: bool, _: bool) -> Result<(), EndpointError> {
         self.0.borrow_mut().response.extend_from_slice(bytes);
@@ -238,136 +252,289 @@ fn descriptors(bytes: &[u8]) -> Vec<&[u8]> {
 }
 
 #[test]
+fn boot_keyboard_switches_formats_and_preserves_leds_and_idle_reports() {
+    let host = Host::default();
+    let io = crate::Io::new();
+    let mut buffers = crate::Buffers::new(&io);
+    let usb = crate::Usb::new(
+        MockDriver::new(&host),
+        "0000000000000000",
+        "Test adapter",
+        Default::default(),
+        &io,
+        &mut buffers,
+    );
+    let endpoint = host
+        .0
+        .borrow()
+        .allocations
+        .iter()
+        .find(|e| e.ep_type == EndpointType::Interrupt && e.max_packet_size == 64)
+        .unwrap()
+        .addr
+        .into();
+    crate::BusHandler(&io).configured(true);
+    let mut running = pin!(usb.run_until_rebuild());
+    let config = exchange(&host, running.as_mut(), [0x80, 6, 0, 2, 0, 0, 255, 0]);
+    let parts = descriptors(&config);
+    let keyboard = parts.iter().find(|d| d[1] == 4 && d[2] == 2).unwrap();
+    assert_eq!(&keyboard[5..8], &[3, 1, 1]);
+    assert_eq!(host.0.borrow().allocations.len(), 4);
+
+    let mut keys = [0; 32];
+    keys[0] = 1 << 4;
+    keys[28] = 3;
+    let send = |id: u8, data: &[u8], running: Pin<&mut _>| {
+        let mut bytes = [0; 69];
+        bytes[0] = id;
+        bytes[1..1 + data.len()].copy_from_slice(data);
+        io.hid_tx
+            .try_send(crate::HidTx {
+                generation: io.status().generation,
+                sequence: 1,
+                bytes,
+                length: 1 + data.len(),
+            })
+            .ok()
+            .unwrap();
+        assert!(poll(running).is_pending());
+        assert!(io.hid_done.try_receive().unwrap().success);
+    };
+    send(1, &keys, running.as_mut());
+    assert_eq!(
+        writes(&host, endpoint).last().unwrap(),
+        &[&[1][..], &keys].concat()
+    );
+    exchange(&host, running.as_mut(), [0x21, 11, 0, 0, 2, 0, 0, 0]);
+    assert_eq!(
+        exchange(&host, running.as_mut(), [0xa1, 3, 0, 0, 2, 0, 1, 0]),
+        [0]
+    );
+    send(1, &keys, running.as_mut());
+    assert_eq!(
+        writes(&host, endpoint).last().unwrap(),
+        &[3, 0, 4, 0, 0, 0, 0, 0]
+    );
+    let before = writes(&host, endpoint).len();
+    send(2, &[0; 10], running.as_mut());
+    assert_eq!(writes(&host, endpoint).len(), before);
+    assert_eq!(
+        exchange(&host, running.as_mut(), [0xa1, 1, 0, 1, 2, 0, 8, 0]),
+        [3, 0, 4, 0, 0, 0, 0, 0]
+    );
+    host.0.borrow_mut().control_data.push_back(vec![2]);
+    exchange(&host, running.as_mut(), [0x21, 9, 0, 2, 2, 0, 1, 0]);
+    assert_eq!(io.status().leds, 2);
+    exchange(&host, running.as_mut(), [0x21, 10, 0, 5, 2, 0, 0, 0]);
+    assert_eq!(
+        exchange(&host, running.as_mut(), [0xa1, 2, 0, 0, 2, 0, 1, 0]),
+        [5]
+    );
+    crate::tests::TICKS.with(|ticks| ticks.set(embassy_time::Duration::from_millis(21).as_ticks()));
+    assert!(poll(running.as_mut()).is_pending());
+    assert_eq!(writes(&host, endpoint).len(), before + 1);
+    assert_eq!(
+        writes(&host, endpoint).last().unwrap(),
+        &[3, 0, 4, 0, 0, 0, 0, 0]
+    );
+    exchange(&host, running.as_mut(), [0x21, 11, 1, 0, 2, 0, 0, 0]);
+    send(1, &[0; 32], running.as_mut());
+    send(2, &[0; 10], running.as_mut());
+    assert_eq!(
+        writes(&host, endpoint).last().unwrap(),
+        &[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    );
+    let before = writes(&host, endpoint).len();
+    crate::tests::TICKS.with(|ticks| ticks.set(embassy_time::Duration::from_millis(42).as_ticks()));
+    send(2, &[0; 10], running.as_mut());
+    let packets = writes(&host, endpoint);
+    assert_eq!(packets.len(), before + 2);
+    assert_eq!(packets[before], [&[1][..], &[0; 32]].concat());
+    assert_eq!(packets[before + 1][0], 2);
+    exchange(&host, running.as_mut(), [0x21, 10, 0, 5, 2, 0, 0, 0]);
+    assert_eq!(
+        exchange(&host, running.as_mut(), [0xa1, 2, 0, 0, 2, 0, 1, 0]),
+        [5]
+    );
+    crate::BusHandler(&io).reset();
+    assert!(!io.status().boot_keyboard);
+}
+
+#[test]
+fn overdue_idle_reports_allow_queued_key_presses_and_releases() {
+    let host = Host::default();
+    let io = crate::Io::new();
+    let mut buffers = crate::Buffers::new(&io);
+    let usb = crate::Usb::new(
+        MockDriver::new(&host),
+        "0000000000000000",
+        "Test adapter",
+        Default::default(),
+        &io,
+        &mut buffers,
+    );
+    crate::BusHandler(&io).configured(true);
+    let mut running = pin!(usb.run_until_rebuild());
+    exchange(&host, running.as_mut(), [0x21, 10, 0, 1, 2, 0, 0, 0]);
+    crate::tests::TICKS.with(|ticks| ticks.set(embassy_time::Duration::from_millis(20).as_ticks()));
+    host.0.borrow_mut().write_ticks = embassy_time::Duration::from_millis(1).as_ticks();
+    for (sequence, key) in [(1, 16), (2, 0)] {
+        let mut bytes = [0; 69];
+        bytes[0] = 1;
+        bytes[1] = key;
+        io.hid_tx
+            .try_send(crate::HidTx {
+                generation: io.status().generation,
+                sequence,
+                bytes,
+                length: 33,
+            })
+            .ok()
+            .unwrap();
+        host.0.borrow_mut().write_budget = Some(4);
+        assert!(poll(running.as_mut()).is_pending());
+        let done = io
+            .hid_done
+            .try_receive()
+            .expect("live input progresses despite overdue idle reports");
+        assert!(done.success);
+        assert_eq!(done.sequence, sequence);
+        assert_eq!(io.reports.lock(|reports| reports.borrow()[0][0]), key);
+    }
+}
+
+#[test]
 fn composite_pools_use_allocated_endpoints_and_one_receiver_function() {
     for hid_count in 0..=4 {
         for xinput_count in 0..=4 {
-            let host = Host::default();
-            let io = crate::Io::new();
-            let mut buffers = crate::Buffers::new(&io);
-            let mut usb = crate::Usb::new(
-                MockDriver::new(&host),
-                "0000000000000000",
-                "Test adapter",
-                crate::Topology {
-                    interfaces: 0,
-                    gamepads: cordial_core::outputs::Plan {
-                        hid_gamepads: hid_count as u8,
-                        xinput_gamepads: xinput_count as u8,
-                    },
-                },
-                &io,
-                &mut buffers,
-            );
-            let channels = &usb.receiver;
-            let mut running = pin!(usb.device.run());
-            let device_descriptor = exchange(&host, running.as_mut(), [0x80, 6, 0, 1, 0, 0, 18, 0]);
-            assert_eq!(&device_descriptor[4..7], &[0xef, 2, 1]);
-            assert_eq!(&device_descriptor[8..12], &[9, 0x12, 0xd1, 0xc0]);
-            let mut full = Vec::new();
             for set in [0, crate::Interface::Via.bit(), crate::Interface::Vial.bit()] {
-                io.set_interfaces(set);
-                let bytes = exchange(&host, running.as_mut(), [0x80, 6, 0, 2, 0, 0, 0xff, 0xff]);
-                let length = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
-                assert_eq!(length, bytes.len());
-                assert!(length <= 512);
-                assert_eq!(
-                    bytes[4] as usize,
-                    3 + hid_count + xinput_count + usize::from(set != 0)
+                let host = Host::default();
+                let io = crate::Io::new();
+                let mut buffers = crate::Buffers::new(&io);
+                let mut usb = crate::Usb::new(
+                    MockDriver::new(&host),
+                    "0000000000000000",
+                    "Test adapter",
+                    crate::Topology {
+                        interfaces: set,
+                        gamepads: cordial_core::outputs::Plan {
+                            hid_gamepads: hid_count as u8,
+                            xinput_gamepads: xinput_count as u8,
+                        },
+                    },
+                    &io,
+                    &mut buffers,
                 );
-                let parts = descriptors(&bytes);
-                let receiver_iads: Vec<_> = parts
-                    .iter()
-                    .filter(|d| d[1] == 11 && d[4..7] == [0xff, 0x5d, 0x81])
-                    .collect();
-                assert_eq!(receiver_iads.len(), usize::from(xinput_count != 0));
-                if xinput_count != 0 {
+                let channels = &usb.receiver;
+                let mut running = pin!(usb.device.run());
+                let device_descriptor =
+                    exchange(&host, running.as_mut(), [0x80, 6, 0, 1, 0, 0, 18, 0]);
+                assert_eq!(&device_descriptor[4..7], &[0xef, 2, 1]);
+                assert_eq!(&device_descriptor[8..12], &[9, 0x12, 0xd1, 0xc0]);
+                let full;
+                {
+                    let bytes =
+                        exchange(&host, running.as_mut(), [0x80, 6, 0, 2, 0, 0, 0xff, 0xff]);
+                    let length = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+                    assert_eq!(length, bytes.len());
+                    assert!(length <= 512);
                     assert_eq!(
-                        &receiver_iads[0][2..4],
-                        &[(3 + hid_count) as u8, xinput_count as u8]
+                        bytes[4] as usize,
+                        3 + hid_count + xinput_count + usize::from(set != 0)
                     );
-                }
-                let interfaces: Vec<_> = parts.iter().filter(|d| d[1] == 4).collect();
-                for (i, interface) in interfaces.iter().enumerate() {
-                    assert_eq!(interface[2] as usize, i);
-                }
-                let capabilities: Vec<_> = parts.iter().filter(|d| d[1] == 0x22).collect();
-                assert_eq!(capabilities.len(), xinput_count);
-                for (index, channel) in channels.iter().flatten().enumerate() {
-                    assert_eq!(channel.interface as usize, 3 + hid_count + index);
-                    assert_eq!(
-                        &interfaces[channel.interface as usize][4..8],
-                        &[2, 0xff, 0x5d, 0x81]
-                    );
-                    assert_eq!(capabilities[index][5], u8::from(channel.input.info().addr));
-                    assert_eq!(
-                        capabilities[index][13],
-                        u8::from(channel.output.info().addr)
-                    );
-                    assert_eq!(channel.input.info().max_packet_size, 32);
-                    assert_eq!(channel.output.info().max_packet_size, 32);
-                    assert_eq!(channel.input.info().interval_ms, 1);
-                    assert_eq!(channel.output.info().interval_ms, 8);
-                }
-                if set != 0 {
+                    let parts = descriptors(&bytes);
+                    let receiver_iads: Vec<_> = parts
+                        .iter()
+                        .filter(|d| d[1] == 11 && d[4..7] == [0xff, 0x5d, 0x81])
+                        .collect();
+                    assert_eq!(receiver_iads.len(), usize::from(xinput_count != 0));
+                    if xinput_count != 0 {
+                        assert_eq!(
+                            &receiver_iads[0][2..4],
+                            &[(3 + hid_count) as u8, xinput_count as u8]
+                        );
+                    }
+                    let interfaces: Vec<_> = parts.iter().filter(|d| d[1] == 4).collect();
+                    for (i, interface) in interfaces.iter().enumerate() {
+                        assert_eq!(interface[2] as usize, i);
+                    }
+                    let capabilities: Vec<_> = parts.iter().filter(|d| d[1] == 0x22).collect();
+                    assert_eq!(capabilities.len(), xinput_count);
+                    for (index, channel) in channels.iter().flatten().enumerate() {
+                        assert_eq!(channel.interface as usize, 3 + hid_count + index);
+                        assert_eq!(
+                            &interfaces[channel.interface as usize][4..8],
+                            &[2, 0xff, 0x5d, 0x81]
+                        );
+                        assert_eq!(capabilities[index][5], u8::from(channel.input.info().addr));
+                        assert_eq!(
+                            capabilities[index][13],
+                            u8::from(channel.output.info().addr)
+                        );
+                        assert_eq!(channel.input.info().max_packet_size, 32);
+                        assert_eq!(channel.output.info().max_packet_size, 32);
+                        assert_eq!(channel.input.info().interval_ms, 1);
+                        assert_eq!(channel.output.info().interval_ms, 8);
+                    }
                     full = bytes;
                 }
-            }
-            let endpoints: Vec<_> = descriptors(&full)
-                .into_iter()
-                .filter(|d| d[1] == 5)
-                .collect();
-            let traffic = host.0.borrow();
-            assert_eq!(endpoints.len(), traffic.allocations.len());
-            for (desc, allocation) in endpoints.iter().zip(&traffic.allocations) {
-                assert_eq!(desc[2], u8::from(allocation.addr));
+                let endpoints: Vec<_> = descriptors(&full)
+                    .into_iter()
+                    .filter(|d| d[1] == 5)
+                    .collect();
+                let traffic = host.0.borrow();
+                assert_eq!(endpoints.len(), traffic.allocations.len());
+                for (desc, allocation) in endpoints.iter().zip(&traffic.allocations) {
+                    assert_eq!(desc[2], u8::from(allocation.addr));
+                    assert_eq!(
+                        u16::from_le_bytes([desc[4], desc[5]]),
+                        allocation.max_packet_size
+                    );
+                }
                 assert_eq!(
-                    u16::from_le_bytes([desc[4], desc[5]]),
-                    allocation.max_packet_size
+                    traffic
+                        .allocations
+                        .iter()
+                        .filter(|e| e.addr.is_in())
+                        .count(),
+                    3 + hid_count + xinput_count + usize::from(set != 0)
                 );
-            }
-            assert_eq!(
-                traffic
-                    .allocations
-                    .iter()
-                    .filter(|e| e.addr.is_in())
-                    .count(),
-                4 + hid_count + xinput_count
-            );
-            assert_eq!(
-                traffic
-                    .allocations
-                    .iter()
-                    .filter(|e| e.addr.is_out())
-                    .count(),
-                2 + xinput_count
-            );
-            drop(traffic);
-            if xinput_count > 0 {
-                let bos = exchange(&host, running.as_mut(), [0x80, 6, 0, 15, 0, 0, 64, 0]);
-                let capabilities = descriptors(&bos);
-                let os_capability = capabilities
-                    .iter()
-                    .find(|d| d[1] == 16 && d[2] == 5)
-                    .unwrap();
-                assert_eq!(&os_capability[20..24], &[0, 0, 3, 6]);
                 assert_eq!(
-                    &os_capability[24..28],
-                    &[46, 0, xinput::MSOS_VENDOR_CODE, 0]
+                    traffic
+                        .allocations
+                        .iter()
+                        .filter(|e| e.addr.is_out())
+                        .count(),
+                    1 + xinput_count + usize::from(set != 0)
                 );
-                let os = exchange(
-                    &host,
-                    running.as_mut(),
-                    [0xc0, xinput::MSOS_VENDOR_CODE, 0, 0, 7, 0, 64, 0],
-                );
-                assert_eq!(os.len(), 46);
-                assert_eq!(&os[8..10], &[46, 0]);
-                assert_eq!(&os[18..26], &[8, 0, 2, 0, (3 + hid_count) as u8, 0, 28, 0]);
-                assert_eq!(&os[26..30], &[20, 0, 3, 0]);
-                assert_eq!(&os[30..38], b"XUSB20\0\0");
-                assert_eq!(&os[38..], &[0; 8]);
-            }
-            if hid_count == 4 && xinput_count == 4 {
-                assert_eq!(full.len(), 455);
+                drop(traffic);
+                if xinput_count > 0 {
+                    let bos = exchange(&host, running.as_mut(), [0x80, 6, 0, 15, 0, 0, 64, 0]);
+                    let capabilities = descriptors(&bos);
+                    let os_capability = capabilities
+                        .iter()
+                        .find(|d| d[1] == 16 && d[2] == 5)
+                        .unwrap();
+                    assert_eq!(&os_capability[20..24], &[0, 0, 3, 6]);
+                    assert_eq!(
+                        &os_capability[24..28],
+                        &[46, 0, xinput::MSOS_VENDOR_CODE, 0]
+                    );
+                    let os = exchange(
+                        &host,
+                        running.as_mut(),
+                        [0xc0, xinput::MSOS_VENDOR_CODE, 0, 0, 7, 0, 64, 0],
+                    );
+                    assert_eq!(os.len(), 46);
+                    assert_eq!(&os[8..10], &[46, 0]);
+                    assert_eq!(&os[18..26], &[8, 0, 2, 0, (3 + hid_count) as u8, 0, 28, 0]);
+                    assert_eq!(&os[26..30], &[20, 0, 3, 0]);
+                    assert_eq!(&os[30..38], b"XUSB20\0\0");
+                    assert_eq!(&os[38..], &[0; 8]);
+                }
+                if hid_count == 4 && xinput_count == 4 && set != 0 {
+                    assert_eq!(full.len(), 455);
+                }
             }
         }
     }
@@ -831,18 +998,6 @@ fn receiver_presence_ack_reset_and_reassignment_use_actual_endpoints() {
     assert_eq!(host.0.borrow().writes.last().unwrap().1, [8, 8]);
 }
 
-// These fixtures poll futures explicitly. Timers use a fixed clock unless a test
-// advances it, so endpoint scheduling does not depend on wall-clock timing.
-struct Clock;
-std::thread_local! { static TICKS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) }; }
-impl embassy_time_driver::Driver for Clock {
-    fn now(&self) -> u64 {
-        TICKS.with(core::cell::Cell::get)
-    }
-    fn schedule_wake(&self, _: u64, _: &Waker) {}
-}
-embassy_time_driver::time_driver_impl!(static CLOCK: Clock = Clock);
-
 fn snapshot(link: u64, epoch: u64, buttons: u32) -> cordial_core::outputs::SlotSnapshot {
     cordial_core::outputs::SlotSnapshot {
         occupant: Some(cordial_core::link::LinkId {
@@ -1078,11 +1233,19 @@ fn workers_settle_reassignment_keep_control_truth_and_leave_cdc_and_keyboard_run
 fn rebuild_drops_every_endpoint_and_receiver_before_allocating_the_next_pools() {
     let host = Host::default();
     let io = crate::Io::new();
-    for count in [4, 0, 1, 3, 2, 4, 0] {
+    for (count, interfaces) in [
+        (4, crate::Interface::Via.bit()),
+        (0, 0),
+        (1, crate::Interface::Vial.bit()),
+        (3, 0),
+        (2, crate::Interface::Via.bit()),
+        (4, 0),
+        (0, crate::Interface::Vial.bit()),
+    ] {
         {
             let mut buffers = crate::Buffers::new(&io);
             let topology = crate::Topology {
-                interfaces: 0,
+                interfaces,
                 gamepads: cordial_core::outputs::Plan {
                     hid_gamepads: count,
                     xinput_gamepads: count,
@@ -1101,7 +1264,10 @@ fn rebuild_drops_every_endpoint_and_receiver_before_allocating_the_next_pools() 
                 .publish(io.status().generation, Default::default());
             let mut running = pin!(usb.run_until_rebuild());
             assert!(poll(running.as_mut()).is_pending());
-            assert_eq!(host.0.borrow().live, 5 + 3 * count as usize);
+            assert_eq!(
+                host.0.borrow().live,
+                3 + 3 * count as usize + 2 * usize::from(interfaces != 0)
+            );
             io.reconnect.signal(topology);
             assert_eq!(poll(running.as_mut()), Poll::Ready(topology));
         }

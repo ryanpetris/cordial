@@ -39,21 +39,28 @@ fn bootloader() -> ! {
 
 #[embassy_executor::task]
 async fn usb_task(serial: &'static str, interfaces: u8) {
+    let mut peripheral = usb::Peripheral::new().expect("USB peripheral");
     let mut out = [0; 256];
-    let mut buffers = Buffers::new(&USB_IO);
-    Usb::new(
-        usb::driver(&mut out).expect("USB peripheral"),
-        serial,
-        board::DEFAULT_ADAPTER_NAME,
-        cordial_usb::Topology {
-            interfaces,
-            ..Default::default()
-        },
-        &USB_IO,
-        &mut buffers,
-    )
-    .run()
-    .await;
+    let mut topology = cordial_usb::Topology {
+        interfaces,
+        ..Default::default()
+    };
+    loop {
+        topology = {
+            let mut buffers = Buffers::new(&USB_IO);
+            Usb::new(
+                peripheral.driver(&mut out),
+                serial,
+                board::DEFAULT_ADAPTER_NAME,
+                topology,
+                &USB_IO,
+                &mut buffers,
+            )
+            .run_until_rebuild()
+            .await
+        };
+        Timer::after_millis(250).await;
+    }
 }
 /// Starts the radio, then runs the priority loop.
 #[embassy_executor::task]

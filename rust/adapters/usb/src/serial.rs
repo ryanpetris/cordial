@@ -15,7 +15,6 @@ pub struct SessionDriver<'a, D> {
 }
 pub struct SessionControl<'a, P> {
     pipe: P,
-    descriptor: crate::configuration::DescriptorFilter,
     io: &'a Io,
 }
 impl<'d, D: Driver<'d>> Driver<'d> for SessionDriver<'d, D> {
@@ -44,14 +43,7 @@ impl<'d, D: Driver<'d>> Driver<'d> for SessionDriver<'d, D> {
     }
     fn start(self, size: u16) -> (Self::Bus, Self::ControlPipe) {
         let (bus, pipe) = self.driver.start(size);
-        (
-            bus,
-            SessionControl {
-                pipe,
-                io: self.io,
-                descriptor: Default::default(),
-            },
-        )
+        (bus, SessionControl { pipe, io: self.io })
     }
 }
 impl<P: ControlPipe> ControlPipe for SessionControl<'_, P> {
@@ -63,12 +55,6 @@ impl<P: ControlPipe> ControlPipe for SessionControl<'_, P> {
         if request[..4] == [0x80, 6, 3, 3] {
             request[2] = configuration::SERIAL_INDEX;
         }
-        // GET_DESCRIPTOR(Configuration) omits the Raw HID slots no enabled interface uses.
-        self.descriptor.hide = if request[0] == 0x80 && request[1] == 6 && request[3] == 2 {
-            crate::configuration::DescriptorFilter::hidden(self.io.interfaces())
-        } else {
-            0
-        };
         request
     }
     async fn data_out(
@@ -80,19 +66,9 @@ impl<P: ControlPipe> ControlPipe for SessionControl<'_, P> {
         self.pipe.data_out(buf, first, last).await
     }
     async fn data_in(&mut self, data: &[u8], first: bool, last: bool) -> Result<(), EndpointError> {
-        if self.descriptor.hide == 0 {
-            return self.pipe.data_in(data, first, last).await;
-        }
-        let mut bytes = [0; 64];
-        bytes[..data.len()].copy_from_slice(data);
-        match self
-            .descriptor
-            .packet(&mut bytes[..data.len()], first, last)
-        {
-            Some((size, last)) => self.pipe.data_in(&bytes[..size], first, last).await,
-            None => Ok(()),
-        }
+        self.pipe.data_in(data, first, last).await
     }
+
     async fn accept(&mut self) {
         let session = self.io.status().session;
         // The host can send its new handshake as soon as this ACK arrives.
@@ -249,7 +225,6 @@ mod tests {
         let hardware = Channel::new();
         let acknowledgements = Cell::new(0);
         let mut pipe = SessionControl {
-            descriptor: Default::default(),
             pipe: Pipe(&acknowledgements),
             io: &io,
         };

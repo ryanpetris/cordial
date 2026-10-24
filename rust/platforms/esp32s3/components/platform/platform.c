@@ -38,10 +38,16 @@ esp_err_t cordial_esp_usb_phy(void) {
     return usb_new_phy(&config, &phy);
 }
 void *cordial_esp_usb_registers(void) { return &USB_DWC; }
+static intr_handle_t usb_interrupt;
 esp_err_t cordial_esp_usb_interrupt(void (*handler)(void *), void *context) {
     // Flash writes may mask this interrupt; handler and Embassy code need not
     // live in IRAM. The controller retains packet/FIFO state until it resumes.
-    return esp_intr_alloc(ETS_USB_INTR_SOURCE, ESP_INTR_FLAG_LEVEL1, handler, context, NULL);
+    return esp_intr_alloc(ETS_USB_INTR_SOURCE, ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_INTRDISABLED,
+                          handler, context, &usb_interrupt);
+}
+
+esp_err_t cordial_esp_usb_interrupt_enable(bool enabled) {
+    return enabled ? esp_intr_enable(usb_interrupt) : esp_intr_disable(usb_interrupt);
 }
 
 #if CONFIG_CORDIAL_DEVELOPMENT
