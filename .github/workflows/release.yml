@@ -180,7 +180,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        board: [pico_w, pico2_w, waveshare_rp2350b_plus_w, esp32s3]
+        board: [pico_w, pico2_w, pimoroni_pico_plus2_w, waveshare_rp2350b_plus_w, esp32s3]
         profile: [production, debug]
     steps:
       - uses: actions/checkout@v7
@@ -236,7 +236,7 @@ jobs:
               test -f "${application}_${CORDIAL_VERSION}-1~${distribution}_amd64.deb"
             done
           done
-          for board in pico_w pico2_w waveshare_rp2350b_plus_w esp32s3; do
+          for board in pico_w pico2_w pimoroni_pico_plus2_w waveshare_rp2350b_plus_w esp32s3; do
             test -f "cordial-firmware-$CORDIAL_VERSION-$board.tar.gz"
             test -f "cordial-firmware-$CORDIAL_VERSION-debug-$board.tar.gz"
           done

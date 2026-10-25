@@ -59,8 +59,11 @@ restarting into the bootloader from the app.
 | --- | --- |
 | Raspberry Pi Pico W | `pico_w` |
 | Raspberry Pi Pico 2 W | `pico2_w` |
+| Pimoroni Pico Plus 2 W | `pimoroni_pico_plus2_w` |
 | Waveshare RP2350B-Plus-W | `waveshare_rp2350b_plus_w` |
 | ESP32-S3 with at least 4 MiB flash and native USB | `esp32s3` |
+
+Pimoroni Pico Plus 2 W hardware verification is outstanding. Cordial leaves its PSRAM unused.
 
 ### First installation
 

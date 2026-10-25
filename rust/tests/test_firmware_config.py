@@ -179,6 +179,7 @@ class BoardConfigTests(unittest.TestCase):
     def test_pico_linker_reserves_e10_inside_the_firmware_area(self):
         for name, origin, size in (("pico_w", 0x10000100, 0xfff00),
                                    ("pico2_w", 0x10000000, 0x1ff000),
+                                   ("pimoroni_pico_plus2_w", 0x10000000, 0x1ff000),
                                    ("waveshare_rp2350b_plus_w", 0x10000000, 0x1ff000)):
             board = config.load(config.ROOT / "boards" / (name + ".json"), "production")
             with tempfile.TemporaryDirectory() as out:
@@ -187,6 +188,36 @@ class BoardConfigTests(unittest.TestCase):
                               Path(out, "memory.x").read_text())
                 self.assertIn("Firmware exceeds its reserved image area", Path(out, "memory.x").read_text())
                 self.assertEqual(board["storage_bytes"], board["minimum_flash_bytes"] - board["firmware_bytes"])
+
+    def test_pimoroni_preset_generates_package_b_with_pico_w_radio_wiring(self):
+        board = config.load(config.ROOT / "boards/pimoroni_pico_plus2_w.json", "production")
+        pico = config.load(config.ROOT / "boards/pico2_w.json", "production")
+        self.assertEqual(board["ram_bytes"], 524288)
+        self.assertEqual(board["radio_backend"], "pico-sdk-cyw43")
+        self.assertEqual(board["storage_identity"], pico["storage_identity"])
+        self.assertNotEqual(board["hardware_digest"], pico["hardware_digest"])
+        with tempfile.TemporaryDirectory() as out:
+            config.generate(board, out)
+            header = Path(out, "cordial.h").read_text()
+            for define, value in (("PICO_RP2350A", 0), ("PICO_XOSC_HZ", 12000000),
+                                  ("CYW43_DEFAULT_PIN_WL_REG_ON", 23),
+                                  ("CYW43_DEFAULT_PIN_WL_DATA_OUT", 24),
+                                  ("CYW43_DEFAULT_PIN_WL_DATA_IN", 24),
+                                  ("CYW43_DEFAULT_PIN_WL_HOST_WAKE", 24),
+                                  ("CYW43_DEFAULT_PIN_WL_CLOCK", 29),
+                                  ("CYW43_DEFAULT_PIN_WL_CS", 25)):
+                self.assertIn(f"#define {define} {value}\n", header)
+            generated = Path(out, "board.rs").read_text()
+            for setting in ('DEFAULT_ADAPTER_NAME: &str = "Pimoroni Pico Plus 2 W";',
+                            'HARDWARE: &str = "pimoroni_pico_plus2_w";',
+                            "FLASH_BYTES: usize = 16777216;",
+                            "MINIMUM_FLASH_BYTES: u32 = 4194304;",
+                            "IMAGE_BYTES: usize = 2093056;",
+                            "PROFILE_MEMORY_BUDGET: Option<u32> = Some(40960);",
+                            "($p.PIN_23, $p.PIN_24, $p.PIN_29, $p.PIN_25)",
+                            "RADIO_LED: Option<(u8, bool)> = Some((0, false));",
+                            "None::<embassy_rp::gpio::Output<'static>>"):
+                self.assertIn(setting, generated)
 
     def test_generic_esp_preset_uses_internal_ram_and_preserves_storage(self):
         board = config.load(config.ROOT / "boards/esp32s3.json", "production")
@@ -212,6 +243,7 @@ class BoardConfigTests(unittest.TestCase):
     def test_bluetooth_limits_and_esp_controller_activities(self):
         from bluetooth_config import generate, limits
         for name, expected in (("pico_w", (2, 8)), ("pico2_w", (6, 14)),
+                               ("pimoroni_pico_plus2_w", (6, 14)),
                                ("waveshare_rp2350b_plus_w", (6, 14)), ("esp32s3", (0, 8))):
             path = config.ROOT / "boards" / f"{name}.json"
             board = config.load(path, "development")
@@ -249,7 +281,8 @@ class BoardConfigTests(unittest.TestCase):
                         config.load(path, "production")
 
     def test_profile_memory_budget_is_generated_without_changing_identity(self):
-        presets = {"pico_w": None, "pico2_w": 40960, "waveshare_rp2350b_plus_w": 40960,
+        presets = {"pico_w": None, "pico2_w": 40960, "pimoroni_pico_plus2_w": 40960,
+                   "waveshare_rp2350b_plus_w": 40960,
                    "esp32s3": 40960}
         for name, expected in presets.items():
             board = config.ROOT / "boards" / f"{name}.json"
@@ -336,6 +369,7 @@ class BoardConfigTests(unittest.TestCase):
 
     def test_presets_and_custom_pins(self):
         for name, feature in (("pico_w", "rp2040"), ("pico2_w", "rp235xa"),
+                              ("pimoroni_pico_plus2_w", "rp235xb"),
                               ("waveshare_rp2350b_plus_w", "rp235xb")):
             board = config.load(config.ROOT / "boards" / f"{name}.json", "development")
             self.assertEqual(board["feature"], feature)

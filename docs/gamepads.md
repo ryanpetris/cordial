@@ -1,6 +1,7 @@
 # Gamepad outputs
 
-Pico W, Pico 2 W and Waveshare RP2350B-Plus-W support HID and XInput gamepad outputs.
+Pico W, Pico 2 W, Pimoroni Pico Plus 2 W and Waveshare RP2350B-Plus-W support HID and XInput
+gamepad outputs.
 
 After pairing a controller, open its Settings tab, select **HID** or **XInput** under
 **Gamepad Output**, and save. The control appears when the adapter advertises an enabled mode or a

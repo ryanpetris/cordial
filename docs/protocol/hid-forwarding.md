@@ -241,7 +241,8 @@ and a failed save retries on a later connection. Gamepad selection and HID++ det
 independently; both must finish before setup completes.
 
 The generic output API defines HID and XInput choices, independent slot pools and runtime states.
-Pico W, Pico 2 W and Waveshare RP2350B-Plus-W provide both USB backends. ESP32 leaves gamepad output
+Pico W, Pico 2 W, Pimoroni Pico Plus 2 W and Waveshare RP2350B-Plus-W provide both USB backends.
+ESP32 leaves gamepad output
 disabled. These preferences do not alter keyboard, mouse, Consumer or
 system input forwarding, profile usage ranges, Bluetooth connection limits, or VIA/Vial behavior.
 VIA/Vial coexistence work is tracked in [issue 1](https://github.com/ryanpetris/cordial/issues/1).
@@ -382,7 +383,8 @@ LED collections, Ordinal instances, and Consumer controls.
 
 ## USB gamepad outputs
 
-On Pico W, Pico 2 W and Waveshare RP2350B-Plus-W, each paired device may select
+On Pico W, Pico 2 W, Pimoroni Pico Plus 2 W and Waveshare RP2350B-Plus-W, each paired device
+may select
 Disabled, HID or XInput for its gamepad role. A missing selection means Disabled.
 Saved devices contribute configured candidates even when disconnected or not resident in the
 Bluetooth stack. Invalid bonds and duplicate peers follow the core's saved-record validation rules.

@@ -68,6 +68,7 @@ class EspStartupStack(unittest.TestCase):
 class Artifact(unittest.TestCase):
     def test_image_limits_include_sector_erase_and_e10_reservation(self):
         for board, limit in (("pico_w", 0x100000), ("pico2_w", 0x1ff000),
+                             ("pimoroni_pico_plus2_w", 0x1ff000),
                              ("waveshare_rp2350b_plus_w", 0x1ff000)):
             config = firmware_config.load(ROOT / "boards" / (board + ".json"), "development")
             value = artifact.manifest(config)
@@ -92,7 +93,7 @@ class Artifact(unittest.TestCase):
             artifact.inspect(artifact.MAGIC + json.dumps(value).encode() + b"\0")
 
     def test_pico_presets_pack_every_profile_and_preserve_reserved_bounds(self):
-        for board in ('pico_w', 'pico2_w', 'waveshare_rp2350b_plus_w'):
+        for board in ('pico_w', 'pico2_w', 'pimoroni_pico_plus2_w', 'waveshare_rp2350b_plus_w'):
             for profile in artifact.PROFILES:
                 config = firmware_config.load(ROOT / 'boards' / (board + '.json'), profile)
                 expected = artifact.manifest(config)
@@ -117,10 +118,11 @@ class Artifact(unittest.TestCase):
         expected = {'production': ('1.2.3', None), 'debug': ('1.2.3-debug', 'bootsel'),
                     'development': ('1.2.3-dev', 'bootsel')}
         with patch.dict(os.environ, CORDIAL_VERSION='1.2.3'):
-            for profile, (version, bootloader) in expected.items():
-                with self.subTest(profile=profile):
-                    value = artifact.manifest(firmware_config.load(ROOT / 'boards/pico_w.json', profile))
-                    self.assertEqual((value['version'], value['bootloader']), (version, bootloader))
+            for board in ('pico_w', 'pimoroni_pico_plus2_w'):
+                for profile, (version, bootloader) in expected.items():
+                    with self.subTest(board=board, profile=profile):
+                        value = artifact.manifest(firmware_config.load(ROOT / 'boards' / (board + '.json'), profile))
+                        self.assertEqual((value['version'], value['bootloader']), (version, bootloader))
 
     def test_version_accepts_only_profile_suffixes(self):
         config = firmware_config.load(ROOT / 'boards/pico_w.json', 'production')

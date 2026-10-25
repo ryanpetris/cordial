@@ -53,6 +53,7 @@
 | --- | --- | --- | --- | --- |
 | Raspberry Pi Pico W | `pico_w` | Classic and Low Energy | Yes | No |
 | Raspberry Pi Pico 2 W | `pico2_w` | Classic and Low Energy | Yes | Yes |
+| Pimoroni Pico Plus 2 W | `pimoroni_pico_plus2_w` | Classic and Low Energy | Yes | Yes |
 | Waveshare RP2350B-Plus-W | `waveshare_rp2350b_plus_w` | Classic and Low Energy | Yes | Yes |
 | ESP32-S3 with at least 4 MiB flash and native USB | `esp32s3` | Low Energy only | No | Yes |
 

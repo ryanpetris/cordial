@@ -1,0 +1,25 @@
+{
+  "name": "pimoroni_pico_plus2_w",
+  "default_adapter_name": "Pimoroni Pico Plus 2 W",
+  "chip": "rp2350",
+  "package": "b",
+  "minimum_flash_bytes": 4194304,
+  "xosc_hz": 12000000,
+  "radio": {
+    "power": 23,
+    "data": 24,
+    "clock": 29,
+    "cs": 25,
+    "led": {
+      "pin": 0,
+      "active_low": false
+    }
+  },
+  "mcu_led": null,
+  "bluetooth_backend": "btstack",
+  "usb_backend": "embassy",
+  "storage_backend": "littlefs",
+  "radio_backend": "pico-sdk-cyw43",
+  "firmware_bytes": 2097152,
+  "profile_memory_budget": 40960
+}

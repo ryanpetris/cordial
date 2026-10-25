@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | `pico_w` | Classic HID and BLE through BTstack | No |
 | `pico2_w` | Classic HID and BLE through BTstack | Yes |
+| `pimoroni_pico_plus2_w` | Classic HID and BLE through BTstack | Yes |
 | `waveshare_rp2350b_plus_w` | Classic HID and BLE through BTstack | Yes |
 | `esp32s3` | BLE through ESP-NimBLE or BTstack | Yes |
 
@@ -20,6 +21,9 @@ Bluetooth pool sizes derive from the same `CORDIAL_CONFIG` for Rust and C. See
 [Bluetooth capacity](protocol/limits-and-errors.md#bluetooth-capacity) for the independent transport
 allowances and pairing reserve. Pico presets use `pico-sdk-cyw43`; `embassy-cyw43` is also supported.
 The `esp32s3` preset uses `esp-nimble` and `esp-idf`.
+
+The `pimoroni_pico_plus2_w` preset targets the Pimoroni Pico Plus 2 W with an RP2350B and
+16 MiB flash. Cordial leaves its 8 MiB PSRAM unused. Hardware verification is outstanding.
 
 `esp32s3` targets ESP32-S3 boards with at least 4 MiB flash and native USB connected to the host.
 It reserves 2 MiB for firmware and budgets 40 KiB of internal RAM for loaded profiles.
@@ -387,8 +391,8 @@ build outputs while preserving downloaded dependencies and toolchains.
 
 ## USB gamepad builds
 
-Pico W, Pico 2 W and Waveshare RP2350B-Plus-W enable the `cordial-usb/gamepad`
-feature. These builds advertise
+Pico W, Pico 2 W, Pimoroni Pico Plus 2 W and Waveshare RP2350B-Plus-W enable the
+`cordial-usb/gamepad` feature. These builds advertise
 Disabled, HID and XInput gamepad output modes. USB gamepad slot limits are separate from the
 board's Bluetooth transport allowances.
 

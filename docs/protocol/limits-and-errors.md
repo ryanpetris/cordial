@@ -49,6 +49,7 @@ The board configuration generates the Rust and C pool sizes through
 | --- | --- | --- | --- | --- | --- |
 | `pico_w` | 2 | 8 | 11 | 3 | 9 |
 | `pico2_w` | 6 | 14 | 21 | 7 | 15 |
+| `pimoroni_pico_plus2_w` | 6 | 14 | 21 | 7 | 15 |
 | `waveshare_rp2350b_plus_w` | 6 | 14 | 21 | 7 | 15 |
 | `esp32s3` | 0 | 8 | 9 | 0 | 9 |
 
