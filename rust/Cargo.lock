@@ -273,6 +273,7 @@ dependencies = [
 name = "cordial-client"
 version = "0.0.0"
 dependencies = [
+ "cordial-core",
  "cordial-protocol",
  "prost",
  "serialport",

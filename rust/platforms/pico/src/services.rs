@@ -111,3 +111,14 @@ pub async fn flash_capacity<T: Instance, M: Mode, const N: usize>(
     }
     Ok(None)
 }
+
+/// Resets the MCU and runs ordinary firmware startup.
+pub fn reset() -> ! {
+    // ARM AIRCR SYSRESETREQ, with the required VECTKEY.
+    unsafe {
+        core::ptr::write_volatile(0xe000_ed0c as *mut u32, 0x05fa_0004);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}

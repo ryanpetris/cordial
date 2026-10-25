@@ -26,6 +26,12 @@
 | Profile name | 1..64 UTF-8 bytes |
 | Text information values | 64 UTF-8 bytes |
 | Adapter name | 1..64 UTF-8 bytes |
+| File path | Canonical absolute UTF-8, at most 192 bytes |
+| Bounded file read | `length` of 1..512 bytes; required during assisted production access |
+| File write | At most 512 data bytes per request, also within the complete request limit |
+| Host migration input | At most 16,384 dataset files and a checked total of 64 MiB before download or allocation |
+| Host migration memory | 256 MiB for input, output and working allocations together; no disk spill |
+| Desktop/CLI migration IPC | 1..65,536 protobuf bytes after a four-byte little-endian length prefix |
 
 HID report-map limits are in [HID forwarding](hid-forwarding.md).
 

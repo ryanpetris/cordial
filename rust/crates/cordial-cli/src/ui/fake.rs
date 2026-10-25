@@ -11,9 +11,12 @@ use std::{
 #[derive(Clone, Debug, PartialEq)]
 pub enum Call {
     Open(String),
+    OpenAdapter(String, String),
     Close,
     Run(String),
     List,
+    Migrate(String, String),
+    CancelMigration,
 }
 
 #[derive(Clone, Default)]
@@ -25,6 +28,11 @@ pub struct Fake {
 impl Backend for Fake {
     fn open(&self, port: String) -> SessionId {
         self.calls.borrow_mut().push(Call::Open(port));
+        self.next.set(self.next.get() + 1);
+        self.next.get()
+    }
+    fn open_adapter(&self, port: String, id: String) -> SessionId {
+        self.calls.borrow_mut().push(Call::OpenAdapter(port, id));
         self.next.set(self.next.get() + 1);
         self.next.get()
     }
@@ -43,5 +51,11 @@ impl Backend for Fake {
     }
     fn list_ports(&self) {
         self.calls.borrow_mut().push(Call::List);
+    }
+    fn migrate(&self, id: String, port: String) {
+        self.calls.borrow_mut().push(Call::Migrate(id, port));
+    }
+    fn cancel_migration(&self) {
+        self.calls.borrow_mut().push(Call::CancelMigration);
     }
 }

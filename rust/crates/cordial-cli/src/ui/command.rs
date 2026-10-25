@@ -83,6 +83,7 @@ const SPECS: &[Spec] = &[
         "Enable or disable a configuration interface, optionally selecting its profile",
     ),
     spec(INTERFACE_RESET, "", "Clear a disabled interface's profile"),
+    spec("adapter restart", "", "Restart the adapter"),
     spec(
         "adapter bootloader",
         "",
@@ -186,6 +187,8 @@ const SPECS: &[Spec] = &[
         "[--raw] PATH LOCAL_FILE",
         "Download an adapter file, a saved record as JSON unless --raw; an existing local file is never replaced",
     ),
+    spec("migrate", "", "Migrate the adapter's saved data"),
+    spec("migrate cancel", "", "Stop migrating"),
     spec("help", "[COMMAND]", "Show this help"),
     spec("quit", "", "Close control session; saved HID keeps working"),
     spec("exit", "", ""),
@@ -252,6 +255,7 @@ shown or changed.",
 /// is still starting or failed to, so they run without waiting for readiness.
 pub const DIRECT: &[&str] = &[
     "adapter status",
+    "adapter restart",
     "file list",
     "file get",
     "adapter bootloader",
@@ -579,6 +583,8 @@ pub enum Line {
     List,
     Select(String),
     Quit,
+    Migrate,
+    MigrateCancel,
     /// `device list`, listed with this filter after a refresh.
     Devices(Filter),
     Run(Command),
@@ -687,6 +693,8 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
         ("help", _) if listed_prefix(&words.join(" "), None) => Line::Help(Some(words.join(" "))),
         ("help", _) => return Err(format!("unknown command {}", quote(&words.join(" ")))),
         ("quit" | "exit", 0) => Line::Quit,
+        ("migrate", 0) => Line::Migrate,
+        ("migrate cancel", 0) => Line::MigrateCancel,
         ("adapter select", 1) if !words[0].is_empty() => Line::Select(arg(0)),
         ("adapter list", 0) => Line::List,
         ("adapter status", 0) => Line::Run(Command::Status),
@@ -777,6 +785,7 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
             };
             Line::Run(Command::Layers(target(0)?, layers))
         }
+        ("adapter restart", 0) => Line::Run(Command::Restart),
         ("adapter bootloader", 0) => Line::Run(Command::Bootloader),
         (SCAN, 0..=2) => {
             let mut transports = Vec::new();
@@ -1315,6 +1324,8 @@ pub(crate) mod tests {
             ],
             information: Some(p::AdapterInformation {
                 development_build: Some(true),
+                storage_format: Some(2),
+                target_storage_format: Some(2),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1758,7 +1769,10 @@ pub(crate) mod tests {
         st.status.information = None;
         let shown = help(Some(&st));
         assert!(!shown.contains("file list") && !shown.contains("adapter bootloader"));
-        assert!(shown.contains("except adapter status."), "{shown}");
+        assert!(
+            shown.contains("except adapter status and adapter restart."),
+            "{shown}"
+        );
         assert!(help(None).contains("adapter bootloader"));
     }
 

@@ -40,7 +40,7 @@ pub enum Event {
         ticket: Ticket,
         result: Result<Outcome, Error>,
     },
-    /// The controller's session closed after `close`.
+    /// The controller's session closed after `close`, and its port is released.
     Closed,
 }
 
@@ -48,10 +48,23 @@ pub enum Event {
 pub enum Phase {
     /// The port is open and the adapter's status read.
     Opened,
+    /// The port is open, but the adapter's saved data must be migrated first. Only status is
+    /// read until the session closes; this replaces `Opened`.
+    Migrate,
+    /// The port is open and the adapter waits for a migration, but its other errors stop Cordial
+    /// from running one. Only status and restart work until the session closes; this replaces
+    /// `Opened`.
+    Blocked(Error),
+    /// The port is open, but this version of Cordial can't use the adapter. Only status is read
+    /// until the session closes; this replaces `Opened`.
+    Unsupported(Error),
     /// The adapter is starting; commands that need Bluetooth or storage wait.
     Waiting,
     /// The adapter is ready and its saved devices are loaded.
     Ready,
+    /// The port answered for an adapter other than the one it was opened for. The session
+    /// closed after reading only status; this replaces `Opened`.
+    Other,
     /// Opening failed. With `open`, the session stays for status and development commands.
     Failed {
         error: Error,
@@ -222,6 +235,8 @@ pub enum Command {
         enabled: Option<bool>,
         profile: Option<Pick>,
     },
+    /// Restarts the adapter, which closes the connection.
+    Restart,
     Bootloader,
     /// Scans the transports, or every supported one when empty, for `seconds` (0 means the
     /// adapter's default).
@@ -293,7 +308,7 @@ impl Command {
     pub fn direct(&self) -> bool {
         matches!(
             self,
-            Self::Status | Self::Bootloader | Self::Files(_) | Self::FileGet { .. }
+            Self::Status | Self::Restart | Self::Bootloader | Self::Files(_) | Self::FileGet { .. }
         )
     }
 
@@ -343,6 +358,7 @@ pub enum Outcome {
     Transport(p::Transport, bool),
     /// A configuration interface's preferences, as the adapter saved them.
     Interface(p::ConfigurationInterface, p::Status),
+    Restart,
     Bootloader,
     ScanStarted(Vec<p::Transport>),
     /// `error` says why the scan ended early or lost candidates; the found ones stay usable.
@@ -523,9 +539,11 @@ impl Session {
         Ok(())
     }
 
+    /// Closes the connection and waits until the port is released, so whatever opens next,
+    /// such as a migration, owns it alone.
     fn shutdown(&self) {
         self.closing.store(true, Ordering::Release);
-        self.connection.close();
+        self.connection.close_and_wait_release();
     }
 
     /// Marks a running command for progress shown beside its target; 0 for none.
@@ -606,6 +624,16 @@ impl Controller {
 
     /// Opens a port, replacing any session. Phases follow as `Event::Connection`.
     pub fn open(&self, port: String) -> SessionId {
+        self.open_as(port, None)
+    }
+
+    /// Opens a port for the adapter with ID `adapter`, as `open` does. Another adapter on the
+    /// port reports `Phase::Other` and receives nothing after its status.
+    pub fn open_adapter(&self, port: String, adapter: String) -> SessionId {
+        self.open_as(port, Some(adapter))
+    }
+
+    fn open_as(&self, port: String, adapter: Option<String>) -> SessionId {
         let (id, old) = {
             let mut active = self.inner.active.lock().unwrap();
             active.generation += 1;
@@ -613,7 +641,7 @@ impl Controller {
             (active.generation, active.session.take())
         };
         let inner = self.inner.clone();
-        thread::spawn(move || open(&inner, id, port, old));
+        thread::spawn(move || open(&inner, id, port, adapter, old));
         id
     }
 
@@ -690,18 +718,25 @@ impl Drop for Shared {
     }
 }
 
-fn open(inner: &Arc<Shared>, id: SessionId, port: String, old: Option<Arc<Session>>) {
+fn open(
+    inner: &Arc<Shared>,
+    id: SessionId,
+    port: String,
+    adapter: Option<String>,
+    old: Option<Arc<Session>>,
+) {
     let gate = inner.gate.lock().unwrap();
     if let Some(old) = old {
         old.shutdown();
     }
-    let failed = |error: Error| {
+    let report = |phase| {
         (inner.sink)(Event::Connection {
             session: id,
             port: port.clone(),
-            phase: Phase::Failed { error, open: false },
+            phase,
         });
     };
+    let failed = |error: Error| report(Phase::Failed { error, open: false });
     let cell = Arc::new(Cell {
         state: Mutex::new(State {
             session: id,
@@ -782,6 +817,10 @@ fn open(inner: &Arc<Shared>, id: SessionId, port: String, old: Option<Arc<Sessio
         session.shutdown();
         return failed(Error::from_client(e, "adapter status"));
     }
+    if adapter.is_some_and(|a| !session.state().status.id.eq_ignore_ascii_case(&a)) {
+        session.shutdown();
+        return report(Phase::Other);
+    }
     {
         let mut active = inner.active.lock().unwrap();
         if active.generation != id || active.closing {
@@ -792,7 +831,12 @@ fn open(inner: &Arc<Shared>, id: SessionId, port: String, old: Option<Arc<Sessio
         active.session = Some(session.clone());
     }
     drop(gate);
-    session.phase(Phase::Opened);
+    match crate::migration::gate(&session.state().status) {
+        crate::migration::Gate::Normal => session.phase(Phase::Opened),
+        crate::migration::Gate::Assist => return session.phase(Phase::Migrate),
+        crate::migration::Gate::Blocked(e) => return session.phase(Phase::Blocked(e)),
+        crate::migration::Gate::Unsupported(e) => return session.phase(Phase::Unsupported(e)),
+    }
     let current = || {
         let active = inner.active.lock().unwrap();
         active.generation == id && !active.closing

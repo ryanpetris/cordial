@@ -4,17 +4,17 @@ use std::{env, path::PathBuf};
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let proto = manifest.join("../../../proto");
-    println!(
-        "cargo:rerun-if-changed={}",
-        proto.join("cordial.proto").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        proto.join("storage.proto").display()
-    );
-
-    let descriptors =
-        protox::compile(["cordial.proto", "storage.proto"], [&proto]).expect("compile schemas");
+    let mut schemas = vec!["cordial.proto", "storage/v2/storage.proto"];
+    if cfg!(feature = "historical-storage") {
+        schemas.push("storage/v1/storage.proto");
+    }
+    if cfg!(feature = "migration") {
+        schemas.push("migration.proto");
+    }
+    for schema in &schemas {
+        println!("cargo:rerun-if-changed={}", proto.join(schema).display());
+    }
+    let descriptors = protox::compile(&schemas, [&proto]).expect("compile schemas");
     let mut config = prost_build::Config::new();
     config.type_attribute(".cordial.Error", "#[derive(Eq, PartialOrd, Ord)]");
     #[cfg(feature = "json")]

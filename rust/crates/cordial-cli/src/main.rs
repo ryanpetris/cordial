@@ -1,5 +1,6 @@
 use cordial_cli::{
     controller::Cancellation,
+    migration,
     runner::{Options, Script},
     ui::{self, UiOptions, text},
 };
@@ -7,7 +8,7 @@ use std::{
     io::{self, IsTerminal},
     process::ExitCode,
 };
-const USAGE: &str = "Usage: cordial [--port PORT] [--json] [--timeout SECONDS] [COMMAND ...]\n       cordial [--port PORT] tui\n\nNo command opens the interactive shell. Piped input is a command script.\n\n  --port PORT        USB CDC serial port\n  --json             Print each response and event as one line of protobuf\n                     JSON. File contents are never printed.\n  --timeout SECONDS  Overall one-shot timeout; finite scan duration\n  --version          Print version\n  --help             Show usage";
+const USAGE: &str = "Usage: cordial [--port PORT] [--json] [--timeout SECONDS] [COMMAND ...]\n       cordial [--port PORT] tui\n       cordial migrate --ipc\n\nNo command opens the interactive shell. Piped input is a command script.\n\n  --port PORT        USB CDC serial port\n  --json             Print each response and event as one line of protobuf\n                     JSON. File contents are never printed.\n  --timeout SECONDS  Overall one-shot timeout; finite scan duration\n  --version          Print version\n  --help             Show usage";
 fn main() -> ExitCode {
     let options = match Options::parse(std::env::args().skip(1)) {
         Ok(options) => options,
@@ -39,6 +40,17 @@ fn main() -> ExitCode {
     }
 }
 fn run(options: Options) -> Result<(), String> {
+    if options.args == ["migrate", "--ipc"] {
+        if options.port.is_some() || options.json || !options.timeout.is_zero() {
+            return Err("migrate --ipc takes no other options".into());
+        }
+        let ipc = migration::Ipc::default();
+        let interrupt = ipc.interrupter();
+        ctrlc::set_handler(move || interrupt.interrupt()).map_err(|e| e.to_string())?;
+        return ipc
+            .run(io::stdin(), &mut io::stdout().lock(), &migration::live())
+            .map_err(|e| e.to_string());
+    }
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if options.args.first().is_some_and(|s| s == "tui") {
         if options.args.len() != 1 {
@@ -62,6 +74,7 @@ fn run(options: Options) -> Result<(), String> {
     Script {
         options,
         cancellation,
+        engine: migration::live(),
     }
     .run(io::stdin(), &mut io::stdout(), &mut io::stderr())
     .map_err(|e| e.to_string())

@@ -7,7 +7,7 @@ use super::{
     layout::{self, Choice, Layout, Tone, bold, dim, err, info_style, styled, warn},
     render::{DialogView, PageView, busy, button_if, pill, staged_label},
     words,
-    world::{AdapterView, Conn},
+    world::{AdapterView, Conn, Storage},
 };
 use crate::{
     commands,
@@ -19,6 +19,16 @@ use crate::{
 };
 use cordial_protocol::{self as p, ConfigurationInterface, ErrorCode, Platform, ResourceType};
 use ratatui::text::Line;
+
+/// Whether the adapter takes a restart: connected, with a storage target this version supports and
+/// no migration in hand.
+fn restartable(a: &AdapterView) -> bool {
+    a.connected()
+        && matches!(
+            a.storage,
+            Storage::Normal | Storage::Required | Storage::Blocked(_)
+        )
+}
 
 pub const PLATFORMS: [Platform; 3] = [Platform::Linux, Platform::Windows, Platform::Mac];
 
@@ -218,6 +228,11 @@ impl<F: Fleet> Model<F> {
             Action::Files if a.status.as_ref().is_some_and(model::development) => {
                 self.open_files(id)
             }
+            Action::Restart
+                if restartable(&a) && !self.running(id, |k| matches!(k, Kind::Restart)) =>
+            {
+                self.run(id, Kind::Restart, Command::Restart);
+            }
             Action::Bootloader if a.status.as_ref().is_some_and(model::development) => {
                 self.dialog = Some(Dialog::Bootloader(id.to_owned()));
             }
@@ -359,29 +374,61 @@ impl<F: Fleet> Model<F> {
         v
     }
 
-    /// The bar on Details and Diagnostics: Rename, and Connect or Disconnect.
+    /// The bar on Details and Diagnostics: Rename, and Connect or Disconnect. During a migration,
+    /// Migrate and Cancel replace Rename.
     fn adapter_bar(&self, a: &AdapterView, bar: &mut Layout) {
         if !a.connected()
             && let Some(e) = &a.connect_error
         {
             bar.para(e, err());
         }
-        if a.conn == Conn::Connecting {
+        if let Storage::Failed { text, .. } | Storage::Blocked(text) | Storage::Unsupported(text) =
+            &a.storage
+        {
+            bar.para(text, err());
+        }
+        if a.conn == Conn::Connecting && !matches!(a.storage, Storage::Failed { .. }) {
             bar.line(busy(""));
         }
         let mut right = Layout::new(bar.width);
-        let development = a.status.as_ref().is_some_and(model::development) && a.connected();
+        let development = a.status.as_ref().is_some_and(model::development)
+            && a.connected()
+            && a.storage == Storage::Normal;
         if development && self.tab == Tab::Diagnostics {
             right.button("Files…", Action::Files, Tone::Normal);
+        }
+        if self.tab == Tab::Diagnostics && restartable(a) {
+            button_if(
+                &mut right,
+                "Restart",
+                Action::Restart,
+                Tone::Normal,
+                !self.running(&a.id, |k| matches!(k, Kind::Restart)),
+            );
+        }
+        if development && self.tab == Tab::Diagnostics {
             right.button("Enter Bootloader…", Action::Bootloader, Tone::Danger);
         }
-        button_if(
-            &mut right,
-            "Rename",
-            Action::RenameAdapter(a.id.clone()),
-            Tone::Normal,
-            a.live().is_some(),
-        );
+        if matches!(a.storage, Storage::Required | Storage::Failed { .. }) {
+            right.button("Migrate", Action::Migrate(a.id.clone()), Tone::Primary);
+        }
+        match &a.storage {
+            Storage::Migrating { cancelling, .. } => button_if(
+                &mut right,
+                "Cancel",
+                Action::CancelMigration,
+                Tone::Normal,
+                !cancelling,
+            ),
+            Storage::Failed { .. } => right.button("Cancel", Action::CancelMigration, Tone::Normal),
+            _ => button_if(
+                &mut right,
+                "Rename",
+                Action::RenameAdapter(a.id.clone()),
+                Tone::Normal,
+                a.live().is_some(),
+            ),
+        }
         match a.conn {
             Conn::Connected => right.button(
                 "Disconnect",
@@ -429,10 +476,28 @@ impl<F: Fleet> Model<F> {
     fn empty_state(a: &AdapterView, b: &mut Layout) {
         b.row();
         b.line(styled(a.status_text().0, bold()));
+        if let Storage::Migrating {
+            progress: Some((done, total)),
+            ..
+        } = a.storage
+        {
+            b.section("Migration");
+            let percent = done.saturating_mul(100) / total.max(1);
+            b.fact(
+                "Progress",
+                &format!("{}%", percent.min(100)),
+                layout::plain(),
+            );
+        }
     }
 
-    /// Diagnostics: the adapter's errors, the saved devices it couldn't read, and its ID.
+    /// Diagnostics: the adapter's errors, why its migration failed, the saved devices it couldn't
+    /// read, and its ID.
     fn adapter_diagnostics(&self, a: &AdapterView, b: &mut Layout) {
+        if let Storage::Failed { reason, .. } = &a.storage {
+            b.section("Migration");
+            b.para(&text::display(reason), layout::plain());
+        }
         if let Some(st) = a
             .status
             .as_ref()

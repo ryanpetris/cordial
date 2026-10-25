@@ -122,6 +122,30 @@ fn start(spawner: embassy_executor::Spawner) {
     );
     let serial = Box::leak(format!("{:016X}", u64::from_le_bytes(unique)).into_boxed_str());
     let mut store = storage::open(board::STORAGE_IDENTITY);
+    let build = Build {
+        development: cfg!(feature = "development"),
+        version: FIRMWARE_VERSION,
+        board: board::HARDWARE,
+        default_adapter_name: board::DEFAULT_ADAPTER_NAME,
+        adapter_id: serial.into(),
+        profile_memory_budget: board::PROFILE_MEMORY_BUDGET,
+        restart: || unsafe { sys::esp_restart() },
+        #[cfg(feature = "development")]
+        bootloader: Some(cordial_core::application::Bootloader { enter: bootloader }),
+        #[cfg(feature = "production")]
+        bootloader: None,
+    };
+    let startup = store.as_ref().map_or_else(
+        |error| cordial_core::migration::Startup::Blocked(*error),
+        storage::Storage::startup,
+    );
+    if startup != cordial_core::migration::Startup::Normal {
+        let topology = cordial_usb::Topology::default();
+        USB_IO.set_topology(topology);
+        spawner.spawn(usb_task(serial, topology).unwrap());
+        spawner.spawn(management_task(store, build, startup).unwrap());
+        return;
+    }
     let topology = embassy_futures::block_on(cordial_usb::saved_topology(
         &mut store,
         board::PROFILE_MEMORY_BUDGET.is_some(),
@@ -131,21 +155,25 @@ fn start(spawner: embassy_executor::Spawner) {
     let interfaces = topology.interfaces;
     let available = store.is_ok();
     let (radio, handle, wake) = radio::new(store);
-    let app = Application::new(Build {
-        development: cfg!(feature = "development"),
-        version: FIRMWARE_VERSION,
-        board: board::HARDWARE,
-        default_adapter_name: board::DEFAULT_ADAPTER_NAME,
-        adapter_id: serial.into(),
-        profile_memory_budget: board::PROFILE_MEMORY_BUDGET,
-        #[cfg(feature = "development")]
-        bootloader: Some(cordial_core::application::Bootloader { enter: bootloader }),
-        #[cfg(feature = "production")]
-        bootloader: None,
-    });
+    let app = Application::new(build);
     let owner: &'static App = Box::leak(Box::new(Owner::new(&USB_IO, app, handle, radio)));
     spawner.spawn(usb_task(serial, topology).unwrap());
     radio::spawn(spawner);
     spawner.spawn(priority_task(owner, wake, available).unwrap());
     spawner.spawn(secondary_task(owner, interfaces).unwrap());
+}
+
+#[embassy_executor::task]
+async fn management_task(
+    mut store: Store,
+    build: Build,
+    startup: cordial_core::migration::Startup,
+) {
+    cordial_usb::management::run(
+        &USB_IO,
+        cordial_core::migration::management::Management::new(build, startup),
+        &mut store,
+        || unsafe { sys::esp_restart() },
+    )
+    .await;
 }

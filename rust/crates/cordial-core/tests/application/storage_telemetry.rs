@@ -25,16 +25,12 @@ fn storage_format_is_validated_independently_of_radio_readiness() {
     );
     let valid = t.store.records[&[0; 9]].clone();
 
-    for format in [
-        None,
-        Some(vec![0xff]),
-        Some(
-            storage::Format {
-                format: 1,
-                initialized: true,
-            }
-            .encode_to_vec(),
-        ),
+    for (format, expected) in [
+        (None, None),
+        (Some(vec![0xff]), None),
+        (Some(vec![8, 1, 16, 1]), Some(1)),
+        (Some(vec![8, 99, 16, 1]), Some(99)),
+        (Some(vec![16, 1]), None),
     ] {
         match format {
             Some(bytes) => {
@@ -44,11 +40,34 @@ fn storage_format_is_validated_independently_of_radio_readiness() {
                 t.store.records.remove(&[0; 9]);
             }
         }
-        assert_eq!(t.status().information.unwrap().storage_format, None);
+        let status = t.status();
+        assert!(
+            status
+                .errors
+                .iter()
+                .all(|error| { error.code != p::ErrorCode::StorageMigrationRequired as i32 })
+        );
+        let information = status.information.unwrap();
+        assert_eq!(information.storage_format, expected);
+        assert_eq!(
+            information.target_storage_format,
+            Some(storage::CURRENT_FORMAT)
+        );
+        if expected.is_none() {
+            assert!(status.errors.iter().any(|error| {
+                error.code == p::ErrorCode::StorageFailed as i32
+                    && error.reason == p::ErrorReason::Storage as i32
+            }));
+        }
     }
     t.store.records.insert([0; 9], valid);
     t.store.fail_load = Some([0; 9]);
-    assert_eq!(t.status().information.unwrap().storage_format, None);
+    let information = t.status().information.unwrap();
+    assert_eq!(information.storage_format, None);
+    assert_eq!(
+        information.target_storage_format,
+        Some(storage::CURRENT_FORMAT)
+    );
 }
 
 #[test]

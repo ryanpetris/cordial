@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { AdapterEntry, AppState, DeviceEntry } from "../../shared/state.ts";
-import { adapterStatus, batteryStale, batteryText, connected, deviceStatus } from "../../shared/text.ts";
+import { adapterStatus, batteryStale, batteryText, canRestart, connected, deviceStatus } from "../../shared/text.ts";
 import { act, api, chooseAdapter, reportError } from "../api.ts";
 import type { Selection } from "../App.tsx";
 import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, MenuIcon, PlugIcon, PlusIcon, RefreshIcon } from "./icons.tsx";
@@ -69,7 +69,7 @@ function AdapterMenu({ adapter, x, y, onRename, onClose }: { adapter: AdapterEnt
       popover="manual"
       role="menu"
       className="context-menu"
-      style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - 90) }}
+      style={{ left: Math.min(x, window.innerWidth - 200), top: Math.min(y, window.innerHeight - 130) }}
     >
       {connected ? (
         <button role="menuitem" onClick={run(() => void act({ type: "adapter.disconnect", adapterId: adapter.id }))}>
@@ -82,6 +82,9 @@ function AdapterMenu({ adapter, x, y, onRename, onClose }: { adapter: AdapterEnt
       )}
       <button role="menuitem" disabled={!connected || !adapter.status?.ready} onClick={run(onRename)}>
         Rename
+      </button>
+      <button role="menuitem" disabled={!canRestart(adapter)} onClick={run(() => void act({ type: "adapter.restart", adapterId: adapter.id }))}>
+        Restart
       </button>
     </div>
   );

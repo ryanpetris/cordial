@@ -13,11 +13,15 @@ digits and begins the USB serial number. Classic starts disabled and BLE enabled
 transport does not scan, connect or accept connections. Until saved adapter settings load, the host
 platform reads as Linux and the transport defaults apply.
 
-`Status.information` holds `firmware_version`, `board_name`, `development_build` and `storage_format`, each with
-independent presence. The Dongle always supplies these known values, including false for a
-production build, except `storage_format`, which is the validated `Format.format` version and is
-omitted when unknown. The current storage format is 2, shared by all nine saved
-file messages. A radio failure does not make a validated storage format unknown.
+`Status.information` holds optional `firmware_version`, `board_name`,
+`development_build`, `storage_format` and `target_storage_format`, each with
+independent presence. Firmware always sets `target_storage_format`, including
+when storage is blocked or unreadable. Production firmware reports
+`development_build = false`. The current `storage_format` is the version declared
+by the committed `/format.pb`, omitted when the root is missing, malformed or unreadable. It does
+not prove dataset validity or readiness. `target_storage_format` is the operating
+format required by the firmware, currently `2`, independently of release version.
+A radio failure does not make a known root format unknown.
 `Status.errors` is the complete current set of adapter problems as full `Error`
 messages, ordered and deduplicated by complete error as defined in
 [Errors](limits-and-errors.md#errors). Empty clears all adapter problems. An `adapter` event
@@ -32,6 +36,33 @@ subsystem recovers. An unresolved save reports outcome `UNKNOWN` and keeps stora
 until its outcome is resolved or a restart successfully reloads saved state; radio recovery does
 not clear it. Storage readiness and storage space are separate: `STORAGE_FULL` uses reason
 `STORAGE`, follows its own clearing rule and does not make storage unready.
+
+Clients verify the presence and exact support of `target_storage_format` before
+any interaction except `GetStatus` or closing the connection. An absent or zero
+target prevents migration and normal commands, even when information is present
+and the adapter reports readiness. Assisted mode reports `ready = false`
+and `STORAGE_MIGRATION_REQUIRED` with reason `STORAGE`, outcome `NO_EFFECT` and no related
+errors. This exact error authorizes assisted migration only when there are no
+other errors. `STORAGE_FAILED` blocks it regardless of outcome. The informational
+`storage_format` never selects migration, its source, reconnect behavior or success.
+The downloaded `/format.pb` selects the source and the host validates the complete
+dataset before writes. Without the marker, a fresh client reports readiness and
+errors without file access, even when the informational formats differ or are absent.
+
+Assisted mode and its migration-required marker remain latched until hardware reset,
+including after intermediate and final root uploads. A fresh host can therefore
+validate an already converted dataset and restart without conversion or file writes.
+Root telemetry failures report `STORAGE_FAILED` and do not authorize migration.
+Normal operation never reports the migration-required marker.
+Blocked mode allows `GetStatus` and `Restart`. General
+`Restart` acknowledges before resetting the MCU and reruns ordinary startup
+without a target or strict dataset validator. An active migration worker confirms
+success after reconnecting by stable ID only when the target is unchanged, the
+marker is absent and `ready = true`, with no errors other than the normal warnings
+`STORAGE_FULL`, `PROFILE_MEMORY_LOW`, `USB_REQUIRED_CAPACITY_EXCEEDED` and
+`USB_RESERVED_CAPACITY_EXCEEDED`, each without related errors. While normal startup
+is unready with nothing but those warnings, an active worker continues status checks
+without file access. See [storage migration](commands.md#file-access-and-storage-migration).
 
 ### Resource capacities
 

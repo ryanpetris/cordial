@@ -13,5 +13,6 @@ Homepage: https://github.com/ryanpetris/cordial
 Package: cordial-desktop
 Architecture: amd64
 Depends: ${misc:Depends}, ${shlibs:Depends}, libnotify4, udev
+Suggests: cordial-cli
 Description: Desktop manager for Cordial Bluetooth adapters
  Tray application for Cordial Bluetooth-to-USB keyboard and mouse adapters.

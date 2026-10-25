@@ -15,9 +15,21 @@ mod generated {
 }
 pub use generated::*;
 
-/// The records the Dongle saves in its filesystem, generated from `proto/storage.proto`. Each file
-/// holds one of these messages.
+/// The records the Dongle saves in its filesystem, generated from
+/// `proto/storage/v2/storage.proto`. Each file holds one of these messages.
 pub mod storage;
+
+/// Framed desktop/CLI subprocess messages. Available only to host migration tools.
+#[cfg(feature = "migration")]
+#[allow(clippy::all, clippy::pedantic, missing_docs)]
+pub mod migration {
+    include!(concat!(env!("OUT_DIR"), "/cordial.migration.rs"));
+    #[cfg(feature = "json")]
+    include!(concat!(env!("OUT_DIR"), "/cordial.migration.serde.rs"));
+
+    /// Maximum protobuf payload length after the four-byte little-endian length prefix.
+    pub const MAX_FRAME_BYTES: usize = 65_536;
+}
 
 #[cfg(feature = "json")]
 mod error_json;
@@ -29,3 +41,14 @@ pub const USB_VENDOR_ID: u16 = 0x1209;
 pub const USB_PRODUCT_ID: u16 = 0xc0d1;
 /// The longest request a Dongle accepts, before frame encoding.
 pub const MAX_REQUEST_BYTES: usize = 1024;
+
+/// Conservative migration data chunk length, independent of the serial request envelope.
+pub const STORAGE_MIGRATION_CHUNK_BYTES: usize = 512;
+/// Maximum UTF-8 byte length of an absolute migration dataset path.
+pub const STORAGE_MIGRATION_PATH_BYTES: usize = 192;
+/// Maximum inventory file count accepted by a host before downloading or allocating.
+pub const STORAGE_MIGRATION_MAX_FILES: usize = 16_384;
+/// Maximum checked total input bytes accepted by a host, independent of adapter capacity.
+pub const STORAGE_MIGRATION_MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+/// Host RAM budget for migration input, output and working allocations together.
+pub const STORAGE_MIGRATION_MAX_MEMORY_BYTES: usize = 256 * 1024 * 1024;

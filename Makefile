@@ -178,12 +178,11 @@ check-desktop: desktop/node_modules/.package-lock.json
 check-tools:
 	$(PYTHON) -m unittest discover -s tools -p 'test_*.py'
 	$(PYTHON) -m unittest discover -s rust/tests -p 'test_*.py'
-# Lint and breaking checks cover every schema in proto/. A schema the base release lacks, such as
-# storage.proto before its first release, is new to buf breaking and has nothing to break.
+# Lint covers all schemas; breaking compares serial/IPC and matching storage formats.
 check-protocol: desktop/node_modules/.package-lock.json
 	npm --prefix desktop/packages/protocol run lint
 	if [ -n "$(PROTOCOL_BASE)" ] && git cat-file -e "$(PROTOCOL_BASE):proto/cordial.proto" 2>/dev/null; then
-	  npm --prefix desktop/packages/protocol run breaking -- "../../../.git#ref=$(PROTOCOL_BASE),subdir=proto"
+	  npm --prefix desktop/packages/protocol run breaking -- "$(PROTOCOL_BASE)"
 	fi
 version:
 	@$(PYTHON) tools/version.py

@@ -11,10 +11,18 @@ mod term;
 pub mod text;
 mod tui;
 
-use crate::controller::{Command, Controller, Event, RunOptions, SessionId, State, Ticket};
-use cordial_client::serial::{self, PortInfo};
+use crate::{
+    controller::{Command, Controller, Event, RunOptions, SessionId, State, Ticket},
+    migration::{self, Worker},
+};
+use cordial_client::{
+    migration::{Outcome, Result as MigrationResult},
+    serial::{self, PortInfo},
+};
+use cordial_protocol::migration::MigrationEvent;
 use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use std::{
+    cell::RefCell,
     fmt,
     sync::{
         Arc,
@@ -60,6 +68,10 @@ pub(crate) enum Msg {
     /// An event of one of the TUI's sessions.
     Fleet(u64, Box<Event>),
     Ports(Result<Vec<PortInfo>, String>),
+    /// An event of the running migration.
+    Migration(MigrationEvent),
+    /// The migration worker's result; it has closed its connection.
+    Migrated(MigrationResult<Outcome>),
     Interrupt,
 }
 
@@ -81,16 +93,60 @@ impl Interrupter {
 /// stand-in.
 pub(crate) trait Backend {
     fn open(&self, port: String) -> SessionId;
+    /// Opens `port` for the adapter with ID `id`; another adapter there reports `Phase::Other`.
+    fn open_adapter(&self, port: String, id: String) -> SessionId;
     fn close(&self);
     fn run(&self, command: Command) -> Ticket;
     fn state(&self) -> Option<State>;
     /// Lists adapters off the interface thread; the result arrives as Msg::Ports.
     fn list_ports(&self);
+    /// Migrates an adapter once the session has closed; events arrive as Msg::Migration and
+    /// the result as Msg::Migrated.
+    fn migrate(&self, id: String, port: String);
+    fn cancel_migration(&self);
 }
 
 pub(crate) struct Live {
     controller: Controller,
     tx: SyncSender<Msg>,
+    worker: Migrator,
+}
+
+/// Starts and cancels the migration worker for an interface.
+pub(crate) struct Migrator {
+    tx: SyncSender<Msg>,
+    worker: RefCell<Option<Worker>>,
+}
+impl Migrator {
+    pub(crate) fn new(tx: SyncSender<Msg>) -> Self {
+        Self {
+            tx,
+            worker: RefCell::new(None),
+        }
+    }
+
+    pub(crate) fn start(&self, id: String, port: String) {
+        let (events, done) = (self.tx.clone(), self.tx.clone());
+        let port = (!port.is_empty()).then_some(port);
+        let worker = Worker::start(
+            &migration::live(),
+            id,
+            port,
+            move |e| {
+                let _ = events.send(Msg::Migration(e));
+            },
+            move |result| {
+                let _ = done.send(Msg::Migrated(result));
+            },
+        );
+        *self.worker.borrow_mut() = Some(worker);
+    }
+
+    pub(crate) fn cancel(&self) {
+        if let Some(worker) = &*self.worker.borrow() {
+            worker.cancel();
+        }
+    }
 }
 impl Live {
     pub(crate) fn new(tx: SyncSender<Msg>) -> Self {
@@ -101,12 +157,19 @@ impl Live {
         let controller = Controller::new(move |e| {
             let _ = sink.send(Msg::Controller(Box::new(e)));
         });
-        Self { controller, tx }
+        Self {
+            controller,
+            worker: Migrator::new(tx.clone()),
+            tx,
+        }
     }
 }
 impl Backend for Live {
     fn open(&self, port: String) -> SessionId {
         self.controller.open(port)
+    }
+    fn open_adapter(&self, port: String, id: String) -> SessionId {
+        self.controller.open_adapter(port, id)
     }
     fn close(&self) {
         self.controller.close();
@@ -122,6 +185,12 @@ impl Backend for Live {
         thread::spawn(move || {
             let _ = tx.send(Msg::Ports(serial::ports().map_err(|e| e.to_string())));
         });
+    }
+    fn migrate(&self, id: String, port: String) {
+        self.worker.start(id, port);
+    }
+    fn cancel_migration(&self) {
+        self.worker.cancel();
     }
 }
 

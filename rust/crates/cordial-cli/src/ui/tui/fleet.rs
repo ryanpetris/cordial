@@ -3,7 +3,7 @@
 //! to each adapter.
 use crate::{
     controller::{Command, Controller, RunOptions, State, Ticket},
-    ui::Msg,
+    ui::{Migrator, Msg},
 };
 use cordial_client::serial::{self, PortInfo};
 use std::{
@@ -21,6 +21,9 @@ pub(crate) type Slot = u64;
 pub(crate) trait Fleet {
     /// Opens a session on `port`. Its phases follow as `Msg::Fleet` with the returned slot.
     fn open(&self, port: &str) -> Slot;
+    /// Opens a session on `port` for the adapter with ID `id`, as `open` does. Another adapter
+    /// on the port reports `Phase::Other`.
+    fn open_adapter(&self, port: &str, id: &str) -> Slot;
     /// Closes a session; `Event::Closed` follows for its slot.
     fn close(&self, slot: Slot);
     /// Runs a command on a session; `Event::Done` reports its result.
@@ -29,6 +32,10 @@ pub(crate) trait Fleet {
     fn state(&self, slot: Slot) -> Option<State>;
     /// Lists the attached adapters off the interface thread; the result arrives as `Msg::Ports`.
     fn list_ports(&self);
+    /// Migrates an adapter once every session has closed; events arrive as `Msg::Migration` and
+    /// the result as `Msg::Migrated`.
+    fn migrate(&self, id: &str, port: &str);
+    fn cancel_migration(&self);
 }
 
 pub(crate) struct Live {
@@ -37,11 +44,13 @@ pub(crate) struct Live {
     only: Option<String>,
     controllers: RefCell<HashMap<Slot, Controller>>,
     next: Cell<Slot>,
+    worker: Migrator,
 }
 
 impl Live {
     pub(crate) fn new(tx: SyncSender<Msg>, only: Option<String>) -> Self {
         Self {
+            worker: Migrator::new(tx.clone()),
             tx,
             only,
             controllers: RefCell::new(HashMap::new()),
@@ -50,8 +59,8 @@ impl Live {
     }
 }
 
-impl Fleet for Live {
-    fn open(&self, port: &str) -> Slot {
+impl Live {
+    fn open_as(&self, open: impl FnOnce(&Controller)) -> Slot {
         let slot = self.next.get() + 1;
         self.next.set(slot);
         let sink = self.tx.clone();
@@ -60,9 +69,23 @@ impl Fleet for Live {
         let controller = Controller::new(move |e| {
             let _ = sink.send(Msg::Fleet(slot, Box::new(e)));
         });
-        controller.open(port.to_owned());
+        open(&controller);
         self.controllers.borrow_mut().insert(slot, controller);
         slot
+    }
+}
+
+impl Fleet for Live {
+    fn open(&self, port: &str) -> Slot {
+        self.open_as(|c| {
+            c.open(port.to_owned());
+        })
+    }
+
+    fn open_adapter(&self, port: &str, id: &str) -> Slot {
+        self.open_as(|c| {
+            c.open_adapter(port.to_owned(), id.to_owned());
+        })
     }
 
     fn close(&self, slot: Slot) {
@@ -106,5 +129,13 @@ impl Fleet for Live {
             };
             let _ = tx.send(Msg::Ports(result));
         });
+    }
+
+    fn migrate(&self, id: &str, port: &str) {
+        self.worker.start(id.to_owned(), port.to_owned());
+    }
+
+    fn cancel_migration(&self) {
+        self.worker.cancel();
     }
 }

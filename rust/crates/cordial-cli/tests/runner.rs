@@ -4,6 +4,7 @@ use common::{Dongle, Plan, refusal};
 use cordial_cli::{
     controller::Cancellation,
     error::Error,
+    migration::Engine,
     runner::{Options, Script},
 };
 use cordial_protocol::{self as p, ErrorCode, ResourceType};
@@ -38,6 +39,27 @@ fn run(
     timeout: Duration,
     input: impl Read + Send + 'static,
 ) -> (Result<(), Error>, String, String) {
+    migrating(
+        dongle,
+        args,
+        json,
+        timeout,
+        input,
+        Cancellation::default(),
+        Arc::new(|_, _, _, _| panic!("no migration is expected")),
+    )
+}
+
+/// `run` with a migration engine.
+fn migrating(
+    dongle: &Dongle,
+    args: &[&str],
+    json: bool,
+    timeout: Duration,
+    input: impl Read + Send + 'static,
+    cancellation: Cancellation,
+    engine: Engine,
+) -> (Result<(), Error>, String, String) {
     let mut out = Vec::new();
     let mut diagnostics = Vec::new();
     let result = Script {
@@ -47,7 +69,8 @@ fn run(
             timeout,
             args: args.iter().map(|s| (*s).to_owned()).collect(),
         },
-        cancellation: Cancellation::default(),
+        cancellation,
+        engine,
     }
     .with_connector(input, &mut out, &mut diagnostics, dongle.connector());
     (
@@ -212,7 +235,6 @@ fn flag_parser_rejects_nonfinite_and_preserves_quoted_os_arguments() {
 fn one_shot_status_skips_readiness_and_json_prints_protobuf_messages() {
     let dongle = Dongle::with(|sim| {
         let mut status = common::status(false);
-        status.information.as_mut().unwrap().storage_format = Some(0);
         status
             .resources
             .push(common::resource(ResourceType::Storage, None, Some(65_536)));
@@ -225,7 +247,7 @@ fn one_shot_status_skips_readiness_and_json_prints_protobuf_messages() {
         "{out}"
     );
     assert!(out.contains("  Firmware: 1.2.3"), "{out}");
-    assert!(out.contains("  Storage Format: 0\n"), "{out}");
+    assert!(out.contains("  Storage Format: 2\n"), "{out}");
     assert!(out.contains("  Storage: Up to 64.0 KiB\n"), "{out}");
     assert!(out.contains("  Ready: no"), "{out}");
     // The saved devices aren't listed, so they aren't counted.
@@ -242,7 +264,7 @@ fn one_shot_status_skips_readiness_and_json_prints_protobuf_messages() {
     assert_eq!(lines[0]["response"]["status"]["name"], "Desk");
     assert_eq!(lines[0]["response"]["status"]["id"], "ADAPTER01");
     let status = &lines[0]["response"]["status"];
-    assert_eq!(status["information"]["storage_format"], 0, "{status}");
+    assert_eq!(status["information"]["storage_format"], 2, "{status}");
     let storage = status["resources"]
         .as_array()
         .unwrap()
@@ -524,7 +546,9 @@ fn file_get_saves_records_as_json_unless_raw() {
 
 #[test]
 fn production_firmware_refuses_development_commands_locally() {
-    let dongle = Dongle::with(|sim| sim.status.information = None);
+    let dongle = Dongle::with(|sim| {
+        sim.status.information.as_mut().unwrap().development_build = Some(false);
+    });
     let (result, _, _) = script(&dongle, &["file", "list", "/"], false, b"");
     assert_eq!(
         result.unwrap_err().message,
@@ -935,4 +959,393 @@ fn profile_commands_need_firmware_with_profiles() {
     assert!(!dongle.sent().contains(&"create_profile"));
     assert!(!dongle.sent().contains(&"list_profiles"));
     assert!(!dongle.sent().contains(&"set_device"));
+}
+
+fn needs_migration(sim: &mut common::Sim) {
+    sim.status.ready = false;
+    sim.status.information.as_mut().unwrap().storage_format = Some(1);
+    sim.status.errors = vec![p::Error {
+        code: ErrorCode::StorageMigrationRequired as i32,
+        reason: p::ErrorReason::Storage as i32,
+        outcome: p::ErrorOutcome::NoEffect as i32,
+        ..Default::default()
+    }];
+}
+
+/// The adapter after a migration and restart.
+fn restarted(sim: &mut common::Sim) {
+    sim.status.ready = true;
+    sim.status.errors.clear();
+    sim.status.information.as_mut().unwrap().storage_format = Some(2);
+}
+
+/// An engine that finds every port released, then migrates the simulated adapter after `delay`
+/// as the worker would, or fails.
+fn engine(dongle: &Dongle, delay: Duration, fail: bool) -> (Engine, Arc<AtomicBool>) {
+    let (dongle, called) = (dongle.clone(), Arc::new(AtomicBool::new(false)));
+    let seen = called.clone();
+    let engine: Engine = Arc::new(move |id, port, cancelled, report| {
+        assert_eq!(dongle.handles(), 0, "a port was still open");
+        assert_eq!((id, port), ("ADAPTER01", Some("simulated")));
+        seen.store(true, Ordering::SeqCst);
+        report(p::migration::MigrationEvent {
+            event: Some(p::migration::migration_event::Event::Waiting(
+                Default::default(),
+            )),
+        });
+        let end = Instant::now() + delay;
+        while Instant::now() < end {
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(cordial_client::migration::Outcome::Cancelled);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        if fail {
+            return Err(cordial_client::migration::Error {
+                reason: "the adapter refused a write".into(),
+                outcome_unknown: true,
+            });
+        }
+        restarted(&mut dongle.0.lock().unwrap());
+        Ok(cordial_client::migration::Outcome::Success)
+    });
+    (engine, called)
+}
+
+#[test]
+fn a_one_shot_command_migrates_the_adapter_first_and_reopens_it() {
+    let dongle = Dongle::with(|sim| {
+        needs_migration(sim);
+        sim.files.insert("/".into(), Vec::new());
+    });
+    // The wait outlasts the timeout: a migration has no time limit.
+    let (engine, called) = engine(&dongle, Duration::from_millis(300), false);
+    let (result, out, diagnostics) = migrating(
+        &dongle,
+        &["file", "list", "/"],
+        false,
+        Duration::from_millis(200),
+        io::empty(),
+        Cancellation::default(),
+        engine,
+    );
+    assert!(called.load(Ordering::SeqCst));
+    // The file listing runs only on the migrated adapter's new session.
+    result.unwrap();
+    assert_eq!(dongle.sent()[..2], ["get_status", "get_status"]);
+    assert!(dongle.sent().contains(&"list_files"));
+    assert_eq!(dongle.sessions(), 2);
+    assert!(diagnostics.contains("Migrating the adapter's saved data"));
+    assert!(diagnostics.contains("Waiting for the adapter"));
+    assert!(diagnostics.contains("Migrated the adapter's saved data."));
+    assert!(!out.contains("Migrat"));
+}
+
+#[test]
+fn migrate_reports_its_result_or_that_nothing_needed_it() {
+    let dongle = Dongle::with(needs_migration);
+    let (engine, _) = engine(&dongle, Duration::ZERO, false);
+    let (result, out, diagnostics) = migrating(
+        &dongle,
+        &["migrate"],
+        false,
+        Duration::ZERO,
+        io::empty(),
+        Cancellation::default(),
+        engine,
+    );
+    result.unwrap();
+    assert_eq!(out, "Migrated the adapter's saved data.\n");
+    assert!(!diagnostics.contains("Migrated"));
+
+    let dongle = Dongle::default();
+    let (result, out, _) = script(&dongle, &["migrate"], false, b"");
+    result.unwrap();
+    assert_eq!(out, "The adapter's saved data doesn't need migration.\n");
+    assert_eq!(dongle.sent()[0], "get_status");
+}
+
+#[test]
+fn a_failed_migration_ends_the_script_without_reopening() {
+    let dongle = Dongle::with(needs_migration);
+    let (engine, _) = engine(&dongle, Duration::ZERO, true);
+    let (result, _, _) = migrating(
+        &dongle,
+        &["adapter", "bootloader"],
+        false,
+        Duration::ZERO,
+        io::empty(),
+        Cancellation::default(),
+        engine,
+    );
+    let e = result.unwrap_err();
+    assert_eq!(
+        e.message,
+        "Cordial couldn't confirm whether the adapter saved its migrated data: the adapter refused a write"
+    );
+    assert_eq!(dongle.sent(), ["get_status"]);
+    assert_eq!(dongle.sessions(), 1);
+}
+
+/// Runs a script whose connector opens `connect(port, opens so far)`, with an engine that
+/// migrates each adapter the dongles name and records the IDs it migrated.
+fn adapters(
+    args: &[&str],
+    input: &'static [u8],
+    dongles: Vec<Dongle>,
+    connect: impl Fn(&str, usize) -> usize + Send + Sync + 'static,
+    migrates: bool,
+) -> (Result<(), Error>, String, Vec<String>) {
+    let migrated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (seen, all) = (migrated.clone(), dongles.clone());
+    let engine: Engine = Arc::new(move |id, _, _, _| {
+        let dongle = all
+            .iter()
+            .find(|d| d.0.lock().unwrap().status.id == id)
+            .unwrap();
+        assert_eq!(dongle.handles(), 0, "a port was still open");
+        seen.lock().unwrap().push(id.to_owned());
+        if migrates {
+            restarted(&mut dongle.0.lock().unwrap());
+        }
+        Ok(cordial_client::migration::Outcome::Success)
+    });
+    let opens = std::sync::atomic::AtomicUsize::new(0);
+    let mut out = Vec::new();
+    let result = Script {
+        options: Options {
+            port: Some("simulated".into()),
+            json: false,
+            timeout: Duration::ZERO,
+            args: args.iter().map(|s| (*s).to_owned()).collect(),
+        },
+        cancellation: Cancellation::default(),
+        engine,
+    }
+    .with_connector(
+        Cursor::new(input),
+        &mut out,
+        &mut Vec::new(),
+        move |port, handler| {
+            let n = opens.fetch_add(1, Ordering::SeqCst);
+            dongles[connect(port, n)].connect(handler)
+        },
+    );
+    let migrated = migrated.lock().unwrap().clone();
+    (result, String::from_utf8(out).unwrap(), migrated)
+}
+
+fn second(sim: &mut common::Sim) {
+    needs_migration(sim);
+    sim.status.id = "ADAPTER02".into();
+    sim.files.insert("/".into(), Vec::new());
+}
+
+#[test]
+fn a_script_migrates_each_adapter_it_selects() {
+    let (a, b) = (Dongle::with(needs_migration), Dongle::with(second));
+    let (result, _, migrated) = adapters(
+        &[],
+        b"adapter select other\nfile list /\n",
+        vec![a.clone(), b.clone()],
+        |port, _| usize::from(port == "other"),
+        true,
+    );
+    result.unwrap();
+    assert_eq!(migrated, ["ADAPTER01", "ADAPTER02"]);
+    assert!(b.sent().contains(&"list_files"));
+}
+
+#[test]
+fn an_adapter_that_still_needs_migration_is_not_migrated_again() {
+    let a = Dongle::with(needs_migration);
+    let (result, _, migrated) = adapters(
+        &["adapter", "status"],
+        b"",
+        vec![a.clone()],
+        |_, _| 0,
+        false,
+    );
+    assert!(result.unwrap_err().message.contains("must be migrated"));
+    assert_eq!(migrated, ["ADAPTER01"]);
+    assert_eq!(a.sent(), ["get_status", "get_status"]);
+}
+
+#[test]
+fn another_adapter_on_the_migrated_adapters_port_receives_only_status() {
+    let a = Dongle::with(needs_migration);
+    let other = Dongle::with(|sim| sim.status.id = "ADAPTER02".into());
+    let (result, _, migrated) = adapters(
+        &["file", "list", "/"],
+        b"",
+        vec![a.clone(), other.clone()],
+        |_, n| usize::from(n > 0),
+        true,
+    );
+    assert!(result.unwrap_err().message.contains("another adapter"));
+    assert_eq!(migrated, ["ADAPTER01"]);
+    assert_eq!(other.sent(), ["get_status"]);
+    assert_eq!(other.handles(), 0);
+}
+
+#[test]
+fn ctrl_c_cancels_the_migration_and_waits_for_the_worker() {
+    let dongle = Dongle::with(needs_migration);
+    let (engine, called) = engine(&dongle, Duration::from_secs(60), false);
+    let cancellation = Cancellation::default();
+    let signal = cancellation.clone();
+    let watcher = called.clone();
+    thread::spawn(move || {
+        while !watcher.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        signal.cancel();
+    });
+    let started = Instant::now();
+    let (result, _, _) = migrating(
+        &dongle,
+        &["adapter", "status"],
+        false,
+        Duration::ZERO,
+        io::empty(),
+        cancellation,
+        engine,
+    );
+    assert_eq!(result.unwrap_err().message, "interrupted");
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(dongle.sessions(), 1);
+}
+
+#[test]
+fn an_unsupported_adapter_takes_only_status() {
+    let dongle = Dongle::with(|sim| {
+        sim.status
+            .information
+            .as_mut()
+            .unwrap()
+            .target_storage_format = Some(3);
+    });
+    for args in [&["file", "list", "/"][..], &["adapter", "restart"]] {
+        let (result, _, _) = script(&dongle, args, false, b"");
+        assert!(result.unwrap_err().message.contains("Update Cordial"));
+    }
+    assert_eq!(dongle.sent(), ["get_status", "get_status"]);
+}
+
+#[test]
+fn an_adapter_without_a_target_never_starts_migration_or_sends_commands() {
+    for marker in [false, true] {
+        let dongle = Dongle::with(|sim| {
+            if marker {
+                needs_migration(sim);
+            }
+            sim.status.ready = true;
+            let information = sim.status.information.as_mut().unwrap();
+            information.storage_format = Some(2);
+            information.target_storage_format = None;
+        });
+        let (worker, called) = engine(&dongle, Duration::ZERO, false);
+        for args in [
+            &["device", "list"][..],
+            &["file", "list", "/"],
+            &["adapter", "restart"],
+            &["migrate"],
+        ] {
+            let (result, _, _) = migrating(
+                &dongle,
+                args,
+                false,
+                Duration::ZERO,
+                io::empty(),
+                Cancellation::default(),
+                worker.clone(),
+            );
+            assert!(result.unwrap_err().message.contains("firmware"));
+        }
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(dongle.sent(), ["get_status"; 4]);
+        assert_eq!(dongle.handles(), 0);
+    }
+}
+
+#[test]
+fn a_blocked_adapter_reports_its_error_and_takes_only_status_and_restart() {
+    for current in [None, Some(1)] {
+        let dongle = Dongle::with(|sim| {
+            needs_migration(sim);
+            sim.status.information.as_mut().unwrap().storage_format = current;
+            sim.status.errors.push(refusal(ErrorCode::StorageFailed));
+            sim.files.insert("/".into(), Vec::new());
+        });
+        let (worker, called) = engine(&dongle, Duration::ZERO, false);
+        for args in [
+            &["device", "list"][..],
+            &["file", "list", "/"],
+            &["migrate"],
+        ] {
+            let (result, _, _) = migrating(
+                &dongle,
+                args,
+                false,
+                Duration::ZERO,
+                io::empty(),
+                Cancellation::default(),
+                worker.clone(),
+            );
+            let e = result.unwrap_err().message;
+            let plain = "the adapter couldn't read or write its saved data";
+            // A refused direct command names the code, as other adapter refusals do.
+            let wanted = if args[0] == "file" {
+                format!("storage_failed: {plain}")
+            } else {
+                plain.into()
+            };
+            assert_eq!(e, wanted, "{args:?}");
+        }
+        assert!(!called.load(Ordering::SeqCst));
+        let (result, out, _) = script(&dongle, &["adapter", "restart"], false, b"");
+        result.unwrap();
+        assert_eq!(out, "The adapter is restarting.\n");
+        assert!(!dongle.sent().contains(&"list_files"));
+        assert_eq!(dongle.sent().last(), Some(&"restart"));
+    }
+}
+
+#[test]
+fn restart_runs_without_migration_or_readiness() {
+    let dongle = Dongle::with(needs_migration);
+    let (worker, called) = engine(&dongle, Duration::ZERO, false);
+    let (result, out, _) = migrating(
+        &dongle,
+        &["adapter", "restart"],
+        false,
+        Duration::ZERO,
+        io::empty(),
+        Cancellation::default(),
+        worker,
+    );
+    result.unwrap();
+    assert_eq!(out, "The adapter is restarting.\n");
+    assert!(!called.load(Ordering::SeqCst));
+    assert_eq!(dongle.sent(), ["get_status", "restart"]);
+
+    // Without the marker the adapter never migrates, even while it's unready.
+    let dongle = Dongle::with(|sim| {
+        sim.status.ready = false;
+        sim.status.errors = vec![refusal(ErrorCode::NotReady)];
+        sim.status.errors[0].reason = p::ErrorReason::Storage as i32;
+    });
+    let (worker, called) = engine(&dongle, Duration::ZERO, false);
+    let (result, _, _) = migrating(
+        &dongle,
+        &["adapter", "restart"],
+        false,
+        Duration::ZERO,
+        io::empty(),
+        Cancellation::default(),
+        worker,
+    );
+    result.unwrap();
+    assert!(!called.load(Ordering::SeqCst));
+    assert_eq!(dongle.sent(), ["get_status", "restart"]);
 }

@@ -18,6 +18,29 @@ pub enum Conn {
     Disconnected,
 }
 
+/// Whether the TUI may use the adapter's saved data, and its migration.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Storage {
+    #[default]
+    Normal,
+    /// The saved data must be migrated; Migrate starts it.
+    Required,
+    Migrating {
+        waiting: bool,
+        cancelling: bool,
+        /// Bytes done and in all, of the current step.
+        progress: Option<(u64, u64)>,
+    },
+    /// The migration failed: what to tell the user, and the worker's reason. Nothing opens
+    /// until Migrate tries again or Cancel ends it.
+    Failed { text: String, reason: String },
+    /// The adapter waits for a migration, but another error, shown here, stops Cordial from
+    /// running one. Restart still works.
+    Blocked(String),
+    /// This version of Cordial can't use the adapter, and why.
+    Unsupported(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct AdapterView {
     pub id: String,
@@ -35,6 +58,7 @@ pub struct AdapterView {
     /// Saved devices the adapter's last listing couldn't read and that this session has no record
     /// of, with why, in ID order.
     pub unreadable: Vec<(u32, p::Error)>,
+    pub storage: Storage,
 }
 
 impl AdapterView {
@@ -42,9 +66,11 @@ impl AdapterView {
         self.conn == Conn::Connected
     }
 
-    /// The adapter's status when it is ready: shown, and locked unless connected.
+    /// The adapter's status when it is ready and usable: shown, and locked unless connected.
     pub fn view(&self) -> Option<&p::Status> {
-        self.status.as_ref().filter(|s| s.ready)
+        self.status
+            .as_ref()
+            .filter(|s| s.ready && self.storage == Storage::Normal)
     }
 
     /// The status of a connected adapter that is ready.
@@ -54,6 +80,15 @@ impl AdapterView {
 
     /// The adapter's status in a few words, and whether it needs attention.
     pub fn status_text(&self) -> (&'static str, bool) {
+        match &self.storage {
+            Storage::Normal => {}
+            Storage::Migrating { waiting: true, .. } => return ("Waiting for Adapter", false),
+            Storage::Migrating { .. } => return ("Migrating…", false),
+            Storage::Unsupported(_) => return ("Unsupported", true),
+            Storage::Required | Storage::Blocked(_) | Storage::Failed { .. } => {
+                return ("Needs Attention", true);
+            }
+        }
         match self.conn {
             Conn::Disconnected => ("Disconnected", false),
             Conn::Connecting => ("Connecting…", false),
@@ -183,10 +218,26 @@ impl<F: Fleet> Model<F> {
                 } else {
                     Vec::new()
                 },
+                storage: s.storage.clone(),
             });
         }
+        if let Some(m) = &self.migration {
+            adapters.push(AdapterView {
+                id: m.id.clone(),
+                name: adapter_name(&m.status, &m.id),
+                conn: Conn::Connecting,
+                ready: false,
+                status: Some(m.status.clone()),
+                attention: Vec::new(),
+                failed: false,
+                connect_error: None,
+                unreadable: Vec::new(),
+                storage: m.storage(),
+            });
+        }
+        let migrating = self.migration.as_ref().map(|m| m.id.as_str());
         for (id, h) in &self.held {
-            if self.sessions.iter().any(|s| &s.id == id) {
+            if self.sessions.iter().any(|s| &s.id == id) || migrating == Some(id) {
                 continue;
             }
             adapters.push(AdapterView {
@@ -199,10 +250,11 @@ impl<F: Fleet> Model<F> {
                 failed: false,
                 connect_error: None,
                 unreadable: Vec::new(),
+                storage: Storage::Normal,
             });
         }
         for (id, o) in &self.off {
-            if o.port.is_none() {
+            if o.port.is_none() || migrating == Some(id) {
                 continue;
             }
             adapters.push(AdapterView {
@@ -219,6 +271,7 @@ impl<F: Fleet> Model<F> {
                 failed: false,
                 connect_error: o.error.clone(),
                 unreadable: Vec::new(),
+                storage: Storage::Normal,
             });
         }
         adapters.sort_by(|a, b| order(&a.name, &b.name).then_with(|| a.id.cmp(&b.id)));

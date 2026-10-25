@@ -351,6 +351,7 @@ fn general_text(code: ErrorCode) -> Option<&'static str> {
         }
         ProfileMemoryExceeded => "the adapter doesn't have room for this device's profiles",
         ProfileLoadFailed => "the adapter couldn't read one of this device's profiles",
+        StorageMigrationRequired => "the adapter's saved data must be migrated before use",
         _ => return None,
     })
 }
@@ -571,15 +572,34 @@ fn outcome_words(e: &p::Error) -> Option<&'static str> {
 /// An explanation followed by what the error's reason concerns, its outcome and each related
 /// failure. A related failure's own details stay inside its parentheses.
 fn detailed(e: &p::Error, explanation: String) -> String {
+    described(e, explanation, related_line)
+}
+
+/// `detailed`, with each related failure as `related` words it.
+fn described(e: &p::Error, explanation: String, related: fn(&p::Error) -> String) -> String {
     let mut parts = vec![explanation];
     parts.extend(context_words(e).map(str::to_owned));
     parts.extend(outcome_words(e).map(str::to_owned));
-    parts.extend(
-        e.related
-            .iter()
-            .map(|r| format!("also ({})", related_line(r))),
-    );
+    parts.extend(e.related.iter().map(|r| format!("also ({})", related(r))));
     parts.join("; ")
+}
+
+/// Explains an adapter error and its related failures in words alone, without any codes.
+pub fn plain_text(e: &p::Error) -> String {
+    let explanation = match known_code(e) {
+        None | Some(ErrorCode::Unknown) => {
+            "the adapter reported an error this version of Cordial doesn't recognize".into()
+        }
+        Some(code) => reason_words(e).map_or_else(|| code_text(code, None), str::to_owned),
+    };
+    described(e, explanation, plain_text)
+}
+
+/// Why a blocked adapter can't be migrated, in words alone.
+pub fn blocked_line(e: &Error) -> String {
+    e.dongle
+        .as_ref()
+        .map_or_else(|| e.message.clone(), plain_text)
 }
 
 /// A related failure with its code. It concerns a step other than the command's own, such as a
@@ -1411,6 +1431,7 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
         Outcome::Name { name, reset: false } => format!("Adapter renamed to {}.", display(name)),
         Outcome::Platform(p) => format!("Platform set to {}.", platform_name(*p)),
         Outcome::Transport(t, on) => format!("{} {}.", transport_long(*t), enabled_word(*on)),
+        Outcome::Restart => "The adapter is restarting.".into(),
         Outcome::Bootloader => "The adapter is restarting into its bootloader.".into(),
         Outcome::ScanStarted(transports) => format!(
             "Discovery started ({}).",
@@ -2183,6 +2204,7 @@ mod tests {
                 board_name: None,
                 development_build: Some(false),
                 storage_format: Some(0),
+                target_storage_format: Some(2),
             }),
             transports: vec![p::TransportSupport {
                 transport: Transport::Ble as i32,

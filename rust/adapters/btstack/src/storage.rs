@@ -134,7 +134,7 @@ impl<S: RecordStore> Storage<S> {
 }
 
 impl<S: RecordStore> RecordStore for Handle<'_, S> {
-    // Development file inspection remains available after a native storage fault.
+    // Development file commands remain available after a native storage fault.
     async fn generation(&mut self) -> Result<u64, Error> {
         self.0
             .store
@@ -166,6 +166,38 @@ impl<S: RecordStore> RecordStore for Handle<'_, S> {
             .try_lock()
             .map_err(|_| Error::Unavailable)?
             .file_read(path, offset, bytes)
+            .await
+    }
+    async fn file_size(&mut self, path: &str) -> Result<Option<usize>, Error> {
+        self.0
+            .store
+            .try_lock()
+            .map_err(|_| Error::Unavailable)?
+            .file_size(path)
+            .await
+    }
+    async fn file_write(&mut self, path: &str, offset: u32, data: &[u8]) -> Result<(), Error> {
+        self.0
+            .store
+            .try_lock()
+            .map_err(|_| Error::Unavailable)?
+            .file_write(path, offset, data)
+            .await
+    }
+    async fn file_move(&mut self, source: &str, destination: &str) -> Result<(), Error> {
+        self.0
+            .store
+            .try_lock()
+            .map_err(|_| Error::Unavailable)?
+            .file_move(source, destination)
+            .await
+    }
+    async fn file_delete(&mut self, path: &str) -> Result<(), Error> {
+        self.0
+            .store
+            .try_lock()
+            .map_err(|_| Error::Unavailable)?
+            .file_delete(path)
             .await
     }
     async fn next_key(&mut self, after: Option<RecordKey>) -> Result<Option<RecordKey>, Error> {

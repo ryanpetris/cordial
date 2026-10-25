@@ -195,7 +195,8 @@ impl Tui {
             if model.done {
                 break;
             }
-            if model.quitting() {
+            // A migration's worker is always waited for.
+            if model.quitting() && !model.migrating() {
                 let since = *closing.get_or_insert_with(Instant::now);
                 if since.elapsed() > CLOSE_LIMIT {
                     break;

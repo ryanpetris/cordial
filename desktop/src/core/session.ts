@@ -8,13 +8,16 @@
 // when the adapter has profiles, the profiles, then each device's settings.
 // The Profiles list and the profile picker show the listed profiles a page at
 // a time; profiles in a device's layers or selected by a configuration
-// interface that the listing hasn't named are named with GetProfile.
+// interface that the listing hasn't named are named with GetProfile. Nothing is listed until the
+// adapter is ready, and an adapter whose saved data this app can't use gets no request after its
+// opening status.
 import { Connection, ConnectionClosedError, CordialError, UnexpectedResponseError, settingsRef, type ByteStream } from "@cordial/client";
 import { OutputMode, Platform, type Event, type Request, type Response, type SetAdapter, type SetDevice } from "@cordial/protocol";
 import type { AdapterStatus, DeviceRecord, Profile, ProfilePage, Setting, SettingsChange, WireError } from "../shared/state.ts";
 import { sameField } from "../shared/settings.ts";
 import { asSentence, errorText } from "../shared/text.ts";
 import * as convert from "./convert.ts";
+import { storageGate, type StorageGate } from "./migration.ts";
 
 export interface SessionHooks {
   /** Some adapter state visible to the user changed. */
@@ -71,6 +74,8 @@ function inactiveAfter(d: DeviceRecord): DeviceRecord["inactive"] {
 
 export class AdapterSession {
   status: AdapterStatus;
+  /** Whether this app can use the adapter's saved data, from its latest status. */
+  gate: StorageGate = { kind: "unknown" };
   readonly devices = new Map<number, DeviceRecord>();
   /** What has been listed and reported of each device's settings, in the adapter's order. */
   readonly settings = new Map<number, Setting[]>();
@@ -132,7 +137,7 @@ export class AdapterSession {
       log: (message) => receiver.session.#hooks.log(message),
     });
     // Callbacks during the handshake have already applied the status and any later adapter event.
-    session.status ??= convert.status(session.#connection.status);
+    if (!session.status) session.#setStatus(session.#connection.status);
     return session;
   }
 
@@ -155,6 +160,7 @@ export class AdapterSession {
     this.#receiver = opened.#receiver;
     this.#receiver.session = this;
     this.status = opened.status;
+    this.gate = opened.gate;
     this.#unavailable();
     this.#syncing = null;
     this.#syncAgain = false;
@@ -214,7 +220,7 @@ export class AdapterSession {
       return;
     }
     const connection = this.#connection;
-    if (connection.closed) return;
+    if (connection.closed || this.gate.kind !== "current" || !this.status.ready) return;
     this.#syncing = (async () => {
       do {
         this.#syncAgain = false;
@@ -586,7 +592,10 @@ export class AdapterSession {
   #setStatus(status: Parameters<typeof convert.status>[0]) {
     const next = convert.status(status);
     // Another adapter can't answer on this session; keep the identity it opened with.
-    if (!this.status || next.id === this.status.id) this.status = next;
+    if (!this.status || next.id === this.status.id) {
+      this.status = next;
+      this.gate = storageGate(status);
+    }
     if (!this.status.ready) this.#unavailable();
     void this.#nameReferences();
   }

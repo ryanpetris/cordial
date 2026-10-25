@@ -133,6 +133,7 @@ export function AdapterPage({
   const [renameError, setRenameError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [connectError, setConnectError] = useState<string | null>(null);
+  const [migrateError, setMigrateError] = useState<string | null>(null);
   const [editing, setEditing] = useState(renaming);
   useEffect(() => setEditing(renaming), [renaming]);
   const [chosen, setTab] = useState<AdapterTab>("details");
@@ -204,6 +205,14 @@ export function AdapterPage({
     if (!result.ok) setConnectError(result.message);
   };
   const connectFailure = connected ? null : (adapter.connectError ?? connectError);
+  const migration = adapter.migration;
+  const migrating = !!migration && ["starting", "migrating", "waiting", "cancelling"].includes(migration.phase);
+  const failure = migration?.message ?? (migration?.canStart ? migrateError : null) ?? connectFailure;
+  const migrate = async () => {
+    setMigrateError(null);
+    const result = await runQuiet({ type: "migration.start", adapterId: adapter.id });
+    if (!result.ok) setMigrateError(result.message);
+  };
   const devices = state.devices.filter((d) => d.adapterId === adapter.id);
   const threshold = state.preferences.lowBatteryPercent;
   const transports = s?.transports ?? [];
@@ -256,11 +265,22 @@ export function AdapterPage({
           </>
         ) : (
           <>
-            {connectFailure ? <span className="bar-start error-text">{connectFailure}</span> : null}
-            {busy || quietBusy || adapter.connection === "connecting" || adapter.connection === "reconnecting" ? <Spinner /> : null}
-            <button disabled={!ready} onClick={() => setEditing(true)}>
-              <PencilIcon /> Rename
-            </button>
+            {failure ? <span className="bar-start error-text">{failure}</span> : null}
+            {busy || quietBusy || migrating || adapter.connection === "connecting" || (adapter.connection === "reconnecting" && !migration) ? <Spinner /> : null}
+            {migration?.canStart ? (
+              <button className="suggested" disabled={quietBusy} onClick={() => void migrate()}>
+                <SwapIcon /> Migrate
+              </button>
+            ) : null}
+            {migration?.canCancel ? (
+              <button disabled={migration.phase === "cancelling"} onClick={() => void run({ type: "migration.cancel" })}>
+                <CloseIcon /> Cancel
+              </button>
+            ) : (
+              <button disabled={!ready} onClick={() => setEditing(true)}>
+                <PencilIcon /> Rename
+              </button>
+            )}
             {connected ? (
               <button disabled={busy} onClick={() => void run({ type: "adapter.disconnect", adapterId: adapter.id })}>
                 <UnplugIcon /> Disconnect
@@ -385,6 +405,13 @@ export function AdapterPage({
         ) : (
           <>
             {s ? null : empty}
+            {migration?.progress ? (
+              <Card title="Migration">
+                <div className="row meter-row">
+                  <Meter fraction={migration.progress.total ? migration.progress.completed / migration.progress.total : 0} />
+                </div>
+              </Card>
+            ) : null}
             {devices.length ? (
               <Card title="Devices">
                 {devices.map((d) => {

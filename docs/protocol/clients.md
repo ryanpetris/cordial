@@ -73,6 +73,65 @@ protobuf `Message`, including nested envelopes and all repeated listing batches.
 desktop and web clients do not apply this limit. See
 [Rust host receive limit](transport.md#rust-host-receive-limit) for overflow and session behavior.
 
+## Storage migration
+
+All clients check the exact `Status.information.target_storage_format` before
+any interaction except bootstrap status or closing the connection. A missing,
+zero or unsupported target allows nothing else. The committed
+`storage_format` is shown but never decides whether to migrate. Clients don't
+infer migration success from readiness alone, an empty command response or a
+subprocess exit. While firmware runs an on-device migration, clients only
+bootstrap, wait or close.
+
+Host assistance starts automatically only when `Status.errors` holds
+`ERROR_CODE_STORAGE_MIGRATION_REQUIRED` with reason `STORAGE`, outcome `NO_EFFECT` and no
+related errors, and holds nothing else. Any other error, including a radio
+error, blocks it: clients show the first such error and allow only status and
+`Restart`. Without the marker, clients use the adapter as usual and never
+migrate or restart it on their own.
+
+The host downloads all dataset files into RAM, determines the source from
+`/format.pb` and validated mixed files, and chooses a supported forward graph
+path before writing anything. A dataset already in the target format needs no
+conversion. The host verifies each uploaded file and writes the root last for
+each checkpoint, then sends `Restart`. See
+[preserving migration](../storage-format.md#preserving-migration) for readback
+checks, limits and temporary replacement files.
+
+`Restart` is also an ordinary command. The CLI's `adapter restart` and the TUI's
+Restart button on the adapter's Diagnostics tab send it whenever the target is
+supported, without waiting for readiness or migration. The adapter refuses it with
+`ERROR_CODE_BUSY` while a pairing or setup link is open.
+
+The desktop runs assisted conversion in a CLI subprocess. Before starting it,
+the desktop closes every adapter and stops discovery, probes and automatic
+reconnect globally. CLI and TUI migration use the same exclusivity through their
+direct coordinator. Migration reconnects indefinitely by stable `Status.id`;
+a port is only a discovery hint and never authorizes using another adapter.
+A response lost during a write requires readback after reconnect before retry.
+
+[`proto/migration.proto`](../../proto/migration.proto) defines subprocess IPC.
+Each stdin `MigrationControl` and stdout `MigrationEvent` has a four-byte
+unsigned little-endian length prefix followed by 1..65,536 protobuf bytes.
+Receivers validate the length before allocation or decoding. Zero, oversized,
+malformed or truncated frames fail closed; pipe write boundaries have no
+meaning. Stdout contains only framed events, and diagnostics use stderr. There
+is no IPC version counter.
+
+The parent sends exactly one start, naming the stable adapter ID and an optional
+port hint. Events report progress, waiting for reconnect, committed root
+checkpoints, failure, verified success or explicit cancellation. An intermediate
+checkpoint event reports a root upload and readback, without completing migration
+or restarting the adapter. Success requires reconnecting to the same ID and
+verifying the requested target, `Status.ready = true` and the absence of
+`ERROR_CODE_STORAGE_MIGRATION_REQUIRED`.
+
+The desktop stays globally suspended until verified success and child exit, or
+explicit user cancellation and child exit. Failure, EOF, lost stdin, unknown
+event variants and child exit alone never authorize resuming connections. On
+explicit cancellation the child stops issuing file commands, closes its adapter
+and exits; a partial temporary file may remain for cleanup on resume.
+
 ## CLI
 
 `cordial --port PORT` opens the shell; `cordial --port PORT COMMAND ...` runs one command, and piped
@@ -86,10 +145,13 @@ before using the CLI.
 | CLI command | Behavior |
 | --- | --- |
 | `adapter list` / `adapter select PORT` | List attached adapters, or switch to one. |
+| `migrate` / `migrate cancel` | Migrate the selected adapter's saved data, or cancel an active migration in the shell. |
+| `cordial migrate --ipc` | Run the desktop's migration helper using framed protobuf on stdin/stdout. Exit 0 means verified success; cancellation and failure exit 1. |
 | `adapter status` | Identity, readiness, platform, storage format and usage, and each supported transport with whether it is enabled and its limits. Device counts appear once the saved devices are listed. |
 | `adapter set name NAME` / `adapter reset name` | Save the adapter name, or restore the firmware default. Quote names containing spaces. |
 | `adapter set platform linux\|windows\|mac` | Save the host platform. |
 | `adapter set transport classic\|ble enabled on\|off` | Enable or disable a transport. Lists only the transports the firmware supports. |
+| `adapter restart` | Restart the adapter. Works while it is unready or needs migration. |
 | `adapter bootloader` | Development firmware: reboot into programming mode. |
 | `scan start [classic\|ble] [SECONDS]` / `scan stop` | Discover devices on every enabled transport or one, for 10 seconds by default. |
 | `pair start CANDIDATE` | Pair a discovered candidate. |
@@ -133,9 +195,16 @@ silently between duplicate names. Setting paths name typed fields, such as `keyb
   on failure. `--timeout SECONDS` bounds a one-shot command and sets the length of a one-shot scan.
   A one-shot `pair start` finds the candidate by name within the same invocation, since candidate
   IDs last only for the session. A timeout never undoes a bond already saved.
+- Required assisted migration runs automatically before ordinary commands. The shell and scripts
+  close their sessions before the migration worker starts. Migration reconnects have no deadline;
+  time spent migrating does not consume a one-shot command's timeout. Ctrl-C cancels migration and
+  waits for the worker to release the adapter.
 - Before sending, the CLI refuses what the Dongle would refuse, using what it already knows (see
   [Client pre-checks](limits-and-errors.md#client-pre-checks)); when the Dongle refuses anyway, the
   error is shown and nothing is retried.
+  An unready adapter without a validated target storage format accepts only status requests.
+  Debug file access and bootloader commands remain available during a radio failure when the
+  adapter reports its validated storage format.
 - Output is human-readable and rendered safely for the terminal. `--json` instead prints every
   response and event as one line of protobuf JSON with the schema's field names. File contents
   are never printed: the response of `file get` is not shown.
@@ -157,7 +226,7 @@ $ cordial --port PORT
 ### Downloaded records
 
 The adapter sends a file's bytes as it saved them; it never converts them. Each saved record holds
-one message from `proto/storage.proto`, named by its path as listed in the [storage
+one message from `proto/storage/v2/storage.proto`, named by its path as listed in the [storage
 format](../storage-format.md#files). `file get` decodes a file at such a path and saves the message
 as indented protobuf JSON with the schema's field names, including `format`, the
 mapping `--json` uses, under the destination name with `.json` in place of `.pb`.
@@ -173,6 +242,11 @@ says why. `--raw` saves the bytes unconverted under the destination name as give
 The TUI uses Ratatui and Crossterm and the same commands as the CLI. It follows the desktop
 application's layout, words and staging rules in the terminal, and opens a session with every
 attached adapter; `--port` limits it to that one port.
+
+Required assisted migration starts automatically. The TUI closes every adapter and suspends
+discovery and reconnects until migration succeeds or the user cancels and the worker exits.
+The adapter page provides Migrate and Cancel controls. A failed migration stays suspended;
+cancelling prevents an immediate automatic retry.
 
 - Discovery: it lists the attached adapters every second, opens each new port that matches the
   [USB discovery descriptors](transport.md#discovery), and shows an adapter once its first

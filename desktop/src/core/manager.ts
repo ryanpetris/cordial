@@ -4,7 +4,7 @@
 import { serialMatches, type ByteStream, type PortInfo } from "@cordial/client";
 import type { Event, Request, Response } from "@cordial/protocol";
 import type { AdapterStatus } from "../shared/state.ts";
-import { clean } from "../shared/text.ts";
+import { MIGRATION_TEXT, clean } from "../shared/text.ts";
 import { AdapterSession } from "./session.ts";
 
 export interface ManagerDeps {
@@ -42,6 +42,7 @@ const BURST_MS = [0, 300, 1000, 3000];
 /** Keeps configuration pages mounted while USB re-enumerates. */
 const RECONNECT_MS = 15000;
 const RETRY_MS = 500;
+const BUSY = MIGRATION_TEXT.busy;
 
 export class AdapterManager {
   readonly connected = new Map<string, Connected>();
@@ -55,6 +56,10 @@ export class AdapterManager {
   #scanning: Promise<void> | null = null;
   #scanAgain = false;
   #stopped = false;
+  /** While suspended, no port is listed or opened. */
+  #suspended = false;
+  /** Connect actions in progress. */
+  readonly #connects = new Set<Promise<string | null>>();
 
   constructor(deps: ManagerDeps) {
     this.#deps = deps;
@@ -62,13 +67,14 @@ export class AdapterManager {
 
   /** Rescans now and a few times shortly after, as after a hotplug event. */
   burst() {
-    if (this.#stopped) return;
+    if (this.#stopped || this.#suspended) return;
     for (const t of this.#timers) clearTimeout(t);
     this.#timers = BURST_MS.map((ms) => setTimeout(() => void this.rescan(), ms));
   }
 
   /** Serializes port enumeration; each path probes independently of the next enumeration. */
   rescan(): Promise<void> {
+    if (this.#suspended) return Promise.resolve();
     if (this.#scanning) {
       this.#scanAgain = true;
       return this.#scanning;
@@ -82,17 +88,17 @@ export class AdapterManager {
         } catch (error) {
           this.#deps.log(`listing serial ports failed: ${(error as Error).message}`);
         }
-      } while (this.#scanAgain && !this.#stopped);
+      } while (this.#scanAgain && !this.#stopped && !this.#suspended);
       this.#scanning = null;
     })();
     return this.#scanning;
   }
 
   async #scan(recovering: Map<string, Connected>) {
-    if (this.#stopped) return;
+    if (this.#stopped || this.#suspended) return;
     for (const [id, c] of this.connected) if (c.serial !== null) recovering.set(id, c);
     const ports = await this.#deps.listPorts();
-    if (this.#stopped) return;
+    if (this.#stopped || this.#suspended) return;
     const paths = new Set(ports.map((p) => p.path));
     let changed = false;
     for (const c of this.connected.values()) {
@@ -138,7 +144,7 @@ export class AdapterManager {
       const id = session.adapterId;
       const entry = this.connected.get(id);
       const expired = recovering.has(id) && recovering.get(id) !== entry;
-      if (expired || this.#stopped || this.disconnected.has(id) || (entry &&
+      if (expired || this.#stopped || this.#suspended || this.disconnected.has(id) || (entry &&
         (!entry.recovery || !entry.session.closed || !port.serial || !serialMatches(port.serial, id)))) {
         await session.close();
         // A disconnected adapter found on another port, such as after being
@@ -159,7 +165,7 @@ export class AdapterManager {
       if (entry) {
         await this.#closing.get(id)?.done;
         if (session.closed) this.#deps.log(`${port.path}: session ended while opening`);
-        if (session.closed || this.connected.get(id) !== entry || this.#stopped || !entry.recovery || !entry.session.closed) {
+        if (session.closed || this.connected.get(id) !== entry || this.#stopped || this.#suspended || !entry.recovery || !entry.session.closed) {
           await session.close();
           return;
         }
@@ -191,7 +197,7 @@ export class AdapterManager {
         this.#deps.log(`${path}: ${(error as Error).message}`);
         return null;
       }
-      if (cancelled || this.#stopped) {
+      if (cancelled || this.#stopped || this.#suspended) {
         await transport.close().catch(() => {});
         return null;
       }
@@ -263,7 +269,7 @@ export class AdapterManager {
   }
 
   #recover(entry: Connected) {
-    if (entry.recovery || this.#stopped) return;
+    if (entry.recovery || this.#stopped || this.#suspended) return;
     if (entry.serial === null) {
       this.connected.delete(entry.id);
       return;
@@ -294,7 +300,15 @@ export class AdapterManager {
   }
 
   /** Opens a disconnected adapter again. Resolves with an error message. */
-  async connect(id: string): Promise<string | null> {
+  connect(id: string): Promise<string | null> {
+    if (this.#suspended) return Promise.resolve(BUSY);
+    const connecting = this.#connect(id);
+    this.#connects.add(connecting);
+    void connecting.finally(() => this.#connects.delete(connecting));
+    return connecting;
+  }
+
+  async #connect(id: string): Promise<string | null> {
     if (this.#stopped) return "This adapter is no longer available.";
     const d = this.disconnected.get(id);
     if (!d || d.connecting) return null;
@@ -315,11 +329,12 @@ export class AdapterManager {
       return "The adapter isn't plugged in.";
     }
     const serial = (await this.#deps.listPorts().catch(() => [])).find((p) => p.path === path)?.serial ?? null;
-    const session = await this.#open(path);
+    const session = this.#suspended ? null : await this.#open(path);
     d.connecting = false;
-    if (this.#stopped) {
+    if (this.#stopped || this.#suspended) {
       await session?.close();
-      return "This adapter is no longer available.";
+      this.#deps.changed();
+      return this.#stopped ? "This adapter is no longer available." : BUSY;
     }
     if (!session || session.closed || session.adapterId !== id) {
       await session?.close();
@@ -333,6 +348,39 @@ export class AdapterManager {
     this.disconnected.delete(id);
     this.#register(id, path, session, serial);
     return null;
+  }
+
+  /**
+   * Closes every adapter's port and waits until each is released, including ports still opening
+   * or probing, and opens none until resume(). Disconnected adapters stay listed.
+   */
+  async suspend() {
+    this.#suspended = true;
+    for (const t of this.#timers) clearTimeout(t);
+    this.#timers = [];
+    for (;;) {
+      for (const c of this.connected.values()) this.#clearRecovery(c);
+      const sessions = [...this.connected.values()].map((c) => c.session);
+      this.connected.clear();
+      const work = [
+        ...[...this.#opening.values()].map((opening) => opening.cancel()?.catch(() => {})),
+        ...this.#probing.values(),
+        ...this.#connects,
+        ...[...this.#closing.values()].map((c) => c.done),
+        ...sessions.map((s) => s.close().catch(() => {})),
+        this.#scanning,
+      ];
+      if (!work.some(Boolean)) break;
+      this.#deps.changed();
+      await Promise.all(work);
+    }
+  }
+
+  /** Lists and opens ports again after suspend(). */
+  resume() {
+    if (!this.#suspended) return;
+    this.#suspended = false;
+    this.burst();
   }
 
   /** Closes every session in an orderly way. */

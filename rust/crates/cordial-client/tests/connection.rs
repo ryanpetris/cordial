@@ -222,6 +222,7 @@ fn oversized_frame(response: bool) -> Vec<u8> {
         message::Kind::Response(p::Response {
             result: Some(response::Result::File(p::FileData {
                 data: vec![1; HOST_RECEIVE_LIMIT],
+                ..Default::default()
             })),
         })
     } else {
@@ -246,6 +247,7 @@ fn exact_limit_response_frame() -> (Vec<u8>, usize) {
         kind: Some(message::Kind::Response(p::Response {
             result: Some(response::Result::File(p::FileData {
                 data: vec![1; data_len],
+                ..Default::default()
             })),
         })),
     };

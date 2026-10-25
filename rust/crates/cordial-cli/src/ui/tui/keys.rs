@@ -530,6 +530,8 @@ impl<F: Fleet> Model<F> {
                 self.menu = None;
                 return self.disconnect_adapter(id);
             }
+            Action::Migrate(id) => return self.migrate_adapter(id),
+            Action::CancelMigration => return self.cancel_migration(),
             Action::RenameAdapter(id) => {
                 self.menu = None;
                 let page = Page::Adapter(id.clone());

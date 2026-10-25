@@ -1,0 +1,108 @@
+// Desktop/CLI migration IPC. Each stdin control and stdout event is one protobuf message
+// prefixed by its unsigned 32-bit byte length in four little-endian bytes. Length must be
+// 1..65536 before allocation or decoding; zero, oversize, malformed and truncated frames fail
+// closed. Write boundaries have no meaning. stdout contains only framed events; diagnostics
+// use stderr. There is no IPC version counter. Unknown oneof variants never authorize resume.
+syntax = "proto3";
+
+package cordial.migration;
+
+// The desktop closes ALL adapters and stops discovery, probes and reconnect before starting
+// the subprocess. It remains globally suspended until verified success AND child exit, or an
+// explicit user cancellation AND child exit. Failure, EOF or child exit alone do not release it.
+// CLI and TUI use the same global exclusivity through their direct coordinator.
+message MigrationControl {
+  oneof action {
+    MigrationStart start = 1;
+    MigrationCancel cancel = 2;
+  }
+}
+
+// Exactly one start per child. The CLI checks exact target schema support before any adapter
+// interaction except bootstrap status/close. Once host assistance is required and the target is
+// supported, it downloads all files into RAM, determines the source from /format.pb and validates
+// mixed files, then chooses a supported forward graph path to the target before any writes.
+// All source files and conversion output stay in RAM, with no host files or backups. Before
+// download/allocation, check at most 16,384 inventory files and a checked total <= 64 MiB of input,
+// independent of adapter capacity. Budget input + output + working allocations within 256 MiB.
+// Unsupported sizes stop before writes. These host safety limits do not change serial limits.
+message MigrationStart {
+  // Required. Stable Status.id. Never substitute another adapter at the hinted port.
+  string adapter_id = 1;
+  // Optional discovery hint. Reconnect by adapter_id indefinitely until explicit cancellation.
+  string port_hint = 2;
+}
+
+// Explicit user cancellation. The child stops issuing file commands, closes its adapter and
+// exits. A partial temporary file may remain for cleanup when migration resumes. A lost stdin
+// stream is a failure, not proof of explicit cancellation or permission to resume.
+message MigrationCancel {}
+
+message MigrationEvent {
+  oneof event {
+    MigrationProgress progress = 1;
+    MigrationWaiting waiting = 2;
+    MigrationCheckpoint checkpoint = 3;
+    MigrationFailure failure = 4;
+    MigrationSuccess success = 5;
+    MigrationCancelled cancelled = 6;
+  }
+}
+
+message MigrationProgress {
+  MigrationPhase phase = 1;
+  // Source determined from the downloaded root and mixed-file validation. Zero while unknown.
+  uint32 source_format = 2;
+  uint32 target_format = 3;
+  // Current checkpoint destination, which need not equal the firmware target.
+  uint32 checkpoint_format = 4;
+  // Optional dataset path currently being transferred, never a host filesystem path.
+  string path = 5;
+  uint64 completed_bytes = 6;
+  uint64 total_bytes = 7;
+}
+
+enum MigrationPhase {
+  MIGRATION_PHASE_UNKNOWN = 0;
+  MIGRATION_PHASE_PREFLIGHT = 1;
+  MIGRATION_PHASE_DOWNLOAD = 2;
+  MIGRATION_PHASE_CONVERT = 3;
+  MIGRATION_PHASE_UPLOAD = 4;
+  MIGRATION_PHASE_VERIFY = 5;
+  MIGRATION_PHASE_DELETE = 6;
+  MIGRATION_PHASE_CHECKPOINT = 7;
+  MIGRATION_PHASE_CONFIRM = 8;
+}
+
+// Reconnection has no timeout. A write with an unknown outcome must be verified after reconnect.
+message MigrationWaiting {
+  string adapter_id = 1;
+  string port_hint = 2;
+  bool verifying_uncertain_write = 3;
+}
+
+// The host has uploaded and read back /format.pb last for this step. An intermediate checkpoint
+// does not complete migration or restart the adapter.
+message MigrationCheckpoint {
+  uint32 committed_format = 1;
+  uint32 target_format = 2;
+}
+
+// Does not permit the desktop to resume its connections, even if the child subsequently exits.
+message MigrationFailure {
+  // Diagnostic detail. The desktop owns any user-facing presentation.
+  string reason = 1;
+  bool outcome_unknown = 2;
+}
+
+// Sent only after reconnecting to the same stable Status.id and verifying the requested target,
+// Status.ready and the absence of STORAGE_MIGRATION_REQUIRED. The desktop also waits for child exit
+// before resuming its connections.
+message MigrationSuccess {
+  string adapter_id = 1;
+  uint32 target_format = 2;
+}
+
+// Acknowledges explicit cancellation after adapter handles are closed. The desktop also waits
+// for child exit. Mixed storage still requires host assistance for a later resume.
+message MigrationCancelled {}

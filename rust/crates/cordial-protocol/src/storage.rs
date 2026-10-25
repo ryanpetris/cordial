@@ -3,13 +3,23 @@
 use alloc::vec::Vec;
 use prost::encoding::{WireType, decode_key, decode_varint};
 
+/// Operating format 2 records. The same types are re-exported directly from this module.
 #[allow(clippy::all, clippy::pedantic, missing_docs)]
-mod generated {
-    include!(concat!(env!("OUT_DIR"), "/cordial.storage.rs"));
+pub mod v2 {
+    include!(concat!(env!("OUT_DIR"), "/cordial.storage.v2.rs"));
     #[cfg(feature = "json")]
-    include!(concat!(env!("OUT_DIR"), "/cordial.storage.serde.rs"));
+    include!(concat!(env!("OUT_DIR"), "/cordial.storage.v2.serde.rs"));
 }
-pub use generated::*;
+pub use v2::*;
+
+/// Historical format 1 records for host-side conversion. Firmware does not enable this feature.
+#[cfg(feature = "historical-storage")]
+#[allow(clippy::all, clippy::pedantic, missing_docs)]
+pub mod v1 {
+    include!(concat!(env!("OUT_DIR"), "/cordial.storage.v1.rs"));
+    #[cfg(feature = "json")]
+    include!(concat!(env!("OUT_DIR"), "/cordial.storage.v1.serde.rs"));
+}
 
 /// The format written by every storage file writer.
 pub const CURRENT_FORMAT: u32 = 2;
@@ -123,6 +133,10 @@ impl FormatReader {
 }
 
 /// Extracts exactly one nonzero uint32 format field without interpreting the payload schema.
+///
+/// Only `/format.pb` reliably identifies a dataset's source schema. Format 1 payloads do not
+/// carry a format header: `Sequence.next_device = 2` also encodes as tag 1 with value 2.
+/// Apply this reader to other files only after the root selects a schema with per-file headers.
 pub fn extract_format(bytes: &[u8]) -> Result<u32, FormatError> {
     let mut reader = FormatReader::default();
     reader.feed(bytes)?;

@@ -7,6 +7,7 @@ use crate::{
     commands::STARTING,
     controller::{Command, Event, Outcome, Phase, SessionId, State, Ticket},
     error::Error,
+    migration::{self, Gate},
     model::{self, Prompt},
     ui::{
         Backend, Interrupter, Live, Msg, UiError, UiOptions,
@@ -17,7 +18,11 @@ use crate::{
         text::{self, Filter, safe},
     },
 };
-use cordial_client::serial::PortInfo;
+use cordial_client::{
+    migration::{Outcome as Migrated, Result as MigrationResult},
+    serial::PortInfo,
+};
+use cordial_protocol::migration::{MigrationEvent, migration_event};
 use ratatui::crossterm::{
     cursor,
     event::{KeyCode, KeyEvent, KeyModifiers},
@@ -25,7 +30,7 @@ use ratatui::crossterm::{
     terminal::{self as crossterm_terminal, Clear, ClearType},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{self, Write},
     sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
     time::{Duration, Instant},
@@ -46,6 +51,32 @@ struct Job {
     /// state of the session that replaced it.
     session: Option<SessionId>,
 }
+
+/// A migration, which owns every adapter connection while it lasts.
+struct Migration {
+    id: String,
+    /// The port the adapter was on, where the worker looks first.
+    port: String,
+    stage: Stage,
+    /// The worker has started; it exits before the migration ends.
+    started: bool,
+    /// The worker waits for the adapter to return.
+    waiting: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Stage {
+    /// The session is closing; the worker starts once it has released its port.
+    Closing,
+    Running,
+    Cancelling,
+    /// The worker failed. Nothing opens until the user cancels or migrates again.
+    Failed,
+}
+
+const MIGRATING: &str = "Migrating the adapter's saved data…";
+const MIGRATED: &str = "Migrated the adapter's saved data.";
+const MIGRATION_CANCELLED: &str = "Migration cancelled.";
 
 pub(crate) struct Model<B: Backend> {
     backend: B,
@@ -71,6 +102,9 @@ pub(crate) struct Model<B: Backend> {
     pub(crate) output: Vec<String>,
     /// The wait for the adapter to return after its connection dropped.
     reconnect: Option<Reconnect>,
+    migration: Option<Migration>,
+    /// Adapters whose migration the user cancelled; they migrate again only with migrate.
+    declined: HashSet<String>,
 }
 
 impl<B: Backend> Model<B> {
@@ -95,6 +129,8 @@ impl<B: Backend> Model<B> {
             jobs: HashMap::new(),
             output: Vec::new(),
             reconnect: None,
+            migration: None,
+            declined: HashSet::new(),
         };
         match port {
             Some(port) => m.open(port),
@@ -128,10 +164,11 @@ impl<B: Backend> Model<B> {
     /// Opens a port the user chose, replacing any open in progress.
     fn open(&mut self, port: String) {
         self.reconnect = None;
-        self.open_port(port);
+        self.open_port(port, None);
     }
 
-    fn open_port(&mut self, port: String) {
+    /// Opens a port, for the adapter with ID `id` when given.
+    fn open_port(&mut self, port: String, id: Option<String>) {
         if self.quitting {
             return;
         }
@@ -140,14 +177,156 @@ impl<B: Backend> Model<B> {
         self.preparing = false;
         self.port = port.clone();
         self.auth_key.clear();
-        self.opening = Some(self.backend.open(port));
+        self.opening = Some(match id {
+            Some(id) => self.backend.open_adapter(port, id),
+            None => self.backend.open(port),
+        });
     }
 
+    /// Closes the session. A running migration is cancelled first, and the shell ends once its
+    /// worker has exited.
     pub(crate) fn quit(&mut self) {
-        if !self.quitting {
-            self.quitting = true;
-            self.backend.close();
+        if self.quitting {
+            return;
         }
+        self.quitting = true;
+        match &mut self.migration {
+            None => self.backend.close(),
+            Some(m) if m.stage == Stage::Running => {
+                m.stage = Stage::Cancelling;
+                self.backend.cancel_migration();
+            }
+            Some(m) if m.stage == Stage::Failed => {
+                self.migration = None;
+                self.done = true;
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Whether a migration owns the adapter connections.
+    pub(crate) fn migrating(&self) -> bool {
+        self.migration.is_some()
+    }
+
+    /// Closes the session and migrates its adapter once the port is released.
+    fn begin_migration(&mut self, id: String) {
+        self.declined.remove(&id);
+        self.migration = Some(Migration {
+            id,
+            port: self.port.clone(),
+            stage: Stage::Closing,
+            started: false,
+            waiting: false,
+        });
+        self.session = None;
+        self.opening = None;
+        self.preparing = false;
+        self.reconnect = None;
+        self.backend.close();
+        self.log(MIGRATING);
+    }
+
+    fn start_worker(&mut self) {
+        if let Some(m) = &mut self.migration {
+            m.stage = Stage::Running;
+            m.started = true;
+            m.waiting = false;
+            self.backend.migrate(m.id.clone(), m.port.clone());
+        }
+    }
+
+    /// Ends the migration and opens its adapter again once it is found. Unless the migration
+    /// succeeded, the adapter migrates again only with migrate.
+    fn resume(&mut self, succeeded: bool) {
+        let Some(m) = self.migration.take() else {
+            return;
+        };
+        if !succeeded {
+            self.declined.insert(m.id.clone());
+        }
+        self.port = m.port;
+        self.reconnect = Reconnect::new(&m.id, &Error::new("the adapter didn't return"));
+    }
+
+    /// `migrate`: migrates the adapter, or tries a failed migration again.
+    fn migrate_command(&mut self) {
+        if let Some(m) = &self.migration {
+            if m.stage == Stage::Failed {
+                self.log(MIGRATING);
+                self.start_worker();
+            } else {
+                self.log(format!("Error: {}", migration::BUSY));
+            }
+            return;
+        }
+        let Some(st) = self.state() else {
+            return self
+                .log("Error: no adapter selected; use adapter list and adapter select PORT");
+        };
+        match migration::gate(&st.status) {
+            Gate::Assist => self.begin_migration(st.status.id),
+            Gate::Normal => self.log("The adapter's saved data doesn't need migration."),
+            Gate::Blocked(e) => self.log(format!("Error: {}", safe(&text::blocked_line(&e)))),
+            Gate::Unsupported(e) => self.log(format!("Error: {}", safe(&e.message))),
+        }
+    }
+
+    /// `migrate cancel`: stops the migration, or ends a failed one and resumes.
+    fn cancel_command(&mut self) {
+        let Some(m) = &mut self.migration else {
+            return self.log("Error: no migration is running");
+        };
+        match m.stage {
+            Stage::Running => {
+                m.stage = Stage::Cancelling;
+                self.backend.cancel_migration();
+            }
+            Stage::Closing => m.stage = Stage::Cancelling,
+            Stage::Cancelling => {}
+            Stage::Failed => self.cancelled(),
+        }
+    }
+
+    fn migration_event(&mut self, event: MigrationEvent) {
+        let Some(m) = &mut self.migration else { return };
+        match event.event {
+            Some(migration_event::Event::Waiting(_)) if !m.waiting => {
+                m.waiting = true;
+                self.log("Waiting for the adapter…");
+            }
+            Some(migration_event::Event::Progress(_)) => m.waiting = false,
+            _ => {}
+        }
+    }
+
+    /// The worker exited with its result.
+    fn migrated(&mut self, result: MigrationResult<Migrated>) {
+        let Some(m) = &mut self.migration else { return };
+        if self.quitting {
+            self.migration = None;
+            self.done = true;
+            return;
+        }
+        match result {
+            Ok(Migrated::Success) => {
+                self.log(MIGRATED);
+                self.resume(true);
+            }
+            // A cancellation the user asked for ends the migration however the worker ended.
+            Ok(Migrated::Cancelled) => self.cancelled(),
+            Err(_) if m.stage == Stage::Cancelling => self.cancelled(),
+            Err(e) => {
+                m.stage = Stage::Failed;
+                m.waiting = false;
+                self.log(format!("Error: {}", safe(&migration::failure_text(&e))));
+            }
+        }
+    }
+
+    fn cancelled(&mut self) {
+        self.log(MIGRATION_CANCELLED);
+        self.resume(false);
     }
 
     fn run(&mut self, command: Command, filter: Option<Filter>) {
@@ -223,6 +402,8 @@ impl<B: Backend> Model<B> {
                 }
             }
             Msg::Ports(result) => self.ports_listed(result),
+            Msg::Migration(e) => self.migration_event(e),
+            Msg::Migrated(result) => self.migrated(result),
             Msg::Controller(e) => self.controller(*e),
             Msg::Key(k) => self.key(k),
         }
@@ -231,13 +412,12 @@ impl<B: Backend> Model<B> {
 
     fn ports_listed(&mut self, result: Result<Vec<PortInfo>, String>) {
         // A failed listing is tried again.
-        if let Some(port) = self
-            .reconnect
-            .as_mut()
-            .and_then(|r| r.listed(result.as_deref().unwrap_or_default()))
+        if let Some(r) = &mut self.reconnect
+            && let Some(port) = r.listed(result.as_deref().unwrap_or_default())
             && self.opening.is_none()
         {
-            self.open_port(port);
+            let id = r.id.clone();
+            self.open_port(port, Some(id));
         }
         if std::mem::take(&mut self.listing) {
             match &result {
@@ -259,11 +439,21 @@ impl<B: Backend> Model<B> {
 
     fn controller(&mut self, e: Event) {
         match e {
-            Event::Closed => {
-                if self.quitting {
-                    self.done = true;
+            Event::Closed => match &self.migration {
+                Some(m) if !m.started => {
+                    if self.quitting {
+                        self.migration = None;
+                        self.done = true;
+                    } else if m.stage == Stage::Cancelling {
+                        self.cancelled();
+                    } else {
+                        self.start_worker();
+                    }
                 }
-            }
+                Some(_) => {}
+                None if self.quitting => self.done = true,
+                None => {}
+            },
             Event::Connection { session, phase, .. } => self.connection(session, phase),
             Event::Notice { session, notice } => {
                 if Some(session) == self.session {
@@ -295,12 +485,40 @@ impl<B: Backend> Model<B> {
                 let port = safe(&self.port);
                 self.log(format!("Connected to {port}. Use help for commands."));
             }
+            Phase::Migrate | Phase::Blocked(_) | Phase::Unsupported(_)
+                if self.opening == Some(session) =>
+            {
+                self.opening = None;
+                if self.quitting {
+                    return;
+                }
+                self.reconnect = None;
+                self.session = Some(session);
+                let port = safe(&self.port);
+                self.log(format!("Connected to {port}."));
+                match phase {
+                    Phase::Blocked(e) => {
+                        return self.log(format!("Error: {}", safe(&text::blocked_line(&e))));
+                    }
+                    Phase::Unsupported(e) => {
+                        return self.log(format!("Error: {}", safe(&e.message)));
+                    }
+                    _ => {}
+                }
+                let id = self.state().map(|st| st.status.id).unwrap_or_default();
+                if self.declined.contains(&id) {
+                    self.log(format!("Error: {}", migration::REQUIRED));
+                } else {
+                    self.begin_migration(id);
+                }
+            }
             Phase::Ready if self.session == Some(session) => self.preparing = false,
-            Phase::Failed { open: false, .. }
+            Phase::Failed { open: false, .. } | Phase::Other
                 if (self.opening == Some(session) || self.session == Some(session))
                     && self.reconnect.is_some() =>
             {
-                // The returning adapter's port may not open at first.
+                // The returning adapter's port may not open at first, or may briefly answer
+                // for another adapter.
                 self.opening = None;
                 self.session = None;
                 self.preparing = false;
@@ -319,7 +537,7 @@ impl<B: Backend> Model<B> {
                 if open {
                     // The session stays for diagnosis and recovery.
                     self.log(format!(
-                        "Error: {line}. adapter status, file list, file get and adapter bootloader still work; use adapter select to retry."
+                        "Error: {line}. adapter status, adapter restart, file list, file get and adapter bootloader still work; use adapter select to retry."
                     ));
                 } else {
                     self.session = None;
@@ -462,8 +680,26 @@ impl<B: Backend> Model<B> {
             Ok(line) => line,
             Err(e) => return self.log(format!("Error: {}", safe(&e))),
         };
+        if let Some(m) = &self.migration
+            && !matches!(
+                parsed,
+                Line::Quit | Line::Help(_) | Line::Migrate | Line::MigrateCancel
+            )
+        {
+            let why = if m.stage == Stage::Failed {
+                format!(
+                    "{}. Use migrate to try again or migrate cancel to stop",
+                    migration::FAILED
+                )
+            } else {
+                migration::BUSY.to_owned()
+            };
+            return self.log(format!("Error: {why}"));
+        }
         let (command, filter) = match parsed {
             Line::Quit => return self.quit(),
+            Line::Migrate => return self.migrate_command(),
+            Line::MigrateCancel => return self.cancel_command(),
             Line::Select(port) => return self.open(port),
             Line::Help(topic) => {
                 return self.log(command::help_on(self.state().as_ref(), topic.as_deref()));
@@ -493,10 +729,19 @@ impl<B: Backend> Model<B> {
         if self.opening.is_some() {
             lines.push("Opening adapter…".to_owned());
         }
-        if self
-            .state()
-            .is_some_and(|st| st.available && !st.status.ready)
-        {
+        if let Some(m) = &self.migration {
+            lines.push(
+                match m.stage {
+                    Stage::Failed => "Needs Attention",
+                    _ if m.waiting => "Waiting for Adapter",
+                    _ => "Migrating…",
+                }
+                .to_owned(),
+            );
+        }
+        if self.state().is_some_and(|st| {
+            st.available && !st.status.ready && matches!(migration::gate(&st.status), Gate::Normal)
+        }) {
             lines.push("Waiting for adapter…".to_owned());
         }
         if self.quitting {
@@ -600,7 +845,8 @@ impl Shell {
             if model.done {
                 break;
             }
-            if model.quitting {
+            // A migration's worker is always waited for.
+            if model.quitting && !model.migrating() {
                 let since = *closing.get_or_insert_with(Instant::now);
                 if since.elapsed() > CLOSE_LIMIT {
                     break;
@@ -852,7 +1098,7 @@ mod tests {
             },
         })));
         assert!(m.output.last().unwrap().ends_with(
-            "adapter status, file list, file get and adapter bootloader still work; use adapter select to retry."
+            "adapter status, adapter restart, file list, file get and adapter bootloader still work; use adapter select to retry."
         ));
     }
 
@@ -946,7 +1192,13 @@ mod tests {
                 port: "/dev/ttyACM1".into(),
                 serial: "0123456789ABCDEF".into(),
             }])));
-            assert_eq!(app.calls().last(), Some(&Call::Open("/dev/ttyACM1".into())));
+            assert_eq!(
+                app.calls().last(),
+                Some(&Call::OpenAdapter(
+                    "/dev/ttyACM1".into(),
+                    "0123456789ABCDEF".into()
+                ))
+            );
             let session = app.fake.next.get();
             app.connection(session, Phase::Opened);
             assert!(app.m.reconnect.is_none());
@@ -995,7 +1247,10 @@ mod tests {
         app.m.reconnect.as_mut().unwrap().hurry();
         app.m.tick();
         app.m.update(Msg::Ports(Ok(vec![adapter("/dev/ttyACM1")])));
-        assert_eq!(app.calls().last(), Some(&Call::Open("/dev/ttyACM1".into())));
+        assert_eq!(
+            app.calls().last(),
+            Some(&Call::OpenAdapter("/dev/ttyACM1".into(), "ADAPTER".into()))
+        );
         let session = app.fake.next.get();
         // The port may not open at first.
         app.connection(
@@ -1076,7 +1331,10 @@ mod tests {
             ["> adapter list", "/dev/ttyACM1  ADAPTER"],
             "the listing is printed as well as followed"
         );
-        assert_eq!(app.calls().last(), Some(&Call::Open("/dev/ttyACM1".into())));
+        assert_eq!(
+            app.calls().last(),
+            Some(&Call::OpenAdapter("/dev/ttyACM1".into(), "ADAPTER".into()))
+        );
 
         // Choosing another port ends the wait, so the adapter isn't reopened over it.
         let mut app = App::new();
@@ -1122,7 +1380,7 @@ mod tests {
         }
         fn last_open(&self) -> Option<String> {
             self.calls().into_iter().rev().find_map(|c| match c {
-                Call::Open(port) => Some(port),
+                Call::Open(port) | Call::OpenAdapter(port, _) => Some(port),
                 _ => None,
             })
         }
@@ -1283,7 +1541,13 @@ mod tests {
             port: "/dev/ttyACM1".into(),
             serial: "0123456789ABCDEF-vial:f64c2b3c".into(),
         }])));
-        assert_eq!(app.calls().last(), Some(&Call::Open("/dev/ttyACM1".into())));
+        assert_eq!(
+            app.calls().last(),
+            Some(&Call::OpenAdapter(
+                "/dev/ttyACM1".into(),
+                "0123456789ABCDEF".into()
+            ))
+        );
         let session = app.fake.next.get();
         app.connection(session, Phase::Opened);
         assert!(app.m.reconnect.is_none());
@@ -1302,5 +1566,241 @@ mod tests {
         app.m.tick();
         assert_eq!(app.m.output, ["Adapter unavailable: unplugged"]);
         assert!(app.m.reconnect.is_none());
+    }
+
+    /// A shell whose adapter reports that its saved data needs migration.
+    fn needing_migration() -> App {
+        let fake = Fake::default();
+        let m = Model::new(fake.clone(), Some("/dev/ttyACM0".into()));
+        let mut app = App { m, fake };
+        let mut st = fixture::state();
+        st.session = app.fake.next.get();
+        st.status.id = "0123456789ABCDEF".into();
+        st.status.ready = false;
+        st.loaded = false;
+        st.status.errors = vec![p::Error {
+            code: p::ErrorCode::StorageMigrationRequired as i32,
+            reason: p::ErrorReason::Storage as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        }];
+        *app.fake.state.borrow_mut() = Some(st);
+        app.fake.calls.borrow_mut().clear();
+        app.connection(app.fake.next.get(), Phase::Migrate);
+        app
+    }
+
+    fn migration_event(event: migration_event::Event) -> Msg {
+        Msg::Migration(MigrationEvent { event: Some(event) })
+    }
+
+    fn failed() -> Msg {
+        Msg::Migrated(Err(cordial_client::migration::Error {
+            reason: "the adapter refused a write".into(),
+            outcome_unknown: false,
+        }))
+    }
+
+    #[test]
+    fn migration_starts_only_once_the_session_has_released_its_port() {
+        let mut app = needing_migration();
+        assert_eq!(app.calls(), [Call::Close]);
+        assert!(app.m.output.iter().any(|l| l == MIGRATING));
+        app.m.update(Msg::Controller(Box::new(Event::Closed)));
+        assert_eq!(
+            app.calls(),
+            [
+                Call::Close,
+                Call::Migrate("0123456789ABCDEF".into(), "/dev/ttyACM0".into())
+            ]
+        );
+        app.m
+            .update(migration_event(migration_event::Event::Waiting(
+                Default::default(),
+            )));
+        assert_eq!(app.m.prompt(80).0[0], "Waiting for Adapter");
+        // Nothing opens or runs while it migrates, however long it waits.
+        app.fake.calls.borrow_mut().clear();
+        for line in [
+            "adapter status",
+            "file list /",
+            "adapter select /dev/ttyACM1",
+            "adapter list",
+        ] {
+            app.typed(line);
+        }
+        app.m.tick();
+        assert!(app.calls().is_empty(), "{:?}", app.calls());
+        assert!(app.m.output.iter().any(|l| l.contains(migration::BUSY)));
+        app.m.update(Msg::Migrated(Ok(Migrated::Success)));
+        assert!(app.m.output.iter().any(|l| l == MIGRATED));
+        assert!(!app.m.migrating());
+        // The adapter is found again by its ID.
+        assert_eq!(app.calls(), [Call::List]);
+    }
+
+    #[test]
+    fn a_failed_migration_keeps_every_port_closed_until_cancelled() {
+        let mut app = needing_migration();
+        app.m.update(Msg::Controller(Box::new(Event::Closed)));
+        app.m.update(failed());
+        assert!(app.m.migrating());
+        assert_eq!(app.m.prompt(80).0[0], "Needs Attention");
+        app.fake.calls.borrow_mut().clear();
+        app.typed("adapter status");
+        app.m.tick();
+        assert!(app.calls().is_empty());
+        // Migrate tries again without opening anything.
+        app.typed("migrate");
+        assert_eq!(
+            app.calls(),
+            [Call::Migrate(
+                "0123456789ABCDEF".into(),
+                "/dev/ttyACM0".into()
+            )]
+        );
+        app.m.update(failed());
+        app.fake.calls.borrow_mut().clear();
+        app.typed("migrate cancel");
+        assert!(!app.m.migrating());
+        assert_eq!(app.calls(), [Call::List]);
+        // The adapter returns still needing migration, and waits for migrate.
+        app.m.update(Msg::Ports(Ok(vec![PortInfo {
+            port: "/dev/ttyACM0".into(),
+            serial: "0123456789ABCDEF".into(),
+        }])));
+        let session = app.fake.next.get();
+        app.fake.calls.borrow_mut().clear();
+        app.fake.state.borrow_mut().as_mut().unwrap().session = session;
+        app.connection(session, Phase::Migrate);
+        assert!(app.calls().is_empty(), "{:?}", app.calls());
+        assert!(app.m.output.iter().any(|l| l.contains(migration::REQUIRED)));
+        app.typed("migrate");
+        assert_eq!(app.calls(), [Call::Close]);
+    }
+
+    #[test]
+    fn quitting_cancels_the_migration_and_waits_for_the_worker() {
+        let mut app = needing_migration();
+        app.m.update(Msg::Controller(Box::new(Event::Closed)));
+        app.fake.calls.borrow_mut().clear();
+        app.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.m.update(Msg::Interrupt);
+        assert_eq!(app.calls(), [Call::CancelMigration]);
+        assert!(!app.m.done);
+        app.m
+            .update(migration_event(migration_event::Event::Cancelled(
+                Default::default(),
+            )));
+        assert!(!app.m.done);
+        app.m.update(Msg::Migrated(Ok(Migrated::Cancelled)));
+        assert!(app.m.done);
+        assert_eq!(app.calls(), [Call::CancelMigration]);
+    }
+
+    #[test]
+    fn cancelling_does_not_migrate_again_by_itself() {
+        let mut app = needing_migration();
+        app.m.update(Msg::Controller(Box::new(Event::Closed)));
+        app.typed("migrate cancel");
+        assert_eq!(app.calls().last(), Some(&Call::CancelMigration));
+        // Still suspended until the worker exits.
+        app.fake.calls.borrow_mut().clear();
+        app.typed("adapter status");
+        assert!(app.calls().is_empty());
+        app.m.update(Msg::Migrated(Ok(Migrated::Cancelled)));
+        assert_eq!(app.calls(), [Call::List]);
+        assert!(app.m.declined.contains("0123456789ABCDEF"));
+    }
+
+    #[test]
+    fn a_failure_reported_after_cancel_ends_the_migration() {
+        let mut app = needing_migration();
+        app.m.update(Msg::Controller(Box::new(Event::Closed)));
+        app.fake.calls.borrow_mut().clear();
+        // The worker failed before it saw the cancellation; its result arrives after.
+        app.typed("migrate cancel");
+        assert_eq!(app.calls(), [Call::CancelMigration]);
+        assert!(app.m.migrating());
+        app.m.update(failed());
+        assert!(!app.m.migrating());
+        assert!(app.m.output.iter().any(|l| l == MIGRATION_CANCELLED));
+        assert!(app.m.declined.contains("0123456789ABCDEF"));
+        // The adapter is found again by its ID, and another adapter on its port is passed over.
+        assert_eq!(app.calls(), [Call::CancelMigration, Call::List]);
+        app.m.update(Msg::Ports(Ok(vec![PortInfo {
+            port: "/dev/ttyACM0".into(),
+            serial: "0123456789ABCDEF".into(),
+        }])));
+        assert_eq!(
+            app.calls().last(),
+            Some(&Call::OpenAdapter(
+                "/dev/ttyACM0".into(),
+                "0123456789ABCDEF".into()
+            ))
+        );
+        app.connection(app.fake.next.get(), Phase::Other);
+        assert_eq!(app.m.session, None);
+        assert!(app.m.reconnect.is_some());
+    }
+
+    #[test]
+    fn an_unsupported_adapter_says_why() {
+        let fake = Fake::default();
+        let mut app = App {
+            m: Model::new(fake.clone(), Some("/dev/ttyACM0".into())),
+            fake,
+        };
+        let session = app.fake.next.get();
+        app.connection(
+            session,
+            Phase::Unsupported(Error::new(migration::UNSUPPORTED)),
+        );
+        assert_eq!(app.m.session, Some(session));
+        assert!(app.m.output.iter().any(|l| l.contains("Update Cordial")));
+        assert!(!app.m.migrating());
+    }
+
+    #[test]
+    fn a_blocked_adapter_shows_its_error_and_doesnt_migrate() {
+        let fake = Fake::default();
+        let mut app = App {
+            m: Model::new(fake.clone(), Some("/dev/ttyACM0".into())),
+            fake,
+        };
+        let mut st = fixture::state();
+        st.session = app.fake.next.get();
+        st.status.ready = false;
+        st.status.errors = vec![
+            p::Error {
+                code: p::ErrorCode::StorageMigrationRequired as i32,
+                reason: p::ErrorReason::Storage as i32,
+                outcome: p::ErrorOutcome::NoEffect as i32,
+                ..Default::default()
+            },
+            p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                reason: p::ErrorReason::Storage as i32,
+                related: vec![p::Error {
+                    code: p::ErrorCode::StorageFull as i32,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        let error = Error::dongle(st.status.errors[1].clone(), None);
+        *app.fake.state.borrow_mut() = Some(st);
+        app.fake.calls.borrow_mut().clear();
+        app.connection(app.fake.next.get(), Phase::Blocked(error.clone()));
+        assert!(!app.m.migrating());
+        assert!(app.calls().is_empty(), "{:?}", app.calls());
+        let line = "Error: the adapter couldn't read or write its saved data; also (the adapter's storage is full)".to_owned();
+        assert_eq!(app.m.output.last(), Some(&line));
+        app.typed("migrate");
+        assert_eq!(app.m.output.last(), Some(&line));
+        assert!(app.calls().is_empty(), "{:?}", app.calls());
+        // Restart runs without readiness or migration.
+        app.typed("adapter restart");
+        assert_eq!(app.calls(), [Call::Run("Restart".into())]);
     }
 }

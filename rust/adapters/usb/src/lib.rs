@@ -17,6 +17,7 @@ pub mod outputs;
 extern crate alloc;
 #[cfg(all(test, feature = "gamepad"))]
 mod gamepad_tests;
+pub mod management;
 pub mod owner;
 mod serial;
 #[cfg(test)]

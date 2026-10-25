@@ -8,6 +8,10 @@ Every release ships a `SHA256SUMS` file for verifying them.
 `cordial-desktop` is the desktop tray app. `cordial-cli` is the `cordial` command-line tool and
 TUI. You can install either package or both.
 
+The CLI is optional for normal desktop use. Install it so the desktop app can automatically invoke
+`cordial` when an adapter needs an assisted storage migration. The CLI and TUI use the same
+converter automatically.
+
 ### Arch Linux
 
 ```sh
@@ -31,6 +35,9 @@ Download `cordial-desktop-*-x86_64.AppImage` for the desktop app and make it exe
 `chmod +x`. A desktop tar archive, `cordial-desktop-*-x64.tar.gz`, is also available; extract it
 and run the included `cordial-desktop`. For the command-line tool, download
 `cordial-cli-*-linux-amd64.tar.gz`.
+
+For AppImage and portable desktop installations, put the extracted `cordial` executable on `PATH`
+so the desktop app can find it.
 
 ### Adapter access
 
@@ -67,10 +74,10 @@ Pimoroni Pico Plus 2 W hardware verification is outstanding. Cordial leaves its 
 
 ### First installation
 
-Cordial initializes storage at startup. Invalid or incompatible saved storage
-resets automatically, including saved devices and preferences. Compatible
-updates preserve saved data. See the [storage format](storage-format.md) for
-recovery and the one-time Pico storage reset on chips of at least 4 MiB.
+Cordial initializes empty storage at startup and migrates supported older storage while preserving
+saved devices and preferences. The firmware determines the target storage format. Update the
+client if it does not support that target or a migration path to it. Invalid, newer, or unsupported
+storage stays intact. See the [storage format](storage-format.md) for migration and recovery.
 
 ### RP2040 and RP2350 boards
 

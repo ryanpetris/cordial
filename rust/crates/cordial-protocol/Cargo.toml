@@ -8,6 +8,10 @@ publish.workspace = true
 license.workspace = true
 
 [features]
+# Host migration tools retain historical schemas. Firmware uses only the operating schema.
+historical-storage = []
+# Desktop/CLI subprocess IPC, independent of the serial API.
+migration = ["historical-storage"]
 # Protobuf JSON mapping for logs and command-line output on hosts.
 json = ["dep:pbjson", "dep:serde", "dep:pbjson-build"]
 

@@ -19,7 +19,7 @@ message Request {
   oneof command {
     GetStatus get_status = 1;
     SetAdapter set_adapter = 2;
-    EnterBootloader enter_bootloader = 3;
+    Restart restart = 3;
 
     StartScan start_scan = 4;
     StopScan stop_scan = 5;
@@ -47,10 +47,17 @@ message Request {
     ListProfileRules list_profile_rules = 24;
     SetProfileRules set_profile_rules = 25;
 
+    // File access is available in debug firmware and automatically while production firmware
+    // requires host-assisted storage migration. See the file command availability rules below.
+    ListFiles list_files = 26;
+    ReadFile read_file = 27;
+    WriteFile write_file = 28;
+    MoveFile move_file = 29;
+    DeleteFile delete_file = 30;
+
     // Development firmware only.
-    ListFeatures list_features = 26;
-    ListFiles list_files = 27;
-    ReadFile read_file = 28;
+    ListFeatures list_features = 31;
+    EnterBootloader enter_bootloader = 32;
   }
 }
 
@@ -91,16 +98,19 @@ message Response {
   oneof result {
     Error error = 1;
     Status status = 2;
-    Device device = 3;
-    DeviceList devices = 4;
+    DeviceList devices = 3;
+    Device device = 4;
     DeviceSettings settings = 5;
-    FeatureList features = 6;
-    FileList files = 7;
-    FileData file = 8;
-    Profile profile = 9;
-    ProfileList profiles = 10;
-    ProfileRules profile_rules = 11;
-    ProfileCreated profile_created = 12;
+
+    ProfileList profiles = 6;
+    Profile profile = 7;
+    ProfileCreated profile_created = 8;
+    ProfileRules profile_rules = 9;
+
+    FileList files = 10;
+    FileData file = 11;
+
+    FeatureList features = 12;
   }
 }
 
@@ -134,6 +144,11 @@ message Event {
 // ---------------------------------------------------------------------------
 
 message GetStatus {}
+
+// Responds with an empty success, drains the response, then performs a full hardware reset.
+// Available in normal operation and management mode, including blocked storage. Restart does
+// not validate or convert files. Startup selects the operating mode again from saved storage.
+message Restart {}
 
 // Partial update: missing fields are left unchanged. Responds with no result once saved; an adapter
 // event follows when anything changed.
@@ -183,7 +198,8 @@ message Status {
   string name = 2;
   // Saved host platform used for special-key translation.
   Platform platform = 3;
-  // Bluetooth and storage are usable. False makes no claim about which subsystem is ready.
+  // Bluetooth and storage are usable. Always false while storage migration is required, active
+  // or blocked, including intermediate checkpoints. False otherwise makes no subsystem claim.
   // Commands that need an unready subsystem return ERROR_CODE_NOT_READY; pairing requires both.
   bool ready = 4;
   // Complete set of current adapter problems, ordered and deduplicated as described by Error.
@@ -743,15 +759,20 @@ enum IntegrationState {
 // Information
 // ---------------------------------------------------------------------------
 
-// Each scalar has independent presence. Missing means unknown, including for booleans and
-// numbers. Text is at most 64 UTF-8 bytes without control characters.
+// Missing optional fields mean unknown, including booleans and numbers.
+// Text is at most 64 UTF-8 bytes without control characters.
 message AdapterInformation {
   optional string firmware_version = 1;
   optional string board_name = 2;
   optional bool development_build = 3;
-  // Validated Format.format epoch of the mounted storage. Missing when unknown, independently
-  // of Status.ready, which also depends on Bluetooth.
+  // Format declared by the committed /format.pb, omitted when unknown. Informational only;
+  // clients use Status.errors to determine whether migration is required.
   optional uint32 storage_format = 4;
+  // Operating storage format required by this firmware, independent of its release version.
+  // Clients verify support before any interaction except GetStatus or closing the connection.
+  // Firmware always supplies this value. Clients do not migrate when it is absent.
+  // Migration converts the downloaded files to this format.
+  optional uint32 target_storage_format = 5;
 }
 
 // Read-only facts, never saved to flash. All readings belong to the current connection and
@@ -1586,7 +1607,7 @@ message ProfileRule {
 }
 
 // ---------------------------------------------------------------------------
-// Development only. Production firmware answers these with ERROR_CODE_UNKNOWN_COMMAND.
+// Development only. Production firmware answers ListFeatures with ERROR_CODE_UNKNOWN_COMMAND.
 // ---------------------------------------------------------------------------
 
 // Lists all of the device's feature tables, in ascending order of integration, then index within
@@ -1621,8 +1642,25 @@ message HidppFeature {
   uint32 flags = 4;
 }
 
-// Lists all of a directory's entries, in ascending order of name compared bytewise. Responds with
-// FileList.
+// ---------------------------------------------------------------------------
+// File access
+// ---------------------------------------------------------------------------
+
+// Debug firmware provides file access during normal operation. Production firmware enables these
+// commands automatically in assisted mode, until restart. Uploading /format.pb alone does not
+// end that state, even at the target format. After startup enters normal operation, production
+// firmware disables file access automatically. No prepare command is needed. File operations
+// never run concurrently with an on-device migration or on blocked storage.
+// Paths are canonical absolute UTF-8 paths of at most 192 bytes, without empty, dot or
+// dot-dot components, control characters or a trailing slash. The directory root / is valid for
+// ListFiles.
+// Mutations return normal empty Response success, durable before acknowledgement. Failures use
+// Response.error and Error.outcome. After an uncertain write or disconnect, clients use ListFiles
+// and ReadFile to verify durable contents before deciding whether to repeat the operation.
+// Each command opens and closes its files. No transfer session is kept by the adapter.
+
+// Lists all of a directory's entries, in ascending order of name compared
+// bytewise. Responds with FileList under the single-frame list response rules.
 message ListFiles {
   // Required. Absolute path.
   string path = 1;
@@ -1639,13 +1677,60 @@ message FileEntry {
   uint64 size = 3;
 }
 
+// Responds with FileData. Without length and with offset = 0, debug firmware returns the entire
+// file, without truncation. Assisted production access requires a bounded length. A nonzero
+// offset without length is invalid.
 message ReadFile {
   // Required. Absolute path.
   string path = 1;
+  // Defaults to zero. May equal but not exceed the file size.
+  uint64 offset = 2;
+  // When present, 1..512 bytes.
+  optional uint32 length = 3;
 }
 
+// Path and offset match the request. Clients check size, length and arithmetic bounds before
+// using the bytes. The size stays constant for a whole download or readback.
 message FileData {
-  bytes data = 1;
+  // Must equal the requested path.
+  string path = 1;
+  // Must equal the requested offset.
+  uint64 offset = 2;
+  // Full file size, equal to the inventory size for download or uploaded size for readback.
+  // After an uncertain replacement, accept only complete old or proposed new content. The old
+  // state is absence for a new destination. Equal sizes require comparing bytes to select a state.
+  uint64 size = 3;
+  // For bounded reads, exactly min(request.length, size - offset) bytes. Short positive reads
+  // are invalid; empty data is valid only at EOF. An unbounded read returns the entire file.
+  bytes data = 4;
+}
+
+// Writes bytes to a file and commits them before responding. Each request is atomic, leaving
+// either its previous or updated contents after interruption. Several requests are not atomic
+// together. To replace a file in chunks, write a temporary path and then use MoveFile.
+message WriteFile {
+  // Required. Canonical file path.
+  string path = 1;
+  // Zero creates or truncates the file. A positive offset overwrites or appends bytes in an
+  // existing file, without truncating its remaining contents. May not exceed the current size.
+  uint64 offset = 2;
+  // At most 512 bytes. Empty data at offset zero creates or truncates to an empty file.
+  // The complete encoded Request still fits within 1024 bytes before COBS encoding.
+  bytes data = 3;
+}
+
+// Atomically moves a file, replacing an existing destination file. After interruption, either
+// the source and previous destination remain, or the destination contains the complete source
+// and the source is absent. Directories are not supported. Identical paths have no effect.
+message MoveFile {
+  string source = 1;
+  string destination = 2;
+}
+
+// Deletes one file. Missing files succeed. / and /format.pb are forbidden.
+message DeleteFile {
+  // Required. Canonical dataset file path.
+  string path = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1727,8 +1812,9 @@ enum ErrorCode {
   // Storage is ready but has insufficient free space to pair another device, or a deferred save
   // failed for lack of space and has not succeeded yet. Clears when neither condition applies.
   ERROR_CODE_STORAGE_FULL = 30;
-  // Loaded profiles use at least 85% of the nonzero profile memory budget.
-  ERROR_CODE_PROFILE_MEMORY_LOW = 31;
+  // Assisted storage migration is required. Uses reason STORAGE and outcome NO_EFFECT.
+  // Remains present until restart, including after files reach the target format.
+  ERROR_CODE_STORAGE_MIGRATION_REQUIRED = 31;
   // At least one USB interface with priority below 0xC0 cannot fit. The client shows a prominent
   // warning and changes the tray indicator. It also shows the reserved-capacity error if present.
   ERROR_CODE_USB_REQUIRED_CAPACITY_EXCEEDED = 32;
@@ -1737,10 +1823,13 @@ enum ErrorCode {
   // interfaces at 0xE0 through 0xFE produces neither code; disabled interfaces at 0xFF are excluded.
   ERROR_CODE_USB_RESERVED_CAPACITY_EXCEEDED = 33;
 
+  // Profile problems.
+  // Loaded profiles use at least 85% of the nonzero profile memory budget. Reported in Status.errors.
+  ERROR_CODE_PROFILE_MEMORY_LOW = 34;
   // Device profile problems, reported in Device.errors. No profiles are loaded for the device
   // while either code applies, so its input passes through unchanged.
-  ERROR_CODE_PROFILE_MEMORY_EXCEEDED = 34;  // The profiles do not fit in the remaining memory budget.
-  ERROR_CODE_PROFILE_LOAD_FAILED = 35;      // A profile could not be read or decoded.
+  ERROR_CODE_PROFILE_MEMORY_EXCEEDED = 35;  // The profiles do not fit in the remaining memory budget.
+  ERROR_CODE_PROFILE_LOAD_FAILED = 36;      // A profile could not be read or decoded.
 }
 
 // Context for any error code. The containing operation defines what failed in this context.

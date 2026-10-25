@@ -21,7 +21,7 @@ use cordial_protocol::{
 use std::time::Duration;
 
 pub(crate) const STARTING: &str =
-    "the adapter is still starting; status, files and bootloader work meanwhile";
+    "the adapter is still starting; status, restart, files and bootloader work meanwhile";
 
 pub(crate) const NO_PROFILES: &str = "this adapter doesn't support profiles";
 
@@ -145,6 +145,10 @@ pub(crate) fn execute(
             "the control session is unavailable; select an adapter",
         ));
     }
+    // Until Cordial knows it may use the adapter, only its status is read and restart sent.
+    if let Some(e) = crate::migration::refusal(&st.status, command) {
+        return Err(e);
+    }
     if !st.ready() && !command.direct() {
         return Err(Error::new(STARTING));
     }
@@ -238,6 +242,10 @@ pub(crate) fn execute(
             save_adapter(session, &st, &update, "adapter interface")?;
             Ok(Outcome::Interface(*interface, session.state().status))
         }
+        Command::Restart => {
+            session.call(C::Restart(p::Restart {}), "adapter restart", true)?;
+            Ok(Outcome::Restart)
+        }
         Command::Bootloader => {
             session.call(
                 C::EnterBootloader(p::EnterBootloader {}),
@@ -297,13 +305,20 @@ pub(crate) fn execute(
             storage::check_destination(&expected, *overwrite)?;
             // The response isn't reported, so file contents are never printed.
             let r = session.call(
-                C::ReadFile(p::ReadFile { path: path.clone() }),
+                C::ReadFile(p::ReadFile {
+                    path: path.clone(),
+                    ..Default::default()
+                }),
                 "file get",
                 false,
             )?;
+            // A read without a length returns the whole file.
             let Some(response::Result::File(file)) = r.result else {
                 return Err(unexpected());
             };
+            if file.path != *path || file.offset != 0 || file.data.len() as u64 != file.size {
+                return Err(unexpected());
+            }
             let (local, data, unconverted) = if *raw {
                 (local.clone(), file.data, None)
             } else {

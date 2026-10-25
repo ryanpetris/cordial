@@ -13,6 +13,7 @@ default = ["serialport"]
 serialport = ["dep:serialport"]
 
 [dependencies]
-cordial-protocol.workspace = true
+cordial-protocol = { workspace = true, features = ["migration"] }
+cordial-core.workspace = true
 prost = { version = "=0.14.4", default-features = false }
 serialport = { version = "=4.10.1", default-features = false, optional = true }

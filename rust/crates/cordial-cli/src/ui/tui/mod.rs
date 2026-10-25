@@ -27,11 +27,16 @@ use crate::settings::{Field as SettingField, Value};
 use crate::{
     controller::{AdapterUpdate, Command, DeviceUpdate, Event, Notice, Outcome, Phase, Ticket},
     error::Error,
-    ui::{Msg, field::Field},
+    migration,
+    ui::{Msg, field::Field, text},
     view::State,
 };
 use add::AddDevice;
-use cordial_client::serial::PortInfo;
+use cordial_client::{
+    migration::{Outcome as Migrated, Result as MigrationResult},
+    serial::PortInfo,
+};
+use cordial_protocol::migration::{MigrationEvent, migration_event};
 use cordial_protocol::{self as p, ConfigurationInterface, OutputMode, Platform, Transport};
 use fleet::{Fleet, Slot};
 use layout::Hit;
@@ -41,7 +46,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     time::{Duration, Instant},
 };
-use world::{AdapterView, DeviceView};
+use world::{AdapterView, DeviceView, Storage};
 
 pub const MIN_WIDTH: usize = 60;
 pub const MIN_HEIGHT: usize = 16;
@@ -116,6 +121,9 @@ pub enum Action {
     Show(Page),
     ConnectAdapter(String),
     DisconnectAdapter(String),
+    /// Migrates an adapter's saved data, or tries a failed migration again.
+    Migrate(String),
+    CancelMigration,
     RenameAdapter(String),
     Tab(Tab),
 
@@ -137,6 +145,7 @@ pub enum Action {
     AdapterSave,
     AdapterDiscard,
     Files,
+    Restart,
     Bootloader,
 
     DeviceToggle(Toggle, bool),
@@ -304,6 +313,7 @@ pub(super) enum Kind {
     CancelPairing,
     Files,
     FileGet,
+    Restart,
     Bootloader,
 }
 
@@ -328,6 +338,47 @@ pub(super) struct Session {
     looked_up: HashSet<u32>,
     /// The saved devices have been listed in this session.
     listed: bool,
+    storage: Storage,
+}
+
+/// A migration, which owns every adapter connection while it lasts.
+pub(super) struct Migration {
+    id: String,
+    /// The port the adapter was on, where the worker looks first.
+    port: String,
+    /// The adapter's status when its session closed.
+    status: p::Status,
+    stage: Stage,
+    /// The worker has started; it exits before the migration ends.
+    started: bool,
+    waiting: bool,
+    progress: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Stage {
+    /// Every session is closing; the worker starts once all have released their ports.
+    Closing,
+    Running,
+    Cancelling,
+    /// The worker failed: what to tell the user, and its reason.
+    Failed(String, String),
+}
+
+impl Migration {
+    pub(super) fn storage(&self) -> Storage {
+        match &self.stage {
+            Stage::Failed(text, reason) => Storage::Failed {
+                text: text.clone(),
+                reason: reason.clone(),
+            },
+            stage => Storage::Migrating {
+                waiting: self.waiting,
+                cancelling: *stage == Stage::Cancelling,
+                progress: self.progress,
+            },
+        }
+    }
 }
 
 /// An adapter that went away, kept while it may return.
@@ -441,6 +492,9 @@ pub(crate) struct Model<F: Fleet> {
     /// Adapters whose scan from a closed Add Device stops once its start is answered.
     scan_stops: HashSet<(Slot, Ticket)>,
     files: files::Files,
+    migration: Option<Migration>,
+    /// Adapters whose migration the user cancelled; they migrate again only with Migrate.
+    declined: HashSet<String>,
 }
 
 impl<F: Fleet> Model<F> {
@@ -499,6 +553,8 @@ impl<F: Fleet> Model<F> {
             add: None,
             scan_stops: HashSet::new(),
             files: files::Files::default(),
+            migration: None,
+            declined: HashSet::new(),
         };
         m.discover();
         m
@@ -508,12 +564,29 @@ impl<F: Fleet> Model<F> {
         self.quitting
     }
 
-    /// Closes every session: a running scan stops and an unsaved pairing is cancelled.
+    /// Closes every session: a running scan stops and an unsaved pairing is cancelled. A running
+    /// migration is cancelled, and the TUI ends once its worker has exited.
     pub(crate) fn quit(&mut self) {
         if self.quitting {
             return;
         }
         self.quitting = true;
+        if let Some(m) = &mut self.migration {
+            match m.stage {
+                Stage::Running => {
+                    m.stage = Stage::Cancelling;
+                    self.fleet.cancel_migration();
+                }
+                Stage::Failed(..) => self.migration = None,
+                _ => {}
+            }
+        }
+        self.close_all();
+        self.check_done();
+    }
+
+    /// Closes every session and every open in progress.
+    fn close_all(&mut self) {
         let slots: Vec<Slot> = self
             .sessions
             .iter()
@@ -524,18 +597,151 @@ impl<F: Fleet> Model<F> {
         for slot in slots {
             self.close_slot(slot);
         }
-        self.sessions.clear();
+        for s in std::mem::take(&mut self.sessions) {
+            self.drop_session(&s.id, s.slot);
+        }
         self.probes.clear();
         for off in self.off.values_mut() {
             off.connecting = None;
             off.waiting = false;
         }
-        self.check_done();
     }
 
     fn check_done(&mut self) {
-        if self.quitting && self.closing.is_empty() {
+        if self.quitting && self.closing.is_empty() && !self.migrating() {
             self.done = true;
+        }
+    }
+
+    /// Whether a migration's worker runs or is about to.
+    pub(crate) fn migrating(&self) -> bool {
+        self.migration
+            .as_ref()
+            .is_some_and(|m| !matches!(m.stage, Stage::Failed(..)))
+    }
+
+    /// Closes every session, stops discovery and migrates the adapter once every port is
+    /// released.
+    fn begin_migration(&mut self, id: &str) {
+        let Some(s) = self.session_of(id) else { return };
+        let (port, slot) = (s.port.clone(), s.slot);
+        let status = self
+            .fleet
+            .state(slot)
+            .map(|st| st.status)
+            .unwrap_or_default();
+        self.declined.remove(id);
+        self.migration = Some(Migration {
+            id: id.to_owned(),
+            port,
+            status,
+            stage: Stage::Closing,
+            started: false,
+            waiting: false,
+            progress: None,
+        });
+        self.close_all();
+        self.start_migration();
+    }
+
+    /// Starts the worker once every session has released its port.
+    fn start_migration(&mut self) {
+        let Some(m) = &mut self.migration else { return };
+        if m.started || !self.closing.is_empty() {
+            return;
+        }
+        if self.quitting {
+            self.migration = None;
+            return self.check_done();
+        }
+        if m.stage == Stage::Cancelling {
+            return self.end_migration(false);
+        }
+        m.stage = Stage::Running;
+        m.started = true;
+        self.fleet.migrate(&m.id, &m.port);
+    }
+
+    /// Ends the migration and lets the adapters open again. Unless the migration succeeded, the
+    /// adapter migrates again only with Migrate.
+    fn end_migration(&mut self, succeeded: bool) {
+        let Some(m) = self.migration.take() else {
+            return;
+        };
+        if !succeeded {
+            self.declined.insert(m.id);
+        }
+        self.list_due = Instant::now();
+    }
+
+    fn migrate_adapter(&mut self, id: &str) {
+        match &mut self.migration {
+            Some(m) if m.id == id && matches!(m.stage, Stage::Failed(..)) => {
+                m.stage = Stage::Running;
+                m.waiting = false;
+                m.progress = None;
+                self.fleet.migrate(&m.id, &m.port);
+            }
+            Some(_) => {}
+            None => {
+                if self
+                    .session_of(id)
+                    .is_some_and(|s| s.storage == Storage::Required)
+                {
+                    self.begin_migration(id);
+                }
+            }
+        }
+    }
+
+    fn cancel_migration(&mut self) {
+        let Some(m) = &mut self.migration else { return };
+        match m.stage {
+            Stage::Running => {
+                m.stage = Stage::Cancelling;
+                self.fleet.cancel_migration();
+            }
+            Stage::Closing => m.stage = Stage::Cancelling,
+            Stage::Cancelling => {}
+            Stage::Failed(..) => self.end_migration(false),
+        }
+    }
+
+    fn migration_event(&mut self, event: MigrationEvent) {
+        let Some(m) = &mut self.migration else { return };
+        match event.event {
+            Some(migration_event::Event::Waiting(_)) => m.waiting = true,
+            Some(migration_event::Event::Progress(p)) => {
+                m.waiting = false;
+                m.progress = (p.total_bytes > 0).then_some((p.completed_bytes, p.total_bytes));
+            }
+            _ => {}
+        }
+    }
+
+    /// The worker exited with its result.
+    fn migrated(&mut self, result: MigrationResult<Migrated>) {
+        let Some(m) = &mut self.migration else { return };
+        if self.quitting {
+            self.migration = None;
+            return self.check_done();
+        }
+        match result {
+            Ok(Migrated::Success) => self.end_migration(true),
+            // A cancellation the user asked for ends the migration however the worker ended.
+            Ok(Migrated::Cancelled) | Err(_) if m.stage == Stage::Cancelling => {
+                self.end_migration(false)
+            }
+            Ok(Migrated::Cancelled) => self.end_migration(false),
+            Err(e) => {
+                let what = if e.outcome_unknown {
+                    migration::UNKNOWN
+                } else {
+                    migration::FAILED
+                };
+                m.stage = Stage::Failed(text::sentence(what), e.reason);
+                m.waiting = false;
+            }
         }
     }
 
@@ -565,8 +771,10 @@ impl<F: Fleet> Model<F> {
     /// Whether a spinner is on screen, which needs faster frames.
     pub(crate) fn animating(&self) -> bool {
         !self.jobs.is_empty()
+            || self.migrating()
             || self.adapters.iter().any(|a| {
-                a.conn == world::Conn::Connecting || a.connected() && !a.ready && !a.failed
+                a.storage == Storage::Normal
+                    && (a.conn == world::Conn::Connecting || a.connected() && !a.ready && !a.failed)
             })
             || self.states.values().any(|st| {
                 st.scanning.is_some() || st.devices.iter().any(|d| d.state != 0 && d.state != 2)
@@ -601,6 +809,8 @@ impl<F: Fleet> Model<F> {
                 self.unhover();
             }
             Msg::Ports(result) => self.ports_listed(result),
+            Msg::Migration(e) => self.migration_event(e),
+            Msg::Migrated(result) => self.migrated(result),
             Msg::Fleet(slot, e) => self.fleet_event(slot, *e),
             Msg::Controller(_) => {}
             Msg::Mouse(m) => self.mouse(m),
@@ -637,7 +847,11 @@ impl<F: Fleet> Model<F> {
 
     /// Lists the attached adapters when due.
     fn discover(&mut self) {
-        if self.quitting || self.listing || Instant::now() < self.list_due {
+        if self.quitting
+            || self.listing
+            || self.migration.is_some()
+            || Instant::now() < self.list_due
+        {
             return;
         }
         self.listing = true;
@@ -657,6 +871,10 @@ impl<F: Fleet> Model<F> {
         self.listing = false;
         self.list_due = Instant::now() + LIST_EVERY;
         self.listed = true;
+        // A migration owns the ports until it ends.
+        if self.migration.is_some() {
+            return;
+        }
         let Ok(ports) = result else {
             // A failed listing changes nothing and is tried again.
             return;
@@ -763,6 +981,7 @@ impl<F: Fleet> Model<F> {
             Event::Closed => {
                 self.closing.remove(&slot);
                 self.check_done();
+                self.start_migration();
                 self.retry_waiting();
             }
             Event::Connection { phase, .. } => self.connection(slot, phase),
@@ -786,6 +1005,27 @@ impl<F: Fleet> Model<F> {
     fn connection(&mut self, slot: Slot, phase: Phase) {
         match phase {
             Phase::Opened => self.opened(slot),
+            Phase::Migrate | Phase::Blocked(_) | Phase::Unsupported(_) => {
+                self.opened(slot);
+                let Some(s) = self.session_mut(slot) else {
+                    return;
+                };
+                s.storage = match phase {
+                    Phase::Blocked(e) => {
+                        Storage::Blocked(words::failure_in(&e, words::Scope::Other))
+                    }
+                    Phase::Unsupported(e) => Storage::Unsupported(words::failure(&e)),
+                    _ => Storage::Required,
+                };
+                let id = s.id.clone();
+                if s.storage == Storage::Required
+                    && !self.declined.contains(&id)
+                    && self.migration.is_none()
+                    && !self.quitting
+                {
+                    self.begin_migration(&id);
+                }
+            }
             Phase::Waiting => {}
             Phase::Ready => self.ready(slot),
             Phase::Failed { error, open: true } => {
@@ -802,6 +1042,15 @@ impl<F: Fleet> Model<F> {
                 {
                     self.close_on(slot, port);
                     let why = words::open_failed(&self.off_name(&id));
+                    self.connect_failed(&id, &why);
+                }
+            }
+            Phase::Other => {
+                if let Some(port) = self.port_of(slot)
+                    && let Some(id) = self.connecting_off(slot)
+                {
+                    self.close_on(slot, port);
+                    let why = words::other_adapter(&self.off_name(&id));
                     self.connect_failed(&id, &why);
                 }
             }
@@ -842,6 +1091,7 @@ impl<F: Fleet> Model<F> {
             }
             return self.register(slot, port, id);
         }
+        // The controller has checked that the adapter is the one Connect opened its port for.
         let Some((key, port)) = self
             .off
             .iter()
@@ -850,11 +1100,6 @@ impl<F: Fleet> Model<F> {
         else {
             return;
         };
-        if id != key {
-            self.close_slot(slot);
-            let why = words::other_adapter(&self.off_name(&key));
-            return self.connect_failed(&key, &why);
-        }
         self.off.remove(&key);
         self.register(slot, port, id);
     }
@@ -875,6 +1120,7 @@ impl<F: Fleet> Model<F> {
             picker,
             looked_up: HashSet::new(),
             listed: false,
+            storage: Storage::Normal,
         });
     }
 
@@ -996,6 +1242,9 @@ impl<F: Fleet> Model<F> {
         if off.connecting.is_some() || off.waiting || self.quitting {
             return;
         }
+        if self.migration.is_some() {
+            return self.connect_failed(id, &text::sentence(migration::BUSY));
+        }
         let Some(port) = off.port.clone() else {
             return self.connect_failed(id, words::NOT_PLUGGED_IN);
         };
@@ -1007,7 +1256,7 @@ impl<F: Fleet> Model<F> {
             }
             return;
         }
-        let slot = self.fleet.open(&port);
+        let slot = self.fleet.open_adapter(&port, id);
         if let Some(off) = self.off.get_mut(id) {
             off.connecting = Some(slot);
             off.connect_port = port;
@@ -1163,6 +1412,11 @@ impl<F: Fleet> Model<F> {
             Kind::Profile => self.profile_result(&job, &result),
             Kind::Scan | Kind::Pair | Kind::Answer | Kind::CancelPairing => {
                 self.add_result(&job, &result)
+            }
+            Kind::Restart => {
+                if let Err(e) = &result {
+                    self.toast(words::failure(e));
+                }
             }
             Kind::Files | Kind::FileGet | Kind::Bootloader => self.files_result(&job, &result),
         }

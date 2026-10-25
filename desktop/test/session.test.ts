@@ -314,14 +314,14 @@ describe("AdapterSession", () => {
     await session.close();
   });
 
-  it("lists the devices again once the adapter becomes ready", async () => {
+  it("lists the devices once the adapter becomes ready", async () => {
     const { fake, session } = await openSession({ ready: false });
-    await until(() => !session.listing);
+    await new Promise((r) => setTimeout(r, 50));
     expect(session.available).toBe(false);
-    expect(session.status.ready).toBe(false);
+    expect(fake.received.map((r) => r.command.case)).toEqual(["getStatus"]);
     fake.changeAdapter({ ready: true });
-    await until(() => fake.received.filter((r) => r.command.case === "listDevices").length === 2);
-    expect(session.status.ready).toBe(true);
+    await until(() => session.listed);
+    expect(fake.received.filter((r) => r.command.case === "listDevices")).toHaveLength(1);
     await session.close();
   });
 

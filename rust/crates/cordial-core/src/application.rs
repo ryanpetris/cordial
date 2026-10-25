@@ -11,7 +11,7 @@
 //! Records nothing needs on flash at once, such as a configuration editor's edits, discovered
 //! layouts and first-connection setup, are saved once keyboard and mouse input pauses
 //! ([`crate::deferred`]), one per call. Everything waiting is saved in one call before USB
-//! enumerates again, before the bootloader and when an editor is released, and every dirty record
+//! enumerates again, before restarting and when an editor is released, and every dirty record
 //! before free space is checked for a new profile, a pairing or a new setting. Saves that commands
 //! promise, and bonds, are written before the command responds.
 //!
@@ -60,6 +60,8 @@ pub struct Build {
     pub profile_memory_budget: Option<u32>,
     /// Production composition supplies None and does not link the entry function.
     pub bootloader: Option<Bootloader>,
+    /// Restarts the MCU and runs ordinary firmware startup.
+    pub restart: fn() -> !,
 }
 pub struct Bootloader {
     pub enter: fn() -> !,
@@ -174,6 +176,7 @@ enum Pending {
     Rules(u32, Option<profiles::RuleRef>),
     Features(u32, usize),
     Files(FileListing),
+    File(crate::files::Reader),
     /// Deleting a profile once no saved device refers to it.
     DeleteProfile(u64, Records),
     /// Starting a pairing once the saved device with the candidate's identity, if any, is found.
@@ -321,6 +324,7 @@ pub struct Application {
     /// generation, and a later background step counts again.
     counted: Option<u64>,
     storage_format: Option<u32>,
+    storage_format_error: Option<crate::storage::Error>,
     storage_used: Option<u32>,
     storage_total: Option<u32>,
     /// Profiles with a pending profile event.
@@ -342,7 +346,7 @@ pub struct Application {
     next_profile: usize,
     /// Scan results go before device events next time, so neither starves the other.
     scan_turn: bool,
-    reboot_at: Option<u64>,
+    reboot_at: Option<(u64, fn() -> !)>,
     /// Records saved once input pauses.
     unsaved: deferred::Dirty,
     lost_retry: Backoff,
@@ -515,6 +519,7 @@ impl Application {
             adapter_dirty: false,
             counted: None,
             storage_format: None,
+            storage_format_error: None,
             storage_used: None,
             storage_total: None,
             profile_dirty: Vec::new(),
@@ -562,6 +567,7 @@ impl Application {
             board_name: Some(self.build.board.into()),
             development_build: Some(self.development()),
             storage_format: self.storage_format,
+            target_storage_format: Some(cordial_protocol::storage::CURRENT_FORMAT),
         });
         let mut errors: Vec<p::Error> = self
             .manager
@@ -570,6 +576,9 @@ impl Application {
             .chain(self.manager.storage_error.iter())
             .cloned()
             .collect();
+        if self.storage_format_error.is_some() {
+            errors.push(crate::migration::startup_error());
+        }
         if self.manager.storage_ready && (self.manager.storage_full() || self.manager.unsaved_full)
         {
             errors.push(p::Error {
@@ -677,7 +686,9 @@ impl Application {
             id: self.build.adapter_id.clone(),
             name: self.adapter_name().into(),
             platform: wire::platform(self.manager.preference.host_platform) as i32,
-            ready: self.manager.radio_ready && self.manager.storage_ready,
+            ready: self.manager.radio_ready
+                && self.manager.storage_ready
+                && self.storage_format_error.is_none(),
             errors,
             resources: alloc::vec![
                 wire::resource(
@@ -1046,6 +1057,7 @@ impl Application {
                     | Pending::Rules(..)
                     | Pending::Features(..)
                     | Pending::Files(_)
+                    | Pending::File(_)
             )
         )
     }
@@ -1082,7 +1094,10 @@ impl Application {
         // Storage can stop being ready between steps, such as after a write in the priority loop
         // fails. The command then fails as it would have at its start, instead of answering with
         // records left out.
-        if self.pending.is_some() && !self.manager.storage_ready {
+        if self.pending.is_some()
+            && !self.manager.storage_ready
+            && !matches!(self.pending, Some(Pending::File(_)))
+        {
             self.pending = None;
             return self.fail(self.not_ready(p::ErrorReason::Storage));
         }
@@ -1176,6 +1191,11 @@ impl Application {
                 }
             }
             Some(Pending::Files(listing)) => self.list_files(listing, store).await,
+            Some(Pending::File(mut reader)) => {
+                if !reader.step(&mut self.serial, store).await {
+                    self.pending = Some(Pending::File(reader));
+                }
+            }
             Some(Pending::DeleteProfile(id, scan)) => {
                 self.delete_profile(id, scan, store, radio).await
             }
@@ -1248,6 +1268,7 @@ impl Application {
             | Command::SetProfileRules(_) => self.fail(failure(Error::UnknownCommand)),
             Command::SetAdapter(args) => self.set_adapter(args, store, radio, now).await,
             Command::EnterBootloader(_) => self.bootloader(now),
+            Command::Restart(_) => self.reboot(self.build.restart, now),
             Command::StartScan(args) => self.start_scan(args, radio, now),
             Command::StopScan(_) => {
                 self.stop_scan(radio);
@@ -1300,10 +1321,40 @@ impl Application {
                     page: Vec::new(),
                 }));
             }
-            Command::ReadFile(args) if development => self.read_file(&args.path, store).await,
-            Command::ListFeatures(_) | Command::ListFiles(_) | Command::ReadFile(_) => {
-                self.fail(failure(Error::UnknownCommand))
+            Command::ReadFile(args) if development && args.length.is_none() => {
+                match crate::files::Reader::new(store, args).await {
+                    Ok(reader) => self.pending = Some(Pending::File(reader)),
+                    Err(e) => self.fail(crate::files::failure(e, false)),
+                }
             }
+            Command::ReadFile(args) if development => match crate::files::read(store, args).await {
+                Ok(data) => self.reply(Some(R::File(data))),
+                Err(e) => self.fail(crate::files::failure(e, false)),
+            },
+            Command::WriteFile(args) if development => {
+                match crate::files::write(store, args).await {
+                    Ok(()) => self.reply(None),
+                    Err(e) => self.fail(crate::files::failure(e, true)),
+                }
+            }
+            Command::MoveFile(args) if development => {
+                match crate::files::move_file(store, args).await {
+                    Ok(()) => self.reply(None),
+                    Err(e) => self.fail(crate::files::failure(e, true)),
+                }
+            }
+            Command::DeleteFile(args) if development => {
+                match crate::files::delete(store, args).await {
+                    Ok(()) => self.reply(None),
+                    Err(e) => self.fail(crate::files::failure(e, true)),
+                }
+            }
+            Command::ListFeatures(_)
+            | Command::ListFiles(_)
+            | Command::ReadFile(_)
+            | Command::WriteFile(_)
+            | Command::MoveFile(_)
+            | Command::DeleteFile(_) => self.fail(failure(Error::UnknownCommand)),
         }
         if self.streaming() {
             self.serial.start_stream();
@@ -2199,6 +2250,10 @@ impl Application {
         if !self.development() || self.build.bootloader.is_none() {
             return self.fail(failure(Error::UnknownCommand));
         }
+        self.reboot(self.build.bootloader.as_ref().unwrap().enter, now);
+    }
+
+    fn reboot(&mut self, enter: fn() -> !, now: u64) {
         if self.pair.is_some()
             || self
                 .manager
@@ -2214,7 +2269,7 @@ impl Application {
         for source in 0..devices::ACTIVE_CONNECTIONS {
             self.manager.forward.remove(source);
         }
-        self.reboot_at = Some(now.saturating_add(250));
+        self.reboot_at = Some((now.saturating_add(250), enter));
     }
 
     fn start_scan<B: Bluetooth>(&mut self, args: p::StartScan, radio: &mut B, now: u64) {
@@ -2968,23 +3023,6 @@ impl Application {
         }
     }
 
-    async fn read_file<S: RecordStore>(&mut self, path: &str, store: &mut S) {
-        if !crate::model::storage_path(path) {
-            return self.fail(bad_args());
-        }
-        let mut data = Vec::new();
-        let mut chunk = [0; 512];
-        loop {
-            match store.file_read(path, data.len() as u32, &mut chunk).await {
-                Ok(0) => break,
-                Ok(n) => data.extend_from_slice(&chunk[..n]),
-                Err(crate::storage::Error::Missing) => return self.fail(failure(Error::NotFound)),
-                Err(_) => return self.fail(failure(Error::StorageFailed)),
-            }
-        }
-        self.reply(Some(R::File(p::FileData { data })));
-    }
-
     fn close<B: Bluetooth>(&mut self, link: LinkId, error: Option<Error>, radio: &mut B) {
         let slot = self.manager.connection(link).and_then(|c| c.device);
         self.manager.close(link, error, radio);
@@ -3601,7 +3639,7 @@ impl Application {
     }
 
     /// Saves everything waiting at once, whatever input is doing: before USB enumerates again,
-    /// before the bootloader and when an editor is released.
+    /// before restarting and when an editor is released.
     pub async fn save_all<S: RecordStore>(&mut self, store: &mut S, now: u64) {
         self.save_records(store, now).await;
         if self.manager.storage_ready {
@@ -3830,9 +3868,16 @@ impl Application {
     /// Refreshes storage telemetry. A failed count omits usage and keeps the admission estimate.
     async fn refresh_available<S: RecordStore>(&mut self, store: &mut S) {
         let full = self.manager.storage_full();
-        let previous = (self.storage_format, self.storage_used, self.storage_total);
+        let previous = (
+            self.storage_format,
+            self.storage_format_error,
+            self.storage_used,
+            self.storage_total,
+        );
         self.counted = store.generation().await.ok();
-        self.storage_format = crate::storage::format(store).await.ok().map(|f| f.format);
+        let format = crate::migration::committed_format(store).await;
+        self.storage_format_error = format.as_ref().err().copied();
+        self.storage_format = format.ok();
         self.storage_total = store
             .total_bytes()
             .await
@@ -3846,7 +3891,13 @@ impl Application {
             .storage_total
             .and_then(|total| total.checked_sub(available?.try_into().ok()?));
         self.adapter_dirty |= full != self.manager.storage_full()
-            || previous != (self.storage_format, self.storage_used, self.storage_total);
+            || previous
+                != (
+                    self.storage_format,
+                    self.storage_format_error,
+                    self.storage_used,
+                    self.storage_total,
+                );
     }
 
     /// Removes a saved layout that no longer describes the device.
@@ -4977,7 +5028,7 @@ impl Application {
     /// The secondary loop's application work after serial input: releases an idle editor, starts
     /// settings jobs, then writes one event when the serial output is free, or else takes one
     /// step of background work. Returns whether it wrote an event or took a step. Once the
-    /// bootloader has been requested, it enters it when output and input have been sent.
+    /// restart has been requested, it resets the MCU when output and input have been sent.
     pub async fn work<S: RecordStore, B: Bluetooth>(
         &mut self,
         store: &mut S,
@@ -4987,15 +5038,11 @@ impl Application {
         self.manager.defer_lost_devices =
             !self.cleanup_ready() || !self.manager.lost_devices.is_empty();
         self.release_editor(store, now).await;
-        if let Some(deadline) = self.reboot_at {
-            if ((self.serial.queued() == 0 && self.manager.forward.pending() == 0)
-                || now >= deadline)
-                && self.build.bootloader.is_some()
+        if let Some((deadline, enter)) = self.reboot_at {
+            if (self.serial.queued() == 0 && self.manager.forward.pending() == 0) || now >= deadline
             {
                 self.save_all(store, now).await;
-                if let Some(boot) = &self.build.bootloader {
-                    (boot.enter)();
-                }
+                enter();
             }
             return false;
         }

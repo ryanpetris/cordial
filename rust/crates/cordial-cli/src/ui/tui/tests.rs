@@ -25,9 +25,12 @@ fn err(code: p::ErrorCode) -> p::Error {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Call {
     Open(String),
+    OpenAdapter(String, String),
     Close(Slot),
     Run(Slot, String),
     List,
+    Migrate(String, String),
+    CancelMigration,
 }
 
 #[derive(Default)]
@@ -47,6 +50,12 @@ impl Fleet for FakeFleet {
         i.next += 1;
         i.next
     }
+    fn open_adapter(&self, port: &str, id: &str) -> Slot {
+        let mut i = self.0.borrow_mut();
+        i.calls.push(Call::OpenAdapter(port.into(), id.into()));
+        i.next += 1;
+        i.next
+    }
     fn close(&self, slot: Slot) {
         self.0.borrow_mut().calls.push(Call::Close(slot));
     }
@@ -61,6 +70,15 @@ impl Fleet for FakeFleet {
     }
     fn list_ports(&self) {
         self.0.borrow_mut().calls.push(Call::List);
+    }
+    fn migrate(&self, id: &str, port: &str) {
+        self.0
+            .borrow_mut()
+            .calls
+            .push(Call::Migrate(id.into(), port.into()));
+    }
+    fn cancel_migration(&self) {
+        self.0.borrow_mut().calls.push(Call::CancelMigration);
     }
 }
 
@@ -461,9 +479,10 @@ fn disconnect_keeps_the_adapter_until_connect() {
     );
     // Connect waits for the closing session to release the port.
     app.click("[Connect]");
-    assert!(!app.calls().contains(&Call::Open("/dev/ttyACM1".into())));
+    let connect = Call::OpenAdapter("/dev/ttyACM1".into(), "00000000000FA002".into());
+    assert!(!app.calls().contains(&connect));
     app.m.update(Msg::Fleet(slot, Box::new(Event::Closed)));
-    assert!(app.calls().contains(&Call::Open("/dev/ttyACM1".into())));
+    assert!(app.calls().contains(&connect));
 }
 
 #[test]
@@ -1325,6 +1344,32 @@ fn the_enabled_limit_is_predicted_as_the_adapter_applies_it() {
 }
 
 #[test]
+fn connect_refuses_another_adapter_on_the_port() {
+    let mut app = App::two(110, 32);
+    app.m.disconnect_adapter("00000000000FA002");
+    closed(&mut app, 2);
+    app.fleet.0.borrow_mut().calls.clear();
+    app.m.connect_adapter("00000000000FA002");
+    assert_eq!(
+        app.calls(),
+        [Call::OpenAdapter(
+            "/dev/ttyACM1".into(),
+            "00000000000FA002".into()
+        )]
+    );
+    let slot = app.m.off["00000000000FA002"].connecting.unwrap();
+    app.phase(slot, Phase::Other);
+    assert_eq!(app.calls().last(), Some(&Call::Close(slot)));
+    assert!(app.m.session_of("00000000000FA002").is_none());
+    assert!(
+        app.m.off["00000000000FA002"]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("Another adapter answered on its port."))
+    );
+}
+
+#[test]
 fn a_connect_waiting_for_its_port_follows_the_adapter_to_another_port() {
     let mut app = App::two(110, 32);
     app.m.disconnect_adapter("00000000000FA002");
@@ -1336,7 +1381,10 @@ fn a_connect_waiting_for_its_port_follows_the_adapter_to_another_port() {
         port("/dev/ttyACM0", "00000000000FA001"),
         port("/dev/ttyACM5", "00000000000FA002"),
     ])));
-    assert!(app.calls().contains(&Call::Open("/dev/ttyACM5".into())));
+    assert!(app.calls().contains(&Call::OpenAdapter(
+        "/dev/ttyACM5".into(),
+        "00000000000FA002".into()
+    )));
 }
 
 #[test]
@@ -1797,4 +1845,266 @@ fn device_diagnostics_leave_out_unreported_facts() {
     });
     app.m.tick();
     assert!(!app.shows("Security"), "{}", app.screen());
+}
+
+const MIGRATING_ID: &str = "00000000000FA002";
+
+fn needs_migration() -> State {
+    let mut st = second_adapter();
+    st.status.ready = false;
+    st.loaded = false;
+    st.devices.clear();
+    st.status.errors = vec![p::Error {
+        code: p::ErrorCode::StorageMigrationRequired as i32,
+        reason: p::ErrorReason::Storage as i32,
+        outcome: p::ErrorOutcome::NoEffect as i32,
+        ..Default::default()
+    }];
+    st
+}
+
+fn closed(app: &mut App, slot: Slot) {
+    app.m.update(Msg::Fleet(slot, Box::new(Event::Closed)));
+}
+
+fn opens(app: &App) -> usize {
+    app.calls()
+        .iter()
+        .filter(|c| matches!(c, Call::Open(_)))
+        .count()
+}
+
+fn migration_failed() -> Msg {
+    Msg::Migrated(Err(cordial_client::migration::Error {
+        reason: "the adapter refused a write".into(),
+        outcome_unknown: false,
+    }))
+}
+
+/// A TUI with a ready adapter, a port still opening, and an adapter that needs migration, which
+/// starts closing every session. Returns the three slots.
+fn migrating_app() -> (App, [Slot; 3]) {
+    let mut app = App::new(100, 30);
+    let ports = vec![
+        port("/dev/ttyACM0", "00000000000FA001"),
+        port("/dev/ttyACM1", MIGRATING_ID),
+        port("/dev/ttyACM2", "00000000000FA003"),
+    ];
+    app.m.update(Msg::Ports(Ok(ports)));
+    let slot = |app: &App, name: &str| {
+        *app.m
+            .probes
+            .iter()
+            .find(|(_, p)| p.as_str() == name)
+            .unwrap()
+            .0
+    };
+    let slots = [
+        slot(&app, "/dev/ttyACM0"),
+        slot(&app, "/dev/ttyACM1"),
+        slot(&app, "/dev/ttyACM2"),
+    ];
+    app.fleet
+        .0
+        .borrow_mut()
+        .states
+        .insert(slots[0], first_adapter());
+    app.phase(slots[0], Phase::Opened);
+    app.phase(slots[0], Phase::Ready);
+    app.fleet
+        .0
+        .borrow_mut()
+        .states
+        .insert(slots[1], needs_migration());
+    app.fleet.0.borrow_mut().calls.clear();
+    app.phase(slots[1], Phase::Migrate);
+    (app, slots)
+}
+
+#[test]
+fn migration_closes_every_session_and_open_before_its_worker_starts() {
+    let (mut app, [a, b, c]) = migrating_app();
+    let mut calls = app.calls();
+    calls.sort_by_key(|c| format!("{c:?}"));
+    assert_eq!(calls, [Call::Close(a), Call::Close(b), Call::Close(c)]);
+    closed(&mut app, a);
+    closed(&mut app, b);
+    // The port still opening has not released it yet.
+    assert!(!app.calls().iter().any(|c| matches!(c, Call::Migrate(..))));
+    closed(&mut app, c);
+    assert_eq!(
+        app.calls().last(),
+        Some(&Call::Migrate(MIGRATING_ID.into(), "/dev/ttyACM1".into()))
+    );
+    app.m.update(Msg::Migration(
+        cordial_protocol::migration::MigrationEvent {
+            event: Some(
+                cordial_protocol::migration::migration_event::Event::Waiting(Default::default()),
+            ),
+        },
+    ));
+    assert!(app.shows("Waiting for Adapter"));
+    // Discovery stops: nothing is listed or opened while it migrates.
+    app.fleet.0.borrow_mut().calls.clear();
+    app.m.list_due = Instant::now();
+    app.m.tick();
+    app.m.update(Msg::Ports(Ok(vec![port(
+        "/dev/ttyACM0",
+        "00000000000FA001",
+    )])));
+    assert!(app.calls().is_empty(), "{:?}", app.calls());
+    app.m.update(Msg::Migrated(Ok(Migrated::Success)));
+    app.m.tick();
+    assert_eq!(app.calls(), [Call::List]);
+}
+
+#[test]
+fn a_failed_migration_opens_nothing_until_cancelled_and_is_not_repeated() {
+    let (mut app, slots) = migrating_app();
+    for slot in slots {
+        closed(&mut app, slot);
+    }
+    app.m.update(migration_failed());
+    app.m.open(Page::Adapter(MIGRATING_ID.into()));
+    assert!(app.shows("Needs Attention"));
+    assert!(app.shows("Cordial couldn't migrate the adapter's saved data."));
+    app.fleet.0.borrow_mut().calls.clear();
+    app.m.list_due = Instant::now();
+    app.m.tick();
+    app.m
+        .update(Msg::Ports(Ok(vec![port("/dev/ttyACM1", MIGRATING_ID)])));
+    assert!(app.calls().is_empty(), "{:?}", app.calls());
+    // Migrate tries again without opening anything.
+    app.click("Migrate");
+    assert_eq!(
+        app.calls(),
+        [Call::Migrate(MIGRATING_ID.into(), "/dev/ttyACM1".into())]
+    );
+    app.m.update(migration_failed());
+    app.fleet.0.borrow_mut().calls.clear();
+    app.click("Cancel");
+    app.m.tick();
+    assert_eq!(app.calls(), [Call::List]);
+    app.m
+        .update(Msg::Ports(Ok(vec![port("/dev/ttyACM1", MIGRATING_ID)])));
+    assert_eq!(opens(&app), 1);
+    let slot = *app.m.probes.keys().next().unwrap();
+    app.fleet
+        .0
+        .borrow_mut()
+        .states
+        .insert(slot, needs_migration());
+    app.fleet.0.borrow_mut().calls.clear();
+    app.phase(slot, Phase::Migrate);
+    // A cancelled adapter waits for Migrate.
+    assert!(app.calls().is_empty(), "{:?}", app.calls());
+    app.m.open(Page::Adapter(MIGRATING_ID.into()));
+    assert!(app.shows("Needs Attention"));
+    app.click("Migrate");
+    assert_eq!(app.calls(), [Call::Close(slot)]);
+}
+
+#[test]
+fn a_failure_reported_after_cancel_ends_the_migration() {
+    let (mut app, slots) = migrating_app();
+    for slot in slots {
+        closed(&mut app, slot);
+    }
+    app.m.open(Page::Adapter(MIGRATING_ID.into()));
+    app.fleet.0.borrow_mut().calls.clear();
+    // The worker failed before it saw the cancellation; its result arrives after.
+    app.click("Cancel");
+    assert_eq!(app.calls(), [Call::CancelMigration]);
+    app.m.list_due = Instant::now();
+    app.m.tick();
+    assert_eq!(app.calls(), [Call::CancelMigration]);
+    app.m.update(migration_failed());
+    assert!(app.m.migration.is_none());
+    assert!(app.m.declined.contains(MIGRATING_ID));
+    app.m.tick();
+    app.m.update(Msg::Ports(Ok(vec![
+        port("/dev/ttyACM0", "00000000000FA001"),
+        port("/dev/ttyACM1", MIGRATING_ID),
+    ])));
+    assert_eq!(opens(&app), 2);
+}
+
+#[test]
+fn quitting_cancels_the_migration_and_waits_for_its_worker() {
+    let (mut app, slots) = migrating_app();
+    for slot in slots {
+        closed(&mut app, slot);
+    }
+    app.fleet.0.borrow_mut().calls.clear();
+    app.m.update(Msg::Interrupt);
+    assert_eq!(app.calls(), [Call::CancelMigration]);
+    assert!(!app.m.done);
+    app.m.tick();
+    assert!(!app.m.done);
+    app.m.update(Msg::Migrated(Ok(Migrated::Cancelled)));
+    assert!(app.m.done);
+}
+
+#[test]
+fn an_unsupported_adapter_says_why_and_offers_nothing() {
+    let mut app = App::new(100, 30);
+    app.m.update(Msg::Ports(Ok(vec![port(
+        "/dev/ttyACM0",
+        "00000000000FA001",
+    )])));
+    let slot = *app.m.probes.keys().next().unwrap();
+    let mut st = first_adapter();
+    st.loaded = false;
+    st.status
+        .information
+        .as_mut()
+        .unwrap()
+        .target_storage_format = Some(0);
+    app.fleet.0.borrow_mut().states.insert(slot, st);
+    app.phase(
+        slot,
+        Phase::Unsupported(Error::new(crate::migration::FIRMWARE)),
+    );
+    app.m.open(Page::Adapter("00000000000FA001".into()));
+    assert!(app.shows("Unsupported"));
+    assert!(app.shows("Update the adapter's firmware."));
+    assert!(app.find("Rename").is_none());
+    app.click("Diagnostics");
+    assert!(app.find("Restart").is_none());
+    assert!(!app.calls().iter().any(|c| matches!(c, Call::Run(..))));
+}
+
+#[test]
+fn a_blocked_adapter_shows_its_error_and_offers_restart() {
+    let mut app = App::new(100, 30);
+    app.m.update(Msg::Ports(Ok(vec![port(
+        "/dev/ttyACM0",
+        "00000000000FA001",
+    )])));
+    let slot = *app.m.probes.keys().next().unwrap();
+    let mut st = first_adapter();
+    st.loaded = false;
+    st.status.ready = false;
+    app.fleet.0.borrow_mut().states.insert(slot, st);
+    let blocked = p::Error {
+        code: p::ErrorCode::StorageFailed as i32,
+        outcome: p::ErrorOutcome::NoEffect as i32,
+        related: vec![p::Error {
+            code: p::ErrorCode::StorageFull as i32,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    app.phase(slot, Phase::Blocked(Error::dongle(blocked, None)));
+    assert!(!app.m.migrating());
+    app.m.open(Page::Adapter("00000000000FA001".into()));
+    assert!(app.shows("Needs Attention"));
+    assert!(app.shows("The adapter couldn't read or write its saved data. Also, the"));
+    assert!(app.shows("adapter's storage is full."));
+    let shown = app.render().join("\n");
+    assert!(!shown.contains("storage_f"), "{shown}");
+    app.click("Diagnostics");
+    app.click("Restart");
+    assert!(app.ran("Restart"));
+    assert!(!app.calls().iter().any(|c| matches!(c, Call::Migrate(..))));
 }

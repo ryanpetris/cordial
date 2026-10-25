@@ -167,7 +167,9 @@ fn opening_lists_every_device_in_one_response() {
 
 #[test]
 fn an_unready_adapter_waits_then_loads_when_it_reports_ready() {
-    let dongle = Dongle::with(|sim| sim.status = common::status(false));
+    let dongle = Dongle::with(|sim| {
+        sim.status = common::status(false);
+    });
     let (c, rx) = setup(&dongle);
     c.open("sim".into());
     until(&rx, |e| {
@@ -1016,4 +1018,290 @@ fn gamepad_output_is_saved_only_where_the_adapter_offers_it() {
     assert!(
         matches!(outcome, Outcome::Device { device, .. } if device.output_preferences.is_empty())
     );
+}
+
+/// Sets the adapter's committed and target storage formats.
+fn formats(sim: &mut common::Sim, current: Option<u32>, target: u32) {
+    let information = sim.status.information.as_mut().unwrap();
+    information.storage_format = current;
+    information.target_storage_format = Some(target);
+}
+
+fn storage_error(code: ErrorCode, outcome: p::ErrorOutcome) -> p::Error {
+    p::Error {
+        code: code as i32,
+        reason: p::ErrorReason::Storage as i32,
+        outcome: outcome as i32,
+        ..Default::default()
+    }
+}
+
+/// The marker the adapter reports from boot until restart while it waits for a migration.
+fn required() -> p::Error {
+    storage_error(
+        ErrorCode::StorageMigrationRequired,
+        p::ErrorOutcome::NoEffect,
+    )
+}
+
+fn unusable() -> [Command; 4] {
+    [
+        Command::Files("/".into()),
+        Command::Bootloader,
+        Command::Devices,
+        Command::FileGet {
+            path: "/format.pb".into(),
+            local: "unused".into(),
+            overwrite: false,
+            raw: true,
+        },
+    ]
+}
+
+fn first_phase(rx: &mpsc::Receiver<Event>) -> Phase {
+    match until(rx, |e| matches!(e, Event::Connection { .. })) {
+        Event::Connection { phase, .. } => phase,
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn an_adapter_that_needs_migration_takes_only_status_until_closed() {
+    // The marker decides, whatever committed format the adapter reports.
+    for current in [Some(1), Some(2), None] {
+        let dongle = Dongle::with(|sim| {
+            sim.status.ready = false;
+            formats(sim, current, 2);
+            sim.status.errors = vec![required()];
+        });
+        let (c, rx) = setup(&dongle);
+        c.open("sim".into());
+        let phase = first_phase(&rx);
+        assert!(matches!(phase, Phase::Migrate), "{current:?}: {phase:?}");
+        for command in unusable() {
+            let e = run(&c, &rx, command).unwrap_err();
+            assert!(e.message.contains("must be migrated"), "{e:?}");
+        }
+        run(&c, &rx, Command::Status).unwrap();
+        assert_eq!(dongle.sent(), ["get_status", "get_status"]);
+        c.close();
+        until(&rx, |e| matches!(e, Event::Closed));
+        assert_eq!(dongle.handles(), 0);
+    }
+}
+
+#[test]
+fn other_errors_with_the_marker_take_only_status_and_restart() {
+    let blocked = || storage_error(ErrorCode::StorageFailed, p::ErrorOutcome::Unspecified);
+    let radio = p::Error {
+        reason: p::ErrorReason::Radio as i32,
+        ..storage_error(ErrorCode::NotReady, p::ErrorOutcome::NoEffect)
+    };
+    let mut unknown = required();
+    unknown.outcome = p::ErrorOutcome::Unknown as i32;
+    let mut related = required();
+    related.related = vec![blocked()];
+    for (current, errors) in [
+        (None, vec![required(), blocked()]),
+        (Some(1), vec![blocked(), required()]),
+        (Some(2), vec![required(), radio]),
+        (Some(1), vec![unknown]),
+        (Some(3), vec![related]),
+    ] {
+        let dongle = Dongle::with(|sim| {
+            sim.status.ready = false;
+            formats(sim, current, 2);
+            sim.status.errors = errors.clone();
+        });
+        let (c, rx) = setup(&dongle);
+        c.open("sim".into());
+        let Phase::Blocked(error) = first_phase(&rx) else {
+            panic!("expected Blocked for {current:?} {errors:?}");
+        };
+        let wanted = errors.iter().find(|e| **e != required());
+        assert_eq!(error.dongle.as_ref(), wanted, "{error:?}");
+        for command in unusable() {
+            let e = run(&c, &rx, command).unwrap_err();
+            assert_eq!(e.message, error.message, "{e:?}");
+        }
+        run(&c, &rx, Command::Status).unwrap();
+        assert!(matches!(
+            run(&c, &rx, Command::Restart).unwrap(),
+            Outcome::Restart
+        ));
+        assert_eq!(dongle.sent(), ["get_status", "get_status", "restart"]);
+        // The adapter resets after its reply.
+        eventually(&c, &rx, |st| !st.available);
+    }
+}
+
+#[test]
+fn without_the_marker_an_unready_adapter_waits_as_usual() {
+    for (current, code) in [
+        (Some(2), ErrorCode::NotReady),
+        (Some(1), ErrorCode::NotReady),
+        (None, ErrorCode::StorageFailed),
+    ] {
+        let dongle = Dongle::with(|sim| {
+            sim.status = common::status(false);
+            formats(sim, current, 2);
+            sim.status.errors = vec![storage_error(code, p::ErrorOutcome::NoEffect)];
+            sim.files.insert("/".into(), Vec::new());
+        });
+        let (c, rx) = setup(&dongle);
+        c.open("sim".into());
+        let phase = first_phase(&rx);
+        assert!(matches!(phase, Phase::Opened), "{current:?}: {phase:?}");
+        until(&rx, |e| {
+            matches!(
+                e,
+                Event::Connection {
+                    phase: Phase::Waiting,
+                    ..
+                }
+            )
+        });
+        let e = run(&c, &rx, Command::Devices).unwrap_err();
+        assert!(e.message.contains("still starting"), "{e:?}");
+        run(&c, &rx, Command::Files("/".into())).unwrap();
+        // Restart doesn't wait for readiness.
+        run(&c, &rx, Command::Restart).unwrap();
+        assert_eq!(dongle.sent(), ["get_status", "list_files", "restart"]);
+    }
+}
+
+#[test]
+fn file_access_works_with_matching_formats_or_readiness() {
+    let unready = |sim: &mut common::Sim| {
+        sim.status = common::status(false);
+        sim.status.errors = vec![p::Error {
+            code: ErrorCode::NotReady as i32,
+            reason: p::ErrorReason::Radio as i32,
+            ..Default::default()
+        }];
+    };
+    let ready = |sim: &mut common::Sim| sim.status = common::status(true);
+    for setup_status in [unready as fn(&mut common::Sim), ready] {
+        let dongle = Dongle::with(|sim| {
+            setup_status(sim);
+            sim.files.insert("/".into(), Vec::new());
+        });
+        let (c, rx) = setup(&dongle);
+        c.open("sim".into());
+        until(&rx, |e| {
+            matches!(
+                e,
+                Event::Connection {
+                    phase: Phase::Waiting | Phase::Ready,
+                    ..
+                }
+            )
+        });
+        run(&c, &rx, Command::Files("/".into())).unwrap();
+        assert!(dongle.sent().contains(&"list_files"));
+    }
+}
+
+#[test]
+fn an_unsupported_or_unlabelled_adapter_takes_only_status() {
+    for (current, target, wanted) in [
+        (Some(2), 3, "Update Cordial"),
+        (Some(1), 1, "Update Cordial"),
+        (None, 3, "Update Cordial"),
+        (Some(2), 0, "firmware"),
+    ] {
+        let dongle = Dongle::with(|sim| {
+            formats(sim, current, target);
+            sim.status.errors = vec![required()];
+        });
+        let (c, rx) = setup(&dongle);
+        c.open("sim".into());
+        match first_phase(&rx) {
+            Phase::Unsupported(e) => assert!(e.message.contains(wanted), "{e:?}"),
+            phase => panic!("expected Unsupported, got {phase:?}"),
+        }
+        for command in [Command::Files("/".into()), Command::Restart] {
+            let e = run(&c, &rx, command).unwrap_err();
+            assert!(e.message.contains(wanted), "{e:?}");
+        }
+        assert_eq!(dongle.sent(), ["get_status"]);
+    }
+}
+
+#[test]
+fn an_adapter_without_a_target_takes_only_status_despite_present_information() {
+    for errors in [vec![], vec![required()]] {
+        let dongle = Dongle::with(|sim| {
+            sim.status.ready = true;
+            formats(sim, Some(2), 2);
+            sim.status
+                .information
+                .as_mut()
+                .unwrap()
+                .target_storage_format = None;
+            sim.status.errors = errors;
+        });
+        let (c, rx) = setup(&dongle);
+        c.open("sim".into());
+        assert!(matches!(first_phase(&rx), Phase::Unsupported(_)));
+        for command in unusable().into_iter().chain([Command::Restart]) {
+            assert!(
+                run(&c, &rx, command)
+                    .unwrap_err()
+                    .message
+                    .contains("firmware")
+            );
+        }
+        run(&c, &rx, Command::Status).unwrap();
+        assert_eq!(dongle.sent(), ["get_status", "get_status"]);
+        c.close();
+        until(&rx, |e| matches!(e, Event::Closed));
+        assert_eq!(dongle.handles(), 0);
+    }
+}
+
+#[test]
+fn another_adapter_on_the_expected_port_takes_only_status() {
+    let dongle = Dongle::default();
+    let (c, rx) = setup(&dongle);
+    c.open_adapter("sim".into(), "ADAPTER02".into());
+    match until(&rx, |e| matches!(e, Event::Connection { .. })) {
+        Event::Connection {
+            phase: Phase::Other,
+            ..
+        } => {}
+        e => panic!("expected Other, got {e:?}"),
+    }
+    assert_eq!(dongle.handles(), 0);
+    assert!(run(&c, &rx, Command::Devices).is_err());
+    assert_eq!(dongle.sent(), ["get_status"]);
+
+    // The expected adapter opens as usual.
+    let dongle = Dongle::default();
+    let (c, rx) = setup(&dongle);
+    c.open_adapter("sim".into(), "adapter01".into());
+    until(&rx, |e| {
+        matches!(
+            e,
+            Event::Connection {
+                phase: Phase::Ready,
+                ..
+            }
+        )
+    });
+    assert!(dongle.sent().contains(&"list_devices"));
+}
+
+#[test]
+fn closed_means_the_port_is_released_even_while_opening() {
+    let dongle = Dongle::with(|sim| {
+        sim.slow.insert("get_status", Duration::from_millis(200));
+    });
+    let (c, rx) = setup(&dongle);
+    c.open("sim".into());
+    // Closed while the opening status is still unanswered.
+    std::thread::sleep(Duration::from_millis(50));
+    c.close();
+    until(&rx, |e| matches!(e, Event::Closed));
+    assert_eq!(dongle.handles(), 0);
 }

@@ -33,11 +33,41 @@ show the Dongle's error without refreshing when it refuses anyway.
 | --- | --- | --- |
 | `GetStatus` | `Status` | Refreshes the storage readings first. |
 | `SetAdapter` | none | Partial update of the name, host platform, enabled transports and configuration interfaces, saved together. A name is 1..64 UTF-8 bytes without control characters, trimmed; `""` restores the firmware default. Transport updates apply in order; one for a transport the firmware does not support returns `ERROR_CODE_UNSUPPORTED` and changes nothing. Any transport may be disabled, including all of them. An unchanged value writes nothing. A platform change reconfigures special-key translation on every connected device with HID++ on and re-applies its saved settings. Disabling a transport closes its links, fails a pairing over it that has not saved its bond with `ERROR_CODE_UNSUPPORTED`, drops it from a running scan (ending the scan when no transport is left), stops reconnecting its devices and declines their connections, and makes its saved devices inactive with `INACTIVE_REASON_TRANSPORT_DISABLED`. Enabling it makes them eligible again: after the response, the Dongle reads their saved records in the background, and a `device` event reports each device that becomes resident. Configuration interface changes are described under [Profiles](#profiles). |
+| `Restart` | none | Available in every mode, including assisted and blocked storage. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. After its empty response drains, the Dongle performs a full hardware reset and starts up as it would after a power cycle. It doesn't validate or convert files. |
 | `EnterBootloader` | none | Development firmware only. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. After responding, the Dongle stops reading requests, releases held input, and reboots into ROM programming mode (BOOTSEL on Pico, download mode on ESP32-S3) within about 250 ms. Saved data is untouched. |
 
 An `adapter` event follows any change to the name, platform, enabled transports, configuration
 interfaces, readiness or adapter information. Best-effort storage recounts also report changes
 to storage byte counts or their presence.
+
+## File access and storage migration
+
+`ListFiles`, `ReadFile`, `WriteFile`, `MoveFile` and `DeleteFile` operate on the
+application filesystem in debug firmware and automatically during required host
+assistance in production. See [file access](development.md#file-access) for path
+validation, bounded reads, atomic writes and availability.
+
+`GetStatus` remains available before storage, identity and radio startup. Hosts
+check `Status.information.target_storage_format` for exact support before any
+interaction except bootstrap status or closing the connection.
+`Status.information.storage_format` reports the committed root's format for
+display only.
+
+Assisted mode reports `ERROR_CODE_STORAGE_MIGRATION_REQUIRED` with reason `STORAGE` and
+outcome `NO_EFFECT` in `Status.errors`, enables the shared file commands and
+disables ordinary commands. Firmware selects the mode at boot and keeps it until
+the next restart, even after `/format.pb` reaches the target format. Any other
+status error, or related errors on the marker, blocks host conversion. Without
+the marker, clients never start a migration and treat readiness and errors as
+usual.
+
+The host downloads the whole dataset, converts it when it isn't already in the
+target format, uploads `/format.pb` last and verifies it by reading it back. An
+intermediate checkpoint is an ordinary root upload and readback, followed by the
+next conversion step. After the final root, the host sends `Restart`. It then
+reconnects to the same stable `Status.id` and requires the same supported target,
+`ready = true` and no `ERROR_CODE_STORAGE_MIGRATION_REQUIRED`. See
+[preserving migration](../storage-format.md#preserving-migration).
 
 ## Discovery and pairing
 

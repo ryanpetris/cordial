@@ -17,10 +17,9 @@ pub type Bytes<SIZE> = generic_array::GenericArray<u8, SIZE>;
 pub use littlefs2_core::{Attribute, DirEntry, FileOpenFlags, FileType, Metadata};
 
 use crate::{
-    driver,
+    DISK_VERSION, driver,
     io::{self, Error, OpenSeekFrom, Result},
     path::{Path, PathBuf},
-    DISK_VERSION,
 };
 
 // This conversion is only useless when bindgen emits `lfs_error` as `c_int`.
@@ -422,6 +421,17 @@ impl<Storage: driver::Storage> Filesystem<'_, Storage> {
                 to.as_ptr(),
             )
         };
+        result_from((), return_code)
+    }
+
+    /// Resolve pending filesystem operations without making another filesystem change.
+    ///
+    /// Call this after mounting when reads must see the resolved state of an interrupted rename,
+    /// before classifying application data or cleaning up temporary files. LittleFS otherwise
+    /// defers consistency recovery until the first write. Recovery may write metadata and returns
+    /// the native error if it cannot complete.
+    pub fn make_consistent(&self) -> Result<()> {
+        let return_code = unsafe { ll::lfs_fs_mkconsistent(&mut self.alloc.borrow_mut().state) };
         result_from((), return_code)
     }
 

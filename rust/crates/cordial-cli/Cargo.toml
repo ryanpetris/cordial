@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 cordial-client = { workspace = true, features = ["serialport"] }
-cordial-protocol = { workspace = true, features = ["json"] }
+cordial-protocol = { workspace = true, features = ["json", "migration"] }
 serde_json = { workspace = true, features = ["std"] }
 serde.workspace = true
 prost = { version = "=0.14.4", default-features = false }

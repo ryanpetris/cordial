@@ -67,6 +67,7 @@ struct Shared {
     confirmation: Condvar,
     /// Set once the first request is about to be written; nothing before it is read.
     started: AtomicBool,
+    migration_limits: AtomicBool,
     stop: AtomicBool,
     timeout: Mutex<Option<Duration>>,
     last_received: Mutex<Instant>,
@@ -152,6 +153,7 @@ impl Connection {
             }),
             confirmation: Condvar::new(),
             started: AtomicBool::new(false),
+            migration_limits: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             timeout: Mutex::new(Some(DEFAULT_TIMEOUT)),
             last_received: Mutex::new(Instant::now()),
@@ -172,6 +174,10 @@ impl Connection {
     /// Progressing responses may take longer. A stalled request closes the connection.
     pub fn set_timeout(&self, timeout: Option<Duration>) {
         *self.shared.timeout.lock().unwrap() = timeout;
+    }
+
+    pub(crate) fn set_migration_limits(&self) {
+        self.shared.migration_limits.store(true, Ordering::Release);
     }
 
     /// Why the connection closed, or `None` while it is open.
@@ -196,9 +202,27 @@ impl Connection {
             .wait_timeout_while(released, RELEASE_TIMEOUT, |released| !*released);
     }
 
+    /// Closes the session and waits until both stream handles are released.
+    /// Returns false when called from the reader handler, which cannot wait for itself.
+    /// Readers must have bounded read timeouts for this call to finish.
+    pub fn close_and_wait_release(&self) -> bool {
+        self.shared.close(Error::Closed);
+        if thread::current().id() == self.reader {
+            return false;
+        }
+        let released = self.shared.released.lock().unwrap();
+        drop(
+            self.shared
+                .release
+                .wait_while(released, |released| !*released)
+                .unwrap(),
+        );
+        true
+    }
+
     /// Sends one command and returns the Dongle's response, which may hold an error result.
     pub fn request(&self, command: Command) -> Result<p::Response> {
-        self.send(command, None)
+        self.send(command, None, None)
     }
 
     /// Sends one command as [`Connection::request`] does, and passes its response to `observe`
@@ -210,10 +234,28 @@ impl Connection {
         command: Command,
         observe: impl FnOnce(&p::Response) + Send + 'static,
     ) -> Result<p::Response> {
-        self.send(command, Some(Box::new(observe)))
+        self.send(command, Some(Box::new(observe)), None)
     }
 
-    fn send(&self, command: Command, observe: Option<Observer>) -> Result<p::Response> {
+    pub(crate) fn migration_request(
+        &self,
+        command: Command,
+        cancelled: &AtomicBool,
+    ) -> Result<p::Response> {
+        self.set_migration_limits();
+        self.send(command, None, Some(cancelled))
+    }
+
+    fn send(
+        &self,
+        command: Command,
+        observe: Option<Observer>,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<p::Response> {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            self.shared.close(Error::Closed);
+            return Err(Error::Closed);
+        }
         let request = p::Request {
             command: Some(command),
         };
@@ -255,6 +297,11 @@ impl Connection {
             let Some(stream) = writer.as_mut() else {
                 return Err(Error::Closed);
             };
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                drop(writer);
+                self.shared.close(Error::Closed);
+                return Err(Error::Closed);
+            }
             if let Err(error) = write_all(stream.as_mut(), &frame) {
                 drop(writer);
                 let error = Error::from(error);
@@ -264,20 +311,21 @@ impl Connection {
         }
         let timeout = *self.shared.timeout.lock().unwrap();
         let started = Instant::now();
-        let reply = match timeout {
-            Some(timeout) => loop {
-                let idle = (*self.shared.last_received.lock().unwrap())
-                    .max(started)
-                    .elapsed();
-                match rx.recv_timeout(timeout.saturating_sub(idle)) {
+        let reply = if let Some(cancelled) = cancelled {
+            loop {
+                if cancelled.load(Ordering::Acquire) {
+                    self.shared.close(Error::Closed);
+                    break Err(Error::Closed);
+                }
+                match rx.recv_timeout(Duration::from_millis(50)) {
                     Ok(reply) => break Ok(reply),
                     Err(RecvTimeoutError::Timeout) => {
-                        if (*self.shared.last_received.lock().unwrap())
-                            .max(started)
-                            .elapsed()
-                            >= timeout
-                        {
-                            // A lost response would make every later response answer the wrong request.
+                        if timeout.is_some_and(|timeout| {
+                            (*self.shared.last_received.lock().unwrap())
+                                .max(started)
+                                .elapsed()
+                                >= timeout
+                        }) {
                             self.shared.close(Error::Timeout);
                             break Err(Error::Timeout);
                         }
@@ -286,10 +334,35 @@ impl Connection {
                         break Err(self.closed().unwrap_or(Error::Closed));
                     }
                 }
-            },
-            None => rx
-                .recv()
-                .map_err(|_| self.closed().unwrap_or(Error::Closed)),
+            }
+        } else {
+            match timeout {
+                Some(timeout) => loop {
+                    let idle = (*self.shared.last_received.lock().unwrap())
+                        .max(started)
+                        .elapsed();
+                    match rx.recv_timeout(timeout.saturating_sub(idle)) {
+                        Ok(reply) => break Ok(reply),
+                        Err(RecvTimeoutError::Timeout) => {
+                            if (*self.shared.last_received.lock().unwrap())
+                                .max(started)
+                                .elapsed()
+                                >= timeout
+                            {
+                                // A lost response would make every later response answer the wrong request.
+                                self.shared.close(Error::Timeout);
+                                break Err(Error::Timeout);
+                            }
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            break Err(self.closed().unwrap_or(Error::Closed));
+                        }
+                    }
+                },
+                None => rx
+                    .recv()
+                    .map_err(|_| self.closed().unwrap_or(Error::Closed)),
+            }
         };
         reply?
     }
@@ -534,7 +607,10 @@ impl Connection {
     /// Development firmware only.
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         self.call(
-            Command::ReadFile(p::ReadFile { path: path.into() }),
+            Command::ReadFile(p::ReadFile {
+                path: path.into(),
+                ..Default::default()
+            }),
             |r| match r {
                 response::Result::File(file) => Some(file.data),
                 _ => None,
@@ -618,7 +694,24 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
             let Some(frame) = decoder.push(byte) else {
                 continue;
             };
-            let message = frame.ok().and_then(|frame| p::Message::decode(frame).ok());
+            if shared.migration_limits.load(Ordering::Acquire)
+                && let Ok(bytes) = frame.as_ref()
+            {
+                match crate::migration::wire::migration_response(bytes) {
+                    Ok(false) => continue,
+                    Err(()) => {
+                        failed = Some(Error::Protocol);
+                        break;
+                    }
+                    Ok(true) => {}
+                }
+            }
+            let message = frame.ok().and_then(|frame| {
+                if shared.migration_limits.load(Ordering::Acquire) {
+                    crate::migration::wire::check_file_lists(frame).ok()?;
+                }
+                p::Message::decode(frame).ok()
+            });
             if !synced {
                 if shared.started.load(Ordering::Acquire)
                     && let Some(p::Message {
@@ -775,5 +868,55 @@ mod tests {
             ));
         }
         assert!(writes.try_recv().is_err());
+    }
+
+    #[test]
+    fn exclusive_close_waits_for_actual_reader_release() {
+        struct HeldReader(Receiver<()>, mpsc::Sender<()>);
+        impl Read for HeldReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.1.send(()).unwrap();
+                self.0.recv().unwrap();
+                Ok(0)
+            }
+        }
+        let (release, held) = mpsc::channel();
+        let (entered, reading) = mpsc::channel();
+        let (connection, _) = Connection::new(HeldReader(held, entered), io::sink());
+        reading.recv_timeout(DEADLINE).unwrap();
+        let connection = Arc::new(connection);
+        let closer = connection.clone();
+        let (finished, done) = mpsc::channel();
+        let close = thread::spawn(move || finished.send(closer.close_and_wait_release()).unwrap());
+        while !connection.shared.stop.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        assert!(done.try_recv().is_err());
+        release.send(()).unwrap();
+        assert!(done.recv_timeout(DEADLINE).unwrap());
+        close.join().unwrap();
+        assert!(*connection.shared.released.lock().unwrap());
+    }
+
+    #[test]
+    fn migration_cancellation_interrupts_an_unbounded_response_wait() {
+        let (connection, _responses, writes) = connection();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker = connection.clone();
+        let cancellation = cancelled.clone();
+        let (finished, done) = mpsc::channel();
+        let request = thread::spawn(move || {
+            finished
+                .send(worker.migration_request(Command::GetStatus(p::GetStatus {}), &cancellation))
+                .unwrap();
+        });
+        writes.recv_timeout(DEADLINE).unwrap();
+        cancelled.store(true, Ordering::Release);
+        assert!(matches!(
+            done.recv_timeout(DEADLINE).unwrap(),
+            Err(Error::Closed)
+        ));
+        request.join().unwrap();
+        assert!(connection.close_and_wait_release());
     }
 }

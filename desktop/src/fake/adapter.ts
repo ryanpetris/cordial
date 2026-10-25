@@ -409,6 +409,12 @@ const sameObject = (s: FakeSetting, group: string, index: number | null) => s.gr
 /** A saved record's failed read. */
 const READ_ERROR: ErrorInit = { code: ErrorCode.STORAGE_FAILED, reason: ErrorReason.STORAGE, outcome: ErrorOutcome.NO_EFFECT };
 
+/** The error the firmware reports, and refuses other commands with, in assisted mode. */
+const STORAGE_MIGRATION_REQUIRED: ErrorInit = { code: ErrorCode.STORAGE_MIGRATION_REQUIRED, reason: ErrorReason.STORAGE, outcome: ErrorOutcome.NO_EFFECT };
+
+/** Commands assisted mode still runs. */
+const ASSISTED_COMMANDS = new Set(["getStatus", "restart", "listFiles", "readFile", "writeFile", "moveFile", "deleteFile"]);
+
 /** The reason the firmware gives a code that comes without one here. */
 const REASONS: Partial<Record<ErrorCode, ErrorReason>> = {
   [ErrorCode.NOT_READY]: ErrorReason.RADIO,
@@ -468,6 +474,15 @@ export class FakeAdapter implements ByteStream {
   /** Storage in use and the filesystem's size, in bytes; null while unknown. */
   storageUsed: number | null = 24576;
   storageTotal: number | null = 524288;
+  /** The format the saved root declares; null when it can't be determined. */
+  storageFormat: number | null = 2;
+  /** The storage format the firmware operates on; null for firmware that doesn't report one. */
+  targetStorageFormat: number | null = 2;
+  /** Assisted mode, which startup selects from the saved data and which lasts until the next
+   * start, whatever is written meanwhile. */
+  migrationRequired = false;
+  /** How often the adapter started again after the first time. */
+  restarts = 0;
   readonly usbInterfaces: number;
   maxEnabled: number;
   /** Requests received in this session, for assertions. */
@@ -651,16 +666,37 @@ export class FakeAdapter implements ByteStream {
    * device is attached again shortly after with its new interfaces. */
   #reconnectUsb() {
     this.usbReconnects++;
+    this.#drained(() => this.#detach());
+  }
+
+  /** Runs `run` once everything this session already wrote has gone out. */
+  #drained(run: () => void) {
     const session = this.#session;
     this.#outbox = this.#outbox.then(() => {
-      if (this.#session !== session) return;
-      this.present = false;
-      this.unplug();
-      setTimeout(() => {
-        this.present = true;
-        for (const listener of this.#hotplug) listener();
-      }, 100);
+      if (this.#session === session) run();
     });
+  }
+
+  /** The device detaches, `then` runs, and the device is attached again shortly after. */
+  #detach(then = () => {}) {
+    this.present = false;
+    this.unplug();
+    then();
+    setTimeout(() => {
+      this.present = true;
+      for (const listener of this.#hotplug) listener();
+    }, 100);
+  }
+
+  /** Starts again, as after a reset or power cycle: the port goes away, and startup selects
+   * assisted mode again from the saved data. */
+  reboot() {
+    this.#detach(() => this.#boot());
+  }
+
+  #boot() {
+    this.restarts++;
+    this.migrationRequired = this.storageFormat !== this.targetStorageFormat;
   }
 
   // ---- Output -------------------------------------------------------------
@@ -744,10 +780,10 @@ export class FakeAdapter implements ByteStream {
     const codes = [
       ...(omitted.some((p) => p < 0xc0) ? [ErrorCode.USB_REQUIRED_CAPACITY_EXCEEDED] : []),
       ...(omitted.some((p) => p >= 0xc0 && p < 0xe0) ? [ErrorCode.USB_RESERVED_CAPACITY_EXCEEDED] : []),
-      ...(this.ready && this.storageFull ? [ErrorCode.STORAGE_FULL] : []),
+      ...(this.ready && !this.migrationRequired && this.storageFull ? [ErrorCode.STORAGE_FULL] : []),
       ...(this.profileSupport && this.memoryBudget > 0 && this.memoryUsed() * 100 >= this.memoryBudget * 85 ? [ErrorCode.PROFILE_MEMORY_LOW] : []),
     ];
-    return errorList([...this.faults, ...codes.map(errorOf)]);
+    return errorList([...this.faults, ...codes.map(errorOf), ...(this.migrationRequired ? [STORAGE_MIGRATION_REQUIRED] : [])]);
   }
 
   /** The USB interfaces the firmware would expose, with their priorities, lower first: serial
@@ -791,7 +827,7 @@ export class FakeAdapter implements ByteStream {
       id: this.id,
       name: this.name,
       platform: upper(Platform, this.platform),
-      ready: this.ready,
+      ready: this.ready && !this.migrationRequired,
       errors: this.errors(),
       resources: [
         { type: ResourceType.INTERFACES, count: this.#usb.exposed.length, limit: this.usbInterfaces },
@@ -805,7 +841,13 @@ export class FakeAdapter implements ByteStream {
           { type: ResourceType.CONNECTIONS, count: this.devices.filter((d) => d.transport === t && d.state === "connected").length, limit: this.maxEnabled },
         ],
       })),
-      information: { firmwareVersion: "0.0.0-dev", boardName: this.board, developmentBuild: true, storageFormat: 2 },
+      information: {
+        firmwareVersion: "0.0.0-dev",
+        boardName: this.board,
+        developmentBuild: true,
+        storageFormat: this.storageFormat ?? undefined,
+        targetStorageFormat: this.targetStorageFormat ?? undefined,
+      },
       outputSupport: this.gamepadOutputs
         ? [{
             role: Role.GAMEPAD,
@@ -1001,7 +1043,7 @@ export class FakeAdapter implements ByteStream {
     this.#event({ case: "device", value: this.record(d) });
   }
 
-  changeAdapter(patch: { ready?: boolean; storageFull?: boolean; memoryBudget?: number; storageUsed?: number | null; storageTotal?: number | null }) {
+  changeAdapter(patch: Partial<Pick<FakeAdapter, "ready" | "storageFull" | "memoryBudget" | "storageUsed" | "storageTotal">>) {
     Object.assign(this, patch);
     this.#load(null);
     this.#event({ case: "adapter", value: this.status() });
@@ -1095,6 +1137,7 @@ export class FakeAdapter implements ByteStream {
     const failure = command.case ? this.failures[command.case]?.shift() : undefined;
     try {
       if (failure !== undefined) throw new Refusal(failure);
+      if (this.migrationRequired && !ASSISTED_COMMANDS.has(command.case ?? "")) throw new Refusal(STORAGE_MIGRATION_REQUIRED);
       this.#run(command);
     } catch (error) {
       if (!(error instanceof Refusal)) throw error;
@@ -1116,6 +1159,9 @@ export class FakeAdapter implements ByteStream {
     switch (command.case) {
       case "getStatus":
         return this.#reply({ result: { case: "status", value: this.status() } });
+      case "restart":
+        this.#reply({});
+        return this.#drained(() => this.reboot());
       case "setAdapter":
         return this.#setAdapter(command.value);
       case "startScan": {

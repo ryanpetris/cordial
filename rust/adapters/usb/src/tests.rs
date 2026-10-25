@@ -26,6 +26,7 @@ pub(super) fn application() -> Application {
         default_adapter_name: "Test adapter",
         adapter_id: "adapter".into(),
         profile_memory_budget: None,
+        restart: || panic!("restarted"),
         bootloader: None,
     })
 }

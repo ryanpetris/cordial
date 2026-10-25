@@ -2,6 +2,18 @@ use crate::model::settings::{SettingKey, SettingScope};
 use alloc::vec::Vec;
 use cordial_protocol::storage as saved;
 
+/// Device-owned staging names. Only this complete root-level pattern is reserved.
+pub const WRITE_TEMP_PREFIX: &str = "/.file-write-";
+/// Whether an absolute path has the complete device-owned staging filename pattern.
+pub fn is_write_temp(path: &str) -> bool {
+    path.strip_prefix(WRITE_TEMP_PREFIX).is_some_and(|suffix| {
+        suffix.len() == 16
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// Logical document selector. Backends map kind and owner to filesystem paths.
 pub type RecordKey = [u8; 9];
 
@@ -21,14 +33,14 @@ pub enum Error {
     Missing,
 }
 
-/// Whether a development file entry is a file or a directory.
+/// Whether a filesystem entry is a file or a directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileType {
     File,
     Directory,
 }
 
-/// One entry of a development directory listing.
+/// One entry of a directory listing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
     pub name: alloc::string::String,
@@ -50,6 +62,38 @@ pub trait RecordStore {
         _offset: u32,
         _bytes: &mut [u8],
     ) -> Result<usize, Error> {
+        Err(Error::Unavailable)
+    }
+    /// File length, including zero for an empty file.
+    async fn file_size(&mut self, path: &str) -> Result<Option<usize>, Error> {
+        let (parent, name) = path.rsplit_once('/').ok_or(Error::Bounds)?;
+        let parent = if parent.is_empty() { "/" } else { parent };
+        let mut index = 0;
+        loop {
+            match self.file_entry(parent, index).await {
+                Ok(Some(entry)) if entry.name == name => {
+                    return if entry.kind == FileType::File {
+                        Ok(Some(entry.size))
+                    } else {
+                        Err(Error::Bounds)
+                    };
+                }
+                Ok(Some(_)) => index += 1,
+                Ok(None) | Err(Error::Missing) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    /// Commits one file write atomically. Offset zero truncates; positive offsets never create gaps.
+    async fn file_write(&mut self, _path: &str, _offset: u32, _data: &[u8]) -> Result<(), Error> {
+        Err(Error::Unavailable)
+    }
+    /// Atomically replaces the destination with the source file.
+    async fn file_move(&mut self, _source: &str, _destination: &str) -> Result<(), Error> {
+        Err(Error::Unavailable)
+    }
+    /// Removes a file. Missing files succeed.
+    async fn file_delete(&mut self, _path: &str) -> Result<(), Error> {
         Err(Error::Unavailable)
     }
     /// Enumerate unique live keys. Physical obsolete versions are not entries.
@@ -190,6 +234,24 @@ impl<S: RecordStore> RecordStore for Result<S, Error> {
             .map_err(|e| *e)?
             .file_read(path, offset, bytes)
             .await
+    }
+    async fn file_size(&mut self, path: &str) -> Result<Option<usize>, Error> {
+        self.as_mut().map_err(|e| *e)?.file_size(path).await
+    }
+    async fn file_write(&mut self, path: &str, offset: u32, data: &[u8]) -> Result<(), Error> {
+        self.as_mut()
+            .map_err(|e| *e)?
+            .file_write(path, offset, data)
+            .await
+    }
+    async fn file_move(&mut self, source: &str, destination: &str) -> Result<(), Error> {
+        self.as_mut()
+            .map_err(|e| *e)?
+            .file_move(source, destination)
+            .await
+    }
+    async fn file_delete(&mut self, path: &str) -> Result<(), Error> {
+        self.as_mut().map_err(|e| *e)?.file_delete(path).await
     }
     async fn record_ids(&mut self, kind: u8, after: u64, limit: usize) -> Result<Vec<u64>, Error> {
         self.as_mut()

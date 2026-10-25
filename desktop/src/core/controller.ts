@@ -2,15 +2,19 @@
 // actions. Electron-free so it can be tested against a simulated adapter.
 // Refusals the adapter would make that this app can predict from what it
 // knows are made here, before sending; one the adapter makes anyway is shown
-// as it is, without retrying or reading anything again.
+// as it is, without retrying or reading anything again. An adapter in assisted mode with no other
+// error starts the Cordial CLI when it connects, once every adapter's port is closed; no adapter
+// opens again until the CLI confirms success and exits, or the user cancels and it exits.
 import { CordialError, type Connection } from "@cordial/client";
-import { ErrorCode, IntegrationKind, OutputMode, Platform, Role, Transport, type Event, type Request, type Response } from "@cordial/protocol";
+import { ErrorCode, IntegrationKind, OutputMode, Platform, Role, Transport, type Event, type MigrationEvent, type Request, type Response } from "@cordial/protocol";
 import { adapterName } from "../shared/adapter-name.ts";
 import {
   DEFAULT_PREFERENCES,
   type Action,
   type ActionResult,
   type AdapterEntry,
+  type AdapterMigration,
+  type AdapterStatus,
   type AppState,
   type Battery,
   type DeviceEntry,
@@ -30,6 +34,7 @@ import { gamepadModes } from "../shared/outputs.ts";
 import { interfaceProblem, profileInUse, profileName, stagedInterfaces } from "../shared/profiles.ts";
 import { settingId, settingsBusy } from "../shared/settings.ts";
 import {
+  MIGRATION_TEXT,
   PLATFORMS,
   TRANSPORTS,
   clean,
@@ -48,6 +53,7 @@ import {
 import { BatteryAlerts, CRITICAL_PERCENT, type Alert } from "./battery.ts";
 import * as convert from "./convert.ts";
 import { AdapterManager, type ManagerDeps } from "./manager.ts";
+import { STORAGE_FORMAT, type MigrationHost, type MigrationProcess } from "./migration.ts";
 import { AdapterSession, failure } from "./session.ts";
 
 export interface ControllerDeps extends Omit<ManagerDeps, "changed" | "event"> {
@@ -59,6 +65,8 @@ export interface ControllerDeps extends Omit<ManagerDeps, "changed" | "event"> {
   lowBattery(alert: Alert): void;
   connection(name: string, connected: boolean): void;
   profileAlert(alert: ProfileAlert): void;
+  /** Starts the Cordial CLI to migrate saved data; absent where processes can't be started. */
+  migration?: MigrationHost;
 }
 
 const PUBLISH_MS = 30;
@@ -96,6 +104,32 @@ export function batteryOf({ battery }: DeviceInformation, current = true): Batte
 }
 
 type Scan = ScanState & { session: AdapterSession; connection: Connection };
+
+/** A migration by the CLI, from the moment adapters start closing until the adapters open again. */
+interface Migration {
+  adapterId: string;
+  /** The adapter's status when the migration started. */
+  status: AdapterStatus;
+  path: string;
+  phase: "starting" | "migrating" | "waiting" | "cancelling" | "failed";
+  message: string | null;
+  progress: AdapterMigration["progress"];
+  process: MigrationProcess | null;
+  /** The CLI was started, whether or not it could run. */
+  started: boolean;
+  running: boolean;
+  /** The user cancelled. */
+  cancelled: boolean;
+  /** The CLI reported success for this adapter and target. */
+  succeeded: boolean;
+  failed: boolean;
+  /** Resolves once the adapters may open again. */
+  done: Promise<void>;
+  end(): void;
+}
+
+/** Actions that stay available while a migration runs. */
+const DURING_MIGRATION = new Set<Action["type"]>(["preferences", "adapter.menu", "app.menu"]);
 type Pairing = PairingState & { session: AdapterSession; connection: Connection; dismissed: boolean; transport: TransportName | null };
 
 export class Controller {
@@ -117,6 +151,15 @@ export class Controller {
    * until the condition clears. */
   readonly #memoryAlerted = new Set<string>();
   readonly #profileAlerted = new Set<string>();
+  #migration: Migration | null = null;
+  /** Actions running, which finish before a migration closes their adapters. */
+  readonly #inflight = new Set<Promise<ActionResult>>();
+  /** Adapters whose migration the user cancelled; they migrate again only with Migrate. */
+  readonly #declined = new Set<string>();
+  /** Adapters whose last migration found no CLI, until the adapters are refreshed. */
+  readonly #missing = new Set<string>();
+  /** Sessions that started a migration by themselves already. */
+  #tried = new WeakSet<AdapterSession>();
 
   constructor(deps: ControllerDeps) {
     this.#deps = deps;
@@ -143,6 +186,7 @@ export class Controller {
   }
 
   #publish() {
+    this.#autoMigrate();
     this.#revision++;
     const state = this.state();
     if (this.#preferences.notifyLowBattery)
@@ -189,7 +233,9 @@ export class Controller {
   state(): AppState {
     const adapters: AdapterEntry[] = [];
     const devices: DeviceEntry[] = [];
+    const m = this.#migration;
     for (const { id, session, recovery } of this.manager.connected.values()) {
+      if (id === m?.adapterId) continue;
       const status = session.status;
       const entries = session.listed ? [...session.devices.values()].map((d) => this.#device(id, session, d)) : [];
       const attention: string[] = [];
@@ -211,9 +257,28 @@ export class Controller {
         profileNames: Object.fromEntries(session.profileNames),
         profilesAvailable: session.available && session.profilesAvailable,
         unreadableDevices: session.listed ? session.unreadableDevices : [],
+        migration: this.#gateEntry(id, session),
       });
       devices.push(...entries);
     }
+    if (m)
+      adapters.push({
+        name: m.status.name,
+        id: m.adapterId,
+        connection: "reconnecting",
+        connectError: null,
+        readiness: "waiting",
+        status: m.status,
+        listing: false,
+        listError: null,
+        attention: [],
+        profilePage: null,
+        pickerPage: null,
+        profileNames: {},
+        profilesAvailable: false,
+        unreadableDevices: [],
+        migration: { phase: m.phase, message: m.message, progress: m.progress, canStart: false, canCancel: true },
+      });
     for (const d of this.manager.disconnected.values()) {
       if (!d.path) continue;
       adapters.push({
@@ -231,6 +296,7 @@ export class Controller {
         profileNames: {},
         profilesAvailable: false,
         unreadableDevices: [],
+        migration: null,
       });
     }
     adapters.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
@@ -325,6 +391,168 @@ export class Controller {
       p.message = `The device is paired, but the adapter couldn't connect to it. ${errorText(connectionError(d)!, "other")}`;
     }
     if (p.phase !== "connecting" && p.dismissed) this.#pairing = null;
+  }
+
+  /** Why the app can't use a session's saved data; null when it can. */
+  #gateEntry(id: string, session: AdapterSession): AdapterMigration | null {
+    const entry = (phase: AdapterMigration["phase"], message: string | null, canStart = false): AdapterMigration =>
+      ({ phase, message, progress: null, canStart, canCancel: false });
+    switch (session.gate.kind) {
+      case "current":
+        return null;
+      case "unsupported":
+        return entry("unsupported", MIGRATION_TEXT.unsupported);
+      case "unknown":
+        return entry("unsupported", MIGRATION_TEXT.firmware);
+      case "blocked":
+        return entry("required", errorText(session.gate.error));
+      case "assisted": {
+        const host = !!this.#deps.migration;
+        return entry("required", !host || this.#missing.has(id) ? MIGRATION_TEXT.cli : null, host && !this.#migration);
+      }
+    }
+  }
+
+  // ---- Migration ----------------------------------------------------------
+
+  /** Starts a migration for the first adapter that needs one and hasn't tried by itself. */
+  #autoMigrate() {
+    if (this.#migration || this.#stopped || !this.#deps.migration) return;
+    for (const { id, session, recovery } of this.manager.connected.values()) {
+      if (session.gate.kind !== "assisted" || session.closed || recovery || this.#declined.has(id) || this.#tried.has(session)) continue;
+      this.#tried.add(session);
+      void this.#startMigration(id);
+      return;
+    }
+  }
+
+  async #startMigration(adapterId: string): Promise<ActionResult> {
+    const host = this.#deps.migration;
+    if (!host) return { ok: false, message: MIGRATION_TEXT.cli };
+    if (this.#migration) return { ok: false, message: MIGRATION_TEXT.busy };
+    const entry = this.manager.connected.get(adapterId);
+    if (!entry || entry.session.closed || entry.recovery) return GONE;
+    if (entry.session.gate.kind !== "assisted") {
+      const message = this.#gateEntry(adapterId, entry.session)?.message;
+      return message ? { ok: false, message } : GONE;
+    }
+    const cli = host.find();
+    if (!cli) {
+      this.#missing.add(adapterId);
+      this.changed();
+      return { ok: false, message: MIGRATION_TEXT.cli };
+    }
+    this.#missing.delete(adapterId);
+    this.#declined.delete(adapterId);
+    let end!: () => void;
+    const m: Migration = {
+      adapterId,
+      status: entry.session.status,
+      path: entry.path,
+      phase: "starting",
+      message: null,
+      progress: null,
+      process: null,
+      started: false,
+      running: false,
+      cancelled: false,
+      succeeded: false,
+      failed: false,
+      done: new Promise((resolve) => (end = resolve)),
+      end: () => end(),
+    };
+    this.#migration = m;
+    this.changed();
+    // New actions are refused from here. Those in flight finish first, so closing their adapter
+    // can't leave their outcome unknown.
+    await Promise.allSettled([...this.#inflight]);
+    await this.#stopScan();
+    if (this.#pairing?.phase === "pairing") await this.#pairing.connection.cancelPairing().catch(() => {});
+    await this.manager.suspend();
+    if (m.cancelled || this.#stopped) {
+      this.#endMigration(m);
+      return { ok: true };
+    }
+    m.started = true;
+    m.running = true;
+    m.process = host.start(cli, {
+      event: (event) => this.#migrationEvent(m, event),
+      malformed: (reason) => {
+        this.#deps.log(`migration output unusable: ${reason}`);
+        this.#migrationFailed(m, MIGRATION_TEXT.failed);
+      },
+      exit: (code, signal) => this.#migrationExit(m, code, signal),
+    });
+    m.process.send({ action: { case: "start", value: { adapterId, portHint: m.path } } });
+    this.changed();
+    return { ok: true };
+  }
+
+  #migrationEvent(m: Migration, { event }: MigrationEvent) {
+    switch (event.case) {
+      case "progress":
+      case "checkpoint":
+      case "waiting":
+        if (m.phase !== "cancelling" && m.phase !== "failed") m.phase = event.case === "waiting" ? "waiting" : "migrating";
+        if (event.case === "progress")
+          m.progress = event.value.totalBytes ? { completed: Number(event.value.completedBytes), total: Number(event.value.totalBytes) } : null;
+        break;
+      case "failure":
+        this.#deps.log(`migration failed: ${event.value.reason}`);
+        this.#migrationFailed(m, event.value.outcomeUnknown ? MIGRATION_TEXT.unknown : MIGRATION_TEXT.failed);
+        return;
+      case "success":
+        if (event.value.adapterId === m.adapterId && event.value.targetFormat === STORAGE_FORMAT) m.succeeded = true;
+        else {
+          this.#deps.log(`migration reported success for another adapter or format: ${event.value.adapterId} ${event.value.targetFormat}`);
+          this.#migrationFailed(m, MIGRATION_TEXT.failed);
+          return;
+        }
+        break;
+      // Cancelled and events this app doesn't know change nothing; only the exit ends a migration.
+    }
+    this.changed();
+  }
+
+  #migrationFailed(m: Migration, message: string) {
+    m.failed = true;
+    if (m.phase !== "cancelling") m.phase = "failed";
+    m.message ??= message;
+    this.changed();
+  }
+
+  #migrationExit(m: Migration, code: number | null, signal: string | null) {
+    m.running = false;
+    this.#deps.log(`cordial migrate exited: ${signal ?? (code === null ? "not started" : `status ${code}`)}`);
+    if (m.cancelled || (m.succeeded && !m.failed && code === 0)) this.#endMigration(m);
+    else this.#migrationFailed(m, MIGRATION_TEXT.failed);
+  }
+
+  /** Opens the adapters again. */
+  #endMigration(m: Migration) {
+    if (this.#migration !== m) return;
+    this.#migration = null;
+    if (!m.succeeded || m.failed) this.#declined.add(m.adapterId);
+    m.end();
+    if (!this.#stopped) this.manager.resume();
+    this.changed();
+  }
+
+  /** Cancels the migration, if any, and resolves once the CLI has exited and the adapters may open
+   * again, however long that takes. */
+  cancelMigration(): Promise<void> {
+    const m = this.#migration;
+    if (!m) return Promise.resolve();
+    if (!m.cancelled) {
+      m.cancelled = true;
+      if (m.running) {
+        m.phase = "cancelling";
+        m.process!.send({ action: { case: "cancel", value: {} } });
+      } else if (m.started) this.#endMigration(m);
+      // Before the CLI starts, starting sees the cancellation once the adapters have closed.
+      this.changed();
+    }
+    return m.done;
   }
 
   // ---- Actions -----------------------------------------------------------
@@ -467,6 +695,28 @@ export class Controller {
   }
 
   async act(action: Action): Promise<ActionResult> {
+    if (action.type === "migration.start") return await this.#startMigration(action.adapterId);
+    if (action.type === "migration.cancel") {
+      void this.cancelMigration();
+      return { ok: true };
+    }
+    if (this.#migration && !DURING_MIGRATION.has(action.type)) return { ok: false, message: MIGRATION_TEXT.busy };
+    const id = "adapterId" in action ? action.adapterId : "key" in action ? action.key.slice(0, action.key.indexOf("/")) : null;
+    const session = id === null ? undefined : this.manager.connected.get(id)?.session;
+    // Restart works whenever the adapter's firmware operates on this app's storage format.
+    const restartable = action.type === "adapter.restart" && session?.gate.kind !== "unsupported" && session?.gate.kind !== "unknown";
+    if (session && session.gate.kind !== "current" && !restartable && action.type !== "adapter.connect" && action.type !== "adapter.disconnect" && action.type !== "adapter.menu")
+      return { ok: false, message: this.#gateEntry(id!, session)?.message ?? codeText("not_ready") };
+    const run = this.#act(action);
+    this.#inflight.add(run);
+    try {
+      return await run;
+    } finally {
+      this.#inflight.delete(run);
+    }
+  }
+
+  async #act(action: Exclude<Action, { type: "migration.start" | "migration.cancel" }>): Promise<ActionResult> {
     try {
       switch (action.type) {
         case "device.reload": {
@@ -533,6 +783,13 @@ export class Controller {
           await session.connection.setAdapter({ name });
           return { ok: true };
         }
+        case "adapter.restart": {
+          const session = this.#session(action.adapterId);
+          if (!session) return GONE;
+          // The adapter resets once its answer has gone out, and is opened again as it reappears.
+          await session.connection.send({ case: "restart", value: {} });
+          return { ok: true };
+        }
         case "adapter.disconnect":
           await this.manager.disconnect(action.adapterId);
           this.changed();
@@ -542,7 +799,10 @@ export class Controller {
           return error ? { ok: false, message: error } : { ok: true };
         }
         case "adapters.refresh":
+          this.#missing.clear();
+          this.#tried = new WeakSet();
           this.manager.burst();
+          this.changed();
           return { ok: true };
         case "scan.start":
           return await this.#startScan(action.adapterId);
@@ -751,10 +1011,12 @@ export class Controller {
     }
   }
 
+  /** Closes every adapter, after cancelling any migration and waiting for the CLI to exit. */
   async stop() {
     this.#stopped = true;
     clearTimeout(this.#timer);
     this.#timer = undefined;
+    await this.cancelMigration();
     await this.manager.stop();
   }
 }

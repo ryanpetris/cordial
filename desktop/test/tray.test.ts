@@ -19,6 +19,7 @@ const adapter = (id: string, patch: Partial<AdapterEntry> = {}): AdapterEntry =>
   profileNames: {},
   profilesAvailable: true,
   unreadableDevices: [],
+  migration: null,
   ...patch,
 });
 

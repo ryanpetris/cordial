@@ -4,11 +4,15 @@
 set -euxo pipefail
 pacman -Syu --noconfirm namcap python
 sed -i '/^NoExtract.*usr\/share\/doc/d' /etc/pacman.conf
+bsdtar -xOf build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst .PKGINFO | grep '^optdepend = cordial-cli: '
 pacman -U --noconfirm build/packages/cli-arch/cordial-cli-*.pkg.tar.zst
 python tools/check_linux_package.py cordial-cli --version "$CORDIAL_VERSION"
 test ! -e /usr/bin/cordial-desktop
+pacman -R --noconfirm cordial-cli
 pacman -U --noconfirm build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst
 python tools/check_linux_package.py cordial-desktop --version "$CORDIAL_VERSION"
+test ! -e /usr/bin/cordial
+pacman -U --noconfirm build/packages/cli-arch/cordial-cli-*.pkg.tar.zst
 # Bundled Electron belongs in /opt under the Arch Electron guidelines.
 namcap -e elfpaths build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst > namcap.log
 namcap build/packages/cli-arch/cordial-cli-*.pkg.tar.zst >> namcap.log

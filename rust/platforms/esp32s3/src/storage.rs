@@ -71,6 +71,7 @@ pub fn open(identity: [u8; 32]) -> Result<Storage, Error> {
             .then_some(capacity.max(crate::board::MINIMUM_FLASH_BYTES)),
         (capacity != 0).then_some(capacity),
         identity,
+        || unsafe { (u64::from(sys::esp_random()) << 32) | u64::from(sys::esp_random()) },
     ))
 }
 impl Drop for Flash {

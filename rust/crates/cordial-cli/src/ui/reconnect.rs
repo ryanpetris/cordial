@@ -15,7 +15,7 @@ const POLL: Duration = Duration::from_millis(500);
 
 pub(crate) struct Reconnect {
     /// The adapter ID that begins its USB serial number.
-    id: String,
+    pub(crate) id: String,
     /// Why the connection dropped, reported if the adapter doesn't return.
     error: Error,
     until: Instant,

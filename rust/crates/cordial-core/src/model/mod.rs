@@ -10,13 +10,13 @@ pub mod translation;
 /// The largest integer saved preferences keep exactly in their JSON documents.
 pub const MAX_INTEGER: u64 = 9_007_199_254_740_991;
 
-/// A development file path: absolute ASCII, at most 255 bytes, with no `.` or `..` components
-/// and no control bytes.
+/// A canonical absolute UTF-8 file path of at most 192 bytes.
 pub fn storage_path(path: &str) -> bool {
-    path.starts_with('/')
-        && path.len() <= 255
-        && path.is_ascii()
-        && !path.bytes().any(|b| b < 32 || b == 127)
+    (path == "/" || (!path.ends_with('/') && !path.contains("//")))
+        && !path.contains('\\')
+        && path.starts_with('/')
+        && path.len() <= 192
+        && !path.chars().any(char::is_control)
         && !path.split('/').any(|p| p == "." || p == "..")
 }
 

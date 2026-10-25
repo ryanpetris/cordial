@@ -77,6 +77,7 @@ const ERRORS: Record<Code, string> = {
   usb_reserved_capacity_exceeded: "the adapter doesn't have enough USB capacity for every reserved interface",
   profile_memory_exceeded: "the adapter doesn't have room for this device's profiles",
   profile_load_failed: "the adapter couldn't read one of this device's profiles",
+  storage_migration_required: "the adapter's saved data must be migrated before use",
 };
 
 /** Wording for a code whose reason changes what failed. */
@@ -111,6 +112,7 @@ const CONTEXT: Record<ErrorReasonName, string | null> = {
 const IMPLIED: Partial<Record<Code, ErrorReasonName>> = {
   storage_failed: "storage",
   storage_full: "storage",
+  storage_migration_required: "storage",
   profile_memory_low: "profile_memory",
   profile_memory_exceeded: "profile_memory",
   usb_required_capacity_exceeded: "output_backend",
@@ -568,8 +570,35 @@ const ADVISORY: (Code | number)[] = ["storage_full", "profile_memory_low", "usb_
 /** The adapter's radio, storage and other faults, which a starting adapter doesn't report. */
 export const adapterFaults = (s: AdapterStatus | null) => s?.errors.filter((e) => !ADVISORY.includes(e.code)) ?? [];
 
+/** Why the app can't use an adapter's saved data, and how a migration of it failed. */
+export const MIGRATION_TEXT = {
+  unsupported: "The adapter uses a storage format this version of Cordial doesn't support. Update Cordial to use this adapter.",
+  firmware: "This version of Cordial doesn't support the adapter's firmware. Update the adapter's firmware.",
+  cli: "The adapter's saved data must be migrated before use. Install the Cordial CLI to migrate it.",
+  failed: "Cordial couldn't migrate the adapter's saved data.",
+  unknown: "Cordial couldn't confirm whether the adapter saved its migrated data.",
+  busy: "Cordial is migrating an adapter's saved data. Try again when it finishes.",
+};
+
+/** Whether Restart is available: the adapter is open and its firmware operates on this app's
+ * storage format, whatever its readiness or errors. */
+export const canRestart = (a: AdapterEntry) => a.connection === "connected" && a.migration?.phase !== "unsupported";
+
 /** The adapter's state in a few words, and whether it needs attention. */
 export function adapterStatus(a: AdapterEntry): { text: string; warn: boolean } {
+  switch (a.migration?.phase) {
+    case "starting":
+    case "migrating":
+    case "cancelling":
+      return { text: "Migrating…", warn: false };
+    case "waiting":
+      return { text: "Waiting for Adapter", warn: false };
+    case "unsupported":
+      return { text: "Unsupported", warn: true };
+    case "required":
+    case "failed":
+      return { text: "Needs Attention", warn: true };
+  }
   if (a.connection === "disconnected" || a.connection === "reconnecting") return { text: "Disconnected", warn: false };
   if (a.connection === "connecting") return { text: "Connecting…", warn: false };
   if (a.readiness === "waiting") return adapterFaults(a.status).length || a.listError ? { text: "Needs Attention", warn: true } : { text: "Starting…", warn: false };

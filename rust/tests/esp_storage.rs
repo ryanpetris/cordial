@@ -30,6 +30,10 @@ thread_local! {
     static DRIVER_SIZE: Cell<u32> = const { Cell::new(0) };
     static MUTATIONS: Cell<usize> = const { Cell::new(0) };
 }
+unsafe fn esp_random() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 mod platform {
     pub unsafe fn cordial_esp_storage_capacity(
         minimum: u32,
@@ -305,8 +309,12 @@ fn fallback_formats_only_minimum_despite_cached_larger_extent() {
     DETECTED.set(Some(0));
     let tail = FLASH.with_borrow(|f| f[4 * 1024 * 1024..].to_vec());
     let mut fs = open().unwrap();
-    assert_eq!(fs.total_bytes().unwrap(), 2 * 1024 * 1024 - 4096);
-    assert_eq!(fs.file_size("/saved.bin").unwrap(), None);
+    assert_eq!(fs.total_bytes().unwrap(), 6 * 1024 * 1024 - 4096);
+    assert!(matches!(
+        fs.startup(),
+        cordial_core::migration::Startup::Blocked(_)
+    ));
+    assert_eq!(fs.file_size("/saved.bin").unwrap(), Some(9000));
     FLASH.with_borrow(|f| assert_eq!(f[4 * 1024 * 1024..], tail));
 }
 
@@ -328,7 +336,7 @@ fn detected_below_minimum_never_formats_fresh_or_invalid_filesystems() {
 }
 
 #[test]
-fn detected_below_minimum_forbids_root_reset_but_missing_detection_allows_it() {
+fn invalid_roots_stay_mounted_without_reset_for_every_capacity_probe() {
     for root in ["/format.pb", "/identity.pb", "/sequence.pb"] {
         FLASH.with_borrow_mut(|f| *f = vec![0xff; 8 * 1024 * 1024]);
         DETECTED.set(Some(8 * 1024 * 1024));
@@ -336,25 +344,30 @@ fn detected_below_minimum_forbids_root_reset_but_missing_detection_allows_it() {
         let mut fs = open().unwrap();
         block_on(Identity::initialize(&mut fs, [1; 6], || 7)).unwrap();
         fs.replace_file("/devices/1/device.pb", &[42; 100]).unwrap();
-        if root == "/format.pb" {
-            fs.replace_file(root, &[8, 99]).unwrap();
-        } else {
-            fs.remove_file(root).unwrap();
-        }
+        fs.replace_file(root, &[8, 99]).unwrap();
         drop(fs);
         let before = FLASH.with_borrow(Clone::clone);
         for capacity in [1, 2] {
             DETECTED.set(Some(capacity * 1024 * 1024));
             DRIVER_SIZE.set(board::MINIMUM_FLASH_BYTES);
             MUTATIONS.set(0);
-            assert!(matches!(open(), Err(Error::Bounds)));
+            let fs = open().unwrap();
+            assert!(matches!(
+                fs.startup(),
+                cordial_core::migration::Startup::Blocked(_)
+            ));
+            drop(fs);
             assert_eq!(MUTATIONS.get(), 0);
             FLASH.with_borrow(|f| assert_eq!(*f, before));
             PARTITIONS.with_borrow(|p| assert!(p.is_empty()));
         }
         DETECTED.set(Some(0));
         let mut fs = open().unwrap();
-        assert!(block_on(Identity::load(&mut fs)).unwrap().is_none());
-        assert_eq!(fs.file_size("/devices/1/device.pb").unwrap(), None);
+        assert!(matches!(
+            fs.startup(),
+            cordial_core::migration::Startup::Blocked(_)
+        ));
+        assert_eq!(fs.file_size("/devices/1/device.pb").unwrap(), Some(100));
+        FLASH.with_borrow(|f| assert_eq!(*f, before));
     }
 }

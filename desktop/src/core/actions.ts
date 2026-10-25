@@ -49,6 +49,7 @@ const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "devices.reload": { adapterId: "string" },
   "adapter.connect": { adapterId: "string" },
   "adapter.disconnect": { adapterId: "string" },
+  "adapter.restart": { adapterId: "string" },
   "adapter.menu": { adapterId: "string" },
   "adapters.refresh": {},
   "app.menu": { x: "number", y: "number" },
@@ -59,6 +60,8 @@ const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "pair.cancel": {},
   "pair.dismiss": {},
   preferences: { preferences: "string" },
+  "migration.start": { adapterId: "string" },
+  "migration.cancel": {},
 };
 
 const PREFERENCES: Record<string, "boolean" | "number"> = {

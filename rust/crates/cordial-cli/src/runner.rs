@@ -5,6 +5,7 @@ use crate::{
         State, Ticket, Wait,
     },
     error::Error,
+    migration::{self, Engine, Worker},
     ui::{
         command::{self, Line},
         text::{self, Filter},
@@ -13,7 +14,7 @@ use crate::{
 use cordial_client::{Connection, Received, serial};
 use cordial_protocol::{self as p, event, message};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, BufReader, Read, Write},
     sync::mpsc::{self, Receiver, RecvTimeoutError},
     thread,
@@ -100,6 +101,8 @@ fn json(kind: message::Kind) -> String {
 pub struct Script {
     pub options: Options,
     pub cancellation: Cancellation,
+    /// Migrates an adapter whose saved data needs it before any command runs.
+    pub engine: Engine,
 }
 
 type Handler = Box<dyn FnMut(Received<'_>) + Send>;
@@ -163,12 +166,15 @@ impl Script {
             foreground: None,
             pending: BTreeMap::new(),
             answered: None,
+            migrated: BTreeSet::new(),
+            closed: false,
         };
         let result = run.run_loop(port, first, out, diagnostics);
         controller.close();
-        // With --json, events that arrive before the session closes are still printed.
+        // With --json, events that arrive before the session closes are still printed. A
+        // migration that ended the run has closed it already.
         let end = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < end {
+        while !run.closed && Instant::now() < end {
             match events.recv_timeout(Duration::from_millis(25)) {
                 Ok(Event::Closed) | Err(RecvTimeoutError::Disconnected) => break,
                 Ok(Event::Notice { session, notice })
@@ -230,6 +236,11 @@ struct Run<'a> {
     pending: BTreeMap<Ticket, (Command, Filter)>,
     /// The pairing step last answered, so one prompt takes one answer.
     answered: Option<p::Pairing>,
+    /// The adapters migrated in this run. One that still needs migration when it reopens isn't
+    /// migrated again.
+    migrated: BTreeSet<String>,
+    /// The session has closed for a migration and nothing was opened since.
+    closed: bool,
 }
 
 impl Run<'_> {
@@ -316,7 +327,7 @@ impl Run<'_> {
         diagnostics: &mut dyn Write,
     ) -> Result<(), Error> {
         let timeout = self.script.options.timeout;
-        let deadline = (self.one_shot && !timeout.is_zero()).then(|| Instant::now() + timeout);
+        let mut deadline = (self.one_shot && !timeout.is_zero()).then(|| Instant::now() + timeout);
         self.session = self.controller.open(port);
         let mut opened = false;
         let mut ready = false;
@@ -428,6 +439,26 @@ impl Run<'_> {
                 match line {
                     Line::Devices(_) => unreachable!(),
                     Line::Quit => return Ok(()),
+                    Line::Migrate => {
+                        let status = self.controller.state().unwrap_or_default().status;
+                        if let migration::Gate::Blocked(e) = migration::gate(&status) {
+                            return Err(Error::new(text::blocked_line(&e)));
+                        }
+                        let line = if self
+                            .controller
+                            .state()
+                            .is_some_and(|s| self.migrated.contains(&s.status.id))
+                        {
+                            MIGRATED
+                        } else {
+                            "The adapter's saved data doesn't need migration."
+                        };
+                        write_line(if self.json() { diagnostics } else { out }, line)?;
+                        if self.one_shot && self.foreground.is_none() {
+                            return Ok(());
+                        }
+                    }
+                    Line::MigrateCancel => return Err(Error::new("no migration is running")),
                     Line::Select(port) => {
                         self.session = self.controller.open(port);
                         opened = false;
@@ -478,6 +509,38 @@ impl Run<'_> {
                     session: id, phase, ..
                 }) if id == self.session => match phase {
                     Phase::Opened => opened = true,
+                    // A restart doesn't need the saved data migrated.
+                    Phase::Migrate if matches!(next, Some(Line::Run(Command::Restart))) => {
+                        opened = true;
+                    }
+                    // The migration replaces the session and waits as long as it takes.
+                    Phase::Migrate => {
+                        let id = self.controller.state().unwrap_or_default().status.id;
+                        if self.migrated.contains(&id) {
+                            return Err(Error::new(migration::REQUIRED));
+                        }
+                        let began = Instant::now();
+                        let quiet = matches!(next, Some(Line::Migrate));
+                        let port = self.migrate(quiet, diagnostics)?;
+                        self.migrated.insert(id.clone());
+                        deadline = deadline.map(|d| d + began.elapsed());
+                        // The adapter's status must name it before anything else is read.
+                        self.session = self.controller.open_adapter(port, id);
+                        self.closed = false;
+                        (opened, ready, unready, starting, told) =
+                            (false, false, None, None, false);
+                    }
+                    Phase::Other => {
+                        return Err(Error::new(
+                            "another adapter answered on the migrated adapter's port",
+                        ));
+                    }
+                    // Status and restart still run.
+                    Phase::Blocked(error) => {
+                        opened = true;
+                        unready = Some(Error::new(text::blocked_line(&error)));
+                    }
+                    Phase::Unsupported(error) => return Err(error),
                     Phase::Ready => ready = true,
                     Phase::Failed { open: true, error } => unready = Some(error),
                     Phase::Failed { error, .. } => return Err(error),
@@ -535,6 +598,77 @@ impl Run<'_> {
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+const MIGRATED: &str = "Migrated the adapter's saved data.";
+
+impl Run<'_> {
+    /// Migrates the open adapter and returns the port to open it on again. The session closes
+    /// and releases its port first, and the worker runs until it finishes or Ctrl+C cancels it.
+    fn migrate(&mut self, quiet: bool, diagnostics: &mut dyn Write) -> Result<String, Error> {
+        let st = self.controller.state().unwrap_or_default();
+        let (id, port) = (st.status.id, st.port);
+        self.controller.close();
+        loop {
+            match self.events.recv() {
+                Ok(Event::Closed) => break,
+                Ok(_) => {}
+                Err(_) => return Err(Error::new("control event stream closed")),
+            }
+        }
+        self.closed = true;
+        // The worker's result is awaited even if diagnostics can't be written.
+        let _ = write_line(diagnostics, "Migrating the adapter's saved data…");
+        let (tx, rx) = mpsc::channel();
+        let done = tx.clone();
+        let worker = Worker::start(
+            &self.script.engine,
+            id.clone(),
+            Some(port.clone()),
+            move |event| {
+                let _ = tx.send(Ok(event));
+            },
+            move |result| {
+                let _ = done.send(Err(result));
+            },
+        );
+        let (mut waiting, mut cancelled) = (false, false);
+        let result = loop {
+            if !cancelled && self.script.cancellation.cancelled() {
+                cancelled = true;
+                worker.cancel();
+            }
+            use cordial_protocol::migration::migration_event::Event as M;
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(event)) => match event.event {
+                    Some(M::Waiting(_)) if !waiting => {
+                        waiting = true;
+                        let _ = write_line(diagnostics, "Waiting for the adapter…");
+                    }
+                    Some(M::Progress(_)) => waiting = false,
+                    _ => {}
+                },
+                Ok(Err(result)) => break result,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    unreachable!("the worker reports its result")
+                }
+            }
+        };
+        match result {
+            Ok(cordial_client::migration::Outcome::Success) => {
+                if !quiet {
+                    write_line(diagnostics, MIGRATED)?;
+                }
+                let found = serial::ports()
+                    .ok()
+                    .and_then(|ports| ports.into_iter().find(|p| p.is_adapter(&id)));
+                Ok(found.map_or(port, |p| p.port))
+            }
+            Ok(cordial_client::migration::Outcome::Cancelled) => Err(Error::new("interrupted")),
+            Err(e) => Err(Error::new(migration::failure_text(&e))),
         }
     }
 }

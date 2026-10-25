@@ -2,7 +2,7 @@
 
 Pico and ESP32-S3 use LittleFS through a local `littlefs2` 0.8.1 patch for runtime
 block counts. Each file holds one protobuf message from
-[`proto/storage.proto`](../proto/storage.proto). Application data and Bluetooth
+[`proto/storage/v2/storage.proto`](../proto/storage/v2/storage.proto). Application data and Bluetooth
 bonds share the filesystem. ESP32-S3 has no NVS partition.
 
 ## Flash allocation
@@ -65,20 +65,60 @@ because a driver can read SFDP while checking its addressing support.
 
 ## Startup recovery
 
-Startup mounts LittleFS and validates `Format.format` before reading saved USB
-configuration or other application data. The shared storage format is `2`.
-Format `1` has no migration and resets the adapter's Bluetooth identity, saved
-devices, preferences and profiles. Devices must pair again. Missing, corrupt or
-unsupported root formats, invalid filesystems and invalid essential identity or
-sequence roots trigger one LittleFS format and root initialization attempt when
-formatting is permitted.
-Recovery never zero-fills or securely wipes flash. Driver I/O errors stop
-initialization without a format retry loop. A later boot may retry.
+Startup classifies the committed `/format.pb` before application recovery, ordinary
+record cleanup, topology, identity or radio initialization. The operating format
+is `2`, reported independently of the firmware release. A genuinely empty filesystem may provision
+normally. A missing root with any committed data, an unknown or newer format, or
+malformed or ambiguous migration input blocks startup. None of these cases authorizes
+formatting or erasing saved data. Native LittleFS consistency recovery runs before
+reading entries, and startup deletes internal `/.file-write-<16 lowercase hex digits>` files before classification,
+even on blocked storage. These are the only exceptions to preserving blocked storage.
+Driver I/O errors stop initialization without a format retry loop.
 
-An interrupted first initialization can resume while no devices or profiles are
-saved. An invalid essential root in an initialized store resets the whole
-filesystem so bonds cannot survive with a new adapter identity. Normal LittleFS
-power-loss recovery preserves committed records.
+Format `1` migrates to `2`, preserving identity, bonds, preferences, profiles and
+allocated IDs. Firmware classifies the source and runs eligible on-device
+migrations internally, initially `1 -> 2`. Hosts only request bootstrap status or
+close the connection while firmware migrates. A known older format that has no
+on-device path or cannot fit within the on-device resource budget needs host
+assistance to preserve saved data.
+
+`Status.information.storage_format` is optional and reports the committed root's
+format when it can be determined. Missing, malformed or unreadable roots leave it
+absent and report `Status.errors`. It is not proof that the dataset is valid or
+ready. Optional `target_storage_format` reports the firmware's operating target,
+currently `2`, independently of its release version. Firmware always sets it,
+including when storage is blocked or unreadable. Clients check presence and exact
+target support first. An absent or zero target prevents migration and normal
+commands. The current format is informational and never controls migration,
+source selection, reconnection or success. The migration-required error authorizes
+host assistance and the downloaded `/format.pb` selects the source. Without that
+marker, fresh clients report readiness and errors without file access.
+
+Firmware selects normal, assisted or blocked operation at boot. Assisted mode
+reports `ready = false` and `STORAGE_MIGRATION_REQUIRED` with reason `STORAGE`, outcome
+`NO_EFFECT` and no related errors. This exact marker authorizes migration only
+when no other status errors are present. Mode and marker stay latched through
+intermediate and final root uploads until a hardware reset. Root telemetry failures
+report `STORAGE_FAILED`, which blocks host conversion regardless of outcome.
+Normal operation never reports the marker. Blocked mode allows `GetStatus` and `Restart`. General
+`Restart` is available in every mode and acknowledges before resetting the MCU,
+then reruns ordinary startup as a power cycle would. It has no target or strict
+dataset validator.
+
+A missing root can begin initialization only on a genuinely empty filesystem.
+Essential identity or sequence failures in older or mixed storage leave saved data
+intact. Once storage is positively identified as current format, existing recovery
+still resets corrupt essential roots when formatting is permitted. An unknown or
+newer essential record format never authorizes that reset. Current startup checks
+record versions without requiring every payload to pass migration validation.
+Conflicting version headers or insufficient memory to identify a record's format
+block startup without resetting storage.
+Recognizable v1 records, including a Sequence whose first field resembles a v2
+header, block current startup before essential-root recovery can reset data.
+Corrupt nonessential current records stay on storage for ordinary loaders to handle;
+inactive children receive ordinary best-effort cleanup without host assistance.
+Migration validates the complete dataset strictly. Restart uses ordinary startup
+recovery, including its current-format repair and cleanup rules.
 
 The guard's 32-byte layout hash describes the backend and record layout,
 independently of capacity. It is repaired only after filesystem validation and
@@ -101,18 +141,19 @@ the measurement is smaller or missing.
 The persisted filesystem end must fit checked byte arithmetic and Pico's 16 MiB
 address window. On unchanged hardware, valid geometry retains the prior I/O
 extent. Reads and writes are bounded to that extent or a larger measured capacity
-before validation of application roots, growth, cleanup or guard repair can write.
+before native consistency recovery, validation of application roots, growth,
+cleanup or guard repair can write. Rejected candidate probes never run consistency
+recovery. Later I/O remounts repeat it within the accepted bounds before reading entries.
 With no valid filesystem geometry, formatting uses only measured capacity or the
-board minimum, never the exploratory address window. With valid geometry, an
-format mismatch or invalid roots reset the selected Pico filesystem in place,
-using its checked extent or a larger measured capacity. This preserves the start
-and extent on later boots with missing measurements, even when the filesystem
-extends beyond the board minimum. A successful below-minimum measurement still
-forbids this reset. Actual flash I/O failures never trigger format.
+board minimum, never the exploratory address window. With valid geometry, a
+format mismatch enters the migration classification above. Only positively identified
+current-format corruption permits the existing essential-root recovery. The checked extent remains
+valid on later boots with missing measurements, even when the filesystem extends
+beyond the board minimum. A successful below-minimum measurement forbids
+formatting. Actual flash I/O failures never trigger format.
 
-ESP32-S3 resets invalid roots or root formats within the measured capacity or, without
-a measurement, the board minimum. A later successful measurement can grow the
-filesystem again.
+ESP32-S3 applies the same preserving root classification within its addressable
+extent. A later successful measurement can grow the filesystem again.
 
 The selected mount stays open through root validation and growth. With a matching
 guard, startup mounts a current 2 MiB layout once. An RP2040 filesystem at 1 MiB
@@ -144,6 +185,8 @@ geometry. Current inspection and flashing tools reject schema `1` artifacts.
 | `/devices/<id>/layout.pb` | `Layout` | The device's HID layout: `maps` and, for BLE, `reports` |
 | `/profiles/<id>/profile.pb` | `Profile` | Profile name and roles summary; this file commits the profile's existence |
 | `/profiles/<id>/rules.pb` | `Rules` | The profile's rules |
+| `/.file-upload` | Raw bytes | Temporary file used by host convention for chunked replacement; accessible through file commands and excluded from the migration dataset |
+| `/.file-write-<random>` | Raw bytes | Internal atomic-creation temporary file; `<random>` is 16 lowercase hexadecimal digits. Hidden from file listings and deleted before migration. |
 
 IDs are positive decimal integers without padding or prefixes. Devices and profiles have separate
 sequences; `/devices/1/device.pb` and `/profiles/1/profile.pb` can both exist.
@@ -179,10 +222,10 @@ remain as defined in the schema, including `Rule.input = 1` and
 The version applies to the entire storage format, not to individual file types.
 A version change updates all nine messages together. Compatible additions whose
 zero value or absence preserves the existing meaning do not require a version
-bump. There is no generic migration engine; support for a future migration
-requires a separate implementation. Firmware downgrades are not supported.
-A release that changes the storage format must increment the minor version
-before `1.0`, or the major version from `1.0`.
+bump. Migration edges explicitly define their source and destination formats;
+adding a format requires its schema and conversion support. Firmware downgrades
+are not supported. Breaking storage changes require a minor release increment
+before `1.0`, or a major increment from `1.0`.
 
 The schema's comments document each message, its fields, and firmware validation that requires
 relationships between records. Fields follow the kinds of the [compatibility
@@ -205,6 +248,134 @@ device's policy and bond, at least one saved setting, the report maps of a layou
 a profile's name and at least one rule remain required. Adapter writers still
 include an entry for every transport. Forgetting the last setting or rule deletes
 its file rather than saving a message containing only `format`.
+
+## Preserving migration
+
+Versioned schemas retain format `1` in
+[`proto/storage/v1/storage.proto`](../proto/storage/v1/storage.proto) and format
+`2` in [`proto/storage/v2/storage.proto`](../proto/storage/v2/storage.proto).
+Firmware compiles only its operating schema. Host tools retain historical
+schemas. The archived v1 schema is frozen and pinned by a SHA256 golden check.
+The v1 root reliably identifies format `1`. Its other eight file messages have
+no format field; v2 shifts their outer tags by one and adds `format = 1` with
+value `2`. Nested messages keep their tags and meanings.
+
+The committed root selects the dataset epoch. During interrupted migration,
+recognition uses both complete outer record grammars, not a blind decode with
+the root's schema. A v1 Sequence with `next_device = 2` can look like a v2 header.
+Conversely, `08 02 10 05 18 07` is a completed v2 Sequence with IDs `5` and `7`;
+a loose v1 decoder would read `2` and `5` and silently ignore tag `3`. The frozen
+v1 outer grammar rejects unknown outer tags and duplicate singular fields as
+ambiguous. Well-defined unknown fields inside nested payloads remain intact.
+Malformed or ambiguous records stop the migration before writes.
+
+On-device startup validates the source once, replaces files with readback, validates
+the target and commits the root last. Replacements retain the inventory cursor;
+deletions restart it because directory indices shift. Memory holds one file and its
+conversion, plus the current directory path stack. Directory enumeration reopens
+and skips entries, so large directories still require quadratic metadata reads.
+Many obsolete files also cause repeated scans.
+
+Before any interaction except bootstrap status or closing the connection, the
+host verifies exact support for `Status.information.target_storage_format`, then
+requires the exact `STORAGE_MIGRATION_REQUIRED`/`STORAGE`/`NO_EFFECT` marker with no related
+errors and no other status errors. The informational current format may be absent,
+matching or different; none of these values authorizes or blocks migration.
+The host recursively
+inventories files with `ListFiles`, downloads every dataset file into RAM with
+bounded `ReadFile` calls, determines the source from
+`/format.pb` and validates mixed files. It then chooses a supported directed
+forward graph path to the target and completes the conversion in RAM before
+writing anything. Edges may skip numbers; format numbers need not be contiguous.
+Each edge declares an immediate checkpoint or permission to defer it, safe
+write/delete order, and recognition and resume rules for mixed files. The first
+edge is `1 -> 2`, for both on-device and assisted migration.
+
+Each directory listing is one complete framed response, optionally produced
+incrementally. The recursive dataset inventory includes every committed file,
+including `/format.pb`, and excludes `/.file-upload`. Before downloading or
+allocating, a host checks at most 16,384 files and a checked total of at most
+64 MiB of input, independent of adapter capacity. Conversion budgets input,
+output and working allocations together within 256 MiB. These host safety
+limits do not change serial payload limits. Unsupported sizes stop before
+writes. No host filesystem data, backups or disk spill are allowed.
+
+Every read response must match the requested path and offset exactly. The expected
+size is the inventory size for download and the uploaded size for readback. After
+an uncertain replacement, accept only the old or proposed new state. The old state
+is absence for a new path. A present file must match the complete old or new
+content. Equal sizes do not select a candidate. Size stays constant throughout a file read.
+Its data length must equal
+`min(request.length, size - offset)`. Offset must not exceed size, zero bytes
+are allowed only at EOF, and short positive chunks are rejected. Clients reject
+mismatch, overflow or excess data before retaining or converting bytes.
+
+File access uses ordinary `ListFiles`, `ReadFile`, `WriteFile`, `MoveFile` and
+`DeleteFile` commands. Debug firmware enables them during normal operation;
+production firmware enables them only in assisted mode, which remains latched
+until hardware reset even after the root declares the target. They never run
+concurrently with an on-device migration or on blocked storage. Each command opens
+and closes its files. The adapter keeps no upload session or prepare handshake.
+
+`WriteFile` at offset zero creates or truncates a file. A positive offset
+overwrites or appends in an existing file without truncating the remaining
+contents and cannot exceed its current size. Each request is atomic and flushes
+before acknowledgement; a series of requests is not atomic together. A file
+that fits within 512 bytes can be replaced directly at offset zero.
+
+For every new file, the storage layer writes to a randomly named internal
+temporary file, then atomically moves it to the requested path. This applies to
+all callers, including normal record saves, provisioning and migration. Before migration,
+startup deletes leftover files matching the internal temporary naming pattern
+without recovering their contents, even when classification blocks startup.
+`ListFiles` excludes these internal files.
+This happens inside the adapter and requires no extra protocol commands.
+
+For a larger replacement, the host writes `/.file-upload` at offset zero,
+appends the remaining chunks, reads back the complete temporary file, and uses
+`MoveFile` to replace its destination atomically. It then reads back and compares
+the destination. The temporary path is a host convention, accessible through all
+ordinary file commands and excluded only from the migration dataset. There is
+no persisted migration journal. After interruption, the host checks the
+destination before restarting or discarding a temporary file. Startup removes
+an abandoned temporary file only for current storage, an eligible on-device
+migration or assisted mode. Blocked startup preserves the host temporary
+file; the internal creation files follow their separate cleanup rule above.
+The temporary file alone counts as an empty filesystem.
+
+The host reads back and compares each replacement before proceeding. It deletes
+obsolete files only once replacements are durable and verified, in the edge's
+safe order. `DeleteFile` succeeds for a missing file and forbids `/` and
+`/format.pb`. Cleanup, including the host temporary file, finishes before each
+checkpoint. The host uploads `/format.pb` last, then reads back and compares the
+entire root. Intermediate checkpoints keep file access enabled for the next edge.
+
+After verifying the final root, the host sends `Restart`. Root uploads alone do
+not change assisted mode. Restart acknowledges before resetting the MCU and runs
+ordinary startup recovery without a separate migration completion validator.
+The host reconnects by stable `Status.id`, checks exact target support again,
+and requires the same target, no migration-required marker and `ready = true` for
+success. Normal startup may also report the warnings `STORAGE_FULL`,
+`PROFILE_MEMORY_LOW`, `USB_REQUIRED_CAPACITY_EXCEEDED` and
+`USB_RESERVED_CAPACITY_EXCEEDED`, each without related errors. Any other error
+stops the worker. Transport reconnection continues until cancellation, with old
+handles released before reopening.
+
+If the final root acknowledgement is lost and the marker persists, the active
+worker reads back the durable root against its known previous and proposed contents.
+An already committed final root needs no further file writes before `Restart`.
+If a physical reset has already restored readiness without the marker, status
+verification suffices. During active reconnection or restart, no marker with
+`ready = false` and nothing but those warnings permits only further status checks.
+Other errors stop the worker. If a restart acknowledgement is lost and the marker
+persists, the worker retries `Restart`.
+
+A fresh client seeing the marker downloads and validates the complete dataset.
+If `/format.pb` already declares the target, validation succeeds without conversion
+or file writes and the host sends `Restart` to exit assisted mode. Keeping the
+marker until reset lets a fresh host finish after the previous host committed the
+final root and disconnected before reset. Informational current-format presence
+or equality never changes this behavior.
 
 ## Adapter
 
@@ -539,7 +710,8 @@ Closing the session discards its events; cleanup continues without them.
 The adapter serializes bounded batches as ordinary list responses, concatenates their protobuf
 bytes and feeds one incremental COBS encoder. Each listing is one logical response in one frame.
 Requests wait until that response finishes, and changes during it remain pending for subsequent
-events. File reads use one 512-byte chunk and return the whole file in one response. See
+events. File reads use a 512-byte working buffer and return the requested range in one response.
+An unbounded debug read returns the whole file. See
 [list streaming](protocol/compatibility.md#listings).
 
 Filesystem operations are synchronous. Two loops on one executor share the application, its storage
@@ -579,10 +751,12 @@ when a write came after the last count. Saving a layout also counts after its wr
 when it took the room kept for pairing. Otherwise the storage-full status is counted again by a
 background step after other work. The interface provides no asynchronous-latency guarantee.
 
-## Development access
+## File access
 
-`ListFiles` lists a directory and `ReadFile` returns a complete file in one response frame. See
-[development commands](protocol/development.md). Downloads may contain Bluetooth secrets.
-The CLI keeps payloads out of event logs and uses private temporary files on Unix. It saves a
-downloaded record as JSON; see [downloaded records](protocol/clients.md#downloaded-records).
-Production firmware omits the handlers.
+`ListFiles`, `ReadFile`, `WriteFile`, `MoveFile` and `DeleteFile` provide file
+access in debug firmware and during required host assistance in production.
+See [file commands](protocol/development.md#file-access). Downloads may contain
+Bluetooth secrets. The CLI keeps payloads out of event logs and uses private
+temporary files on Unix for explicit downloads. It saves a downloaded record
+as JSON; see [downloaded records](protocol/clients.md#downloaded-records).
+Assisted migration keeps its entire dataset in RAM instead.

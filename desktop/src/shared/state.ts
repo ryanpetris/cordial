@@ -373,6 +373,23 @@ export interface AdapterEntry {
   profileNames: Record<string, Profile>;
   /** The profile listing has succeeded on the current ready transport. */
   profilesAvailable: boolean;
+  /** Why this app can't use the adapter's saved data yet, and any migration of it; null when it can. */
+  migration: AdapterMigration | null;
+}
+
+/** An adapter whose saved data this app can't use yet. `required`: the Cordial CLI must migrate
+ * it; `message` says what stops that, if anything. `starting` through `failed`: the CLI's
+ * migration, during which every other adapter is closed. `unsupported`: the adapter's firmware operates on a storage format this app doesn't. */
+export interface AdapterMigration {
+  phase: "required" | "starting" | "migrating" | "waiting" | "cancelling" | "failed" | "unsupported";
+  /** What stops the adapter from being used, in words. */
+  message: string | null;
+  /** Bytes of the current step done and in total; null while unknown. */
+  progress: { completed: number; total: number } | null;
+  /** Migrate starts a migration with the CLI. */
+  canStart: boolean;
+  /** Cancel stops the migration, or ends a failed one, and opens the other adapters again. */
+  canCancel: boolean;
 }
 
 export interface DeviceEntry {
@@ -501,6 +518,8 @@ export type Action =
   | { type: "profiles.page"; adapterId: string; page: "first" | "next" | "previous"; picker?: boolean }
   /** `adapter.reload` reads the shown profile page again; `devices.reload` lists the devices again. */
   | { type: "adapter.connect" | "adapter.disconnect" | "adapter.menu" | "adapter.reload" | "devices.reload"; adapterId: string }
+  /** Resets the adapter, which starts again from its saved data. */
+  | { type: "adapter.restart"; adapterId: string }
   | { type: "adapters.refresh" }
   /** Opens the window's app menu at a point in CSS pixels from the window's top left. */
   | { type: "app.menu"; x: number; y: number }
@@ -509,7 +528,10 @@ export type Action =
   | { type: "pair.start"; adapterId: string; candidateId: number }
   | { type: "pair.reply"; accept: boolean; value?: string }
   | { type: "pair.cancel" | "pair.dismiss" }
-  | { type: "preferences"; preferences: Partial<Preferences> };
+  | { type: "preferences"; preferences: Partial<Preferences> }
+  /** Migrates the adapter's saved data with the Cordial CLI. */
+  | { type: "migration.start"; adapterId: string }
+  | { type: "migration.cancel" };
 
 export type ActionResult = ({ ok: true } | { ok: false; message: string; inline?: boolean }) & {
   settingsSave?: SettingsSave;

@@ -19,8 +19,9 @@ import { isAction } from "../core/actions.ts";
 import { Controller } from "../core/controller.ts";
 import { listPorts, openSerial } from "@cordial/client/node";
 import { hostPlatform, watchHotplug } from "../node/host.ts";
+import { migrationHost } from "../node/migration.ts";
 import { preferencesFrom, type Action, type AppState, type Navigation, type Preferences } from "../shared/state.ts";
-import { profileAlertText } from "../shared/text.ts";
+import { canRestart, profileAlertText } from "../shared/text.ts";
 import { trayModel, type TrayModel } from "./tray-model.ts";
 import { closeNotifications, showNotification } from "./notifications.ts";
 
@@ -275,6 +276,7 @@ function adapterMenu(adapterId: string) {
           click: () => void act({ type: "adapter.connect", adapterId }),
         },
     { label: "Rename", enabled: connected && !!adapter.status?.ready, click: () => showWindow({ page: "adapter", id: adapterId, rename: true }) },
+    { label: "Restart", enabled: canRestart(adapter), click: () => void act({ type: "adapter.restart", adapterId }) },
   ]).popup({ window });
 }
 
@@ -294,7 +296,10 @@ async function quit() {
   if (quitting) return;
   quitting = true;
   closeNotifications();
-  await Promise.race([Promise.all([stopHotplug?.(), controller.stop()]), new Promise((r) => setTimeout(r, 1500))]);
+  const stopping = Promise.all([stopHotplug?.(), controller.stop()]);
+  // A running migration is cancelled, and the app waits for the CLI to exit without a time limit.
+  await controller.cancelMigration();
+  await Promise.race([stopping, new Promise((r) => setTimeout(r, 1500))]);
   tray?.destroy();
   app.exit(0);
 }
@@ -325,6 +330,8 @@ void app.whenReady().then(async () => {
   controller = new Controller({
     ...ports,
     log,
+    // Simulated adapters never need the CLI, which would reach real ones.
+    migration: simulated ? undefined : migrationHost(log),
     preferences,
     savePreferences,
     hostPlatform: hostPlatform(),

@@ -2,7 +2,7 @@ import { vi } from "vitest";
 import type { ByteStream, PortInfo } from "@cordial/client";
 import { IntegrationKind } from "@cordial/protocol";
 import { FakeAdapter, type FakeOptions } from "../src/fake/adapter.ts";
-import { Controller } from "../src/core/controller.ts";
+import { Controller, type ControllerDeps } from "../src/core/controller.ts";
 import { information } from "../src/core/convert.ts";
 import { AdapterSession } from "../src/core/session.ts";
 import { DEFAULT_PREFERENCES, type AppState, type DeviceRecord, type SettingField, type SettingFields, type SettingsGroupName } from "../src/shared/state.ts";
@@ -49,7 +49,7 @@ export async function openSession(options: FakeOptions = {}) {
 }
 
 /** A controller whose ports are simulated adapters, keyed by path. */
-export function controller(fakes: Record<string, FakeAdapter>) {
+export function controller(fakes: Record<string, FakeAdapter>, extra: Partial<ControllerDeps> = {}) {
   let state: AppState | null = null;
   // Tests may replace the port list and count opens after construction.
   const ports = { list: null as null | (() => Promise<PortInfo[]>), open: null as null | ((path: string) => Promise<ByteStream>), opened: 0 };
@@ -72,7 +72,7 @@ export function controller(fakes: Record<string, FakeAdapter>) {
       return f.open();
     },
   };
-  const c = new Controller(deps);
+  const c = new Controller({ ...deps, ...extra });
   return { c, deps, ports, state: () => state };
 }
 

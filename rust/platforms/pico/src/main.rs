@@ -168,12 +168,44 @@ async fn main_task(spawner: Spawner) {
                     board::MINIMUM_FLASH_BYTES,
                     capacity,
                     board::STORAGE_IDENTITY,
+                    services::random_u64,
                 )
                 .await
             }
             Err(_) => Err(Error::Bounds),
         }
     };
+    let build = Build {
+        development: cfg!(feature = "development"),
+        version: FIRMWARE_VERSION,
+        board: board::HARDWARE,
+        default_adapter_name: board::DEFAULT_ADAPTER_NAME,
+        adapter_id: identity.adapter,
+        profile_memory_budget: board::PROFILE_MEMORY_BUDGET,
+        restart: services::reset,
+        #[cfg(feature = "development")]
+        bootloader: Some(cordial_core::application::Bootloader {
+            enter: services::bootloader,
+        }),
+        #[cfg(feature = "production")]
+        bootloader: None,
+    };
+    let startup = records.as_ref().map_or_else(
+        |error| cordial_core::migration::Startup::Blocked(*error),
+        Records::startup,
+    );
+    if startup != cordial_core::migration::Startup::Normal {
+        let topology = Topology::default();
+        USB_IO.set_topology(topology);
+        spawner.spawn(usb_task(p.USB, serial, topology).unwrap());
+        cordial_usb::management::run(
+            &USB_IO,
+            cordial_core::migration::management::Management::new(build, startup),
+            &mut records,
+            services::reset,
+        )
+        .await;
+    }
     let topology = cordial_usb::saved_topology(
         &mut records,
         board::PROFILE_MEMORY_BUDGET.is_some(),
@@ -196,20 +228,7 @@ async fn main_task(spawner: Spawner) {
     }));
     // This is the only host instance and owner for the lifetime of the board.
     let backend = unsafe { Backend::new(state, Some(chipset)) };
-    let mut app = Application::new(Build {
-        development: cfg!(feature = "development"),
-        version: FIRMWARE_VERSION,
-        board: board::HARDWARE,
-        default_adapter_name: board::DEFAULT_ADAPTER_NAME,
-        adapter_id: identity.adapter,
-        profile_memory_budget: board::PROFILE_MEMORY_BUDGET,
-        #[cfg(feature = "development")]
-        bootloader: Some(cordial_core::application::Bootloader {
-            enter: services::bootloader,
-        }),
-        #[cfg(feature = "production")]
-        bootloader: None,
-    });
+    let mut app = Application::new(build);
     app.manager.output_support = cordial_usb::outputs::SUPPORT;
     let owner: &'static App =
         Box::leak(Box::new(Owner::new(&USB_IO, app, store.handle(), backend)));

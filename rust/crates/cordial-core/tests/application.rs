@@ -82,6 +82,7 @@ fn build(development: bool, bootloader: Option<fn() -> !>) -> Build {
         default_adapter_name: "Test adapter",
         adapter_id: "adapter".into(),
         profile_memory_budget: Some(PROFILE_BUDGET),
+        restart: || panic!("restarted"),
         bootloader: bootloader.map(|enter| Bootloader { enter }),
     }
 }
@@ -1353,7 +1354,10 @@ fn development_commands_exist_only_in_development_firmware() {
     let mut t = Test::new(false);
     for command in [
         Command::ListFiles(p::ListFiles { path: "/".into() }),
-        Command::ReadFile(p::ReadFile { path: "/a".into() }),
+        Command::ReadFile(p::ReadFile {
+            path: "/a".into(),
+            ..Default::default()
+        }),
         Command::ListFeatures(p::ListFeatures { device: SAVED }),
         Command::EnterBootloader(p::EnterBootloader {}),
     ] {
@@ -1388,13 +1392,15 @@ fn development_files_are_listed_and_read_whole() {
     );
     match t.ok(Command::ReadFile(p::ReadFile {
         path: "/device.json".into(),
+        ..Default::default()
     })) {
         Some(R::File(f)) => assert_eq!(f.data, bytes),
         other => panic!("{other:?}"),
     }
     assert_eq!(
         t.code(Command::ReadFile(p::ReadFile {
-            path: "/../x".into()
+            path: "/../x".into(),
+            ..Default::default()
         })),
         p::ErrorCode::BadArgs
     );
@@ -1435,6 +1441,68 @@ fn bootloader_releases_input_before_reboot() {
         t.app.manager.forward.packet().is_some(),
         "accepted reboot first releases the host's held key"
     );
+}
+
+#[test]
+fn production_restart_releases_input_and_saves_edits_before_reset() {
+    let mut t = Test::new(true);
+    let (id, link) = editing(&mut t);
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    tap(&mut t, link);
+    t.event(Event::Input(
+        InputReport::new(link, ServiceId(7), 0, &[1]).unwrap(),
+    ));
+    drain_forward(&mut t);
+    assert_eq!(t.ok(Command::Restart(p::Restart {})), None);
+    assert!(t.app.manager.forward.pending() > 0);
+    block_on(t.app.work(&mut t.store, &mut t.radio, t.now));
+    drain_forward(&mut t);
+    let reset = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on(t.app.work(&mut t.store, &mut t.radio, t.now));
+    }));
+    assert_eq!(
+        reset.unwrap_err().downcast_ref::<&str>(),
+        Some(&"restarted")
+    );
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
+}
+
+#[test]
+fn production_restart_waits_for_ack_and_uses_the_control_deadline_if_it_is_lost() {
+    for lost in [false, true] {
+        let mut t = Test::new(false);
+        drain_forward(&mut t);
+        block_on(t.app.begin(
+            p::Request {
+                command: Some(Command::Restart(p::Restart {})),
+            },
+            &mut t.store,
+            &mut t.radio,
+            t.now,
+        ));
+        drain_forward(&mut t);
+        block_on(t.app.work(&mut t.store, &mut t.radio, t.now));
+        let (token, bytes) = t.app.serial.output(63).unwrap();
+        let length = bytes.len();
+        t.app.serial.output_complete(token, 0);
+        block_on(t.app.work(&mut t.store, &mut t.radio, t.now + 249));
+        if lost {
+            t.now += 250;
+        } else {
+            assert_eq!(t.response().result, None);
+        }
+        assert!(length > 0);
+        let reset = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(t.app.work(&mut t.store, &mut t.radio, t.now));
+        }));
+        assert_eq!(
+            reset.unwrap_err().downcast_ref::<&str>(),
+            Some(&"restarted")
+        );
+    }
 }
 
 #[test]
@@ -1964,9 +2032,9 @@ fn connecting_a_blocked_device_is_refused_as_blocked() {
 #[test]
 fn a_failed_free_space_read_keeps_storage_ready() {
     let mut t = Test::new(true);
-    t.store.fail = true;
+    t.store.fail_count = true;
     assert!(t.status().ready);
-    t.store.fail = false;
+    t.store.fail_count = false;
     assert!(t.app.manager.storage_ready);
 }
 

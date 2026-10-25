@@ -10,9 +10,9 @@
   },
   "scripts": {
     "generate": "node scripts/generate.mjs",
-    "check:generated": "node scripts/generate.mjs --check",
+    "check:generated": "node scripts/generate.mjs --check && node --test scripts/schema-build.test.mjs",
     "lint": "buf lint ../../../proto --config buf.yaml",
-    "breaking": "buf breaking ../../../proto --config buf.yaml --against"
+    "breaking": "node scripts/breaking.mjs"
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.16.0"

@@ -10,6 +10,7 @@ fn exhausted_candidate_ids_report_the_retained_result_without_losing_candidates(
             default_adapter_name: "Test adapter",
             adapter_id: "adapter".into(),
             profile_memory_budget: None,
+            restart: || panic!("restarted"),
             bootloader: None,
         });
         if retained {

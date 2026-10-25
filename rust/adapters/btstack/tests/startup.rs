@@ -39,6 +39,7 @@ fn management_and_development_recovery_work_before_controller_start() {
         default_adapter_name: "Test adapter",
         adapter_id: "adapter".into(),
         profile_memory_budget: None,
+        restart: || panic!("restarted"),
         bootloader: Some(Bootloader {
             enter: || std::panic::panic_any("entered bootloader"),
         }),

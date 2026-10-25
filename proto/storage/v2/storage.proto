@@ -13,7 +13,7 @@
 // reads as Linux.
 syntax = "proto3";
 
-package cordial.storage;
+package cordial.storage.v2;
 
 // /format.pb: the filesystem's root record, written when storage is provisioned.
 message Format {

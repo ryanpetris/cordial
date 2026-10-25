@@ -17,6 +17,7 @@ use std::{
     io::{self, Read, Write},
     sync::{
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread,
@@ -56,6 +57,21 @@ impl Write for PipeWriter {
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// A client's reading half, counted while held, as a serial port's handle is.
+struct Held(PipeReader, Arc<AtomicUsize>);
+
+impl Read for Held {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        self.0.read(out)
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.1.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -118,7 +134,9 @@ pub struct Sim {
     pairing: Option<u32>,
     out: Option<PipeWriter>,
     /// Counts sessions, so a session that ends after the next one started leaves it alone.
-    session: u64,
+    pub session: u64,
+    /// Client reading halves not yet released.
+    pub handles: Arc<AtomicUsize>,
 }
 
 pub fn resource(kind: ResourceType, count: Option<u32>, limit: Option<u32>) -> p::ResourceCapacity {
@@ -151,7 +169,8 @@ pub fn status(ready: bool) -> p::Status {
             firmware_version: Some("1.2.3-dev".into()),
             board_name: None,
             development_build: Some(true),
-            storage_format: None,
+            storage_format: Some(2),
+            target_storage_format: Some(2),
         }),
         ..Default::default()
     }
@@ -357,6 +376,7 @@ impl Default for Sim {
             pairing: None,
             out: None,
             session: 0,
+            handles: Arc::default(),
         }
     }
 }
@@ -365,6 +385,7 @@ fn kind_name(command: &Command) -> &'static str {
     match command {
         Command::GetStatus(_) => "get_status",
         Command::SetAdapter(_) => "set_adapter",
+        Command::Restart(_) => "restart",
         Command::EnterBootloader(_) => "enter_bootloader",
         Command::StartScan(_) => "start_scan",
         Command::StopScan(_) => "stop_scan",
@@ -384,6 +405,9 @@ fn kind_name(command: &Command) -> &'static str {
         Command::ListFeatures(_) => "list_features",
         Command::ListFiles(_) => "list_files",
         Command::ReadFile(_) => "read_file",
+        Command::WriteFile(_) => "write_file",
+        Command::MoveFile(_) => "move_file",
+        Command::DeleteFile(_) => "delete_file",
         Command::ListProfiles(_) => "list_profiles",
         Command::GetProfile(_) => "get_profile",
         Command::CreateProfile(_) => "create_profile",
@@ -765,6 +789,11 @@ impl Sim {
                     self.event(p::event::Kind::Adapter(status));
                 }
             }
+            // The adapter resets once its reply has left, which closes the connection.
+            Command::Restart(_) => {
+                self.respond(None);
+                self.out = None;
+            }
             Command::EnterBootloader(_) => self.respond(None),
             Command::StartScan(scan) => {
                 if scan.transports.is_empty() {
@@ -1137,7 +1166,36 @@ impl Sim {
                 None => self.respond(error(ErrorCode::NotFound)),
             },
             Command::ReadFile(r) => match self.data.get(&r.path).cloned() {
-                Some(data) => self.respond(Some(response::Result::File(p::FileData { data }))),
+                Some(data) => {
+                    let start = (r.offset as usize).min(data.len());
+                    let end = r
+                        .length
+                        .map_or(data.len(), |n| (start + n as usize).min(data.len()));
+                    self.respond(Some(response::Result::File(p::FileData {
+                        path: r.path,
+                        offset: r.offset,
+                        size: data.len() as u64,
+                        data: data[start..end].to_vec(),
+                    })))
+                }
+                None => self.respond(error(ErrorCode::NotFound)),
+            },
+            Command::WriteFile(w) => {
+                let data = self.data.entry(w.path).or_default();
+                let start = w.offset as usize;
+                data.resize(data.len().max(start + w.data.len()), 0);
+                data[start..start + w.data.len()].copy_from_slice(&w.data);
+                self.respond(None)
+            }
+            Command::MoveFile(m) => match self.data.remove(&m.source) {
+                Some(data) => {
+                    self.data.insert(m.destination, data);
+                    self.respond(None)
+                }
+                None => self.respond(error(ErrorCode::NotFound)),
+            },
+            Command::DeleteFile(d) => match self.data.remove(&d.path) {
+                Some(_) => self.respond(None),
                 None => self.respond(error(ErrorCode::NotFound)),
             },
         }
@@ -1163,12 +1221,14 @@ impl Dongle {
         let (client_writer, mut from_client) = pipe();
         // The session starts with the Dongle's delimiter.
         let _ = to_client.clone().write_all(&[frame::DELIMITER]);
-        let session = {
+        let (session, handles) = {
             let mut sim = self.0.lock().unwrap();
             sim.out = Some(to_client);
             sim.session += 1;
-            sim.session
+            (sim.session, sim.handles.clone())
         };
+        handles.fetch_add(1, Ordering::SeqCst);
+        let client_reader = Held(client_reader, handles);
         let sim = self.0.clone();
         thread::spawn(move || {
             let mut decoder = Decoder::new(Some(MAX_REQUEST_BYTES));
@@ -1221,6 +1281,16 @@ impl Dongle {
     /// Ends the Dongle's side of the session, as unplugging it would.
     pub fn unplug(&self) {
         self.0.lock().unwrap().out = None;
+    }
+
+    /// Client reading halves not yet released.
+    pub fn handles(&self) -> usize {
+        self.0.lock().unwrap().handles.load(Ordering::SeqCst)
+    }
+
+    /// Sessions opened so far.
+    pub fn sessions(&self) -> u64 {
+        self.0.lock().unwrap().session
     }
 
     pub fn sent(&self) -> Vec<&'static str> {

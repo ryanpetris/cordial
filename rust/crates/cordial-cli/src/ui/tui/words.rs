@@ -52,6 +52,7 @@ fn error_clause(code: ErrorCode) -> &'static str {
         }
         ProfileMemoryExceeded => "the adapter doesn't have room for this device's profiles",
         ProfileLoadFailed => "the adapter couldn't read one of this device's profiles",
+        StorageMigrationRequired => "the adapter's saved data must be migrated before use",
     }
 }
 

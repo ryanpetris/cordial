@@ -73,7 +73,7 @@ impl Session {
     pub fn active(&self) -> bool {
         self.active
     }
-    /// Accepted bootloader entry stops reading further requests.
+    /// An accepted restart stops reading further requests.
     pub fn stop_commands(&mut self) {
         self.stopped = true;
     }
@@ -141,6 +141,24 @@ impl Session {
         .encode_to_vec();
         let mut encoded = Vec::new();
         encoder.push(&bytes, &mut encoded);
+        if finished {
+            self.stream.take().unwrap().finish(&mut encoded);
+        }
+        if !encoded.is_empty() {
+            self.response = Some(encoded);
+        }
+    }
+
+    /// Appends already encoded protobuf bytes to a single response frame.
+    /// File readers use this to split one length-delimited bytes field across bounded reads.
+    pub fn stream_bytes(&mut self, bytes: &[u8], finished: bool) {
+        if !self.active {
+            return;
+        }
+        assert!(self.stream_ready());
+        let encoder = self.stream.as_mut().expect("response stream");
+        let mut encoded = Vec::new();
+        encoder.push(bytes, &mut encoded);
         if finished {
             self.stream.take().unwrap().finish(&mut encoded);
         }

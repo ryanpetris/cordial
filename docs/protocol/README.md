@@ -17,18 +17,23 @@ reports what it says, such as battery levels.
 - [Records: status, profiles, devices, integrations, information and settings](records.md)
 - [Limits and errors](limits-and-errors.md)
 - [CLI, TUI and desktop behavior](clients.md)
-- [Development commands](development.md)
+- [Development and file commands](development.md)
 - [HID decoding, forwarding limits and suspend behavior](hid-forwarding.md)
 
 ## Definitions
 
 - [`proto/cordial.proto`](../../proto/cordial.proto) defines every message. Its comments say what
   each field means, which fields are required, and what a missing field means.
-- [`proto/storage.proto`](../../proto/storage.proto) defines the saved records independently of
-  the serial representation. See [storage format](../storage-format.md).
+- [`proto/storage/v2/storage.proto`](../../proto/storage/v2/storage.proto) defines the operating saved
+  records independently of the serial representation. Historical schemas remain under
+  `proto/storage/v1/`. See [storage format](../storage-format.md).
+- [`proto/migration.proto`](../../proto/migration.proto) defines framed desktop/CLI subprocess IPC.
+  Its length prefix and bounds are separate from the serial API's COBS frames.
 
-`buf lint` checks both schemas, and `buf breaking` compares them with the newest earlier release
-in the same series. See [Compatibility rules](compatibility.md).
+`buf lint` checks all schemas, and `buf breaking` compares them with the newest earlier release
+in the same series. Unversioned historical storage schemas are assigned their matching namespace
+before comparison. Each storage format is compared with itself, while all serial and IPC fields
+retain the `WIRE_JSON` checks. See [Compatibility rules](compatibility.md).
 
 ## Libraries
 
@@ -40,6 +45,9 @@ them too:
 | Messages and framing | `cordial-protocol` | `@cordial/protocol` |
 | Port discovery and connection | `cordial-client` | `@cordial/client` (`/node`, `/web`) |
 
-The protocol libraries do no I/O; the Rust one is `no_std` and shared with the firmware. The client
+The protocol libraries do no I/O; the Rust one is `no_std` and shared with the firmware.
+Firmware compiles only the current v2 storage schema. Host clients also retain v1
+for preserving migration; the Rust `historical-storage` and `migration` features
+provide historical records and subprocess IPC to host builds. The client
 libraries carry no user-facing text and keep no state beyond the open connection. All examples in
 these documents use synthetic identifiers and values.

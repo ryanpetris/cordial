@@ -13,6 +13,7 @@
 //! The library keeps no state beyond the open connection and writes nothing to stdout or logs.
 mod connection;
 mod error;
+pub mod migration;
 pub mod order;
 pub mod rules;
 #[cfg(feature = "serialport")]
