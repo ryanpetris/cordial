@@ -62,7 +62,15 @@
 | Raspberry Pi Pico W | Classic and Low Energy | `cordial-firmware-<version>-pico_w.tar.gz` |
 | Raspberry Pi Pico 2 W | Classic and Low Energy | `cordial-firmware-<version>-pico2_w.tar.gz` |
 | Waveshare RP2350B-Plus-W | Classic and Low Energy | `cordial-firmware-<version>-waveshare_rp2350b_plus_w.tar.gz` |
-| Seeed Studio XIAO ESP32S3 | Low Energy only | `cordial-firmware-<version>-xiao_esp32s3.tar.gz` |
+| ESP32-S3 with 8 MiB flash and native USB | Low Energy only | `cordial-firmware-<version>-esp32s3_8mb.tar.gz` |
+
+The ESP32-S3 image requires 8 MiB flash and a USB connection wired to the chip's native USB
+peripheral. A USB-to-UART connection alone cannot provide Cordial's USB keyboard and mouse.
+Expected compatible boards include the [Seeed Studio XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/),
+[M5Stack Atom S3](https://docs.m5stack.com/en/core/AtomS3) and
+[Atom S3U](https://docs.m5stack.com/en/core/AtomS3U). Hardware validation of this image is pending.
+This image does not use PSRAM or support onboard displays, application buttons or status
+LEDs. It does not cover every ESP32-S3 variant.
 
 Each board also has a debug archive, `cordial-firmware-<version>-debug-<board>.tar.gz`, which adds
 adapter file access and restarting into the bootloader from the app.
@@ -117,6 +125,14 @@ Log out and back in after changing groups.
 Download your board's firmware from the
 [latest release](https://github.com/ryanpetris/cordial/releases/latest) and extract it.
 
+For a first installation, or an update from release 0.6.3 or earlier, erase the
+board's flash before flashing Cordial. Use `picotool erase` in BOOTSEL mode or
+`esptool --chip esp32s3 erase_flash` in download mode. This removes the existing
+firmware and saved data; pair your devices after flashing. Factory firmware and
+earlier storage formats can leave data that prevents Cordial from initializing
+its storage. Updates within the current storage format preserve saved devices
+and preferences without erasing flash. See [building](docs/building.md#firmware).
+
 **Raspberry Pi Pico W, Pico 2 W and Waveshare RP2350B-Plus-W**
 
 1. Hold the **BOOTSEL** (or **BOOT**) button while plugging the board into USB.
@@ -124,24 +140,29 @@ Download your board's firmware from the
 2. Copy the extracted `.uf2` file onto that drive. The board restarts as
    a Cordial adapter.
 
-**Seeed Studio XIAO ESP32S3**
+**ESP32-S3 with 8 MiB flash and native USB**
 
-Hold **BOOT** while plugging the board in, then flash it with
-[esptool](https://docs.espressif.com/projects/esptool/) from the extracted
-`xiao_esp32s3-esp-nimble-esp-idf` folder:
+Enter the board's download mode:
+
+- **XIAO ESP32-S3:** hold **BOOT** while connecting the USB data cable, then release it.
+- **Atom S3 and Atom S3U:** connect USB, hold the **Reset** button for about two seconds until
+  the internal green LED lights, then release it. See M5Stack's
+  [Atom S3 instructions](https://docs.m5stack.com/en/core/AtomS3#learn) and
+  [Atom S3U instructions](https://docs.m5stack.com/en/arduino/m5atoms3u/program#2-download-mode).
+- **Other boards:** follow the manufacturer's download-mode instructions and use the native USB
+  connector for normal operation.
+
+Flash it with [esptool](https://docs.espressif.com/projects/esptool/) from the extracted
+`esp32s3_8mb-esp-nimble-esp-idf` folder:
 
 ```sh
 esptool --chip esp32s3 write_flash \
   0x0 bootloader.bin \
   0x8000 partition-table.bin \
-  0x10000 cordial-xiao_esp32s3-esp-nimble-esp-idf.bin
+  0x10000 cordial-esp32s3_8mb-esp-nimble-esp-idf.bin
 ```
 
-Updating a board from release 0.6.3 or earlier? Those releases save data in an
-earlier storage format, which this firmware doesn't open. Erase the board's flash
-first, with `picotool erase` in BOOTSEL mode or
-`esptool --chip esp32s3 erase_flash`, then flash it as above and pair your devices
-again. See [building](docs/building.md#firmware).
+After flashing, unplug the board and plug it back in.
 
 ### 3. Pair your devices
 

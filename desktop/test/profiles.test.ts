@@ -229,7 +229,7 @@ describe("Profiles", () => {
   });
 
   it("remaps Game Pad input without gamepad outputs", async () => {
-    const { c } = await start({ board: "xiao_esp32s3", profiles: [profile(1, "A")] });
+    const { c } = await start({ board: "esp32s3_8mb", profiles: [profile(1, "A")] });
     const { connection } = c.manager.connected.get(ID)!.session;
     const support = connection.status.profileSupport!;
     expect(support.ranges.some((r) => r.kind === UsageRange_Kind.REMAP_INPUT && r.collection?.usage === 0x05)).toBe(true);

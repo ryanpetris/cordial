@@ -76,7 +76,7 @@ class Artifact(unittest.TestCase):
                     artifact.uf2(image + b'\0' * config['storage_offset'])
 
     def test_backend_identity_and_bootloader_capability_are_checked(self):
-        config = firmware_config.load(ROOT / 'boards/xiao_esp32s3.json', 'development')
+        config = firmware_config.load(ROOT / 'boards/esp32s3_8mb.json', 'development')
         expected = artifact.manifest(config)
         def blob(value):
             return artifact.MAGIC + json.dumps(value).encode() + b'\0'

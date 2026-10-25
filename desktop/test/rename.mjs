@@ -52,7 +52,7 @@ try {
   await save();
   await checked(classic, false);
   // The simulated ESP32-S3 supports only BLE.
-  await page.getByRole('button', { name: /^XIAO ESP32-S3/ }).first().click();
+  await page.getByRole('button', { name: /^ESP32-S3/ }).first().click();
   await settings();
   await checked(ble, true);
   assert.equal(await classic.count(), 0);
@@ -81,12 +81,12 @@ try {
   await page.getByRole('heading', { name: 'Pico 2 W', exact: true }).waitFor({ state: 'attached' });
   // Give both adapters the same name and verify the displayed and editable values.
   await rename.click();
-  await input.fill('XIAO ESP32-S3');
+  await input.fill('ESP32-S3');
   await submit.click();
   await input.waitFor({ state: 'hidden' });
-  await page.getByRole('heading', { name: 'XIAO ESP32-S3', exact: true }).waitFor({ state: 'attached' });
+  await page.getByRole('heading', { name: 'ESP32-S3', exact: true }).waitFor({ state: 'attached' });
   await rename.click();
-  assert.equal(await input.inputValue(), 'XIAO ESP32-S3');
+  assert.equal(await input.inputValue(), 'ESP32-S3');
   await page.getByRole('button', { name: 'Cancel', exact: true }).click();
   assert.equal(await page.locator('.page-header button').count(), 0);
   await bar.getByRole('button', { name: 'Disconnect', exact: true }).click();
@@ -94,7 +94,7 @@ try {
   assert.equal(await rename.isDisabled(), true);
   await bar.getByRole('button', { name: 'Connect', exact: true }).click();
   await bar.getByRole('button', { name: 'Disconnect', exact: true }).waitFor();
-  await page.getByRole('heading', { name: 'XIAO ESP32-S3', exact: true }).waitFor({ state: 'attached' });
+  await page.getByRole('heading', { name: 'ESP32-S3', exact: true }).waitFor({ state: 'attached' });
   await app.evaluate(({ ipcMain }) => {
     ipcMain.removeHandler('act');
     ipcMain.handle('act', () => ({ ok: false, message: 'Could not save name' }));

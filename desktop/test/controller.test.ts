@@ -67,7 +67,7 @@ describe("Controller", () => {
 
   it("combines adapters and hides a port that isn't one", async () => {
     const a = new FakeAdapter({ adapterId: "AAAA0001" });
-    const b = new FakeAdapter({ adapterId: "BBBB0002", board: "xiao_esp32s3" });
+    const b = new FakeAdapter({ adapterId: "BBBB0002", board: "esp32s3_8mb" });
     const { c, deps, state } = controller({ "/a": a, "/b": b });
     const broken = new FakeAdapter({ adapterId: "CCCC0003" });
     broken.write = async () => {
@@ -78,8 +78,8 @@ describe("Controller", () => {
     await until(() => loaded(state(), 8));
     const s = state()!;
     expect(s.adapters.map((x) => [x.name, x.connection])).toEqual([
+      ["ESP32-S3", "connected"],
       ["Pico 2 W", "connected"],
-      ["XIAO ESP32-S3", "connected"],
     ]);
     const mouse = s.devices.find((d) => d.key === "AAAA0001/2")!;
     expect(mouse).toMatchObject({ name: "Example Mouse", kind: "mouse" });
@@ -730,7 +730,7 @@ it("names a disabled transport when the adapter refuses a scan because the trans
 });
 
 it("refuses changing a transport the adapter doesn't support", async () => {
-  const a = new FakeAdapter({ adapterId: "AAAA0001", board: "xiao_esp32s3", transports: ["ble"] });
+  const a = new FakeAdapter({ adapterId: "AAAA0001", board: "esp32s3_8mb", transports: ["ble"] });
   const { c, state } = controller({ "/a": a });
   await c.manager.rescan();
   await until(() => loaded(state(), 4));

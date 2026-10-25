@@ -21,7 +21,7 @@ linking and artifact inspection reject overlap.
 | Pico W | 2 MiB | 1 MiB | 255 | 1,044,480 |
 | Pico 2 W | 4 MiB | 1 MiB | 766 | 3,137,536 |
 | Waveshare RP2350B-Plus-W | 16 MiB | 1 MiB | 3,838 | 15,720,448 |
-| XIAO ESP32-S3 | 8 MiB | 2 MiB | 1,535 | 6,287,360 |
+| ESP32-S3, 8 MiB | 8 MiB | 2 MiB | 1,535 | 6,287,360 |
 
 The first storage sector contains a 32-byte layout hash outside LittleFS.
 RP2350 also reserves its final flash sector for the ROM E10 marker. ESP uses

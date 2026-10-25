@@ -124,6 +124,7 @@ await page.getByRole("button", { name: "Travel Copy, Options", exact: true }).wa
 await shot("adapter-profiles");
 await page.getByRole("tab", { name: "Details" }).click();
 await page.getByRole("button", { name: "Add Device" }).click();
+await page.getByRole("combobox", { name: "Adapter", exact: true }).selectOption(smokeAdapter.id);
 await page.getByText("Example Keys Mini").waitFor();
 await shot("add-device");
 await page.getByRole("listitem").filter({ hasText: "Example Keys Mini" }).getByRole("button", { name: "Pair" }).click();

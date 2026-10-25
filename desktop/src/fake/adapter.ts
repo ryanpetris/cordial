@@ -379,7 +379,7 @@ export function demoCandidates(): Candidate[] {
   ];
 }
 
-const BOARDS: Record<string, string> = { pico_w: "Pico W", pico2_w: "Pico 2 W", xiao_esp32s3: "XIAO ESP32-S3", waveshare_rp2350b_plus_w: "RP2350B-Plus-W" };
+const BOARDS: Record<string, string> = { pico_w: "Pico W", pico2_w: "Pico 2 W", esp32s3_8mb: "ESP32-S3", waveshare_rp2350b_plus_w: "RP2350B-Plus-W" };
 const TRANSPORT = { classic: Transport.CLASSIC, ble: Transport.BLE } as const;
 const INTERFACE = { via: ConfigurationInterface.VIA, vial: ConfigurationInterface.VIAL } as const;
 const OUTPUT = { disabled: OutputMode.DISABLED, hid: OutputMode.HID, xinput: OutputMode.XINPUT } as const;
@@ -549,7 +549,7 @@ export class FakeAdapter implements ByteStream {
     this.#latency = options.latency ?? 0;
     this.#settingJobMs = options.settingJobMs ?? 0;
     this.profileSupport = options.profileSupport ?? this.board !== "pico_w";
-    this.gamepadOutputs = options.gamepadOutputs ?? this.board !== "xiao_esp32s3";
+    this.gamepadOutputs = options.gamepadOutputs ?? this.board !== "esp32s3_8mb";
     this.profiles = this.profileSupport ? (options.profiles ?? []) : [];
     if (!this.profileSupport) for (const d of this.devices) d.profiles = [];
     this.interfaces = {

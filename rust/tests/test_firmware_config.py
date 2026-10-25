@@ -55,7 +55,7 @@ class GeneratedConfigTests(unittest.TestCase):
                         self.assert_outputs(out, before)
 
     def test_config_changes_update_affected_outputs(self):
-        for name in ("pico2_w", "xiao_esp32s3"):
+        for name in ("pico2_w", "esp32s3_8mb"):
             raw = json.loads((config.ROOT / "boards" / f"{name}.json").read_text())
             with self.subTest(board=name), tempfile.TemporaryDirectory() as temp:
                 path, out = Path(temp, "board.json"), Path(temp, "generated")
@@ -76,7 +76,7 @@ class GeneratedConfigTests(unittest.TestCase):
                     self.assert_outputs(out, before, outputs)
 
     def test_version_changes_update_metadata_only(self):
-        for name in ("pico2_w", "xiao_esp32s3"):
+        for name in ("pico2_w", "esp32s3_8mb"):
             board = config.load(config.ROOT / "boards" / f"{name}.json", "production")
             with self.subTest(board=name), tempfile.TemporaryDirectory() as temp, \
                     patch.dict(os.environ, CORDIAL_VERSION="1.2.3"):
@@ -89,7 +89,7 @@ class GeneratedConfigTests(unittest.TestCase):
                 self.assertIn('const FIRMWARE_VERSION: &str = "1.2.4";', (out / "metadata.rs").read_text())
 
     def test_esp_native_sources_and_headers_invalidate_defaults(self):
-        board = config.load(config.ROOT / "boards/xiao_esp32s3.json", "development")
+        board = config.load(config.ROOT / "boards/esp32s3_8mb.json", "development")
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(esp_config, "__file__", str(Path(temp, "tools/esp_config.py"))):
             components = Path(temp, "platforms/esp32s3/components/native")
@@ -113,7 +113,7 @@ class GeneratedConfigTests(unittest.TestCase):
                     self.assert_outputs(out, before)
 
     def test_build_preserves_generated_config_and_repairs_changed_board_json(self):
-        for name in ("pico2_w", "xiao_esp32s3"):
+        for name in ("pico2_w", "esp32s3_8mb"):
             board = config.ROOT / "boards" / f"{name}.json"
             with self.subTest(board=name), tempfile.TemporaryDirectory() as temp, \
                     patch.object(build, "ROOT", Path(temp, "rust")), \
@@ -146,10 +146,32 @@ class GeneratedConfigTests(unittest.TestCase):
 
 
 class BoardConfigTests(unittest.TestCase):
+    def test_generic_esp_preset_uses_internal_ram_and_preserves_storage(self):
+        board = config.load(config.ROOT / "boards/esp32s3_8mb.json", "production")
+        self.assertEqual(board["name"], "esp32s3_8mb")
+        self.assertEqual(board["default_adapter_name"], "ESP32-S3")
+        self.assertIsNone(board["mcu_led"])
+        self.assertEqual(board["flash_bytes"], 8388608)
+        self.assertEqual(board["firmware_bytes"], 2097152)
+        self.assertEqual(board["profile_memory_budget"], 40960)
+        self.assertEqual(board["storage_offset"], 2097152)
+        self.assertEqual(board["storage_bytes"], 6291456)
+        self.assertEqual(board["storage_identity"].hex(),
+                         "7af0b00fd614e5dfc523cba0f6cf2cf871b59483d4b339fe35856d06f1cbaf2a")
+        self.assertEqual((board["bluetooth_backend"], board["radio_backend"],
+                          board["usb_backend"], board["storage_backend"]),
+                         ("esp-nimble", "esp-idf", "embassy", "littlefs"))
+        with tempfile.TemporaryDirectory() as out:
+            config.generate(board, out)
+            generated = Path(out, "board.rs").read_text()
+            self.assertIn('DEFAULT_ADAPTER_NAME: &str = "ESP32-S3";', generated)
+            self.assertIn('HARDWARE: &str = "esp32s3_8mb";', generated)
+            self.assertIn("MCU_LED: Option<(u8, bool)> = None;", generated)
+
     def test_bluetooth_limits_and_esp_controller_activities(self):
         from bluetooth_config import generate, limits
         for name, expected in (("pico_w", (2, 8)), ("pico2_w", (6, 14)),
-                               ("waveshare_rp2350b_plus_w", (6, 14)), ("xiao_esp32s3", (0, 8))):
+                               ("waveshare_rp2350b_plus_w", (6, 14)), ("esp32s3_8mb", (0, 8))):
             path = config.ROOT / "boards" / f"{name}.json"
             board = config.load(path, "development")
             self.assertEqual(limits(board), expected)
@@ -187,7 +209,7 @@ class BoardConfigTests(unittest.TestCase):
 
     def test_profile_memory_budget_is_generated_without_changing_identity(self):
         presets = {"pico_w": None, "pico2_w": 40960, "waveshare_rp2350b_plus_w": 40960,
-                   "xiao_esp32s3": 40960}
+                   "esp32s3_8mb": 40960}
         for name, expected in presets.items():
             board = config.ROOT / "boards" / f"{name}.json"
             raw = json.loads(board.read_text())
@@ -240,7 +262,7 @@ class BoardConfigTests(unittest.TestCase):
                 config.load(path, "development")
 
     def test_esp_backend_selection_preserves_wiring_and_separates_storage(self):
-        preset = json.loads((config.ROOT / "boards/xiao_esp32s3.json").read_text())
+        preset = json.loads((config.ROOT / "boards/esp32s3_8mb.json").read_text())
         digests, layouts = set(), set()
         choices = {"btstack": "BT_CONTROLLER_ONLY", "esp-nimble": "BT_NIMBLE_ENABLED"}
         with tempfile.TemporaryDirectory() as temp:
@@ -251,6 +273,7 @@ class BoardConfigTests(unittest.TestCase):
                 out = Path(temp, backend)
                 config.generate(board, out)
                 sdk = (out / "sdkconfig.defaults").read_text()
+                self.assertIn("CONFIG_SPIRAM=n\n", sdk)
                 self.assertIn(f"CONFIG_{choice}=y\n", sdk)
                 if backend == "esp-nimble":
                     self.assertIn("CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y\n", sdk)

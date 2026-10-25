@@ -134,7 +134,7 @@ fn first_adapter() -> State {
 fn second_adapter() -> State {
     let mut st = fixture::state();
     st.status.id = "00000000000FA002".into();
-    st.status.name = "XIAO ESP32-S3".into();
+    st.status.name = "ESP32-S3".into();
     st.candidates.clear();
     let mut kb = fixture::device(1, "Example Compact Keyboard");
     battery(&mut kb, 54);
@@ -356,7 +356,7 @@ fn every_adapter_opens_and_lists_its_devices() {
         "Example Mouse",
         "Example Compact Keyboard",
         "Pico 2 W",
-        "XIAO ESP32-S3",
+        "ESP32-S3",
         "Needs Attention",
     ] {
         assert!(screen.contains(name), "{name}:\n{screen}");
@@ -445,7 +445,7 @@ fn a_lost_adapter_keeps_its_page_while_it_may_return() {
 #[test]
 fn disconnect_keeps_the_adapter_until_connect() {
     let mut app = App::two(110, 32);
-    app.click("XIAO ESP32-S3");
+    app.click("ESP32-S3");
     app.click("Disconnect");
     let slot = 2;
     assert!(app.calls().contains(&Call::Close(slot)));
@@ -1248,7 +1248,7 @@ fn add_device_scans_pairs_and_stops_on_close() {
     assert_eq!(app.m.dialog, Some(Dialog::AddDevice));
     app.finish(Ok(Outcome::ScanStarted(vec![p::Transport::Ble])));
     assert_eq!(app.m.dialog, Some(Dialog::AddDevice), "{:?}", app.m.add);
-    let slot = app.slot("00000000000FA001");
+    let slot = app.slot(app.m.add.as_ref().unwrap().adapter.as_deref().unwrap());
     app.edit(slot, |st| {
         st.scanning = Some(vec![p::Transport::Ble]);
         st.candidates = vec![fixture::candidate(9, "Example Pebble")];

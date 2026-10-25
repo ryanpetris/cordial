@@ -1,15 +1,12 @@
 {
-  "name": "xiao_esp32s3",
-  "default_adapter_name": "XIAO ESP32-S3",
+  "name": "esp32s3_8mb",
+  "default_adapter_name": "ESP32-S3",
   "chip": "esp32s3",
   "package": "esp32s3",
   "flash_bytes": 8388608,
   "xosc_hz": 40000000,
   "radio": null,
-  "mcu_led": {
-    "pin": 21,
-    "active_low": true
-  },
+  "mcu_led": null,
   "bluetooth_backend": "esp-nimble",
   "usb_backend": "embassy",
   "storage_backend": "littlefs",

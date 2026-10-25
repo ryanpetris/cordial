@@ -56,6 +56,7 @@ cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_byte
         "ESP_CONSOLE_NONE": True, "ESP_CONSOLE_SECONDARY_NONE": True,
         "USJ_ENABLE_USB_SERIAL_JTAG": True, "LOG_DEFAULT_LEVEL_NONE": True,
         "BOOTLOADER_LOG_LEVEL_NONE": True,
+        "SPIRAM": False,
         # The partition table has no NVS partition. Calibrate the PHY fully at
         # every boot rather than loading and storing calibration data in NVS.
         "ESP_PHY_CALIBRATION_AND_DATA_STORAGE": False,

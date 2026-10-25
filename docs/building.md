@@ -7,7 +7,7 @@
 | `pico_w` | Classic HID and BLE through BTstack | No |
 | `pico2_w` | Classic HID and BLE through BTstack | Yes |
 | `waveshare_rp2350b_plus_w` | Classic HID and BLE through BTstack | Yes |
-| `xiao_esp32s3` | BLE through ESP-NimBLE or BTstack | Yes |
+| `esp32s3_8mb` | BLE through ESP-NimBLE or BTstack | Yes |
 
 Board definitions live in `rust/boards/`. They specify pins, flash allocation, clock settings,
 backends and `profile_memory_budget`: the bytes of RAM for loaded [input
@@ -18,7 +18,20 @@ Pico W preset leaves profiles out to keep its limited RAM for connections. The o
 Bluetooth pool sizes derive from the same `CORDIAL_CONFIG` for Rust and C. See
 [Bluetooth capacity](protocol/limits-and-errors.md#bluetooth-capacity) for the independent transport
 allowances and pairing reserve. Pico presets use `pico-sdk-cyw43`; `embassy-cyw43` is also supported.
-The XIAO preset uses `esp-nimble` and `esp-idf`.
+The `esp32s3_8mb` preset uses `esp-nimble` and `esp-idf`.
+
+`esp32s3_8mb` targets ESP32-S3 boards with 8 MiB flash and native USB connected to the host.
+It reserves 2 MiB for firmware and budgets 40 KiB of internal RAM for loaded profiles.
+PSRAM is disabled, so boards without it can use the same image. `mcu_led` is `null`; the image
+does not configure a status LED or support onboard displays or application buttons. In particular,
+the [Atom S3 pin map](https://docs.m5stack.com/en/core/AtomS3#pinmap) assigns GPIO21 to LCD MOSI.
+
+The [Seeed Studio XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/),
+[M5Stack Atom S3](https://docs.m5stack.com/en/core/AtomS3) and
+[Atom S3U](https://docs.m5stack.com/en/core/AtomS3U) are expected compatible boards. Hardware
+validation of this image is pending. The preset does not cover every ESP32-S3 variant;
+flash capacity and native USB wiring must match. See the [flashing steps](../README.md#2-flash-the-adapter)
+for each board's download mode.
 
 To use custom wiring or another backend, copy a preset, edit it and pass its path
 to `python3 rust/tools/build_firmware.py`. USB and Bluetooth identities are
@@ -167,7 +180,7 @@ adapter. Changes in Settings last until the server stops.
 
 ```sh
 make firmware BOARD=pico_w
-make firmware BOARD=xiao_esp32s3 PROFILE=production
+make firmware BOARD=esp32s3_8mb PROFILE=production
 make firmware-all
 ```
 
@@ -227,8 +240,10 @@ Firmware updates within one storage format, named by the layout identity in the
 [storage format](storage-format.md), preserve saved bonds, identities and
 preferences. Firmware never opens or reformats storage of another format, such
 as the `littlefs-json-1` storage of release 0.6.3 and earlier, so the adapter
-never becomes ready. Erase the board's whole flash before flashing it: on Pico boards
-in BOOTSEL mode with `picotool erase` (picotool 2.0 or later), then copy the
+never becomes ready. A first installation also requires blank storage; data from
+factory or other firmware prevents provisioning. For a first installation or an
+update from another storage format, erase the board's whole flash before flashing
+it: on Pico boards in BOOTSEL mode with `picotool erase` (picotool 2.0 or later), then copy the
 UF2; on the ESP32-S3 with `esptool --chip esp32s3 erase_flash` before
 `write_flash`. The adapter then starts with a new Bluetooth identity and no
 saved devices, so pair each device again, removing the adapter from the device
@@ -364,7 +379,7 @@ Clippy for the firmware platform crates runs in the firmware images, for one boa
 profile or for all of them:
 
 ```sh
-make check-firmware BOARD=xiao_esp32s3 PROFILE=production
+make check-firmware BOARD=esp32s3_8mb PROFILE=production
 make check-firmware-all
 ```
 

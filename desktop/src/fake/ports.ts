@@ -27,7 +27,7 @@ export function simulatedPorts(count: number) {
       // The ESP32-S3 has no Bluetooth Classic, and has its own sample devices.
       new FakeAdapter(
         i
-          ? { adapterId: `00000000000FA0${String(i + 1).padStart(2, "0")}`, board: "xiao_esp32s3", transports: ["ble"], devices: demoDevicesBle(), candidates: demoCandidatesBle(), latency: 5 }
+          ? { adapterId: `00000000000FA0${String(i + 1).padStart(2, "0")}`, board: "esp32s3_8mb", transports: ["ble"], devices: demoDevicesBle(), candidates: demoCandidatesBle(), latency: 5 }
           : { adapterId: "00000000000FA001", board: "pico2_w", transports: ["classic", "ble"], devices: devicesWithLayers(), profiles: demoProfiles(), latency: 5 },
       ),
     );

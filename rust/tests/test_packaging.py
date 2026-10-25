@@ -108,7 +108,7 @@ class EspBuild(unittest.TestCase):
             self.assertEqual(diagnostics.read(), "Cargo diagnostic\n")
 
     def test_only_esp_builds_discover_sdk_and_pass_it_to_packaging(self):
-        for board in ("pico2_w", "xiao_esp32s3"):
+        for board in ("pico2_w", "esp32s3_8mb"):
             for clippy in (False, True):
                 with self.subTest(board=board, clippy=clippy), tempfile.TemporaryDirectory() as temp, \
                         patch.object(build, "ROOT", Path(temp, "rust")), \
@@ -123,13 +123,15 @@ class EspBuild(unittest.TestCase):
                                    IDF_PYTHON_ENV_PATH=temp, LIBCLANG_PATH=temp):
                     build.build(build.firmware_config.ROOT / "boards" / f"{board}.json",
                                 "production", temp, clippy=clippy)
-                    discover = board == "xiao_esp32s3" and not clippy
+                    discover = board == "esp32s3_8mb" and not clippy
                     self.assertEqual(esp.called, discover)
                     self.assertEqual(command.called, not discover)
                     if clippy:
                         package.assert_not_called()
                     else:
                         self.assertEqual(package.call_args.args[1], esp.return_value if discover else None)
+                        backend = "esp-nimble-esp-idf" if discover else "btstack-pico-sdk-cyw43"
+                        self.assertEqual(package.call_args.args[4], f"{board}-{backend}")
 
 
 class Packaging(unittest.TestCase):
