@@ -28,6 +28,7 @@ pub struct Store {
     pub available: Option<usize>,
     pub fail_count: bool,
     pub capacity: Option<usize>,
+    pub total_bytes: Option<usize>,
     /// Allocation unit for records counted against `capacity`.
     pub block: Option<usize>,
     /// Record reads so far.
@@ -47,6 +48,9 @@ pub struct Store {
     pub on_save: Option<fn()>,
 }
 impl RecordStore for Store {
+    async fn total_bytes(&mut self) -> Result<usize, storage::Error> {
+        self.total_bytes.ok_or(storage::Error::Unavailable)
+    }
     async fn generation(&mut self) -> Result<u64, storage::Error> {
         Ok(self.generation)
     }

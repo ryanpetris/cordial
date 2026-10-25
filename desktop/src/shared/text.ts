@@ -356,10 +356,22 @@ export function memoryPercent(s: AdapterStatus | null): number | null {
 }
 
 /** A resource's usage in a few words: "3 of 7", or what is known of it. */
-export function capacityText(r: Resource): string {
-  if (r.count !== null && r.limit !== null) return `${r.count} of ${r.limit}`;
-  if (r.count !== null) return String(r.count);
-  return r.limit !== null ? `Up to ${r.limit}` : "Unknown";
+export function capacityText(r: Resource, unit: (n: number) => string = String): string {
+  if (r.count !== null && r.limit !== null) return `${unit(r.count)} of ${unit(r.limit)}`;
+  if (r.count !== null) return unit(r.count);
+  return r.limit !== null ? `Up to ${unit(r.limit)}` : "Unknown";
+}
+
+/** A byte count for people: exact below 1 KiB. */
+export function bytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  return n < 1048576 ? `${(n / 1024).toFixed(1)} KiB` : `${(n / 1048576).toFixed(1)} MiB`;
+}
+
+/** The adapter's storage usage in bytes; null while neither value is known. */
+export function storageText(s: AdapterStatus): string | null {
+  const r = s.resources.find((r) => r.type === "storage");
+  return r && (r.count !== null || r.limit !== null) ? capacityText(r, bytes) : null;
 }
 
 /** Status labels for the adapter's USB capacity errors, in the order shown. */

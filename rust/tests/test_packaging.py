@@ -73,7 +73,7 @@ class EspBuild(unittest.TestCase):
                         patch.object(build.artifact, "inspect", return_value={}), \
                         patch.object(build.artifact, "manifest", return_value={}):
                     build.package({"chip": "esp32s3", "bluetooth_backend": "esp-nimble",
-                                   "flash_bytes": 8 * 1048576,
+                                   "minimum_flash_bytes": 8 * 1048576,
                                    "storage_offset": 0x200000}, sdk, elf, output, "board",
                                   Path("gcc"), {"IDF_PYTHON_ENV_PATH": str(root)})
                 self.assertEqual(header.call_args_list[0].args, (b"current bootloader", settings, (0, 99)))
@@ -108,7 +108,7 @@ class EspBuild(unittest.TestCase):
             self.assertEqual(diagnostics.read(), "Cargo diagnostic\n")
 
     def test_only_esp_builds_discover_sdk_and_pass_it_to_packaging(self):
-        for board in ("pico2_w", "esp32s3_8mb"):
+        for board in ("pico2_w", "esp32s3"):
             for clippy in (False, True):
                 with self.subTest(board=board, clippy=clippy), tempfile.TemporaryDirectory() as temp, \
                         patch.object(build, "ROOT", Path(temp, "rust")), \
@@ -123,7 +123,7 @@ class EspBuild(unittest.TestCase):
                                    IDF_PYTHON_ENV_PATH=temp, LIBCLANG_PATH=temp):
                     build.build(build.firmware_config.ROOT / "boards" / f"{board}.json",
                                 "production", temp, clippy=clippy)
-                    discover = board == "esp32s3_8mb" and not clippy
+                    discover = board == "esp32s3" and not clippy
                     self.assertEqual(esp.called, discover)
                     self.assertEqual(command.called, not discover)
                     if clippy:
@@ -163,10 +163,9 @@ class Packaging(unittest.TestCase):
                              hashlib.sha256(b"new").hexdigest() + "  new.bin\n")
 
     def test_esp_rejects_wrong_images_and_partitions(self):
-        config = {"storage_offset": 0x7e0000, "storage_bytes": 0x20000}
+        config = {"storage_offset": 0x200000}
         entries = [(1, 1, 0xf000, 0x1000, b"phy_init"),
-                   (0, 0, 0x10000, 0x7d0000, b"factory"), (1, 0x40, 0x7e0000, 0x1000, b"cordial_layout"),
-                   (1, 0x83, 0x7e1000, 0x1f000, b"cordial_app")]
+                   (0, 0, 0x10000, 0x1f0000, b"factory")]
         def table(rows):
             data = b"".join(struct.pack("<HBBII16sI", 0x50aa, *row, 0) for row in rows)
             data += b"\xeb\xeb" + b"\xff" * 14 + hashlib.md5(data).digest()

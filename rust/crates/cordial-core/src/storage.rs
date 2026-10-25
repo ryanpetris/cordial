@@ -119,7 +119,11 @@ pub trait RecordStore {
         f(&bytes);
         Ok(true)
     }
-    /// Conservative remaining payload budget after backend reclamation reserves.
+    /// Total bytes in the mounted filesystem, when the backend can measure them.
+    async fn total_bytes(&mut self) -> Result<usize, Error> {
+        Err(Error::Unavailable)
+    }
+    /// Best-effort free filesystem allocation bytes, before application admission reserves.
     async fn available(&mut self) -> Result<usize, Error>;
     async fn load(&mut self, key: RecordKey, value: &mut [u8]) -> Result<Option<usize>, Error>;
     async fn save(&mut self, key: RecordKey, value: &[u8]) -> Result<(), Error>;
@@ -201,6 +205,9 @@ impl<S: RecordStore> RecordStore for Result<S, Error> {
     }
     async fn available(&mut self) -> Result<usize, Error> {
         self.as_mut().map_err(|e| *e)?.available().await
+    }
+    async fn total_bytes(&mut self) -> Result<usize, Error> {
+        self.as_mut().map_err(|e| *e)?.total_bytes().await
     }
 
     async fn load_owned(&mut self, key: RecordKey) -> Result<Option<Vec<u8>>, Error> {
@@ -498,4 +505,35 @@ pub async fn open<S: RecordStore>(store: &mut S) -> Result<(), Error> {
     } else {
         Err(Error::Layout)
     }
+}
+
+/// Validates the epoch and essential roots before startup reads saved configuration.
+/// An unfinished first initialization may resume only without saved devices or profiles.
+pub async fn validate_roots<S: RecordStore>(store: &mut S) -> Result<(), Error> {
+    let header = format(store).await?;
+    let identity = crate::identity::Identity::load(store).await?;
+    let sequence = store.load_owned(SEQUENCE).await?;
+    if let Some(bytes) = &sequence {
+        let value: saved::Sequence = decode(bytes)?;
+        if value.next_device == 0 || value.next_profile == 0 {
+            return Err(Error::Corrupt);
+        }
+    }
+    if header.initialized {
+        if identity.is_none() || sequence.is_none() {
+            return Err(Error::Corrupt);
+        }
+    } else {
+        if identity.is_none() && sequence.is_some() {
+            return Err(Error::Corrupt);
+        }
+        let mut previous = None;
+        while let Some(key) = store.next_key(previous).await? {
+            if matches!(key[0], 2 | 8) {
+                return Err(Error::Corrupt);
+            }
+            previous = Some(key);
+        }
+    }
+    Ok(())
 }

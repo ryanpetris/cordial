@@ -21,3 +21,6 @@ void cordial_esp_bootloader(void) __attribute__((noreturn));
 esp_err_t cordial_esp_controller_start(void (*sent)(void), int (*received)(uint8_t *, uint16_t));
 esp_err_t cordial_esp_controller_send(const uint8_t *data, uint16_t length);
 #endif
+
+esp_err_t cordial_esp_storage_capacity(uint32_t minimum, uint32_t *capacity,
+                                     uint32_t *addressable);

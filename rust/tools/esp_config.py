@@ -16,19 +16,21 @@ def normalize(config, profile):
     backend = config["bluetooth_backend"]
     if backend not in BACKENDS or config["usb_backend"] != "embassy" or config["storage_backend"] != "littlefs":
         raise ValueError("ESP32-S3 requires a selected Bluetooth host, embassy USB and LittleFS")
-    flash = integer(config["flash_bytes"], 2097152, 16777216, "flash_bytes")
+    flash = integer(config["minimum_flash_bytes"], 4194304, 134217728, "minimum_flash_bytes")
     if flash & (flash - 1):
         raise ValueError("ESP32-S3 flash capacity must be a power of two")
-    offset = integer(config["firmware_bytes"], 2097152, flash - 131072, "firmware_bytes", 65536)
+    if flash < 4194304 or config["firmware_bytes"] != 2097152:
+        raise ValueError("ESP32-S3 requires at least 4 MiB and a 2 MiB firmware reservation")
+    offset = 2097152
     storage = flash - offset
     led = indicator(config["mcu_led"], 48, "mcu_led")
     if led is not None:
         if led in (19, 20, *range(22, 38)):
             raise ValueError("LED pin is absent, reserved for flash, or used by native USB")
-    physical = {k: config[k] for k in ("chip", "package", "flash_bytes", "xosc_hz", "mcu_led")}
+    physical = {k: config[k] for k in ("chip", "package", "xosc_hz", "mcu_led")}
     digest = hashlib.sha256(json.dumps(physical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     layout = {"format": "littlefs-2", "storage_backend": "littlefs",
-              "offset": flash - storage, "bytes": storage, "erase_bytes": 4096,
+              "erase_bytes": 4096,
               "guard_bytes": 4096}
     marker = hashlib.sha256(json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()).digest()
     return config | {"profile": profile, "target": "xtensa-esp32s3-espidf",
@@ -45,8 +47,6 @@ def generate(config, out):
     write_text_if_changed(partitions, f"""# Name,Type,SubType,Offset,Size
 phy_init,data,phy,0xf000,0x1000
 factory,app,factory,0x10000,{config['storage_offset'] - 0x10000:#x}
-cordial_layout,data,0x40,{config['storage_offset']:#x},0x1000
-cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_bytes'] - 4096:#x}
 """)
     _, ble_connections = limits(config)
     values = {
@@ -61,7 +61,7 @@ cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_byte
         # every boot rather than loading and storing calibration data in NVS.
         "ESP_PHY_CALIBRATION_AND_DATA_STORAGE": False,
         "FREERTOS_HZ": 1000, "ESP_MAIN_TASK_STACK_SIZE": 65536,
-        f"ESPTOOLPY_FLASHSIZE_{config['flash_bytes'] // 1048576}MB": True,
+        f"ESPTOOLPY_FLASHSIZE_{config['minimum_flash_bytes'] // 1048576}MB": True,
         "PARTITION_TABLE_CUSTOM": True, "PARTITION_TABLE_CUSTOM_FILENAME": str(partitions.resolve()),
     }
     values.update({choice: backend == config["bluetooth_backend"] for backend, choice in BACKENDS.items()})
@@ -94,7 +94,7 @@ cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_byte
 pub const HARDWARE: &str = {json.dumps(config['name'])};
 pub const PROFILE_MEMORY_BUDGET: Option<u32> = {profile_memory_budget(config)};
 pub const STORAGE_START: u32 = {config['storage_offset']};
-pub const STORAGE_END: u32 = {config['flash_bytes']};
+pub const MINIMUM_FLASH_BYTES: u32 = {config['minimum_flash_bytes']};
 pub const STORAGE_IDENTITY: [u8; 32] = {list(config['storage_identity'])!r};
 pub const MCU_LED: Option<(u8, bool)> = {('Some((' + str(config['mcu_led']['pin']) + ', ' + str(config['mcu_led']['active_low']).lower() + '))') if config['mcu_led'] else 'None'};
 """)

@@ -98,8 +98,8 @@ fn main() {
         if env::var_os("CARGO_FEATURE_RP2040").is_none() {
             println!("cargo:rustc-link-arg=--wrap=memcpy");
         }
-        if env::var_os("CARGO_FEATURE_PICO_SDK_CYW43").is_some() {
-            let paths: Vec<_> = paths.lines().collect();
+        {
+            let paths: Vec<_> = paths.lines().take(2).collect();
             let native = root.join("tools/pico_radio.py");
             println!("cargo:rerun-if-changed={}", native.display());
             println!(
@@ -117,8 +117,12 @@ fn main() {
                     .success()
             );
             println!("cargo:rustc-link-search={}", out.join("radio").display());
-            println!("cargo:rustc-link-lib=static=cordial_radio");
-        } else {
+            println!("cargo:rustc-link-lib=static=cordial_flash");
+            if env::var_os("CARGO_FEATURE_PICO_SDK_CYW43").is_some() {
+                println!("cargo:rustc-link-lib=static=cordial_radio");
+            }
+        }
+        if env::var_os("CARGO_FEATURE_EMBASSY_CYW43").is_some() {
             let firmware = PathBuf::from(paths.lines().last().expect("controller firmware path"));
             for (name, file) in [
                 ("CYW43_WIFI", "43439A0.bin"),

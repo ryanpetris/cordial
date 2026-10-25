@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import struct
 import unittest
 from unittest.mock import patch
 
@@ -65,6 +66,31 @@ class EspStartupStack(unittest.TestCase):
 
 
 class Artifact(unittest.TestCase):
+    def test_image_limits_include_sector_erase_and_e10_reservation(self):
+        for board, limit in (("pico_w", 0x100000), ("pico2_w", 0x1ff000),
+                             ("waveshare_rp2350b_plus_w", 0x1ff000)):
+            config = firmware_config.load(ROOT / "boards" / (board + ".json"), "development")
+            value = artifact.manifest(config)
+            payload = artifact.MAGIC + json.dumps(value).encode() + b"\0"
+            self.assertEqual(artifact.image_capacity(value), limit)
+            for size in (limit - 255, limit):
+                image = payload.ljust(size, b"\xff")
+                data = artifact.uf2(image)
+                self.assertEqual(inspect_uf2(data), value)
+                if value["chip"] == "rp2350":
+                    self.assertEqual(struct.unpack_from("<I", data, 12)[0], 0x101fff00)
+                    # The application's last page stops before the marker's erase sector.
+                    self.assertEqual(struct.unpack_from("<I", data, len(data) - 512 + 12)[0],
+                                     0x101fef00)
+            with self.assertRaisesRegex(ValueError, "overlaps"):
+                artifact.uf2(payload.ljust(limit + 1, b"\xff"))
+
+    def test_fixed_geometry_artifact_schema_is_rejected(self):
+        value = artifact.manifest(firmware_config.load(ROOT / "boards/pico_w.json", "debug"))
+        value["schema"] = 1
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            artifact.inspect(artifact.MAGIC + json.dumps(value).encode() + b"\0")
+
     def test_pico_presets_pack_every_profile_and_preserve_reserved_bounds(self):
         for board in ('pico_w', 'pico2_w', 'waveshare_rp2350b_plus_w'):
             for profile in artifact.PROFILES:
@@ -76,13 +102,13 @@ class Artifact(unittest.TestCase):
                     artifact.uf2(image + b'\0' * config['storage_offset'])
 
     def test_backend_identity_and_bootloader_capability_are_checked(self):
-        config = firmware_config.load(ROOT / 'boards/esp32s3_8mb.json', 'development')
+        config = firmware_config.load(ROOT / 'boards/esp32s3.json', 'development')
         expected = artifact.manifest(config)
         def blob(value):
             return artifact.MAGIC + json.dumps(value).encode() + b'\0'
         self.assertEqual(artifact.inspect(blob(expected)), expected)
         for changes in ({'bootloader': 'bootsel'},
-                        {'storage_bytes': 4096}, {'storage_identity': '0' * 64},
+                        {'firmware_bytes': 4096}, {'storage_identity': '0' * 64},
                         {'profile': 'production'}, {'unused': True}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 artifact.inspect(blob(expected | changes))

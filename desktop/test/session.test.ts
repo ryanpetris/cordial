@@ -19,7 +19,8 @@ describe("AdapterSession", () => {
       { transport: "ble", enabled: true, resources: [usage("devices", 2, 7), usage("connections", 2, 7)] },
     ]);
     expect(session.status.errors).toEqual([]);
-    expect(session.status.resources).toEqual([usage("interfaces", 11, 16)]);
+    expect(session.status.resources).toEqual([usage("interfaces", 11, 16), usage("storage", 24576, 524288)]);
+    expect(session.status.information.storageFormat).toBe(1);
     // Limit-only entries keep their count unknown.
     expect(session.status.profileSupport).toEqual({ resources: [usage("memory", 0, 4096), usage("outputs", null, 8), usage("layers", null, 4)] });
     expect(session.status.interfaces).toEqual([
@@ -321,6 +322,15 @@ describe("AdapterSession", () => {
     fake.changeAdapter({ ready: true });
     await until(() => fake.received.filter((r) => r.command.case === "listDevices").length === 2);
     expect(session.status.ready).toBe(true);
+    await session.close();
+  });
+
+  it("follows storage usage the adapter reports in its events", async () => {
+    const { fake, session } = await openSession();
+    await until(() => session.listed);
+    fake.changeAdapter({ storageUsed: 0, storageTotal: null });
+    await until(() => session.status.resources.some((r) => r.type === "storage" && r.count === 0));
+    expect(session.status.resources.find((r) => r.type === "storage")).toEqual({ type: "storage", count: 0, limit: null });
     await session.close();
   });
 

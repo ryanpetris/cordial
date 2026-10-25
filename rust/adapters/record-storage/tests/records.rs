@@ -3,7 +3,7 @@ use embassy_futures::block_on;
 use embedded_storage_async::nor_flash::{
     ErrorType, MultiwriteNorFlash, NorFlash, NorFlashErrorKind, ReadNorFlash,
 };
-type Storage = cordial_record_storage::Storage<Flash, 30>;
+type Storage = cordial_record_storage::Storage<Flash>;
 use std::{cell::RefCell, rc::Rc};
 
 #[derive(Clone)]
@@ -66,28 +66,23 @@ impl NorFlash for Flash {
 impl MultiwriteNorFlash for Flash {}
 
 #[test]
-fn unknown_or_partly_used_partitions_are_never_provisioned_or_changed() {
+fn nonblank_and_stale_markers_recover_only_the_owned_filesystem() {
     block_on(async {
-        let flash = Flash::blank();
-        let range = 4096..128 * 1024;
-        assert!(matches!(
-            Storage::open(flash.clone(), range.clone(), [1; 32]).await,
-            Err(Error::Unprovisioned)
-        ));
-        flash.0.borrow_mut()[128 * 1024 - 1] = 0;
-        let before = flash.0.borrow().clone();
-        assert!(matches!(
-            Storage::open_or_provision_blank(flash.clone(), range.clone(), [1; 32]).await,
-            Err(Error::Layout)
-        ));
-        assert_eq!(*flash.0.borrow(), before);
-        flash.0.borrow_mut()[4096] = 7;
-        let before = flash.0.borrow().clone();
-        assert!(matches!(
-            Storage::open_or_provision_blank(flash.clone(), range, [1; 32]).await,
-            Err(Error::Layout)
-        ));
-        assert_eq!(*flash.0.borrow(), before);
+        for offset in [4096, 4196, 8192, 128 * 1024 - 1] {
+            let flash = Flash::sized(132 * 1024);
+            flash.0.borrow_mut()[..4096].fill(0x42);
+            flash.0.borrow_mut()[128 * 1024..].fill(0x24);
+            flash.0.borrow_mut()[offset] = 0;
+            let mut fs = Storage::open_or_recover(flash.clone(), 4096..128 * 1024, [1; 32])
+                .await
+                .unwrap();
+            assert_eq!(
+                cordial_core::storage::format(&mut fs).await.unwrap().format,
+                1
+            );
+            assert!(flash.0.borrow()[..4096].iter().all(|v| *v == 0x42));
+            assert!(flash.0.borrow()[128 * 1024..].iter().all(|v| *v == 0x24));
+        }
     });
 }
 #[test]
@@ -289,7 +284,7 @@ fn interrupted_replacement(old: Vec<u8>, new: Vec<u8>) {
                 cut: false,
             };
             let mut fs =
-                cordial_record_storage::Storage::<_, 30>::open(driver, 4096..128 * 1024, [1; 32])
+                cordial_record_storage::Storage::<_>::open(driver, 4096..128 * 1024, [1; 32])
                     .await
                     .unwrap();
             let result = fs.replace_file("/device.pb", &new);
@@ -332,13 +327,13 @@ fn interrupted_creations_leave_no_record_or_the_complete_record() {
                     cut: false,
                 };
                 let mut fs =
-                    cordial_record_storage::Storage::<_, 30>::open(driver, range.clone(), [1; 32])
+                    cordial_record_storage::Storage::<_>::open(driver, range.clone(), [1; 32])
                         .await
                         .unwrap();
                 let result = fs.save(record_key(2, 2), &new).await;
                 drop(fs);
                 // Inspect the flash as the interruption left it; this mount cannot clean up.
-                let mut left = cordial_record_storage::Storage::<_, 30>::open(
+                let mut left = cordial_record_storage::Storage::<_>::open(
                     RejectedWrites(flash.clone()),
                     range.clone(),
                     [1; 32],
@@ -437,12 +432,11 @@ fn a_failed_creation_reclaims_its_empty_file_and_directory() {
                 mutations: 0,
                 fail_at,
             };
-            let mut fs =
-                cordial_record_storage::Storage::<_, 30>::open(driver, range.clone(), [1; 32])
-                    .await
-                    .unwrap();
+            let mut fs = cordial_record_storage::Storage::<_>::open(driver, range.clone(), [1; 32])
+                .await
+                .unwrap();
             let result = fs.save(record_key(2, 2), &new).await;
-            let mut left = cordial_record_storage::Storage::<_, 30>::open(
+            let mut left = cordial_record_storage::Storage::<_>::open(
                 RejectedWrites(flash.clone()),
                 range.clone(),
                 [1; 32],
@@ -500,48 +494,48 @@ fn an_empty_record_file_holds_no_record() {
     });
 }
 #[test]
-fn matching_guard_with_broken_filesystem_is_never_reformatted() {
+fn matching_guard_with_broken_filesystem_is_reformatted() {
     block_on(async {
         let flash = Flash::blank();
         flash.0.borrow_mut()[4096..4128].fill(1);
-        let before = flash.0.borrow().clone();
-        assert!(
-            Storage::open_or_provision_blank(flash.clone(), 4096..128 * 1024, [1; 32])
+        let mut store = Storage::open_or_recover(flash, 4096..128 * 1024, [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(
+            cordial_core::storage::format(&mut store)
                 .await
-                .is_err()
+                .unwrap()
+                .format,
+            1
         );
-        assert_eq!(*flash.0.borrow(), before);
     });
 }
 
 #[test]
-fn interrupted_provisioning_never_reformats_a_claimed_partition() {
+fn interrupted_startup_recovers_with_a_bounded_retry() {
     block_on(async {
         let mut completed = false;
-        for cut in 0..40 {
+        for cut in 0..80 {
             let flash = Flash::blank();
             let driver = CutFlash {
                 flash: flash.clone(),
                 remaining: cut,
                 cut: false,
             };
-            let result = cordial_record_storage::Storage::<_, 30>::provision_blank(
-                driver,
-                4096..128 * 1024,
-                [1; 32],
-            )
-            .await;
-            let claimed = flash.0.borrow()[4096..128 * 1024]
-                .iter()
-                .any(|b| *b != 0xff);
-            let before = flash.0.borrow().clone();
-            let reopened =
-                Storage::open_or_provision_blank(flash.clone(), 4096..128 * 1024, [1; 32]).await;
-            if claimed {
-                assert_eq!(*flash.0.borrow(), before, "cut {cut}");
-            }
+            let result =
+                cordial_record_storage::Storage::open_or_recover(driver, 4096..128 * 1024, [1; 32])
+                    .await;
+            let mut reopened = Storage::open_or_recover(flash, 4096..128 * 1024, [1; 32])
+                .await
+                .unwrap();
+            assert_eq!(
+                cordial_core::storage::format(&mut reopened)
+                    .await
+                    .unwrap()
+                    .format,
+                1
+            );
             if result.is_ok() {
-                assert!(reopened.is_ok());
                 completed = true;
                 break;
             }
@@ -571,7 +565,7 @@ fn interrupted_device_deletion_never_restores_a_committed_device() {
                 cut: false,
             };
             let mut fs =
-                cordial_record_storage::Storage::<_, 30>::open(driver, 4096..128 * 1024, [1; 32])
+                cordial_record_storage::Storage::<_>::open(driver, 4096..128 * 1024, [1; 32])
                     .await
                     .unwrap();
             let result = fs.remove_file(device);
@@ -764,7 +758,7 @@ fn record_ids_page_record_directories_in_ascending_numeric_order() {
     use cordial_core::storage::{Error, RecordStore, record_key};
     block_on(async {
         // Every directory takes a metadata pair, more than the small test filesystem holds.
-        let mut store = cordial_record_storage::Storage::<_, 126>::provision_blank(
+        let mut store = cordial_record_storage::Storage::<_>::provision_blank(
             Flash::sized(512 * 1024),
             4096..512 * 1024,
             [1; 32],
@@ -873,7 +867,7 @@ fn operations_reuse_the_mount_and_remount_after_a_failure() {
     block_on(async {
         let flash = Flash::sized(512 * 1024);
         let range = 4096..512 * 1024;
-        let mut store = cordial_record_storage::Storage::<_, 126>::provision_blank(
+        let mut store = cordial_record_storage::Storage::<_>::provision_blank(
             flash.clone(),
             range.clone(),
             [1; 32],
@@ -893,10 +887,10 @@ fn operations_reuse_the_mount_and_remount_after_a_failure() {
             fail: fail.clone(),
             fail_writes: fail_writes.clone(),
         };
-        let mut store = cordial_record_storage::Storage::<_, 126>::open(driver, range, [1; 32])
+        let mut store = cordial_record_storage::Storage::<_>::open(driver, range, [1; 32])
             .await
             .unwrap();
-        let load = async |store: &mut cordial_record_storage::Storage<ProbeFlash, 126>| {
+        let load = async |store: &mut cordial_record_storage::Storage<ProbeFlash>| {
             reads.set(0);
             let mut bytes = [0; 16];
             let result = store.load(record_key(8, 20), &mut bytes).await;
@@ -971,9 +965,12 @@ fn free_space_follows_writes_and_loads_check_the_buffer() {
             .unwrap();
         assert_eq!(
             store.load(record_key(8, 2), &mut bytes).await,
-            Err(Error::Io)
+            Err(Error::Corrupt)
         );
-        assert_eq!(store.load_owned(record_key(8, 2)).await, Err(Error::Io));
+        assert_eq!(
+            store.load_owned(record_key(8, 2)).await,
+            Err(Error::Corrupt)
+        );
     });
 }
 
@@ -1035,7 +1032,7 @@ fn mounting_opens_storage_when_cleanup_cannot_remove_files() {
             .unwrap();
         drop(store);
         let baseline = flash.0.borrow().clone();
-        let mut store = cordial_record_storage::Storage::<_, 30>::open(
+        let mut store = cordial_record_storage::Storage::<_>::open(
             RejectedWrites(flash.clone()),
             range.clone(),
             [1; 32],
@@ -1058,13 +1055,13 @@ fn mounting_opens_storage_when_cleanup_cannot_remove_files() {
 }
 
 #[test]
-fn startup_provisions_a_blank_store_and_refuses_another_layout() {
+fn startup_preserves_valid_roots_and_recovers_a_mismatched_epoch() {
     use cordial_core::identity::Identity;
     use prost::Message;
     block_on(async {
         let flash = Flash::blank();
         let range = 4096..128 * 1024;
-        let mut store = Storage::open_or_provision_blank(flash.clone(), range.clone(), [1; 32])
+        let mut store = Storage::open_or_recover(flash.clone(), range.clone(), [1; 32])
             .await
             .unwrap();
         let identity = Identity::initialize(&mut store, [1, 2, 3, 4, 5, 6], || 9)
@@ -1087,10 +1084,9 @@ fn startup_provisions_a_blank_store_and_refuses_another_layout() {
                 next_profile: 1
             }
         );
-        let mut store =
-            Storage::open_or_provision_blank(store.into_flash(), range.clone(), [1; 32])
-                .await
-                .unwrap();
+        let mut store = Storage::open_or_recover(store.into_flash(), range.clone(), [1; 32])
+            .await
+            .unwrap();
         assert_eq!(
             Identity::initialize(&mut store, [1, 2, 3, 4, 5, 6], || 10).await,
             Ok(identity)
@@ -1101,27 +1097,22 @@ fn startup_provisions_a_blank_store_and_refuses_another_layout() {
             Err(Error::Layout)
         );
         drop(store);
-        // Storage of another layout identity, such as an earlier format's, is refused and left
-        // untouched.
-        let before = flash.0.borrow().clone();
-        assert!(matches!(
-            Storage::open_or_provision_blank(flash.clone(), range.clone(), [2; 32]).await,
-            Err(Error::Layout)
-        ));
-        assert_eq!(*flash.0.borrow(), before);
-        // So is a root record of another format under this layout's guard.
-        let mut store = Storage::open(flash.clone(), range.clone(), [1; 32])
+        let mut store = Storage::open_or_recover(flash.clone(), range.clone(), [2; 32])
             .await
             .unwrap();
-        store
-            .replace_file("/format.pb", br#"{"format":1,"initialized":true}"#)
+        assert!(Identity::load(&mut store).await.unwrap().is_some());
+        store.replace_file("/format.pb", &[8, 2, 16, 1]).unwrap();
+        drop(store);
+        let mut store = Storage::open_or_recover(flash, range, [2; 32])
+            .await
             .unwrap();
-        let before = flash.0.borrow().clone();
-        assert_eq!(
-            Identity::initialize(&mut store, [1, 2, 3, 4, 5, 6], || 10).await,
-            Err(Error::Layout)
+        assert!(Identity::load(&mut store).await.unwrap().is_none());
+        assert!(
+            !cordial_core::storage::format(&mut store)
+                .await
+                .unwrap()
+                .initialized
         );
-        assert_eq!(*flash.0.borrow(), before);
     });
 }
 
@@ -1180,7 +1171,7 @@ fn a_record_whose_old_contents_cannot_be_read_is_written_over() {
             .map(|(index, _)| index)
             .collect();
         assert!(!blocks.is_empty());
-        let mut store = cordial_record_storage::Storage::<_, 30>::open(
+        let mut store = cordial_record_storage::Storage::<_>::open(
             UnreadableOnce {
                 flash: flash.clone(),
                 blocks,
@@ -1218,7 +1209,7 @@ fn a_failed_write_over_unreadable_contents_is_a_definite_failure() {
             .filter(|(_, block)| block.windows(512).any(|w| w.iter().all(|b| *b == 0x5a)))
             .map(|(index, _)| index)
             .collect();
-        let mut store = cordial_record_storage::Storage::<_, 30>::open(
+        let mut store = cordial_record_storage::Storage::<_>::open(
             UnreadableBlocks {
                 flash: flash.clone(),
                 blocks,
@@ -1332,5 +1323,688 @@ fn device_output_preferences_share_the_existing_record_and_layout() {
         let bytes = store.load_owned(record_key(2, 1)).await.unwrap().unwrap();
         let saved = cordial_protocol::storage::Device::decode(bytes.as_slice()).unwrap();
         assert_eq!(saved.policy.unwrap().output_preferences.len(), 1);
+    });
+}
+
+#[test]
+fn physical_capacity_uses_stable_reservations_and_sector_boundaries() {
+    use cordial_record_storage::flash_range;
+    for mib in [2, 3, 4, 6, 8, 12, 16, 32, 64] {
+        let capacity = mib * 1024 * 1024;
+        let start = if mib < 4 {
+            1024 * 1024
+        } else {
+            2 * 1024 * 1024
+        };
+        assert_eq!(flash_range(capacity), Ok(start..capacity));
+    }
+    for capacity in [0, 1024 * 1024, 4194305, u32::MAX] {
+        assert_eq!(flash_range(capacity), Err(Error::Bounds));
+    }
+}
+
+#[test]
+fn compatible_filesystem_grows_and_preserves_roots_and_records() {
+    use cordial_core::{identity::Identity, storage::RecordStore};
+    block_on(async {
+        let flash = Flash::sized(512 * 1024);
+        let mut fs = Storage::open_or_recover(flash.clone(), 4096..128 * 1024, [1; 32])
+            .await
+            .unwrap();
+        let identity = Identity::initialize(&mut fs, [1; 6], || 7).await.unwrap();
+        fs.replace_file("/saved.bin", &[42; 9000]).unwrap();
+        drop(fs);
+        // A stale or torn guard has no authority over a valid filesystem.
+        flash.0.borrow_mut()[4096..4128].fill(0);
+        let mut fs = Storage::open_or_recover(flash.clone(), 4096..512 * 1024, [2; 32])
+            .await
+            .unwrap();
+        assert_eq!(fs.total_bytes().unwrap(), 126 * 4096);
+        assert_eq!(RecordStore::total_bytes(&mut fs).await.unwrap(), 126 * 4096);
+        assert_eq!(
+            Identity::load(&mut fs).await.unwrap(),
+            Some(identity.clone())
+        );
+        assert_eq!(fs.file_size("/saved.bin").unwrap(), Some(9000));
+        let free = fs.available().await.unwrap();
+        assert!(free < fs.total_bytes().unwrap());
+        drop(fs);
+        let before = flash.0.borrow().clone();
+        let mut fs = Storage::open_or_recover(flash.clone(), 4096..512 * 1024, [2; 32])
+            .await
+            .unwrap();
+        assert_eq!(Identity::load(&mut fs).await.unwrap(), Some(identity));
+        assert_eq!(*flash.0.borrow(), before);
+    });
+}
+
+#[test]
+fn growth_uses_current_geometry_and_leaves_smaller_or_missing_measurements_alone() {
+    use cordial_core::{
+        identity::Identity,
+        storage::{RecordStore, record_key},
+    };
+    block_on(async {
+        let flash = Flash::sized(1024 * 1024);
+        let range = 4096..1024 * 1024;
+        let mut fs = Storage::open_or_recover(flash.clone(), 4096..128 * 1024, [1; 32])
+            .await
+            .unwrap();
+        let identity = Identity::initialize(&mut fs, [1; 6], || 7).await.unwrap();
+        fs.save(record_key(2, 1), &[42; 9000]).await.unwrap();
+        drop(fs);
+        for (step, end) in [
+            Some(512 * 1024),
+            None,
+            Some(128 * 1024),
+            Some(512 * 1024),
+            Some(64 * 1024),
+            Some(1024 * 1024),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let before = flash.0.borrow().clone();
+            let mut fs = Storage::open_with_capacity(flash.clone(), range.clone(), end, [1; 32])
+                .await
+                .unwrap();
+            let expected_end = if end == Some(1024 * 1024) {
+                1024 * 1024
+            } else {
+                512 * 1024
+            };
+            assert_eq!(fs.total_bytes().unwrap(), expected_end - 8192);
+            assert_eq!(
+                Identity::load(&mut fs).await.unwrap(),
+                Some(identity.clone())
+            );
+            assert_eq!(
+                fs.load_owned(record_key(2, 1)).await.unwrap(),
+                Some(vec![42; 9000])
+            );
+            if (1..5).contains(&step) {
+                assert_eq!(*flash.0.borrow(), before);
+            }
+        }
+    });
+}
+
+#[test]
+fn inaccessible_existing_blocks_never_trigger_formatting() {
+    block_on(async {
+        let flash = Flash::sized(512 * 1024);
+        let mut fs = Storage::open_or_recover(flash.clone(), 4096..512 * 1024, [1; 32])
+            .await
+            .unwrap();
+        fs.replace_file("/saved.bin", &[42; 128 * 1024]).unwrap();
+        drop(fs);
+        let before = flash.0.borrow().clone();
+        let result =
+            Storage::open_with_capacity(flash.clone(), 4096..128 * 1024, None, [1; 32]).await;
+        match result {
+            Ok(mut fs) => {
+                // Metadata can fit below the limit even when file data does not.
+                let mut bytes = vec![0; 128 * 1024];
+                assert_eq!(fs.read_file("/saved.bin", 0, &mut bytes), Err(Error::Io));
+            }
+            Err(e) => assert_eq!(e, Error::Io),
+        }
+        assert_eq!(*flash.0.borrow(), before);
+        let mut fs = Storage::open_or_recover(flash, 4096..512 * 1024, [1; 32])
+            .await
+            .unwrap();
+        let mut bytes = vec![0; 128 * 1024];
+        assert_eq!(
+            fs.read_file("/saved.bin", 0, &mut bytes).unwrap(),
+            bytes.len()
+        );
+        assert!(bytes.iter().all(|b| *b == 42));
+    });
+}
+
+#[test]
+fn invalid_epochs_and_essential_roots_reset_the_whole_filesystem() {
+    use cordial_core::identity::Identity;
+    block_on(async {
+        for root in ["/format.pb", "/identity.pb", "/sequence.pb"] {
+            let invalid_value = if root == "/sequence.pb" {
+                &[8, 0, 16, 1]
+            } else {
+                &[8, 2, 16, 1]
+            };
+            for bytes in [
+                None,
+                Some(&b"invalid"[..]),
+                Some(&invalid_value[..]),
+                Some(&[8, 0, 16, 1][..]),
+                Some(&[8, 1][..]),
+            ] {
+                let flash = Flash::blank();
+                let range = 4096..128 * 1024;
+                let mut fs = Storage::open_or_recover(flash.clone(), range.clone(), [1; 32])
+                    .await
+                    .unwrap();
+                Identity::initialize(&mut fs, [1; 6], || 7).await.unwrap();
+                fs.replace_file("/devices/1/device.pb", b"saved bond")
+                    .unwrap();
+                if let Some(bytes) = bytes {
+                    fs.replace_file(root, bytes).unwrap();
+                } else {
+                    fs.remove_file(root).unwrap();
+                }
+                drop(fs);
+                let mut fs = Storage::open_or_recover(flash, range, [1; 32])
+                    .await
+                    .unwrap();
+                assert!(Identity::load(&mut fs).await.unwrap().is_none(), "{root}");
+                assert_eq!(fs.file_size("/devices/1/device.pb").unwrap(), None);
+            }
+        }
+    });
+}
+
+#[test]
+fn startup_io_failure_preserves_the_flash_and_can_be_retried() {
+    use cordial_core::identity::Identity;
+    block_on(async {
+        for initialized in [false, true] {
+            let flash = Flash::blank();
+            let range = 4096..128 * 1024;
+            if initialized {
+                let mut fs = Storage::open_or_recover(flash.clone(), range.clone(), [1; 32])
+                    .await
+                    .unwrap();
+                Identity::initialize(&mut fs, [1; 6], || 7).await.unwrap();
+            }
+            let before = flash.0.borrow().clone();
+            let driver = UnreadableOnce {
+                flash: flash.clone(),
+                blocks: vec![2],
+            };
+            assert!(matches!(
+                cordial_record_storage::Storage::open_or_recover(driver, range.clone(), [1; 32])
+                    .await,
+                Err(Error::Io)
+            ));
+            assert_eq!(*flash.0.borrow(), before);
+            let mut fs = Storage::open_or_recover(flash, range, [1; 32])
+                .await
+                .unwrap();
+            assert_eq!(
+                Identity::load(&mut fs).await.unwrap().is_some(),
+                initialized
+            );
+        }
+    });
+}
+
+#[test]
+fn interrupted_growth_and_guard_repair_preserve_committed_records() {
+    use cordial_core::identity::Identity;
+    block_on(async {
+        let flash = Flash::sized(512 * 1024);
+        let mut fs = Storage::open_or_recover(flash.clone(), 4096..128 * 1024, [1; 32])
+            .await
+            .unwrap();
+        let identity = Identity::initialize(&mut fs, [1; 6], || 7).await.unwrap();
+        fs.replace_file("/saved.bin", &[42; 9000]).unwrap();
+        drop(fs);
+        let baseline = flash.0.borrow().clone();
+        let mut completed = false;
+        for cut in 0..80 {
+            *flash.0.borrow_mut() = baseline.clone();
+            let driver = CutFlash {
+                flash: flash.clone(),
+                remaining: cut,
+                cut: false,
+            };
+            let result =
+                cordial_record_storage::Storage::open_or_recover(driver, 4096..512 * 1024, [2; 32])
+                    .await;
+            let mut fs = Storage::open_or_recover(flash.clone(), 4096..512 * 1024, [2; 32])
+                .await
+                .unwrap();
+            assert_eq!(
+                Identity::load(&mut fs).await.unwrap(),
+                Some(identity.clone()),
+                "cut {cut}"
+            );
+            let mut bytes = [0; 9000];
+            assert_eq!(
+                fs.read_file("/saved.bin", 0, &mut bytes).unwrap(),
+                bytes.len()
+            );
+            assert_eq!(bytes, [42; 9000]);
+            assert_eq!(fs.total_bytes().unwrap(), 126 * 4096);
+            if result.is_ok() {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+    });
+}
+
+#[test]
+fn interrupted_first_identity_initialization_resumes_safely() {
+    use cordial_core::{identity::Identity, storage::validate_roots};
+    block_on(async {
+        let flash = Flash::blank();
+        let range = 4096..128 * 1024;
+        let fs = Storage::open_or_recover(flash.clone(), range.clone(), [1; 32])
+            .await
+            .unwrap();
+        drop(fs);
+        let baseline = flash.0.borrow().clone();
+        let mut completed = false;
+        for cut in 0..80 {
+            *flash.0.borrow_mut() = baseline.clone();
+            let driver = CutFlash {
+                flash: flash.clone(),
+                remaining: cut,
+                cut: false,
+            };
+            let mut fs =
+                cordial_record_storage::Storage::open_or_recover(driver, range.clone(), [1; 32])
+                    .await
+                    .unwrap();
+            let result = Identity::initialize(&mut fs, [1; 6], || 7).await;
+            drop(fs);
+            let mut fs = Storage::open_or_recover(flash.clone(), range.clone(), [1; 32])
+                .await
+                .unwrap();
+            Identity::initialize(&mut fs, [1; 6], || 7).await.unwrap();
+            validate_roots(&mut fs).await.unwrap();
+            if result.is_ok() {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+    });
+}
+
+#[test]
+fn moved_filesystem_start_resets_bonds_within_the_current_owned_range() {
+    use cordial_core::identity::Identity;
+    use cordial_record_storage::flash_range;
+    block_on(async {
+        let flash = Flash::sized(4 * 1024 * 1024);
+        let mut fs = Storage::open_or_recover(flash.clone(), 1024 * 1024..4 * 1024 * 1024, [1; 32])
+            .await
+            .unwrap();
+        Identity::initialize(&mut fs, [1; 6], || 7).await.unwrap();
+        fs.replace_file("/devices/1/device.pb", b"saved bond")
+            .unwrap();
+        drop(fs);
+        let firmware = flash.0.borrow()[..2 * 1024 * 1024].to_vec();
+        let mut fs = Storage::open_or_recover(
+            flash.clone(),
+            flash_range(4 * 1024 * 1024).unwrap(),
+            [1; 32],
+        )
+        .await
+        .unwrap();
+        assert_eq!(Identity::load(&mut fs).await.unwrap(), None);
+        assert_eq!(fs.file_size("/devices/1/device.pb").unwrap(), None);
+        assert_eq!(fs.total_bytes().unwrap(), 2 * 1024 * 1024 - 4096);
+        assert_eq!(&flash.0.borrow()[..2 * 1024 * 1024], firmware);
+    });
+}
+
+#[test]
+fn pico_cold_boot_retains_geometry_records_and_current_reservation() {
+    use cordial_core::identity::Identity;
+    const MIB: u32 = 1024 * 1024;
+    block_on(async {
+        for minimum in [2 * MIB, 4 * MIB] {
+            let flash = Flash::sized(16 * MIB as usize);
+            let mut fs = Storage::open_detected(flash.clone(), minimum, Some(8 * MIB), [1; 32])
+                .await
+                .unwrap();
+            let identity = Identity::initialize(&mut fs, [1; 6], || 7).await.unwrap();
+            fs.replace_file("/saved.bin", &vec![42; 3 * MIB as usize])
+                .unwrap();
+            drop(fs);
+            for measured in [None, Some(MIB), Some(2 * MIB), Some(4 * MIB), Some(8 * MIB)] {
+                let before = flash.0.borrow().clone();
+                let mut fs = Storage::open_detected(flash.clone(), minimum, measured, [1; 32])
+                    .await
+                    .unwrap();
+                assert_eq!(fs.total_bytes().unwrap(), 6 * MIB as usize - 4096);
+                assert_eq!(
+                    Identity::load(&mut fs).await.unwrap(),
+                    Some(identity.clone())
+                );
+                let mut bytes = vec![0; 3 * MIB as usize];
+                assert_eq!(
+                    fs.read_file("/saved.bin", 0, &mut bytes).unwrap(),
+                    bytes.len()
+                );
+                assert!(bytes.iter().all(|b| *b == 42));
+                drop(fs);
+                assert_eq!(*flash.0.borrow(), before);
+            }
+            let mut fs = Storage::open_detected(flash.clone(), minimum, Some(16 * MIB), [1; 32])
+                .await
+                .unwrap();
+            assert_eq!(fs.total_bytes().unwrap(), 14 * MIB as usize - 4096);
+            assert_eq!(Identity::load(&mut fs).await.unwrap(), Some(identity));
+        }
+    });
+}
+
+#[test]
+fn pico_fresh_format_uses_only_the_minimum_region_without_detection() {
+    const MIB: u32 = 1024 * 1024;
+    block_on(async {
+        for minimum in [2 * MIB, 4 * MIB] {
+            let flash = Flash::sized(16 * MIB as usize);
+            flash.0.borrow_mut()[minimum as usize..].fill(0x42);
+            let mut fs = Storage::open_detected(flash.clone(), minimum, None, [1; 32])
+                .await
+                .unwrap();
+            let start = cordial_record_storage::flash_range(minimum).unwrap().start;
+            assert_eq!(fs.total_bytes().unwrap(), (minimum - start) as usize - 4096);
+            assert!(
+                flash.0.borrow()[minimum as usize..]
+                    .iter()
+                    .all(|b| *b == 0x42)
+            );
+        }
+    });
+}
+
+#[test]
+fn pico_root_recovery_preserves_geometry_and_resets_only_once() {
+    use cordial_core::{
+        identity::Identity,
+        storage::{RecordStore, record_key},
+    };
+    const MIB: u32 = 1024 * 1024;
+    block_on(async {
+        for minimum in [2 * MIB, 4 * MIB] {
+            for root in ["/format.pb", "/identity.pb", "/sequence.pb"] {
+                for measured in [None, Some(MIB), Some(2 * MIB)] {
+                    let flash = Flash::sized(16 * MIB as usize);
+                    let mut fs =
+                        Storage::open_detected(flash.clone(), minimum, Some(8 * MIB), [1; 32])
+                            .await
+                            .unwrap();
+                    Identity::initialize(&mut fs, [1; 6], || 7).await.unwrap();
+                    fs.save(record_key(2, 1), &[42; 100]).await.unwrap();
+                    if root == "/format.pb" {
+                        fs.replace_file(root, &[8, 99]).unwrap();
+                    } else {
+                        fs.remove_file(root).unwrap();
+                    }
+                    drop(fs);
+                    let before = flash.0.borrow().clone();
+                    if measured.is_some_and(|end| end < minimum) {
+                        let mutations = Rc::new(std::cell::Cell::new(0));
+                        let result = cordial_record_storage::Storage::open_detected(
+                            WrappingReadFlash {
+                                flash: flash.clone(),
+                                mutations: mutations.clone(),
+                            },
+                            minimum,
+                            measured,
+                            [1; 32],
+                        )
+                        .await;
+                        assert!(matches!(result, Err(Error::Bounds)));
+                        assert_eq!(mutations.get(), 0);
+                        assert_eq!(*flash.0.borrow(), before);
+                    }
+                    // A missing probe permits recovery within the checked geometry.
+                    let measured = measured.filter(|end| *end >= minimum);
+                    let mut fs = Storage::open_detected(flash.clone(), minimum, measured, [1; 32])
+                        .await
+                        .unwrap();
+                    assert_eq!(fs.total_bytes().unwrap(), 6 * MIB as usize - 4096);
+                    assert!(Identity::load(&mut fs).await.unwrap().is_none());
+                    assert!(fs.load_owned(record_key(2, 1)).await.unwrap().is_none());
+                    assert_eq!(
+                        flash.0.borrow()[..2 * MIB as usize],
+                        before[..2 * MIB as usize]
+                    );
+                    assert_eq!(
+                        flash.0.borrow()[8 * MIB as usize..],
+                        before[8 * MIB as usize..]
+                    );
+                    let identity = Identity::initialize(&mut fs, [2; 6], || 8).await.unwrap();
+                    fs.save(record_key(2, 1), &[7; 9000]).await.unwrap();
+                    fs.save(record_key(4, 1), &[8; 100]).await.unwrap();
+                    drop(fs);
+                    let before = flash.0.borrow().clone();
+                    for _ in 0..3 {
+                        let mut fs = Storage::open_detected(flash.clone(), minimum, None, [1; 32])
+                            .await
+                            .unwrap();
+                        assert_eq!(fs.total_bytes().unwrap(), 6 * MIB as usize - 4096);
+                        assert_eq!(
+                            Identity::load(&mut fs).await.unwrap(),
+                            Some(identity.clone())
+                        );
+                        assert_eq!(
+                            fs.load_owned(record_key(2, 1)).await.unwrap(),
+                            Some(vec![7; 9000])
+                        );
+                        assert_eq!(
+                            fs.load_owned(record_key(4, 1)).await.unwrap(),
+                            Some(vec![8; 100])
+                        );
+                        drop(fs);
+                        assert_eq!(*flash.0.borrow(), before);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Models address aliasing on an undersized chip and forbids every mutation.
+struct WrappingReadFlash {
+    flash: Flash,
+    mutations: Rc<std::cell::Cell<usize>>,
+}
+impl ErrorType for WrappingReadFlash {
+    type Error = NorFlashErrorKind;
+}
+impl ReadNorFlash for WrappingReadFlash {
+    const READ_SIZE: usize = 1;
+    fn capacity(&self) -> usize {
+        16 * 1024 * 1024
+    }
+    async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        let data = self.flash.0.borrow();
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = data[(offset as usize + i) % data.len()];
+        }
+        Ok(())
+    }
+}
+impl NorFlash for WrappingReadFlash {
+    const WRITE_SIZE: usize = 1;
+    const ERASE_SIZE: usize = 4096;
+    async fn write(&mut self, _: u32, _: &[u8]) -> Result<(), Self::Error> {
+        self.mutations.set(self.mutations.get() + 1);
+        Err(NorFlashErrorKind::Other)
+    }
+    async fn erase(&mut self, _: u32, _: u32) -> Result<(), Self::Error> {
+        self.mutations.set(self.mutations.get() + 1);
+        Err(NorFlashErrorKind::Other)
+    }
+}
+
+#[test]
+fn pico_detected_undersized_chips_never_format_even_when_addresses_wrap() {
+    const MIB: u32 = 1024 * 1024;
+    block_on(async {
+        for (minimum, physical) in [(2 * MIB, MIB), (4 * MIB, MIB), (4 * MIB, 2 * MIB)] {
+            for fill in [0xff, 0x42] {
+                let flash = Flash::sized(physical as usize);
+                flash.0.borrow_mut().fill(fill);
+                flash.0.borrow_mut()[..64 * 1024].fill(0x24);
+                let before = flash.0.borrow().clone();
+                let mutations = Rc::new(std::cell::Cell::new(0));
+                let result = cordial_record_storage::Storage::open_detected(
+                    WrappingReadFlash {
+                        flash: flash.clone(),
+                        mutations: mutations.clone(),
+                    },
+                    minimum,
+                    Some(physical),
+                    [1; 32],
+                )
+                .await;
+                assert_eq!(mutations.get(), 0);
+                assert!(matches!(result, Err(Error::Bounds)));
+                assert_eq!(*flash.0.borrow(), before);
+            }
+        }
+    });
+}
+
+#[test]
+fn pico_current_two_mib_filesystem_wins_over_stale_one_mib_filesystem() {
+    const MIB: u32 = 1024 * 1024;
+    block_on(async {
+        let flash = Flash::sized(16 * MIB as usize);
+        let mut fs = Storage::open_or_recover(flash.clone(), MIB..2 * MIB, [1; 32])
+            .await
+            .unwrap();
+        fs.replace_file("/old.bin", &[1; 100]).unwrap();
+        drop(fs);
+        let old = flash.0.borrow()[MIB as usize..2 * MIB as usize].to_vec();
+        let mut fs = Storage::open_detected(flash.clone(), 2 * MIB, Some(8 * MIB), [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(fs.file_size("/old.bin").unwrap(), None);
+        assert_eq!(flash.0.borrow()[MIB as usize..2 * MIB as usize], old);
+        fs.replace_file("/current.bin", &[2; 100]).unwrap();
+        drop(fs);
+        for measured in [None, Some(2 * MIB), Some(4 * MIB)] {
+            let before = flash.0.borrow().clone();
+            let mut fs = Storage::open_detected(flash.clone(), 2 * MIB, measured, [1; 32])
+                .await
+                .unwrap();
+            assert_eq!(fs.total_bytes().unwrap(), 6 * MIB as usize - 4096);
+            assert_eq!(fs.file_size("/current.bin").unwrap(), Some(100));
+            assert_eq!(fs.file_size("/old.bin").unwrap(), None);
+            assert_eq!(*flash.0.borrow(), before);
+        }
+    });
+}
+
+#[test]
+fn pico_one_mib_current_layout_survives_missing_smaller_and_equal_detection() {
+    const MIB: u32 = 1024 * 1024;
+    block_on(async {
+        let flash = Flash::sized(16 * MIB as usize);
+        let mut fs = Storage::open_detected(flash.clone(), 2 * MIB, Some(2 * MIB), [1; 32])
+            .await
+            .unwrap();
+        fs.replace_file("/saved.bin", &[42; 9000]).unwrap();
+        drop(fs);
+        for measured in [None, Some(MIB), Some(2 * MIB)] {
+            let before = flash.0.borrow().clone();
+            let mut fs = Storage::open_detected(flash.clone(), 2 * MIB, measured, [1; 32])
+                .await
+                .unwrap();
+            assert_eq!(fs.total_bytes().unwrap(), MIB as usize - 4096);
+            assert_eq!(fs.file_size("/saved.bin").unwrap(), Some(9000));
+            assert_eq!(*flash.0.borrow(), before);
+        }
+    });
+}
+
+#[test]
+fn pico_discovery_reuses_the_selected_mount_for_validation_and_growth() {
+    const MIB: u32 = 1024 * 1024;
+    block_on(async {
+        let flash = Flash::sized(16 * MIB as usize);
+        let fs = Storage::open_detected(flash.clone(), 4 * MIB, Some(4 * MIB), [1; 32])
+            .await
+            .unwrap();
+        drop(fs);
+        let before = flash.0.borrow().clone();
+        for measured in [None, Some(4 * MIB), Some(8 * MIB)] {
+            let mut counts = Vec::new();
+            for discovery in [false, true] {
+                flash.0.borrow_mut().copy_from_slice(&before);
+                let reads = Rc::new(std::cell::Cell::new(0));
+                let driver = ProbeFlash {
+                    flash: flash.clone(),
+                    reads: reads.clone(),
+                    fail: Rc::new(std::cell::Cell::new(false)),
+                    fail_writes: Rc::new(std::cell::Cell::new(measured != Some(8 * MIB))),
+                };
+                let mut fs = if discovery {
+                    cordial_record_storage::Storage::open_detected(
+                        driver,
+                        4 * MIB,
+                        measured,
+                        [1; 32],
+                    )
+                    .await
+                    .unwrap()
+                } else {
+                    cordial_record_storage::Storage::open_with_limits(
+                        driver,
+                        2 * MIB..measured.unwrap_or(4 * MIB),
+                        Some(measured.unwrap_or(4 * MIB)),
+                        measured,
+                        [1; 32],
+                    )
+                    .await
+                    .unwrap()
+                };
+                assert_eq!(
+                    fs.total_bytes().unwrap(),
+                    (measured.unwrap_or(4 * MIB) - 2 * MIB) as usize - 4096
+                );
+                counts.push(reads.get());
+            }
+            // Selecting geometry adds no reads to the ordinary mounted path.
+            assert_eq!(counts[0], counts[1]);
+        }
+    });
+}
+
+#[test]
+fn pico_geometry_must_fit_addressability_and_io_failures_do_not_format() {
+    const MIB: u32 = 1024 * 1024;
+    block_on(async {
+        let flash = Flash::sized(16 * MIB as usize);
+        let fs = Storage::provision_blank(flash.clone(), 2 * MIB..16 * MIB, [1; 32])
+            .await
+            .unwrap();
+        drop(fs);
+        // The superblock has a valid CRC but its absolute end exceeds the driver.
+        flash.0.borrow_mut().truncate(8 * MIB as usize);
+        let before = flash.0.borrow().clone();
+        let mut fs = Storage::open_detected(flash.clone(), 4 * MIB, None, [1; 32])
+            .await
+            .unwrap();
+        assert_eq!(fs.total_bytes().unwrap(), 2 * MIB as usize - 4096);
+        assert_eq!(
+            flash.0.borrow()[4 * MIB as usize..],
+            before[4 * MIB as usize..]
+        );
+        drop(fs);
+        let before = flash.0.borrow().clone();
+        let result = cordial_record_storage::Storage::open_detected(
+            UnreadableBlocks {
+                flash: flash.clone(),
+                blocks: vec![2 * MIB as usize / 4096 + 1],
+            },
+            4 * MIB,
+            None,
+            [1; 32],
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Io)));
+        assert_eq!(*flash.0.borrow(), before);
     });
 }

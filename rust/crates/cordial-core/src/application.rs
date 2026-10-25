@@ -320,6 +320,9 @@ pub struct Application {
     /// The store generation free space was last counted at for the status. Writes change the
     /// generation, and a later background step counts again.
     counted: Option<u64>,
+    storage_format: Option<u32>,
+    storage_used: Option<u32>,
+    storage_total: Option<u32>,
     /// Profiles with a pending profile event.
     profile_dirty: Vec<u64>,
     profile_removed: VecDeque<u64>,
@@ -511,6 +514,9 @@ impl Application {
             removed: VecDeque::new(),
             adapter_dirty: false,
             counted: None,
+            storage_format: None,
+            storage_used: None,
+            storage_total: None,
             profile_dirty: Vec::new(),
             profile_removed: VecDeque::new(),
             editor: None,
@@ -555,6 +561,7 @@ impl Application {
             firmware_version: Some(self.build.version.into()),
             board_name: Some(self.build.board.into()),
             development_build: Some(self.development()),
+            storage_format: self.storage_format,
         });
         let mut errors: Vec<p::Error> = self
             .manager
@@ -672,11 +679,18 @@ impl Application {
             platform: wire::platform(self.manager.preference.host_platform) as i32,
             ready: self.manager.radio_ready && self.manager.storage_ready,
             errors,
-            resources: alloc::vec![wire::resource(
-                p::ResourceType::Interfaces,
-                self.usb_exposed.map(|t| u32::from(t.cost().interfaces)),
-                Some(u32::from(self.manager.usb_budget.interfaces))
-            )],
+            resources: alloc::vec![
+                wire::resource(
+                    p::ResourceType::Interfaces,
+                    self.usb_exposed.map(|t| u32::from(t.cost().interfaces)),
+                    Some(u32::from(self.manager.usb_budget.interfaces))
+                ),
+                wire::resource(
+                    p::ResourceType::Storage,
+                    self.storage_used,
+                    self.storage_total
+                ),
+            ],
             transports: devices::Transports::ALL
                 .into_iter()
                 .filter(|t| supported.supports(*t))
@@ -1189,12 +1203,7 @@ impl Application {
         let profiles = self.manager.profiles_supported();
         match command {
             Command::GetStatus(_) => {
-                if self.manager.storage_ready {
-                    // A failed size read keeps the last estimate.
-                    if let Ok(bytes) = store.available().await {
-                        self.manager.available_bytes = bytes;
-                    }
-                }
+                self.refresh_available(store).await;
                 let status = self.status(radio);
                 self.reply(Some(R::Status(status)));
             }
@@ -3818,15 +3827,26 @@ impl Application {
         }
     }
 
-    /// Counts free space for the status. A failed count keeps the last estimate until the next
-    /// write.
+    /// Refreshes storage telemetry. A failed count omits usage and keeps the admission estimate.
     async fn refresh_available<S: RecordStore>(&mut self, store: &mut S) {
         let full = self.manager.storage_full();
+        let previous = (self.storage_format, self.storage_used, self.storage_total);
         self.counted = store.generation().await.ok();
-        if let Ok(bytes) = store.available().await {
+        self.storage_format = crate::storage::format(store).await.ok().map(|f| f.format);
+        self.storage_total = store
+            .total_bytes()
+            .await
+            .ok()
+            .and_then(|n| n.try_into().ok());
+        let available = store.available().await.ok();
+        if let Some(bytes) = available {
             self.manager.available_bytes = bytes;
         }
-        self.adapter_dirty |= full != self.manager.storage_full();
+        self.storage_used = self
+            .storage_total
+            .and_then(|total| total.checked_sub(available?.try_into().ok()?));
+        self.adapter_dirty |= full != self.manager.storage_full()
+            || previous != (self.storage_format, self.storage_used, self.storage_total);
     }
 
     /// Removes a saved layout that no longer describes the device.

@@ -1,9 +1,9 @@
 #![no_std]
 extern crate alloc;
 
-use alloc::{boxed::Box, format, vec::Vec};
+use alloc::{boxed::Box, format, rc::Rc, vec::Vec};
 use cordial_core::storage::{Error, RecordKey, RecordStore};
-use core::{ops::Range, ptr::NonNull};
+use core::{cell::Cell, ops::Range, ptr::NonNull};
 use embassy_futures::block_on;
 use embedded_storage_async::nor_flash::NorFlash;
 use littlefs2::{
@@ -16,6 +16,19 @@ use littlefs2::{
 
 pub const MARKER_BYTES: usize = 32;
 pub const BLOCK_BYTES: usize = 4096;
+/// Flash owned by storage after the stable firmware reservation.
+/// Callers reject capacity beyond their driver's addressing limit.
+pub fn flash_range(capacity: u32) -> Result<Range<u32>, Error> {
+    if capacity < 2 * 1024 * 1024 || !capacity.is_multiple_of(BLOCK_BYTES as u32) {
+        return Err(Error::Bounds);
+    }
+    let start = if capacity < 4 * 1024 * 1024 {
+        1024 * 1024
+    } else {
+        2 * 1024 * 1024
+    };
+    Ok(start..capacity)
+}
 /// LittleFS's smallest read. Directory and metadata reads ask for a few bytes at a time, and on
 /// the RP2040 and RP2350 each flash read is a separate DMA transfer with a fixed setup cost, so
 /// reading whole 128-byte units cuts a record listing's flash reads about tenfold for about the
@@ -27,8 +40,8 @@ const READ_BYTES: usize = 128;
 ///
 /// The filesystem stays mounted between operations, since a LittleFS mount
 /// reads every metadata pair.
-pub struct Storage<F: NorFlash + 'static, const BLOCKS: usize> {
-    mount: Mount<F, BLOCKS>,
+pub struct Storage<F: NorFlash + 'static> {
+    mount: Mount<F>,
     generation: u64,
     /// Free space as of the last traversal, cleared by every write attempt.
     available: Option<usize>,
@@ -37,10 +50,10 @@ pub struct Storage<F: NorFlash + 'static, const BLOCKS: usize> {
 /// LittleFS state, the driver it reads through and the filesystem mounted over
 /// them. LittleFS keeps pointers to the allocation and driver while mounted, so
 /// they stay at one heap address for the mount's life.
-struct Volume<F: NorFlash + 'static, const BLOCKS: usize> {
-    alloc: Allocation<Flash<F, BLOCKS>>,
-    driver: Flash<F, BLOCKS>,
-    fs: Option<Filesystem<'static, Flash<F, BLOCKS>>>,
+struct Volume<F: NorFlash + 'static> {
+    alloc: Allocation<Flash<F>>,
+    driver: Flash<F>,
+    fs: Option<Filesystem<'static, Flash<F>>>,
 }
 
 /// A filesystem mounted on demand over a `Volume` this value owns.
@@ -52,11 +65,15 @@ struct Volume<F: NorFlash + 'static, const BLOCKS: usize> {
 /// moving or dropping a `Mount` moves only the pointer. The `'static` lifetime is
 /// never exposed: `with` lends the filesystem for one call, and no closure
 /// returns a borrow of it.
-struct Mount<F: NorFlash + 'static, const BLOCKS: usize> {
-    volume: NonNull<Volume<F, BLOCKS>>,
+struct Mount<F: NorFlash + 'static> {
+    volume: NonNull<Volume<F>>,
+    io_failed: Rc<Cell<bool>>,
+    blocks: Rc<Cell<usize>>,
 }
-impl<F: NorFlash + 'static, const BLOCKS: usize> Mount<F, BLOCKS> {
-    fn new(driver: Flash<F, BLOCKS>) -> Self {
+impl<F: NorFlash + 'static> Mount<F> {
+    fn new(driver: Flash<F>) -> Self {
+        let io_failed = driver.io_failed.clone();
+        let blocks = driver.blocks.clone();
         let volume = Box::new(Volume {
             alloc: Allocation::new(),
             driver,
@@ -64,6 +81,8 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Mount<F, BLOCKS> {
         });
         Self {
             volume: NonNull::from(Box::leak(volume)),
+            io_failed,
+            blocks,
         }
     }
     /// Run `f` on the mounted filesystem, mounting it first if needed. An error
@@ -71,8 +90,9 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Mount<F, BLOCKS> {
     /// next call reads the flash again.
     fn with<R>(
         &mut self,
-        f: impl FnOnce(&Filesystem<'static, Flash<F, BLOCKS>>) -> littlefs2::io::Result<R>,
+        f: impl FnOnce(&Filesystem<'static, Flash<F>>) -> littlefs2::io::Result<R>,
     ) -> littlefs2::io::Result<R> {
+        self.io_failed.set(false);
         let volume = self.volume.as_ptr();
         // SAFETY: see `Mount`. `fs` is a field disjoint from `alloc` and `driver`.
         let fs = match unsafe { &mut (*volume).fs } {
@@ -82,10 +102,20 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Mount<F, BLOCKS> {
                 // exists while `fs` is empty.
                 let (alloc, driver) = unsafe { (&mut (*volume).alloc, &mut (*volume).driver) };
                 // A mount reinitializes all LittleFS state in the allocation.
-                empty.insert(Filesystem::mount(alloc, driver)?)
+                let mounted = Filesystem::mount(alloc, driver);
+                if self.io_failed.get() {
+                    return Err(LfsError::IO);
+                }
+                let fs = mounted?;
+                empty.insert(fs)
             }
         };
         let result = f(fs);
+        let result = if self.io_failed.get() && result.is_err() {
+            Err(LfsError::IO)
+        } else {
+            result
+        };
         if let Err(e) = result
             && !matches!(
                 e,
@@ -104,42 +134,59 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Mount<F, BLOCKS> {
         // SAFETY: see `Mount`. No borrow of `fs` outlives a `with` call.
         unsafe { (*self.volume.as_ptr()).fs = None };
     }
-    fn into_driver(mut self) -> Flash<F, BLOCKS> {
+    fn into_driver(mut self) -> Flash<F> {
         self.unmount();
+        let mut this = core::mem::ManuallyDrop::new(self);
         // SAFETY: see `Mount`. The filesystem's borrows ended above, and
-        // forgetting `self` keeps `Drop` from freeing the volume again.
-        let volume = unsafe { Box::from_raw(self.volume.as_ptr()) };
-        core::mem::forget(self);
+        // suppressing `Drop` keeps it from freeing the volume again.
+        let volume = unsafe { Box::from_raw(this.volume.as_ptr()) };
+        // SAFETY: `ManuallyDrop` leaves these owned references to be dropped
+        // exactly once here. Neither field is accessed afterward.
+        unsafe {
+            core::ptr::drop_in_place(&mut this.io_failed);
+            core::ptr::drop_in_place(&mut this.blocks);
+        }
         volume.driver
     }
 }
-impl<F: NorFlash + 'static, const BLOCKS: usize> Drop for Mount<F, BLOCKS> {
+impl<F: NorFlash + 'static> Drop for Mount<F> {
     fn drop(&mut self) {
         self.unmount();
         // SAFETY: see `Mount`. The filesystem's borrows ended above.
         drop(unsafe { Box::from_raw(self.volume.as_ptr()) });
     }
 }
-struct Flash<F, const BLOCKS: usize> {
+struct Flash<F> {
     flash: F,
     start: u32,
+    blocks: Rc<Cell<usize>>,
+    io_failed: Rc<Cell<bool>>,
 }
-impl<F: NorFlash, const BLOCKS: usize> driver::Storage for Flash<F, BLOCKS> {
+impl<F: NorFlash> driver::Storage for Flash<F> {
     const READ_SIZE: usize = READ_BYTES;
     const WRITE_SIZE: usize = F::WRITE_SIZE;
     const BLOCK_SIZE: usize = BLOCK_BYTES;
-    const BLOCK_COUNT: usize = BLOCKS;
+    const BLOCK_COUNT: usize = 0;
+    fn block_count(&self) -> usize {
+        self.blocks.get()
+    }
     const BLOCK_CYCLES: isize = 500;
     type CACHE_SIZE = littlefs2::consts::U512;
     type LOOKAHEAD_SIZE = littlefs2::consts::U16;
     fn read(&mut self, off: usize, buf: &mut [u8]) -> littlefs2::io::Result<usize> {
         self.bounds(off, buf.len())?;
-        block_on(self.flash.read(self.start + off as u32, buf)).map_err(|_| LfsError::IO)?;
+        block_on(self.flash.read(self.start + off as u32, buf)).map_err(|_| {
+            self.io_failed.set(true);
+            LfsError::IO
+        })?;
         Ok(buf.len())
     }
     fn write(&mut self, off: usize, buf: &[u8]) -> littlefs2::io::Result<usize> {
         self.bounds(off, buf.len())?;
-        block_on(self.flash.write(self.start + off as u32, buf)).map_err(|_| LfsError::IO)?;
+        block_on(self.flash.write(self.start + off as u32, buf)).map_err(|_| {
+            self.io_failed.set(true);
+            LfsError::IO
+        })?;
         Ok(buf.len())
     }
     fn erase(&mut self, off: usize, len: usize) -> littlefs2::io::Result<usize> {
@@ -148,17 +195,22 @@ impl<F: NorFlash, const BLOCKS: usize> driver::Storage for Flash<F, BLOCKS> {
             self.flash
                 .erase(self.start + off as u32, self.start + (off + len) as u32),
         )
-        .map_err(|_| LfsError::IO)?;
+        .map_err(|_| {
+            self.io_failed.set(true);
+            LfsError::IO
+        })?;
         Ok(len)
     }
 }
-impl<F, const BLOCKS: usize> Flash<F, BLOCKS> {
+impl<F> Flash<F> {
     fn bounds(&self, off: usize, len: usize) -> littlefs2::io::Result<()> {
         if off
             .checked_add(len)
-            .is_none_or(|end| end > BLOCKS * BLOCK_BYTES)
+            .is_none_or(|end| end > self.blocks.get() * BLOCK_BYTES)
         {
-            Err(LfsError::INVALID)
+            // An inaccessible block is not evidence that the filesystem is corrupt.
+            self.io_failed.set(true);
+            Err(LfsError::IO)
         } else {
             Ok(())
         }
@@ -168,9 +220,9 @@ fn error(e: LfsError) -> Error {
     match e {
         LfsError::NO_SPACE => Error::Full,
         LfsError::NO_MEMORY => Error::Unavailable,
+        LfsError::CORRUPTION => Error::Corrupt,
         LfsError::INVALID | LfsError::FILENAME_TOO_LONG => Error::Bounds,
         LfsError::FILE_TOO_BIG => Error::TooLarge,
-        // A failed metadata checksum is a read error: the data may read back on a later try.
         LfsError::NO_SUCH_ENTRY | LfsError::PATH_NOT_DIR => Error::Missing,
         _ => Error::Io,
     }
@@ -181,13 +233,13 @@ fn checked_path(value: &str) -> Result<PathBuf, Error> {
     }
     PathBuf::try_from(value).map_err(|_| Error::Bounds)
 }
-impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
+impl<F: NorFlash + 'static> Storage<F> {
     fn config(flash: &F, range: &Range<u32>) -> Result<(), Error> {
-        if BLOCKS < 2
+        let bytes = range.end.checked_sub(range.start).ok_or(Error::Bounds)? as usize;
+        if bytes < 3 * BLOCK_BYTES
             || F::ERASE_SIZE != BLOCK_BYTES
             || range.end as usize > flash.capacity()
-            || range.end.checked_sub(range.start).map(|n| n as usize)
-                != Some((BLOCKS + 1) * BLOCK_BYTES)
+            || !bytes.is_multiple_of(BLOCK_BYTES)
             || !(range.start as usize).is_multiple_of(BLOCK_BYTES)
             || F::READ_SIZE == 0
             || F::WRITE_SIZE == 0
@@ -198,56 +250,252 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
         }
         Ok(())
     }
-    pub async fn open_or_provision_blank(
-        mut flash: F,
+    /// Mounts and validates application roots before any saved settings are used.
+    pub async fn open_or_recover(
+        flash: F,
         range: Range<u32>,
         identity: [u8; MARKER_BYTES],
     ) -> Result<Self, Error> {
-        Self::config(&flash, &range)?;
-        let mut page = [0; 512];
-        flash
-            .read(range.start, &mut page)
-            .await
-            .map_err(|_| Error::Io)?;
-        if page[..MARKER_BYTES] == [0xff; MARKER_BYTES] {
-            Self::provision_blank(flash, range, identity).await
-        } else {
-            Self::open(flash, range, identity).await
-        }
+        let available_end = Some(range.end);
+        Self::open_with_capacity(flash, range, available_end, identity).await
     }
-    pub async fn open(
+    /// Opens storage with an optional growth limit, independently of the safely
+    /// addressable range. Missing or smaller measurements never shrink a filesystem.
+    pub async fn open_with_capacity(
+        flash: F,
+        range: Range<u32>,
+        available_end: Option<u32>,
+        identity: [u8; MARKER_BYTES],
+    ) -> Result<Self, Error> {
+        let format_end = Some(range.end);
+        Self::open_with_limits(flash, range, format_end, available_end, identity).await
+    }
+    /// Keeps discovery I/O bounds separate from the region approved for formatting.
+    /// `None` permits only an existing filesystem with valid application roots.
+    pub async fn open_with_limits(
         mut flash: F,
         range: Range<u32>,
+        format_end: Option<u32>,
+        available_end: Option<u32>,
         identity: [u8; MARKER_BYTES],
     ) -> Result<Self, Error> {
         Self::config(&flash, &range)?;
-        let mut page = [0; 512];
-        flash
-            .read(range.start, &mut page)
+        if let Some(end) = format_end {
+            Self::config(&flash, &(range.start..end))?;
+            if end > range.end {
+                return Err(Error::Bounds);
+            }
+        }
+        let marker_matches = Self::marker_matches(&mut flash, range.start, &identity).await?;
+        let store = Self::new(flash, &range);
+        store
+            .finish_startup(range, format_end, available_end, identity, marker_matches)
             .await
-            .map_err(|_| Error::Io)?;
-        if page[..MARKER_BYTES] == [0xff; MARKER_BYTES] {
-            return Err(Error::Unprovisioned);
+    }
+    /// Selects a Pico filesystem using read-only mounts at the approved boundaries.
+    /// A current 2 MiB reservation takes precedence over stale 1 MiB metadata.
+    /// A measured capacity below the board minimum forbids formatting, but does
+    /// not override an existing filesystem with valid geometry and roots.
+    pub async fn open_detected(
+        mut flash: F,
+        minimum: u32,
+        available_end: Option<u32>,
+        identity: [u8; MARKER_BYTES],
+    ) -> Result<Self, Error> {
+        let addressable = u32::try_from(flash.capacity()).map_err(|_| Error::Bounds)?;
+        let format_end = available_end.unwrap_or(minimum);
+        let reservation = flash_range(format_end.max(minimum))?.start;
+        if format_end > addressable {
+            return Err(Error::Bounds);
         }
-        if page[..MARKER_BYTES] != identity {
-            return Err(Error::Layout);
+        // RP2350's minimum selects only 2 MiB. RP2040 can also have a current
+        // 1 MiB reservation, unless reliable capacity requires the larger one.
+        for start in [2 * 1024 * 1024, 1024 * 1024] {
+            if start < reservation || start + 3 * BLOCK_BYTES as u32 > addressable {
+                continue;
+            }
+            let range = start..addressable;
+            Self::config(&flash, &range)?;
+            let marker_matches = Self::marker_matches(&mut flash, start, &identity).await?;
+            let mut store = Self::new(flash, &range);
+            let geometry = store.mount.with(|fs| Ok(fs.total_space()));
+            match geometry {
+                Ok(bytes) => {
+                    let end = u32::try_from(bytes)
+                        .ok()
+                        .and_then(|bytes| start.checked_add(BLOCK_BYTES as u32)?.checked_add(bytes))
+                        .filter(|end| *end <= addressable);
+                    if let Some(end) = end {
+                        // Checked geometry retains the filesystem's extent for I/O
+                        // and root recovery. Only a larger measurement expands it.
+                        let io_end = end.max(available_end.unwrap_or(end));
+                        store
+                            .mount
+                            .blocks
+                            .set((io_end - start) as usize / BLOCK_BYTES - 1);
+                        return store
+                            .finish_startup(
+                                start..io_end,
+                                (format_end >= minimum).then_some(io_end),
+                                available_end,
+                                identity,
+                                marker_matches,
+                            )
+                            .await;
+                    }
+                }
+                Err(LfsError::CORRUPTION | LfsError::INVALID) => (),
+                Err(e) => return Err(error(e)),
+            }
+            flash = store.into_flash();
         }
-        let mut store = Self {
+        // Every eligible mount was invalid. Format only the measured or
+        // minimum region, never the exploratory address window.
+        if format_end < minimum {
+            return Err(Error::Bounds);
+        }
+        let format_range = flash_range(format_end)?;
+        Self::config(&flash, &format_range)?;
+        let mut store = Self::new(flash, &format_range);
+        store.reformat()?;
+        cordial_core::storage::open(&mut store).await?;
+        store
+            .finish_startup(
+                format_range,
+                Some(format_end),
+                available_end,
+                identity,
+                false,
+            )
+            .await
+    }
+    async fn marker_matches(
+        flash: &mut F,
+        start: u32,
+        identity: &[u8; MARKER_BYTES],
+    ) -> Result<bool, Error> {
+        let mut page = [0; 512];
+        flash.read(start, &mut page).await.map_err(|_| Error::Io)?;
+        Ok(page[..MARKER_BYTES] == *identity)
+    }
+    async fn finish_startup(
+        mut self,
+        range: Range<u32>,
+        format_end: Option<u32>,
+        available_end: Option<u32>,
+        identity: [u8; MARKER_BYTES],
+        marker_matches: bool,
+    ) -> Result<Self, Error> {
+        let mounted = self.mount.with(|_| Ok(()));
+        let valid = match mounted {
+            Ok(()) => cordial_core::storage::validate_roots(&mut self).await,
+            Err(LfsError::CORRUPTION | LfsError::INVALID) => Err(Error::Corrupt),
+            Err(e) => return Err(error(e)),
+        };
+        match valid {
+            Ok(()) => (),
+            Err(Error::Layout | Error::Corrupt | Error::TooLarge) => {
+                let format_end = format_end.ok_or(Error::Bounds)?;
+                let bytes = (format_end - range.start) as usize;
+                self.mount.unmount();
+                self.mount.blocks.set(bytes / BLOCK_BYTES - 1);
+                self.reformat()?;
+                cordial_core::storage::open(&mut self).await?;
+            }
+            Err(e) => return Err(e),
+        }
+        if let Some(end) = available_end {
+            let blocks = end
+                .min(range.end)
+                .saturating_sub(range.start)
+                .saturating_sub(BLOCK_BYTES as u32) as usize
+                / BLOCK_BYTES;
+            self.mount
+                .with(|fs| {
+                    if blocks > fs.total_blocks() {
+                        fs.grow(blocks)?;
+                    }
+                    Ok(())
+                })
+                .map_err(error)?;
+        }
+        if !marker_matches {
+            self.write_marker(range.start, identity).await?;
+        }
+        self.cleanup();
+        Ok(self)
+    }
+    fn new(flash: F, range: &Range<u32>) -> Self {
+        Self {
             mount: Mount::new(Flash {
                 flash,
                 start: range.start + BLOCK_BYTES as u32,
+                blocks: Rc::new(Cell::new(
+                    (range.end - range.start) as usize / BLOCK_BYTES - 1,
+                )),
+                io_failed: Rc::new(Cell::new(false)),
             }),
             generation: 0,
             available: None,
-        };
-        // Never format on mount failure. An interrupted provisioning attempt
-        // requires explicit recovery, just like unknown or damaged storage.
+        }
+    }
+    fn reformat(&mut self) -> Result<(), Error> {
+        self.mount.unmount();
+        // SAFETY: unmount ends the filesystem's borrows of the volume fields.
+        let driver = unsafe { &mut (*self.mount.volume.as_ptr()).driver };
+        driver.io_failed.set(false);
+        let result = Filesystem::format(driver);
+        if driver.io_failed.get() {
+            return Err(Error::Io);
+        }
+        result.map_err(error)?;
+        self.available = None;
+        self.mount.with(|_| Ok(())).map_err(error)
+    }
+    async fn write_marker(
+        &mut self,
+        start: u32,
+        identity: [u8; MARKER_BYTES],
+    ) -> Result<(), Error> {
+        self.mount.unmount();
+        // SAFETY: unmount ends the filesystem's borrows of the volume fields.
+        let flash = unsafe { &mut (*self.mount.volume.as_ptr()).driver.flash };
+        let mut page = [0xff; 512];
+        flash.read(start, &mut page).await.map_err(|_| Error::Io)?;
+        if page[..MARKER_BYTES] == identity {
+            return Ok(());
+        }
+        flash
+            .erase(start, start + BLOCK_BYTES as u32)
+            .await
+            .map_err(|_| Error::Io)?;
+        page.fill(0xff);
+        page[..MARKER_BYTES].copy_from_slice(&identity);
+        flash.write(start, &page).await.map_err(|_| Error::Io)?;
+        flash.read(start, &mut page).await.map_err(|_| Error::Io)?;
+        if page[..MARKER_BYTES] != identity {
+            return Err(Error::Io);
+        }
+        Ok(())
+    }
+    /// Mounts without startup recovery, for operations that must preserve read failures.
+    pub async fn open(
+        flash: F,
+        range: Range<u32>,
+        _identity: [u8; MARKER_BYTES],
+    ) -> Result<Self, Error> {
+        Self::config(&flash, &range)?;
+        let mut store = Self::new(flash, &range);
         store.mount.with(|_| Ok(())).map_err(error)?;
+        store.cleanup();
+        Ok(store)
+    }
+    fn cleanup(&mut self) {
         // Cleanup removes record directories without their commit file, or with an empty one. It
         // is best effort, and its first failure ends it: loads find no record in such a
         // directory, and record IDs are never reused. A failure that may leave the mounted state
         // behind the flash unmounts it, so the next operation mounts again.
-        let _ = store.mount.with(|fs| {
+        let _ = self.mount.with(|fs| {
             for (directory, record) in [
                 (path!("/devices"), path!("device.pb")),
                 (path!("/profiles"), path!("profile.pb")),
@@ -278,51 +526,22 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
             }
             Ok(())
         });
-        Ok(store)
     }
+    /// Creates an empty filesystem in the supplied owned range.
     pub async fn provision_blank(
-        mut flash: F,
+        flash: F,
         range: Range<u32>,
         identity: [u8; MARKER_BYTES],
     ) -> Result<Self, Error> {
         Self::config(&flash, &range)?;
-        if identity == [0xff; MARKER_BYTES] {
-            return Err(Error::Layout);
-        }
-        let mut page = [0; 512];
-        for at in (range.start..range.end).step_by(page.len()) {
-            flash.read(at, &mut page).await.map_err(|_| Error::Io)?;
-            if page.iter().any(|&v| v != 0xff) {
-                return Err(Error::Layout);
-            }
-        }
-        page.fill(0xff);
-        page[..MARKER_BYTES].copy_from_slice(&identity);
-        // Claim the layout before formatting. Any interruption leaves either a
-        // mountable filesystem or a failure, never permission to format again.
-        flash
-            .write(range.start, &page)
-            .await
-            .map_err(|_| Error::Io)?;
-        flash
-            .read(range.start, &mut page)
-            .await
-            .map_err(|_| Error::Io)?;
-        if page[..MARKER_BYTES] != identity {
-            return Err(Error::Io);
-        }
-        let mut driver = Flash {
-            flash,
-            start: range.start + BLOCK_BYTES as u32,
-        };
-        Filesystem::format(&mut driver).map_err(error)?;
-        let mut store = Self {
-            mount: Mount::new(driver),
-            generation: 0,
-            available: None,
-        };
-        store.mount.with(|_| Ok(())).map_err(error)?;
+        let mut store = Self::new(flash, &range);
+        store.reformat()?;
+        store.write_marker(range.start, identity).await?;
         Ok(store)
+    }
+    /// Total mounted filesystem bytes, excluding the guard sector.
+    pub fn total_bytes(&mut self) -> Result<usize, Error> {
+        self.mount.with(|fs| Ok(fs.total_space())).map_err(error)
     }
     pub fn into_flash(self) -> F {
         self.mount.into_driver().flash
@@ -502,7 +721,7 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
         }
     }
 }
-impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
+impl<F: NorFlash + 'static> Storage<F> {
     /// Reads record `key` whole into the buffer `buffer` supplies for the file's length.
     fn read_record<B: AsMut<[u8]>>(
         &mut self,
@@ -531,7 +750,7 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> Storage<F, BLOCKS> {
             Ok(result) => result,
             Err(LfsError::NO_SUCH_ENTRY) => Ok(None),
             // A directory in the record's place.
-            Err(LfsError::PATH_IS_DIR) => Err(Error::Io),
+            Err(LfsError::PATH_IS_DIR) => Err(Error::Corrupt),
             Err(e) => Err(error(e)),
         }
     }
@@ -590,7 +809,7 @@ fn record_path(key: RecordKey) -> Result<alloc::string::String, Error> {
         _ => return Err(Error::Bounds),
     })
 }
-impl<F: NorFlash + 'static, const BLOCKS: usize> RecordStore for Storage<F, BLOCKS> {
+impl<F: NorFlash + 'static> RecordStore for Storage<F> {
     async fn generation(&mut self) -> Result<u64, Error> {
         Ok(self.generation)
     }
@@ -749,6 +968,9 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> RecordStore for Storage<F, BLOC
             })
             .map_err(error)
     }
+    async fn total_bytes(&mut self) -> Result<usize, Error> {
+        Storage::total_bytes(self)
+    }
     async fn available(&mut self) -> Result<usize, Error> {
         // LittleFS counts used blocks by traversing every metadata pair and file.
         if let Some(bytes) = self.available {
@@ -796,7 +1018,7 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> RecordStore for Storage<F, BLOC
             Ok(found) => Ok(found),
             Err(LfsError::NO_SUCH_ENTRY) => Ok(false),
             // A directory in the record's place.
-            Err(LfsError::PATH_IS_DIR) => Err(Error::Io),
+            Err(LfsError::PATH_IS_DIR) => Err(Error::Corrupt),
             Err(e) => Err(error(e)),
         }
     }
@@ -805,5 +1027,54 @@ impl<F: NorFlash + 'static, const BLOCKS: usize> RecordStore for Storage<F, BLOC
     }
     async fn remove(&mut self, key: RecordKey) -> Result<(), Error> {
         self.remove_file(&record_path(key)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use embedded_storage_async::nor_flash::{ErrorType, NorFlashErrorKind, ReadNorFlash};
+
+    struct UnusedFlash;
+    impl ErrorType for UnusedFlash {
+        type Error = NorFlashErrorKind;
+    }
+    impl ReadNorFlash for UnusedFlash {
+        const READ_SIZE: usize = 1;
+        async fn read(&mut self, _: u32, _: &mut [u8]) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+        fn capacity(&self) -> usize {
+            unreachable!()
+        }
+    }
+    impl NorFlash for UnusedFlash {
+        const WRITE_SIZE: usize = 1;
+        const ERASE_SIZE: usize = BLOCK_BYTES;
+        async fn erase(&mut self, _: u32, _: u32) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+        async fn write(&mut self, _: u32, _: &[u8]) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn extracted_driver_releases_shared_allocations() {
+        let mount = Mount::new(Flash {
+            flash: UnusedFlash,
+            start: 0,
+            blocks: Rc::new(Cell::new(3)),
+            io_failed: Rc::new(Cell::new(false)),
+        });
+        let blocks = Rc::downgrade(&mount.blocks);
+        let io_failed = Rc::downgrade(&mount.io_failed);
+
+        let driver = mount.into_driver();
+        assert_eq!(blocks.strong_count(), 1);
+        assert_eq!(io_failed.strong_count(), 1);
+        drop(driver);
+        assert!(blocks.upgrade().is_none());
+        assert!(io_failed.upgrade().is_none());
     }
 }

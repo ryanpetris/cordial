@@ -54,7 +54,7 @@
 | Raspberry Pi Pico W | `pico_w` | Classic and Low Energy | Yes | No |
 | Raspberry Pi Pico 2 W | `pico2_w` | Classic and Low Energy | Yes | Yes |
 | Waveshare RP2350B-Plus-W | `waveshare_rp2350b_plus_w` | Classic and Low Energy | Yes | Yes |
-| ESP32-S3 with 8 MiB flash and native USB | `esp32s3_8mb` | Low Energy only | No | Yes |
+| ESP32-S3 with at least 4 MiB flash and native USB | `esp32s3` | Low Energy only | No | Yes |
 
 Each board's firmware is in `cordial-firmware-<version>-<code>.tar.gz`.
 

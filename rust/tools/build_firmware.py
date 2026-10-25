@@ -101,8 +101,6 @@ def esp_partitions(data, config):
     expected = [
         (1, 1, 0xf000, 0x1000, b"phy_init", 0),
         (0, 0, 0x10000, config["storage_offset"] - 0x10000, b"factory", 0),
-        (1, 0x40, config["storage_offset"], 4096, b"cordial_layout", 0),
-        (1, 0x83, config["storage_offset"] + 4096, config["storage_bytes"] - 4096, b"cordial_app", 0),
     ]
     if len(data) != 0xc00:
         raise ValueError("ESP partition table has an unexpected size")
@@ -180,7 +178,7 @@ def package(config, sdk, elf, output, name, gcc, env):
         frames = esp_startup_frames(disassembly)
         print(f"ESP startup stack frames: {frames}", flush=True)
         settings = json.loads((sdk / "flasher_args.json").read_text())["flash_settings"]
-        if settings["flash_size"] != f"{config['flash_bytes']//1048576}MB":
+        if settings["flash_size"] != f"{config['minimum_flash_bytes']//1048576}MB":
             raise ValueError("ESP SDK flash size differs from board configuration")
         sdkconfig = dict(line.split("=", 1) for line in (sdk.parent / "sdkconfig").read_text().splitlines()
                          if line.startswith("CONFIG_"))

@@ -10,7 +10,7 @@ license.workspace = true
 delog = { version = "=0.1.8", default-features = false, features = ["portable-atomic"] }
 cordial-core.workspace = true
 embedded-storage-async = "=0.4.2"
-littlefs2 = { version = "=0.8.1", default-features = false }
+littlefs2 = { path = "../../vendor/littlefs2", default-features = false }
 embassy-futures = "=0.1.2"
 
 [dev-dependencies]

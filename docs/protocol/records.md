@@ -13,9 +13,11 @@ digits and begins the USB serial number. Classic starts disabled and BLE enabled
 transport does not scan, connect or accept connections. Until saved adapter settings load, the host
 platform reads as Linux and the transport defaults apply.
 
-`Status.information` holds `firmware_version`, `board_name` and `development_build`, each with
+`Status.information` holds `firmware_version`, `board_name`, `development_build` and `storage_format`, each with
 independent presence. The Dongle always supplies these known values, including false for a
-production build. `Status.errors` is the complete current set of adapter problems as full `Error`
+production build, except `storage_format`, which is the validated `Format.format` epoch and is
+omitted when unknown. The current storage epoch is 1. A radio failure does not make a validated
+storage epoch unknown. `Status.errors` is the complete current set of adapter problems as full `Error`
 messages, ordered and deduplicated by complete error as defined in
 [Errors](limits-and-errors.md#errors). Empty clears all adapter problems. An `adapter` event
 replaces the complete `Status`, including its errors and resource counts.
@@ -41,12 +43,22 @@ what is counted and its units:
 | Container | Type | Count | Limit |
 | --- | --- | --- | --- |
 | `Status.resources` | `INTERFACES` | USB interfaces actually exposed, including each interface of a multi-interface function | Compiled USB interface maximum |
+| `Status.resources` | `STORAGE` | Best-effort filesystem allocation in use, in raw bytes | Total bytes in the mounted filesystem |
 | `TransportSupport.resources` | `DEVICES` | Saved devices enabled for that transport, even while the transport is disabled; excludes pairing | Enabled-device allowance, equal to the normal connection allowance |
 | `TransportSupport.resources` | `CONNECTIONS` | Occupied normal connection slots, including connecting and closing slots until freed; excludes pairing | Normal connection allowance, equal to the enabled-device allowance |
 | `OutputModeSupport.resources` | `SLOTS` | Enumerated pool size for that role and mode, absent until known | Compiled slot maximum, at most four per gamepad mode |
 | `ProfileSupport.resources` | `MEMORY` | Bytes used by loaded profiles, shared by ID | Shared loaded-profile budget in bytes |
 | `ProfileSupport.resources` | `OUTPUTS` | Omitted | Maximum outputs in one remap and after every applied layer for one held input |
 | `ProfileSupport.resources` | `LAYERS` | Omitted | Maximum profile IDs in one device's layer list |
+
+Storage usage is the mounted filesystem size minus its best-effort free-space estimate. It includes
+filesystem overhead, does not subtract pairing or maintenance reserves, and is not an exact sum of
+file lengths. The total excludes firmware, guard regions and the RP2350 E10 reservation. It uses
+the mounted filesystem's actual block count, which can be smaller than the detected flash allows.
+A failed free-space measurement omits `count` while a known `limit` remains available. `GetStatus`
+refreshes these readings. Existing recounts after storage mutations or generation changes can send
+an `adapter` event when a reading or its presence changes, even without a `STORAGE_FULL` change.
+Updates are best effort and do not promise a notification for every write.
 
 Saved enabled-device count can exceed its allowance; the saved preferences remain intact.
 Connection counts describe occupied slots, not just fully connected devices. Firmware reports its

@@ -121,10 +121,7 @@ fn start(spawner: embassy_executor::Spawner) {
         sys::ESP_OK
     );
     let serial = Box::leak(format!("{:016X}", u64::from_le_bytes(unique)).into_boxed_str());
-    let mut store = storage::open(
-        board::STORAGE_IDENTITY,
-        board::STORAGE_START..board::STORAGE_END,
-    );
+    let mut store = storage::open(board::STORAGE_IDENTITY);
     let topology = embassy_futures::block_on(cordial_usb::saved_topology(
         &mut store,
         board::PROFILE_MEMORY_BUDGET.is_some(),

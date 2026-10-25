@@ -2,8 +2,8 @@ import { ErrorCode, ErrorOutcome, ErrorReason } from "@cordial/protocol";
 import { ConnectionClosedError, CordialError } from "@cordial/client";
 import { describe, expect, it } from "vitest";
 import { failure } from "../src/core/session.ts";
-import type { WireError } from "../src/shared/state.ts";
-import { READ_FAILED, ROLES, asSentence, codeText, displayKind, errorText, kindText, profileErrorText, reasonText, stateText } from "../src/shared/text.ts";
+import type { AdapterStatus, WireError } from "../src/shared/state.ts";
+import { READ_FAILED, ROLES, asSentence, codeText, displayKind, errorText, kindText, profileErrorText, reasonText, stateText, storageText } from "../src/shared/text.ts";
 
 describe("error wording", () => {
   it("shows messages as sentences and inserts them as reasons without the period", () => {
@@ -106,3 +106,17 @@ describe("error wording", () => {
 function error(e: Partial<WireError> & Pick<WireError, "code">): WireError {
   return { reason: "unknown", outcome: "unspecified", related: [], ...e };
 }
+
+describe("storage wording", () => {
+  const status = (count: number | null, limit: number | null, present = true) =>
+    ({ resources: present ? [{ type: "storage", count, limit }] : [] }) as unknown as AdapterStatus;
+
+  it("shows whichever of the used and total bytes is known", () => {
+    expect(storageText(status(0, 0))).toBe("0 B of 0 B");
+    expect(storageText(status(512, 2048))).toBe("512 B of 2.0 KiB");
+    expect(storageText(status(12288, null))).toBe("12.0 KiB");
+    expect(storageText(status(null, 1048576))).toBe("Up to 1.0 MiB");
+    expect(storageText(status(null, null))).toBeNull();
+    expect(storageText(status(null, null, false))).toBeNull();
+  });
+});

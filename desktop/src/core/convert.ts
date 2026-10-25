@@ -124,6 +124,7 @@ export function status(s: Status): AdapterStatus {
       firmwareVersion: optional(s.information?.firmwareVersion),
       boardName: optional(s.information?.boardName),
       developmentBuild: optional(s.information?.developmentBuild),
+      storageFormat: optional(s.information?.storageFormat),
     },
     profileSupport: p ? { resources: resources(p.resources) } : null,
     // Without profile support there are no interfaces, whatever the message carries.

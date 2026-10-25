@@ -490,33 +490,21 @@ pub fn integration_text(i: &p::Integration) -> String {
     }
 }
 
-/// The detected HID++ version, as "4.5".
-pub fn version_text(d: &p::Device) -> String {
-    match model::hidpp_version(d) {
-        Some((major, minor)) => format!("{major}.{minor}"),
-        None => "Unknown".into(),
-    }
-}
-
-/// The link security facts, labelled.
-pub fn security_facts(s: &p::Security) -> [(&'static str, String); 4] {
-    let flag = |v: Option<bool>| match v {
-        None => "Not Reported".to_owned(),
-        Some(true) => "Yes".into(),
-        Some(false) => "No".into(),
-    };
+/// The link security facts the device reported, labelled.
+pub fn security_facts(s: &p::Security) -> Vec<(&'static str, String)> {
+    let flag = |b| if b { "Yes" } else { "No" }.to_owned();
     [
-        ("Encrypted", flag(s.encrypted)),
-        ("Authenticated Pairing", flag(s.authenticated)),
-        ("Secure Connections", flag(s.secure_connections)),
+        ("Encrypted", s.encrypted.map(flag)),
+        ("Authenticated Pairing", s.authenticated.map(flag)),
+        ("Secure Connections", s.secure_connections.map(flag)),
         (
             "Encryption Key",
-            match s.key_size {
-                Some(n) => format!("{}-bit", n * 8),
-                None => "Not Reported".into(),
-            },
+            s.key_size.map(|n| format!("{}-bit", n * 8)),
         ),
     ]
+    .into_iter()
+    .filter_map(|(label, value)| Some((label, value?)))
+    .collect()
 }
 
 /// The low battery threshold, in percent, the desktop application uses by default.

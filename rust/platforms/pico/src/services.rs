@@ -67,3 +67,47 @@ pub fn bootloader() -> ! {
         core::hint::spin_loop();
     }
 }
+
+/// Detects the physical flash through JEDEC RDID before other flash users start.
+fn detect_flash_capacity<T: Instance, M: Mode, const N: usize>(
+    flash: &mut Flash<'_, T, M, N>,
+) -> Result<u32, embassy_rp::flash::Error> {
+    #[cfg(feature = "rp2040")]
+    let jedec = flash.blocking_jedec_id()?;
+    #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+    let jedec = {
+        let _ = flash;
+        unsafe extern "C" {
+            fn cordial_flash_jedec_id() -> u32;
+        }
+        unsafe { cordial_flash_jedec_id() }
+    };
+    // JEDEC's capacity byte is the base-2 exponent of the capacity in bytes.
+    let exponent = jedec & 0xff;
+    if jedec >> 16 == 0 || jedec >> 16 == 0xff || !(1..32).contains(&exponent) {
+        return Err(embassy_rp::flash::Error::Other);
+    }
+    // Embassy's flash commands and the XIP window address at most 16 MiB.
+    let capacity = 1u32 << exponent;
+    if capacity as usize > N {
+        return Err(embassy_rp::flash::Error::OutOfBounds);
+    }
+    Ok(capacity)
+}
+
+/// Retries missing JEDEC responses without inventing a capacity measurement.
+pub async fn flash_capacity<T: Instance, M: Mode, const N: usize>(
+    flash: &mut Flash<'_, T, M, N>,
+) -> Result<Option<u32>, embassy_rp::flash::Error> {
+    for attempt in 0..3 {
+        match detect_flash_capacity(flash) {
+            Ok(capacity) => return Ok(Some(capacity)),
+            Err(embassy_rp::flash::Error::OutOfBounds) => {
+                return Err(embassy_rp::flash::Error::OutOfBounds);
+            }
+            Err(_) if attempt < 2 => embassy_time::Timer::after_millis(10).await,
+            Err(_) => (),
+        }
+    }
+    Ok(None)
+}

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/cordial-protocol", "crates/cordial-core", "crates/cordial-client", "crates/cordial-cli", "adapters/record-storage", "adapters/usb", "adapters/btstack", "adapters/ble-hid"]
-exclude = ["platforms/pico", "platforms/esp32s3"]
+exclude = ["platforms/pico", "platforms/esp32s3", "vendor/littlefs2"]
 
 [workspace.package]
 version = "0.0.0"

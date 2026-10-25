@@ -450,14 +450,23 @@ impl<F: Fleet> Model<F> {
         }
         let connected = self.devices.iter().filter(|d| d.connected()).count();
         let adapters = self.adapters.iter().filter(|a| a.connected()).count();
-        b.line(Line::from(vec![
-            span(connected.to_string(), title()),
-            span(" Connected   ", dim()),
-            span(self.devices.len().to_string(), bold()),
-            span(" Paired   ", dim()),
-            span(adapters.to_string(), bold()),
-            span(" Adapters", dim()),
-        ]));
+        // Device counts are shown once every connected adapter has listed its devices.
+        let listed = self
+            .adapters
+            .iter()
+            .filter(|a| a.connected())
+            .all(|a| self.devices_listed(&a.id));
+        let mut counts = Vec::new();
+        if listed {
+            counts = vec![
+                span(connected.to_string(), title()),
+                span(" Connected   ", dim()),
+                span(self.devices.len().to_string(), bold()),
+                span(" Paired   ", dim()),
+            ];
+        }
+        counts.extend([span(adapters.to_string(), bold()), span(" Adapters", dim())]);
+        b.line(Line::from(counts));
 
         let alerts = self.alerts();
         if !alerts.is_empty() {
@@ -518,7 +527,7 @@ impl<F: Fleet> Model<F> {
         for a in &self.adapters {
             let (status, attention) = a.status_text();
             let mut right = Line::default();
-            if a.connected() {
+            if a.connected() && self.devices_listed(&a.id) {
                 let paired = self.devices.iter().filter(|d| d.adapter == a.id).count();
                 let on = self
                     .devices

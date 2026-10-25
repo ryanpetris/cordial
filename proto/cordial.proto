@@ -203,6 +203,11 @@ message Status {
   // INTERFACES counts USB interfaces actually exposed; limit is the compiled interface maximum.
   // Every interface of a multi-interface function counts. Other USB resource limits can cause
   // allocation errors even when this count is below its limit.
+  // STORAGE uses raw bytes: count is a best-effort estimate of filesystem allocation in use;
+  // limit is the mounted filesystem size, excluding firmware and reserved flash regions.
+  // The estimate includes filesystem overhead and does not subtract admission reserves. Values
+  // have independent presence. Recounts after storage mutations can send Event.adapter even
+  // without a STORAGE_FULL change; these are best-effort updates, not per-write notifications.
   // USB allocation prefers lower priorities: serial 0x00; keyboard/mouse required by a connected
   // device 0x41; HID gamepad selected by a connected device 0x42; XInput selected by a connected
   // device 0x43; enabled editor used by a connected device's selected profile 0x44; disconnected
@@ -249,6 +254,7 @@ enum ResourceType {
   RESOURCE_TYPE_MEMORY = 5;
   RESOURCE_TYPE_OUTPUTS = 6;
   RESOURCE_TYPE_LAYERS = 7;
+  RESOURCE_TYPE_STORAGE = 8;
 }
 
 // What the Dongle supports for one transport. Per-transport limits and capabilities are added here
@@ -743,6 +749,9 @@ message AdapterInformation {
   optional string firmware_version = 1;
   optional string board_name = 2;
   optional bool development_build = 3;
+  // Validated Format.format epoch of the mounted storage. Missing when unknown, independently
+  // of Status.ready, which also depends on Bluetooth.
+  optional uint32 storage_format = 4;
 }
 
 // Read-only facts, never saved to flash. All readings belong to the current connection and

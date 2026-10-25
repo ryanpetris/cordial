@@ -1,5 +1,7 @@
 #[path = "application/gamepad_setup.rs"]
 mod gamepad_setup;
+#[path = "application/storage_telemetry.rs"]
+mod storage_telemetry;
 mod support;
 use cordial_core::model::{
     errors::ErrorCode,

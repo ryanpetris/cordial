@@ -1,4 +1,4 @@
-"""Build the selected unmodified SDK radio components as a Rust-linked archive."""
+"""Build SDK flash helpers and the selected radio components as Rust-linked archives."""
 import os
 from pathlib import Path
 import subprocess
@@ -21,8 +21,12 @@ def build(config_path, out, sdk, driver):
         f"-DPICO_HARD_FLOAT_ABI={int(config['chip'] == 'rp2350')}",
         f"-DPICO_TOOLCHAIN_PATH={gcc.parent}", "-DCMAKE_BUILD_TYPE=Release",
         f"-DCORDIAL_CONFIG_DIR={out}",
+        f"-DCORDIAL_SDK_RADIO={int(config['radio_backend'] == 'pico-sdk-cyw43')}",
     ], check=True)
-    subprocess.run(["cmake", "--build", str(out / "radio"), "--target", "cordial_radio", "-j", "4"], check=True)
+    targets = ["cordial_flash"]
+    if config["radio_backend"] == "pico-sdk-cyw43":
+        targets.append("cordial_radio")
+    subprocess.run(["cmake", "--build", str(out / "radio"), "--target", *targets, "-j", "4"], check=True)
     flags = (["-mcpu=cortex-m0plus", "-mthumb"] if config["chip"] == "rp2040" else
              ["-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv5-sp-d16"])
     libc = Path(subprocess.check_output([gcc, *flags, "-print-file-name=libc_nano.a"], text=True).strip())

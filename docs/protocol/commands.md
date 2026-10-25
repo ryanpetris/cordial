@@ -31,12 +31,13 @@ show the Dongle's error without refreshing when it refuses anyway.
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `GetStatus` | `Status` | Refreshes the free-storage estimate first. |
+| `GetStatus` | `Status` | Refreshes the storage readings first. |
 | `SetAdapter` | none | Partial update of the name, host platform, enabled transports and configuration interfaces, saved together. A name is 1..64 UTF-8 bytes without control characters, trimmed; `""` restores the firmware default. Transport updates apply in order; one for a transport the firmware does not support returns `ERROR_CODE_UNSUPPORTED` and changes nothing. Any transport may be disabled, including all of them. An unchanged value writes nothing. A platform change reconfigures special-key translation on every connected device with HID++ on and re-applies its saved settings. Disabling a transport closes its links, fails a pairing over it that has not saved its bond with `ERROR_CODE_UNSUPPORTED`, drops it from a running scan (ending the scan when no transport is left), stops reconnecting its devices and declines their connections, and makes its saved devices inactive with `INACTIVE_REASON_TRANSPORT_DISABLED`. Enabling it makes them eligible again: after the response, the Dongle reads their saved records in the background, and a `device` event reports each device that becomes resident. Configuration interface changes are described under [Profiles](#profiles). |
 | `EnterBootloader` | none | Development firmware only. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. After responding, the Dongle stops reading requests, releases held input, and reboots into ROM programming mode (BOOTSEL on Pico, download mode on ESP32-S3) within about 250 ms. Saved data is untouched. |
 
 An `adapter` event follows any change to the name, platform, enabled transports, configuration
-interfaces, readiness or adapter information.
+interfaces, readiness or adapter information. Best-effort storage recounts also report changes
+to storage byte counts or their presence.
 
 ## Discovery and pairing
 

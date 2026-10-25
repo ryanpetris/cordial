@@ -6,7 +6,7 @@ use cordial_cli::{
     error::Error,
     runner::{Options, Script},
 };
-use cordial_protocol::{self as p, ErrorCode};
+use cordial_protocol::{self as p, ErrorCode, ResourceType};
 use serde_json::Value;
 use std::{
     fs,
@@ -210,7 +210,14 @@ fn flag_parser_rejects_nonfinite_and_preserves_quoted_os_arguments() {
 
 #[test]
 fn one_shot_status_skips_readiness_and_json_prints_protobuf_messages() {
-    let dongle = Dongle::with(|sim| sim.status = common::status(false));
+    let dongle = Dongle::with(|sim| {
+        let mut status = common::status(false);
+        status.information.as_mut().unwrap().storage_format = Some(0);
+        status
+            .resources
+            .push(common::resource(ResourceType::Storage, None, Some(65_536)));
+        sim.status = status;
+    });
     let (result, out, _) = script(&dongle, &["adapter", "status"], false, b"");
     result.unwrap();
     assert!(
@@ -218,7 +225,11 @@ fn one_shot_status_skips_readiness_and_json_prints_protobuf_messages() {
         "{out}"
     );
     assert!(out.contains("  Firmware: 1.2.3"), "{out}");
+    assert!(out.contains("  Storage Format: 0\n"), "{out}");
+    assert!(out.contains("  Storage: Up to 64.0 KiB\n"), "{out}");
     assert!(out.contains("  Ready: no"), "{out}");
+    // The saved devices aren't listed, so they aren't counted.
+    assert!(!out.contains("Saved Devices"), "{out}");
     assert!(!dongle.sent().contains(&"list_devices"));
 
     let (result, out, _) = script(&dongle, &["adapter", "status"], true, b"");
@@ -230,6 +241,16 @@ fn one_shot_status_skips_readiness_and_json_prints_protobuf_messages() {
     assert_eq!(lines.len(), 1, "{out}");
     assert_eq!(lines[0]["response"]["status"]["name"], "Desk");
     assert_eq!(lines[0]["response"]["status"]["id"], "ADAPTER01");
+    let status = &lines[0]["response"]["status"];
+    assert_eq!(status["information"]["storage_format"], 0, "{status}");
+    let storage = status["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["type"] == "RESOURCE_TYPE_STORAGE")
+        .unwrap();
+    assert_eq!(storage["limit"], 65_536);
+    assert!(storage.get("count").is_none(), "{storage}");
 }
 
 #[test]

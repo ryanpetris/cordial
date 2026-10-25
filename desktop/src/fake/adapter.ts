@@ -379,7 +379,7 @@ export function demoCandidates(): Candidate[] {
   ];
 }
 
-const BOARDS: Record<string, string> = { pico_w: "Pico W", pico2_w: "Pico 2 W", esp32s3_8mb: "ESP32-S3", waveshare_rp2350b_plus_w: "RP2350B-Plus-W" };
+const BOARDS: Record<string, string> = { pico_w: "Pico W", pico2_w: "Pico 2 W", esp32s3: "ESP32-S3", waveshare_rp2350b_plus_w: "RP2350B-Plus-W" };
 const TRANSPORT = { classic: Transport.CLASSIC, ble: Transport.BLE } as const;
 const INTERFACE = { via: ConfigurationInterface.VIA, vial: ConfigurationInterface.VIAL } as const;
 const OUTPUT = { disabled: OutputMode.DISABLED, hid: OutputMode.HID, xinput: OutputMode.XINPUT } as const;
@@ -465,6 +465,9 @@ export class FakeAdapter implements ByteStream {
   readonly defaultName: string;
   ready: boolean;
   storageFull = false;
+  /** Storage in use and the filesystem's size, in bytes; null while unknown. */
+  storageUsed: number | null = 24576;
+  storageTotal: number | null = 524288;
   readonly usbInterfaces: number;
   maxEnabled: number;
   /** Requests received in this session, for assertions. */
@@ -549,7 +552,7 @@ export class FakeAdapter implements ByteStream {
     this.#latency = options.latency ?? 0;
     this.#settingJobMs = options.settingJobMs ?? 0;
     this.profileSupport = options.profileSupport ?? this.board !== "pico_w";
-    this.gamepadOutputs = options.gamepadOutputs ?? this.board !== "esp32s3_8mb";
+    this.gamepadOutputs = options.gamepadOutputs ?? this.board !== "esp32s3";
     this.profiles = this.profileSupport ? (options.profiles ?? []) : [];
     if (!this.profileSupport) for (const d of this.devices) d.profiles = [];
     this.interfaces = {
@@ -790,7 +793,10 @@ export class FakeAdapter implements ByteStream {
       platform: upper(Platform, this.platform),
       ready: this.ready,
       errors: this.errors(),
-      resources: [{ type: ResourceType.INTERFACES, count: this.#usb.exposed.length, limit: this.usbInterfaces }],
+      resources: [
+        { type: ResourceType.INTERFACES, count: this.#usb.exposed.length, limit: this.usbInterfaces },
+        { type: ResourceType.STORAGE, count: this.storageUsed ?? undefined, limit: this.storageTotal ?? undefined },
+      ],
       transports: this.transports.map((t) => ({
         transport: TRANSPORT[t],
         enabled: this.enabled[t],
@@ -799,7 +805,7 @@ export class FakeAdapter implements ByteStream {
           { type: ResourceType.CONNECTIONS, count: this.devices.filter((d) => d.transport === t && d.state === "connected").length, limit: this.maxEnabled },
         ],
       })),
-      information: { firmwareVersion: "0.0.0-dev", boardName: this.board, developmentBuild: true },
+      information: { firmwareVersion: "0.0.0-dev", boardName: this.board, developmentBuild: true, storageFormat: 1 },
       outputSupport: this.gamepadOutputs
         ? [{
             role: Role.GAMEPAD,
@@ -995,7 +1001,7 @@ export class FakeAdapter implements ByteStream {
     this.#event({ case: "device", value: this.record(d) });
   }
 
-  changeAdapter(patch: { ready?: boolean; storageFull?: boolean; memoryBudget?: number }) {
+  changeAdapter(patch: { ready?: boolean; storageFull?: boolean; memoryBudget?: number; storageUsed?: number | null; storageTotal?: number | null }) {
     Object.assign(this, patch);
     this.#load(null);
     this.#event({ case: "adapter", value: this.status() });

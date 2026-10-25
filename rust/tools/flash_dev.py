@@ -5,8 +5,6 @@ No production-write path exists. Verification uses embedded metadata, UF2
 addresses/family, and the mounted volume's physical USB identity.
 """
 import argparse
-import ctypes
-import fcntl
 import hashlib
 import json
 import os
@@ -16,7 +14,7 @@ import struct
 import subprocess
 import sys
 
-from firmware_artifact import MAGIC, FAMILIES, inspect as inspect_manifest
+from firmware_artifact import MAGIC, FAMILIES, image_capacity, inspect as inspect_manifest
 FLASH_BASE = 0x10000000
 
 
@@ -79,11 +77,11 @@ def inspect_uf2(data):
     manifest = inspect_manifest(payload)
     if manifest["chip"] not in FAMILIES:
         raise ValueError("UF2 requires a Pico processor")
-    flash, storage = manifest["flash_bytes"], manifest["storage_offset"]
-    errata_bytes = 4096 if manifest["chip"] == "rp2350" else 0
-    if addresses[-1] + 256 > FLASH_BASE + storage:
+    extent = (addresses[-1] + 256 - FLASH_BASE + 4095) // 4096 * 4096
+    if extent > image_capacity(manifest):
         raise ValueError("Image overlaps persistent storage or exceeds flash")
-    expected_absolute = FLASH_BASE + flash - 256 if errata_bytes else None
+    expected_absolute = (FLASH_BASE + manifest["firmware_bytes"] - 256
+                         if manifest["chip"] == "rp2350" else None)
     if absolute_address != expected_absolute:
         raise ValueError("Missing, misplaced or unexpected RP2350-E10 workaround block")
     if families != {FAMILIES[manifest["chip"]]}:
@@ -119,178 +117,7 @@ def mounted_target(mount, chip):
     return mount, os.makedev(major, minor), usb
 
 
-class _USBControl(ctypes.Structure):
-    _fields_ = [("request_type", ctypes.c_uint8), ("request", ctypes.c_uint8),
-                ("value", ctypes.c_uint16), ("index", ctypes.c_uint16),
-                ("length", ctypes.c_uint16), ("timeout", ctypes.c_uint32),
-                ("data", ctypes.c_void_p)]
-
-
-class _USBBulk(ctypes.Structure):
-    _fields_ = [("endpoint", ctypes.c_uint), ("length", ctypes.c_uint),
-                ("timeout", ctypes.c_uint), ("data", ctypes.c_void_p)]
-
-
-class _PicoBoot:
-    """Linux usbfs transport for the SDK's boot/picoboot.h ROM protocol."""
-
-    def __init__(self, usb, chip):
-        self.fd = None
-        self.interface = None
-        self.token = 0
-        try:
-            bus = int((usb / "busnum").read_text())
-            address = int((usb / "devnum").read_text())
-            major, minor = map(int, (usb / "dev").read_text().split(":"))
-            self.fd = os.open(f"/dev/bus/usb/{bus:03}/{address:03}", os.O_RDWR | os.O_NOFOLLOW)
-            if os.fstat(self.fd).st_rdev != os.makedev(major, minor):
-                raise ValueError("BOOTSEL USB node changed during verification")
-            descriptor = self.control(0x80, 6, 0x0100, 0, 18)
-            pid = 0x0003 if chip == "rp2040" else 0x000f
-            if (len(descriptor) != 18 or descriptor[:2] != b"\x12\x01" or
-                    struct.unpack_from("<HH", descriptor, 8) != (0x2e8a, pid)):
-                raise ValueError("PICOBOOT handle is not the expected processor")
-            config = self.control(0x80, 6, 0x0200, 0, 9)
-            if len(config) != 9 or config[:2] != b"\x09\x02":
-                raise ValueError("Invalid BOOTSEL USB configuration")
-            size = struct.unpack_from("<H", config, 2)[0]
-            if not 9 <= size <= 4096:
-                raise ValueError("Invalid BOOTSEL USB configuration length")
-            config = self.control(0x80, 6, 0x0200, 0, size)
-            if len(config) != size or self.control(0x80, 8, 0, 0, 1) != config[5:6]:
-                raise ValueError("BOOTSEL USB configuration changed")
-            interface, self.out_ep, self.in_ep = self.find_interface(config)
-            fcntl.ioctl(self.fd, 0x8004550f, struct.pack("I", interface))  # USBDEVFS_CLAIMINTERFACE
-            self.interface = interface
-        except BaseException:
-            self.close()
-            raise
-
-    @staticmethod
-    def find_interface(config):
-        matches, endpoints, current = [], [], None
-        offset = 0
-        while offset < len(config):
-            length = config[offset]
-            if length < 2 or offset + length > len(config):
-                raise ValueError("Malformed BOOTSEL USB descriptor")
-            desc = config[offset:offset + length]
-            offset += length
-            if desc[1] == 4:
-                if current is not None:
-                    matches.append((current, endpoints))
-                current, endpoints = None, []
-                if length == 9 and desc[3] == 0 and desc[4:7] == b"\x02\xff\x00" and desc[7] == 0:
-                    current = desc[2]
-            elif desc[1] == 5 and current is not None:
-                if length != 7 or desc[3] & 3 != 2:
-                    raise ValueError("PICOBOOT endpoint is not bulk")
-                endpoints.append(desc[2])
-        if current is not None:
-            matches.append((current, endpoints))
-        if len(matches) != 1:
-            raise ValueError("Cannot identify one PICOBOOT interface")
-        interface, endpoints = matches[0]
-        outputs = [ep for ep in endpoints if not ep & 0x80 and ep & 15]
-        inputs = [ep for ep in endpoints if ep & 0x80 and ep & 15]
-        if len(endpoints) != 2 or len(outputs) != 1 or len(inputs) != 1:
-            raise ValueError("Invalid PICOBOOT endpoints")
-        return interface, outputs[0], inputs[0]
-
-    def control(self, request_type, request, value, index, size):
-        buffer = ctypes.create_string_buffer(size)
-        transfer = _USBControl(request_type, request, value, index, size, 3000, ctypes.addressof(buffer))
-        count = fcntl.ioctl(self.fd, 0xc0005500 | ctypes.sizeof(transfer) << 16, transfer)
-        if not 0 <= count <= size:
-            raise OSError("Invalid USB control response length")
-        return buffer.raw[:count]
-
-    def bulk(self, endpoint, data, size):
-        buffer = ctypes.create_string_buffer(data, max(size, 1))
-        transfer = _USBBulk(endpoint, size, 10000, ctypes.addressof(buffer))
-        count = fcntl.ioctl(self.fd, 0xc0005502 | ctypes.sizeof(transfer) << 16, transfer)
-        if not 0 <= count <= size:
-            raise OSError("Invalid USB bulk response length")
-        return buffer.raw[:count]
-
-    def command(self, command, args=b"", read_size=0):
-        self.token += 1
-        packet = struct.pack("<IIBBHI16s", 0x431fd10b, self.token, command, len(args), 0, read_size, args)
-        if len(self.bulk(self.out_ep, packet, len(packet))) != len(packet):
-            raise OSError("Short PICOBOOT command write")
-        result = self.bulk(self.in_ep, b"", read_size) if read_size else b""
-        if len(result) != read_size:
-            raise OSError("Short PICOBOOT read")
-        if self.bulk(self.out_ep if command & 0x80 else self.in_ep, b"", 0 if command & 0x80 else 1):
-            raise OSError("Invalid PICOBOOT acknowledgement")
-        status = self.control(0xc1, 0x42, 0, self.interface, 16)
-        if len(status) != 16 or struct.unpack_from("<IIBB", status) != (self.token, 0, command, 0):
-            raise OSError("PICOBOOT command did not complete successfully")
-        return result
-
-    def close(self):
-        if self.fd is not None:
-            try:
-                if self.interface is not None:
-                    fcntl.ioctl(self.fd, 0x80045510, struct.pack("I", self.interface))  # USBDEVFS_RELEASEINTERFACE
-            finally:
-                os.close(self.fd)
-                self.fd = None
-
-
-def check_development_storage(data, hardware, usb, clear=False):
-    verified = verify_development(data, hardware)
-    start = FLASH_BASE + verified["storage_offset"]
-    size = verified["storage_bytes"]
-    boot = _PicoBoot(usb, verified["chip"])
-    try:
-        for endpoint in (boot.out_ep, boot.in_ep):
-            fcntl.ioctl(boot.fd, 0x80045515, struct.pack("I", endpoint))
-        boot.control(0x41, 0x41, 0, boot.interface, 0)
-        boot.command(0x01, b"\x01")
-        try:
-            boot.command(0x06)  # ROM flash reads/erases require XIP disabled.
-            def read(address, length=4096):
-                return boot.command(0x84, struct.pack("<II", address, length), length)
-            first = read(FLASH_BASE)
-            if first == b"\xff" * 4096:
-                # Only a wholly blank board permits first provisioning.
-                for offset in range(4096, verified["flash_bytes"], 4096):
-                    if read(FLASH_BASE + offset) != b"\xff" * 4096:
-                        raise ValueError("Existing flash is unrecognized; use coordinated manual provisioning")
-            else:
-                try:
-                    installed = inspect_manifest(first)
-                except (ValueError, UnicodeError) as error:
-                    raise ValueError("Installed image has no current manifest; use coordinated manual provisioning") from error
-                for field in ("chip", "package", "hardware_digest", "flash_bytes", "bluetooth_backend",
-                              "usb_backend", "storage_backend", "storage_offset", "storage_bytes", "storage_identity"):
-                    if installed[field] != verified[field]:
-                        raise ValueError(f"Installed {field} differs; use coordinated manual provisioning")
-                marker = read(start, 32)
-                if marker != bytes.fromhex(verified["storage_identity"]):
-                    if marker != b"\xff" * 32 or any(read(address) != b"\xff" * 4096
-                            for address in range(start, start + size, 4096)):
-                        raise ValueError("Stored layout differs; use coordinated manual provisioning")
-            if clear:
-                # Keep the recognized marker until the data erase completes, so
-                # an interrupted explicit clear can be retried normally.
-                for address in reversed(range(start, start + size, 4096)):
-                    boot.command(0x03, struct.pack("<II", address, 4096))
-                    if read(address) != b"\xff" * 4096:
-                        raise OSError("Storage erase readback failed; no firmware was written")
-
-        finally:
-            boot.command(0x01, b"\x00")
-    finally:
-        boot.close()
-
-
-def clear_development_storage(data, hardware, usb):
-    check_development_storage(data, hardware, usb, clear=True)
-
-
-def write_development(data, manifest, mount, clear_storage=False):
+def write_development(data, manifest, mount):
     # Recheck artifact policy inside the sole write function too.
     verified = verify_development(data, manifest["hardware"])
     mount, device_number, usb = mounted_target(mount, verified["chip"])
@@ -298,9 +125,6 @@ def write_development(data, manifest, mount, clear_storage=False):
     try:
         if os.fstat(directory).st_dev != device_number:
             raise ValueError("Mount changed during verification")
-        check_development_storage(data, verified["hardware"], usb, clear=clear_storage)
-        if mounted_target(mount, verified["chip"]) != (mount, device_number, usb):
-            raise ValueError("Mount changed after storage check; no firmware was written")
         fd = os.open("CORDIAL.UF2", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644, dir_fd=directory)
         try:
             remaining = memoryview(data)
@@ -325,19 +149,15 @@ def main():
     parser.add_argument("--hardware", required=True, help="board the artifact must be built for, such as pico2_w")
     parser.add_argument("--mount", type=Path)
     parser.add_argument("--write", action="store_true", help="write after artifact and USB identity checks; otherwise inspect only")
-    parser.add_argument("--clear-storage", action="store_true",
-                        help="with --write, erase saved bonds/configuration using ROM PICOBOOT before writing firmware")
     args = parser.parse_args()
     try:
-        if args.clear_storage and not args.write:
-            raise ValueError("--clear-storage requires --write")
         data = args.uf2.read_bytes()
         manifest = verify_development(data, args.hardware)
         print(json.dumps({"artifact": str(args.uf2), "sha256": hashlib.sha256(data).hexdigest(), "manifest": manifest}, indent=2))
         if args.write:
             if args.mount is None:
                 raise ValueError("--write requires --mount")
-            write_development(data, manifest, args.mount, args.clear_storage)
+            write_development(data, manifest, args.mount)
             print("Development UF2 written. Check USB enumeration before attempting another write.")
         return 0
     except SubmissionUnconfirmed as error:

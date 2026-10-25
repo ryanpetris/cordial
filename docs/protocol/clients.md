@@ -86,7 +86,7 @@ before using the CLI.
 | CLI command | Behavior |
 | --- | --- |
 | `adapter list` / `adapter select PORT` | List attached adapters, or switch to one. |
-| `adapter status` | Identity, readiness, platform, and each supported transport with whether it is enabled and its limits. |
+| `adapter status` | Identity, readiness, platform, storage format and usage, and each supported transport with whether it is enabled and its limits. Device counts appear once the saved devices are listed. |
 | `adapter set name NAME` / `adapter reset name` | Save the adapter name, or restore the firmware default. Quote names containing spaces. |
 | `adapter set platform linux\|windows\|mac` | Save the host platform. |
 | `adapter set transport classic\|ble enabled on\|off` | Enable or disable a transport. Lists only the transports the firmware supports. |
@@ -273,6 +273,8 @@ The desktop application uses the same commands and session rules as the CLI.
   `ERROR_CODE_PROFILE_MEMORY_EXCEEDED` or `ERROR_CODE_PROFILE_LOAD_FAILED`. Each notification
   resets after its condition clears. Device errors appear on Diagnostics.
 - Adapters open on Details, with Settings, Profiles when the adapter supports them, and Diagnostics.
+  Details shows storage usage from `RESOURCE_TYPE_STORAGE`, and Diagnostics shows the storage
+  format, each only while the adapter reports it.
   Profiles lists every profile, each with an icon for each role it changes, and the configuration
   interfaces, each with its own switch and profile. The profile picker reads the complete list.
   Changes on Settings and Profiles stay staged across tabs until Save sends them together in one request; a

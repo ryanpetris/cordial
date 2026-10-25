@@ -47,7 +47,7 @@ class GeneratedConfigTests(unittest.TestCase):
                         config.generate(selected, out)
                         expected = {"metadata.rs", "board.rs"}
                         expected |= {"partitions.csv", "sdkconfig.defaults"} if esp else {"memory.x"}
-                        if backend == "pico-sdk-cyw43":
+                        if not esp:
                             expected.add("cordial.h")
                         self.assertEqual({p.name for p in out.iterdir()}, expected)
                         before = self.snapshot(out)
@@ -55,7 +55,7 @@ class GeneratedConfigTests(unittest.TestCase):
                         self.assert_outputs(out, before)
 
     def test_config_changes_update_affected_outputs(self):
-        for name in ("pico2_w", "esp32s3_8mb"):
+        for name in ("pico2_w", "esp32s3"):
             raw = json.loads((config.ROOT / "boards" / f"{name}.json").read_text())
             with self.subTest(board=name), tempfile.TemporaryDirectory() as temp:
                 path, out = Path(temp, "board.json"), Path(temp, "generated")
@@ -63,8 +63,7 @@ class GeneratedConfigTests(unittest.TestCase):
                 config.generate(config.load(path, "development"), out)
                 layout_outputs = {"metadata.rs", "board.rs"}
                 layout_outputs |= {"partitions.csv", "sdkconfig.defaults"} if raw["chip"] == "esp32s3" else {"memory.x"}
-                changes = [({"default_adapter_name": "Desk adapter"}, {"board.rs"}),
-                           ({"firmware_bytes": raw["firmware_bytes"] + 65536}, layout_outputs)]
+                changes = [({"default_adapter_name": "Desk adapter"}, {"board.rs"})]
                 if raw["chip"] != "esp32s3":
                     changes.append(({"radio": raw["radio"] | {"clock": 28}},
                                     {"board.rs", "cordial.h", "metadata.rs"}))
@@ -76,7 +75,7 @@ class GeneratedConfigTests(unittest.TestCase):
                     self.assert_outputs(out, before, outputs)
 
     def test_version_changes_update_metadata_only(self):
-        for name in ("pico2_w", "esp32s3_8mb"):
+        for name in ("pico2_w", "esp32s3"):
             board = config.load(config.ROOT / "boards" / f"{name}.json", "production")
             with self.subTest(board=name), tempfile.TemporaryDirectory() as temp, \
                     patch.dict(os.environ, CORDIAL_VERSION="1.2.3"):
@@ -89,7 +88,7 @@ class GeneratedConfigTests(unittest.TestCase):
                 self.assertIn('const FIRMWARE_VERSION: &str = "1.2.4";', (out / "metadata.rs").read_text())
 
     def test_esp_native_sources_and_headers_invalidate_defaults(self):
-        board = config.load(config.ROOT / "boards/esp32s3_8mb.json", "development")
+        board = config.load(config.ROOT / "boards/esp32s3.json", "development")
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(esp_config, "__file__", str(Path(temp, "tools/esp_config.py"))):
             components = Path(temp, "platforms/esp32s3/components/native")
@@ -113,7 +112,7 @@ class GeneratedConfigTests(unittest.TestCase):
                     self.assert_outputs(out, before)
 
     def test_build_preserves_generated_config_and_repairs_changed_board_json(self):
-        for name in ("pico2_w", "esp32s3_8mb"):
+        for name in ("pico2_w", "esp32s3"):
             board = config.ROOT / "boards" / f"{name}.json"
             with self.subTest(board=name), tempfile.TemporaryDirectory() as temp, \
                     patch.object(build, "ROOT", Path(temp, "rust")), \
@@ -146,18 +145,60 @@ class GeneratedConfigTests(unittest.TestCase):
 
 
 class BoardConfigTests(unittest.TestCase):
+    def test_minimum_flash_capacity_generates_constants_and_manifest(self):
+        for path in sorted(config.ROOT.joinpath("boards").glob("*.json")):
+            with self.subTest(board=path.stem), tempfile.TemporaryDirectory() as out:
+                board = config.load(path, "production")
+                minimum = board["minimum_flash_bytes"]
+                config.generate(board, out)
+                generated = Path(out, "board.rs").read_text()
+                self.assertIn(f"pub const MINIMUM_FLASH_BYTES: u32 = {minimum};", generated)
+                manifest = artifact.manifest(board)
+                self.assertEqual(manifest["minimum_flash_bytes"], minimum)
+                self.assertNotIn("flash_bytes", manifest)
+                if board["chip"] == "esp32s3":
+                    self.assertIn(f"CONFIG_ESPTOOLPY_FLASHSIZE_{minimum // 1048576}MB=y\n",
+                                  Path(out, "sdkconfig.defaults").read_text())
+                else:
+                    self.assertIn("pub const FLASH_BYTES: usize = 16777216;", generated)
+                    self.assertIn(f"#define PICO_FLASH_SIZE_BYTES {minimum}\n",
+                                  Path(out, "cordial.h").read_text())
+
+    def test_minimum_flash_capacity_field_is_required(self):
+        for name in ("pico_w", "esp32s3"):
+            raw = json.loads((config.ROOT / "boards" / f"{name}.json").read_text())
+            missing = dict(raw)
+            minimum = missing.pop("minimum_flash_bytes")
+            for invalid in (missing, missing | {"flash_bytes": minimum}, raw | {"flash_bytes": minimum}):
+                with self.subTest(board=name, fields=sorted(invalid)), tempfile.TemporaryDirectory() as out:
+                    path = Path(out, "board.json")
+                    path.write_text(json.dumps(invalid))
+                    with self.assertRaisesRegex(ValueError, "requires exactly"):
+                        config.load(path, "production")
+
+    def test_pico_linker_reserves_e10_inside_the_firmware_area(self):
+        for name, origin, size in (("pico_w", 0x10000100, 0xfff00),
+                                   ("pico2_w", 0x10000000, 0x1ff000),
+                                   ("waveshare_rp2350b_plus_w", 0x10000000, 0x1ff000)):
+            board = config.load(config.ROOT / "boards" / (name + ".json"), "production")
+            with tempfile.TemporaryDirectory() as out:
+                config.generate(board, out)
+                self.assertIn(f"FLASH : ORIGIN = {origin:#x}, LENGTH = {size}",
+                              Path(out, "memory.x").read_text())
+                self.assertIn("Firmware exceeds its reserved image area", Path(out, "memory.x").read_text())
+                self.assertEqual(board["storage_bytes"], board["minimum_flash_bytes"] - board["firmware_bytes"])
+
     def test_generic_esp_preset_uses_internal_ram_and_preserves_storage(self):
-        board = config.load(config.ROOT / "boards/esp32s3_8mb.json", "production")
-        self.assertEqual(board["name"], "esp32s3_8mb")
+        board = config.load(config.ROOT / "boards/esp32s3.json", "production")
+        self.assertEqual(board["name"], "esp32s3")
         self.assertEqual(board["default_adapter_name"], "ESP32-S3")
         self.assertIsNone(board["mcu_led"])
-        self.assertEqual(board["flash_bytes"], 8388608)
+        self.assertEqual(board["minimum_flash_bytes"], 4194304)
         self.assertEqual(board["firmware_bytes"], 2097152)
         self.assertEqual(board["profile_memory_budget"], 40960)
         self.assertEqual(board["storage_offset"], 2097152)
-        self.assertEqual(board["storage_bytes"], 6291456)
-        self.assertEqual(board["storage_identity"].hex(),
-                         "7af0b00fd614e5dfc523cba0f6cf2cf871b59483d4b339fe35856d06f1cbaf2a")
+        self.assertEqual(board["storage_bytes"], 2097152)
+        self.assertEqual(len(board["storage_identity"]), 32)
         self.assertEqual((board["bluetooth_backend"], board["radio_backend"],
                           board["usb_backend"], board["storage_backend"]),
                          ("esp-nimble", "esp-idf", "embassy", "littlefs"))
@@ -165,13 +206,13 @@ class BoardConfigTests(unittest.TestCase):
             config.generate(board, out)
             generated = Path(out, "board.rs").read_text()
             self.assertIn('DEFAULT_ADAPTER_NAME: &str = "ESP32-S3";', generated)
-            self.assertIn('HARDWARE: &str = "esp32s3_8mb";', generated)
+            self.assertIn('HARDWARE: &str = "esp32s3";', generated)
             self.assertIn("MCU_LED: Option<(u8, bool)> = None;", generated)
 
     def test_bluetooth_limits_and_esp_controller_activities(self):
         from bluetooth_config import generate, limits
         for name, expected in (("pico_w", (2, 8)), ("pico2_w", (6, 14)),
-                               ("waveshare_rp2350b_plus_w", (6, 14)), ("esp32s3_8mb", (0, 8))):
+                               ("waveshare_rp2350b_plus_w", (6, 14)), ("esp32s3", (0, 8))):
             path = config.ROOT / "boards" / f"{name}.json"
             board = config.load(path, "development")
             self.assertEqual(limits(board), expected)
@@ -209,7 +250,7 @@ class BoardConfigTests(unittest.TestCase):
 
     def test_profile_memory_budget_is_generated_without_changing_identity(self):
         presets = {"pico_w": None, "pico2_w": 40960, "waveshare_rp2350b_plus_w": 40960,
-                   "esp32s3_8mb": 40960}
+                   "esp32s3": 40960}
         for name, expected in presets.items():
             board = config.ROOT / "boards" / f"{name}.json"
             raw = json.loads(board.read_text())
@@ -255,14 +296,14 @@ class BoardConfigTests(unittest.TestCase):
                     self.assertIn("#define CYW43_DEFAULT_PIN_WL_CLOCK 47", header)
                     self.assertIn("#define CYW43_DEFAULT_PIN_WL_DATA_IN 16", header)
                 else:
-                    self.assertFalse((out / "cordial.h").exists())
+                    self.assertTrue((out / "cordial.h").exists())
             self.assertEqual(len(identities), 1)
             path.write_text(json.dumps(preset | {"radio_backend": "esp-idf"}))
             with self.assertRaisesRegex(ValueError, "Pico requires"):
                 config.load(path, "development")
 
     def test_esp_backend_selection_preserves_wiring_and_separates_storage(self):
-        preset = json.loads((config.ROOT / "boards/esp32s3_8mb.json").read_text())
+        preset = json.loads((config.ROOT / "boards/esp32s3.json").read_text())
         digests, layouts = set(), set()
         choices = {"btstack": "BT_CONTROLLER_ONLY", "esp-nimble": "BT_NIMBLE_ENABLED"}
         with tempfile.TemporaryDirectory() as temp:
@@ -280,14 +321,14 @@ class BoardConfigTests(unittest.TestCase):
                     self.assertIn("CONFIG_BT_NIMBLE_GATT_SERVER=y\n", sdk)
                 for other in set(choices.values()) - {choice}:
                     self.assertIn(f"CONFIG_{other}=n\n", sdk)
-                self.assertIn("cordial_layout,data,0x40,0x200000,0x1000", (out / "partitions.csv").read_text())
-                self.assertIn("cordial_app,data,0x83,0x201000,0x5ff000", (out / "partitions.csv").read_text())
+                self.assertEqual((out / "partitions.csv").read_text().splitlines()[1:],
+                                 ["phy_init,data,phy,0xf000,0x1000", "factory,app,factory,0x10000,0x1f0000"])
                 digests.add(board["hardware_digest"])
                 layouts.add(board["storage_identity"])
             self.assertEqual(len(digests), 1)
             self.assertEqual(len(layouts), 1)
             for change in ({"bluetooth_backend": "other"}, {"xosc_hz": 12000000},
-                           {"flash_bytes": 3 * 1048576}, {"mcu_led": {"pin":19,"active_low":True}},
+                           {"minimum_flash_bytes": 3 * 1048576}, {"mcu_led": {"pin":19,"active_low":True}},
                            {"mcu_led": {"pin":33,"active_low":False}}, {"radio": {}}):
                 path.write_text(json.dumps(preset | change))
                 with self.assertRaises(ValueError):
@@ -305,7 +346,7 @@ class BoardConfigTests(unittest.TestCase):
                 self.assertIn(f"$p.PIN_{board['radio']['data']}", generated)
                 self.assertIn("LENGTH = 65536", Path(out, "memory.x").read_text())
         pico = config.load(config.ROOT / "boards/pico_w.json", "production")
-        self.assertEqual(pico["hardware_digest"], "22410797341ffa56e16b6cc87598d2c23820dacd176b988d38dc8b73f4583d30")
+        self.assertEqual(pico["hardware_digest"], "ffdb0d6b84422d4068ada7bfef928f7ad3a0f9bb59b161037bbd0a06dc230f77")
         raw = json.loads((config.ROOT / "boards/waveshare_rp2350b_plus_w.json").read_text())
         raw["name"] = "custom_rp2350"
         raw["radio"] = {"power": 40, "data": 16, "clock": 47, "cs": 41, "led": None}

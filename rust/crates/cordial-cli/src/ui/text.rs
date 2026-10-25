@@ -376,14 +376,31 @@ pub fn usb_capacity(st: &p::Status) -> Vec<(ErrorCode, &'static str)> {
         .collect()
 }
 
-/// A resource's usage in a few words: "3 of 7", or what is known of it.
-pub fn capacity_text(r: &p::ResourceCapacity) -> String {
-    match (r.count, r.limit) {
-        (Some(count), Some(limit)) => format!("{count} of {limit}"),
-        (Some(count), None) => count.to_string(),
-        (None, Some(limit)) => format!("Up to {limit}"),
-        (None, None) => "Unknown".into(),
-    }
+/// A resource's usage in a few words: "3 of 7", or what is known of it; None when nothing is.
+pub fn capacity_text(r: &p::ResourceCapacity) -> Option<String> {
+    usage(r, |n| n.to_string())
+}
+
+/// The adapter's storage usage in bytes, as `capacity_text` words it.
+pub fn storage_text(st: &p::Status) -> Option<String> {
+    usage(
+        model::resource(&st.resources, ResourceType::Storage)?,
+        bytes,
+    )
+}
+
+fn usage(r: &p::ResourceCapacity, unit: impl Fn(u64) -> String) -> Option<String> {
+    Some(match (r.count, r.limit) {
+        (Some(count), Some(limit)) => format!("{} of {}", unit(count.into()), unit(limit.into())),
+        (Some(count), None) => unit(count.into()),
+        (None, Some(limit)) => format!("Up to {}", unit(limit.into())),
+        (None, None) => return None,
+    })
+}
+
+/// The validated format of the adapter's mounted storage.
+pub fn storage_format(st: &p::Status) -> Option<u32> {
+    st.information.as_ref()?.storage_format
 }
 
 /// Short explanations of integration and setting failures, as device and
@@ -758,81 +775,60 @@ pub fn up_words(up: &Up) -> String {
     }
 }
 
-/// The HID++ version a device reported, as details show it.
-pub fn hidpp_protocol_text(d: &p::Device) -> String {
-    match (model::hidpp_version(d), model::hidpp_up(d)) {
-        (Some((major, minor)), _) => format!("{major}.{minor}"),
-        (None, Up::Unsupported(_)) => "Unavailable".into(),
-        (None, Up::Starting) => "Checking".into(),
-        _ => "Unknown".into(),
-    }
+/// The HID++ version a device reported, as "4.5".
+pub fn hidpp_protocol_text(d: &p::Device) -> Option<String> {
+    model::hidpp_version(d).map(|(major, minor)| format!("{major}.{minor}"))
 }
 
-/// The security of a device's current link. Only a connected device has one, so a report
-/// left over from an earlier link is never shown.
-pub fn link_security(d: &p::Device) -> Option<Option<&p::Security>> {
-    model::connected(d).then_some(d.security.as_ref())
+/// The reported security of a device's current link. Only a connected device has one, so a
+/// report left over from an earlier link is never shown.
+pub fn link_security(d: &p::Device) -> Option<&p::Security> {
+    d.security.as_ref().filter(|_| model::connected(d))
 }
 
 /// A short summary of link security: encryption and whether pairing was
-/// authenticated. Unauthenticated encryption is a valid link, not a failure,
-/// and no combination is called simply secure.
-pub fn security_summary(s: Option<&p::Security>) -> &'static str {
-    let Some(s) = s else {
-        return "Security Not Reported";
-    };
-    match (s.encrypted, s.authenticated) {
-        (Some(false), _) => "Not Encrypted",
-        (None, _) => "Encryption Not Reported",
-        (Some(true), Some(true)) => "Encrypted, Authenticated",
-        (Some(true), Some(false)) => "Encrypted, Unauthenticated",
-        (Some(true), None) => "Encrypted",
-    }
+/// authenticated, or None while encryption isn't reported. Unauthenticated
+/// encryption is a valid link, not a failure, and no combination is called
+/// simply secure.
+pub fn security_summary(s: &p::Security) -> Option<&'static str> {
+    Some(match (s.encrypted?, s.authenticated) {
+        (false, _) => "Not Encrypted",
+        (true, Some(true)) => "Encrypted, Authenticated",
+        (true, Some(false)) => "Encrypted, Unauthenticated",
+        (true, None) => "Encrypted",
+    })
 }
 
-/// What a link property reports: a yes/no fact, a plain value such as the
-/// key length, or nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Reading {
-    Yes,
-    No,
-    Value,
-    NotReported,
-}
-
-/// One link property: its name, the value in words, and what it reports.
+/// One link property: its name and its value in words.
 pub struct SecurityFact {
     pub label: &'static str,
     pub value: String,
-    pub reading: Reading,
 }
 
-/// Every link security property, each marked when not reported. Key length
-/// is a number, not a verdict, so no length is marked as approved.
-pub fn security_facts(s: &p::Security) -> [SecurityFact; 4] {
-    let flag = |label, v: Option<bool>| SecurityFact {
-        label,
-        value: v
-            .map_or("Not Reported", |b| if b { "Yes" } else { "No" })
-            .into(),
-        reading: match v {
-            Some(true) => Reading::Yes,
-            Some(false) => Reading::No,
-            None => Reading::NotReported,
-        },
-    };
+/// The link security properties the device reported. Key length is a number, not a verdict,
+/// so no length is marked as approved.
+pub fn security_facts(s: &p::Security) -> Vec<SecurityFact> {
+    let flag = |b| if b { "Yes" } else { "No" }.to_owned();
     [
-        flag("Encryption", s.encrypted),
-        flag("Authenticated Pairing (MITM Protection)", s.authenticated),
-        flag("Secure Connections", s.secure_connections),
-        SecurityFact {
-            label: "Encryption Key",
-            value: s
-                .key_size
-                .map_or("Not Reported".into(), |b| format!("{} bits", b * 8)),
-            reading: s.key_size.map_or(Reading::NotReported, |_| Reading::Value),
-        },
+        ("Encryption", s.encrypted.map(flag)),
+        (
+            "Authenticated Pairing (MITM Protection)",
+            s.authenticated.map(flag),
+        ),
+        ("Secure Connections", s.secure_connections.map(flag)),
+        (
+            "Encryption Key",
+            s.key_size.map(|b| format!("{} bits", b * 8)),
+        ),
     ]
+    .into_iter()
+    .filter_map(|(label, value)| {
+        Some(SecurityFact {
+            label,
+            value: value?,
+        })
+    })
+    .collect()
 }
 
 /// A device's state as the CLI spells it.
@@ -876,14 +872,8 @@ pub fn device_line(d: &p::Device) -> String {
     if let Some(reason) = model::inactive(d).filter(|r| *r != InactiveReason::Disabled) {
         let _ = write!(line, " inactive={}", model::token(reason.as_str_name()));
     }
-    if let Some(s) = link_security(d) {
-        let words = match s {
-            Some(_) => security_summary(s)
-                .to_lowercase()
-                .replace(", ", ",")
-                .replace(' ', "-"),
-            None => "not-reported".into(),
-        };
+    if let Some(words) = link_security(d).and_then(security_summary) {
+        let words = words.to_lowercase().replace(", ", ",").replace(' ', "-");
         let _ = write!(line, " security={words}");
     }
     if let Some(e) = model::last_error(d) {
@@ -929,19 +919,24 @@ pub fn candidate_line(c: &p::Candidate) -> String {
     )
 }
 
-/// `adapter status` for the shell.
-pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String {
+/// `adapter status` for the shell. Device counts need the saved devices, once listed.
+pub fn adapter_info(port: &str, st: &p::Status, devices: Option<&[p::Device]>) -> String {
     let mut b = format!("Adapter {}", safe(&st.id));
     let mut field = |key: &str, value: &str| {
         let _ = write!(b, "\n  {key}: {}", safe(value));
     };
-    field("Port", port);
+    if !port.is_empty() {
+        field("Port", port);
+    }
     let information = st.information.clone().unwrap_or_default();
     if let Some(v) = &information.firmware_version {
         field("Firmware", v);
     }
     if let Some(v) = &information.board_name {
         field("Board", v);
+    }
+    if let Some(v) = information.storage_format {
+        field("Storage Format", &v.to_string());
     }
     field("Name", &display(&st.name));
     field("Platform", &platform_token(st.platform()));
@@ -958,6 +953,9 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
         "Storage Full",
         &yes_no(model::storage_full(st)).to_lowercase(),
     );
+    if let Some(v) = storage_text(st) {
+        field("Storage", &v);
+    }
     for (_, label) in usb_capacity(st) {
         field("USB", label);
     }
@@ -973,15 +971,17 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
             transports.join(", ")
         },
     );
-    field("Saved Devices", &devices.len().to_string());
-    field(
-        "Connected Devices",
-        &devices
-            .iter()
-            .filter(|d| model::connected(d))
-            .count()
-            .to_string(),
-    );
+    if let Some(devices) = devices {
+        field("Saved Devices", &devices.len().to_string());
+        field(
+            "Connected Devices",
+            &devices
+                .iter()
+                .filter(|d| model::connected(d))
+                .count()
+                .to_string(),
+        );
+    }
     for t in model::enabled_transports(st) {
         let Some(r) = model::enabled_devices(st, t) else {
             continue;
@@ -997,8 +997,10 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
         };
         field(&format!("Enabled Places ({})", transport_name(t)), &value);
     }
-    if let Some(r) = model::resource(&st.resources, ResourceType::Interfaces) {
-        field("USB Interfaces", &capacity_text(r).to_lowercase());
+    if let Some(v) =
+        model::resource(&st.resources, ResourceType::Interfaces).and_then(capacity_text)
+    {
+        field("USB Interfaces", &v.to_lowercase());
     }
     for m in model::gamepad_support(st) {
         let Some(r) = model::resource(&m.resources, ResourceType::Slots) else {
@@ -1034,14 +1036,15 @@ pub fn device_info(d: &p::Device) -> String {
         field("Roles", &roles.join(", "));
     }
     field("State", &state_token(d));
-    match link_security(d) {
-        None => field("Link Security", "not connected"),
-        Some(None) => field("Link Security", security_summary(None)),
-        Some(Some(s)) => {
-            field("Link Security", security_summary(Some(s)));
-            for f in security_facts(s) {
-                field(&format!("  {}", f.label), &f.value);
-            }
+    if let Some(s) = link_security(d) {
+        // The facts sit under the summary when there is one.
+        let summary = security_summary(s);
+        if let Some(words) = summary {
+            field("Link Security", words);
+        }
+        let indent = if summary.is_some() { "  " } else { "" };
+        for f in security_facts(s) {
+            field(&format!("{indent}{}", f.label), &f.value);
         }
     }
     field("Bluetooth", &enablement_words(d));
@@ -1049,7 +1052,9 @@ pub fn device_info(d: &p::Device) -> String {
     field("Blocked", &yes_no(d.blocked).to_lowercase());
     field("Reconnect", if d.paused { "paused" } else { "automatic" });
     field("Logitech Features", on_off(model::hidpp_enabled(d)));
-    field("HID++ Protocol", &hidpp_protocol_text(d));
+    if let Some(v) = hidpp_protocol_text(d) {
+        field("HID++ Protocol", &v);
+    }
     field("HID++ Status", &up_words(&model::hidpp_up(d)));
     if model::gamepad(d) {
         let mode = model::gamepad_mode(d).map_or("Unknown", output_mode_name);
@@ -1105,26 +1110,9 @@ impl Battery {
     pub fn low(&self) -> bool {
         self.percent.is_some_and(|p| p <= 10)
     }
-    /// For details: "80%" or "Unknown".
-    pub fn percent_words(&self) -> String {
-        match self.percent {
-            Some(p) => format!("{p}%"),
-            None => "Unknown".into(),
-        }
-    }
-    /// For details: "Yes", "No" or "Unknown".
-    pub fn charging_words(&self) -> String {
-        match self.charging {
-            Some(c) => yes_no(c).into(),
-            None => "Unknown".into(),
-        }
-    }
-    /// For device lists: "80%" or "?", with a mark only while charging.
+    /// For device lists: "80%", with a mark only while charging; empty when neither applies.
     pub fn compact(&self, charging: &str) -> String {
-        let mut text = match self.percent {
-            Some(p) => format!("{p}%"),
-            None => "?".into(),
-        };
+        let mut text = self.percent.map(|p| format!("{p}%")).unwrap_or_default();
         if self.charging == Some(true) {
             text.push_str(charging);
         }
@@ -1195,8 +1183,7 @@ pub fn identity(info: Option<&p::DeviceInformation>) -> Vec<(&'static str, Strin
 }
 
 /// The reported information in display order: the battery's charge and charging, the identity,
-/// then the readings this build knows. With either battery value reported, both rows are shown
-/// and an unknown one reads "Unknown". A vendor ID is read with its namespace, on one row.
+/// then the readings this build knows. A vendor ID is read with its namespace, on one row.
 pub fn info_rows(info: Option<&p::DeviceInformation>) -> Vec<InfoRow> {
     let mut rows: Vec<InfoRow> = Vec::new();
     let mut row = |label: &str, value: String| {
@@ -1206,8 +1193,12 @@ pub fn info_rows(info: Option<&p::DeviceInformation>) -> Vec<InfoRow> {
         })
     };
     if let Some(b) = battery(info) {
-        row("Battery", b.percent_words());
-        row("Charging", b.charging_words());
+        if let Some(p) = b.percent {
+            row("Battery", format!("{p}%"));
+        }
+        if let Some(c) = b.charging {
+            row("Charging", yes_no(c).into());
+        }
     }
     let identity = identity(info);
     let registry = identity
@@ -1228,9 +1219,9 @@ pub fn info_rows(info: Option<&p::DeviceInformation>) -> Vec<InfoRow> {
     rows
 }
 
-/// A device's battery for `device list`, or None when it reports none.
+/// A device's battery for `device list`, or None when it reports neither charge nor charging.
 pub fn battery_list(d: &p::Device) -> Option<String> {
-    Some(battery(d.information.as_ref())?.compact("(charging)"))
+    Some(battery(d.information.as_ref())?.compact("(charging)")).filter(|b| !b.is_empty())
 }
 
 pub fn scan_summary(count: u32, error: Option<&p::Error>) -> String {
@@ -1340,6 +1331,18 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
+/// Bytes in use for `adapter status`: "1.0 KiB of 4.0 KiB in use", or what is known of it.
+fn bytes_in_use(r: &p::ResourceCapacity) -> Option<String> {
+    Some(match (r.count, r.limit) {
+        (Some(used), Some(total)) => {
+            format!("{} of {} in use", bytes(used.into()), bytes(total.into()))
+        }
+        (Some(used), None) => format!("{} in use", bytes(used.into())),
+        (None, Some(total)) => bytes(total.into()),
+        (None, None) => return None,
+    })
+}
+
 /// One `file list` row: type, size and name, tab-separated.
 pub fn file_line(e: &p::FileEntry) -> String {
     format!(
@@ -1355,8 +1358,8 @@ pub fn file_line(e: &p::FileEntry) -> String {
 pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> String {
     match outcome {
         Outcome::Status(status) => {
-            let (port, devices) =
-                state.map_or(("", &[][..]), |s| (s.port.as_str(), &s.devices[..]));
+            let port = state.map_or("", |s| s.port.as_str());
+            let devices = state.filter(|s| s.loaded).map(|s| &s.devices[..]);
             let mut b = adapter_info(port, status, devices);
             b.push_str(&profile_fields(status, state));
             b
@@ -1537,23 +1540,8 @@ fn profile_fields(status: &p::Status, state: Option<&State>) -> String {
         return String::new();
     }
     let mut b = String::new();
-    let memory = profiles::resource(status, ResourceType::Memory);
-    match memory.map(|m| (m.count, m.limit)) {
-        Some((Some(used), Some(budget))) => {
-            let _ = write!(
-                b,
-                "\n  Profile Memory: {} of {} in use",
-                bytes(used.into()),
-                bytes(budget.into())
-            );
-        }
-        Some((Some(used), None)) => {
-            let _ = write!(b, "\n  Profile Memory: {} in use", bytes(used.into()));
-        }
-        Some((None, Some(budget))) => {
-            let _ = write!(b, "\n  Profile Memory: {}", bytes(budget.into()));
-        }
-        _ => {}
+    if let Some(v) = profiles::resource(status, ResourceType::Memory).and_then(bytes_in_use) {
+        let _ = write!(b, "\n  Profile Memory: {v}");
     }
     if let Some(max) = profiles::max_layers(status) {
         let _ = write!(b, "\n  Profiles Per Device: {max}");
@@ -1895,7 +1883,7 @@ mod tests {
         );
 
         let mut status = p::Status::default();
-        assert!(!adapter_info("", &status, &[]).contains("Gamepad"));
+        assert!(!adapter_info("", &status, None).contains("Gamepad"));
         let slots = |count, limit| {
             vec![p::ResourceCapacity {
                 r#type: ResourceType::Slots as i32,
@@ -1920,7 +1908,7 @@ mod tests {
                 },
             ],
         }];
-        let info = adapter_info("", &status, &[]);
+        let info = adapter_info("", &status, None);
         assert!(
             info.ends_with("\n  Gamepad Slots (HID): 2 of 4\n  Gamepad Slots (XInput): at most 4"),
             "{info}"
@@ -1981,7 +1969,6 @@ mod tests {
             .collect();
         let expected = [
             ("Battery", "0%"),
-            ("Charging", "Unknown"),
             ("Manufacturer", "Logi"),
             ("Vendor ID", "0x046D (Bluetooth)"),
             ("Product ID", "0xB023"),
@@ -2195,6 +2182,7 @@ mod tests {
                 firmware_version: Some("1.0".into()),
                 board_name: None,
                 development_build: Some(false),
+                storage_format: Some(0),
             }),
             transports: vec![p::TransportSupport {
                 transport: Transport::Ble as i32,
@@ -2212,7 +2200,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let info = adapter_info("", &status, &[]);
+        let info = adapter_info("", &status, None);
         assert!(info.contains("\n  Firmware: 1.0\n"), "{info}");
         assert!(!info.contains("Board"));
         assert!(info.contains("\n  Storage Full: no"));
@@ -2228,7 +2216,7 @@ mod tests {
             err(ErrorCode::UsbRequiredCapacityExceeded),
             err(ErrorCode::UsbReservedCapacityExceeded),
         ];
-        let info = adapter_info("", &status, &[]);
+        let info = adapter_info("", &status, None);
         assert!(info.contains("\n  Storage Full: yes"));
         assert!(
             info.contains("\n  Error: storage_full: the adapter's storage is full\n"),
@@ -2238,13 +2226,143 @@ mod tests {
             info.contains("\n  USB: Required Capacity Exceeded\n  USB: Reserved Capacity Exceeded")
         );
         status.errors = vec![err(ErrorCode::UsbReservedCapacityExceeded)];
-        let info = adapter_info("", &status, &[]);
+        let info = adapter_info("", &status, None);
         assert!(!info.contains("Required") && info.contains("Reserved Capacity Exceeded"));
         let line = event_line(&event::Kind::Adapter(status), false, &[], None).unwrap();
         assert!(
             line.ends_with(" errors=usb_reserved_capacity_exceeded"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn adapter_status_shows_what_is_known_of_storage() {
+        let storage = |count, limit| p::ResourceCapacity {
+            r#type: ResourceType::Storage as i32,
+            count,
+            limit,
+        };
+        let mut st = State::default();
+        let info = adapter_info("", &st.status, None);
+        assert!(!info.contains("Storage Format") && !info.contains("Storage:"));
+        assert!(
+            !info.contains("Port") && !info.contains("Devices:"),
+            "{info}"
+        );
+        st.event(&event::Kind::Adapter(p::Status {
+            information: Some(p::AdapterInformation {
+                storage_format: Some(0),
+                ..Default::default()
+            }),
+            resources: vec![storage(Some(0), Some(0))],
+            ..Default::default()
+        }));
+        st.port = "simulated".into();
+        let status = Outcome::Status(st.status.clone());
+        let info = outcome(&Command::Status, &status, Some(&st));
+        // Zero is known, and saved devices are counted only once listed.
+        assert!(info.contains("\n  Port: simulated\n"), "{info}");
+        assert!(info.contains("\n  Storage Format: 0\n"), "{info}");
+        assert!(info.contains("\n  Storage: 0 B of 0 B\n"), "{info}");
+        assert!(!info.contains("Saved Devices") && !info.contains("Connected Devices"));
+        st.loaded = true;
+        let info = outcome(&Command::Status, &status, Some(&st));
+        assert!(
+            info.contains("\n  Saved Devices: 0\n  Connected Devices: 0"),
+            "{info}"
+        );
+        // Each value is shown without the other.
+        st.event(&event::Kind::Adapter(p::Status {
+            resources: vec![storage(Some(12_288), None)],
+            ..Default::default()
+        }));
+        let info = adapter_info("", &st.status, None);
+        assert!(info.contains("\n  Storage: 12.0 KiB\n"), "{info}");
+        assert!(!info.contains("Storage Format"));
+        st.status.resources = vec![storage(None, Some(1_048_576))];
+        let info = adapter_info("", &st.status, None);
+        assert!(info.contains("\n  Storage: Up to 1.0 MiB\n"), "{info}");
+        st.status.resources = vec![storage(None, None)];
+        assert!(!adapter_info("", &st.status, None).contains("Storage:"));
+    }
+
+    #[test]
+    fn unknown_device_facts_are_left_out() {
+        let mut d = p::Device {
+            id: 1,
+            state: DeviceState::Connected as i32,
+            integrations: vec![p::Integration {
+                kind: p::IntegrationKind::Hidpp as i32,
+                enabled: true,
+                status: Some(p::integration::Status::State(
+                    p::IntegrationState::Starting as i32,
+                )),
+                ..Default::default()
+            }],
+            information: Some(p::DeviceInformation {
+                battery: Some(p::BatteryInformation {
+                    level: None,
+                    charging: Some(false),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let info = device_info(&d);
+        assert!(!info.contains("HID++ Protocol"), "{info}");
+        assert!(info.contains("\n  HID++ Status: Setting Up"), "{info}");
+        assert!(
+            !info.contains("Link Security") && !info.contains("Battery"),
+            "{info}"
+        );
+        assert!(info.contains("\n  Charging: No"), "{info}");
+        let line = device_line(&d);
+        assert!(!line.contains("security=") && !line.contains("hidpp-protocol"));
+        assert_eq!(battery_list(&d), None);
+        d.information.as_mut().unwrap().battery = Some(p::BatteryInformation {
+            level: None,
+            charging: Some(true),
+        });
+        assert_eq!(battery_list(&d).as_deref(), Some("(charging)"));
+        d.security = Some(p::Security {
+            encrypted: Some(false),
+            secure_connections: Some(false),
+            ..Default::default()
+        });
+        let info = device_info(&d);
+        assert!(
+            info.contains(
+                "\n  Link Security: Not Encrypted\n    Encryption: No\n    Secure Connections: No\n"
+            ),
+            "{info}"
+        );
+        assert!(!info.contains("Not Reported"), "{info}");
+        assert!(device_line(&d).contains(" security=not-encrypted"));
+        // Unreported encryption has no summary, but the other reported facts stay.
+        d.security = Some(p::Security {
+            authenticated: Some(false),
+            key_size: Some(16),
+            ..Default::default()
+        });
+        let info = device_info(&d);
+        assert!(
+            info.contains(
+                "\n  Authenticated Pairing (MITM Protection): No\n  Encryption Key: 128 bits\n"
+            ),
+            "{info}"
+        );
+        assert!(
+            !info.contains("Link Security") && !info.contains("Encryption:"),
+            "{info}"
+        );
+        assert!(!info.contains("Not Reported"), "{info}");
+        assert!(!device_line(&d).contains("security="));
+        d.security = Some(p::Security::default());
+        assert!(!device_info(&d).contains("Link Security"));
+        assert!(!device_line(&d).contains("security="));
+        // A disconnected device's security belongs to an earlier link.
+        d.state = DeviceState::Disconnected as i32;
+        assert!(!device_info(&d).contains("Link Security"));
     }
 
     #[test]

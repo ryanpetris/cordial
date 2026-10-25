@@ -80,6 +80,8 @@ export interface AdapterInformation {
   firmwareVersion: string | null;
   boardName: string | null;
   developmentBuild: boolean | null;
+  /** The validated format of the adapter's mounted storage. */
+  storageFormat: number | null;
 }
 
 /** Facts from the device's current connection; each is null while unknown, including while

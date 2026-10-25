@@ -19,6 +19,7 @@ import {
   hasError,
   reasonText,
   storageFull,
+  storageText,
 } from "../../shared/text.ts";
 import { useAction } from "../api.ts";
 import type { Selection } from "../App.tsx";
@@ -207,6 +208,7 @@ export function AdapterPage({
   const threshold = state.preferences.lowBatteryPercent;
   const transports = s?.transports ?? [];
   const usbInterfaces = resource(s?.resources, "interfaces");
+  const storage = s ? storageText(s) : null;
   const usbErrors = USB_CAPACITY.filter(([code]) => hasError(s?.errors, code));
   const enabledDevices = s?.transports.flatMap((t) => {
     const r = resource(t.resources, "devices");
@@ -376,6 +378,7 @@ export function AdapterPage({
             <Card title="Identifiers">
               <Facts>
                 <Fact label="Adapter ID">{adapter.id}</Fact>
+                {s?.information.storageFormat != null ? <Fact label="Storage Format">{s.information.storageFormat}</Fact> : null}
               </Facts>
             </Card>
           </>
@@ -449,6 +452,7 @@ export function AdapterPage({
                 <Facts>
                   <Fact label="Firmware">{s.information.firmwareVersion ?? "Unknown"}</Fact>
                   {s.information.boardName !== null ? <Fact label="Board">{s.information.boardName}</Fact> : null}
+                  {storage !== null ? <Fact label="Storage">{storage}</Fact> : null}
                 </Facts>
               </Card>
             ) : null}

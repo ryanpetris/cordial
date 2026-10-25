@@ -7,19 +7,21 @@
 | `pico_w` | Classic HID and BLE through BTstack | No |
 | `pico2_w` | Classic HID and BLE through BTstack | Yes |
 | `waveshare_rp2350b_plus_w` | Classic HID and BLE through BTstack | Yes |
-| `esp32s3_8mb` | BLE through ESP-NimBLE or BTstack | Yes |
+| `esp32s3` | BLE through ESP-NimBLE or BTstack | Yes |
 
-Board definitions live in `rust/boards/`. They specify pins, flash allocation, clock settings,
+Board definitions live in `rust/boards/`. They specify pins, minimum flash capacity, clock settings,
 backends and `profile_memory_budget`: the bytes of RAM for loaded [input
 profiles](input-profiles.md), or `null` to build without them. The Pico W preset leaves profiles
 out to keep its limited RAM for connections. The other presets budget 40 KiB for loaded profiles,
 shared across connections.
+`minimum_flash_bytes` is the image's minimum flash requirement and the fallback when runtime
+capacity discovery is unsupported. Detected capacity determines the filesystem size.
 Bluetooth pool sizes derive from the same `CORDIAL_CONFIG` for Rust and C. See
 [Bluetooth capacity](protocol/limits-and-errors.md#bluetooth-capacity) for the independent transport
 allowances and pairing reserve. Pico presets use `pico-sdk-cyw43`; `embassy-cyw43` is also supported.
-The `esp32s3_8mb` preset uses `esp-nimble` and `esp-idf`.
+The `esp32s3` preset uses `esp-nimble` and `esp-idf`.
 
-`esp32s3_8mb` targets ESP32-S3 boards with 8 MiB flash and native USB connected to the host.
+`esp32s3` targets ESP32-S3 boards with at least 4 MiB flash and native USB connected to the host.
 It reserves 2 MiB for firmware and budgets 40 KiB of internal RAM for loaded profiles.
 
 The [Seeed Studio XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/),
@@ -174,7 +176,7 @@ adapter. Changes in Settings last until the server stops.
 
 ```sh
 make firmware BOARD=pico_w
-make firmware BOARD=esp32s3_8mb PROFILE=production
+make firmware BOARD=esp32s3 PROFILE=production
 make firmware-all
 ```
 
@@ -219,18 +221,13 @@ provide overflow detection.
 storage-preserving development updates. See its `--help` for identity and mount
 arguments. ESP32-S3 uses its ROM download protocol and the regions in `flash.json`.
 
-Firmware updates within one storage format, named by the layout identity in the
-[storage format](storage-format.md), preserve saved bonds, identities and
-preferences. Firmware never opens or reformats storage of another format, so
-the adapter cannot become ready with incompatible storage. A first installation
-provisions storage only when the whole storage range is blank. For a first installation on flash
-not known to be blank, or an update from another storage format, erase the board's whole flash
-before flashing it: on RP2040 and RP2350 boards in BOOTSEL mode with `picotool erase` (picotool 2.0
-or later), then copy the UF2; on the ESP32-S3 with `esptool --chip esp32s3 erase_flash` before
-`write_flash`. The adapter then starts with a new Bluetooth identity and no
-saved devices, so pair each device again, removing the adapter from the device
-first where it keeps a pairing. `flash_dev.py` refuses an update whose storage
-layout differs from the installed image's, including with `--clear-storage`.
+Startup mounts storage and checks the epoch in `Format.format` before using saved
+configuration. Invalid filesystems or essential roots and incompatible epochs
+reset the filesystem automatically. Driver I/O failures keep storage unavailable.
+Compatible updates at the same filesystem start preserve saved data and can grow
+the filesystem to the detected capacity. See the [storage format](storage-format.md)
+for reservations, recovery and the one-time Pico storage reset on chips of at
+least 4 MiB.
 
 ### Versioning and release packages
 
@@ -361,7 +358,7 @@ Clippy for the firmware platform crates runs in the firmware images, for one boa
 profile or for all of them:
 
 ```sh
-make check-firmware BOARD=esp32s3_8mb PROFILE=production
+make check-firmware BOARD=esp32s3 PROFILE=production
 make check-firmware-all
 ```
 

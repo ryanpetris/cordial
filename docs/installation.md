@@ -60,19 +60,14 @@ restarting into the bootloader from the app.
 | Raspberry Pi Pico W | `pico_w` |
 | Raspberry Pi Pico 2 W | `pico2_w` |
 | Waveshare RP2350B-Plus-W | `waveshare_rp2350b_plus_w` |
-| ESP32-S3 with 8 MiB flash and native USB | `esp32s3_8mb` |
+| ESP32-S3 with at least 4 MiB flash and native USB | `esp32s3` |
 
 ### First installation
 
-Cordial sets up its storage only when that part of the flash is blank. If the board's flash is not
-known to be blank, erase it before flashing Cordial for the first time. Otherwise the adapter may
-not be able to set up its storage. Erasing removes the existing firmware and saved data. Updates
-within the current storage format keep saved devices and preferences without erasing flash. See
-[building](building.md#firmware) for details.
-
-- RP2040 and RP2350 boards: run `picotool erase` (picotool 2.0 or later) with the board in
-  BOOTSEL mode.
-- ESP32-S3: run `esptool --chip esp32s3 erase_flash` with the board in download mode.
+Cordial initializes storage at startup. Invalid or incompatible saved storage
+resets automatically, including saved devices and preferences. Compatible
+updates preserve saved data. See the [storage format](storage-format.md) for
+recovery and the one-time Pico storage reset on chips of at least 4 MiB.
 
 ### RP2040 and RP2350 boards
 
@@ -82,7 +77,7 @@ within the current storage format keep saved devices and preferences without era
 
 ### ESP32-S3
 
-The ESP32-S3 image needs 8 MiB flash and a USB connection wired to the chip's native USB
+The ESP32-S3 image needs at least 4 MiB flash and a USB connection wired to the chip's native USB
 peripheral. Boards that meet these requirements include the
 [Seeed Studio XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/),
 [M5Stack Atom S3](https://docs.m5stack.com/en/core/AtomS3) and
@@ -99,13 +94,13 @@ Enter the board's download mode:
   connector for normal operation.
 
 Flash it with [esptool](https://docs.espressif.com/projects/esptool/) from the extracted
-`esp32s3_8mb-esp-nimble-esp-idf` folder:
+`esp32s3-esp-nimble-esp-idf` folder:
 
 ```sh
 esptool --chip esp32s3 write_flash \
   0x0 bootloader.bin \
   0x8000 partition-table.bin \
-  0x10000 cordial-esp32s3_8mb-esp-nimble-esp-idf.bin
+  0x10000 cordial-esp32s3-esp-nimble-esp-idf.bin
 ```
 
 After flashing, unplug the board and plug it back in.

@@ -8,6 +8,7 @@ import {
   FunctionRowMode,
   IntegrationKind,
   KeyboardPlatform,
+  ResourceType,
   SettingState,
   SettingsObjectSchema,
   SettingsUpdateSchema,
@@ -138,9 +139,21 @@ describe("information", () => {
       resources: [{ type: 1, limit: 16 }],
       profileSupport: { resources: [{ type: 5, count: 0, limit: 0 }] },
     }));
-    expect(s.information).toEqual({ firmwareVersion: "1.0.0", boardName: null, developmentBuild: false });
+    expect(s.information).toEqual({ firmwareVersion: "1.0.0", boardName: null, developmentBuild: false, storageFormat: null });
     expect(s.resources).toEqual([{ type: "interfaces", count: null, limit: 16 }]);
     expect(s.profileSupport!.resources).toEqual([{ type: "memory", count: 0, limit: 0 }]);
+  });
+
+  it("reads storage usage and format, keeping zero apart from unknown", () => {
+    const storage = (count?: number, limit?: number) =>
+      convert.status(create(StatusSchema, { information: { storageFormat: 0 }, resources: [{ type: ResourceType.STORAGE, count, limit }] }));
+    const zero = storage(0, 0);
+    expect(zero.information.storageFormat).toBe(0);
+    expect(zero.resources).toEqual([{ type: "storage", count: 0, limit: 0 }]);
+    expect(storage(4096).resources).toEqual([{ type: "storage", count: 4096, limit: null }]);
+    expect(storage(undefined, 8192).resources).toEqual([{ type: "storage", count: null, limit: 8192 }]);
+    expect(storage().resources).toEqual([{ type: "storage", count: null, limit: null }]);
+    expect(convert.status(create(StatusSchema, {})).information.storageFormat).toBeNull();
   });
 
   it("keeps error details it doesn't know as numbers, so distinct errors stay distinct", () => {

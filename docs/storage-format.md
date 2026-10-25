@@ -1,47 +1,133 @@
 # Current persistent format
 
-The application uses upstream LittleFS through `littlefs2` 0.8.1 on Pico and
-ESP32-S3. The layout identity is `littlefs-2`. Each file holds one protobuf
-message from [`proto/storage.proto`](../proto/storage.proto). There is no
-migration or automatic reformat on a read failure, and storage of another layout
-identity stays unopened until the board is re-flashed with its flash erased, as
-[building](building.md#firmware) describes.
-Application data and Bluetooth bonds use the common filesystem. The ESP32-S3
-partition table has no NVS partition.
+Pico and ESP32-S3 use LittleFS through a local `littlefs2` 0.8.1 patch for runtime
+block counts. Each file holds one protobuf message from
+[`proto/storage.proto`](../proto/storage.proto). Application data and Bluetooth
+bonds share the filesystem. ESP32-S3 has no NVS partition.
 
 ## Flash allocation
 
-Every erase block is 4096 bytes. Board configuration specifies `firmware_bytes`;
-storage occupies the remaining flash after platform reservations. Firmware
-linking and artifact inspection reject overlap.
+Startup detects physical flash. The firmware reservation is 1 MiB on 2 MiB chips
+and 2 MiB on chips of at least 4 MiB. The linked image end never selects the
+filesystem start. Board configuration's `minimum_flash_bytes` describes the image's
+minimum flash capacity, not the storage capacity detected at startup.
 
-| Board | Flash | Firmware reservation | LittleFS blocks | LittleFS bytes |
-| --- | ---: | ---: | ---: | ---: |
-| Pico W | 2 MiB | 1 MiB | 255 | 1,044,480 |
-| Pico 2 W | 4 MiB | 1 MiB | 766 | 3,137,536 |
-| Waveshare RP2350B-Plus-W | 16 MiB | 1 MiB | 3,838 | 15,720,448 |
-| ESP32-S3, 8 MiB | 8 MiB | 2 MiB | 1,535 | 6,287,360 |
+Every erase block is 4096 bytes. Storage starts at the reservation boundary.
+Its first sector is a guard outside LittleFS; the filesystem uses all remaining
+flash. Pico's Embassy driver addresses at most 16 MiB and rejects larger chips.
+ESP-IDF uses larger chips when its flash driver supports their addressing mode;
+otherwise storage initialization fails rather than silently reducing capacity.
 
-The first storage sector contains a 32-byte layout hash outside LittleFS.
-RP2350 also reserves its final flash sector for the ROM E10 marker. ESP uses
-`cordial_layout` subtype `0x40` and `cordial_app` subtype `0x83`. Its firmware reservation
-includes bootloader, partition table, PHY data and the application image. Its partition table is:
+RP2350 requires at least 4 MiB flash. Its E10 workaround sector occupies
+`0x1ff000..0x200000` inside the 2 MiB firmware reservation, leaving 2,093,056 bytes
+for the linked image. The UF2 writes its dedicated marker page at `0x1fff00`,
+absolute address `0x101fff00`. This is the only UF2 write allowed outside the
+ordinary image area. Link and artifact checks include page padding and sector
+erase bounds. The guard occupies `0x200000..0x201000`, and LittleFS ends at the
+physical flash end without a tail reservation.
+
+All boards try capacity discovery up to three times, with a 10 ms scheduler delay
+between failed retryable attempts. No delay follows success or the final attempt.
+Missing measurements use the board's `minimum_flash_bytes` to format fresh or
+invalid filesystems, without authorizing filesystem growth. A successful
+measurement below that minimum forbids formatting on all boards. Pico decodes
+valid JEDEC capacities below the minimum as successful measurements, not missing
+responses. Read-only discovery can still retain an existing filesystem with valid
+geometry and application roots. With a below-minimum measurement, missing or
+invalid filesystems and invalid roots return a bounds error without writes.
+
+ESP32-S3 images require at least 4 MiB and reserve 2 MiB for bootloader, partition
+table, PHY data and application. Unsupported discovery, no response and timeouts
+permit fallback after a successful raw flash read. An output populated by a failed
+probe is discarded, including failures in the SDK's operation-end hook.
+Uninitialized drivers and raw I/O errors stop storage initialization.
+The fixed on-flash partition table contains:
 
 | Name | Type | Subtype | Offset | Size |
 | --- | --- | --- | ---: | ---: |
 | `phy_init` | data | `phy` | `0xf000` | `0x1000` |
-| `factory` | app | `factory` | `0x10000` | firmware reservation minus `0x10000` |
-| `cordial_layout` | data | `0x40` | firmware reservation | `0x1000` |
-| `cordial_app` | data | `0x83` | firmware reservation plus `0x1000` | remaining flash |
+| `factory` | app | `factory` | `0x10000` | `0x1f0000` |
 
-The bootloader starts at `0x0` and the partition table at `0x8000`. The range `0x9000..0xf000` is
-unallocated. Storage occupies the end of flash and the application partition starts on a 64 KiB
-boundary, so that range cannot extend either.
+The bootloader starts at `0x0` and the partition table at `0x8000`.
+After detection, firmware registers `cordial_layout`, subtype `0x40`, at
+`0x200000` for one sector and `cordial_app`, subtype `0x83`, over the remaining
+flash from `0x201000`. Registration checks overlap with existing partitions and
+does not rewrite the on-flash table. Registration preserves the initialized
+driver's addressable range when a later measurement is smaller or unavailable.
+A successful larger measurement extends that range. The image header's minimum
+capacity does not cap storage. ESP-IDF 6.1 identifies the chip before publishing
+the default driver, then replaces its size with the image minimum. Startup decodes
+that cached ID using the selected SDK driver's density encoding to retain access
+to an expanded filesystem even when all new probes fail. Unknown encodings do not
+establish a larger extent. The cached ID supplies an I/O bound, not a growth
+measurement or format limit. Capability checks use the SDK's operation protection
+because a driver can read SFDP while checking its addressing support.
 
-Provisioning verifies the entire guard and filesystem range is erased before
-its first write. It claims the guard before formatting. A missing guard over
-nonblank storage, a mismatch, an interrupted format or a mount failure leaves
-storage unavailable. None of these failures triggers an automatic erase.
+## Startup recovery
+
+Startup mounts LittleFS and validates `Format.format` before reading saved USB
+configuration or other application data. Its epoch remains `1`; changing that
+value in firmware resets saved data. Missing, corrupt or mismatched epochs,
+invalid filesystems and invalid essential identity or sequence roots trigger one
+LittleFS format and root initialization attempt when formatting is permitted.
+Recovery never zero-fills or securely wipes flash. Driver I/O errors stop
+initialization without a format retry loop. A later boot may retry.
+
+An interrupted first initialization can resume while no devices or profiles are
+saved. An invalid essential root in an initialized store resets the whole
+filesystem so bonds cannot survive with a new adapter identity. Normal LittleFS
+power-loss recovery preserves committed records.
+
+The guard's 32-byte layout hash describes the backend and record layout,
+independently of capacity. It is repaired only after filesystem validation and
+growth succeed. A stale, missing or torn guard cannot override a valid filesystem.
+A compatible filesystem at the same start grows only when available space after
+reservations exceeds its mounted block count. Equal, smaller and unavailable
+measurements leave its geometry unchanged. This policy is common to all boards
+and does not depend on previous fallback use. Moving its start requires a reset.
+Recovery only writes the current storage range; it never erases the firmware or
+E10 sector.
+
+Pico first mounts candidate filesystems without writing, using LittleFS's CRC
+validation and persisted geometry. RP2350 inspects only the filesystem after the
+2 MiB reservation. RP2040 checks that location first, then the 1 MiB reservation
+only when the current capacity policy permits it. A reliable measurement of at
+least 4 MiB requires the 2 MiB reservation even if valid older metadata remains at
+1 MiB. A valid current filesystem at 2 MiB wins over stale metadata at 1 MiB when
+the measurement is smaller or missing.
+
+The persisted filesystem end must fit checked byte arithmetic and Pico's 16 MiB
+address window. On unchanged hardware, valid geometry retains the prior I/O
+extent. Reads and writes are bounded to that extent or a larger measured capacity
+before validation of application roots, growth, cleanup or guard repair can write.
+With no valid filesystem geometry, formatting uses only measured capacity or the
+board minimum, never the exploratory address window. With valid geometry, an
+epoch mismatch or invalid roots reset the selected Pico filesystem in place,
+using its checked extent or a larger measured capacity. This preserves the start
+and extent on later boots with missing measurements, even when the filesystem
+extends beyond the board minimum. A successful below-minimum measurement still
+forbids this reset. Actual flash I/O failures never trigger format.
+
+ESP32-S3 resets invalid roots or epochs within the measured capacity or, without
+a measurement, the board minimum. A later successful measurement can grow the
+filesystem again.
+
+The selected mount stays open through root validation and growth. With a matching
+guard, startup mounts a current 2 MiB layout once. An RP2040 filesystem at 1 MiB
+needs the preceding failed candidate mount at 2 MiB when that location fits the
+address window. Growth runs on the mounted filesystem. A stale guard requires an
+unmount for direct guard access and a remount for cleanup; guard access does not
+borrow the underlying driver while LittleFS owns it.
+
+Moving the Pico storage start from 1 MiB to 2 MiB on chips of at least 4 MiB is a
+breaking storage change and resets saved devices and preferences once. Later
+images can grow within their reserved area without resetting storage. A release
+containing this change needs a new minor version before 1.0 or a new major version
+from 1.0. Firmware downgrades are not supported.
+
+Firmware artifact schema `2` records the minimum chip capacity, stable firmware
+reservation and `detected-tail` storage policy instead of claiming fixed runtime
+geometry. Current inspection and flashing tools reject schema `1` artifacts.
 
 ## Files
 
@@ -65,7 +151,7 @@ relationships between records. Fields follow the kinds of the [compatibility
 rules](protocol/compatibility.md#fields): the firmware checks each Required field, reads a missing
 plain field as its zero value, and gives `optional` and message fields presence. Later firmware adds
 fields whose zero value or absence keeps the earlier meaning, so records gain fields without a new
-layout identity. The firmware ignores unknown fields; it leaves out entries of repeated fields
+format epoch. The firmware ignores unknown fields; it leaves out entries of repeated fields
 whose transport, integration, configuration interface or role is unknown or unspecified, and reads
 an unknown host platform as Linux. Otherwise a record whose Required field is missing or out of
 range is undecodable.
@@ -303,7 +389,7 @@ outcome that cannot be read back returns `Unknown` so application state is not p
 confirmed save.
 
 The initial sequence, with `next_device: 1` and `next_profile: 1`, is committed before the
-`initialized` marker. A missing sequence after initialization is a storage fault. Allocating an ID
+`initialized` marker. A missing sequence after initialization triggers startup recovery. Allocating an ID
 commits the sequence with the following ID before the device or profile with the allocated ID is
 published, and once every 32-bit ID has been used, allocation reports a full store. IDs are never reused, including after
 deletion; failed pairing may leave gaps.
@@ -320,9 +406,8 @@ removed before its `profile.pb` is. A failed publication with a known outcome cl
 an unknown outcome leaves the files for recovery. Startup removes record directories without their
 commit file, or with an empty one. This cleanup is best effort: its first failure ends it and
 storage opens anyway, because a directory without its commit file holds no record, and IDs are
-never reused. Only a mount failure keeps storage from opening. Native forget failure blocks the
-session. Missing roots after initialization, corrupt roots or an address mismatch prevent Bluetooth
-startup. BTstack reads cached roots, never a filesystem from inside its native root callback.
+never reused. A driver I/O failure keeps storage unavailable. Native forget failure blocks the
+session. An address mismatch prevents Bluetooth startup. BTstack reads cached roots, never a filesystem from inside its native root callback.
 
 LittleFS supplies its normal power-loss recovery and wear levelling. Block
 cycles are explicitly 500. Pairing admission leaves 32 KiB for maintenance and

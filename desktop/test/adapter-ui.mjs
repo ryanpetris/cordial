@@ -118,6 +118,28 @@ try {
   await publish(ready);
   await usbFact.getByText("Reserved Capacity Exceeded", { exact: true }).waitFor({ state: "detached" });
 
+  // Details shows whichever storage values are known; Diagnostics shows the storage format.
+  const storageFact = page.locator(".fact").filter({ has: page.locator("dt", { hasText: /^Storage$/ }) });
+  await storageFact.getByText("24.0 KiB of 512.0 KiB", { exact: true }).waitFor();
+  const resources = status.resources;
+  for (const [count, limit, text] of [[0, null, "0 B"], [null, 1048576, "Up to 1.0 MiB"], [null, null, null]]) {
+    status.resources = [...resources.filter((r) => r.type !== "storage"), { type: "storage", count, limit }];
+    await publish(ready);
+    if (text) await storageFact.getByText(text, { exact: true }).waitFor();
+    else await storageFact.waitFor({ state: "detached" });
+  }
+  status.resources = resources;
+  await publish(ready);
+  const formatFact = page.locator(".fact").filter({ has: page.locator("dt", { hasText: /^Storage Format$/ }) });
+  await tab("Diagnostics").click();
+  await formatFact.getByText("1", { exact: true }).waitFor();
+  const information = status.information;
+  status.information = { ...information, storageFormat: null };
+  await publish(ready);
+  await formatFact.waitFor({ state: "detached" });
+  status.information = information;
+  await tab("Details").click();
+
   // Diagnostics lists the adapter's errors with every detail, and the saved devices it couldn't
   // read, which Retry lists again.
   status.errors = [{ code: "storage_failed", reason: "storage", outcome: "unknown", related: [] }];

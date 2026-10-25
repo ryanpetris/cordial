@@ -151,6 +151,7 @@ pub fn status(ready: bool) -> p::Status {
             firmware_version: Some("1.2.3-dev".into()),
             board_name: None,
             development_build: Some(true),
+            storage_format: None,
         }),
         ..Default::default()
     }

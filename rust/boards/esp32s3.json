@@ -1,9 +1,9 @@
 {
-  "name": "esp32s3_8mb",
+  "name": "esp32s3",
   "default_adapter_name": "ESP32-S3",
   "chip": "esp32s3",
   "package": "esp32s3",
-  "flash_bytes": 8388608,
+  "minimum_flash_bytes": 4194304,
   "xosc_hz": 40000000,
   "radio": null,
   "mcu_led": null,

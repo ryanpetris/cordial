@@ -1590,3 +1590,211 @@ fn a_fault_while_starting_needs_attention() {
     app.click("Pico 2 W");
     assert!(app.shows("Needs Attention"), "{}", app.screen());
 }
+
+#[test]
+fn device_counts_wait_for_every_adapter_to_list_its_devices() {
+    let unlisted = |mut st: State| {
+        st.loaded = false;
+        st.devices.clear();
+        st
+    };
+    let counts = |app: &mut App| {
+        app.render()
+            .into_iter()
+            .find(|l| l.contains(" Adapters"))
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
+    };
+
+    let mut app = App::new(110, 32);
+    app.attach(vec![("/dev/ttyACM0", unlisted(second_adapter()))]);
+    assert!(
+        counts(&mut app).ends_with("│ 1 Adapters"),
+        "{}",
+        app.screen()
+    );
+    assert!(!app.shows("paired"), "{}", app.screen());
+
+    // One adapter listed and one not: no total yet, and only the listed adapter's counts.
+    let mut app = App::new(110, 32);
+    app.attach(vec![
+        ("/dev/ttyACM0", first_adapter()),
+        ("/dev/ttyACM1", unlisted(second_adapter())),
+    ]);
+    assert!(
+        counts(&mut app).ends_with("│ 2 Adapters"),
+        "{}",
+        app.screen()
+    );
+    assert!(app.shows("3 paired · 2 connected"), "{}", app.screen());
+    assert!(!app.shows("0 paired"), "{}", app.screen());
+    assert!(app.shows("Example Keys Wireless"), "{}", app.screen());
+
+    let slot = app.slot("00000000000FA002");
+    app.edit(slot, |st| *st = second_adapter());
+    app.m.tick();
+    assert!(
+        counts(&mut app).ends_with("│ 3 Connected 4 Paired 2 Adapters"),
+        "{}",
+        app.screen()
+    );
+    assert!(app.shows("1 paired · 1 connected"), "{}", app.screen());
+
+    // A listed adapter with no devices has a known count of zero.
+    let mut empty = second_adapter();
+    empty.devices.clear();
+    let mut app = App::new(110, 32);
+    app.attach(vec![("/dev/ttyACM0", empty)]);
+    assert!(
+        counts(&mut app).ends_with("│ 0 Connected 0 Paired 1 Adapters"),
+        "{}",
+        app.screen()
+    );
+    assert!(app.shows("0 paired · 0 connected"), "{}", app.screen());
+}
+
+/// The page's fact row labelled `label`, its spacing collapsed, if any.
+fn fact_line(screen: &str, label: &str) -> Option<String> {
+    screen
+        .lines()
+        .filter_map(|l| l.split_once("│ ").map(|(_, page)| page))
+        .find(|l| l.starts_with(&format!("{label} ")))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+#[test]
+fn adapter_storage_shows_what_is_known() {
+    let mut st = first_adapter();
+    st.status.information = None;
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Pico 2 W");
+    // Nothing known of the adapter itself leaves no Information section.
+    let screen = app.screen();
+    assert!(
+        !screen.contains("Information") && !screen.contains("Firmware"),
+        "{screen}"
+    );
+    app.click("Diagnostics");
+    assert!(!app.shows("Storage Format"), "{}", app.screen());
+    // A status event brings zero values, which are known.
+    let slot = app.slot("00000000000FA001");
+    let storage = |count, limit| p::ResourceCapacity {
+        r#type: p::ResourceType::Storage as i32,
+        count,
+        limit,
+    };
+    app.edit(slot, |st| {
+        st.status.information = Some(p::AdapterInformation {
+            storage_format: Some(0),
+            ..Default::default()
+        });
+        st.status.resources = vec![storage(Some(0), Some(0))];
+    });
+    app.m.tick();
+    let screen = app.screen();
+    assert_eq!(
+        fact_line(&screen, "Storage Format").as_deref(),
+        Some("Storage Format 0"),
+        "{screen}"
+    );
+    app.click("Details");
+    let screen = app.screen();
+    assert!(
+        screen.contains("Information") && !screen.contains("Firmware"),
+        "{screen}"
+    );
+    assert_eq!(
+        fact_line(&screen, "Storage").as_deref(),
+        Some("Storage 0 B of 0 B"),
+        "{screen}"
+    );
+    for (resource, shown) in [
+        (storage(Some(12_288), None), Some("Storage 12.0 KiB")),
+        (
+            storage(None, Some(1_048_576)),
+            Some("Storage Up to 1.0 MiB"),
+        ),
+        (
+            storage(Some(512), Some(2048)),
+            Some("Storage 512 B of 2.0 KiB"),
+        ),
+        (storage(None, None), None),
+    ] {
+        app.edit(slot, |st| st.status.resources = vec![resource]);
+        app.m.tick();
+        let screen = app.screen();
+        assert_eq!(fact_line(&screen, "Storage").as_deref(), shown, "{screen}");
+    }
+    assert!(!app.shows("Information"), "{}", app.screen());
+}
+
+#[test]
+fn usb_errors_show_without_an_unknown_interface_count() {
+    let mut st = first_adapter();
+    st.status.resources = vec![p::ResourceCapacity {
+        r#type: p::ResourceType::Interfaces as i32,
+        count: None,
+        limit: None,
+    }];
+    st.status.errors = vec![err(p::ErrorCode::UsbReservedCapacityExceeded)];
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Pico 2 W");
+    let screen = app.screen();
+    assert!(screen.contains("Reserved Capacity Exceeded"), "{screen}");
+    assert!(
+        !screen.contains("Interfaces") && !screen.contains("Unknown"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn device_diagnostics_leave_out_unreported_facts() {
+    let mut st = first_adapter();
+    // The mouse has HID++ without a detected version.
+    st.devices[1].security = Some(p::Security {
+        encrypted: Some(false),
+        ..Default::default()
+    });
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Example Mouse");
+    app.click("Diagnostics");
+    let screen = app.screen();
+    assert!(screen.contains("Logitech Features"), "{screen}");
+    assert!(
+        !screen.contains("HID++ Protocol") && !screen.contains("Unknown"),
+        "{screen}"
+    );
+    assert_eq!(
+        fact_line(&screen, "Encrypted").as_deref(),
+        Some("Encrypted No")
+    );
+    assert!(!screen.contains("Not Reported"), "{screen}");
+    // Unreported encryption leaves the other reported facts in place.
+    let slot = app.slot("00000000000FA001");
+    app.edit(slot, |st| {
+        st.devices[1].security = Some(p::Security {
+            authenticated: Some(false),
+            ..Default::default()
+        })
+    });
+    app.m.tick();
+    let screen = app.screen();
+    assert!(app.shows("Security"), "{screen}");
+    assert_eq!(
+        fact_line(&screen, "Authenticated Pairing").as_deref(),
+        Some("Authenticated Pairing No")
+    );
+    assert!(
+        fact_line(&screen, "Encrypted").is_none() && !screen.contains("Not Reported"),
+        "{screen}"
+    );
+    // Security that reports nothing leaves no section.
+    app.edit(slot, |st| {
+        st.devices[1].security = Some(p::Security::default())
+    });
+    app.m.tick();
+    assert!(!app.shows("Security"), "{}", app.screen());
+}

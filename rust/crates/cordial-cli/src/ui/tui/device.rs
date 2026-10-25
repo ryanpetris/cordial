@@ -803,11 +803,9 @@ impl<F: Fleet> Model<F> {
         }
         if let Some(i) = model::hidpp(&d.d) {
             b.section("Logitech Features");
-            b.fact(
-                "HID++ Protocol",
-                &words::version_text(&d.d),
-                layout::plain(),
-            );
+            if let Some(v) = text::hidpp_protocol_text(&d.d) {
+                b.fact("HID++ Protocol", &v, layout::plain());
+            }
             b.fact("Status", &words::integration_text(i), layout::plain());
         }
         if let Some(o) = model::gamepad_output(&d.d).filter(|_| model::gamepad_saved(&d.d)) {
@@ -817,11 +815,15 @@ impl<F: Fleet> Model<F> {
                 b.fact("Slot", &text::slot_number(slot), layout::plain());
             }
         }
-        if d.connected()
-            && let Some(security) = &d.d.security
-        {
+        let security =
+            d.d.security
+                .as_ref()
+                .filter(|_| d.connected())
+                .map(words::security_facts)
+                .unwrap_or_default();
+        if !security.is_empty() {
             b.section("Security");
-            for (label, value) in words::security_facts(security) {
+            for (label, value) in security {
                 b.fact(label, &value, layout::plain());
             }
         }

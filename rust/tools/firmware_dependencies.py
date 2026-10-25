@@ -77,6 +77,6 @@ if __name__ == "__main__":
     selection.add_argument("--radio", choices=("embassy-cyw43", "pico-sdk-cyw43"))
     selection.add_argument("--btstack", action="store_true")
     args = parser.parse_args()
-    paths = [prepare_btstack()] if args.btstack else (prepare_sdk() if args.radio == "pico-sdk-cyw43" else prepare())
+    paths = [prepare_btstack()] if args.btstack else (prepare_sdk() if args.radio == "pico-sdk-cyw43" else (*prepare_sdk(), *prepare()))
     for path in paths:
         print(path)

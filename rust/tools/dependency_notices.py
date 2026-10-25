@@ -52,7 +52,7 @@ def record(cargo, platform, features, target, env, output, sdk=None):
                 "sha256": hashlib.sha256(destination.read_bytes()).hexdigest()}
 
     for package in sorted(metadata["packages"], key=lambda p: (p["name"], p["version"])):
-        if package["id"] not in selected or package["source"] is None:
+        if package["id"] not in selected or (package["source"] is None and package["name"] != "littlefs2"):
             continue
         root = Path(package["manifest_path"]).parent
         prefix = f"crates/{package['name']}-{package['version']}"
@@ -82,16 +82,17 @@ def record(cargo, platform, features, target, env, output, sdk=None):
             "rijndael": "Public domain; Philip J. Erdelsky; 3rd-party/rijndael/rijndael.c header"})
     if platform == "pico":
         native[-1]["notices"].append(copy(deps.ROOT.parent / "notices/raspberry-pi-btstack.txt", "btstack/raspberry-pi.txt"))
+        pico = deps.CACHE / "pico-sdk"
+        native.append({"name": "Pico SDK flash components" if "embassy-cyw43" in features
+                       else "Pico SDK flash and radio components", "revision": deps.PICO_SDK_REVISION,
+                       "notices": [copy(pico / "LICENSE.TXT", "pico-sdk/LICENSE.TXT")]})
         if "embassy-cyw43" in features:
             firmware = deps.CACHE / "cyw43-firmware" / deps.CONTROLLER_REVISION
             native.append({"name": "CYW43439 controller assets", "revision": deps.CONTROLLER_REVISION,
                            "files": deps.CONTROLLER_FILES, "notices": [copy(
                                firmware / "LICENSE-permissive-binary-license-1.0.txt", "cyw43/LICENSE.txt")]})
         else:
-            pico = deps.CACHE / "pico-sdk"
             driver = deps.CACHE / "cyw43-driver"
-            native.append({"name": "Pico SDK radio components", "revision": deps.PICO_SDK_REVISION,
-                           "notices": [copy(pico / "LICENSE.TXT", "pico-sdk/LICENSE.TXT")]})
             native.append({"name": "CYW43 C driver", "revision": deps.CYW43_DRIVER_REVISION,
                            "notices": [copy(driver / "LICENSE", "cyw43-driver/LICENSE")]})
             blobs = driver / "firmware"

@@ -1,13 +1,10 @@
-//! Raw application flash in the `cordial_layout` and `cordial_app` partitions.
+//! Runtime partitions on the detected main flash, outside the firmware reservation.
 use cordial_core::storage::Error;
 use embedded_storage_async::nor_flash::{ErrorType, NorFlash, NorFlashErrorKind, ReadNorFlash};
 use esp_idf_sys as sys;
 use std::ops::Range;
 
-pub type Storage = cordial_record_storage::Storage<
-    Flash,
-    { ((crate::board::STORAGE_END - crate::board::STORAGE_START) / 4096 - 1) as usize },
->;
+pub type Storage = cordial_record_storage::Storage<Flash>;
 pub struct Flash {
     guard: &'static sys::esp_partition_t,
     app: &'static sys::esp_partition_t,
@@ -16,27 +13,73 @@ fn partition(
     subtype: sys::esp_partition_subtype_t,
     range: Range<u32>,
 ) -> Result<&'static sys::esp_partition_t, Error> {
-    let p = unsafe {
-        sys::esp_partition_find_first(
+    let mut p = std::ptr::null();
+    let label = if subtype == 0x40 {
+        c"cordial_layout"
+    } else {
+        c"cordial_app"
+    };
+    let code = unsafe {
+        sys::esp_partition_register_external(
+            std::ptr::null_mut(),
+            range.start as usize,
+            (range.end - range.start) as usize,
+            label.as_ptr(),
             sys::esp_partition_type_t_ESP_PARTITION_TYPE_DATA,
             subtype,
-            std::ptr::null(),
+            &mut p,
         )
-        .as_ref()
-    }
-    .ok_or(Error::Layout)?;
-    if p.address != range.start || Some(p.size) != range.end.checked_sub(range.start) {
+    };
+    if code != sys::ESP_OK {
         return Err(Error::Layout);
     }
-    Ok(p)
+    unsafe { p.as_ref() }.ok_or(Error::Layout)
 }
-pub fn open(identity: [u8; 32], range: Range<u32>) -> Result<Storage, Error> {
+pub fn open(identity: [u8; 32]) -> Result<Storage, Error> {
+    let mut capacity = 0;
+    let mut addressable = 0;
+    if unsafe {
+        sys::platform::cordial_esp_storage_capacity(
+            crate::board::MINIMUM_FLASH_BYTES,
+            &mut capacity,
+            &mut addressable,
+        )
+    } != sys::ESP_OK
+    {
+        return Err(Error::Io);
+    }
+    let range = cordial_record_storage::flash_range(addressable)?;
+    if range.start != crate::board::STORAGE_START {
+        return Err(Error::Bounds);
+    }
     let start = range.start.checked_add(4096).ok_or(Error::Bounds)?;
-    let flash = Flash {
-        guard: partition(0x40, range.start..start)?,
-        app: partition(0x83, start..range.end)?,
+    let guard = partition(0x40, range.start..start)?;
+    let app = match partition(0x83, start..range.end) {
+        Ok(p) => p,
+        Err(e) => {
+            unsafe {
+                sys::esp_partition_deregister_external(guard);
+            }
+            return Err(e);
+        }
     };
-    embassy_futures::block_on(Storage::open_or_provision_blank(flash, range, identity))
+    let flash = Flash { guard, app };
+    embassy_futures::block_on(Storage::open_with_limits(
+        flash,
+        range,
+        (capacity == 0 || capacity >= crate::board::MINIMUM_FLASH_BYTES)
+            .then_some(capacity.max(crate::board::MINIMUM_FLASH_BYTES)),
+        (capacity != 0).then_some(capacity),
+        identity,
+    ))
+}
+impl Drop for Flash {
+    fn drop(&mut self) {
+        unsafe {
+            sys::esp_partition_deregister_external(self.app);
+            sys::esp_partition_deregister_external(self.guard);
+        }
+    }
 }
 impl Flash {
     fn region(

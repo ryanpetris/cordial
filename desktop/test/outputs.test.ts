@@ -21,7 +21,7 @@ const support = (modes: AdapterStatus["outputSupport"][number]["modes"]): Adapte
   errors: [],
   resources: [],
   transports: [],
-  information: { firmwareVersion: null, boardName: null, developmentBuild: null },
+  information: { firmwareVersion: null, boardName: null, developmentBuild: null, storageFormat: null },
   profileSupport: null,
   interfaces: [],
   outputSupport: [{ role: "gamepad", modes }],
@@ -194,7 +194,7 @@ describe("Gamepad Output changes", () => {
   });
 
   it("refuses enabled modes the adapter doesn't advertise, and turns a stale choice off", async () => {
-    const fake = new FakeAdapter({ adapterId: ID, board: "esp32s3_8mb", transports: ["ble"], devices: controllers() });
+    const fake = new FakeAdapter({ adapterId: ID, board: "esp32s3", transports: ["ble"], devices: controllers() });
     const { c, state } = controller({ "/a": fake });
     await c.manager.rescan();
     await until(() => loaded(state(), 3));

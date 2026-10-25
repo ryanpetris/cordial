@@ -748,6 +748,11 @@ impl<F: Fleet> Model<F> {
         self.sessions.iter_mut().find(|s| s.id == id)
     }
 
+    /// The adapter's session has listed its saved devices.
+    fn devices_listed(&self, id: &str) -> bool {
+        self.session_of(id).is_some_and(|s| s.listed)
+    }
+
     /// A live session's view.
     pub(super) fn state_of(&self, id: &str) -> Option<&State> {
         self.states.get(&self.session_of(id)?.slot)

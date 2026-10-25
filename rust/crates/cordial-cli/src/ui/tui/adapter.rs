@@ -463,6 +463,9 @@ impl<F: Fleet> Model<F> {
         }
         b.section("Identifiers");
         b.fact("Adapter ID", &a.id, layout::plain());
+        if let Some(format) = a.live().and_then(text::storage_format) {
+            b.fact("Storage Format", &format.to_string(), layout::plain());
+        }
     }
 
     fn adapter_details(&self, a: &AdapterView, b: &mut Layout) {
@@ -499,27 +502,22 @@ impl<F: Fleet> Model<F> {
         }
         let limited: Vec<_> = model::enabled_transports(live)
             .into_iter()
-            .filter_map(|t| {
-                let r = model::enabled_devices(live, t)?;
-                (r.count.is_some() || r.limit.is_some()).then_some((t, r))
-            })
+            .filter_map(|t| Some((t, text::capacity_text(model::enabled_devices(live, t)?)?)))
             .collect();
         if !limited.is_empty() {
             b.section("Active Devices");
-            for (t, r) in limited {
-                b.fact(
-                    words::transport_name(t),
-                    &text::capacity_text(r),
-                    layout::plain(),
-                );
+            for (t, used) in limited {
+                b.fact(words::transport_name(t), &used, layout::plain());
             }
         }
-        let interfaces = model::resource(&live.resources, ResourceType::Interfaces);
+        let interfaces = model::resource(&live.resources, ResourceType::Interfaces)
+            .and_then(text::capacity_text);
         let usb = text::usb_capacity(live);
         if interfaces.is_some() || !usb.is_empty() {
             b.section("USB");
-            let count = interfaces.map_or_else(|| "Unknown".into(), text::capacity_text);
-            b.fact("Interfaces", &count, layout::plain());
+            if let Some(count) = interfaces {
+                b.fact("Interfaces", &count, layout::plain());
+            }
             for (code, label) in usb {
                 let look = if code == ErrorCode::UsbRequiredCapacityExceeded {
                     warn()
@@ -542,11 +540,19 @@ impl<F: Fleet> Model<F> {
                 b.fact(words::transport_name(t), value, look);
             }
         }
-        b.section("Information");
-        let firmware = Self::firmware(live).unwrap_or_else(|| "Unknown".into());
-        b.fact("Firmware", &firmware, layout::plain());
-        if let Some(board) = Self::board(live) {
-            b.fact("Board", &board, layout::plain());
+        let facts: Vec<_> = [
+            ("Firmware", Self::firmware(live)),
+            ("Board", Self::board(live)),
+            ("Storage", text::storage_text(live)),
+        ]
+        .into_iter()
+        .filter_map(|(label, value)| Some((label, value?)))
+        .collect();
+        if !facts.is_empty() {
+            b.section("Information");
+            for (label, value) in facts {
+                b.fact(label, &value, layout::plain());
+            }
         }
     }
 

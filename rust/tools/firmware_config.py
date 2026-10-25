@@ -44,7 +44,7 @@ def indicator(value, maximum, label):
 
 def load(path, profile):
     config = json.loads(Path(path).read_text(), object_pairs_hook=unique_object)
-    fields = {"default_adapter_name", "name", "chip", "package", "flash_bytes", "xosc_hz", "radio", "mcu_led",
+    fields = {"default_adapter_name", "name", "chip", "package", "minimum_flash_bytes", "xosc_hz", "radio", "mcu_led",
               "bluetooth_backend", "radio_backend", "usb_backend", "storage_backend", "firmware_bytes",
               "profile_memory_budget"}
     if not isinstance(config, dict) or set(config) != fields:
@@ -73,8 +73,12 @@ def load(path, profile):
         raise ValueError("Pico requires btstack, embassy USB and littlefs")
     if config["radio_backend"] not in ("pico-sdk-cyw43", "embassy-cyw43"):
         raise ValueError("Pico requires pico-sdk-cyw43 or embassy-cyw43 radio")
-    flash = integer(config["flash_bytes"], 2097152, 16777216, "flash_bytes", 4096)
-    offset = integer(config["firmware_bytes"], 1048576, flash - 131072, "firmware_bytes", 4096)
+    flash = integer(config["minimum_flash_bytes"], 2097152, 16777216, "minimum_flash_bytes", 4096)
+    offset = 1048576 if flash < 4194304 else 2097152
+    if config["firmware_bytes"] != offset:
+        raise ValueError("firmware_bytes must equal the stable firmware reservation")
+    if config["chip"] == "rp2350" and flash < 4194304:
+        raise ValueError("RP2350 firmware requires at least 4 MiB flash")
     # The timer/watchdog use an integer reference-cycle count per microsecond.
     crystal = integer(config["xosc_hz"], 5000000, 15000000, "xosc_hz", 1000000)
     # Keep the supported 125/150 MHz system and 48 MHz USB clocks. The crystal
@@ -95,7 +99,7 @@ def load(path, profile):
         if mcu_led in pins:
             raise ValueError("MCU LED cannot share a radio pin")
     sys_div1 = 6 if config["chip"] == "rp2040" else 5
-    physical = [config["chip"], config["package"], flash, 2, crystal,
+    physical = [config["chip"], config["package"], 2, crystal,
                 radio["power"], radio["data"], radio["data"], radio["data"],
                 radio["clock"], radio["cs"], led if led is not None else -1,
                 mcu_led if mcu_led is not None else -1,
@@ -104,14 +108,15 @@ def load(path, profile):
                 config["mcu_led"]["active_low"] if mcu_led is not None else False]
     digest = hashlib.sha256("/".join(map(str, physical)).encode()).hexdigest()
     errata_bytes = 4096 if config["chip"] == "rp2350" else 0
-    storage = flash - offset - errata_bytes
+    storage = flash - offset
     # Identity includes record format and selected backend, independently of pins.
     layout = {"format": "littlefs-2",
-              "storage_backend": selected[2], "offset": offset, "bytes": storage,
+              "storage_backend": selected[2],
               "erase_bytes": 4096}
     marker = hashlib.sha256(json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()).digest()
     return config | {"profile": profile, "feature": feature, "target": triple,
-                     "storage_bytes": storage, "ram_bytes": ram, "hardware_digest": digest, "storage_offset": offset,
+                     "storage_bytes": storage, "image_bytes": offset - errata_bytes,
+                     "ram_bytes": ram, "hardware_digest": digest, "storage_offset": offset,
                      "storage_identity": marker, "sys_div1": sys_div1}
 
 
@@ -130,7 +135,7 @@ def generate(config, out):
         return generate_esp(config, out)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    radio, flash, ram = config["radio"], config["flash_bytes"], config["ram_bytes"]
+    radio, flash, ram = config["radio"], config["minimum_flash_bytes"], config["ram_bytes"]
     boot2 = 256 if config["chip"] == "rp2040" else 0
     # Reserve stack separately from the Talc heap. The 64 KiB allowance stays
     # unchanged until interrupt-inclusive high-water is measured on hardware.
@@ -138,7 +143,7 @@ def generate(config, out):
     heap_end = ram + 8192 - stack
     memory = f"""MEMORY {{
     BOOT2 : ORIGIN = 0x10000000, LENGTH = {boot2}
-    FLASH : ORIGIN = {0x10000000 + boot2:#x}, LENGTH = {config['storage_offset'] - boot2}
+    FLASH : ORIGIN = {0x10000000 + boot2:#x}, LENGTH = {config['image_bytes'] - boot2}
     RAM : ORIGIN = 0x20000000, LENGTH = {heap_end}
     STACK : ORIGIN = {0x20000000 + heap_end:#x}, LENGTH = {stack}
 }}
@@ -153,16 +158,18 @@ _heap_end = ORIGIN(RAM) + LENGTH(RAM);
     .cordial_metadata : ALIGN(4) { KEEP(*(.cordial_metadata)); } > FLASH
 } INSERT AFTER .vector_table;
 _stext = ALIGN(ADDR(.cordial_metadata) + SIZEOF(.cordial_metadata), 8);
+_firmware_end = LOADADDR(.data) + SIZEOF(.data);
 ASSERT(_heap_end > __sheap, "Static RAM leaves no application heap");
+ASSERT(_firmware_end <= ORIGIN(FLASH) + LENGTH(FLASH), "Firmware exceeds its reserved image area");
 """
     # link.x includes memory.x before defining its default _stext. Keeping the
     # insertion here also makes dependency links independent of argument order.
     write_text_if_changed(out / "memory.x", memory + sections)
     # Concrete peripheral tokens keep pin ownership checked by Rust, including
     # arbitrary supported pin maps. No runtime table or unsafe pin stealing.
-    code = f"""pub const FLASH_BYTES: usize = {flash};
-pub const STORAGE_START: u32 = {config['storage_offset']};
-pub const STORAGE_END: u32 = {config['storage_offset'] + config['storage_bytes']};
+    code = f"""pub const FLASH_BYTES: usize = 16777216;
+pub const MINIMUM_FLASH_BYTES: u32 = {flash};
+pub const IMAGE_BYTES: usize = {config['image_bytes']};
 pub const STORAGE_IDENTITY: [u8; 32] = {list(config['storage_identity'])!r};
 pub const DEFAULT_ADAPTER_NAME: &str = {json.dumps(config["default_adapter_name"], ensure_ascii=False)};
 pub const HARDWARE: &str = {json.dumps(config['name'])};
@@ -191,22 +198,21 @@ pub const RADIO_LED: Option<(u8, bool)> = {('Some((' + str(radio['led']['pin']) 
 macro_rules! indicator_pin {{ ($p:ident) => {{ {expression} }}; }}
 """
     write_text_if_changed(out / "board.rs", code)
-    if config["radio_backend"] == "pico-sdk-cyw43":
-        defines = {
-            "PICO_CYW43_SUPPORTED": 1, "PICO_FLASH_SIZE_BYTES": flash,
-            "PICO_XOSC_HZ": config["xosc_hz"],
-            "CYW43_DEFAULT_PIN_WL_REG_ON": radio["power"],
-            "CYW43_DEFAULT_PIN_WL_DATA_OUT": radio["data"],
-            "CYW43_DEFAULT_PIN_WL_DATA_IN": radio["data"],
-            "CYW43_DEFAULT_PIN_WL_HOST_WAKE": radio["data"],
-            "CYW43_DEFAULT_PIN_WL_CLOCK": radio["clock"],
-            "CYW43_DEFAULT_PIN_WL_CS": radio["cs"],
-            "CYW43_WL_GPIO_COUNT": 3,
-        }
-        if config["chip"] == "rp2350":
-            defines["PICO_RP2350A"] = int(config["package"] == "a")
-        write_text_if_changed(out / "cordial.h", "#pragma once\n" + "".join(
-            f"#define {key} {value}\n" for key, value in defines.items()))
+    defines = {
+        "PICO_CYW43_SUPPORTED": 1, "PICO_FLASH_SIZE_BYTES": flash,
+        "PICO_XOSC_HZ": config["xosc_hz"],
+        "CYW43_DEFAULT_PIN_WL_REG_ON": radio["power"],
+        "CYW43_DEFAULT_PIN_WL_DATA_OUT": radio["data"],
+        "CYW43_DEFAULT_PIN_WL_DATA_IN": radio["data"],
+        "CYW43_DEFAULT_PIN_WL_HOST_WAKE": radio["data"],
+        "CYW43_DEFAULT_PIN_WL_CLOCK": radio["clock"],
+        "CYW43_DEFAULT_PIN_WL_CS": radio["cs"],
+        "CYW43_WL_GPIO_COUNT": 3,
+    }
+    if config["chip"] == "rp2350":
+        defines["PICO_RP2350A"] = int(config["package"] == "a")
+    write_text_if_changed(out / "cordial.h", "#pragma once\n" + "".join(
+        f"#define {key} {value}\n" for key, value in defines.items()))
 
 
 def main():

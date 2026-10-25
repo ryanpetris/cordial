@@ -3,7 +3,7 @@
   "default_adapter_name": "Pico W",
   "chip": "rp2040",
   "package": "rp2040",
-  "flash_bytes": 2097152,
+  "minimum_flash_bytes": 2097152,
   "xosc_hz": 12000000,
   "radio": {
     "power": 23,

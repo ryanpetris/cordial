@@ -33,7 +33,6 @@ static RADIO_ADDRESS: Signal<CriticalSectionRawMutex, [u8; 6]> = Signal::new();
 static READY: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 type Records = cordial_record_storage::Storage<
     Flash<'static, embassy_rp::peripherals::FLASH, Async, { board::FLASH_BYTES }>,
-    { ((board::STORAGE_END - board::STORAGE_START) as usize / 4096) - 1 },
 >;
 
 // A bad layout remains unavailable, while status and development recovery work.
@@ -154,12 +153,27 @@ async fn main_task(spawner: Spawner) {
     let mut flash = Flash::<_, Async, { board::FLASH_BYTES }>::new(p.FLASH, p.DMA_CH1, DmaIrqs);
     let identity = services::identity(&mut flash).expect("board identity");
     let serial = Box::leak(identity.adapter.clone().into_boxed_str());
-    let mut records = Records::open_or_provision_blank(
-        flash,
-        board::STORAGE_START..board::STORAGE_END,
-        board::STORAGE_IDENTITY,
-    )
-    .await;
+    let capacity = services::flash_capacity(&mut flash).await;
+    unsafe extern "C" {
+        static _firmware_end: u8;
+    }
+    let image_end = core::ptr::addr_of!(_firmware_end).addr() - 0x1000_0000;
+    let mut records = if image_end > board::IMAGE_BYTES {
+        Err(Error::Bounds)
+    } else {
+        match capacity {
+            Ok(capacity) => {
+                Records::open_detected(
+                    flash,
+                    board::MINIMUM_FLASH_BYTES,
+                    capacity,
+                    board::STORAGE_IDENTITY,
+                )
+                .await
+            }
+            Err(_) => Err(Error::Bounds),
+        }
+    };
     let topology = cordial_usb::saved_topology(
         &mut records,
         board::PROFILE_MEMORY_BUDGET.is_some(),
