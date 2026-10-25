@@ -63,6 +63,11 @@ Every complete outgoing `Request` must fit 1024 protobuf bytes, including all en
 command envelope. `SetProfileRules` is atomic per request, with no automatic splitting or atomicity
 across several requests.
 
+The Rust client library sends the first request alone. Other callers wait until a `Response`
+answers it, including `Response.error` or a response with no result. It then allows pipelining and
+matches responses to requests in write order. If sending or waiting for the opening response fails,
+including a timeout or connection close, waiting callers fail without writing their requests.
+
 The Rust client library, CLI and TUI enforce a local 32 MiB decoded receive limit on each complete
 protobuf `Message`, including nested envelopes and all repeated listing batches. The TypeScript
 desktop and web clients do not apply this limit. See

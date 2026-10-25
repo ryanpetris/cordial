@@ -55,12 +55,16 @@ struct State {
     /// One entry per request written and not yet answered, oldest first.
     pending: VecDeque<(p::Request, Reply, Option<Observer>)>,
     closed: Option<Error>,
+    confirmed: bool,
+    #[cfg(test)]
+    confirmation_waiting: Option<mpsc::Sender<()>>,
 }
 
 struct Shared {
     /// The writer, held across a whole frame so frames never interleave.
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     state: Mutex<State>,
+    confirmation: Condvar,
     /// Set once the first request is about to be written; nothing before it is read.
     started: AtomicBool,
     stop: AtomicBool,
@@ -82,6 +86,7 @@ impl Shared {
             state.closed = Some(error.clone());
             std::mem::take(&mut state.pending)
         };
+        self.confirmation.notify_all();
         for (_, reply, _) in pending {
             let _ = reply.try_send(Err(error.clone()));
         }
@@ -98,6 +103,7 @@ impl Shared {
 /// to requests in the order the requests were written. A reader thread receives everything the
 /// Dongle sends. Following the session rules, the connection sends a frame delimiter before its
 /// first request and ignores everything it receives before the first response that follows it.
+/// Only the first request is sent until its response arrives; later requests may be pipelined.
 /// A decoded response or event frame may be at most 32 MiB.
 ///
 /// Dropping the connection closes it.
@@ -140,7 +146,11 @@ impl Connection {
             state: Mutex::new(State {
                 pending: VecDeque::new(),
                 closed: None,
+                confirmed: false,
+                #[cfg(test)]
+                confirmation_waiting: None,
             }),
+            confirmation: Condvar::new(),
             started: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             timeout: Mutex::new(Some(DEFAULT_TIMEOUT)),
@@ -214,14 +224,30 @@ impl Connection {
         let mut frame = Vec::with_capacity(bytes.len() + bytes.len() / 254 + 3);
         let (tx, rx) = mpsc::sync_channel(1);
         {
-            let mut writer = self.shared.writer.lock().unwrap();
-            {
+            let mut writer = loop {
+                let writer = self.shared.writer.lock().unwrap();
                 let mut state = self.shared.state.lock().unwrap();
                 if let Some(error) = &state.closed {
                     return Err(error.clone());
                 }
-                state.pending.push_back((request, tx, observe));
-            }
+                if !self.shared.started.load(Ordering::Acquire) || state.confirmed {
+                    state.pending.push_back((request, tx, observe));
+                    break writer;
+                }
+                // Until a response confirms the session, a rejected opening frame must not
+                // let another request's response answer the first request.
+                drop(writer);
+                #[cfg(test)]
+                if let Some(waiting) = state.confirmation_waiting.take() {
+                    waiting.send(()).unwrap();
+                }
+                drop(
+                    self.shared
+                        .confirmation
+                        .wait_while(state, |state| !state.confirmed && state.closed.is_none())
+                        .unwrap(),
+                );
+            };
             if !self.shared.started.swap(true, Ordering::AcqRel) {
                 frame.push(frame::DELIMITER);
             }
@@ -611,11 +637,19 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
             match message.kind {
                 Some(message::Kind::Event(event)) => handler(Received::Event(event)),
                 Some(message::Kind::Response(response)) => {
-                    let waiting = shared.state.lock().unwrap().pending.pop_front();
+                    let waiting = {
+                        let mut state = shared.state.lock().unwrap();
+                        let waiting = state.pending.pop_front();
+                        if waiting.is_some() {
+                            state.confirmed = true;
+                        }
+                        waiting
+                    };
                     let Some((request, reply, observe)) = waiting else {
                         failed = Some(Error::Protocol);
                         break;
                     };
+                    shared.confirmation.notify_all();
                     handler(Received::Response(&request, &response));
                     if let Some(observe) = observe {
                         observe(&response);
@@ -637,4 +671,109 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
     shared.close(error.clone());
     let closed = shared.state.lock().unwrap().closed.clone();
     handler(Received::Closed(&closed.unwrap_or(error)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    struct Reader(Receiver<Vec<u8>>);
+
+    impl Read for Reader {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            match self.0.recv_timeout(Duration::from_millis(10)) {
+                Ok(bytes) => {
+                    out[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Err(RecvTimeoutError::Timeout) => Err(io::ErrorKind::TimedOut.into()),
+                Err(RecvTimeoutError::Disconnected) => Ok(0),
+            }
+        }
+    }
+
+    struct Writer(mpsc::Sender<()>);
+
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.send(()).unwrap();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn connection() -> (Arc<Connection>, mpsc::Sender<Vec<u8>>, Receiver<()>) {
+        let (responses, reader) = mpsc::channel();
+        let (writer, writes) = mpsc::channel();
+        let (connection, _) = Connection::new(Reader(reader), Writer(writer));
+        connection.set_timeout(None);
+        (Arc::new(connection), responses, writes)
+    }
+
+    fn request(connection: &Arc<Connection>) -> Receiver<Result<p::Response>> {
+        let connection = connection.clone();
+        let (reply, result) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = reply.send(connection.request(Command::StopScan(p::StopScan {})));
+        });
+        result
+    }
+
+    fn blocked_request(connection: &Arc<Connection>) -> Receiver<Result<p::Response>> {
+        let (waiting, entered) = mpsc::channel();
+        connection.shared.state.lock().unwrap().confirmation_waiting = Some(waiting);
+        let result = request(connection);
+        entered.recv_timeout(DEADLINE).unwrap();
+        // The signal is sent with the state locked. Acquiring it proves the waiter has
+        // released it inside the condition variable wait, before confirmation or close.
+        drop(connection.shared.state.lock().unwrap());
+        result
+    }
+
+    #[test]
+    fn an_opening_response_wakes_a_blocked_confirmation_waiter() {
+        let (connection, responses, writes) = connection();
+        let opening = request(&connection);
+        writes.recv_timeout(DEADLINE).unwrap();
+        let waiting = blocked_request(&connection);
+
+        let mut response = Vec::new();
+        frame::encode(
+            &p::Message {
+                kind: Some(message::Kind::Response(p::Response::default())),
+            },
+            &mut response,
+        );
+        responses.send(response).unwrap();
+        opening.recv_timeout(DEADLINE).unwrap().unwrap();
+        writes.recv_timeout(DEADLINE).unwrap();
+
+        connection.close();
+        assert!(matches!(
+            waiting.recv_timeout(DEADLINE).unwrap(),
+            Err(Error::Closed)
+        ));
+    }
+
+    #[test]
+    fn closing_wakes_a_blocked_confirmation_waiter_without_a_timeout() {
+        let (connection, _responses, writes) = connection();
+        let opening = request(&connection);
+        writes.recv_timeout(DEADLINE).unwrap();
+        let waiting = blocked_request(&connection);
+
+        connection.close();
+        for result in [opening, waiting] {
+            assert!(matches!(
+                result.recv_timeout(DEADLINE).unwrap(),
+                Err(Error::Closed)
+            ));
+        }
+        assert!(writes.try_recv().is_err());
+    }
 }

@@ -58,10 +58,11 @@ adapter-to-host cap, and the TypeScript desktop and web clients do not apply thi
 
 Once the encoded limit is exceeded, the decoder discards bytes without further buffer growth until
 the next delimiter. It also rejects a frame whose decoded size exceeds the limit. The decoder
-reports an oversized frame only at its delimiter. Before session synchronization, the client
-ignores the discarded frame and can synchronize on the next eligible response. After
-synchronization, it closes the session with a protocol error and fails all pending requests to
-avoid misaligning later FIFO responses.
+reports an oversized frame only at its delimiter. Before session synchronization, the Rust client
+discards invalid and oversized frames without removing the pending opening request or releasing
+waiting callers. It can synchronize on the next eligible `Response`. After synchronization, it
+closes the session with a protocol error and fails all pending requests to avoid misaligning later
+FIFO responses.
 
 An endless stream of nonzero bytes therefore keeps frame buffering bounded but does not trigger
 an immediate protocol-error close. Incoming bytes still reset the existing request inactivity

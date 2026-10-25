@@ -19,6 +19,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const TEST_DEADLINE: Duration = Duration::from_secs(10);
+
 const HOST_RECEIVE_LIMIT: usize = 32 * 1024 * 1024;
 
 /// One direction of an in-memory byte stream. Reads time out like a serial port's.
@@ -74,6 +76,8 @@ enum ReadStep {
     Repeat { byte: u8, remaining: usize },
     Bytes { bytes: Vec<u8>, offset: usize },
     Signal(Sender<()>),
+    Wait(Receiver<()>),
+    Fail(io::ErrorKind),
 }
 
 struct ScriptReader {
@@ -116,6 +120,14 @@ impl Read for ScriptReader {
                     *offset += n;
                     return Ok(n);
                 }
+                ReadStep::Wait(signal) => {
+                    if signal.try_recv().is_err() {
+                        thread::sleep(Duration::from_millis(1));
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    self.steps.pop_front();
+                }
+                ReadStep::Fail(kind) => return Err((*kind).into()),
                 ReadStep::Signal(signal) => {
                     signal.send(()).unwrap();
                     self.steps.pop_front();
@@ -136,6 +148,52 @@ impl Write for CountingWriter {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// Holds the first write so another caller can queue behind the writer lock.
+struct HeldWriter {
+    inner: CountingWriter,
+    written: Sender<Vec<u8>>,
+    release: Option<Receiver<io::Result<()>>>,
+}
+
+impl Write for HeldWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.written.send(bytes.to_vec()).unwrap();
+        if let Some(release) = self.release.take() {
+            release.recv_timeout(TEST_DEADLINE).unwrap()?;
+        }
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn hold_writer(inner: CountingWriter) -> (HeldWriter, Receiver<Vec<u8>>, Sender<io::Result<()>>) {
+    let (written, writes) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    (
+        HeldWriter {
+            inner,
+            written,
+            release: Some(wait),
+        },
+        writes,
+        release,
+    )
+}
+
+fn background<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Receiver<T> {
+    let (started, ready) = mpsc::channel();
+    let (done, result) = mpsc::channel();
+    thread::spawn(move || {
+        started.send(()).unwrap();
+        let _ = done.send(work());
+    });
+    ready.recv_timeout(TEST_DEADLINE).unwrap();
+    result
 }
 
 fn scripted(steps: impl IntoIterator<Item = ReadStep>) -> (ScriptReader, CountingWriter) {
@@ -417,6 +475,228 @@ fn the_first_request_follows_a_delimiter_and_leftovers_are_ignored() {
     }
     assert_eq!(*received.lock().unwrap(), expected);
     assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn rejected_opening_frames_keep_the_next_request_unsent() {
+    for case in 0..3 {
+        let rejected = match case {
+            0 => vec![0xff, 0],
+            1 => vec![2, 0xff, 0],
+            2 => oversized_frame(true),
+            _ => unreachable!(),
+        };
+        let mut leftovers = framed(message::Kind::Event(p::Event::default()));
+        frame::encode(&p::Message::default(), &mut leftovers);
+        leftovers.extend(rejected);
+        let (consumed, rejected) = mpsc::channel();
+        let (reader, writer) = scripted([
+            ReadStep::WaitForWrites(1),
+            bytes(leftovers),
+            ReadStep::Signal(consumed),
+            ReadStep::WaitForWrites(2),
+            bytes(framed(message::Kind::Response(p::Response {
+                result: Some(response::Result::Devices(devices(vec![saved(9)]))),
+            }))),
+        ]);
+        let (writer, writes, release) = hold_writer(writer);
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let seen = callbacks.clone();
+        let connection = Arc::new(Connection::with_handler(reader, writer, move |received| {
+            if !matches!(received, Received::Closed(_)) {
+                seen.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+        connection.set_timeout(Some(Duration::from_secs(3)));
+        let opening = {
+            let connection = connection.clone();
+            let seen = callbacks.clone();
+            background(move || {
+                connection.request_with(Command::GetStatus(p::GetStatus {}), move |_| {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+        };
+        assert_eq!(writes.recv_timeout(TEST_DEADLINE).unwrap()[0], 0);
+        let next = {
+            let connection = connection.clone();
+            background(move || connection.list_devices())
+        };
+        release.send(Ok(())).unwrap();
+        rejected.recv_timeout(TEST_DEADLINE).unwrap();
+        assert!(matches!(
+            writes.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert!(connection.closed().is_none());
+        if case != 0 {
+            connection.close();
+        }
+        for failed in [
+            opening.recv_timeout(TEST_DEADLINE).unwrap().map(|_| ()),
+            next.recv_timeout(TEST_DEADLINE).unwrap().map(|_| ()),
+        ] {
+            if case == 0 {
+                assert!(matches!(failed, Err(Error::Timeout)));
+            } else {
+                assert!(matches!(failed, Err(Error::Closed)));
+            }
+        }
+        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
+        assert!(writes.try_recv().is_err());
+    }
+}
+
+#[test]
+fn any_opening_response_allows_pipelining_before_callbacks_finish() {
+    for result in [
+        Some(response::Result::Status(status("Ready"))),
+        Some(response::Result::Error(p::Error::default())),
+        None,
+        Some(response::Result::Devices(p::DeviceList::default())),
+    ] {
+        let opening_response = p::Response { result };
+        let (reader, writer) = scripted([
+            ReadStep::WaitForWrites(1),
+            bytes(framed(message::Kind::Response(opening_response.clone()))),
+            ReadStep::WaitForWrites(3),
+            bytes(framed(message::Kind::Response(p::Response::default()))),
+            bytes(framed(message::Kind::Response(p::Response::default()))),
+        ]);
+        let (writer, writes, release_write) = hold_writer(writer);
+        let (entered, callback) = mpsc::channel();
+        let (release_callback, wait) = mpsc::channel();
+        let mut first = true;
+        let connection = Arc::new(Connection::with_handler(reader, writer, move |received| {
+            if matches!(received, Received::Response(..)) && first {
+                first = false;
+                entered.send(()).unwrap();
+                wait.recv_timeout(TEST_DEADLINE).unwrap();
+            }
+        }));
+        let opening = {
+            let connection = connection.clone();
+            background(move || connection.status())
+        };
+        assert_eq!(writes.recv_timeout(TEST_DEADLINE).unwrap()[0], 0);
+        let next = {
+            let connection = connection.clone();
+            background(move || connection.stop_scan())
+        };
+        release_write.send(Ok(())).unwrap();
+        callback.recv_timeout(TEST_DEADLINE).unwrap();
+        assert_ne!(writes.recv_timeout(TEST_DEADLINE).unwrap()[0], 0);
+        let later = {
+            let connection = connection.clone();
+            background(move || connection.stop_scan())
+        };
+        assert_ne!(writes.recv_timeout(TEST_DEADLINE).unwrap()[0], 0);
+        release_callback.send(()).unwrap();
+        let answer = opening.recv_timeout(TEST_DEADLINE).unwrap();
+        match opening_response.result {
+            Some(response::Result::Status(expected)) => assert_eq!(answer.unwrap(), expected),
+            Some(response::Result::Error(expected)) => {
+                assert!(matches!(answer, Err(Error::Dongle(error)) if error == expected));
+            }
+            _ => assert!(matches!(answer, Err(Error::UnexpectedResponse))),
+        }
+        next.recv_timeout(TEST_DEADLINE).unwrap().unwrap();
+        later.recv_timeout(TEST_DEADLINE).unwrap().unwrap();
+        assert!(connection.closed().is_none());
+    }
+}
+
+#[test]
+fn closing_or_io_failure_wakes_unsent_requests_without_a_timeout() {
+    for case in 0..3 {
+        let (fail, wait) = mpsc::channel();
+        let (reader, writer) = scripted([
+            ReadStep::Wait(wait),
+            ReadStep::Fail(io::ErrorKind::ConnectionReset),
+        ]);
+        let (writer, writes, release) = hold_writer(writer);
+        let (connection, _events) = Connection::new(reader, writer);
+        connection.set_timeout(None);
+        let connection = Arc::new(connection);
+        let opening = {
+            let connection = connection.clone();
+            background(move || connection.status())
+        };
+        writes.recv_timeout(TEST_DEADLINE).unwrap();
+        let next = {
+            let connection = connection.clone();
+            background(move || connection.status())
+        };
+        release
+            .send(if case == 2 {
+                Err(io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(())
+            })
+            .unwrap();
+        if case != 2 {
+            assert!(matches!(
+                writes.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ));
+            if case == 0 {
+                connection.close();
+            } else {
+                fail.send(()).unwrap();
+            }
+        }
+        for failed in [
+            opening.recv_timeout(TEST_DEADLINE).unwrap(),
+            next.recv_timeout(TEST_DEADLINE).unwrap(),
+        ] {
+            match case {
+                0 => assert!(matches!(failed, Err(Error::Closed))),
+                1 => assert!(
+                    matches!(failed, Err(Error::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset)
+                ),
+                2 => assert!(
+                    matches!(failed, Err(Error::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+                ),
+                _ => unreachable!(),
+            }
+        }
+        assert!(writes.try_recv().is_err());
+        assert!(connection.closed().is_some());
+    }
+}
+
+#[test]
+fn the_opening_observer_can_close_with_a_concurrent_request() {
+    let (reader, writer) = scripted([
+        ReadStep::WaitForWrites(1),
+        bytes(framed(message::Kind::Response(p::Response::default()))),
+    ]);
+    let (writer, writes, release) = hold_writer(writer);
+    let (connection, _events) = Connection::new(reader, writer);
+    connection.set_timeout(None);
+    let connection = Arc::new(connection);
+    let opening = {
+        let connection = connection.clone();
+        background(move || {
+            let close = connection.clone();
+            connection.request_with(Command::StopScan(p::StopScan {}), move |_| close.close())
+        })
+    };
+    writes.recv_timeout(TEST_DEADLINE).unwrap();
+    let next = {
+        let connection = connection.clone();
+        background(move || connection.status())
+    };
+    release.send(Ok(())).unwrap();
+    assert_eq!(
+        opening.recv_timeout(TEST_DEADLINE).unwrap().unwrap(),
+        p::Response::default()
+    );
+    assert!(matches!(
+        next.recv_timeout(TEST_DEADLINE).unwrap(),
+        Err(Error::Closed)
+    ));
+    assert!(matches!(connection.closed(), Some(Error::Closed)));
 }
 
 #[test]
