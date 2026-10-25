@@ -8,6 +8,7 @@
 | --- | --- |
 | Complete host `Request` | 1024 protobuf bytes, including the command envelope and all entries, before COBS encoding |
 | Adapter response and event frames | No total protocol size cap |
+| Rust host receive frame | 32 MiB, or 33,554,432 decoded protobuf bytes, for the complete `Message`; at most 33,686,537 COBS bytes excluding the delimiter |
 | Pointer Sensor DPI choices | At most six per sensor, including saved metadata |
 | Scan candidates | 32 per scan |
 | Normal connections | `CONNECTIONS.limit` in each `TransportSupport.resources` entry, independently per transport |
@@ -27,6 +28,10 @@
 | Adapter name | 1..64 UTF-8 bytes |
 
 HID report-map limits are in [HID forwarding](hid-forwarding.md).
+
+The Rust receive limit applies to the client library, CLI and TUI, including all nested envelopes
+and repeated listing batches. It does not apply to the TypeScript desktop or web clients. See
+[Rust host receive limit](transport.md#rust-host-receive-limit) for buffering and session errors.
 
 ### Bluetooth capacity
 

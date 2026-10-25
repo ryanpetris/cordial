@@ -60,18 +60,20 @@ fn skips_empty_frames_and_resynchronizes() {
 }
 
 #[test]
-fn rejects_frames_over_the_limit_until_the_next_delimiter() {
-    let mut decoder = Decoder::new(Some(16));
+fn enforces_decoded_and_encoded_limits_and_recovers_at_the_delimiter() {
+    let limit = 508;
+    let mut decoder = Decoder::new(Some(limit));
     let mut stream = Vec::new();
-    frame::encode_bytes(&[1; 17], &mut stream);
-    frame::encode_bytes(&[2; 16], &mut stream);
-    frame::encode_bytes(&[3; 600], &mut stream);
+    frame::encode_bytes(&vec![1; limit], &mut stream);
+    frame::encode_bytes(&vec![0; limit + 1], &mut stream);
+    stream.extend(vec![0xff; limit + limit / 254 + 2]);
+    stream.push(frame::DELIMITER);
     frame::encode_bytes(&[4; 1], &mut stream);
     assert_eq!(
         frames(&mut decoder, &stream),
         vec![
+            Ok(vec![1; limit]),
             Err(FrameError::TooLong),
-            Ok(vec![2; 16]),
             Err(FrameError::TooLong),
             Ok(vec![4]),
         ]

@@ -15,8 +15,8 @@ pub enum Error {
     TooLong,
     /// Reading from or writing to the stream failed. The connection is closed.
     Io(Arc<io::Error>),
-    /// The Dongle sent a frame that is not a valid message, or a response with no request
-    /// waiting for it. The connection is closed.
+    /// The Dongle sent a frame that exceeds the client's receive limit or is not a valid message,
+    /// or a response arrived with no request waiting for it. The connection is closed.
     Protocol,
     /// The connection is closed: the stream ended or [`Connection::close`] was called.
     ///

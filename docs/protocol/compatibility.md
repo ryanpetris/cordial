@@ -164,7 +164,9 @@ meaning and need not align with COBS blocks, USB packets or host reads.
 A failure after list data has been emitted appends an ordinary `Message` containing
 `Response.error` to the same COBS frame. The response oneof replaces the list with that error.
 Clients decode and apply only completed frames, so they never apply partial success. A disconnect
-discards an incomplete frame. Adapter-to-host messages have no total protocol size cap.
+discards an incomplete frame. Adapter-to-host messages have no total protocol size cap. The Rust
+client's local [receive limit](transport.md#rust-host-receive-limit) applies to the complete received
+frame; an oversized listing is discarded in full.
 
 Events never interleave within a response frame. The Dongle preserves changes that occur during
 the listing for subsequent events. A client replaces its list with the completed response, then
@@ -202,7 +204,7 @@ or an empty `SettingForget` marker. Missing leaves the preference unchanged; `fo
 the saved preference and never resets the actual device value. False and zero remain explicit
 writes. See [settings records](records.md#settings) for metadata and event replacement rules.
 
-Settings responses and change events have no transport-derived object or message size limit.
+The wire protocol imposes no object or message size limit on settings responses and change events.
 Ranges, choices and saved metadata remain complete. Device and resource constraints still apply,
 such as at most six Pointer Sensor DPI choices. The 1024-byte limit applies only to the complete
 host `Request`, including its command envelope and all entries, before COBS encoding.

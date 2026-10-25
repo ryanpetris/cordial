@@ -44,8 +44,33 @@ or the protocol, and opening the port or changing the baud rate never reboots th
   and answered with `ERROR_CODE_TOO_LONG`.
 - Dongle frames have no total protocol size limit, including typed settings and saved metadata.
   The Dongle writes long frames incrementally and never interleaves two frames. Lists use bounded
-  batches inside one frame; see [Listings](compatibility.md#listings).
+  batches inside one frame; see [Listings](compatibility.md#listings). Rust clients apply a local
+  [receive limit](#rust-host-receive-limit).
 - USB checksums every packet, so frames carry no checksum of their own.
+
+### Rust host receive limit
+
+The Rust client library, including the CLI and TUI, accepts at most 32 MiB, or 33,554,432 decoded
+protobuf bytes, per received frame. This counts the complete `Message`, including nested envelopes
+and every repeated listing batch. Its COBS receive buffer holds at most 33,686,537 encoded bytes,
+excluding the delimiter. This is a client implementation limit; the wire protocol has no overall
+adapter-to-host cap, and the TypeScript desktop and web clients do not apply this limit.
+
+Once the encoded limit is exceeded, the decoder discards bytes without further buffer growth until
+the next delimiter. It also rejects a frame whose decoded size exceeds the limit. The decoder
+reports an oversized frame only at its delimiter. Before session synchronization, the client
+ignores the discarded frame and can synchronize on the next eligible response. After
+synchronization, it closes the session with a protocol error and fails all pending requests to
+avoid misaligning later FIFO responses.
+
+An endless stream of nonzero bytes therefore keeps frame buffering bounded but does not trigger
+an immediate protocol-error close. Incoming bytes still reset the existing request inactivity
+timer. Buffer allocation capacity and decoded objects can use additional memory; these byte limits
+are not a bound on total process memory.
+
+Complete valid supported lists and events within the limit keep their normal semantics. Clients
+never apply an oversized frame partially. The cap allows generous room for current firmware
+responses; revisit it when producers or storage limits grow.
 
 ## Requests and responses
 

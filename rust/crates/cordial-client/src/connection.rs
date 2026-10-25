@@ -28,6 +28,9 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long [`Connection::close`] waits for the reader thread to release the stream.
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// The largest decoded response or event frame accepted from the Dongle.
+const MAX_RECEIVED_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
 /// What the reader thread received, passed to a handler in the order it arrived.
 #[derive(Debug)]
 #[allow(
@@ -95,6 +98,7 @@ impl Shared {
 /// to requests in the order the requests were written. A reader thread receives everything the
 /// Dongle sends. Following the session rules, the connection sends a frame delimiter before its
 /// first request and ignores everything it receives before the first response that follows it.
+/// A decoded response or event frame may be at most 32 MiB.
 ///
 /// Dropping the connection closes it.
 pub struct Connection {
@@ -565,7 +569,7 @@ fn write_all(stream: &mut dyn Write, mut bytes: &[u8]) -> io::Result<()> {
 }
 
 fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Received<'_>)) {
-    let mut decoder = Decoder::new(None);
+    let mut decoder = Decoder::new(Some(MAX_RECEIVED_FRAME_BYTES));
     let mut buffer = [0; 4096];
     // Until the first response to this client's first request, frames are leftovers.
     let mut synced = false;

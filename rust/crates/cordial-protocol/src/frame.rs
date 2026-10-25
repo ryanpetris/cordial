@@ -200,3 +200,26 @@ fn decode_in_place(bytes: &mut [u8]) -> Result<usize, FrameError> {
     }
     Ok(write)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DELIMITER, Decoder, FrameError};
+
+    #[test]
+    fn an_unterminated_overlong_frame_stops_growing_the_buffer() {
+        let mut decoder = Decoder::new(Some(16));
+        for _ in 0..18 {
+            assert!(decoder.push(1).is_none());
+        }
+        assert!(decoder.discarding);
+        assert!(decoder.buffer.is_empty());
+        let capacity = decoder.buffer.capacity();
+
+        for _ in 0..65_536 {
+            assert!(decoder.push(1).is_none());
+        }
+        assert!(decoder.buffer.is_empty());
+        assert_eq!(decoder.buffer.capacity(), capacity);
+        assert_eq!(decoder.push(DELIMITER), Some(Err(FrameError::TooLong)));
+    }
+}

@@ -63,6 +63,11 @@ Every complete outgoing `Request` must fit 1024 protobuf bytes, including all en
 command envelope. `SetProfileRules` is atomic per request, with no automatic splitting or atomicity
 across several requests.
 
+The Rust client library, CLI and TUI enforce a local 32 MiB decoded receive limit on each complete
+protobuf `Message`, including nested envelopes and all repeated listing batches. The TypeScript
+desktop and web clients do not apply this limit. See
+[Rust host receive limit](transport.md#rust-host-receive-limit) for overflow and session behavior.
+
 ## CLI
 
 `cordial --port PORT` opens the shell; `cordial --port PORT COMMAND ...` runs one command, and piped

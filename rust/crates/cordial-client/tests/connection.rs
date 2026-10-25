@@ -8,14 +8,18 @@ use cordial_protocol::{
 };
 use prost::Message as _;
 use std::{
+    collections::VecDeque,
     io::{self, Read, Write},
     sync::{
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+const HOST_RECEIVE_LIMIT: usize = 32 * 1024 * 1024;
 
 /// One direction of an in-memory byte stream. Reads time out like a serial port's.
 struct PipeReader {
@@ -63,6 +67,142 @@ fn pipe() -> (PipeWriter, PipeReader) {
             buffer: Vec::new(),
         },
     )
+}
+
+enum ReadStep {
+    WaitForWrites(usize),
+    Repeat { byte: u8, remaining: usize },
+    Bytes { bytes: Vec<u8>, offset: usize },
+    Signal(Sender<()>),
+}
+
+struct ScriptReader {
+    writes: Arc<AtomicUsize>,
+    steps: VecDeque<ReadStep>,
+}
+
+impl Read for ScriptReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let Some(step) = self.steps.front_mut() else {
+                thread::sleep(Duration::from_millis(1));
+                return Err(io::ErrorKind::TimedOut.into());
+            };
+            match step {
+                ReadStep::WaitForWrites(count) => {
+                    if self.writes.load(Ordering::Acquire) < *count {
+                        thread::sleep(Duration::from_millis(1));
+                        return Err(io::ErrorKind::TimedOut.into());
+                    }
+                    self.steps.pop_front();
+                }
+                ReadStep::Repeat { byte, remaining } => {
+                    if *remaining == 0 {
+                        self.steps.pop_front();
+                        continue;
+                    }
+                    let n = out.len().min(*remaining);
+                    out[..n].fill(*byte);
+                    *remaining -= n;
+                    return Ok(n);
+                }
+                ReadStep::Bytes { bytes, offset } => {
+                    if *offset == bytes.len() {
+                        self.steps.pop_front();
+                        continue;
+                    }
+                    let n = out.len().min(bytes.len() - *offset);
+                    out[..n].copy_from_slice(&bytes[*offset..*offset + n]);
+                    *offset += n;
+                    return Ok(n);
+                }
+                ReadStep::Signal(signal) => {
+                    signal.send(()).unwrap();
+                    self.steps.pop_front();
+                }
+            }
+        }
+    }
+}
+
+struct CountingWriter(Arc<AtomicUsize>);
+
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.fetch_add(1, Ordering::Release);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn scripted(steps: impl IntoIterator<Item = ReadStep>) -> (ScriptReader, CountingWriter) {
+    let writes = Arc::new(AtomicUsize::new(0));
+    (
+        ScriptReader {
+            writes: writes.clone(),
+            steps: steps.into_iter().collect(),
+        },
+        CountingWriter(writes),
+    )
+}
+
+fn bytes(bytes: Vec<u8>) -> ReadStep {
+    ReadStep::Bytes { bytes, offset: 0 }
+}
+
+fn framed(kind: message::Kind) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    frame::encode(&p::Message { kind: Some(kind) }, &mut bytes);
+    bytes
+}
+
+fn oversized_frame(response: bool) -> Vec<u8> {
+    let kind = if response {
+        message::Kind::Response(p::Response {
+            result: Some(response::Result::File(p::FileData {
+                data: vec![1; HOST_RECEIVE_LIMIT],
+            })),
+        })
+    } else {
+        message::Kind::Event(p::Event {
+            kind: Some(p::event::Kind::Adapter(p::Status {
+                name: "x".repeat(HOST_RECEIVE_LIMIT),
+                ..Default::default()
+            })),
+        })
+    };
+    let message = p::Message { kind: Some(kind) };
+    assert!(message.encoded_len() > HOST_RECEIVE_LIMIT);
+    let mut bytes = Vec::new();
+    frame::encode(&message, &mut bytes);
+    bytes
+}
+
+fn exact_limit_response_frame() -> (Vec<u8>, usize) {
+    // At this size, the three nested protobuf lengths use four bytes each.
+    let data_len = HOST_RECEIVE_LIMIT - 15;
+    let message = p::Message {
+        kind: Some(message::Kind::Response(p::Response {
+            result: Some(response::Result::File(p::FileData {
+                data: vec![1; data_len],
+            })),
+        })),
+    };
+    assert_eq!(message.encoded_len(), HOST_RECEIVE_LIMIT);
+    let mut bytes = Vec::new();
+    frame::encode(&message, &mut bytes);
+    (bytes, data_len)
+}
+
+fn wait_for_writes(writes: &AtomicUsize, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while writes.load(Ordering::Acquire) < count {
+        assert!(Instant::now() < deadline, "request was not written");
+        thread::yield_now();
+    }
 }
 
 /// The Dongle's side of the stream.
@@ -277,6 +417,46 @@ fn the_first_request_follows_a_delimiter_and_leftovers_are_ignored() {
     }
     assert_eq!(*received.lock().unwrap(), expected);
     assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn oversized_frames_before_synchronization_are_ignored() {
+    let (before_done, before_wait) = mpsc::channel();
+    let encoded_overflow = HOST_RECEIVE_LIMIT + HOST_RECEIVE_LIMIT / 254 + 2;
+    let response = framed(message::Kind::Response(p::Response {
+        result: Some(response::Result::Status(status("Ready"))),
+    }));
+    let (reader, writer) = scripted([
+        ReadStep::Repeat {
+            byte: 1,
+            remaining: encoded_overflow,
+        },
+        bytes(vec![frame::DELIMITER]),
+        ReadStep::Signal(before_done),
+        ReadStep::WaitForWrites(1),
+        ReadStep::Repeat {
+            byte: 1,
+            remaining: encoded_overflow,
+        },
+        bytes(vec![frame::DELIMITER]),
+        bytes(response),
+    ]);
+    let (connection, events) = Connection::new(reader, writer);
+
+    before_wait.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(connection.status().unwrap().name, "Ready");
+    assert!(connection.closed().is_none());
+    assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn a_response_at_the_host_receive_limit_is_accepted() {
+    let (response, data_len) = exact_limit_response_frame();
+    let (reader, writer) = scripted([ReadStep::WaitForWrites(1), bytes(response)]);
+    let (connection, _events) = Connection::new(reader, writer);
+
+    assert_eq!(connection.read_file("/large").unwrap().len(), data_len);
+    assert!(connection.closed().is_none());
 }
 
 #[test]
@@ -600,6 +780,45 @@ fn an_invalid_frame_after_the_first_response_closes_the_connection() {
     thread::sleep(Duration::from_millis(100));
     assert!(matches!(connection.closed(), Some(Error::Protocol)));
     assert!(matches!(connection.status(), Err(Error::Protocol)));
+}
+
+#[test]
+fn oversized_responses_and_events_close_the_synchronized_connection() {
+    for is_response in [true, false] {
+        let synchronized = framed(message::Kind::Response(p::Response {
+            result: Some(response::Result::Status(status("Ready"))),
+        }));
+        let later_response = framed(message::Kind::Response(p::Response {
+            result: Some(response::Result::Devices(devices(vec![saved(9)]))),
+        }));
+        let (reader, writer) = scripted([
+            ReadStep::WaitForWrites(1),
+            bytes(synchronized),
+            ReadStep::WaitForWrites(3),
+            bytes(oversized_frame(is_response)),
+            bytes(later_response),
+        ]);
+        let writes = writer.0.clone();
+        let (connection, events) = Connection::new(reader, writer);
+        connection.set_timeout(Some(Duration::from_secs(1)));
+        assert_eq!(connection.status().unwrap().name, "Ready");
+        let connection = Arc::new(connection);
+
+        let first = {
+            let connection = connection.clone();
+            thread::spawn(move || connection.request(Command::GetStatus(p::GetStatus {})))
+        };
+        wait_for_writes(&writes, 2);
+        let second = {
+            let connection = connection.clone();
+            thread::spawn(move || connection.request(Command::ListDevices(p::ListDevices {})))
+        };
+
+        assert!(matches!(first.join().unwrap(), Err(Error::Protocol)));
+        assert!(matches!(second.join().unwrap(), Err(Error::Protocol)));
+        assert!(matches!(connection.closed(), Some(Error::Protocol)));
+        assert!(events.recv_timeout(Duration::from_secs(1)).is_err());
+    }
 }
 
 #[test]
