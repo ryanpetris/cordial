@@ -125,11 +125,25 @@ async fn secondary_task(owner: &'static App, interfaces: u8) {
     owner.secondary(interfaces, now).await
 }
 
-#[embassy_executor::main(
-    executor = "embassy_rp::executor::Executor",
-    entry = "cortex_m_rt::entry"
-)]
-async fn main(spawner: Spawner) {
+#[cortex_m_rt::entry]
+fn main() -> ! {
+    if embassy_rp::install_core0_stack_guard().is_err() {
+        fatal();
+    }
+    start()
+}
+
+// Keep executor and task construction frames behind the installed stack guard.
+#[inline(never)]
+fn start() -> ! {
+    static EXECUTOR: static_cell::StaticCell<embassy_rp::executor::Executor> =
+        static_cell::StaticCell::new();
+    let executor = EXECUTOR.init(embassy_rp::executor::Executor::new());
+    executor.run(|spawner| spawner.spawn(main_task(spawner).unwrap()));
+}
+
+#[embassy_executor::task]
+async fn main_task(spawner: Spawner) {
     let mut config = embassy_rp::config::Config::default();
     config.clocks = board::clocks();
     let p = embassy_rp::init(config);

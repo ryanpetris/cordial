@@ -194,6 +194,31 @@ initialization frames together have at most 16 KiB. This catches large construct
 temporaries; SDK calls and executor workloads still need stack measurements on
 hardware before reducing the FreeRTOS stack allocation.
 
+Every Pico board reserves 65536 bytes for the core 0 stack. Its synchronous entry
+installs `embassy_rp::install_core0_stack_guard` before executor or task
+construction, peripheral initialization, heap initialization and application
+construction. A separate, non-inlined function starts the executor so its frames
+are allocated after guard installation. Firmware halts if installation fails.
+The Cortex-M reset handler initializes RAM before this entry runs, so that early
+runtime code is outside this protection.
+
+On RP2040, Embassy uses the MPU to deny access to a 32-byte subregion at the
+bottom of the stack reservation. Access to that subregion faults, but a large
+stack adjustment can jump over it and corrupt memory below the reservation
+without touching the guard. On RP2350, Embassy sets `MSPLIM` to the bottom of
+the reservation so main stack pointer updates below that limit fault. The guards
+provide overflow detection but do not prove that the reserved stack is sufficient
+or measure its high-water usage. They do not provide general memory protection.
+
+No on-device stack high-water measurement is recorded here. Before reducing
+stack reservations, measure both production and debug firmware on each affected
+chip. Use a debugger to fill only the unused stack with a known pattern after
+reset and before application startup. Inspect the boundary between the overwritten
+and intact pattern after startup and sustained USB and radio activity, including
+pairing, reconnections, storage writes and interrupt load. Keep the active stack
+and the guard region out of the fill. Record the workload, observed peak and
+remaining headroom. A passing workload does not bound untested paths.
+
 `rust/tools/flash_dev.py` inspects Pico UF2 artifacts and supports explicit
 storage-preserving development updates. See its `--help` for identity and mount
 arguments. ESP32-S3 uses its ROM download protocol and the regions in `flash.json`.
