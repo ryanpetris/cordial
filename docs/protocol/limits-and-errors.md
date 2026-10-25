@@ -56,20 +56,58 @@ hardware.
 
 ## Errors
 
-`Error` carries an `ErrorCode`, the capacity that ran out for `ERROR_CODE_NO_CAPACITY`, and
-`outcome_unknown` for a save that may or may not have taken effect. The same codes describe a
-failed connection or profile load (`Device.errors`), integration (`Integration.status`),
-setting (`SettingStatus`) and pairing (`failed`). `Status.errors` carries adapter problems. These scopes remain separate; an
-integration or setting error does not become a device error. Each adapter and device list is a
-complete replacement, without duplicates and in numeric order. The comments on `ErrorCode` in
-[`proto/cordial.proto`](../../proto/cordial.proto) say what each code means; the host supplies the
-words a user sees.
+`Error` contains `code`, `reason`, `outcome` and repeated `related` errors. Every code can carry all
+three details. Full errors describe command responses, adapter and device problems, record reads,
+scans, pairing, integrations, settings and output setup. These scopes remain separate; an
+integration or setting error does not become a device error. The comments in
+[`proto/cordial.proto`](../../proto/cordial.proto) define the codes; the host supplies user-facing
+words without discarding the reported details.
 
-A failed save that the Dongle cannot resolve sets `outcome_unknown` and leaves storage not ready
-until restart; a client shows that the save status is unknown rather than assuming either value.
-A full flash keeps the previous value. A lost response leaves the outcome of a command uncertain;
-after reconnecting, a client reads the current state before retrying, and never retries pairing or
-unpairing automatically.
+`ErrorReason` supplies context independently of the code:
+
+| Reason | Context |
+| --- | --- |
+| `UNKNOWN` | No further context is known. |
+| `ENABLED_DEVICES` | Enabled-device admission, including the transport's `DEVICES` allowance. |
+| `CONNECTIONS` | Connection slots, including the transport's `CONNECTIONS` allowance. |
+| `SCAN_CANDIDATES` | Retaining scan candidates or allocating their IDs. |
+| `STORAGE` | Reading, writing or allocating persistent storage. |
+| `PROFILE_MEMORY` | A profile's memory or the shared loaded-profile budget. |
+| `RADIO` | Bluetooth radio initialization or operation. |
+| `OUTPUT_BACKEND` | The selected USB output backend. |
+| `INPUT_LAYOUT` | The device's input layout for the requested translation. |
+
+`ErrorOutcome` reports evidence about the containing operation's effects or results. For command
+responses this means requested changes, or returned results for a read. Other records define their
+scope, such as bond saving for pairing or applying a setting to the device.
+
+| Outcome | Evidence |
+| --- | --- |
+| `UNSPECIFIED` | No outcome information is supplied. Unknown enum values provide no information either. |
+| `UNKNOWN` | The adapter explicitly cannot determine the outcome. |
+| `NO_EFFECT` | No effects or results occurred in the documented scope. |
+| `PARTIAL` | Some effects or results are confirmed, but the operation did not complete fully. Remaining effects are not confirmed absent. |
+| `COMPLETE` | The intended effects or results are confirmed despite a failure elsewhere in the operation, such as later cleanup. |
+
+Missing details never imply success, unchanged data or permission to retry. An error code alone
+proves no outcome. Conversions between wire, application and client errors preserve the complete
+error recursively and use `UNSPECIFIED` when they have no outcome evidence. They use `NO_EFFECT`
+only when evidence confirms that no effects or results occurred in the documented scope.
+
+`related` preserves additional failures without replacing the primary failure or its outcome.
+Each related error retains its own context and outcome scope. Error lists, including related
+lists, are ordered lexicographically by numeric code, reason, outcome and then related errors
+recursively. A shorter related list sorts first when it is a prefix of another. Only identical
+complete errors are duplicates; equal codes with different details stay distinct. Adapter and
+device error lists are complete replacements.
+
+A save whose durability cannot be resolved reports `STORAGE_FAILED`, reason `STORAGE` and outcome
+`UNKNOWN`. Storage stays not ready until the outcome is resolved or a restart successfully reloads
+saved state. Radio recovery cannot clear it. `STORAGE_FULL` also uses reason `STORAGE` and does not
+make storage unready; a confirmed no-effect failure leaves the previous value intact. A lost
+response leaves a command's outcome uncertain. After reconnecting, a client reads the current
+state before retrying and never retries pairing or unpairing automatically. Even `COMPLETE` remains
+an error in the containing operation.
 
 ## Client pre-checks
 
@@ -79,9 +117,9 @@ refuses, the client shows the error and does nothing else, since events bring it
 
 | Refusal | Client checks |
 | --- | --- |
-| A device change that needs a bond table entry: `NO_CAPACITY`, `CAPACITY_REASON_ENABLED` | For a device whose `Device.inactive` is set, a change that leaves it enabled and unblocked on a transport the firmware supports and has enabled: the devices of that transport without `Device.inactive` against its advertised `DEVICES.limit` |
-| Pairing with no room: `NO_CAPACITY`, `CAPACITY_REASON_STORAGE` | `ERROR_CODE_STORAGE_FULL` in `Status.errors` |
-| A second pairing: `BUSY` | The latest pairing step is not `done` or `failed` |
+| A device change that needs a bond table entry: `NO_CAPACITY`, `ERROR_REASON_ENABLED_DEVICES` | For a device whose `Device.inactive` is set, a change that leaves it enabled and unblocked on a transport the firmware supports and has enabled: the devices of that transport without `Device.inactive` against its advertised `DEVICES.limit` |
+| Pairing with no room: `NO_CAPACITY`, `ERROR_REASON_STORAGE` | `ERROR_CODE_STORAGE_FULL` in `Status.errors` |
+| A second pairing: `BUSY` | The latest pairing step is not `done` or `error` |
 | Answering a prompt: `NO_PROMPT` | The latest pairing step is `enter_code` or `confirm_code` |
 | Connecting: `DISABLED`, `BLOCKED` | `Device.enabled`, `Device.blocked`, `Device.inactive` |
 | Scanning with no transports: `BAD_ARGS` | The request itself |
@@ -92,7 +130,7 @@ refuses, the client shows the error and does nothing else, since events bring it
 | Profile commands on a board without profile support: `UNKNOWN_COMMAND` | `Status.profile_support` |
 | Device layers on a board without profile support: `UNSUPPORTED` | `Status.profile_support` |
 | A missing rule input or collection, an input or output out of range, too many outputs, or a zero scale: `BAD_ARGS` | `ProfileSupport.ranges`, matching kind, usage and collection, and `OUTPUTS.limit` in `ProfileSupport.resources` |
-| A profile larger than the memory budget: `NO_CAPACITY`, `CAPACITY_REASON_PROFILE_MEMORY` | None; the size of a saved profile is the Dongle's |
+| A profile larger than the memory budget: `NO_CAPACITY`, `ERROR_REASON_PROFILE_MEMORY` | None; the size of a saved profile is the Dongle's |
 | Too many layers: `BAD_ARGS` | `LAYERS.limit` in `ProfileSupport.resources` |
 | An enabled configuration interface without a profile: `BAD_ARGS` | The resulting `enabled` and `profile` of each interface |
 | Enabling conflicting configuration interfaces: `UNSUPPORTED` | `ConfigurationInterfaceSupport.conflicts` |
@@ -113,6 +151,9 @@ subtle indicator without a large Overview banner. See
 device whose layers are not loaded. These do not replace ordinary inactive or output states.
 An immediate `ConnectDevice` refusal uses response `Error`; a failure after acceptance arrives
 in `Event.device` with a disconnected state and a connection code in `Device.errors`.
+An unpair that fails after its link closes reports the full failure in `Device.errors`, including
+an unresolved deletion outcome and any failure to restore the native bond. A successful restoration
+does not imply a partial unpair merely because the native bond was temporarily removed.
 
 For contextual resource units and independent optional count and limit fields, see
 [resource capacities](records.md#resource-capacities).

@@ -190,8 +190,14 @@ fn responses_match_requests_in_order_with_events_between() {
 fn status_and_device_events_preserve_scoped_errors_and_resources() {
     let mut adapter = status("Desk");
     adapter.errors = vec![
-        p::ErrorCode::UsbRequiredCapacityExceeded as i32,
-        p::ErrorCode::UsbReservedCapacityExceeded as i32,
+        p::Error {
+            code: p::ErrorCode::UsbRequiredCapacityExceeded as i32,
+            ..Default::default()
+        },
+        p::Error {
+            code: p::ErrorCode::UsbReservedCapacityExceeded as i32,
+            ..Default::default()
+        },
     ];
     adapter.resources = vec![p::ResourceCapacity {
         r#type: p::ResourceType::Interfaces as i32,
@@ -206,11 +212,17 @@ fn status_and_device_events_preserve_scoped_errors_and_resources() {
         ..Default::default()
     }];
     let mut saved_device = device(2);
-    saved_device.errors = vec![p::ErrorCode::ProfileMemoryExceeded as i32];
+    saved_device.errors = vec![p::Error {
+        code: p::ErrorCode::ProfileMemoryExceeded as i32,
+        ..Default::default()
+    }];
     saved_device.integrations = vec![p::Integration {
         kind: p::IntegrationKind::Hidpp as i32,
         enabled: true,
-        status: Some(p::integration::Status::Error(p::ErrorCode::Timeout as i32)),
+        status: Some(p::integration::Status::Error(p::Error {
+            code: p::ErrorCode::Timeout as i32,
+            ..Default::default()
+        })),
         ..Default::default()
     }];
     let reply = adapter.clone();
@@ -271,13 +283,24 @@ fn the_first_request_follows_a_delimiter_and_leftovers_are_ignored() {
 fn dongle_errors_are_error_values_and_raw_responses_keep_them() {
     let error = p::Error {
         code: p::ErrorCode::NoCapacity as i32,
-        reason: p::CapacityReason::Enabled as i32,
-        outcome_unknown: false,
+        reason: p::ErrorReason::EnabledDevices as i32,
+        outcome: p::ErrorOutcome::Partial as i32,
+        related: vec![p::Error {
+            code: p::ErrorCode::Timeout as i32,
+            reason: p::ErrorReason::Radio as i32,
+            outcome: p::ErrorOutcome::Unknown as i32,
+            related: vec![p::Error {
+                code: 200,
+                reason: 201,
+                outcome: 202,
+                related: vec![],
+            }],
+        }],
     };
-    let reply = error;
+    let reply = error.clone();
     let (reader, writer, _, _out) = dongle(
         |_| {},
-        move |_, out| out.respond(Some(response::Result::Error(reply))),
+        move |_, out| out.respond(Some(response::Result::Error(reply.clone()))),
     );
     let (connection, _events) = Connection::new(reader, writer);
     let result = connection.set_device(p::SetDevice {
@@ -588,7 +611,7 @@ fn a_handler_sees_events_and_responses_in_stream_order() {
             Command::ListSettings(_) => {
                 out.event(p::event::Kind::ScanDone(p::ScanDone {
                     count: 2,
-                    truncated: false,
+                    error: None,
                 }));
                 out.respond(Some(response::Result::Settings(p::DeviceSettings {
                     device: 1,
@@ -718,12 +741,32 @@ fn list_result(kind: usize, start: u32, count: u32) -> response::Result {
     let ids = || start + 1..start + count + 1;
     match kind {
         0 => response::Result::Devices(devices(
-            ids().map(p::device_list_entry::Entry::Unreadable).collect(),
+            ids()
+                .map(|id| {
+                    p::device_list_entry::Entry::Error(p::RecordError {
+                        id,
+                        error: Some(p::Error {
+                            code: p::ErrorCode::StorageFailed as i32,
+                            reason: p::ErrorReason::Storage as i32,
+                            outcome: p::ErrorOutcome::NoEffect as i32,
+                            related: vec![],
+                        }),
+                    })
+                })
+                .collect(),
         )),
         1 => response::Result::Profiles(p::ProfileList {
             entries: ids()
                 .map(|id| p::ProfileListEntry {
-                    entry: Some(p::profile_list_entry::Entry::Unreadable(id)),
+                    entry: Some(p::profile_list_entry::Entry::Error(p::RecordError {
+                        id,
+                        error: Some(p::Error {
+                            code: p::ErrorCode::StorageFailed as i32,
+                            reason: p::ErrorReason::Storage as i32,
+                            outcome: p::ErrorOutcome::NoEffect as i32,
+                            related: vec![],
+                        }),
+                    })),
                 })
                 .collect(),
         }),
@@ -856,7 +899,10 @@ fn terminal_errors_replace_each_streamed_list_before_observers_see_it() {
             code: p::ErrorCode::NotReady as i32,
             ..Default::default()
         };
-        let frame = streaming_frame([list_result(kind, 0, 1), response::Result::Error(error)]);
+        let frame = streaming_frame([
+            list_result(kind, 0, 1),
+            response::Result::Error(error.clone()),
+        ]);
         let observed = Arc::new(Mutex::new(Vec::new()));
         let log = observed.clone();
         let (reader, writer, _, _out) = dongle(|_| {}, move |_, out| out.raw(&frame));

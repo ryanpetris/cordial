@@ -76,7 +76,12 @@ fn new_gamepad_enables_hid_after_saving_and_reports_the_output() {
         })
         .unwrap();
     assert_eq!(device.output_preferences, [output(p::OutputMode::Hid)]);
-    assert_eq!(device.outputs[0].state, p::OutputState::Pending as i32);
+    assert_eq!(
+        device.outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Pending as i32
+        ))
+    );
     t.app.set_output_enumeration(Some(Enumeration {
         plan: t.app.manager.outputs.plan(),
         generation: 1,
@@ -84,8 +89,10 @@ fn new_gamepad_enables_hid_after_saving_and_reports_the_output() {
     }));
     assert!(t.events().iter().any(|e| matches!(e, Ev::Adapter(_))));
     assert_eq!(
-        t.device(SAVED).outputs[0].state,
-        p::OutputState::Active as i32
+        t.device(SAVED).outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Active as i32
+        ))
     );
     assert_eq!(t.app.gamepad_outputs().hid[0].occupant, Some(link));
 

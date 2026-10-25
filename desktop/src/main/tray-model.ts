@@ -1,6 +1,6 @@
 // What the tray shows for a state, independent of Electron.
 import type { AppState, DeviceEntry } from "../shared/state.ts";
-import { batteryText, deviceStatus } from "../shared/text.ts";
+import { batteryText, connected as isConnected, deviceStatus } from "../shared/text.ts";
 import { batteryLevel, isLow } from "../core/battery.ts";
 
 export type TrayBase = "idle" | "connected";
@@ -29,13 +29,14 @@ export interface TrayModel {
 function trayDevice(d: DeviceEntry, threshold: number, ready: boolean): TrayDevice {
   const level = batteryLevel(d.battery, threshold);
   const battery = batteryText(d.battery);
-  const parts = [deviceStatus(d.device)];
+  const parts = [deviceStatus(d)];
   if (battery) parts.push(level === "low" || level === "critical" ? `${battery} (low)` : battery);
   return {
     key: d.key,
     label: `${d.name} — ${parts.join(" · ")}`,
-    connected: d.device.state === "connected",
-    canConnect: ready && d.device.state === "disconnected" && d.device.inactive === null,
+    connected: isConnected(d),
+    // A record that is only last known leaves Connect to the adapter.
+    canConnect: ready && (!!d.readError || (d.device.state === "disconnected" && d.device.inactive === null)),
     low: isLow(d.battery, threshold),
   };
 }
@@ -47,7 +48,7 @@ export function trayModel(state: AppState): TrayModel {
   const devices = state.devices.filter((d) => ids.has(d.adapterId));
   const ready = new Set(adapters.filter((a) => a.readiness === "ready").map((a) => a.id));
   const tray = (d: DeviceEntry) => trayDevice(d, threshold, ready.has(d.adapterId));
-  const connected = devices.filter((d) => d.device.state === "connected");
+  const connected = devices.filter(isConnected);
   const low = connected.filter((d) => isLow(d.battery, threshold));
   const attention = adapters.flatMap((a) => a.attention.map((reason) => `${a.name}: ${reason}`));
   const groups =

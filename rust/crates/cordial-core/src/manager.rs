@@ -20,6 +20,7 @@ use crate::{
     storage::{Preferences, RecordStore},
 };
 use alloc::{boxed::Box, vec::Vec};
+use cordial_protocol::{self as p, ErrorReason};
 
 pub struct Connection {
     pub id: LinkId,
@@ -52,7 +53,7 @@ pub const FIRST_INPUT_WAIT_MS: u64 = 1000;
 type OutputObservation = (
     u64,
     cordial_protocol::OutputMode,
-    cordial_protocol::OutputState,
+    Result<cordial_protocol::OutputState, cordial_protocol::ErrorReason>,
     Option<u32>,
 );
 
@@ -60,7 +61,7 @@ pub struct Manager {
     /// Resident reconnection entries.
     pub devices: Vec<Option<Device>>,
     pub connections: Box<[Option<Connection>]>,
-    pub forward: Forwarder,
+    pub forward: Box<Forwarder>,
     pub outputs: crate::outputs::Planner,
     pub usb_budget: crate::usb::Budget,
     output_runtime: crate::outputs::Runtime,
@@ -72,6 +73,8 @@ pub struct Manager {
     pub preference: AdapterPreference,
     pub storage_ready: bool,
     pub write_uncertain: bool,
+    pub storage_error: Option<cordial_protocol::Error>,
+    pub radio_error: Option<cordial_protocol::Error>,
     /// A deferred save whose outcome is unknown made storage not ready; its first later success
     /// makes it ready again, unless another failure has made it not ready since.
     pub unsaved_unready: bool,
@@ -111,7 +114,7 @@ impl Default for Manager {
             connections: core::iter::repeat_with(|| None)
                 .take(ACTIVE_CONNECTIONS)
                 .collect(),
-            forward: Forwarder::default(),
+            forward: Box::default(),
             outputs: crate::outputs::Planner::default(),
             usb_budget: crate::usb::Budget::default(),
             output_runtime: crate::outputs::Runtime::default(),
@@ -122,6 +125,8 @@ impl Default for Manager {
             preference: AdapterPreference::default(),
             storage_ready: false,
             write_uncertain: false,
+            storage_error: None,
+            radio_error: None,
             unsaved_unready: false,
             unsaved_full: false,
             last_input: None,
@@ -333,15 +338,25 @@ impl Manager {
         let mode = crate::outputs::gamepad(&policy.output_preferences);
         let (mut state, mut assigned) = self.gamepad_state(mode, slot);
         if (!policy.enabled || policy.blocked)
-            && !matches!(state, OutputState::Disabled | OutputState::Unsupported)
+            && matches!(state, Ok(s) if s != OutputState::Disabled)
         {
-            state = OutputState::Disconnected;
+            state = Ok(OutputState::Disconnected);
             assigned = None;
         }
         cordial_protocol::OutputStatus {
             role: Role::Gamepad as i32,
             mode: mode as i32,
-            state: state as i32,
+            status: Some(match state {
+                Ok(state) => cordial_protocol::output_status::Status::State(state as i32),
+                Err(reason) => {
+                    cordial_protocol::output_status::Status::Error(cordial_protocol::Error {
+                        code: cordial_protocol::ErrorCode::Unsupported as i32,
+                        reason: reason as i32,
+                        outcome: cordial_protocol::ErrorOutcome::NoEffect as i32,
+                        ..Default::default()
+                    })
+                }
+            }),
             slot: assigned,
         }
     }
@@ -350,7 +365,10 @@ impl Manager {
         &self,
         mode: cordial_protocol::OutputMode,
         slot: Option<usize>,
-    ) -> (cordial_protocol::OutputState, Option<u32>) {
+    ) -> (
+        Result<cordial_protocol::OutputState, cordial_protocol::ErrorReason>,
+        Option<u32>,
+    ) {
         use cordial_protocol::{OutputMode, OutputState, Role};
         let d = slot.and_then(|s| self.devices.get(s)?.as_ref());
         let c = slot.and_then(|s| {
@@ -360,9 +378,9 @@ impl Manager {
                 .find(|c| c.device == Some(s))
         });
         let state = if mode == OutputMode::Disabled {
-            OutputState::Disabled
+            Ok(OutputState::Disabled)
         } else if !crate::outputs::supports(self.output_support, Role::Gamepad, mode) {
-            OutputState::Unsupported
+            Err(cordial_protocol::ErrorReason::OutputBackend)
         } else if c.is_none_or(|c| c.closing)
             || d.is_none_or(|d| d.state == State::Disconnected)
             || d.is_some_and(|d| {
@@ -372,9 +390,9 @@ impl Manager {
                     || !self.preference.transports.contains(d.peer.transport)
             })
         {
-            OutputState::Disconnected
+            Ok(OutputState::Disconnected)
         } else if c.is_some_and(|c| c.runtime.is_some() && !self.gamepad_source(c)) {
-            OutputState::Unsupported
+            Err(cordial_protocol::ErrorReason::InputLayout)
         } else if c.is_some_and(|c| self.output_candidate(c))
             && self.output_runtime.enumeration.is_some_and(|e| e.ready)
         {
@@ -386,14 +404,14 @@ impl Manager {
                 .map(|s| s as u32);
             return (
                 if assigned.is_some() {
-                    OutputState::Active
+                    Ok(OutputState::Active)
                 } else {
-                    OutputState::Pending
+                    Ok(OutputState::Pending)
                 },
                 assigned,
             );
         } else {
-            OutputState::Pending
+            Ok(OutputState::Pending)
         };
         (state, None)
     }
@@ -600,11 +618,28 @@ impl Manager {
         }
         // The transports in use follow the saved preference. A failure leaves storage not
         // ready, so the next Ready loads and applies it again.
-        self.apply_transports(radio)?;
-        self.sync_bonds(store, radio).await?;
+        if let Err(error) = self.apply_transports(radio) {
+            self.radio_error = Some(crate::wire::error(
+                error,
+                Some(cordial_protocol::ErrorReason::Radio),
+                false,
+            ));
+            return Err(error);
+        }
+        if let Err((error, reason)) = self.sync_bonds(store, radio).await {
+            if reason == ErrorReason::Radio {
+                self.radio_error = Some(crate::wire::error(
+                    error,
+                    Some(cordial_protocol::ErrorReason::Radio),
+                    false,
+                ));
+            }
+            return Err(error);
+        }
         self.pending_device = None;
         self.available_bytes = store.available().await.map_err(|_| Error::StorageFailed)?;
         self.storage_ready = true;
+        self.storage_error = None;
         Ok(())
     }
     /// Clears and disables every configuration interface whose profile no longer exists. When the
@@ -679,7 +714,9 @@ impl Manager {
         }
         if changed {
             self.bonds_pending = true;
-            self.sync_bonds(store, radio).await?;
+            self.sync_bonds(store, radio)
+                .await
+                .map_err(|(error, _)| error)?;
         }
         Ok(changed)
     }
@@ -784,9 +821,24 @@ impl Manager {
     /// No room to save another device.
     /// Storage stops being ready after a failure.
     pub fn fail_storage(&mut self) {
+        let mut error = crate::wire::error(Error::StorageFailed, None, false);
+        if self
+            .storage_error
+            .as_ref()
+            .is_some_and(|e| e.outcome == cordial_protocol::ErrorOutcome::Unknown as i32)
+        {
+            error.outcome = cordial_protocol::ErrorOutcome::Unknown as i32;
+        }
+        self.storage_error = Some(error);
         self.storage_ready = false;
         self.unsaved_unready = false;
         self.reconcile_outputs();
+    }
+    /// A save could not be confirmed. Other subsystem recovery cannot resolve it.
+    pub fn fail_unknown_save(&mut self) {
+        self.fail_storage();
+        self.storage_error.as_mut().unwrap().outcome =
+            cordial_protocol::ErrorOutcome::Unknown as i32;
     }
     /// Whether free space, as last counted, leaves no room to pair another device.
     pub fn storage_full(&self) -> bool {
@@ -943,22 +995,39 @@ impl Manager {
     }
     /// Rebuild the native active view from committed records. Import existing
     /// entries in place so unrelated live connections keep their database index.
-    /// A device whose record turns out to be lost is deleted.
+    /// Lost records are deleted only when no save has an unresolved outcome.
     pub async fn sync_bonds<S: RecordStore, B: Bluetooth>(
         &mut self,
         store: &mut S,
         radio: &mut B,
-    ) -> Result<(), Error> {
-        for peer in radio.bonds().await? {
-            self.forget_stale(peer, radio).await?;
+    ) -> Result<(), (Error, ErrorReason)> {
+        self.bonds_pending = true;
+        let unresolved = self
+            .storage_error
+            .as_ref()
+            .is_some_and(|error| error.outcome == cordial_protocol::ErrorOutcome::Unknown as i32);
+        // An unresolved save cannot authorize deleting bonds or records during recovery.
+        if !unresolved {
+            for peer in radio.bonds().await.map_err(|e| (e, ErrorReason::Radio))? {
+                self.forget_stale(peer, radio)
+                    .await
+                    .map_err(|e| (e, ErrorReason::Radio))?;
+            }
         }
         let mut slot = 0;
+        let mut failure = None;
         while let Some(next) = self.next_resident(slot) {
-            self.import(next, store, radio).await?;
+            if let Err(error) = self.import(next, store, radio).await {
+                if !unresolved || error.1 != ErrorReason::Storage {
+                    return Err(error);
+                }
+                // A missing record cannot prevent restoring other residents after a restart.
+                failure.get_or_insert(error);
+            }
             slot = next + 1;
         }
-        self.bonds_pending = false;
-        Ok(())
+        self.bonds_pending = unresolved;
+        failure.map_or(Ok(()), Err)
     }
     /// Removes `peer`'s bond from the stack unless a resident entry or a link uses it.
     pub async fn forget_stale<B: Bluetooth>(&self, peer: Peer, radio: &mut B) -> Result<(), Error> {
@@ -977,23 +1046,33 @@ impl Manager {
     pub fn next_resident(&self, slot: usize) -> Option<usize> {
         (slot..self.devices.len()).find(|&s| self.devices[s].as_ref().is_some_and(|d| !d.retiring))
     }
-    /// Loads the saved bond of the resident entry in `slot` into the stack. A device whose record
-    /// turns out to be lost is deleted.
+    /// Loads the saved bond of the resident entry in `slot` into the stack. Lost records are
+    /// deleted only when no save has an unresolved outcome.
     pub async fn import<S: RecordStore, B: Bluetooth>(
         &mut self,
         slot: usize,
         store: &mut S,
         radio: &mut B,
-    ) -> Result<(), Error> {
+    ) -> Result<(), (Error, ErrorReason)> {
         let Some((id, peer)) = self.devices[slot].as_ref().map(|d| (d.id, d.peer)) else {
             return Ok(());
         };
         match crate::bonds::load(store, id).await {
-            Ok(Some(bond)) if bond.valid() && bond.owner == id && bond.identity == peer => {
-                radio.import_bond(&bond).await
+            Ok(Some(bond)) if bond.valid() && bond.owner == id && bond.identity == peer => radio
+                .import_bond(&bond)
+                .await
+                .map_err(|e| (e, ErrorReason::Radio)),
+            Ok(_) | Err(crate::storage::Error::Corrupt) => {
+                if self.storage_error.as_ref().is_some_and(|error| {
+                    error.outcome == cordial_protocol::ErrorOutcome::Unknown as i32
+                }) {
+                    return Err((Error::StorageFailed, ErrorReason::Storage));
+                }
+                self.lose(id, store, radio)
+                    .await
+                    .map_err(|e| (e, ErrorReason::Unknown))
             }
-            Ok(_) | Err(crate::storage::Error::Corrupt) => self.lose(id, store, radio).await,
-            Err(_) => Err(Error::StorageFailed),
+            Err(_) => Err((Error::StorageFailed, ErrorReason::Storage)),
         }
     }
     /// Reads a saved policy and bond, removing a device whose record is confirmed lost.
@@ -1200,7 +1279,7 @@ impl Manager {
         Ok(())
     }
     /// Saves the bond of pairing link `id` for `saved`, the saved device with `identity`, or for a
-    /// new device when there is none. Returns the device's ID and, when it is resident, its slot.
+    /// new device when there is none. Returns the saved ID, resident slot and any subsequent error.
     ///
     /// The caller verifies the live pairing attempt and its deadline first. New native keys remain
     /// provisional until the device record is committed.
@@ -1212,27 +1291,38 @@ impl Manager {
         name: &[u8],
         store: &mut S,
         radio: &mut B,
-    ) -> Result<(u64, Option<usize>), Error> {
-        let c = self.connection(id).ok_or(Error::NotConnected)?;
+    ) -> Result<(u64, Option<usize>, Option<cordial_protocol::Error>), cordial_protocol::Error>
+    {
+        use cordial_protocol::{ErrorOutcome, ErrorReason};
+        let unchanged = |code| cordial_protocol::Error {
+            outcome: ErrorOutcome::NoEffect as i32,
+            ..crate::wire::error(code, None, false)
+        };
+        self.write_uncertain = false;
+        let c = self
+            .connection(id)
+            .ok_or_else(|| unchanged(Error::NotConnected))?;
         if c.closing || c.device.is_some() {
-            return Err(Error::NotPending);
+            return Err(unchanged(Error::NotPending));
         }
         if identity.transport != c.peer.transport
             || (identity.transport == Transport::Classic && identity != c.peer)
         {
-            return Err(Error::AuthenticationFailed);
+            return Err(unchanged(Error::AuthenticationFailed));
         }
-        let pending = self.pending_device.ok_or(Error::NotPending)?;
+        let pending = self
+            .pending_device
+            .ok_or_else(|| unchanged(Error::NotPending))?;
         let resident = self.peer(identity);
         if let Some(slot) = resident
             && self.link_for(slot).is_some_and(|other| other != id)
         {
-            return Err(Error::Busy);
+            return Err(unchanged(Error::Busy));
         }
         // Renewing a saved device's bond keeps its ID and preferences, including whether it is
         // enabled. A blocked device is never renewed.
         let mut policy = match saved.filter(|p| p.peer == identity) {
-            Some(policy) if policy.blocked => return Err(Error::Blocked),
+            Some(policy) if policy.blocked => return Err(unchanged(Error::Blocked)),
             Some(policy) => policy,
             None => {
                 let mut policy = Policy::paired(pending, identity, name);
@@ -1241,26 +1331,33 @@ impl Manager {
             }
         };
         let retained = policy.id != pending;
-        let mut bond = radio.export_bond(identity).await?;
+        let mut bond = radio.export_bond(identity).await.map_err(unchanged)?;
         bond.owner = policy.id;
         bond.identity = identity;
         bond.complete = true;
         policy.bond = policy.id;
         let mode = crate::outputs::gamepad(&policy.output_preferences);
-        self.outputs.prepare(policy.id, mode)?;
+        self.outputs.prepare(policy.id, mode).map_err(unchanged)?;
         let configured = crate::outputs::Configured::load(&policy, store).await;
         // Adopt before commit; a failed commit is restored from the old record
         // after teardown. Resolve ambiguous write errors by reading the record.
-        radio.adopt(id)?;
+        radio.adopt(id).map_err(unchanged)?;
         if let Err(error) = crate::bonds::commit(store, &policy, &bond).await {
             self.write_uncertain = error == crate::storage::Error::Unknown;
             if self.write_uncertain {
-                self.fail_storage();
+                self.fail_unknown_save();
             }
-            return Err(if error == crate::storage::Error::Full {
-                Error::StorageFull
-            } else {
-                Error::StorageFailed
+            return Err(cordial_protocol::Error {
+                outcome: if error == crate::storage::Error::Unknown {
+                    ErrorOutcome::Unknown
+                } else {
+                    ErrorOutcome::NoEffect
+                } as i32,
+                ..unchanged(if error == crate::storage::Error::Full {
+                    Error::StorageFull
+                } else {
+                    Error::StorageFailed
+                })
             });
         }
         self.outputs.configure(configured);
@@ -1269,10 +1366,22 @@ impl Manager {
             // The new bond's connection discovers the device and saves its layout again.
             crate::layouts::remove(store, policy.id).await;
         }
+        let mut error = None;
         let slot = match resident {
             Some(slot) => Some(slot),
             None if self.eligible(&policy) && self.room(identity.transport) => {
-                Some(self.add(&policy)?)
+                match self.add(&policy) {
+                    Ok(slot) => Some(slot),
+                    Err(code) => {
+                        self.vacated = true;
+                        error = Some(cordial_protocol::Error {
+                            reason: ErrorReason::EnabledDevices as i32,
+                            outcome: ErrorOutcome::Complete as i32,
+                            ..crate::wire::error(code, None, false)
+                        });
+                        None
+                    }
+                }
             }
             None => None,
         };
@@ -1289,10 +1398,18 @@ impl Manager {
             radio.promote(id);
             c.pairing = false;
         }
-        if self.finish_pair(store).await.is_err() {
-            self.fail_storage();
+        if let Err(code) = self.finish_pair(store).await {
+            let recount = crate::wire::error(code, None, false);
+            if let Some(error) = &mut error {
+                error.related.push(recount);
+            } else {
+                error = Some(cordial_protocol::Error {
+                    outcome: ErrorOutcome::Complete as i32,
+                    ..recount
+                });
+            }
         }
-        Ok((policy.id, slot))
+        Ok((policy.id, slot, error))
     }
     pub fn security(&mut self, id: LinkId, security: ConnectionSecurity) -> Option<usize> {
         let c = self.connection_mut(id)?;
@@ -1721,31 +1838,36 @@ impl Manager {
     /// device's connection in line with it. Turning a connected device off or blocking it closes
     /// its link; its entry leaves once the link has closed. `bond` is the bond the device's
     /// saved record holds when the caller read it in this step; otherwise the record is read for
-    /// it.
+    /// it. Errors after the record commits carry COMPLETE even if the stack cannot apply it.
     pub async fn save_policy<S: RecordStore, B: Bluetooth>(
         &mut self,
         mut policy: Policy,
         bond: Option<&crate::bonds::Bond>,
         store: &mut S,
         radio: &mut B,
-    ) -> Result<(), Error> {
+    ) -> Result<(), p::Error> {
         self.write_uncertain = false;
         if !self.storage_ready {
-            return Err(Error::StorageFailed);
+            return Err(crate::wire::error(Error::StorageFailed, None, false));
         }
         let slot = self.find(policy.id);
         let eligible = self.eligible(&policy);
         if eligible && slot.is_none() && !self.room(policy.peer.transport) {
-            return Err(Error::Capacity);
+            return Err(p::Error {
+                outcome: p::ErrorOutcome::NoEffect as i32,
+                ..crate::wire::error(Error::Capacity, Some(ErrorReason::EnabledDevices), false)
+            });
         }
         if slot.is_some_and(|s| self.devices[s].as_ref().unwrap().deleting) {
-            return Err(Error::Busy);
+            return Err(crate::wire::error(Error::Busy, None, false));
         }
         policy
             .output_preferences
             .retain(|p| p.mode != cordial_protocol::OutputMode::Disabled || policy.setup_pending);
         let mode = crate::outputs::gamepad(&policy.output_preferences);
-        self.outputs.prepare(policy.id, mode)?;
+        self.outputs
+            .prepare(policy.id, mode)
+            .map_err(|e| crate::wire::error(e, None, false))?;
         let configured = crate::outputs::Configured::load(&policy, store).await;
         let saved = match bond {
             Some(bond) => Policies { store }.save_with(&policy, bond).await,
@@ -1754,27 +1876,38 @@ impl Manager {
         if saved == Err(crate::storage::Error::Missing) {
             // The saved record is missing, undecodable or holds another device's bond.
             let _ = self.lose(policy.id, store, radio).await;
-            return Err(Error::NotFound);
+            return Err(crate::wire::error(Error::NotFound, None, false));
         }
         saved.map_err(|error| {
             self.write_uncertain = error == crate::storage::Error::Unknown;
             if self.write_uncertain {
-                self.fail_storage();
+                self.fail_unknown_save();
             }
-            match error {
-                crate::storage::Error::Full => Error::StorageFull,
-                _ => Error::StorageFailed,
-            }
+            crate::wire::error(
+                match error {
+                    crate::storage::Error::Full => Error::StorageFull,
+                    _ => Error::StorageFailed,
+                },
+                None,
+                self.write_uncertain,
+            )
         })?;
         self.outputs.configure(configured);
         self.reconcile_outputs();
+        let complete = |code, reason| p::Error {
+            outcome: p::ErrorOutcome::Complete as i32,
+            ..crate::wire::error(code, Some(reason), false)
+        };
         match slot {
             None if eligible => {
-                let slot = self.add(&policy)?;
+                let slot = self.add(&policy).map_err(|error| {
+                    self.vacated = true;
+                    complete(error, ErrorReason::Unknown)
+                })?;
                 // Only this entry is new; the stack's other bonds are as they were.
-                if let Err(error) = self.import(slot, store, radio).await {
+                if let Err((error, reason)) = self.import(slot, store, radio).await {
                     self.bonds_pending = true;
-                    return Err(error);
+                    return Err(complete(error, reason));
                 }
             }
             None => {}
@@ -1788,8 +1921,11 @@ impl Manager {
                 None => {
                     let peer = self.devices[slot].as_ref().unwrap().peer;
                     self.drop_entry(slot);
-                    if radio.capabilities().supports(peer.transport) {
-                        radio.forget(peer).await?;
+                    if radio.capabilities().supports(peer.transport)
+                        && let Err(error) = radio.forget(peer).await
+                    {
+                        self.bonds_pending = true;
+                        return Err(complete(error, ErrorReason::Radio));
                     }
                 }
             },
@@ -1962,7 +2098,7 @@ impl Manager {
             .map_err(|error| {
                 self.write_uncertain = error == crate::storage::Error::Unknown;
                 if self.write_uncertain {
-                    self.fail_storage();
+                    self.fail_unknown_save();
                 }
                 if error == crate::storage::Error::Full {
                     Error::StorageFull
@@ -1992,14 +2128,14 @@ impl Manager {
         peer: Peer,
         store: &mut S,
         radio: &mut B,
-    ) -> Result<(), Error> {
+    ) -> Result<(), p::Error> {
         self.write_uncertain = false;
         if !self.storage_ready {
-            return Err(Error::StorageFailed);
+            return Err(crate::wire::error(Error::StorageFailed, None, false));
         }
         let slot = self.find(id);
         if slot.is_some_and(|slot| self.link_for(slot).is_some()) {
-            return Err(Error::Busy);
+            return Err(crate::wire::error(Error::Busy, None, false));
         }
         if let Some(slot) = slot {
             self.devices[slot].as_mut().unwrap().deleting = true;
@@ -2007,31 +2143,42 @@ impl Manager {
         if radio.capabilities().supports(peer.transport)
             && let Err(error) = radio.forget(peer).await
         {
-            // Nothing was saved; the device stays as it was, and its bond is loaded again if the
-            // stack lost it.
+            // The record remains authoritative. Restore its bond if the stack lost it.
             if let Some(slot) = slot {
                 self.devices[slot].as_mut().unwrap().deleting = false;
             }
-            let _ = self.sync_bonds(store, radio).await;
+            let mut error = crate::wire::error(error, Some(ErrorReason::Radio), false);
+            if let Err((code, reason)) = self.sync_bonds(store, radio).await {
+                error
+                    .related
+                    .push(crate::wire::error(code, Some(reason), false));
+            }
             return Err(error);
         }
         if let Err(error) = (Policies { store }).remove(id).await {
             self.write_uncertain = error == crate::storage::Error::Unknown;
+            let mut error = crate::wire::error(
+                if error == crate::storage::Error::Full {
+                    Error::StorageFull
+                } else {
+                    Error::StorageFailed
+                },
+                None,
+                self.write_uncertain,
+            );
             if self.write_uncertain {
-                self.fail_storage();
+                self.fail_unknown_save();
             } else {
                 if let Some(slot) = slot {
                     self.devices[slot].as_mut().unwrap().deleting = false;
                 }
-                if self.sync_bonds(store, radio).await.is_err() {
-                    self.fail_storage();
+                if let Err((code, reason)) = self.sync_bonds(store, radio).await {
+                    error
+                        .related
+                        .push(crate::wire::error(code, Some(reason), false));
                 }
             }
-            return Err(if error == crate::storage::Error::Full {
-                Error::StorageFull
-            } else {
-                Error::StorageFailed
-            });
+            return Err(error);
         }
         if let Some(slot) = slot {
             self.drop_entry(slot);

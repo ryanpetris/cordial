@@ -16,6 +16,7 @@ const adapter = (id: string, patch: Partial<AdapterEntry> = {}): AdapterEntry =>
   profilePage: null,
   pickerPage: null,
   profileNames: {},
+  unreadableDevices: [],
   ...patch,
 });
 
@@ -29,6 +30,7 @@ const entry = (adapterId: string, id: string, patch: Partial<DeviceEntry> = {}, 
   pending: [],
   settings: null,
   settingsError: null,
+  readError: null,
   settingsSave: null,
   ...patch,
 });

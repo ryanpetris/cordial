@@ -2,7 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { resource } from "../../shared/capacity.ts";
 import { canEnable, copyName, interfaceName, profileName, profileText } from "../../shared/profiles.ts";
 import type { AdapterEntry, AdapterStatus, DeviceEntry, InterfaceChange, InterfaceState, Profile, RoleName } from "../../shared/state.ts";
-import { READ_FAILED, ROLES, memoryPercent } from "../../shared/text.ts";
+import { READ_FAILED, ROLES, errorText, hasError, memoryPercent, reasonText } from "../../shared/text.ts";
 import { act, useAction } from "../api.ts";
 import { Card, Dialog, Menu, Meter, Row, Spinner, Staged, Switch } from "./common.tsx";
 import {
@@ -152,7 +152,10 @@ export function AdapterProfiles({ adapter, locked }: { adapter: AdapterEntry; lo
         </button>
       </Row>
     )),
-    ...(page?.unreadable ?? []).map((id) => <Row key={id} title={`Profile ${id}`} subtitle="Couldn't Read" dim />),
+    ...(page?.unreadable ?? []).map(({ id, error }) => {
+      const detail = errorText(error, "read");
+      return <Row key={id} title={`Profile ${id}`} subtitle={detail === READ_FAILED ? "Couldn't Read" : `Couldn't Read: ${reasonText(detail)}`} dim />;
+    }),
   ];
   return (
     <>
@@ -237,7 +240,7 @@ export function ProfileMemory({ status }: { status: AdapterStatus }) {
           <span>In Use</span>
           <span className="value">{percent}%</span>
         </div>
-        <Meter fraction={percent / 100} low={status.errors.includes("profile_memory_low")} />
+        <Meter fraction={percent / 100} low={hasError(status.errors, "profile_memory_low")} />
       </div>
     </Card>
   );

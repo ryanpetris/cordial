@@ -8,13 +8,14 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { compareRuleRefs, compareSettingsRefs, ruleRef, settingsRef, type ByteStream } from "@cordial/client";
 import {
-  CapacityReason,
   CodeKind,
   ConfigurationInterface,
   DELIMITER,
   DeviceSchema,
   DeviceState,
   ErrorCode,
+  ErrorOutcome,
+  ErrorReason,
   FrameDecoder,
   InactiveReason,
   IntegrationKind,
@@ -35,6 +36,7 @@ import {
   Transport,
   encodeFrame,
   type DeviceInformationSchema,
+  type ErrorSchema,
   type EventSchema,
   type PairingSchema,
   type ProfileRule,
@@ -51,6 +53,7 @@ import { adapterName } from "../shared/adapter-name.ts";
 import type { Candidate, KindName, OutputModeName, RoleName, Scalar, SettingField, SettingFields, SettingsGroupName, ValueType } from "../shared/state.ts";
 
 type MessageInit = MessageInitShape<typeof MessageSchema>;
+export type ErrorInit = MessageInitShape<typeof ErrorSchema>;
 type Command<C extends Request["command"]["case"]> = Extract<Request["command"], { case: C }>["value"];
 
 /** A HID++ setting field: its group, component index (pointer sensors only) and field. Enum
@@ -59,15 +62,16 @@ export type FakeSetting = Omit<SettingField, "integration"> & {
   type: ValueType;
   value: Scalar | null;
   saved: Scalar | null;
+  /** `unsupported` reports the saved setting as unsupported. */
   state: "unknown" | "pending" | "applied" | "changed_on_device" | "unsupported";
   /** The last apply's failure, replacing the state. */
-  error: ErrorCode | null;
+  error: ErrorCode | ErrorInit | null;
   choices: Scalar[];
   min: number | null;
   max: number | null;
   step: number | null;
   /** Applying the saved value fails with this, though it stays saved. */
-  fails: ErrorCode | null;
+  fails: ErrorCode | ErrorInit | null;
 };
 
 export interface FakeDevice {
@@ -81,14 +85,14 @@ export interface FakeDevice {
   blocked: boolean;
   paused: boolean;
   /** The last failed connection attempt. */
-  error: ErrorCode | null;
+  error: ErrorCode | ErrorInit | null;
   hidppEnabled: boolean;
   /** The HID++ version the device reports when connected; null for a device without HID++. */
   hidpp: [number, number] | null;
   /** Replaces the HID++ state the fake derives while connected, such as `STARTING`. */
   hidppState: IntegrationState | null;
   /** HID++ failed to start on the connected device. */
-  hidppError: ErrorCode | null;
+  hidppError: ErrorCode | ErrorInit | null;
   roles: RoleName[];
   /** What the device reports while connected. */
   info: MessageInitShape<typeof DeviceInformationSchema>;
@@ -402,9 +406,49 @@ function takes(s: FakeSetting, v: Scalar): boolean {
 
 const sameObject = (s: FakeSetting, group: string, index: number | null) => s.group === group && s.index === index;
 
+/** A saved record's failed read. */
+const READ_ERROR: ErrorInit = { code: ErrorCode.STORAGE_FAILED, reason: ErrorReason.STORAGE, outcome: ErrorOutcome.NO_EFFECT };
+
+/** The reason the firmware gives a code that comes without one here. */
+const REASONS: Partial<Record<ErrorCode, ErrorReason>> = {
+  [ErrorCode.NOT_READY]: ErrorReason.RADIO,
+  [ErrorCode.NO_CAPACITY]: ErrorReason.ENABLED_DEVICES,
+  [ErrorCode.STORAGE_FAILED]: ErrorReason.STORAGE,
+  [ErrorCode.STORAGE_FULL]: ErrorReason.STORAGE,
+  [ErrorCode.PROFILE_MEMORY_LOW]: ErrorReason.PROFILE_MEMORY,
+  [ErrorCode.USB_REQUIRED_CAPACITY_EXCEEDED]: ErrorReason.OUTPUT_BACKEND,
+  [ErrorCode.USB_RESERVED_CAPACITY_EXCEEDED]: ErrorReason.OUTPUT_BACKEND,
+  [ErrorCode.PROFILE_MEMORY_EXCEEDED]: ErrorReason.PROFILE_MEMORY,
+  [ErrorCode.PROFILE_LOAD_FAILED]: ErrorReason.STORAGE,
+};
+
+/** An error as the protocol carries it, from a code alone, with the firmware's reason, or a
+ * complete error. */
+const errorOf = (e: ErrorCode | ErrorInit): ErrorInit => (typeof e === "number" ? { code: e, reason: REASONS[e] } : e);
+
+/** The firmware's order of errors: by numeric code, reason and outcome, then related errors in
+ * turn, a shorter list first. */
+function compareErrors(a: ErrorInit, b: ErrorInit): number {
+  const order = (a.code ?? 0) - (b.code ?? 0) || (a.reason ?? 0) - (b.reason ?? 0) || (a.outcome ?? 0) - (b.outcome ?? 0);
+  if (order) return order;
+  const x = a.related ?? [];
+  const y = b.related ?? [];
+  for (let i = 0; i < Math.min(x.length, y.length); i++) {
+    const related = compareErrors(x[i]!, y[i]!);
+    if (related) return related;
+  }
+  return x.length - y.length;
+}
+
+/** Errors in the firmware's order without duplicates. */
+const errorList = (list: ErrorInit[]) => list.sort(compareErrors).filter((e, i, all) => !i || compareErrors(all[i - 1]!, e));
+
 class Refusal extends Error {
-  constructor(readonly code: ErrorCode, readonly reason = CapacityReason.UNKNOWN) {
-    super(ErrorCode[code]);
+  readonly error: ErrorInit;
+  constructor(code: ErrorCode | ErrorInit, reason?: ErrorReason) {
+    const error = typeof code === "number" ? { ...errorOf(code), ...(reason === undefined ? {} : { reason }) } : code;
+    super(ErrorCode[error.code ?? ErrorCode.UNKNOWN]);
+    this.error = error;
   }
 }
 
@@ -427,13 +471,20 @@ export class FakeAdapter implements ByteStream {
   received: Request[] = [];
   /** Events sent in this session, for assertions. */
   events: NonNullable<MessageInitShape<typeof EventSchema>["kind"]>[] = [];
-  /** Error codes to answer the next requests of a command with, in order, by command case. */
-  failures: Record<string, ErrorCode[]> = {};
-  /** Error codes that end the next listings of a command after their first Message of entries,
-   * in order, by command case. */
-  lateFailures: Record<string, ErrorCode[]> = {};
+  /** Errors to answer the next requests of a command with, in order, by command case. A code alone
+   * gets the reason the firmware would give it. */
+  failures: Record<string, (ErrorCode | ErrorInit)[]> = {};
+  /** Errors that end the next listings of a command after their first Message of entries, in
+   * order, by command case. */
+  lateFailures: Record<string, (ErrorCode | ErrorInit)[]> = {};
   /** Whether a STORAGE_FAILED failure leaves the outcome of its write unknown. */
   uncertainWrites = false;
+  /** The error the next scan ends with, right after its last candidate, keeping its candidates. */
+  scanError: ErrorInit | null = null;
+  /** Radio, storage and other faults the status reports along with what the state shows. */
+  faults: ErrorInit[] = [];
+  /** The error the next pairing ends with in place of authenticating. */
+  pairingError: ErrorInit | null = null;
   readonly profileSupport: boolean;
   readonly gamepadOutputs: boolean;
   profiles: FakeProfile[];
@@ -442,7 +493,7 @@ export class FakeAdapter implements ByteStream {
   memoryBudget: number;
   maxLayers: number;
   batchSize: number;
-  /** Records whose flash read fails: listed as unreadable, and a profile here can't load. */
+  /** Records whose flash read fails: listed with a read error, and a profile here can't load. */
   unreadableDevices = new Set<number>();
   unreadableProfiles = new Set<number>();
   /** Records listed as entries of a kind newer than the client, which it reads as unset. */
@@ -652,7 +703,7 @@ export class FakeAdapter implements ByteStream {
     for (let i = 0; i === 0 || i < entries.length; i += this.batchSize) {
       pieces.push({ kind: { case: "response", value: { result: result(entries.slice(i, i + this.batchSize)) } } });
       if (late !== undefined) {
-        pieces.push({ kind: { case: "response", value: { result: { case: "error", value: { code: late } } } } });
+        pieces.push({ kind: { case: "response", value: { result: { case: "error", value: errorOf(late) } } } });
         break;
       }
     }
@@ -683,16 +734,17 @@ export class FakeAdapter implements ByteStream {
     return this.profiles.filter((p) => ids.has(p.id)).reduce((n, p) => n + sizeOf(p), 0);
   }
 
-  /** The adapter's problems, in numeric order. */
-  errors(): ErrorCode[] {
+  /** The adapter's problems, in the firmware's order: `faults`, then what the adapter's state
+   * shows. */
+  errors(): ErrorInit[] {
     const omitted = this.#usb.omitted;
-    const errors = [
+    const codes = [
       ...(omitted.some((p) => p < 0xc0) ? [ErrorCode.USB_REQUIRED_CAPACITY_EXCEEDED] : []),
       ...(omitted.some((p) => p >= 0xc0 && p < 0xe0) ? [ErrorCode.USB_RESERVED_CAPACITY_EXCEEDED] : []),
+      ...(this.ready && this.storageFull ? [ErrorCode.STORAGE_FULL] : []),
+      ...(this.profileSupport && this.memoryBudget > 0 && this.memoryUsed() * 100 >= this.memoryBudget * 85 ? [ErrorCode.PROFILE_MEMORY_LOW] : []),
     ];
-    if (this.ready && this.storageFull) errors.push(ErrorCode.STORAGE_FULL);
-    if (this.profileSupport && this.memoryBudget > 0 && this.memoryUsed() * 100 >= this.memoryBudget * 85) errors.push(ErrorCode.PROFILE_MEMORY_LOW);
-    return [...new Set(errors)].sort((a, b) => a - b);
+    return errorList([...this.faults, ...codes.map(errorOf)]);
   }
 
   /** The USB interfaces the firmware would expose, with their priorities, lower first: serial
@@ -800,31 +852,32 @@ export class FakeAdapter implements ByteStream {
     const mode = d.gamepadOutput;
     const held = this.#slots.get(d.id);
     this.#slots.delete(d.id);
-    let state: OutputState;
+    let state: OutputState | ErrorInit;
     let slot: number | undefined;
     if (mode === "disabled") state = OutputState.DISABLED;
-    else if (!this.gamepadOutputs) state = OutputState.UNSUPPORTED;
+    else if (!this.gamepadOutputs) state = { code: ErrorCode.UNSUPPORTED, reason: ErrorReason.OUTPUT_BACKEND };
     else if (d.state !== "connected" || this.inactive(d) !== undefined) state = OutputState.DISCONNECTED;
-    else if (!d.roles.includes("gamepad")) state = OutputState.UNSUPPORTED;
+    else if (!d.roles.includes("gamepad")) state = { code: ErrorCode.UNSUPPORTED, reason: ErrorReason.INPUT_LAYOUT };
     else {
       const taken = [...this.#slots.values()].filter((s) => s.mode === mode).map((s) => s.slot);
       slot = held?.mode === mode && held.slot < this.pool(mode) ? held.slot : [...Array(this.pool(mode)).keys()].find((n) => !taken.includes(n));
       if (slot !== undefined) this.#slots.set(d.id, { mode, slot });
       state = slot === undefined ? OutputState.PENDING : OutputState.ACTIVE;
     }
-    return { role: Role.GAMEPAD, mode: OUTPUT[mode], state, slot };
+    const status = typeof state === "number" ? { case: "state" as const, value: state } : { case: "error" as const, value: state };
+    return { role: Role.GAMEPAD, mode: OUTPUT[mode], status, slot };
   }
 
   #hidpp(d: FakeDevice) {
     const connected = d.state === "connected";
     const detected = connected && d.hidpp !== null;
     if (!d.hidppEnabled && !detected) return [];
-    let status: { case: "state"; value: IntegrationState } | { case: "error"; value: ErrorCode };
+    let status: { case: "state"; value: IntegrationState } | { case: "error"; value: ErrorInit };
     if (!d.hidppEnabled) status = { case: "state", value: IntegrationState.OFF };
     else if (!connected) status = { case: "state", value: IntegrationState.DISCONNECTED };
-    else if (d.hidppError !== null) status = { case: "error", value: d.hidppError };
+    else if (d.hidppError !== null) status = { case: "error", value: errorOf(d.hidppError) };
     else if (d.hidppState !== null) status = { case: "state", value: d.hidppState };
-    else status = { case: "state", value: d.hidpp ? IntegrationState.ACTIVE : IntegrationState.UNSUPPORTED };
+    else status = d.hidpp ? { case: "state", value: IntegrationState.ACTIVE } : { case: "error", value: { code: ErrorCode.PROTOCOL_UNSUPPORTED } };
     return [{
       kind: IntegrationKind.HIDPP,
       enabled: d.hidppEnabled,
@@ -846,7 +899,7 @@ export class FakeAdapter implements ByteStream {
       blocked: d.blocked,
       paused: d.paused,
       inactive: this.inactive(d),
-      errors: [...new Set([d.error, connected ? d.profileError : null].filter((e) => e !== null))].sort((a, b) => a - b),
+      errors: errorList([d.error, connected ? d.profileError : null].filter((e) => e !== null).map(errorOf)),
       security: connected ? { encrypted: true, authenticated: false, secureConnections: true, keySize: 16 } : undefined,
       integrations: this.#hidpp(d),
       // Information belongs to the current connection.
@@ -860,7 +913,9 @@ export class FakeAdapter implements ByteStream {
   }
 
   #wrapper(s: FakeSetting, connected: boolean) {
-    const status = s.saved === null ? undefined : { result: s.error !== null ? { case: "error" as const, value: s.error } : { case: "state" as const, value: upper(SettingState, s.state) } };
+    const error = s.error ?? (s.state === "unsupported" ? ErrorCode.UNSUPPORTED : null);
+    const status = s.saved === null ? undefined
+      : { result: error !== null ? { case: "error" as const, value: errorOf(error) } : { case: "state" as const, value: upper(SettingState, s.state as Exclude<FakeSetting["state"], "unsupported">) } };
     // A disconnected device's values haven't been read on this connection.
     const value = connected && s.value !== null ? wireOf(s, s.value) : undefined;
     const saved = s.saved === null ? undefined : wireOf(s, s.saved);
@@ -1033,12 +1088,13 @@ export class FakeAdapter implements ByteStream {
     const command = request.command;
     const failure = command.case ? this.failures[command.case]?.shift() : undefined;
     try {
-      if (failure !== undefined) throw new Refusal(failure, failure === ErrorCode.NO_CAPACITY ? CapacityReason.ENABLED : CapacityReason.UNKNOWN);
+      if (failure !== undefined) throw new Refusal(failure);
       this.#run(command);
     } catch (error) {
       if (!(error instanceof Refusal)) throw error;
-      const outcomeUnknown = this.uncertainWrites && error.code === ErrorCode.STORAGE_FAILED;
-      this.#reply({ result: { case: "error", value: { code: error.code, reason: error.reason, outcomeUnknown } } });
+      const e = error.error;
+      const unknown = this.uncertainWrites && e.code === ErrorCode.STORAGE_FAILED && e.outcome === undefined;
+      this.#reply({ result: { case: "error", value: unknown ? { ...e, outcome: ErrorOutcome.UNKNOWN } : e } });
     }
   }
 
@@ -1075,7 +1131,7 @@ export class FakeAdapter implements ByteStream {
               this.#event({ case: "scanFound", value: { id: c.id, transport: TRANSPORT[c.transport!], name: c.name, kinds: c.kinds.map((k) => upper(Kind, k)), rssi: c.rssi ?? undefined } });
           }, 30 * (i + 1)),
         );
-        timers.push(setTimeout(() => this.#stopScan(found.length), (seconds || 10) * 1000));
+        timers.push(setTimeout(() => this.#stopScan(found.length), this.scanError ? 30 * (found.length + 1) : (seconds || 10) * 1000));
         this.#scan = timers;
         return;
       }
@@ -1089,14 +1145,20 @@ export class FakeAdapter implements ByteStream {
         if (!candidate) throw new Refusal(ErrorCode.NOT_FOUND);
         this.#needReady();
         if (!this.available().includes(candidate.transport ?? "ble")) throw new Refusal(ErrorCode.UNSUPPORTED);
-        if (this.storageFull) throw new Refusal(ErrorCode.NO_CAPACITY, CapacityReason.STORAGE);
+        if (this.storageFull) throw new Refusal(ErrorCode.NO_CAPACITY, ErrorReason.STORAGE);
         const pairing = { candidate, prompt: false };
         this.#pairing = pairing;
         this.#reply({});
         this.#pairingEvent({ case: "connecting", value: {} });
         const method = this.pairingMethod;
+        const failure = this.pairingError;
+        this.pairingError = null;
         setTimeout(() => {
           if (this.#pairing !== pairing) return;
+          if (failure) {
+            this.#pairing = null;
+            return this.#pairingEvent({ case: "error", value: failure }, candidate.id);
+          }
           if (!method) return this.#paired();
           pairing.prompt = method !== "show";
           if (method === "confirm") this.#pairingEvent({ case: "confirmCode", value: { passkey: "042731" } });
@@ -1116,7 +1178,7 @@ export class FakeAdapter implements ByteStream {
         this.#reply({});
         if (command.case === "rejectPrompt") {
           this.#pairing = null;
-          this.#pairingEvent({ case: "failed", value: ErrorCode.REJECTED }, p.candidate.id);
+          this.#pairingEvent({ case: "error", value: { code: ErrorCode.REJECTED, outcome: ErrorOutcome.NO_EFFECT } }, p.candidate.id);
         } else setTimeout(() => this.#pairing === p && this.#paired(), 20);
         return;
       }
@@ -1124,18 +1186,18 @@ export class FakeAdapter implements ByteStream {
         const p = this.#pairing;
         this.#pairing = null;
         this.#reply({});
-        if (p) this.#pairingEvent({ case: "failed", value: ErrorCode.CANCELLED }, p.candidate.id);
+        if (p) this.#pairingEvent({ case: "error", value: { code: ErrorCode.CANCELLED, outcome: ErrorOutcome.NO_EFFECT } }, p.candidate.id);
         return;
       }
       case "listDevices": {
         const listed = sorted(this.devices, (d) => d.id, (a, b) => a - b).map((d) =>
           this.newerDevices.has(d.id) ? { entry: { case: undefined } }
-            : this.unreadableDevices.has(d.id) ? { entry: { case: "unreadable" as const, value: d.id } } : { entry: { case: "device" as const, value: this.record(d) } });
+            : this.unreadableDevices.has(d.id) ? { entry: { case: "error" as const, value: { id: d.id, error: READ_ERROR } } } : { entry: { case: "device" as const, value: this.record(d) } });
         return this.#list(command.case, listed, (entries) => ({ case: "devices", value: { entries } }));
       }
       case "getDevice": {
         const d = this.find(command.value.device);
-        if (this.unreadableDevices.has(d.id)) throw new Refusal(ErrorCode.STORAGE_FAILED);
+        if (this.unreadableDevices.has(d.id)) throw new Refusal(READ_ERROR);
         return this.#reply({ result: { case: "device", value: this.record(d) } });
       }
       case "setDevice":
@@ -1147,7 +1209,7 @@ export class FakeAdapter implements ByteStream {
         const inactive = this.inactive(d);
         if (inactive === InactiveReason.DISABLED) throw new Refusal(ErrorCode.DISABLED);
         if (inactive === InactiveReason.BLOCKED) throw new Refusal(ErrorCode.BLOCKED);
-        if (inactive === InactiveReason.CAPACITY) throw new Refusal(ErrorCode.NO_CAPACITY, CapacityReason.ENABLED);
+        if (inactive === InactiveReason.CAPACITY) throw new Refusal(ErrorCode.NO_CAPACITY, ErrorReason.ENABLED_DEVICES);
         if (inactive === InactiveReason.UNSUPPORTED_TRANSPORT || inactive === InactiveReason.TRANSPORT_DISABLED) throw new Refusal(ErrorCode.UNSUPPORTED);
         if (d.state === "connected") return this.#reply({ result: { case: "device", value: this.record(d) } });
         Object.assign(d, { state: "connecting", paused: false, error: null });
@@ -1283,7 +1345,7 @@ export class FakeAdapter implements ByteStream {
     const unused = [InactiveReason.DISABLED, InactiveReason.BLOCKED, InactiveReason.CAPACITY].includes(this.inactive(d)!);
     if (unused && (enabled ?? d.enabled) && !(blocked ?? d.blocked)) {
       const used = this.devices.filter((x) => x !== d && x.transport === d.transport && this.inactive(x) === undefined).length;
-      if (used >= this.maxEnabled) throw new Refusal(ErrorCode.NO_CAPACITY, CapacityReason.ENABLED);
+      if (used >= this.maxEnabled) throw new Refusal(ErrorCode.NO_CAPACITY, ErrorReason.ENABLED_DEVICES);
     }
     const patch: Partial<FakeDevice> = {};
     if (enabled !== undefined) patch.enabled = enabled;
@@ -1343,12 +1405,12 @@ export class FakeAdapter implements ByteStream {
       case "listProfiles": {
         const listed = sorted(this.profiles, (p) => p.id, (a, b) => a - b).map((p) =>
           this.newerProfiles.has(p.id) ? { entry: { case: undefined } }
-            : this.unreadableProfiles.has(p.id) ? { entry: { case: "unreadable" as const, value: p.id } } : { entry: { case: "profile" as const, value: this.#profileRecord(p) } });
+            : this.unreadableProfiles.has(p.id) ? { entry: { case: "error" as const, value: { id: p.id, error: READ_ERROR } } } : { entry: { case: "profile" as const, value: this.#profileRecord(p) } });
         return this.#list(command.case, listed, (entries) => ({ case: "profiles", value: { entries } }));
       }
       case "getProfile": {
         const p = this.#profile(command.value.profile);
-        if (this.unreadableProfiles.has(p.id)) throw new Refusal(ErrorCode.STORAGE_FAILED);
+        if (this.unreadableProfiles.has(p.id)) throw new Refusal(READ_ERROR);
         return this.#reply({ result: { case: "profile", value: this.#profileRecord(p) } });
       }
       case "createProfile":
@@ -1357,7 +1419,7 @@ export class FakeAdapter implements ByteStream {
         const { name } = command.value;
         if (adapterName(name) === null) throw new Refusal(ErrorCode.BAD_ARGS);
         this.#needReady();
-        if (this.storageFull) throw new Refusal(ErrorCode.NO_CAPACITY, CapacityReason.STORAGE);
+        if (this.storageFull) throw new Refusal(ErrorCode.NO_CAPACITY, ErrorReason.STORAGE);
         const created: FakeProfile = { id: this.#nextProfile++, name, rules: source ? source.rules.map((r) => create(ProfileRuleSchema, r)) : [] };
         if (source?.size !== undefined) created.size = source.size;
         this.profiles.push(created);
@@ -1420,7 +1482,7 @@ export class FakeAdapter implements ByteStream {
         const grown = { ...p, rules };
         const loaded = [...this.#loaded.values()].some((ids) => ids.includes(p.id));
         const after = loaded ? this.memoryUsed() - sizeOf(p) + sizeOf(grown) : sizeOf(grown);
-        if (sizeOf(grown) > this.memoryBudget || after > this.memoryBudget) throw new Refusal(ErrorCode.NO_CAPACITY, CapacityReason.PROFILE_MEMORY);
+        if (sizeOf(grown) > this.memoryBudget || after > this.memoryBudget) throw new Refusal(ErrorCode.NO_CAPACITY, ErrorReason.PROFILE_MEMORY);
         this.#needReady();
         const roles = rolesOf(p).join();
         const loads = this.#loads();
@@ -1442,7 +1504,7 @@ export class FakeAdapter implements ByteStream {
       const p = this.#pairing;
       if (p && (p.candidate.transport ?? "ble") === transport) {
         this.#pairing = null;
-        this.#pairingEvent({ case: "failed", value: ErrorCode.UNSUPPORTED }, p.candidate.id);
+        this.#pairingEvent({ case: "error", value: { code: ErrorCode.UNSUPPORTED, outcome: ErrorOutcome.NO_EFFECT } }, p.candidate.id);
       }
       if (this.#scan) {
         this.#scanning = this.#scanning.filter((t) => t !== transport);
@@ -1460,7 +1522,9 @@ export class FakeAdapter implements ByteStream {
     if (!this.#scan) return;
     for (const t of this.#scan) clearTimeout(t);
     this.#scan = null;
-    this.#event({ case: "scanDone", value: { count, truncated: false } });
+    const error = this.scanError ?? undefined;
+    this.scanError = null;
+    this.#event({ case: "scanDone", value: { count, error } });
   }
 
   #pairingEvent(step: MessageInitShape<typeof PairingSchema>["step"], candidate = this.#pairing?.candidate.id ?? 0) {

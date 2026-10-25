@@ -1,4 +1,4 @@
-import { ErrorCode, IntegrationState, OutputMode, Role, SettingsGroup } from "@cordial/protocol";
+import { ErrorCode, ErrorOutcome, IntegrationState, OutputMode, Role, SettingsGroup } from "@cordial/protocol";
 import { describe, expect, it } from "vitest";
 import { FakeAdapter, device, setting } from "../src/fake/adapter.ts";
 import * as convert from "../src/core/convert.ts";
@@ -51,6 +51,35 @@ describe("AdapterSession", () => {
     fake.changeAdapter({ ready: true });
     await until(() => lists() === 2 && !session.devices.has(2));
     expect([...session.devices.keys()].sort()).toEqual([1, 3, 4, 5]);
+    expect([...session.readErrors]).toEqual([[3, { code: "storage_failed", reason: "storage", outcome: "no_effect", related: [] }]]);
+    // Reloading the unreadable device lists the devices again; a fresh record clears its error.
+    session.reload(3);
+    await until(() => lists() === 3);
+    expect(session.readErrors.has(3)).toBe(true);
+    fake.unreadableDevices.clear();
+    fake.changeDevice(3, { name: "Renamed" });
+    await until(() => session.devices.get(3)!.name === "Renamed");
+    expect(session.readErrors.size).toBe(0);
+    await session.close();
+  });
+
+  it("keeps the ID and error of every record it couldn't read, with or without an earlier record", async () => {
+    const devices = [1, 2, 3].map((id) => device(id));
+    const fake = new FakeAdapter({ devices, batchSize: 2 });
+    fake.unreadableDevices.add(2);
+    const hooks = { changed: vi.fn(), closed: vi.fn(), event: vi.fn(), log: vi.fn() };
+    const session = await AdapterSession.open(fake.open(), hooks);
+    session.run();
+    await until(() => session.listed);
+    const error = { code: "storage_failed", reason: "storage", outcome: "no_effect", related: [] };
+    expect([...session.devices.keys()]).toEqual([1, 3]);
+    expect(session.unreadableDevices).toEqual([{ id: 2, error }]);
+    // Listing again reads it; until then nothing of its current state is made up.
+    fake.unreadableDevices.clear();
+    session.relist();
+    await until(() => session.devices.has(2));
+    expect(session.unreadableDevices).toEqual([]);
+    expect(session.readErrors.size).toBe(0);
     await session.close();
   });
 
@@ -258,9 +287,9 @@ describe("AdapterSession", () => {
     expect(session.settings.get(1)).toEqual([
       { integration: 1, group: "backlight", index: null, field: "brightness", type: "integer", value: 3, saved: 5, state: "changed_on_device", error: null, choices: [], min: 0, max: 7, step: 1 },
       { integration: 1, group: "pointer_sensor", index: 1, field: "dpi", type: "integer", value: 800, saved: null, state: null, error: null, choices: [400, 800], min: null, max: null, step: null },
-      { integration: 1, group: "wheel", index: null, field: "mode", type: "enum", value: "stepped", saved: "free_spin", state: null, error: "timeout", choices: ["free_spin", "stepped"], min: null, max: null, step: null },
+      { integration: 1, group: "wheel", index: null, field: "mode", type: "enum", value: "stepped", saved: "free_spin", state: null, error: { code: "timeout", reason: "unknown", outcome: "unspecified", related: [] }, choices: ["free_spin", "stepped"], min: null, max: null, step: null },
     ]);
-    const entry = () => ({ device: session.devices.get(1)! });
+    const entry = () => ({ device: session.devices.get(1)!, readError: null });
     expect(settingsCurrent(entry())).toBe(true);
     expect(versionText(entry().device.hidpp!)).toBe("4.2");
     fake.changeDevice(1, { hidppState: IntegrationState.STARTING });
@@ -268,8 +297,13 @@ describe("AdapterSession", () => {
     expect(settingsCurrent(entry())).toBe(false);
     expect(integrationText(entry().device.hidpp!)).toBe("Setting Up");
     fake.changeDevice(1, { hidppState: null, hidppError: ErrorCode.PROTOCOL_UNSUPPORTED });
-    await until(() => session.devices.get(1)!.hidpp?.error === "protocol_unsupported");
-    expect(integrationText(entry().device.hidpp!)).toBe("Failed: This device doesn't support this feature");
+    await until(() => session.devices.get(1)!.hidpp?.error?.code === "protocol_unsupported");
+    expect(integrationText(entry().device.hidpp!)).toBe("Unsupported");
+    fake.changeDevice(1, { hidppError: { code: ErrorCode.TIMEOUT, outcome: ErrorOutcome.UNKNOWN, related: [{ code: ErrorCode.TRANSPORT_ERROR }] } });
+    await until(() => session.devices.get(1)!.hidpp?.error?.code === "timeout");
+    expect(integrationText(entry().device.hidpp!)).toBe(
+      "Failed: This device didn't respond in time. The adapter couldn't confirm whether the change took effect. Also, the adapter couldn't exchange messages with this device",
+    );
     // While disconnected, the list holds the saved settings, with their limits and without readings.
     fake.changeDevice(1, { hidppError: null, state: "disconnected" });
     await until(() => session.devices.get(1)!.hidpp?.state === "disconnected" && session.settings.get(1)!.length === 2);

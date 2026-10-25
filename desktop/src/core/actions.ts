@@ -46,6 +46,7 @@ const FIELDS: Record<Action["type"], Record<string, Kind>> = {
   "profile.delete": { adapterId: "string", profile: "id" },
   "profiles.page": { adapterId: "string", page: "page", picker: "boolean?" },
   "adapter.reload": { adapterId: "string" },
+  "devices.reload": { adapterId: "string" },
   "adapter.connect": { adapterId: "string" },
   "adapter.disconnect": { adapterId: "string" },
   "adapter.menu": { adapterId: "string" },

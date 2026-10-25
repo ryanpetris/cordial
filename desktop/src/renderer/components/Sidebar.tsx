@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { AdapterEntry, AppState, DeviceEntry } from "../../shared/state.ts";
-import { adapterStatus, batteryStale, batteryText, deviceStatus } from "../../shared/text.ts";
+import { adapterStatus, batteryStale, batteryText, connected, deviceStatus } from "../../shared/text.ts";
 import { act, api, chooseAdapter, reportError } from "../api.ts";
 import type { Selection } from "../App.tsx";
 import { AdapterIcon, AppIcon, BatteryGlyph, DeviceIcon, GearIcon, HomeIcon, MenuIcon, PlugIcon, PlusIcon, RefreshIcon } from "./icons.tsx";
@@ -10,12 +10,12 @@ function DeviceRow({ d, selected, threshold, onSelect }: { d: DeviceEntry; selec
   const low = isLow(d.battery, threshold);
   return (
     <button className={selected ? "side-row selected" : "side-row"} aria-current={selected} onClick={onSelect}>
-      <span className={d.device.state === "connected" ? "side-icon on" : "side-icon"}>
+      <span className={connected(d) ? "side-icon on" : "side-icon"}>
         <DeviceIcon kind={d.kind} />
       </span>
       <span className="side-text">
         <span className="side-title">{d.name}</span>
-        <span className="side-subtitle">{deviceStatus(d.device)}</span>
+        <span className="side-subtitle">{deviceStatus(d)}</span>
       </span>
       {d.battery ? (
         <span className={`side-battery${low ? " low" : ""}${batteryStale(d.battery) ? " dim" : ""}`} title={`Battery ${batteryText(d.battery) ?? "unknown"}`}>

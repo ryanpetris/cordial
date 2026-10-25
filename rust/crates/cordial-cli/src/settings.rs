@@ -5,8 +5,8 @@
 use crate::model;
 use cordial_client::order;
 use cordial_protocol::{
-    self as p, ErrorCode, IntegrationKind, SettingState, SettingsGroup as G, integer_setting,
-    setting_status, settings_object::Group, settings_update::Group as U,
+    self as p, IntegrationKind, SettingState, SettingsGroup as G, integer_setting, setting_status,
+    settings_object::Group, settings_update::Group as U,
 };
 
 /// A field this build knows, in display order.
@@ -220,16 +220,16 @@ pub struct Setting {
     /// The preference saved on the adapter.
     pub saved: Option<Value>,
     /// How applying the saved preference went, while there is one.
-    pub status: Option<Result<SettingState, ErrorCode>>,
+    pub status: Option<Result<SettingState, p::Error>>,
     pub limits: Limits,
 }
 
 fn applied(
     saved: bool,
     status: Option<&p::SettingStatus>,
-) -> Option<Result<SettingState, ErrorCode>> {
-    saved.then(|| match status.and_then(|s| s.result) {
-        Some(setting_status::Result::Error(n)) => Err(model::code(n)),
+) -> Option<Result<SettingState, p::Error>> {
+    saved.then(|| match status.and_then(|s| s.result.clone()) {
+        Some(setting_status::Result::Error(e)) => Err(e),
         Some(setting_status::Result::State(n)) => Ok(SettingState::try_from(n).unwrap_or_default()),
         None => Ok(SettingState::Unknown),
     })
@@ -751,7 +751,7 @@ pub fn accepts(s: &Setting, v: &Value) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use p::settings_object::Group;
+    use p::{ErrorCode, settings_object::Group};
 
     pub fn object(group: Group) -> p::SettingsObject {
         p::SettingsObject {
@@ -822,7 +822,10 @@ pub(crate) mod tests {
                 value: Some(false),
                 saved: Some(false),
                 status: Some(p::SettingStatus {
-                    result: Some(setting_status::Result::Error(ErrorCode::Timeout as i32)),
+                    result: Some(setting_status::Result::Error(p::Error {
+                        code: ErrorCode::Timeout as i32,
+                        ..Default::default()
+                    })),
                 }),
             }),
             delay: Some(p::BacklightDelaySettings {
@@ -842,7 +845,13 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(all[0].value, Some(Value::Bool(false)));
-        assert_eq!(all[0].status, Some(Err(ErrorCode::Timeout)));
+        assert_eq!(
+            all[0].status,
+            Some(Err(p::Error {
+                code: ErrorCode::Timeout as i32,
+                ..Default::default()
+            }))
+        );
         assert_eq!(all[1].value, Some(Value::Integer(0)));
         assert_eq!(all[1].status, None);
     }
@@ -928,7 +937,7 @@ pub(crate) mod tests {
             &update(Field::hidpp(Leaf::Dpi, Some(1)), None),
         );
         let all = settings(&objects);
-        assert_eq!((all[1].saved, all[1].status), (None, None));
+        assert_eq!((all[1].saved, all[1].status.clone()), (None, None));
         // The other fields of the object are untouched.
         assert_eq!(all[2].field.leaf, Leaf::WheelMode);
         assert_eq!(

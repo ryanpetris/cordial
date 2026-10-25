@@ -86,12 +86,16 @@ pub struct Sim {
     pub status: p::Status,
     /// Saved devices; listed in ascending ID order.
     pub devices: Vec<p::Device>,
-    /// Saved devices whose records can't be read.
+    /// Saved devices whose records can't be read, listed with a storage read error.
     pub unreadable: Vec<u32>,
     pub settings: BTreeMap<u32, Vec<p::SettingsObject>>,
     pub candidates: Vec<p::Candidate>,
     /// A scan ends at once with scan_done.
     pub scan_ends: bool,
+    /// The error a scan that ends at once reports, keeping its candidates.
+    pub scan_error: Option<p::Error>,
+    /// Replaces the error a failing pairing ends with.
+    pub pairing_error: Option<p::Error>,
     pub plan: Plan,
     /// Pairing saves the device with this record.
     pub paired: p::Device,
@@ -100,7 +104,7 @@ pub struct Sim {
     /// Every command received, in order.
     pub log: Vec<Command>,
     /// Commands answered with this error instead.
-    pub refuse: BTreeMap<&'static str, ErrorCode>,
+    pub refuse: BTreeMap<&'static str, p::Error>,
     /// Listings that end with this error after their first Message of entries, once.
     pub fail_late: BTreeMap<&'static str, ErrorCode>,
     /// Commands that take effect at once but whose replies leave only after this delay.
@@ -335,6 +339,8 @@ impl Default for Sim {
             settings: BTreeMap::new(),
             candidates: vec![candidate(1, "New Keyboard")],
             scan_ends: true,
+            scan_error: None,
+            pairing_error: None,
             plan: Plan::Done,
             paired: device(9, "New Keyboard", Transport::Ble),
             files: BTreeMap::new(),
@@ -388,10 +394,28 @@ fn kind_name(command: &Command) -> &'static str {
 }
 
 fn error(code: ErrorCode) -> Option<response::Result> {
-    Some(response::Result::Error(p::Error {
+    Some(response::Result::Error(refusal(code)))
+}
+
+/// An adapter error with only a code.
+pub fn refusal(code: ErrorCode) -> p::Error {
+    p::Error {
         code: code as i32,
         ..Default::default()
-    }))
+    }
+}
+
+/// A saved record's failed read.
+pub fn read_error(id: u32) -> p::RecordError {
+    p::RecordError {
+        id,
+        error: Some(p::Error {
+            code: ErrorCode::StorageFailed as i32,
+            reason: p::ErrorReason::Storage as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            related: Vec::new(),
+        }),
+    }
 }
 
 /// `entries` in key order.
@@ -593,7 +617,12 @@ impl Sim {
 
     fn pair_failed(&mut self, code: ErrorCode) {
         let candidate = self.pairing.take().unwrap_or_default();
-        self.prompt(candidate, pairing::Step::Failed(code as i32));
+        let error = self.pairing_error.take().unwrap_or(p::Error {
+            code: code as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        });
+        self.prompt(candidate, pairing::Step::Error(error));
     }
 
     /// Applies configuration interface updates in order, as SetAdapter does.
@@ -687,8 +716,8 @@ impl Sim {
 
     fn answer(&mut self, command: Command) {
         self.log.push(command.clone());
-        if let Some(code) = self.refuse.get(kind_name(&command)) {
-            return self.respond(error(*code));
+        if let Some(e) = self.refuse.get(kind_name(&command)) {
+            return self.respond(Some(response::Result::Error(e.clone())));
         }
         let profiles = self.status.profile_support.is_some();
         match command {
@@ -754,19 +783,14 @@ impl Sim {
                 }
                 if self.scan_ends {
                     let count = self.candidates.len() as u32;
-                    self.event(p::event::Kind::ScanDone(p::ScanDone {
-                        count,
-                        truncated: false,
-                    }));
+                    let error = self.scan_error.clone();
+                    self.event(p::event::Kind::ScanDone(p::ScanDone { count, error }));
                 }
             }
             Command::StopScan(_) => {
                 self.respond(None);
                 let count = self.candidates.len() as u32;
-                self.event(p::event::Kind::ScanDone(p::ScanDone {
-                    count,
-                    truncated: false,
-                }));
+                self.event(p::event::Kind::ScanDone(p::ScanDone { count, error: None }));
             }
             Command::StartPairing(start) => {
                 if !self.candidates.iter().any(|c| c.id == start.candidate) {
@@ -820,7 +844,7 @@ impl Sim {
                     .chain(
                         self.unreadable
                             .iter()
-                            .map(|id| device_list_entry::Entry::Unreadable(*id)),
+                            .map(|id| device_list_entry::Entry::Error(read_error(*id))),
                     )
                     .map(|entry| p::DeviceListEntry { entry: Some(entry) })
                     .collect();
@@ -871,8 +895,8 @@ impl Sim {
                 if update.enabled == Some(true) && !d.enabled && enabled >= 7 {
                     return self.respond(Some(response::Result::Error(p::Error {
                         code: ErrorCode::NoCapacity as i32,
-                        reason: p::CapacityReason::Enabled as i32,
-                        outcome_unknown: false,
+                        reason: p::ErrorReason::EnabledDevices as i32,
+                        ..Default::default()
                     })));
                 }
                 if let Some(v) = update.enabled {

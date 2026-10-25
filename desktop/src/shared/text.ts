@@ -9,6 +9,7 @@ import type {
   Code,
   DeviceKind,
   DeviceInformation,
+  DeviceEntry,
   DeviceRecord,
   HostPlatform,
   Inactive,
@@ -28,6 +29,8 @@ import type {
   SettingsGroupName,
   TransportName,
   WireError,
+  ErrorOutcomeName,
+  ErrorReasonName,
 } from "./state.ts";
 
 /** A clause as a complete sentence: capitalized, with a final period. */
@@ -52,7 +55,7 @@ const ERRORS: Record<Code, string> = {
   unsupported: "the adapter or device doesn't support this action",
   no_capacity: "the adapter has no room for that right now",
   no_prompt: "that pairing prompt is no longer waiting for an answer",
-  storage_failed: "the adapter couldn't save the change. Your saved data hasn't changed",
+  storage_failed: "the adapter couldn't save the change",
   internal: "the adapter hit an unexpected failure",
   in_use: "this profile is still in use. Remove it from every device and interface before deleting it",
   candidate_expired: "this device is no longer available. Search again",
@@ -76,16 +79,87 @@ const ERRORS: Record<Code, string> = {
   profile_load_failed: "the adapter couldn't read one of this device's profiles",
 };
 
-const CAPACITY: Record<NonNullable<WireError["reason"]>, string> = {
-  unknown: ERRORS.no_capacity,
-  enabled: "every enabled-device place is in use. Turn off another device first",
-  storage: "the adapter's storage is full. Remove an unused device or forget a saved setting, then try again",
-  connections: "every connection is in use. Disconnect a device first",
-  profile_memory: "the adapter doesn't have enough profile memory for this change",
+/** Wording for a code whose reason changes what failed. */
+const SPECIFIC: Partial<Record<`${Code}:${ErrorReasonName}`, string>> = {
+  "no_capacity:enabled_devices": "every enabled-device place is in use. Turn off another device first",
+  "no_capacity:storage": "the adapter's storage is full. Remove an unused device or forget a saved setting, then try again",
+  "no_capacity:connections": "every connection is in use. Disconnect a device first",
+  "no_capacity:profile_memory": "the adapter doesn't have enough profile memory for this change",
+  "no_capacity:scan_candidates": "the adapter had no room to list every device it found",
+  "no_capacity:output_backend": "the adapter doesn't have enough USB capacity for this output",
+  "not_ready:radio": "the adapter's Bluetooth radio isn't ready. Try again in a moment",
+  "not_ready:storage": "the adapter's storage isn't ready. Try again in a moment",
+  "unsupported:output_backend": "the adapter doesn't support this output",
+  "unsupported:input_layout": "the adapter can't use this device's input layout for this output",
+  "internal:scan_candidates": "the adapter couldn't keep track of every device it found",
+};
+
+/** What a reason concerns, for a code whose wording doesn't already say. */
+const CONTEXT: Record<ErrorReasonName, string | null> = {
+  unknown: null,
+  enabled_devices: "enabled devices",
+  connections: "the adapter's connections",
+  scan_candidates: "the devices found while searching",
+  storage: "the adapter's storage",
+  profile_memory: "profile memory",
+  radio: "the adapter's Bluetooth radio",
+  output_backend: "the adapter's USB output",
+  input_layout: "this device's input layout",
+};
+
+/** The reason each code's wording already names. */
+const IMPLIED: Partial<Record<Code, ErrorReasonName>> = {
+  storage_failed: "storage",
+  storage_full: "storage",
+  profile_memory_low: "profile_memory",
+  profile_memory_exceeded: "profile_memory",
+  usb_required_capacity_exceeded: "output_backend",
+  usb_reserved_capacity_exceeded: "output_backend",
 };
 
 /** A failed read of the adapter's saved data, where the save wording doesn't apply. */
 export const READ_FAILED = "The adapter couldn't read its saved data. Try again.";
+
+/** What an error's outcome is about: a change saved on the adapter, a change applied to the
+ * device, a read, a pairing's saved device, the cleanup after a failed pairing, or another
+ * operation, as for related failures with no more specific scope. */
+export type Scope = "save" | "apply" | "read" | "pair" | "cleanup" | "other";
+
+const OUTCOMES: Record<Scope, Partial<Record<ErrorOutcomeName, string>>> = {
+  save: {
+    unknown: "The adapter couldn't confirm whether the change was saved. Check before trying again.",
+    partial: "The adapter confirmed saving only part of the change.",
+    complete: "The adapter saved the change despite this.",
+  },
+  apply: {
+    unknown: "The adapter couldn't confirm whether the change took effect.",
+    partial: "Only part of the change is confirmed to have taken effect.",
+    complete: "The change took effect despite this.",
+  },
+  read: {
+    unknown: "The adapter couldn't confirm whether the results are complete.",
+    partial: "The adapter returned only some of the results.",
+    complete: "The results are complete despite this.",
+  },
+  pair: {
+    unknown: "The adapter couldn't confirm whether it saved the device. Check its saved devices before pairing again.",
+    partial: "The adapter confirmed saving only part of the pairing.",
+    complete: "The adapter saved the device despite this.",
+  },
+  cleanup: {
+    unknown: "The adapter couldn't confirm whether it finished cleaning up.",
+    partial: "The adapter finished only part of the cleanup.",
+    complete: "The adapter finished cleaning up despite this.",
+  },
+  other: {
+    unknown: "Its outcome is unknown.",
+    partial: "It partly completed.",
+    complete: "Its intended effects completed.",
+  },
+};
+
+/** The scope of the related failures of an error in `scope`. */
+const RELATED: Record<Scope, Scope> = { save: "other", apply: "other", read: "read", pair: "cleanup", cleanup: "other", other: "other" };
 
 /** A local error's text as a complete sentence. */
 export const asSentence = (s: string) => {
@@ -95,13 +169,46 @@ export const asSentence = (s: string) => {
   return /[.!?]$/.test(capital) ? capital : `${capital}.`;
 };
 
-/** An adapter error as a sentence for the window or a notification. */
-export function errorText(error: WireError): string {
-  if (error.code === "no_capacity") return sentence(CAPACITY[error.reason ?? "unknown"]);
-  if (error.code === "storage_failed" && error.outcomeUnknown)
-    return "The adapter couldn't confirm whether the change was saved. Check before trying again.";
-  return sentence(ERRORS[error.code]);
+/** Whether an outcome is evidence: unknown, partial or complete. A value this app doesn't know is
+ * none. */
+const evidence = (e: WireError) => e.outcome === "unknown" || e.outcome === "partial" || e.outcome === "complete";
+
+/** Whether an error reports nothing beyond its code and reason, so a short wording of it loses
+ * nothing. */
+export const plainError = (e: WireError) => !evidence(e) && !e.related.length;
+
+/** What failed, as a clause, with what its reason concerns. */
+function failureClause(e: WireError, scope: Scope): string {
+  if (typeof e.code === "number") return ERRORS.unknown;
+  const reason = typeof e.reason === "number" ? "unknown" : e.reason;
+  const specific = SPECIFIC[`${e.code}:${reason}`];
+  if (specific) return specific;
+  let clause = ERRORS[e.code];
+  if (e.code === "storage_failed") {
+    // Only an outcome of no effect confirms that nothing was saved.
+    clause = scope === "read" ? reasonText(READ_FAILED)
+      : scope === "save" && e.outcome === "no_effect" ? clause
+      : scope === "pair" && e.outcome === "no_effect" ? "the adapter couldn't save the device"
+      : "the adapter couldn't read or write its saved data";
+  }
+  const context = IMPLIED[e.code] === reason ? null : CONTEXT[reason];
+  return context ? `${clause}. This involves ${context}` : clause;
 }
+
+/** An adapter error as sentences for the window or a notification: what failed, what is known of
+ * its effects, then each related failure with its own outcome. */
+export function errorText(e: WireError, scope: Scope = "save", also = false): string {
+  const clause = failureClause(e, scope);
+  const outcome = typeof e.outcome === "number" ? undefined : OUTCOMES[scope][e.outcome];
+  return [also ? `Also, ${clause}.` : sentence(clause), ...(outcome ? [outcome] : []), ...e.related.map((r) => errorText(r, RELATED[scope], true))].join(" ");
+}
+
+/** Whether an error is a plain refusal the short "Unsupported" wording covers. */
+export const unsupportedError = (e: WireError | null) => e?.code === "unsupported" && plainError(e);
+/** Whether an integration's error plainly says the device can't use it at all. */
+export const integrationUnsupported = (e: WireError | null) => !!e && (e.code === "unsupported" || e.code === "protocol_unsupported") && plainError(e);
+
+export const hasError = (list: WireError[] | undefined, code: Code) => !!list?.some((e) => e.code === code);
 
 export const codeText = (code: Code) => sentence(ERRORS[code]);
 
@@ -132,18 +239,19 @@ export const INTEGRATION_STATES: Record<IntegrationStateName, string> = {
   disconnected: "Waiting to Connect",
   starting: "Setting Up",
   active: "Active",
-  unsupported: "Unsupported",
 };
 
-export function integrationText(i: Integration): string {
-  return i.state ? INTEGRATION_STATES[i.state] : `Failed: ${reasonText(codeText(i.error ?? "unknown"))}`;
-}
+/** A status, or a failure as "Unsupported" or "Failed: {reason}". */
+export const stateText = (state: string | null, error: WireError | null, unsupported = unsupportedError(error)) =>
+  state ?? (unsupported ? "Unsupported" : `Failed: ${reasonText(error ? errorText(error, "apply") : codeText("unknown"))}`);
+
+export const integrationText = (i: Integration) => stateText(i.state && INTEGRATION_STATES[i.state], i.error, integrationUnsupported(i.error));
 
 /** The detected HID++ version, as "4.5". */
 export const versionText = (i: Integration) => (i.version ? `${i.version.major}.${i.version.minor}` : "Unknown");
 
 /** A saved setting's state as its marker names it; `unmanaged` is a setting with no saved value. */
-export const SETTING_STATES: Record<SettingStateName | "unmanaged" | "error", string> = {
+export const SETTING_STATES: Record<SettingStateName | "unmanaged" | "unsupported" | "error", string> = {
   unmanaged: "Not Saved",
   unknown: "Saved",
   pending: "Saved",
@@ -160,7 +268,6 @@ export const OUTPUT_STATES: Record<OutputStateName, string> = {
   disconnected: "Waiting to Connect",
   pending: "Setting Up",
   active: "Active",
-  unsupported: "Unsupported",
 };
 
 export const PLATFORMS: Record<HostPlatform, string> = { linux: "Linux", windows: "Windows", mac: "macOS" };
@@ -218,26 +325,27 @@ export function displayKind(kinds: KindName[], roles: RoleName[] = []): DeviceKi
 }
 
 /** Device errors that say why a connected device's profiles aren't loaded. */
-const PROFILE_ERRORS: Code[] = ["profile_memory_exceeded", "profile_load_failed"];
+const PROFILE_ERRORS: (Code | number)[] = ["profile_memory_exceeded", "profile_load_failed"];
 
 /** Why a connected device's profiles aren't loaded, if they aren't. */
-export const profileError = (d: DeviceRecord): Code | null =>
-  d.state === "connected" ? (d.errors.find((e) => PROFILE_ERRORS.includes(e)) ?? null) : null;
+export const profileError = (d: DeviceRecord): WireError | null =>
+  d.state === "connected" ? (d.errors.find((e) => PROFILE_ERRORS.includes(e.code)) ?? null) : null;
 
 /** The device's last failed connection attempt. */
-export const connectionError = (d: DeviceRecord): Code | null => d.errors.find((e) => !PROFILE_ERRORS.includes(e)) ?? null;
+export const connectionError = (d: DeviceRecord): WireError | null => d.errors.find((e) => !PROFILE_ERRORS.includes(e.code)) ?? null;
 
-/** Why a connected device's profiles aren't loaded. */
-export function profileErrorText(code: Code): string {
-  if (code === "profile_memory_exceeded") return "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.";
-  return codeText(code);
+/** Why a connected device's profiles aren't loaded. The short wording of a lack of room is for a
+ * plain error whose reason, if any, is profile memory. */
+export function profileErrorText(e: WireError): string {
+  const room = e.code === "profile_memory_exceeded" && plainError(e) && (e.reason === "unknown" || e.reason === "profile_memory");
+  return room ? "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles." : errorText(e, "apply");
 }
 
 /** A profile alert's notification; a memory alert has no body. */
 export function profileAlertText(alert: ProfileAlert): { title: string; body: string | null } {
   return alert.kind === "memory"
     ? { title: `${alert.name} is almost out of profile memory.`, body: null }
-    : { title: `${alert.name} connected without its profiles.`, body: profileErrorText(alert.code) };
+    : { title: `${alert.name} connected without its profiles.`, body: profileErrorText(alert.error) };
 }
 
 /** How full the adapter's profile memory is, as a whole percentage; null while either value is
@@ -263,7 +371,7 @@ export const USB_CAPACITY: [Code, string][] = [
 /** Why a nearby device can't be added: the adapter has no room to save it. */
 export const STORAGE_FULL = "Storage Full";
 
-export const storageFull = (s: AdapterStatus | null) => !!s?.errors.includes("storage_full");
+export const storageFull = (s: AdapterStatus | null) => hasError(s?.errors, "storage_full");
 
 export interface SettingInfo {
   label: string;
@@ -419,8 +527,13 @@ export function batteryText(b: Battery | null): string | null {
 /** Whether the shown battery reading is only last known. */
 export const batteryStale = (b: Battery) => (b.percent != null && !b.percentFresh) || (b.charging != null && !b.chargingFresh);
 
+/** Whether the device is connected as far as the adapter last confirmed; a record the latest
+ * listing couldn't read confirms nothing. */
+export const connected = (e: Pick<DeviceEntry, "device" | "readError">) => !e.readError && e.device.state === "connected";
+
 /** The device's state in a few words, as lists show it. */
-export function deviceStatus(d: DeviceRecord): string {
+export function deviceStatus({ device: d, readError }: Pick<DeviceEntry, "device" | "readError">): string {
+  if (readError) return "Couldn't Read";
   if (d.blocked) return "Blocked";
   switch (d.state) {
     case "connected":
@@ -434,11 +547,17 @@ export function deviceStatus(d: DeviceRecord): string {
   }
 }
 
+/** Adapter errors shown in their own places, which say nothing of readiness. */
+const ADVISORY: (Code | number)[] = ["storage_full", "profile_memory_low", "usb_required_capacity_exceeded", "usb_reserved_capacity_exceeded"];
+
+/** The adapter's radio, storage and other faults, which a starting adapter doesn't report. */
+export const adapterFaults = (s: AdapterStatus | null) => s?.errors.filter((e) => !ADVISORY.includes(e.code)) ?? [];
+
 /** The adapter's state in a few words, and whether it needs attention. */
 export function adapterStatus(a: AdapterEntry): { text: string; warn: boolean } {
   if (a.connection === "disconnected") return { text: "Disconnected", warn: false };
   if (a.connection === "connecting") return { text: "Connecting…", warn: false };
-  if (a.readiness === "waiting") return { text: "Starting…", warn: false };
+  if (a.readiness === "waiting") return adapterFaults(a.status).length ? { text: "Needs Attention", warn: true } : { text: "Starting…", warn: false };
   return a.attention.length ? { text: "Needs Attention", warn: true } : { text: "Ready", warn: false };
 }
 

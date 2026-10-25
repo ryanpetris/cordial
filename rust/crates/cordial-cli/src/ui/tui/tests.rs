@@ -14,6 +14,14 @@ use ratatui::{
 };
 use std::{cell::RefCell, rc::Rc};
 
+/// An error with only a code.
+fn err(code: p::ErrorCode) -> p::Error {
+    p::Error {
+        code: code as i32,
+        ..Default::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Call {
     Open(String),
@@ -526,7 +534,9 @@ fn gamepad_adapter(saved: p::OutputMode) -> State {
     pad.outputs = vec![p::OutputStatus {
         role: p::Role::Gamepad as i32,
         mode: saved as i32,
-        state: p::OutputState::Active as i32,
+        status: Some(p::output_status::Status::State(
+            p::OutputState::Active as i32,
+        )),
         slot: Some(0),
     }];
     st.devices.push(pad);
@@ -1390,7 +1400,7 @@ fn usb_capacity_errors_show_independently() {
         count: Some(0),
         limit: Some(8),
     }];
-    st.status.errors = vec![p::ErrorCode::UsbReservedCapacityExceeded as i32];
+    st.status.errors = vec![err(p::ErrorCode::UsbReservedCapacityExceeded)];
     let mut app = App::new(110, 40);
     app.attach(vec![("/dev/ttyACM0", st)]);
     // Reserved capacity alone is shown on the adapter's page, without needing attention.
@@ -1406,8 +1416,8 @@ fn usb_capacity_errors_show_independently() {
     let slot = app.slot("00000000000FA001");
     app.edit(slot, |st| {
         st.status.errors = vec![
-            p::ErrorCode::UsbRequiredCapacityExceeded as i32,
-            p::ErrorCode::UsbReservedCapacityExceeded as i32,
+            err(p::ErrorCode::UsbRequiredCapacityExceeded),
+            err(p::ErrorCode::UsbReservedCapacityExceeded),
         ];
         st.status.resources[0].count = None;
     });
@@ -1426,10 +1436,157 @@ fn usb_capacity_errors_show_independently() {
     assert!(app.shows("Required Capacity Exceeded"), "{}", app.screen());
     // Required capacity alone.
     app.edit(slot, |st| {
-        st.status.errors = vec![p::ErrorCode::UsbRequiredCapacityExceeded as i32];
+        st.status.errors = vec![err(p::ErrorCode::UsbRequiredCapacityExceeded)];
     });
     app.click("Pico 2 W");
     let screen = app.screen();
     assert!(screen.contains("Required Capacity Exceeded"), "{screen}");
     assert!(!screen.contains("Reserved Capacity Exceeded"), "{screen}");
+}
+
+#[test]
+fn a_device_record_the_adapter_couldnt_read_says_so_on_diagnostics() {
+    let mut st = first_adapter();
+    st.unreadable.insert(
+        1,
+        p::Error {
+            code: p::ErrorCode::StorageFailed as i32,
+            reason: p::ErrorReason::Storage as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            related: Vec::new(),
+        },
+    );
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    // The device stays listed with what was known of it.
+    app.click("Example Keys Wireless");
+    app.click("Diagnostics");
+    let screen = app.screen();
+    assert!(
+        screen.contains("The adapter couldn't read this device's saved data. Try again."),
+        "{screen}"
+    );
+    assert!(screen.contains("Retry"), "{screen}");
+}
+
+#[test]
+fn a_settings_save_failure_says_couldnt_save_only_with_no_effect() {
+    for (outcome, refused) in [
+        (p::ErrorOutcome::Unspecified as i32, false),
+        (97, false),
+        (p::ErrorOutcome::NoEffect as i32, true),
+    ] {
+        let mut app = App::two(110, 32);
+        app.click("Example Mouse");
+        app.click("Settings");
+        app.click("[○ Free Spin]");
+        app.click("[Save]");
+        let error = p::Error {
+            outcome,
+            ..err(p::ErrorCode::Timeout)
+        };
+        app.finish(Err(Error::dongle(error, Some("setting set"))));
+        let screen = app.screen();
+        assert_eq!(screen.contains("Couldn't Save"), refused, "{screen}");
+        assert!(
+            screen.contains("This device didn't respond in time"),
+            "{screen}"
+        );
+    }
+}
+
+#[test]
+fn a_settings_save_failure_after_sending_is_unconfirmed() {
+    use cordial_client::Error as E;
+    let io = || E::Io(std::sync::Arc::new(std::io::Error::other("unplugged")));
+    for (error, refused) in [
+        (Error::from_client(E::Timeout, "setting set"), false),
+        (Error::from_client(io(), "setting set"), false),
+        (Error::from_client(E::Protocol, "setting set"), false),
+        (
+            Error::from_client(E::UnexpectedResponse, "setting set"),
+            false,
+        ),
+        (Error::from_client(E::Closed, "setting set"), false),
+        (Error::from_client(E::TooLong, "setting set"), true),
+        (
+            Error::code(p::ErrorCode::BadArgs, Some("setting set")),
+            true,
+        ),
+    ] {
+        let mut app = App::two(110, 32);
+        app.click("Example Mouse");
+        app.click("Settings");
+        app.click("[○ Free Spin]");
+        app.click("[Save]");
+        let message = error.message.clone();
+        app.finish(Err(error));
+        let screen = app.screen();
+        assert_eq!(
+            screen.contains("Couldn't Save"),
+            refused,
+            "{message}: {screen}"
+        );
+    }
+}
+
+#[test]
+fn a_device_record_the_adapter_couldnt_read_is_only_last_known() {
+    let mut st = first_adapter();
+    let read = p::Error {
+        code: p::ErrorCode::StorageFailed as i32,
+        reason: p::ErrorReason::Storage as i32,
+        outcome: p::ErrorOutcome::NoEffect as i32,
+        related: Vec::new(),
+    };
+    st.unreadable.insert(2, read.clone());
+    // A device this session never read stays on the adapter's Diagnostics with its error.
+    st.unreadable.insert(9, read);
+    st.status.errors = vec![p::Error {
+        code: p::ErrorCode::StorageFailed as i32,
+        reason: p::ErrorReason::Storage as i32,
+        outcome: p::ErrorOutcome::Unknown as i32,
+        related: Vec::new(),
+    }];
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Example Mouse");
+    let screen = app.screen();
+    assert!(screen.contains("Couldn't Read"), "{screen}");
+    assert!(!screen.contains("[Disconnect]"), "{screen}");
+    app.click("Pico 2 W");
+    app.click("Diagnostics");
+    let screen = app.screen();
+    assert!(screen.contains("Device 9  Couldn't Read"), "{screen}");
+    assert!(
+        screen.contains("The adapter couldn't read or write its saved data."),
+        "{screen}"
+    );
+    app.click("Retry");
+    assert!(
+        app.calls()
+            .iter()
+            .any(|c| matches!(c, Call::Run(_, r) if r == "Devices")),
+        "{:?}",
+        app.calls()
+    );
+}
+
+#[test]
+fn a_fault_while_starting_needs_attention() {
+    let mut st = first_adapter();
+    st.status.ready = false;
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Pico 2 W");
+    assert!(app.shows("Starting…"), "{}", app.screen());
+    let slot = app.slot("00000000000FA001");
+    app.edit(slot, |st| {
+        st.status.errors = vec![p::Error {
+            reason: p::ErrorReason::Radio as i32,
+            ..err(p::ErrorCode::NotReady)
+        }];
+    });
+    app.click("Pico 2 W");
+    assert!(app.shows("Needs Attention"), "{}", app.screen());
 }

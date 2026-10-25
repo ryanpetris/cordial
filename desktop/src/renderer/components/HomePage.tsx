@@ -1,6 +1,6 @@
 import { isLow } from "../../shared/battery.ts";
 import type { AppState } from "../../shared/state.ts";
-import { adapterStatus, batteryStale } from "../../shared/text.ts";
+import { adapterStatus, batteryStale, connected as isConnected } from "../../shared/text.ts";
 import type { Selection } from "../App.tsx";
 import { Card, Meter, Page, Summary } from "./common.tsx";
 import { AdapterIcon, BatteryGlyph, ChevronIcon, DeviceIcon, HomeIcon } from "./icons.tsx";
@@ -20,7 +20,7 @@ export function HomePage({ state, onSelect }: { state: AppState; onSelect: (s: S
   const threshold = state.preferences.lowBatteryPercent;
   const adapterName = (id: string) => state.adapters.find((a) => a.id === id)?.name ?? "";
   const several = state.adapters.filter((a) => a.connection === "connected").length > 1;
-  const connected = state.devices.filter((d) => d.device.state === "connected");
+  const connected = state.devices.filter(isConnected);
   const low = state.devices.filter((d) => isLow(d.battery, threshold));
   return (
     <Page icon={<HomeIcon size={20} />} title="Overview">
@@ -82,7 +82,7 @@ export function HomePage({ state, onSelect }: { state: AppState; onSelect: (s: S
         {state.adapters.map((a) => {
           const devices = state.devices.filter((d) => d.adapterId === a.id);
           const paired = devices.length;
-          const on = devices.filter((d) => d.device.state === "connected").length;
+          const on = devices.filter(isConnected).length;
           const status = adapterStatus(a);
           return (
             <button key={a.id} className="row clickable" onClick={() => onSelect({ page: "adapter", id: a.id })}>

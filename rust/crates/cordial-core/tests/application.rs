@@ -419,7 +419,7 @@ fn hidpp(device: &p::Device) -> &p::Integration {
 }
 
 fn hidpp_state(device: &p::Device) -> p::integration::Status {
-    hidpp(device).status.unwrap()
+    hidpp(device).status.clone().unwrap()
 }
 
 fn preference(key: SettingKey, feature: FeatureId, value: u16) -> Preference {
@@ -638,7 +638,7 @@ fn enabling_past_the_stack_limit_is_refused() {
         ..Default::default()
     }));
     assert_eq!(error.code, p::ErrorCode::NoCapacity as i32);
-    assert_eq!(error.reason, p::CapacityReason::Enabled as i32);
+    assert_eq!(error.reason, p::ErrorReason::EnabledDevices as i32);
 }
 
 #[test]
@@ -697,7 +697,7 @@ fn scans_validate_their_transports_and_report_candidates() {
     let events = t.events();
     assert!(events.contains(&Ev::ScanDone(p::ScanDone {
         count: 1,
-        truncated: false
+        error: None
     })));
     assert_eq!(t.radio.scans.last(), Some(&(token, false, false)));
     // Stopping an idle scan answers and reports nothing.
@@ -838,7 +838,11 @@ fn prompts_and_pairings_are_checked() {
     t.finish_disconnects();
     assert_eq!(
         pairing_steps(&t.events()).last(),
-        Some(&p::pairing::Step::Failed(p::ErrorCode::Rejected as i32))
+        Some(&p::pairing::Step::Error(p::Error {
+            code: p::ErrorCode::Rejected as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        }))
     );
     assert!(t.app.manager.devices.iter().all(Option::is_none));
 }
@@ -919,7 +923,11 @@ fn failed_stranger_bond_cleanup_is_retried_before_the_next_pair() {
     // The attempt fails for its own reason; the stranger's bond is removed by a later sync.
     assert_eq!(
         pairing_steps(&t.events()).last(),
-        Some(&p::pairing::Step::Failed(p::ErrorCode::AuthFailed as i32))
+        Some(&p::pairing::Step::Error(p::Error {
+            code: p::ErrorCode::AuthFailed as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        }))
     );
     assert!(t.radio.bonds.contains(&stranger));
     t.radio.reject_forget = false;
@@ -938,12 +946,13 @@ fn pairing_with_full_storage_has_a_reason_and_scanning_stays_available() {
     let candidate = t.candidate(peer(2), peer(2));
     let error = t.error(Command::StartPairing(p::StartPairing { candidate }));
     assert_eq!(error.code, p::ErrorCode::NoCapacity as i32);
-    assert_eq!(error.reason, p::CapacityReason::Storage as i32);
+    assert_eq!(error.reason, p::ErrorReason::Storage as i32);
     assert!(t.radio.connects.is_empty());
     assert!(
         t.status()
             .errors
-            .contains(&(p::ErrorCode::StorageFull as i32))
+            .iter()
+            .any(|e| e.code == p::ErrorCode::StorageFull as i32)
     );
 }
 
@@ -980,7 +989,7 @@ fn a_connect_that_times_out_keeps_automatic_reconnection() {
         "a timeout must not pause trusted automatic reconnection"
     );
     assert_eq!(
-        d.errors.first().copied(),
+        d.errors.first().map(|e| e.code),
         Some(p::ErrorCode::Timeout as i32)
     );
 }
@@ -2009,7 +2018,7 @@ fn a_connected_device_going_away_records_no_error() {
     });
     let d = t.device(SAVED);
     assert_eq!(d.state, p::DeviceState::Disconnected as i32);
-    assert_eq!(d.errors.first().copied(), None);
+    assert_eq!(d.errors.first().map(|e| e.code), None);
 }
 
 #[test]
@@ -2022,7 +2031,7 @@ fn a_link_lost_while_connecting_records_its_error() {
         error: Some(cordial_core::model::errors::ErrorCode::ConnectionFailed),
     });
     assert_eq!(
-        t.device(SAVED).errors.first().copied(),
+        t.device(SAVED).errors.first().map(|e| e.code),
         Some(p::ErrorCode::ConnectionFailed as i32)
     );
 }
@@ -2039,7 +2048,7 @@ fn a_device_failing_authentication_keeps_reconnecting() {
     });
     let failed = t.now;
     assert_eq!(
-        t.device(SAVED).errors.first().copied(),
+        t.device(SAVED).errors.first().map(|e| e.code),
         Some(p::ErrorCode::AuthFailed as i32)
     );
     // Anyone can fail a handshake with the device's address, so this only backs off.
@@ -2078,7 +2087,7 @@ fn no_error_stops_automatic_reconnection() {
         });
         let failed = t.now;
         assert!(
-            t.device(SAVED).errors.first().copied().is_some(),
+            t.device(SAVED).errors.first().map(|e| e.code).is_some(),
             "{error:?}"
         );
         t.now = failed + FIRST_RETRY - 2;
@@ -2594,7 +2603,7 @@ fn disabling_classic_closes_its_links_and_refuses_classic_work() {
         d.inactive,
         Some(p::InactiveReason::TransportDisabled as i32)
     );
-    assert_eq!(d.errors.first().copied(), None);
+    assert_eq!(d.errors.first().map(|e| e.code), None);
     assert!(!t.radio.bonds.contains(&peer(1)));
     // Classic devices are neither paged nor admitted, and Classic commands are refused as for
     // an unsupported transport. BLE is unaffected.
@@ -2773,7 +2782,11 @@ fn disabling_a_transport_ends_its_scan_and_pairing() {
         assert!(events.iter().any(|e| matches!(e, Ev::ScanDone(_))));
         assert_eq!(
             pairing_steps(&events).last(),
-            Some(&p::pairing::Step::Failed(p::ErrorCode::Unsupported as i32))
+            Some(&p::pairing::Step::Error(p::Error {
+                code: p::ErrorCode::Unsupported as i32,
+                outcome: p::ErrorOutcome::NoEffect as i32,
+                ..Default::default()
+            }))
         );
         assert_eq!(
             t.radio.scans.last().map(|s| (s.1, s.2)),
@@ -2792,7 +2805,11 @@ fn disabling_a_transport_ends_a_pairing_that_has_not_started_its_link() {
     assert!(t.radio.connects.is_empty());
     assert_eq!(
         pairing_steps(&events).last(),
-        Some(&p::pairing::Step::Failed(p::ErrorCode::Unsupported as i32))
+        Some(&p::pairing::Step::Error(p::Error {
+            code: p::ErrorCode::Unsupported as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        }))
     );
 }
 
@@ -3057,7 +3074,7 @@ fn free_space_is_counted_after_writes_in_a_later_step() {
     let error = t.error(Command::CreateProfile(p::CreateProfile {
         name: "More".into(),
     }));
-    assert_eq!(error.reason, p::CapacityReason::Storage as i32);
+    assert_eq!(error.reason, p::ErrorReason::Storage as i32);
     assert_eq!(t.store.counts, counts + 1);
     let counts = t.store.counts;
     t.poll();
@@ -3206,7 +3223,18 @@ fn device_listings_stream_and_report_unreadable_and_lost_records() {
             .iter()
             .map(|e| match e.entry.as_ref().unwrap() {
                 Entry::Device(d) => (d.id, true),
-                Entry::Unreadable(id) => (*id, false),
+                Entry::Error(error) => {
+                    assert_eq!(
+                        error.error,
+                        Some(p::Error {
+                            code: p::ErrorCode::StorageFailed as i32,
+                            reason: p::ErrorReason::Storage as i32,
+                            outcome: p::ErrorOutcome::NoEffect as i32,
+                            related: vec![],
+                        })
+                    );
+                    (error.id, false)
+                }
             })
             .collect()
     };
@@ -3543,8 +3571,7 @@ fn sent_keys(t: &mut Test) -> Vec<u16> {
 fn profile_error(d: &p::Device) -> Option<p::ErrorCode> {
     d.errors
         .iter()
-        .copied()
-        .filter_map(|e| p::ErrorCode::try_from(e).ok())
+        .filter_map(|e| p::ErrorCode::try_from(e.code).ok())
         .find(|e| {
             matches!(
                 e,
@@ -3716,7 +3743,7 @@ fn creating_a_profile_that_does_not_fit_in_flash_is_refused() {
         name: "Full".into(),
     }));
     assert_eq!(error.code, p::ErrorCode::NoCapacity as i32);
-    assert_eq!(error.reason, p::CapacityReason::Storage as i32);
+    assert_eq!(error.reason, p::ErrorReason::Storage as i32);
     t.store.available = None;
     assert_eq!(create(&mut t, "Fits"), 1);
 }
@@ -3743,7 +3770,18 @@ fn profile_listings_stream_and_report_unreadable_and_lost_records() {
             .iter()
             .map(|e| match e.entry.as_ref().unwrap() {
                 Entry::Profile(p) => (p.id, true),
-                Entry::Unreadable(id) => (*id, false),
+                Entry::Error(error) => {
+                    assert_eq!(
+                        error.error,
+                        Some(p::Error {
+                            code: p::ErrorCode::StorageFailed as i32,
+                            reason: p::ErrorReason::Storage as i32,
+                            outcome: p::ErrorOutcome::NoEffect as i32,
+                            related: vec![],
+                        })
+                    );
+                    (error.id, false)
+                }
             })
             .collect()
     };
@@ -4036,7 +4074,7 @@ fn a_profile_larger_than_the_memory_budget_cannot_be_saved() {
         changes: vec![remap(KEYBOARD_COLLECTION, key(20), &[key(21)])],
     }));
     assert_eq!(error.code, p::ErrorCode::NoCapacity as i32);
-    assert_eq!(error.reason, p::CapacityReason::ProfileMemory as i32);
+    assert_eq!(error.reason, p::ErrorReason::ProfileMemory as i32);
     assert_eq!(rules_of(&mut t, id).len(), 6);
 }
 
@@ -4138,7 +4176,7 @@ fn a_device_whose_layers_do_not_fit_loads_none_of_them() {
     let events = t.events();
     assert!(events.iter().any(|e| matches!(
         e,
-        Ev::Device(d) if d.errors.contains(&(p::ErrorCode::ProfileMemoryExceeded as i32))
+        Ev::Device(d) if d.errors.iter().any(|e| e.code == p::ErrorCode::ProfileMemoryExceeded as i32)
     )));
     // Changing the layers loads the new ones at once.
     let d = set_layers(&mut t, SAVED, &[small]);
@@ -4290,7 +4328,7 @@ fn an_edit_that_would_overflow_loaded_profiles_is_refused() {
         changes: vec![remap(KEYBOARD_COLLECTION, key(20), &[key(21)])],
     }));
     assert_eq!(error.code, p::ErrorCode::NoCapacity as i32);
-    assert_eq!(error.reason, p::CapacityReason::ProfileMemory as i32);
+    assert_eq!(error.reason, p::ErrorReason::ProfileMemory as i32);
     assert!(rules_of(&mut t, empty).is_empty());
     assert_eq!(profile_error(&t.device(SAVED)), None);
     // Shrinking a loaded profile, and growing one that is not loaded, are fine.
@@ -5979,7 +6017,7 @@ fn a_failed_deferred_save_is_reported_and_retried_with_a_backoff() {
     t.now += cordial_core::application::EDITOR_BATCH_MS;
     let events = t.events();
     assert!(events.iter().any(|e| matches!(e, Ev::Adapter(s)
-        if s.ready && s.errors.contains(&(p::ErrorCode::StorageFull as i32)))));
+        if s.ready && s.errors.iter().any(|e| e.code == p::ErrorCode::StorageFull as i32))));
     assert_eq!(rules_writes(&t, id), 1);
     // The edit stays in use, and nothing is tried again before the backoff.
     assert_eq!(press(&mut t, link, &[4]), [5]);
@@ -6028,7 +6066,7 @@ fn a_failed_deferred_save_is_reported_and_retried_with_a_backoff() {
     let events = t.events();
     assert_eq!(rules_writes(&t, id), 4);
     assert!(events.iter().any(|e| matches!(e, Ev::Adapter(s)
-        if s.ready && !s.errors.contains(&(p::ErrorCode::StorageFull as i32)))));
+        if s.ready && !s.errors.iter().any(|e| e.code == p::ErrorCode::StorageFull as i32))));
     assert_eq!(
         saved_rules(&mut t, id),
         [remap_rule(KEYBOARD_COLLECTION, key(4), &[6])]
@@ -6555,7 +6593,7 @@ fn a_failed_retry_of_a_file_that_holds_the_edits_counts_as_saved() {
 }
 
 #[test]
-fn reloading_storage_keeps_edits_not_yet_saved() {
+fn radio_recovery_keeps_edits_not_yet_saved() {
     let mut t = Test::new(true);
     let id = editing_alone(&mut t);
     set_layers(&mut t, SAVED, &[id]);
@@ -6565,14 +6603,25 @@ fn reloading_storage_keeps_edits_not_yet_saved() {
     t.now += cordial_core::application::EDITOR_BATCH_MS;
     t.events();
     assert!(!t.status().ready);
-    // The write did not reach the file, and storage is loaded again while the edits wait.
+    // The radio restarts while the write remains unresolved.
     t.store.unknown = None;
     t.store.fail_save = Some((rules, false));
     t.store.records.remove(&rules);
     t.event(Event::Restarting(ErrorCode::RadioUnavailable));
+    t.radio.bonds.clear();
+    t.radio.applied.clear();
+    let writes = t.store.writes.len();
     t.event(Event::Ready);
-    // Loading resolves nothing of the unknown write, so storage stays not ready until a retry
-    // reads the file back.
+    assert_eq!(t.radio.bonds, [peer(1)]);
+    assert_eq!(
+        t.radio.applied,
+        [(Transport::Classic, true), (Transport::Ble, true)]
+    );
+    assert_eq!(t.store.writes.len(), writes);
+    assert!(t.app.manager.unsaved_unready);
+    assert_eq!(t.app.manager.admits(peer(1), t.now), None);
+    assert_eq!(t.status().errors[0].outcome(), p::ErrorOutcome::Unknown);
+    // Storage stays unavailable until a retry reads the file back.
     assert!(!t.status().ready);
     t.now += cordial_core::deferred::RULES_RETRY_MAX_MS as u64;
     t.events();
@@ -6596,6 +6645,37 @@ fn reloading_storage_keeps_edits_not_yet_saved() {
     assert_eq!(saved.len(), 2);
     assert!(saved.contains(&remap_rule(KEYBOARD_COLLECTION, key(4), &[5])));
     assert_eq!(press(&mut t, link, &[4]), [5]);
+}
+
+#[test]
+fn radio_recovery_read_failure_keeps_profile_save_recovery_pending() {
+    let mut t = Test::new(true);
+    let id = editing_alone(&mut t);
+    set_layers(&mut t, SAVED, &[id]);
+    t.store.unknown = Some(record_key(9, id));
+    assert_eq!(set_first_key(&mut t, 5), 5);
+    t.now += cordial_core::application::EDITOR_BATCH_MS;
+    t.events();
+    assert!(t.app.manager.unsaved_unready);
+    let failure = t.app.manager.storage_error.clone();
+
+    t.event(Event::Restarting(ErrorCode::RadioUnavailable));
+    t.store.fail_load = Some(record_key(2, SAVED));
+    t.event(Event::Ready);
+    assert!(t.app.manager.unsaved_unready);
+    assert_eq!(t.app.manager.storage_error, failure);
+    assert!(!t.app.manager.storage_ready);
+
+    t.store.fail_load = None;
+    t.store.unknown = None;
+    t.now += cordial_core::deferred::RULES_RETRY_MAX_MS as u64;
+    t.events();
+    assert!(t.status().ready);
+    assert!(t.status().errors.is_empty());
+    assert_eq!(
+        saved_rules(&mut t, id),
+        [remap_rule(KEYBOARD_COLLECTION, key(4), &[5])]
+    );
 }
 
 #[test]
@@ -6678,7 +6758,11 @@ fn a_full_filesystem_for_edits_written_from_the_editor_is_reported() {
     fail_next_allocation();
     block_on(t.app.save_all(&mut t.store, t.now));
     assert!(allocation_failed());
-    let full = |s: &p::Status| s.errors.contains(&(p::ErrorCode::StorageFull as i32));
+    let full = |s: &p::Status| {
+        s.errors
+            .iter()
+            .any(|e| e.code == p::ErrorCode::StorageFull as i32)
+    };
     let status = t.status();
     assert!(status.ready && full(&status));
     t.store.full = None;
@@ -6726,7 +6810,7 @@ fn output_planner_allocation_failure_has_no_enabled_device_capacity_reason() {
         panic!("output selection succeeded without planner memory");
     };
     assert_eq!(error.code, p::ErrorCode::NoCapacity as i32);
-    assert_eq!(error.reason, p::CapacityReason::Unknown as i32);
+    assert_eq!(error.reason, p::ErrorReason::Unknown as i32);
     assert!(t.store.writes.is_empty());
     assert_eq!(t.saved(SAVED), original);
     assert_eq!(t.app.manager.outputs.plan(), Default::default());
@@ -6748,7 +6832,7 @@ fn a_lost_record_awaiting_cleanup_is_not_available_to_device_commands() {
     t.store.fail_remove = Some(key);
     assert_eq!(
         block_on(t.app.manager.import(slot, &mut t.store, &mut t.radio)),
-        Err(ErrorCode::StorageFailed)
+        Err((ErrorCode::StorageFailed, p::ErrorReason::Unknown))
     );
     assert_eq!(t.app.manager.lost_devices, [u64::from(SAVED)]);
     for command in [
@@ -6858,7 +6942,12 @@ fn output_updates_save_once_in_order_and_failed_saves_leave_runtime_unchanged() 
         ..Default::default()
     });
     assert_eq!(d.output_preferences, [output(p::OutputMode::Xinput)]);
-    assert_eq!(d.outputs[0].state, p::OutputState::Disconnected as i32);
+    assert_eq!(
+        d.outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Disconnected as i32
+        ))
+    );
     assert_eq!(d.outputs[0].slot, None);
     assert_eq!(t.store.writes.iter().filter(|&&k| k == key).count(), 1);
     assert_eq!(
@@ -6911,7 +7000,15 @@ fn output_updates_save_once_in_order_and_failed_saves_leave_runtime_unchanged() 
     let connected = connect_saved(&mut t, descriptor());
     let d = t.device(SAVED);
     assert_eq!(d.state, p::DeviceState::Connected as i32);
-    assert_eq!(d.outputs[0].state, p::OutputState::Unsupported as i32);
+    assert_eq!(
+        d.outputs[0].status,
+        Some(p::output_status::Status::Error(p::Error {
+            code: p::ErrorCode::Unsupported as i32,
+            reason: p::ErrorReason::InputLayout as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        }))
+    );
     assert_eq!(d.outputs[0].slot, None);
     assert!(t.app.manager.connection(connected).is_some());
     t.set_device(p::SetDevice {
@@ -7359,9 +7456,12 @@ fn matching_a_bond_keeps_output_selections_on_read_failure() {
         assert!(!events.iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
         assert_eq!(
             pairing_steps(&events).last(),
-            Some(&p::pairing::Step::Failed(
-                p::ErrorCode::StorageFailed as i32
-            ))
+            Some(&p::pairing::Step::Error(p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                reason: p::ErrorReason::Storage as i32,
+                outcome: p::ErrorOutcome::NoEffect as i32,
+                ..Default::default()
+            }))
         );
     }
 }
@@ -7506,7 +7606,12 @@ fn gamepad_enumeration_reports_capacity_and_device_state_changes() {
     ));
     t.events();
     let before = t.device(SAVED);
-    assert_eq!(before.outputs[0].state, p::OutputState::Pending as i32);
+    assert_eq!(
+        before.outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Pending as i32
+        ))
+    );
     let status_before = t.status();
     t.events();
     let mut enumeration = Enumeration {
@@ -7523,7 +7628,7 @@ fn gamepad_enumeration_reports_capacity_and_device_state_changes() {
         events
             .iter()
             .any(|e| matches!(e, Ev::Device(d) if d.id == SAVED
-        && d.outputs[0].state == p::OutputState::Active as i32 && d.outputs[0].slot == Some(0)))
+        && d.outputs[0].status == Some(p::output_status::Status::State(p::OutputState::Active as i32)) && d.outputs[0].slot == Some(0)))
     );
     assert!(events.iter().any(|e| matches!(e, Ev::Adapter(_))));
     let mut active = t.device(SAVED);
@@ -7549,11 +7654,11 @@ fn gamepad_enumeration_reports_capacity_and_device_state_changes() {
     t.app.set_output_enumeration(Some(enumeration));
     assert_eq!(t.app.gamepad_outputs(), held);
     assert!(t.events().iter().any(|e| matches!(e, Ev::Device(d)
-        if d.outputs[0].state == p::OutputState::Pending as i32 && d.outputs[0].slot.is_none())));
+        if d.outputs[0].status == Some(p::output_status::Status::State(p::OutputState::Pending as i32)) && d.outputs[0].slot.is_none())));
     enumeration.ready = true;
     t.app.set_output_enumeration(Some(enumeration));
     assert!(t.events().iter().any(|e| matches!(e, Ev::Device(d)
-        if d.outputs[0].state == p::OutputState::Active as i32)));
+        if d.outputs[0].status == Some(p::output_status::Status::State(p::OutputState::Active as i32)))));
     t.app.set_output_enumeration(Some(enumeration));
     assert!(
         !t.events()
@@ -7874,12 +7979,14 @@ fn required_and_reserved_usb_errors_are_independent_and_resources_keep_unknown_p
     assert!(
         status
             .errors
-            .contains(&(p::ErrorCode::UsbRequiredCapacityExceeded as i32))
+            .iter()
+            .any(|e| e.code == p::ErrorCode::UsbRequiredCapacityExceeded as i32)
     );
     assert!(
         status
             .errors
-            .contains(&(p::ErrorCode::UsbReservedCapacityExceeded as i32))
+            .iter()
+            .any(|e| e.code == p::ErrorCode::UsbReservedCapacityExceeded as i32)
     );
     let interfaces = status
         .resources
@@ -7896,12 +8003,14 @@ fn required_and_reserved_usb_errors_are_independent_and_resources_keep_unknown_p
     assert!(
         status
             .errors
-            .contains(&(p::ErrorCode::UsbRequiredCapacityExceeded as i32))
+            .iter()
+            .any(|e| e.code == p::ErrorCode::UsbRequiredCapacityExceeded as i32)
     );
     assert!(
         !status
             .errors
-            .contains(&(p::ErrorCode::UsbReservedCapacityExceeded as i32))
+            .iter()
+            .any(|e| e.code == p::ErrorCode::UsbReservedCapacityExceeded as i32)
     );
 }
 
@@ -8627,4 +8736,828 @@ fn paused_profile_cleanup_allows_pairing_bond_sync_and_resident_fill() {
             assert!(t.app.manager.lost_profiles.is_empty());
         }
     }
+}
+
+#[test]
+fn scan_limits_keep_candidates_and_radio_failure_keeps_the_collection_error() {
+    for radio_failure in [false, true] {
+        let mut t = Test::new(false);
+        t.scan(&[p::Transport::Classic]);
+        for n in 1..=cordial_core::devices::SCAN_CANDIDATES + 1 {
+            t.found(peer(n as u8), Some(peer(n as u8)), "Keyboard");
+        }
+        if radio_failure {
+            t.event(Event::Failed(ErrorCode::ConnectionFailed));
+        } else {
+            t.ok(Command::StopScan(p::StopScan {}));
+        }
+        let events = t.events();
+        let done = events
+            .iter()
+            .find_map(|event| match event {
+                Ev::ScanDone(done) => Some(done),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(done.count, cordial_core::devices::SCAN_CANDIDATES as u32);
+        let capacity = p::Error {
+            code: p::ErrorCode::NoCapacity as i32,
+            reason: p::ErrorReason::ScanCandidates as i32,
+            outcome: p::ErrorOutcome::Partial as i32,
+            related: vec![],
+        };
+        assert_eq!(
+            done.error,
+            Some(if radio_failure {
+                p::Error {
+                    code: p::ErrorCode::ConnectionFailed as i32,
+                    reason: p::ErrorReason::Radio as i32,
+                    outcome: p::ErrorOutcome::Partial as i32,
+                    related: vec![capacity],
+                }
+            } else {
+                capacity
+            })
+        );
+        if !radio_failure {
+            let candidate = events
+                .iter()
+                .find_map(|event| match event {
+                    Ev::ScanFound(c) => Some(c.id),
+                    _ => None,
+                })
+                .unwrap();
+            t.pair(candidate);
+        }
+    }
+}
+
+#[test]
+fn empty_failed_scan_has_no_results_and_starting_again_clears_the_error() {
+    let mut t = Test::new(false);
+    t.scan(&[p::Transport::Classic]);
+    t.event(Event::Failed(ErrorCode::RadioUnavailable));
+    assert!(t.events().iter().any(|event| matches!(event, Ev::ScanDone(done)
+        if done.count == 0 && done.error.as_ref().is_some_and(|error| error.reason() == p::ErrorReason::Radio && error.outcome() == p::ErrorOutcome::NoEffect))));
+    t.event(Event::Ready);
+    t.scan(&[p::Transport::Classic]);
+    t.ok(Command::StopScan(p::StopScan {}));
+    assert!(t.events().contains(&Ev::ScanDone(p::ScanDone {
+        count: 0,
+        error: None
+    })));
+}
+
+#[test]
+fn pairing_save_evidence_survives_bond_cleanup_and_radio_recovery() {
+    for unknown in [false, true] {
+        let mut t = Test::new(true);
+        t.app.manager.devices[0].as_mut().unwrap().paused = true;
+        let identity = peer(2);
+        let candidate = t.candidate(identity, identity);
+        t.pair(candidate);
+        t.poll();
+        let link = t.radio.connects.last().unwrap().0;
+        let record = record_key(2, SAVED + 1);
+        if unknown {
+            t.store.unknown = Some(record);
+        } else {
+            t.store.full = Some(record);
+        }
+        t.event(Event::Bonded { link, identity });
+        t.events();
+        t.radio.reject_forget = true;
+        t.finish_disconnects();
+        let steps = pairing_steps(&t.events());
+        let Some(p::pairing::Step::Error(error)) = steps.last() else {
+            panic!("{steps:?}")
+        };
+        assert_eq!(
+            error.code(),
+            if unknown {
+                p::ErrorCode::StorageFailed
+            } else {
+                p::ErrorCode::NoCapacity
+            }
+        );
+        assert_eq!(error.reason(), p::ErrorReason::Storage);
+        assert_eq!(
+            error.outcome(),
+            if unknown {
+                p::ErrorOutcome::Unknown
+            } else {
+                p::ErrorOutcome::NoEffect
+            }
+        );
+        assert!(
+            error
+                .related
+                .iter()
+                .any(|error| error.code() == p::ErrorCode::StorageFailed
+                    && error.reason() == p::ErrorReason::Radio
+                    && error.outcome() == p::ErrorOutcome::Unspecified)
+        );
+        if unknown {
+            assert!(
+                error
+                    .related
+                    .iter()
+                    .any(|error| error.code() == p::ErrorCode::StorageFailed
+                        && error.reason() == p::ErrorReason::Storage)
+            );
+            t.event(Event::Failed(ErrorCode::Timeout));
+            assert!(
+                t.status()
+                    .errors
+                    .iter()
+                    .any(|error| error.reason() == p::ErrorReason::Radio)
+            );
+            t.radio.bonds = vec![identity];
+            t.radio.applied.clear();
+            let writes = t.store.writes.len();
+            t.event(Event::Ready);
+            assert!(t.radio.bonds.contains(&peer(1)));
+            assert!(t.radio.bonds.contains(&identity));
+            assert_eq!(
+                t.radio.applied,
+                [(Transport::Classic, true), (Transport::Ble, true)]
+            );
+            assert_eq!(t.store.writes.len(), writes);
+            assert!(t.app.manager.bonds_pending);
+            assert_eq!(t.app.manager.admits(peer(1), t.now), None);
+            let error = t.error(Command::ListDevices(p::ListDevices {}));
+            assert_eq!(error.reason(), p::ErrorReason::Storage);
+            let status = t.status();
+            assert!(!status.ready);
+            assert!(
+                status
+                    .errors
+                    .iter()
+                    .all(|error| error.reason() != p::ErrorReason::Radio)
+            );
+            assert!(
+                status
+                    .errors
+                    .iter()
+                    .any(|error| error.reason() == p::ErrorReason::Storage
+                        && error.outcome() == p::ErrorOutcome::Unknown)
+            );
+        } else {
+            assert!(t.status().ready);
+        }
+    }
+}
+
+#[test]
+fn adapter_startup_and_radio_storage_faults_recover_independently() {
+    let app = Application::new(build(false, None));
+    assert!(!app.status(&Radio::default()).ready);
+    assert!(app.status(&Radio::default()).errors.is_empty());
+    let mut t = Test::new(false);
+    t.event(Event::Failed(ErrorCode::Timeout));
+    t.event(Event::Failed(ErrorCode::StorageFailed));
+    let errors = t.status().errors;
+    assert_eq!(errors.len(), 2);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.reason() == p::ErrorReason::Radio
+                && error.code() == p::ErrorCode::Timeout)
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.reason() == p::ErrorReason::Storage
+                && error.code() == p::ErrorCode::StorageFailed)
+    );
+    t.store.fail = true;
+    t.event(Event::Ready);
+    let errors = t.status().errors;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].reason(), p::ErrorReason::Storage);
+    t.store.fail = false;
+    t.event(Event::Ready);
+    assert!(t.status().errors.is_empty());
+    assert!(t.status().ready);
+}
+
+#[test]
+fn unsupported_integrations_report_errors_with_the_current_failure_code() {
+    let mut t = Test::new(true);
+    let link = connect_saved(&mut t, descriptor());
+    t.settle();
+    let error = match hidpp_state(&t.device(SAVED)) {
+        p::integration::Status::Error(error) => error,
+        state => panic!("{state:?}"),
+    };
+    assert_eq!(error.code(), p::ErrorCode::ProtocolUnsupported);
+    assert_eq!(error.outcome(), p::ErrorOutcome::Unspecified);
+    t.app
+        .manager
+        .connection_mut(link)
+        .unwrap()
+        .runtime
+        .as_mut()
+        .unwrap()
+        .client
+        .protocol = cordial_core::model::hidpp::ProtocolState::Error {
+        code: ErrorCode::HidppInvalidResponse,
+    };
+    assert!(
+        matches!(hidpp_state(&t.device(SAVED)), p::integration::Status::Error(error)
+        if error.code() == p::ErrorCode::InvalidResponse)
+    );
+}
+
+#[test]
+fn pairing_failure_before_saving_does_not_reuse_another_writes_uncertainty() {
+    let mut t = Test::new(false);
+    let identity = peer(2);
+    let candidate = t.candidate(identity, identity);
+    t.pair(candidate);
+    t.poll();
+    let link = t.radio.connects.last().unwrap().0;
+    t.app.manager.write_uncertain = true;
+    t.radio.reject_adoption = true;
+    t.event(Event::Bonded { link, identity });
+    t.events();
+    t.finish_disconnects();
+    let steps = pairing_steps(&t.events());
+    assert!(matches!(steps.last(), Some(p::pairing::Step::Error(error))
+        if error.code() == p::ErrorCode::ConnectionFailed && error.outcome() == p::ErrorOutcome::NoEffect));
+}
+
+#[test]
+fn pairing_reports_a_confirmed_bond_when_subsequent_cleanup_fails() {
+    for admitted in [false, true] {
+        let mut t = Test::new(true);
+        t.app.manager.devices[0].as_mut().unwrap().paused = true;
+        let identity = peer(2);
+        // Renewing a disabled saved device commits its bond without promoting the link.
+        let saved = if admitted { SAVED + 1 } else { SAVED };
+        if !admitted {
+            let mut policy = t.saved(SAVED);
+            policy.peer = identity;
+            policy.enabled = false;
+            block_on(cordial_core::bonds::commit(
+                &mut t.store,
+                &policy,
+                &bond(policy.id, identity),
+            ))
+            .unwrap();
+            block_on(t.app.manager.load(&mut t.store, &mut t.radio)).unwrap();
+        }
+        let candidate = t.candidate(identity, identity);
+        t.pair(candidate);
+        t.poll();
+        let link = t.radio.connects.last().unwrap().0;
+        let record = record_key(2, saved);
+        t.store.fail_count = true;
+        t.radio.bonds.push(identity);
+        t.event(Event::Bonded { link, identity });
+        let events = t.events();
+        let steps = pairing_steps(&events);
+        let Some(p::pairing::Step::Error(error)) = steps.last() else {
+            panic!("{steps:?}")
+        };
+        assert_eq!(error.code(), p::ErrorCode::StorageFailed);
+        assert_eq!(error.reason(), p::ErrorReason::Storage);
+        assert_eq!(error.outcome(), p::ErrorOutcome::Complete);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Ev::Device(device) if device.id == saved))
+        );
+        assert!(t.store.records.contains_key(&record));
+        assert!(t.radio.bonds.contains(&identity));
+        assert_eq!(t.radio.promoted.contains(&link), admitted);
+        assert_eq!(t.radio.closes.contains(&link), !admitted);
+        assert!(t.app.manager.storage_ready);
+        assert!(t.status().errors.is_empty());
+        assert!(t.device_entries().iter().any(|entry| matches!(&entry.entry, Some(p::device_list_entry::Entry::Device(device)) if device.id == saved)));
+    }
+}
+
+#[test]
+fn rejected_background_scan_toggles_retry_without_dropping_live_devices() {
+    for rejection in [
+        ErrorCode::Busy,
+        ErrorCode::Capacity,
+        ErrorCode::RadioUnavailable,
+    ] {
+        let mut t = Test::new(true);
+        let identity = Peer {
+            transport: Transport::Ble,
+            ..peer(2)
+        };
+        let policy = Policy::paired(78, identity, b"Mouse");
+        block_on(cordial_core::bonds::commit(
+            &mut t.store,
+            &policy,
+            &bond(78, identity),
+        ))
+        .unwrap();
+        block_on(t.app.manager.load(&mut t.store, &mut t.radio)).unwrap();
+        let link = connect_saved(&mut t, descriptor());
+        t.scan(&[p::Transport::Ble]);
+        t.radio.reject_scan = Some(rejection);
+        t.now = 1499;
+        t.poll();
+        assert!(t.radio.reconnect.contains(&identity));
+        assert_eq!(
+            t.radio.scans.last().map(|scan| (scan.1, scan.2)),
+            Some((false, false))
+        );
+        assert!(t.app.manager.connection(link).is_some_and(|c| !c.closing));
+        assert!(t.status().ready);
+        assert!(t.status().errors.is_empty());
+        assert!(
+            !t.events()
+                .iter()
+                .any(|event| matches!(event, Ev::ScanDone(_)))
+        );
+        let attempts = t.radio.scans.len();
+        t.radio.reject_scan = None;
+        t.poll();
+        assert_eq!(t.radio.scans.len(), attempts + 1);
+        t.poll();
+        assert_eq!(t.radio.scans.len(), attempts + 1);
+        t.event(Event::Failed(ErrorCode::RadioUnavailable));
+        assert!(t.app.manager.connection(link).is_none());
+        assert!(!t.status().ready);
+        assert!(
+            t.status()
+                .errors
+                .iter()
+                .any(|error| error.reason() == p::ErrorReason::Radio)
+        );
+        assert!(
+            t.events()
+                .iter()
+                .any(|event| matches!(event, Ev::ScanDone(done)
+            if done.error.as_ref().is_some_and(|error| error.reason() == p::ErrorReason::Radio)))
+        );
+    }
+}
+
+#[test]
+fn rejected_scan_stop_reports_the_operation_error_and_retries_the_backend_stop() {
+    let mut t = Test::new(false);
+    t.scan(&[p::Transport::Classic]);
+    t.radio.reject_scan = Some(ErrorCode::Busy);
+    t.ok(Command::StopScan(p::StopScan {}));
+    assert!(
+        t.events()
+            .iter()
+            .any(|event| matches!(event, Ev::ScanDone(done)
+        if done.error.as_ref().is_some_and(|error| error.code() == p::ErrorCode::Busy
+            && error.reason() == p::ErrorReason::Radio)))
+    );
+    assert!(t.status().ready);
+    assert!(t.status().errors.is_empty());
+    let attempts = t.radio.scans.len();
+    t.radio.reject_scan = None;
+    t.poll();
+    assert_eq!(t.radio.scans.len(), attempts + 1);
+    assert_eq!(
+        t.radio.scans.last().map(|scan| (scan.1, scan.2)),
+        Some((false, false))
+    );
+    t.poll();
+    assert_eq!(t.radio.scans.len(), attempts + 1);
+}
+
+#[test]
+fn startup_refusals_do_not_claim_radio_failure() {
+    let mut t = Test::new(false);
+    t.app.manager.radio_ready = false;
+    let error = t.error(Command::StartScan(p::StartScan {
+        transports: vec![p::Transport::Ble as i32],
+        seconds: 60,
+    }));
+    assert_eq!(error.code(), p::ErrorCode::NotReady);
+    assert_eq!(error.reason(), p::ErrorReason::Unknown);
+    assert!(t.status().errors.is_empty());
+}
+
+#[test]
+fn startup_memory_failure_is_not_a_radio_fault() {
+    let (_, store, radio) = setup();
+    let mut t = Test::with(store, radio, build(false, None));
+    t.app.manager.storage_ready = false;
+    FAIL_LAYOUT.with(|f| {
+        f.set(Some(
+            std::alloc::Layout::array::<Option<SavedDevice>>(4).unwrap(),
+        ))
+    });
+    t.event(Event::Ready);
+    assert!(FAIL_LAYOUT.with(|f| f.get()).is_none());
+    assert!(t.app.manager.radio_ready);
+    assert!(!t.app.manager.storage_ready);
+    let errors = t.status().errors;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code(), p::ErrorCode::NoCapacity);
+    assert_eq!(errors[0].reason(), p::ErrorReason::Unknown);
+    t.event(Event::Ready);
+    assert!(t.status().ready);
+    assert!(t.status().errors.is_empty());
+}
+
+#[test]
+fn unresolved_save_recovery_restores_later_bonds_without_reconciling_lost_records() {
+    for corrupt in [false, true] {
+        let mut t = Test::new(true);
+        let later = t.add_saved(2);
+        t.app.manager.fail_unknown_save();
+        let failure = t.app.manager.storage_error.clone();
+        t.event(Event::Failed(ErrorCode::Timeout));
+        if corrupt {
+            t.store
+                .records
+                .insert(record_key(2, SAVED), UNDECODABLE.to_vec());
+        } else {
+            t.store.records.remove(&record_key(2, SAVED));
+        }
+        t.radio.bonds.clear();
+        let writes = t.store.writes.len();
+        let forgotten = t.radio.forgotten.len();
+        t.event(Event::Ready);
+        assert_eq!(t.store.writes.len(), writes);
+        assert_eq!(t.radio.forgotten.len(), forgotten);
+        assert!(t.app.manager.find(SAVED as u64).is_some());
+        assert!(t.app.manager.find(later as u64).is_some());
+        assert_eq!(t.radio.bonds, vec![peer(2)]);
+        assert!(t.app.manager.bonds_pending);
+        assert!(!t.app.manager.storage_ready);
+        assert!(t.app.manager.radio_ready);
+        assert_eq!(t.app.manager.storage_error, failure);
+        assert_eq!(t.status().errors.len(), 1);
+        assert_eq!(t.status().errors[0].outcome(), p::ErrorOutcome::Unknown);
+    }
+}
+
+#[test]
+fn recovery_cleanup_failures_retry_without_persistent_adapter_faults() {
+    for radio_failure in [false, true] {
+        let mut t = Test::new(true);
+        t.event(Event::Failed(ErrorCode::Timeout));
+        t.store.records.remove(&record_key(2, SAVED));
+        if radio_failure {
+            t.radio.reject_forget = true;
+        } else {
+            t.store.fail_remove = Some(record_key(2, SAVED));
+        }
+        t.event(Event::Ready);
+        assert!(t.app.manager.lost_devices.contains(&(SAVED as u64)));
+        assert!(t.app.manager.storage_ready);
+        assert!(t.app.manager.radio_ready);
+        assert!(t.status().errors.is_empty());
+        t.store.fail_remove = None;
+        t.radio.reject_forget = false;
+        for _ in 0..20 {
+            t.now += FIRST_RETRY;
+            t.poll();
+        }
+        assert!(t.app.manager.lost_devices.is_empty());
+        assert!(t.radio.bonds.is_empty());
+        assert!(!t.app.manager.bonds_pending);
+        assert!(t.status().ready);
+        assert!(t.status().errors.is_empty());
+    }
+}
+
+#[test]
+fn refused_reload_preserves_the_existing_storage_fault() {
+    let mut t = Test::new(true);
+    connect_saved(&mut t, descriptor());
+    t.app.manager.fail_storage();
+    let failure = t.app.manager.storage_error.clone();
+    // Live links refuse a full reload until they close.
+    t.event(Event::Ready);
+    assert_eq!(t.app.manager.storage_error, failure);
+    assert!(!t.app.manager.storage_ready);
+    assert!(t.app.manager.radio_ready);
+    assert!(t.app.manager.radio_error.is_none());
+}
+
+#[test]
+fn not_ready_uses_the_refusing_gate_and_keeps_both_faults() {
+    let mut t = Test::new(false);
+    t.app.manager.fail_unknown_save();
+    t.app.manager.radio_ready = false;
+    let scan = || {
+        Command::StartScan(p::StartScan {
+            transports: vec![p::Transport::Ble as i32],
+            seconds: 60,
+        })
+    };
+    let error = t.error(scan());
+    assert_eq!(error.reason(), p::ErrorReason::Unknown);
+    assert_eq!(
+        error.related,
+        vec![t.app.manager.storage_error.clone().unwrap()]
+    );
+    t.event(Event::Failed(ErrorCode::Timeout));
+    let mut faults = vec![
+        t.app.manager.storage_error.clone().unwrap(),
+        t.app.manager.radio_error.clone().unwrap(),
+    ];
+    faults.sort();
+    let error = t.error(scan());
+    assert_eq!(error.code(), p::ErrorCode::NotReady);
+    assert_eq!(error.reason(), p::ErrorReason::Radio);
+    assert_eq!(error.related, faults);
+    let error = t.error(Command::ListDevices(p::ListDevices {}));
+    assert_eq!(error.reason(), p::ErrorReason::Storage);
+    assert_eq!(error.related, faults);
+}
+
+#[test]
+fn pairing_admission_allocation_failure_still_announces_the_saved_device() {
+    for recount_failed in [false, true] {
+        let mut t = Test::new(true);
+        t.app.manager.devices[0].as_mut().unwrap().paused = true;
+        let identity = peer(2);
+        let candidate = t.candidate(identity, identity);
+        t.pair(candidate);
+        t.poll();
+        let link = t.radio.connects.last().unwrap().0;
+        t.app.manager.devices.shrink_to_fit();
+        t.store.fail_count = recount_failed;
+        FAIL_LAYOUT.with(|f| {
+            f.set(Some(
+                std::alloc::Layout::array::<Option<SavedDevice>>(4).unwrap(),
+            ))
+        });
+        t.event(Event::Bonded { link, identity });
+        let events = t.events();
+        assert!(FAIL_LAYOUT.with(|f| f.get()).is_none());
+        let steps = pairing_steps(&events);
+        let Some(p::pairing::Step::Error(error)) = steps.last() else {
+            panic!("{steps:?}")
+        };
+        assert_eq!(error.code(), p::ErrorCode::NoCapacity);
+        assert_eq!(error.reason(), p::ErrorReason::EnabledDevices);
+        assert_eq!(error.outcome(), p::ErrorOutcome::Complete);
+        assert_eq!(error.related.len(), usize::from(recount_failed));
+        if recount_failed {
+            assert_eq!(error.related[0].reason(), p::ErrorReason::Storage);
+            assert_eq!(error.related[0].outcome(), p::ErrorOutcome::Unspecified);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Ev::Device(device) if device.id == SAVED + 1))
+        );
+        assert!(t.store.records.contains_key(&record_key(2, SAVED + 1)));
+        assert!(t.app.manager.storage_ready);
+        assert!(t.radio.closes.contains(&link));
+        assert!(!t.radio.promoted.contains(&link));
+        t.finish_disconnects();
+        t.events();
+        assert!(t.app.manager.find(u64::from(SAVED + 1)).is_some());
+    }
+}
+
+#[test]
+fn load_refused_by_a_live_connection_is_not_a_radio_fault() {
+    let mut t = Test::new(true);
+    let link = connect_saved(&mut t, descriptor());
+    t.app.manager.storage_ready = false;
+    t.event(Event::Ready);
+    assert!(t.app.manager.radio_ready);
+    assert!(t.app.manager.connection(link).is_some_and(|c| !c.closing));
+    assert!(!t.app.manager.storage_ready);
+    let errors = t.status().errors;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code(), p::ErrorCode::Busy);
+    assert_eq!(errors[0].reason(), p::ErrorReason::Unknown);
+}
+
+#[test]
+fn transport_failure_during_load_keeps_its_radio_context() {
+    let mut t = Test::new(false);
+    t.app.manager.storage_ready = false;
+    t.radio.reject_transport = Some(ErrorCode::Capacity);
+    t.event(Event::Ready);
+    assert!(!t.app.manager.radio_ready);
+    let errors = t.status().errors;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code(), p::ErrorCode::NoCapacity);
+    assert_eq!(errors[0].reason(), p::ErrorReason::Radio);
+    let error = t.error(Command::StartScan(p::StartScan {
+        transports: vec![p::Transport::Ble as i32],
+        seconds: 60,
+    }));
+    assert_eq!(error.code(), p::ErrorCode::NotReady);
+    assert_eq!(error.reason(), p::ErrorReason::Radio);
+    assert_eq!(error.related, errors);
+    t.radio.reject_transport = None;
+    t.event(Event::Ready);
+    assert!(t.status().ready);
+    assert!(t.status().errors.is_empty());
+}
+
+#[test]
+fn committed_enable_reports_complete_and_publishes_the_saved_policy_after_import_failure() {
+    let mut t = Test::new(true);
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        enabled: Some(false),
+        ..Default::default()
+    });
+    t.events();
+    t.radio.reject_import = Some(ErrorCode::Capacity);
+    let error = t.error(Command::SetDevice(p::SetDevice {
+        device: SAVED,
+        enabled: Some(true),
+        ..Default::default()
+    }));
+    assert_eq!(error.code(), p::ErrorCode::NoCapacity);
+    assert_eq!(error.reason(), p::ErrorReason::Radio);
+    assert_eq!(error.outcome(), p::ErrorOutcome::Complete);
+    assert!(t.saved(SAVED).enabled);
+    assert!(t.app.manager.bonds_pending);
+    assert!(t.app.manager.storage_ready);
+    assert!(
+        t.events()
+            .iter()
+            .any(|e| matches!(e, Ev::Device(d) if d.id == SAVED && d.enabled))
+    );
+    t.radio.reject_import = None;
+    block_on(t.app.manager.sync_bonds(&mut t.store, &mut t.radio)).unwrap();
+    assert!(t.radio.bonds.contains(&peer(1)));
+    assert!(!t.app.manager.bonds_pending);
+}
+
+#[test]
+fn committed_disable_and_block_publish_the_saved_policy_after_forget_failure() {
+    for blocked in [false, true] {
+        let mut t = Test::new(true);
+        t.radio.reject_forget = true;
+        let error = t.error(Command::SetDevice(p::SetDevice {
+            device: SAVED,
+            enabled: (!blocked).then_some(false),
+            blocked: blocked.then_some(true),
+            ..Default::default()
+        }));
+        assert_eq!(error.code(), p::ErrorCode::StorageFailed);
+        assert_eq!(error.reason(), p::ErrorReason::Radio);
+        assert_eq!(error.outcome(), p::ErrorOutcome::Complete);
+        assert_eq!(t.saved(SAVED).blocked, blocked);
+        assert_eq!(t.saved(SAVED).enabled, blocked);
+        assert!(t.app.manager.find(SAVED.into()).is_none());
+        assert!(t.app.manager.bonds_pending);
+        assert!(t.app.manager.storage_ready);
+        assert!(t.events().iter().any(|e| matches!(e, Ev::Device(d)
+            if d.id == SAVED && d.blocked == blocked && d.enabled == blocked)));
+        t.radio.reject_forget = false;
+        block_on(t.app.manager.sync_bonds(&mut t.store, &mut t.radio)).unwrap();
+        assert!(!t.radio.bonds.contains(&peer(1)));
+    }
+}
+
+#[test]
+fn failed_unpair_publishes_the_paused_device_and_restoration_error() {
+    for deferred in [false, true] {
+        let mut t = Test::new(true);
+        let link = deferred.then(|| connect_saved(&mut t, descriptor()));
+        if deferred {
+            t.events();
+        }
+        assert!(!t.app.manager.devices[0].as_ref().unwrap().paused);
+        t.store.fail_remove = Some(cordial_core::storage::record_key(2, SAVED.into()));
+        t.radio.reject_import = Some(ErrorCode::Busy);
+        let command = Command::UnpairDevice(p::UnpairDevice { device: SAVED });
+        let response = if let Some(link) = link {
+            t.ok(command);
+            t.event(Event::Disconnected { link, error: None });
+            None
+        } else {
+            Some(t.error(command))
+        };
+        let events = t.events();
+        let device = events
+            .iter()
+            .find_map(|e| match e {
+                Ev::Device(d) if d.id == SAVED && !d.errors.is_empty() => Some(d),
+                _ => None,
+            })
+            .expect("the unpair failure has a device event");
+        assert!(device.paused);
+        let error = &device.errors[0];
+        assert_eq!(error.code(), p::ErrorCode::StorageFailed);
+        assert_eq!(error.reason(), p::ErrorReason::Storage);
+        assert_eq!(error.outcome(), p::ErrorOutcome::Unspecified);
+        assert_eq!(
+            error.related,
+            [p::Error {
+                code: p::ErrorCode::Busy as i32,
+                reason: p::ErrorReason::Radio as i32,
+                ..Default::default()
+            }]
+        );
+        if let Some(response) = response {
+            assert_eq!(response, *error);
+        }
+        assert!(t.saved(SAVED).enabled);
+        assert!(t.app.manager.storage_ready);
+        assert!(t.app.manager.bonds_pending);
+        assert!(!t.app.manager.devices[0].as_ref().unwrap().deleting);
+        t.radio.reject_import = None;
+        t.now += FIRST_RETRY;
+        t.events();
+        assert!(t.radio.bonds.contains(&peer(1)));
+        assert!(!t.app.manager.bonds_pending);
+    }
+}
+
+#[test]
+fn deferred_unpair_publishes_unknown_deletion_without_reading_the_deleted_record() {
+    let mut t = Test::new(true);
+    let link = connect_saved(&mut t, descriptor());
+    t.events();
+    t.ok(Command::UnpairDevice(p::UnpairDevice { device: SAVED }));
+    t.store.unknown = Some(cordial_core::storage::record_key(2, SAVED.into()));
+    t.event(Event::Disconnected { link, error: None });
+    let events = t.events();
+    let device = events
+        .iter()
+        .find_map(|e| match e {
+            Ev::Device(d) if d.id == SAVED && !d.errors.is_empty() => Some(d),
+            _ => None,
+        })
+        .expect("the unresolved deletion has a device event");
+    assert!(device.paused);
+    assert_eq!(device.state(), p::DeviceState::Disconnected);
+    assert_eq!(
+        device.errors,
+        [p::Error {
+            code: p::ErrorCode::StorageFailed as i32,
+            reason: p::ErrorReason::Storage as i32,
+            outcome: p::ErrorOutcome::Unknown as i32,
+            ..Default::default()
+        }]
+    );
+    assert!(!t.app.manager.storage_ready);
+    assert!(!t.radio.bonds.contains(&peer(1)));
+    assert!(
+        !t.store
+            .records
+            .contains_key(&cordial_core::storage::record_key(2, SAVED.into()))
+    );
+    assert!(!events.iter().any(|e| matches!(e, Ev::DeviceRemoved(_))));
+    assert_eq!(
+        t.code(Command::GetDevice(p::GetDevice { device: SAVED })),
+        p::ErrorCode::NotReady
+    );
+    t.event(Event::Ready);
+    assert!(!t.app.manager.storage_ready);
+    assert_eq!(
+        t.app.manager.storage_error.as_ref().unwrap().outcome(),
+        p::ErrorOutcome::Unknown
+    );
+}
+
+#[test]
+fn committed_enable_reports_complete_when_resident_allocation_fails() {
+    let mut t = Test::new(true);
+    t.set_device(p::SetDevice {
+        device: SAVED,
+        enabled: Some(false),
+        ..Default::default()
+    });
+    t.events();
+    t.app.manager.devices.clear();
+    t.app.manager.devices.shrink_to_fit();
+    let request = p::Request {
+        command: Some(Command::SetDevice(p::SetDevice {
+            device: SAVED,
+            enabled: Some(true),
+            ..Default::default()
+        })),
+    };
+    FAIL_LAYOUT.with(|f| {
+        f.set(Some(
+            std::alloc::Layout::array::<Option<SavedDevice>>(4).unwrap(),
+        ))
+    });
+    block_on(t.app.dispatch(request, &mut t.store, &mut t.radio, t.now));
+    assert!(FAIL_LAYOUT.with(|f| f.get()).is_none());
+    let Some(R::Error(error)) = t.response().result else {
+        panic!("admission succeeded without resident memory");
+    };
+    assert_eq!(error.code(), p::ErrorCode::NoCapacity);
+    assert_eq!(error.reason(), p::ErrorReason::Unknown);
+    assert_eq!(error.outcome(), p::ErrorOutcome::Complete);
+    assert!(t.saved(SAVED).enabled);
+    assert!(t.app.manager.vacated);
+    assert!(t.app.manager.find(SAVED.into()).is_none());
+    assert!(
+        t.events()
+            .iter()
+            .any(|e| matches!(e, Ev::Device(d) if d.id == SAVED && d.enabled))
+    );
+    assert!(t.app.manager.find(SAVED.into()).is_some());
+    assert!(t.radio.bonds.contains(&peer(1)));
 }

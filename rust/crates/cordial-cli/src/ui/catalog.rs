@@ -5,7 +5,7 @@ use crate::{
     controller::{SettingInput, State, Subject},
     model::{self, Up},
     settings::{self, Field, Leaf, Setting, Type, Value},
-    ui::text::{hidpp_words, name, safe},
+    ui::text::{hidpp_error_words, name, safe},
 };
 use cordial_protocol::{self as p, IntegrationKind, SettingState};
 use std::fmt::Write;
@@ -247,14 +247,16 @@ pub fn setting_value(s: &Setting, input: &SettingInput) -> Result<Value, String>
 
 /// A saved setting's apply state.
 pub fn apply_state(s: &Setting) -> String {
-    match s.status {
+    match &s.status {
         None => "Default".into(),
         Some(Ok(SettingState::Pending)) => "pending".into(),
         Some(Ok(SettingState::Applied)) => "applied".into(),
         Some(Ok(SettingState::ChangedOnDevice)) => "changed on device".into(),
-        Some(Ok(SettingState::Unsupported)) => "unsupported by the device now".into(),
         Some(Ok(SettingState::Unknown)) => "unknown".into(),
-        Some(Err(code)) => format!("failed: {}", hidpp_words(code)),
+        Some(Err(e)) if model::unsupported(e) && model::plain(e) => {
+            "unsupported by the device now".into()
+        }
+        Some(Err(e)) => format!("failed: {}", hidpp_error_words(e)),
     }
 }
 
@@ -325,7 +327,7 @@ pub fn setting_list(d: &p::Device, settings: &[Setting]) -> String {
     let mut b = format!(
         "Settings of {}: {}{}",
         name(Some(&d.name)),
-        crate::ui::text::up_token(model::hidpp_up(d)),
+        crate::ui::text::up_token(&model::hidpp_up(d)),
         cached_note(d)
     );
     let known = presented(settings);

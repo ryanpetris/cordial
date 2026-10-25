@@ -24,7 +24,9 @@ pub struct Store {
     /// A record whose reads fail.
     pub fail_load: Option<RecordKey>,
     pub fail_save: Option<(RecordKey, bool)>,
+    pub fail_after_save: Option<RecordKey>,
     pub available: Option<usize>,
+    pub fail_count: bool,
     pub capacity: Option<usize>,
     /// Allocation unit for records counted against `capacity`.
     pub block: Option<usize>,
@@ -87,7 +89,7 @@ impl RecordStore for Store {
     }
     async fn available(&mut self) -> Result<usize, storage::Error> {
         self.counts += 1;
-        if self.fail {
+        if self.fail || self.fail_count {
             return Err(storage::Error::Io);
         }
         Ok(self
@@ -165,6 +167,9 @@ impl RecordStore for Store {
         }
         self.generation += 1;
         self.records.insert(key, value.to_vec());
+        if self.fail_after_save == Some(key) {
+            self.fail = true;
+        }
         if self.unknown == Some(key) {
             return Err(storage::Error::Unknown);
         }
@@ -190,6 +195,7 @@ pub struct Radio {
     pub info_refreshes: Vec<LinkId>,
     pub reject_info_refresh: bool,
     pub scans: Vec<(u64, bool, bool)>,
+    pub reject_scan: Option<Error>,
     pub bonds: Vec<Peer>,
     pub connects: Vec<(LinkId, bool)>,
     /// The saved layout supplied with each entry of `connects`.
@@ -203,6 +209,7 @@ pub struct Radio {
     pub transports: Option<Capabilities>,
     pub reject_adoption: bool,
     pub reject_forget: bool,
+    pub reject_import: Option<Error>,
     pub reject_inventory: bool,
     pub addresses: Vec<Peer>,
     pub forgotten: Vec<Peer>,
@@ -285,7 +292,10 @@ impl Bluetooth for Radio {
     }
     fn scan(&mut self, id: u64, classic: bool, ble: bool) -> Result<(), Error> {
         self.scans.push((id, classic, ble));
-        Ok(())
+        match self.reject_scan {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     fn connect(
         &mut self,
@@ -371,6 +381,9 @@ impl Bluetooth for Radio {
         panic!("unexpected report read")
     }
     async fn import_bond(&mut self, bond: &cordial_core::bonds::Bond) -> Result<(), Error> {
+        if let Some(error) = self.reject_import {
+            return Err(error);
+        }
         if !self.bonds.contains(&bond.identity) {
             self.bonds.push(bond.identity);
         }

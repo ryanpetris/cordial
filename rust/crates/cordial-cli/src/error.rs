@@ -7,6 +7,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 const CLOSED: &str = "the connection to the adapter closed";
 const TIMEOUT: &str = "the adapter didn't respond in time";
 const IO: &str = "the serial connection to the adapter failed: ";
+pub(crate) const UNEXPECTED: &str = "the adapter returned an unexpected result";
+const PROTOCOL: &str = "the adapter sent a message Cordial couldn't read";
 
 #[derive(Clone, Debug)]
 pub struct Error {
@@ -35,12 +37,24 @@ impl Error {
         }
     }
 
-    /// A Dongle error with only a code, as a pairing failure carries it.
+    /// A refusal Cordial makes before sending, worded as the Dongle's error with `code`: nothing
+    /// took effect.
     pub fn code(code: p::ErrorCode, command: Option<&'static str>) -> Self {
-        Self::dongle(
+        Self::refusal(
             p::Error {
                 code: code as i32,
                 ..Default::default()
+            },
+            command,
+        )
+    }
+
+    /// A refusal Cordial makes before sending, worded as the Dongle's `error`.
+    pub fn refusal(error: p::Error, command: Option<&'static str>) -> Self {
+        Self::dongle(
+            p::Error {
+                outcome: p::ErrorOutcome::NoEffect as i32,
+                ..error
             },
             command,
         )
@@ -50,20 +64,24 @@ impl Error {
         use cordial_client::Error as E;
         match error {
             E::Dongle(e) => Self::dongle(e, Some(command)),
-            E::UnexpectedResponse => Self::new("the adapter returned an unexpected result"),
+            E::UnexpectedResponse => Self::new(UNEXPECTED),
             E::Timeout => Self::new(TIMEOUT),
             E::TooLong => Self::new("the request was too large for the adapter"),
             E::Io(e) => Self::new(format!("{IO}{e}")),
-            E::Protocol => Self::new("the adapter sent a message Cordial couldn't read"),
+            E::Protocol => Self::new(PROTOCOL),
             E::Closed => Self::new(CLOSED),
         }
     }
 
-    /// Whether the connection ended before the adapter answered, so a change the request carried
-    /// may or may not have been saved.
-    pub fn unanswered(&self) -> bool {
+    /// Whether a local failure came after the request may have reached the adapter, so a change
+    /// it carried may or may not have been saved: the connection closed or failed, the adapter
+    /// didn't answer in time, or its answer couldn't be read.
+    pub fn unconfirmed(&self) -> bool {
         self.dongle.is_none()
-            && (self.message == CLOSED || self.message == TIMEOUT || self.message.starts_with(IO))
+            && (matches!(
+                self.message.as_str(),
+                CLOSED | TIMEOUT | UNEXPECTED | PROTOCOL
+            ) || self.message.starts_with(IO))
     }
 
     /// The Dongle's error code, when the Dongle refused.

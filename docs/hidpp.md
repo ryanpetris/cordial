@@ -324,8 +324,9 @@ Refresh can retry that read-only probe once; there is no automatic retry loop.
 Only explicitly saved preferences enter persistent storage. They retain semantic setting IDs,
 feature/revision information, and validation metadata. The inventory, observations, and unsaved
 records are not persisted. A capability change can make a saved preference unsupported without
-deleting it. Storage capacity is checked before saving; a failed save restores the previous
-preference before a device setter can be queued.
+deleting it. Storage capacity is checked before saving. A save failure queues no device setter;
+the error outcome reports what is known about persistence. An unresolved save does not confirm
+that the previous preference remains saved.
 
 The firmware owns protocol operations, setting identifiers, validation, and runtime state. Host
 clients own labels, categories, units, and error messages. See the [serial protocol documentation](protocol/README.md)

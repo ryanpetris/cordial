@@ -1,4 +1,5 @@
 import type { DeviceEntry, SettingField } from "./state.ts";
+import { connected } from "./text.ts";
 
 /** A settings submission or HID++ switch is in flight for the device. */
 export function settingsBusy(entry: Pick<DeviceEntry, "pending" | "settingsSave">): boolean {
@@ -6,8 +7,8 @@ export function settingsBusy(entry: Pick<DeviceEntry, "pending" | "settingsSave"
 }
 
 /** Setting values are current readings only while HID++ is up on a connected device. */
-export function settingsCurrent(entry: Pick<DeviceEntry, "device">): boolean {
-  return entry.device.state === "connected" && entry.device.hidpp?.state === "active";
+export function settingsCurrent(entry: Pick<DeviceEntry, "device" | "readError">): boolean {
+  return connected(entry) && entry.device.hidpp?.state === "active";
 }
 
 export function hidppBusy(entry: Pick<DeviceEntry, "pending">): boolean {

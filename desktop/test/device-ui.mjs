@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 
+const problem = (code) => ({ code, reason: "unknown", outcome: "unspecified", related: [] });
+
 const profile = await mkdtemp(join(tmpdir(), "cordial-device-ui-"));
 await writeFile(join(profile, "preferences.json"), JSON.stringify({ notifyLowBattery: false, notifyConnections: false }));
 const env = { ...process.env, CORDIAL_DESKTOP_SIMULATE: "1" };
@@ -357,7 +359,7 @@ try {
   // Saved, and the apply failed: the draft ends, the setting shows the
   // failure, and Retry saves that value again.
   const outcome = { running: false, items: [{ change: running.items[0].change, status: "saved", error: null }] };
-  Object.assign(handsSaved, { saved: 60, state: null, error: "timeout" });
+  Object.assign(handsSaved, { saved: 60, state: null, error: problem("timeout") });
   entry.settingsSave = outcome;
   await publish();
   await app.evaluate((_electron, outcome) => { globalThis.uiReply({ ok: true, settingsSave: outcome }); globalThis.uiHold = null; }, outcome);
@@ -442,7 +444,7 @@ try {
   assert.ok((await actions()).some((a) => a.type === "device.disconnect" && a.key === entry.key));
   // A failed connection says why on Diagnostics, never as a banner.
   entry.device.state = "disconnected";
-  entry.device.errors = ["connection_failed"];
+  entry.device.errors = [problem("connection_failed")];
   await publish();
   await tab("Diagnostics").click();
   await page.getByText("The adapter couldn't connect to this device.", { exact: true }).waitFor();
@@ -471,6 +473,15 @@ try {
   await bar.getByRole("button", { name: "Retry", exact: true }).click();
   assert.equal((await actions()).at(-1).type, "device.reload");
   entry.settingsError = null;
+  // A record the adapter couldn't list keeps what was known of the device and says so on Diagnostics.
+  entry.readError = { code: "storage_failed", reason: "storage", outcome: "no_effect", related: [] };
+  await publish();
+  await page.getByText("The adapter couldn't read this device's saved data. Try again.", { exact: true }).waitFor();
+  // Its state is only last known, so the page doesn't call it connected.
+  await page.locator(".page-header").getByText("Couldn't Read", { exact: true }).waitFor();
+  await bar.getByRole("button", { name: "Retry", exact: true }).click();
+  assert.equal((await actions()).at(-1).type, "device.reload");
+  entry.readError = null;
   entry.settings = settings;
   entry.device.information = info;
   entry.device.hidpp = { ...entry.device.hidpp, state: "active" };
@@ -489,9 +500,12 @@ try {
   assert.equal(await fact("Status").textContent(), "Active");
   await fact("Device ID").waitFor();
   assert.equal(await page.getByText("Special-Key Translation", { exact: true }).count(), 0);
-  entry.device.hidpp = { ...entry.device.hidpp, state: null, error: "protocol_unsupported" };
+  entry.device.hidpp = { ...entry.device.hidpp, state: null, error: problem("protocol_unsupported") };
   await publish();
-  await page.getByText("Failed: This device doesn't support this feature", { exact: true }).waitFor();
+  assert.equal(await fact("Status").textContent(), "Unsupported");
+  entry.device.hidpp = { ...entry.device.hidpp, state: null, error: { ...problem("timeout"), outcome: "unknown" } };
+  await publish();
+  await page.getByText("Failed: This device didn't respond in time. The adapter couldn't confirm whether the change took effect", { exact: true }).waitFor();
   entry.device.hidpp = { ...entry.device.hidpp, state: "active", error: null };
   await publish();
   await fail("device.refresh");
@@ -561,13 +575,13 @@ try {
   await tab("Settings").click();
   entry.settings = [];
   entry.device.information = { ...blank(info), identity: info.identity };
-  entry.device.hidpp = { ...entry.device.hidpp, state: "unsupported" };
+  entry.device.hidpp = { ...entry.device.hidpp, state: null, error: problem("protocol_unsupported") };
   await publish();
   await tab("Settings").waitFor({ state: "detached" });
   const automatic = page.getByRole("switch", { name: "Automatic Connections", exact: true });
   await automatic.focus();
   // HID++ starting again does not bring the tab back; its settings do.
-  entry.device.hidpp = { ...entry.device.hidpp, state: "starting" };
+  entry.device.hidpp = { ...entry.device.hidpp, state: "starting", error: null };
   await publish();
   assert.equal(await tab("Settings").count(), 0);
   entry.settings = settings;
@@ -576,13 +590,13 @@ try {
   await tab("Details").click();
   await automatic.focus();
   entry.settings = [];
-  entry.device.hidpp = { ...entry.device.hidpp, state: "unsupported" };
+  entry.device.hidpp = { ...entry.device.hidpp, state: null, error: problem("protocol_unsupported") };
   await publish();
   await tab("Settings").waitFor({ state: "detached" });
   assert.equal(await automatic.evaluate((e) => e === document.activeElement), true);
   entry.settings = settings;
   entry.device.information = info;
-  entry.device.hidpp = { ...entry.device.hidpp, state: "active" };
+  entry.device.hidpp = { ...entry.device.hidpp, state: "active", error: null };
   await publish();
   await page.getByRole("tab", { name: "Details", selected: true }).waitFor();
   assert.equal(await automatic.evaluate((e) => e === document.activeElement), true);
@@ -616,7 +630,7 @@ try {
   await publish();
   await page.getByRole("img", { name: "Profiles, Changed", exact: true }).waitFor({ state: "detached" });
   // A connected device whose profiles aren't loaded says why on Diagnostics.
-  entry.device.errors = ["profile_memory_exceeded"];
+  entry.device.errors = [problem("profile_memory_exceeded")];
   await publish();
   await tab("Diagnostics").click();
   await page.getByText("The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.", { exact: true }).waitFor();
@@ -648,7 +662,7 @@ try {
   await fail(null);
   // A full adapter can't add another device.
   const status = state.adapters.find((a) => a.id === entry.adapterId).status;
-  status.errors.push("storage_full");
+  status.errors.push({ ...problem("storage_full"), reason: "storage" });
   await publish();
   await pairing.getByText("Storage Full", { exact: true }).waitFor();
   assert.equal(await pairing.getByRole("button", { name: "Pair", exact: true }).count(), 0);

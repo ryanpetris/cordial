@@ -38,7 +38,7 @@ fn change(
     radio: &mut Radio,
     id: u64,
     f: impl FnOnce(&mut Policy),
-) -> Result<(), Error> {
+) -> Result<(), p::Error> {
     let mut policy = policy(store, id);
     f(&mut policy);
     block_on(manager.save_policy(policy, None, store, radio))
@@ -108,7 +108,7 @@ fn policies_save_before_publish_and_unpair_keeps_adapter_preferences() {
     assert_eq!(
         change(&mut manager, &mut store, &mut radio, 77, |p| p
             .set_hidpp(false)),
-        Err(Error::StorageFailed)
+        Err(cordial_core::wire::error(Error::StorageFailed, None, false))
     );
     assert!(manager.devices[0].as_ref().unwrap().hidpp_enabled);
     store.fail_save = None;
@@ -126,7 +126,7 @@ fn policies_save_before_publish_and_unpair_keeps_adapter_preferences() {
     manager.connected(id, descriptor(), 255, 0).unwrap();
     assert_eq!(
         block_on(manager.unpair(77, peer(1), &mut store, &mut radio)),
-        Err(Error::Busy)
+        Err(cordial_core::wire::error(Error::Busy, None, false))
     );
     manager.disconnect(0, &mut radio).unwrap();
     manager.disconnected(id, None, 1).unwrap();
@@ -211,7 +211,7 @@ fn replacement_commit_preserves_policy_and_reboot_selects_new_bond() {
     assert!(radio.bonds.is_empty());
     let link = manager.pair(peer(1), 90_000, &mut radio).unwrap();
     radio.bonds.push(peer(1));
-    let (id, slot) = block_on(manager.bonded(
+    let (id, slot, _) = block_on(manager.bonded(
         link,
         peer(1),
         saved_peer(&mut store, peer(1)),
@@ -279,7 +279,7 @@ fn a_lost_record_whose_cleanup_fails_is_still_reported_removed() {
     store.fail_remove = Some(key);
     assert_eq!(
         block_on(manager.sync_bonds(&mut store, &mut radio)),
-        Err(Error::StorageFailed)
+        Err((Error::StorageFailed, p::ErrorReason::Unknown))
     );
     assert!(manager.devices.iter().all(Option::is_none));
     assert_eq!(manager.removed, [77]);
@@ -292,7 +292,7 @@ fn additional_pairs_are_saved_disabled_and_enable_does_not_evict() {
         block_on(manager.prepare_pair(peer(n), None, &mut store, &mut radio)).unwrap();
         let link = manager.pair(peer(n), 90_000, &mut radio).unwrap();
         radio.bonds.push(peer(n));
-        let (id, slot) = block_on(manager.bonded(
+        let (id, slot, _) = block_on(manager.bonded(
             link,
             peer(n),
             saved_peer(&mut store, peer(n)),
@@ -327,7 +327,14 @@ fn additional_pairs_are_saved_disabled_and_enable_does_not_evict() {
     assert_eq!(
         change(&mut manager, &mut store, &mut radio, last, |p| p.enabled =
             true),
-        Err(Error::Capacity)
+        Err(p::Error {
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..cordial_core::wire::error(
+                Error::Capacity,
+                Some(p::ErrorReason::EnabledDevices),
+                false
+            )
+        })
     );
     assert!(!policy(&mut store, last).enabled);
     assert!(manager.find(last).is_none());
@@ -429,7 +436,7 @@ fn changed_final_ble_identity_does_not_replace_the_provisional_owner() {
     block_on(manager.prepare_pair(original.peer, Some(original.peer), &mut store, &mut radio))
         .unwrap();
     let link = manager.pair(original.peer, 90_000, &mut radio).unwrap();
-    let (id, slot) = block_on(manager.bonded(
+    let (id, slot, _) = block_on(manager.bonded(
         link,
         final_peer,
         saved_peer(&mut store, final_peer),
@@ -472,7 +479,14 @@ fn unblock_at_capacity_preserves_the_working_selection() {
     assert_eq!(
         change(&mut manager, &mut store, &mut radio, 77, |p| p.blocked =
             false),
-        Err(Error::Capacity)
+        Err(p::Error {
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..cordial_core::wire::error(
+                Error::Capacity,
+                Some(p::ErrorReason::EnabledDevices),
+                false
+            )
+        })
     );
     assert!(policy(&mut store, 77).blocked);
     assert_eq!(
@@ -486,7 +500,7 @@ fn failed_delete_keeps_the_previous_complete_device() {
     store.fail_remove = Some(record_key(2, 77));
     assert_eq!(
         block_on(manager.unpair(77, peer(1), &mut store, &mut radio)),
-        Err(Error::StorageFailed)
+        Err(cordial_core::wire::error(Error::StorageFailed, None, false))
     );
     assert!(radio.bonds.contains(&peer(1)));
     assert!(!manager.devices[0].as_ref().unwrap().deleting);
@@ -540,7 +554,7 @@ fn deleting_highest_device_does_not_reuse_its_id() {
     block_on(manager.prepare_pair(peer(2), None, &mut store, &mut radio)).unwrap();
     let first = last_device(&store);
     let link = manager.pair(peer(2), 90_000, &mut radio).unwrap();
-    let (id, _) = block_on(manager.bonded(
+    let (id, _, _) = block_on(manager.bonded(
         link,
         peer(2),
         saved_peer(&mut store, peer(2)),
@@ -591,7 +605,11 @@ fn late_identity_cannot_take_over_an_existing_live_link() {
             &mut store,
             &mut radio
         )),
-        Err(Error::Busy)
+        Err(p::Error {
+            code: p::ErrorCode::Busy as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        })
     );
     assert_eq!(manager.link_for(0), Some(old));
     assert_eq!(policy(&mut store, 77), original);
@@ -726,7 +744,14 @@ fn only_enabled_devices_the_stack_has_room_for_are_resident() {
     assert_eq!(
         change(&mut manager, &mut store, &mut radio, 3, |p| p.enabled =
             true),
-        Err(Error::Capacity)
+        Err(p::Error {
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..cordial_core::wire::error(
+                Error::Capacity,
+                Some(p::ErrorReason::EnabledDevices),
+                false
+            )
+        })
     );
     assert!(!policy(&mut store, 3).enabled);
 }
@@ -950,7 +975,15 @@ fn output_pools_count_nonresident_selections_and_keep_uncapped_counts() {
     );
     let d = record(&manager, &mut store, 2);
     assert_eq!(d.kinds, [p::Kind::Gamepad as i32]);
-    assert_eq!(d.outputs[0].state, p::OutputState::Unsupported as i32);
+    assert_eq!(
+        d.outputs[0].status,
+        Some(p::output_status::Status::Error(p::Error {
+            code: p::ErrorCode::Unsupported as i32,
+            reason: p::ErrorReason::OutputBackend as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        }))
+    );
     assert_eq!(d.outputs[0].slot, None);
     store.fail_remove = Some(record_key(2, 2));
     assert!(block_on(manager.unpair(2, peer(2), &mut store, &mut radio)).is_err());
@@ -1071,7 +1104,7 @@ fn saving_a_policy_with_a_lost_bond_releases_output_counts() {
         store.fail_load = Some(key);
         assert_eq!(
             block_on(manager.save_policy(saved.clone(), None, &mut store, &mut radio)),
-            Err(Error::StorageFailed)
+            Err(cordial_core::wire::error(Error::StorageFailed, None, false))
         );
         assert_eq!(manager.outputs.plan().xinput_gamepads, 1);
         assert!(manager.removed.is_empty());
@@ -1083,7 +1116,7 @@ fn saving_a_policy_with_a_lost_bond_releases_output_counts() {
         }
         assert_eq!(
             block_on(manager.save_policy(saved, None, &mut store, &mut radio)),
-            Err(Error::NotFound)
+            Err(cordial_core::wire::error(Error::NotFound, None, false))
         );
         assert_eq!(manager.outputs.plan(), Plan::default());
         assert_eq!(manager.removed, [77]);
@@ -1108,7 +1141,7 @@ fn a_lost_device_with_failed_cleanup_cannot_become_resident_again() {
     store.fail_remove = Some(key);
     assert_eq!(
         block_on(manager.import(0, &mut store, &mut radio)),
-        Err(Error::StorageFailed)
+        Err((Error::StorageFailed, p::ErrorReason::Unknown))
     );
     assert!(manager.find(77).is_none());
     assert_eq!(manager.outputs.plan(), Plan::default());
@@ -1248,8 +1281,10 @@ fn gamepad_pools_use_actual_enumeration_and_stable_independent_slots() {
     assert_eq!(manager.connections.iter().flatten().count(), 4);
     assert_eq!(manager.gamepad_outputs(), Default::default());
     assert_eq!(
-        record(&manager, &mut store, 77).outputs[0].state,
-        p::OutputState::Pending as i32
+        record(&manager, &mut store, 77).outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Pending as i32
+        ))
     );
     enumerate_outputs(&mut manager, 1, 2, 1, true);
     let snapshots = manager.gamepad_outputs();
@@ -1258,8 +1293,10 @@ fn gamepad_pools_use_actual_enumeration_and_stable_independent_slots() {
     assert_eq!(snapshots.xinput[0].occupant, Some(b));
     assert_eq!(snapshots.xinput[1].occupant, Some(d));
     assert_eq!(
-        record(&manager, &mut store, 79).outputs[0].state,
-        p::OutputState::Pending as i32
+        record(&manager, &mut store, 79).outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Pending as i32
+        ))
     );
     assert_eq!(record(&manager, &mut store, 80).outputs[0].slot, Some(1));
     manager.close(a, None, &mut radio);
@@ -1273,8 +1310,10 @@ fn gamepad_pools_use_actual_enumeration_and_stable_independent_slots() {
     assert_ne!(reconnected, a);
     assert_eq!(manager.gamepad_outputs().hid[0], replacement.hid[0]);
     assert_eq!(
-        record(&manager, &mut store, 77).outputs[0].state,
-        p::OutputState::Pending as i32
+        record(&manager, &mut store, 77).outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Pending as i32
+        ))
     );
     enumerate_outputs(&mut manager, 2, 2, 2, true);
     let rebuilt = manager.gamepad_outputs();
@@ -1315,8 +1354,10 @@ fn output_controls_refresh_on_input_and_survive_suspend_without_stale_occupants(
     assert_eq!(held.generation, neutral.generation);
     enumerate_outputs(&mut manager, 2, 0, 7, false);
     assert_eq!(
-        record(&manager, &mut store, 77).outputs[0].state,
-        p::OutputState::Pending as i32
+        record(&manager, &mut store, 77).outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Pending as i32
+        ))
     );
     assert_eq!(record(&manager, &mut store, 77).outputs[0].slot, None);
     assert_eq!(manager.gamepad_outputs().hid[0], held);
@@ -1383,7 +1424,7 @@ fn saturated_mode_changes_reassign_without_changing_the_usb_plan() {
             .output_preferences[0]
             .mode =
             Xinput),
-        Err(Error::StorageFailed)
+        Err(cordial_core::wire::error(Error::StorageFailed, None, false))
     );
     assert_eq!(manager.outputs.plan(), desired);
     assert_eq!(manager.gamepad_outputs().hid[0], original);
@@ -1409,8 +1450,10 @@ fn saturated_mode_changes_reassign_without_changing_the_usb_plan() {
     })
     .unwrap();
     assert_eq!(
-        record(&manager, &mut store, 77).outputs[0].state,
-        p::OutputState::Disabled as i32
+        record(&manager, &mut store, 77).outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Disabled as i32
+        ))
     );
     assert_eq!(manager.gamepad_outputs().xinput[0].occupant, None);
 }
@@ -1425,24 +1468,36 @@ fn gamepad_assignments_release_for_layout_storage_policy_and_backend_failures() 
     manager.relayout(a, descriptor()).unwrap();
     assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
     assert_eq!(
-        record(&manager, &mut store, 77).outputs[0].state,
-        p::OutputState::Unsupported as i32
+        record(&manager, &mut store, 77).outputs[0].status,
+        Some(p::output_status::Status::Error(p::Error {
+            code: p::ErrorCode::Unsupported as i32,
+            reason: p::ErrorReason::InputLayout as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        }))
     );
     manager.relayout(a, pad_descriptor()).unwrap();
     assert!(manager.gamepad_outputs().hid[0].generation > original.generation);
     manager.fail_storage();
     assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
     assert_eq!(
-        record(&manager, &mut store, 77).outputs[0].state,
-        p::OutputState::Pending as i32
+        record(&manager, &mut store, 77).outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Pending as i32
+        ))
     );
     manager.storage_ready = true;
     let resumed = manager.gamepad_outputs().hid[0];
     manager.output_support = &[];
     assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
     assert_eq!(
-        record(&manager, &mut store, 77).outputs[0].state,
-        p::OutputState::Unsupported as i32
+        record(&manager, &mut store, 77).outputs[0].status,
+        Some(p::output_status::Status::Error(p::Error {
+            code: p::ErrorCode::Unsupported as i32,
+            reason: p::ErrorReason::OutputBackend as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        }))
     );
     manager.output_support = &[cordial_core::outputs::Support {
         role: p::Role::Gamepad,
@@ -1455,8 +1510,10 @@ fn gamepad_assignments_release_for_layout_storage_policy_and_backend_failures() 
     .unwrap();
     assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
     assert_eq!(
-        record(&manager, &mut store, 77).outputs[0].state,
-        p::OutputState::Disconnected as i32
+        record(&manager, &mut store, 77).outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Disconnected as i32
+        ))
     );
     manager.disconnected(a, None, 3).unwrap();
     block_on(manager.unpair(77, peer(1), &mut store, &mut radio)).unwrap();
@@ -1505,7 +1562,12 @@ fn disabled_gamepad_output_preserves_keyboard_forwarding_and_existing_wire_field
     assert_eq!(manager.forward.packet().unwrap().bytes()[0], 16);
     assert_eq!(manager.gamepad_outputs().hid[0].occupant, None);
     let before = record(&manager, &mut store, 77);
-    assert_eq!(before.outputs[0].state, p::OutputState::Disabled as i32);
+    assert_eq!(
+        before.outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Disabled as i32
+        ))
+    );
     change(&mut manager, &mut store, &mut radio, 77, |policy| {
         policy
             .output_preferences
@@ -1516,7 +1578,12 @@ fn disabled_gamepad_output_preserves_keyboard_forwarding_and_existing_wire_field
     })
     .unwrap();
     let mut after = record(&manager, &mut store, 77);
-    assert_eq!(after.outputs[0].state, p::OutputState::Active as i32);
+    assert_eq!(
+        after.outputs[0].status,
+        Some(p::output_status::Status::State(
+            p::OutputState::Active as i32
+        ))
+    );
     after.outputs = before.outputs.clone();
     after.output_preferences = before.output_preferences.clone();
     assert_eq!(after, before);
@@ -1622,7 +1689,7 @@ fn transport_allowances_are_independent_and_pairing_has_one_reserved_slot() {
             ),
             Err(Error::Busy)
         );
-        let (saved, slot) = block_on(manager.bonded(
+        let (saved, slot, _) = block_on(manager.bonded(
             pairing,
             pairing_peer,
             None,
@@ -1738,7 +1805,7 @@ fn saved_disabled_pair_keeps_reserve_until_disconnect_and_normal_admission_still
             };
             block_on(manager.prepare_pair(candidate, None, &mut store, &mut radio)).unwrap();
             let pairing = manager.pair(candidate, 90_000, &mut radio).unwrap();
-            let (saved, slot) = block_on(
+            let (saved, slot, _) = block_on(
                 manager.bonded(pairing, candidate, None, b"Extra", &mut store, &mut radio),
             )
             .unwrap();
@@ -1825,11 +1892,19 @@ fn resident_promotion_follows_commit_and_failed_commit_keeps_reserve() {
             let result =
                 block_on(manager.bonded(pairing, candidate, None, b"New", &mut store, &mut radio));
             if commit {
-                let (_, slot) = result.unwrap();
+                let (_, slot, _) = result.unwrap();
                 assert!(slot.is_some());
                 assert_eq!(radio.promoted, [pairing]);
             } else {
-                assert_eq!(result, Err(Error::StorageFailed));
+                assert_eq!(
+                    result,
+                    Err(p::Error {
+                        code: p::ErrorCode::StorageFailed as i32,
+                        reason: p::ErrorReason::Storage as i32,
+                        outcome: p::ErrorOutcome::NoEffect as i32,
+                        ..Default::default()
+                    })
+                );
                 assert!(radio.promoted.is_empty());
             }
             assert_eq!(radio.adopted, [pairing]);
@@ -1847,4 +1922,59 @@ fn resident_promotion_follows_commit_and_failed_commit_keeps_reserve() {
             assert!(radio.native_links.as_ref().unwrap().is_empty());
         }
     }
+}
+
+#[test]
+fn unpair_keeps_forget_and_restoration_failures_with_their_radio_context() {
+    let (mut manager, mut store, mut radio) = setup();
+    radio.reject_forget = true;
+    radio.reject_inventory = true;
+    let error = block_on(manager.unpair(77, peer(1), &mut store, &mut radio)).unwrap_err();
+    assert_eq!(
+        error,
+        p::Error {
+            code: p::ErrorCode::StorageFailed as i32,
+            reason: p::ErrorReason::Radio as i32,
+            related: vec![p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                reason: p::ErrorReason::Radio as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    );
+    assert!(manager.storage_ready);
+    assert!(manager.storage_error.is_none());
+    assert!(manager.bonds_pending);
+    assert!(!manager.devices[0].as_ref().unwrap().deleting);
+    assert!(policy(&mut store, 77).enabled);
+    radio.reject_forget = false;
+    radio.reject_inventory = false;
+    block_on(manager.sync_bonds(&mut store, &mut radio)).unwrap();
+    assert!(!manager.bonds_pending);
+    assert!(radio.bonds.contains(&peer(1)));
+}
+
+#[test]
+fn unpair_preserves_storage_context_when_restoration_cannot_read_a_bond() {
+    let (mut manager, mut store, mut radio) = setup();
+    store.fail_remove = Some(record_key(2, 77));
+    store.fail_load = Some(record_key(2, 77));
+    let error = block_on(manager.unpair(77, peer(1), &mut store, &mut radio)).unwrap_err();
+    assert_eq!(error.code(), p::ErrorCode::StorageFailed);
+    assert_eq!(error.reason(), p::ErrorReason::Storage);
+    assert_eq!(error.outcome(), p::ErrorOutcome::Unspecified);
+    assert_eq!(
+        error.related,
+        [p::Error {
+            code: p::ErrorCode::StorageFailed as i32,
+            reason: p::ErrorReason::Storage as i32,
+            ..Default::default()
+        }]
+    );
+    assert!(manager.bonds_pending);
+    store.fail_load = None;
+    block_on(manager.sync_bonds(&mut store, &mut radio)).unwrap();
+    assert!(radio.bonds.contains(&peer(1)));
+    assert!(!manager.bonds_pending);
 }

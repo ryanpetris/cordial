@@ -26,14 +26,20 @@ understood are Required.
 - The zero value of every enum is its safe default. Where none exists it is `_UNSPECIFIED` (for a
   required field) or `_UNKNOWN` (for a value that can come from newer firmware).
 - A client reads an enum value it does not know as the zero value, and skips unknown values in
-  repeated enum fields. An unknown `ErrorCode` is a generic failure; an unknown `InactiveReason`
-  still means inactive.
+  repeated enum fields. An unknown `ErrorCode` is a generic failure; unknown `ErrorReason` and
+  `ErrorOutcome` values provide no further detail. An unknown `InactiveReason` still means inactive.
 - A `oneof` that holds a variant newer than the client reads as unset, with a documented meaning:
   an unknown pairing step means pairing is still in progress, an unknown integration status means
-  off, an unknown settings group means the client skips the object, and an unknown listing entry
-  means the client skips the entry.
-- `ErrorCode` is a wire enum, separate from the firmware's internal error types. The firmware maps
-  internal failures to the appropriate request, adapter, device, integration or setting record.
+  off, an unknown setting status provides no confirmation, and an unknown output status means
+  Unknown. An unknown settings group means the client skips the object, and an unknown listing
+  entry means the client skips the entry. Output producers always set a state or error; explicit
+  `OUTPUT_STATE_UNKNOWN` reports an unknown state.
+- `Error` carries code, reason, outcome and related errors in every failure scope. Conversions
+  preserve the complete error recursively, including unknown numeric details when retained by the
+  decoder. A code alone never establishes an outcome. Missing outcome evidence uses `UNSPECIFIED`,
+  even when the code commonly describes a refusal; `NO_EFFECT` requires evidence of no effects or
+  results in the documented scope. See [Errors](limits-and-errors.md#errors) for outcome meanings
+  and complete-error ordering and deduplication.
 
 ## Changing the schema
 
@@ -96,7 +102,8 @@ feature table as `Feature` records with a new `detail` variant. Settings domains
 behavior, independently of the integration providing it.
 
 - A client keeps the number of a kind it does not know and passes it back unchanged.
-- Integration failures use the shared error codes.
+- Integration failures use the shared `Error` message, including `PROTOCOL_UNSUPPORTED` for
+  missing required protocol versions or reports.
 - The Dongle decodes everything it reads from a device into typed fields before sending it. Raw
   report bytes, protocol responses and hex dumps never reach the wire, and a value the Dongle
   cannot decode is not sent. Decoded identifiers and positions, such as a report ID, a bit offset
@@ -164,9 +171,18 @@ the listing for subsequent events. A client replaces its list with the completed
 applies those events in receive order. Profile rules have no change event, so clients list them
 again when they need a fresh view.
 
-`ListDevices` and `ListProfiles` hold one entry per saved record: the record, or its ID as
-`unreadable` when its flash read fails. An undecodable record is removed as lost and is not listed.
-A client skips entry variants it does not understand and continues reading the same frame.
+`ListDevices` and `ListProfiles` hold one entry per saved record: the record, or an `error` entry
+containing `RecordError { id, error }` when its flash read fails. The error uses `STORAGE_FAILED`,
+reason `STORAGE` and outcome `NO_EFFECT`: no record was returned. It makes no claim about saved
+data. This entry does not fail the whole response; later entries follow. A failure to continue the
+listing instead returns `Response.error` and discards the partial list. An undecodable record is
+removed as lost and is not listed. A client skips entry variants it does not understand and
+continues reading the same frame.
+
+Clients retain a previously known device after its record read fails as last-known data, without
+treating that data as confirmation of its connection or preferences. Fresh records and events
+supersede it; a completed listing that actually omits the ID, or a removal event, removes it.
+Profile read-error placeholders do not require preserving previously cached profile data.
 
 ## Information and settings
 

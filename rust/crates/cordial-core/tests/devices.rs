@@ -235,7 +235,14 @@ fn reconnect_policy_and_names_survive_normal_runtime_transitions() {
         Some(ErrorCode::AuthenticationFailed),
         6000,
     );
-    assert_eq!(d.error, Some(ErrorCode::AuthenticationFailed));
+    assert_eq!(
+        d.error,
+        Some(cordial_core::wire::error(
+            ErrorCode::AuthenticationFailed,
+            None,
+            false
+        ))
+    );
     assert!(!due(&d, 6000 + FIRST - 1));
     assert!(due(&d, 6000 + FIRST));
     // No error stops automatic reconnection; failures keep doubling.
@@ -245,7 +252,7 @@ fn reconnect_policy_and_names_survive_normal_runtime_transitions() {
     ] {
         d.connection(ConnectionState::Connecting, None, at);
         d.connection(ConnectionState::Disconnected, Some(error), at);
-        assert_eq!(d.error, Some(error));
+        assert_eq!(d.error, Some(cordial_core::wire::error(error, None, false)));
         assert!(d.watch_for_return() || d.peer.transport != Transport::Ble);
     }
     assert!(!due(&d, 40_000 + 4 * FIRST - 1));

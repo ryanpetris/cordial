@@ -10,10 +10,10 @@
 // a time; profiles in a device's layers or selected by a configuration
 // interface that the listing hasn't named are named with GetProfile.
 import { Connection, ConnectionClosedError, CordialError, UnexpectedResponseError, settingsRef, type ByteStream } from "@cordial/client";
-import { ErrorCode, OutputMode, Platform, type Event, type Request, type Response, type SetAdapter, type SetDevice } from "@cordial/protocol";
-import type { AdapterStatus, DeviceRecord, Profile, ProfilePage, Setting, SettingsChange } from "../shared/state.ts";
+import { OutputMode, Platform, type Event, type Request, type Response, type SetAdapter, type SetDevice } from "@cordial/protocol";
+import type { AdapterStatus, DeviceRecord, Profile, ProfilePage, Setting, SettingsChange, WireError } from "../shared/state.ts";
 import { sameField } from "../shared/settings.ts";
-import { READ_FAILED, asSentence, errorText } from "../shared/text.ts";
+import { asSentence, errorText } from "../shared/text.ts";
 import * as convert from "./convert.ts";
 
 export interface SessionHooks {
@@ -30,8 +30,7 @@ export interface SessionHooks {
 
 /** Why a failed request failed, in words; `read` marks a request that only reads saved data. */
 export const failure = (error: unknown, read = false) =>
-  error instanceof CordialError && read && error.code === ErrorCode.STORAGE_FAILED ? READ_FAILED
-  : error instanceof CordialError ? errorText(convert.wireError(error))
+  error instanceof CordialError ? errorText(convert.wireError(error), read ? "read" : "save")
     : error instanceof ConnectionClosedError
       ? read ? "The adapter disconnected before it answered." : "The adapter couldn't confirm whether the change was saved."
       : error instanceof UnexpectedResponseError ? "The adapter returned an unexpected result."
@@ -52,8 +51,8 @@ export const PROFILES_PER_PAGE = 10;
 interface ProfileListing {
   /** In ID order. */
   profiles: Profile[];
-  /** IDs of profiles whose record the adapter couldn't read, in ID order. */
-  unreadable: number[];
+  /** Profiles whose record the adapter couldn't read, with why, in ID order. */
+  unreadable: { id: number; error: WireError }[];
   loading: boolean;
   error: string | null;
 }
@@ -76,6 +75,9 @@ export class AdapterSession {
   /** What has been listed and reported of each device's settings, in the adapter's order. */
   readonly settings = new Map<number, Setting[]>();
   readonly settingsErrors = new Map<number, string>();
+  /** Why the latest device listing couldn't read a device's record, until the device's next
+   * record arrives. */
+  readonly readErrors = new Map<number, WireError>();
   /** The devices have been listed. */
   listed = false;
   /** Profiles seen this session, by ID. */
@@ -214,11 +216,11 @@ export class AdapterSession {
     const listing = this.#profiles;
     const index = this.#pages[view];
     if (!listing || index === null || !this.status.profileSupport) return null;
-    const all = [...listing.profiles.map((p) => [p.id, p] as const), ...listing.unreadable.map((id) => [id, null] as const)].sort((a, b) => a[0] - b[0]);
+    const all = [...listing.profiles.map((p) => ({ id: p.id, p })), ...listing.unreadable].sort((a, b) => a.id - b.id);
     const shown = all.slice(index * PROFILES_PER_PAGE, (index + 1) * PROFILES_PER_PAGE);
     return {
-      profiles: shown.flatMap(([, p]) => (p ? [p] : [])),
-      unreadable: shown.flatMap(([id, p]) => (p ? [] : [id])),
+      profiles: shown.flatMap((e) => ("p" in e ? [e.p] : [])),
+      unreadable: shown.flatMap((e) => ("error" in e ? [e] : [])),
       previous: index > 0,
       next: all.length > (index + 1) * PROFILES_PER_PAGE,
       loading: listing.loading,
@@ -293,9 +295,22 @@ export class AdapterSession {
     this.#hooks.changed();
   }
 
-  /** Reads a device's settings list again, as after a failed read. */
+  /** Reads a device's settings list again, as after a failed read, or lists the devices again
+   * when its record couldn't be read. */
   reload(id: number) {
-    void this.#readSettings(id);
+    if (this.readErrors.has(id)) this.#sync();
+    else void this.#readSettings(id);
+  }
+
+  /** Lists the devices again, as after records couldn't be read. */
+  relist() {
+    this.#sync();
+  }
+
+  /** Devices whose record the latest listing couldn't read and that this session has no record
+   * of, in ID order. */
+  get unreadableDevices(): { id: number; error: WireError }[] {
+    return [...this.readErrors].filter(([id]) => !this.devices.has(id)).sort(([a], [b]) => a - b).map(([id, error]) => ({ id, error }));
   }
 
   // ---- State --------------------------------------------------------------
@@ -313,14 +328,19 @@ export class AdapterSession {
         break;
       case "devices": {
         // The listing replaces the devices. A device whose record couldn't be read keeps what was
-        // known of it: a failed read is no proof that it is gone.
+        // known of it, as last known: a failed read is no proof that it is gone.
         const { entries } = result.value;
         const devices = entries.flatMap((e) => (e.entry.case === "device" ? [e.entry.value] : []));
-        const unreadable = entries.flatMap((e) => (e.entry.case === "unreadable" ? [e.entry.value] : []));
-        const listed = new Set([...devices.map((d) => d.id), ...unreadable]);
+        const unreadable = entries.flatMap((e) => (e.entry.case === "error" ? [e.entry.value] : []));
+        const listed = new Set([...devices.map((d) => d.id), ...unreadable.map((u) => u.id)]);
         for (const id of [...this.devices.keys()]) if (!listed.has(id)) this.#remove(id);
         for (const d of devices) this.devices.set(d.id, convert.device(d));
-        if (unreadable.length) this.#hooks.log(`devices ${unreadable.join(", ")} unreadable`);
+        this.readErrors.clear();
+        for (const u of unreadable) {
+          const error = convert.recordError(u);
+          this.readErrors.set(u.id, error);
+          this.#hooks.log(`device ${u.id} unreadable: ${errorText(error, "read")}`);
+        }
         break;
       }
       case "device":
@@ -341,7 +361,9 @@ export class AdapterSession {
         for (const p of profiles) this.#named(p);
         const listing = (this.#profiles ??= { profiles: [], unreadable: [], loading: false, error: null });
         listing.profiles = profiles.sort((a, b) => a.id - b.id);
-        listing.unreadable = entries.flatMap((e) => (e.entry.case === "unreadable" ? [e.entry.value] : [])).sort((a, b) => a - b);
+        listing.unreadable = entries
+          .flatMap((e) => (e.entry.case === "error" ? [{ id: e.entry.value.id, error: convert.recordError(e.entry.value) }] : []))
+          .sort((a, b) => a.id - b.id);
         listing.error = null;
         this.#clampPages();
         break;
@@ -466,7 +488,7 @@ export class AdapterSession {
     const listing = this.#profiles;
     if (!listing) return;
     listing.profiles = [...listing.profiles.filter((x) => x.id !== p.id), p].sort((a, b) => a.id - b.id);
-    listing.unreadable = listing.unreadable.filter((id) => id !== p.id);
+    listing.unreadable = listing.unreadable.filter((u) => u.id !== p.id);
   }
 
   #profileRemoved(id: number) {
@@ -475,7 +497,7 @@ export class AdapterSession {
     const listing = this.#profiles;
     if (!listing) return;
     listing.profiles = listing.profiles.filter((p) => p.id !== id);
-    listing.unreadable = listing.unreadable.filter((x) => x !== id);
+    listing.unreadable = listing.unreadable.filter((u) => u.id !== id);
     this.#clampPages();
   }
 
@@ -489,6 +511,7 @@ export class AdapterSession {
   #putDevice(device: DeviceRecord, event: boolean) {
     const known = this.devices.has(device.id);
     this.devices.set(device.id, device);
+    this.readErrors.delete(device.id);
     // A newly paired device's settings are read once; events keep them current.
     if (!known && event && this.listed) void this.#readSettings(device.id);
     void this.#nameReferences();
@@ -498,6 +521,7 @@ export class AdapterSession {
     this.devices.delete(id);
     this.settings.delete(id);
     this.settingsErrors.delete(id);
+    this.readErrors.delete(id);
   }
 
   /** Ends the session; the adapter stops any scan and unsaved pairing. */

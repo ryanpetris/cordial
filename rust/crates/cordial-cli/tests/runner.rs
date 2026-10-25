@@ -1,6 +1,6 @@
 mod common;
 
-use common::{Dongle, Plan};
+use common::{Dongle, Plan, refusal};
 use cordial_cli::{
     controller::Cancellation,
     error::Error,
@@ -278,6 +278,72 @@ fn one_shot_scan_prints_one_summary() {
 }
 
 #[test]
+fn a_failed_scan_keeps_its_candidates_and_reports_every_error() {
+    let dongle = Dongle::with(|sim| {
+        sim.scan_error = Some(p::Error {
+            code: ErrorCode::Internal as i32,
+            reason: p::ErrorReason::Radio as i32,
+            outcome: p::ErrorOutcome::Partial as i32,
+            related: vec![p::Error {
+                code: ErrorCode::NoCapacity as i32,
+                reason: p::ErrorReason::ScanCandidates as i32,
+                outcome: p::ErrorOutcome::Partial as i32,
+                related: Vec::new(),
+            }],
+        });
+    });
+    let (result, out, _) = script(&dongle, &["scan", "start", "ble", "5"], false, b"");
+    result.unwrap();
+    assert!(
+        out.contains(
+            "Discovery finished: 1 candidate. Error: internal: the adapter hit an unexpected failure; involves the adapter's Bluetooth radio; it partly completed; also (no_capacity: the adapter had no room to list every device it found; it partly completed)"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("[NEW] 1  New Keyboard  ble  candidate"),
+        "{out}"
+    );
+}
+
+#[test]
+fn a_failed_pairing_reports_an_unknown_bond_and_its_cleanup_failure() {
+    let dongle = Dongle::with(|sim| {
+        sim.plan = Plan::EnterCode("012345".into());
+        sim.pairing_error = Some(p::Error {
+            code: ErrorCode::AuthFailed as i32,
+            outcome: p::ErrorOutcome::Unknown as i32,
+            related: vec![p::Error {
+                code: ErrorCode::StorageFailed as i32,
+                reason: p::ErrorReason::Storage as i32,
+                outcome: p::ErrorOutcome::NoEffect as i32,
+                related: Vec::new(),
+            }],
+            ..Default::default()
+        });
+    });
+    let (result, _, _) = script(
+        &dongle,
+        &["pair", "start", "New Keyboard"],
+        false,
+        b"999999\n",
+    );
+    assert_eq!(
+        result.unwrap_err().message,
+        "auth_failed: Bluetooth authentication with this device failed; outcome unknown: the adapter couldn't confirm what took effect; check the current state before trying again; also (storage_failed: the adapter couldn't read or write its saved data)"
+    );
+    // Nothing is tried again.
+    assert_eq!(
+        dongle
+            .sent()
+            .iter()
+            .filter(|c| **c == "start_pairing")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn one_shot_pair_scans_for_its_device_and_takes_the_passkey_from_input() {
     let dongle = Dongle::with(|sim| sim.plan = Plan::EnterCode("012345".into()));
     let (result, out, _) = script(
@@ -308,7 +374,8 @@ fn refusals_name_their_code_and_explanation() {
         "disabled: the device is disabled. Enable it before connecting"
     );
     let dongle = Dongle::with(|sim| {
-        sim.refuse.insert("set_adapter", ErrorCode::StorageFailed);
+        sim.refuse
+            .insert("set_adapter", refusal(ErrorCode::StorageFailed));
     });
     let (result, _, _) = script(&dongle, &["adapter", "set", "name", "Desk 2"], false, b"");
     assert_eq!(
@@ -591,7 +658,8 @@ fn work_on_a_disabled_transport_names_it() {
         let d = sim.devices.iter_mut().find(|d| d.id == 2).unwrap();
         d.enabled = true;
         d.inactive = None;
-        sim.refuse.insert("connect_device", ErrorCode::Unsupported);
+        sim.refuse
+            .insert("connect_device", refusal(ErrorCode::Unsupported));
     });
     let (result, _, _) = script(&dongle, &["device", "connect", "Old Keyboard"], false, b"");
     assert_eq!(
@@ -599,6 +667,28 @@ fn work_on_a_disabled_transport_names_it() {
         "Bluetooth Classic is disabled on the adapter"
     );
     assert!(dongle.sent().contains(&"connect_device"));
+}
+
+#[test]
+fn a_refusal_with_more_to_report_on_a_disabled_transport_keeps_its_details() {
+    let dongle = Dongle::with(|sim| {
+        sim.status.transports[0].enabled = Some(false);
+        let d = sim.devices.iter_mut().find(|d| d.id == 2).unwrap();
+        d.enabled = true;
+        d.inactive = None;
+        sim.refuse.insert(
+            "connect_device",
+            p::Error {
+                outcome: p::ErrorOutcome::Partial as i32,
+                ..refusal(ErrorCode::Unsupported)
+            },
+        );
+    });
+    let (result, _, _) = script(&dongle, &["device", "connect", "Old Keyboard"], false, b"");
+    assert_eq!(
+        result.unwrap_err().message,
+        "unsupported: the adapter or device doesn't support this; it partly completed"
+    );
 }
 
 #[test]

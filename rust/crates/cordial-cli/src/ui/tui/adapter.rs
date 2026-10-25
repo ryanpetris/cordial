@@ -221,6 +221,11 @@ impl<F: Fleet> Model<F> {
             Action::Bootloader if a.status.as_ref().is_some_and(model::development) => {
                 self.dialog = Some(Dialog::Bootloader(id.to_owned()));
             }
+            Action::DevicesRetry
+                if a.connected() && !self.running(id, |k| matches!(k, Kind::Quiet)) =>
+            {
+                self.run(id, Kind::Quiet, Command::Devices);
+            }
             _ => return self.profiles_action(id, action),
         }
         true
@@ -347,8 +352,7 @@ impl<F: Fleet> Model<F> {
                 self.adapter_save_bar(&a, &mut v.bar);
             }
             Tab::Diagnostics => {
-                v.body.section("Identifiers");
-                v.body.fact("Adapter ID", &a.id, layout::plain());
+                self.adapter_diagnostics(&a, &mut v.body);
                 self.adapter_bar(&a, &mut v.bar);
             }
         }
@@ -427,6 +431,40 @@ impl<F: Fleet> Model<F> {
         b.line(styled(a.status_text().0, bold()));
     }
 
+    /// Diagnostics: the adapter's errors, the saved devices it couldn't read, and its ID.
+    fn adapter_diagnostics(&self, a: &AdapterView, b: &mut Layout) {
+        if let Some(st) = a
+            .status
+            .as_ref()
+            .filter(|s| a.connected() && !s.errors.is_empty())
+        {
+            b.section("Errors");
+            for e in &st.errors {
+                b.para(&words::error_text(e, words::Scope::Save), layout::plain());
+            }
+        }
+        if !a.unreadable.is_empty() {
+            b.section("Saved Devices");
+            for (id, e) in &a.unreadable {
+                b.line(Line::from(vec![
+                    layout::span(format!("Device {id}"), dim()),
+                    layout::span(format!("  {}", words::couldnt_read(Some(e))), dim()),
+                ]));
+            }
+            let mut row = Layout::new(b.width);
+            button_if(
+                &mut row,
+                "Retry",
+                Action::DevicesRetry,
+                Tone::Normal,
+                a.connected() && !self.running(&a.id, |k| matches!(k, Kind::Quiet)),
+            );
+            b.align_right(row);
+        }
+        b.section("Identifiers");
+        b.fact("Adapter ID", &a.id, layout::plain());
+    }
+
     fn adapter_details(&self, a: &AdapterView, b: &mut Layout) {
         let Some(live) = a.live() else {
             return Self::empty_state(a, b);
@@ -455,7 +493,7 @@ impl<F: Fleet> Model<F> {
                     right,
                     b.width,
                 );
-                let second = styled(format!("  {}", words::device_status(&d.d)), dim());
+                let second = styled(format!("  {}", d.status()), dim());
                 b.control2(first, second, Action::Show(d.page()));
             }
         }

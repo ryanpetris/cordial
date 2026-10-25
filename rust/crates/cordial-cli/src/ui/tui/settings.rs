@@ -17,7 +17,7 @@ use crate::{
     settings::{self, Field, Leaf, Setting, Type, Value},
     ui::{catalog, text},
 };
-use cordial_protocol::{self as p, ErrorCode, OutputMode, SettingState};
+use cordial_protocol::{self as p, ErrorOutcome, OutputMode, SettingState};
 use ratatui::{style::Style, text::Line};
 use std::collections::BTreeMap;
 
@@ -286,8 +286,9 @@ impl<F: Fleet> Model<F> {
     }
 
     /// Whether the device can be asked for its current settings.
+    /// A record that is only last known leaves that to the adapter.
     fn can_refresh(&self, d: &DeviceView) -> bool {
-        !self.form_busy(d) && d.connected()
+        !self.form_busy(d) && (d.connected() || d.read_error.is_some())
     }
 
     fn submitting(&self, d: &DeviceView) -> bool {
@@ -502,7 +503,8 @@ impl<F: Fleet> Model<F> {
                     .settings_of(&d)
                     .into_iter()
                     .filter(|s| {
-                        matches!(s.status, Some(Err(_))) && self.draft_of(&d, &s.field).is_none()
+                        matches!(&s.status, Some(Err(e)) if !model::unsupported(e))
+                            && self.draft_of(&d, &s.field).is_none()
                     })
                     .filter_map(|s| {
                         let v = s.saved?;
@@ -625,8 +627,39 @@ impl<F: Fleet> Model<F> {
             return;
         };
         let key = (job.adapter.clone(), *device);
-        match result {
-            Ok(_) => {
+        // An outcome this app doesn't know reads as none.
+        let outcome = match result {
+            Err(e) => e
+                .dongle
+                .as_ref()
+                .map(|w| ErrorOutcome::try_from(w.outcome).ok()),
+            Ok(_) => None,
+        };
+        match result.as_ref().err() {
+            Some(e) if outcome != Some(Some(ErrorOutcome::Complete)) => {
+                // Only an outcome confirms what was saved. The changes are saved together, so a
+                // partial save leaves each one's outcome unknown, as does an adapter failure
+                // without an outcome. A local failure saved nothing unless it came after sending.
+                let unknown = match outcome {
+                    Some(o) => o != Some(ErrorOutcome::NoEffect),
+                    None => e.unconfirmed(),
+                };
+                let text = match words::failure(e) {
+                    t if t.is_empty() => words::SETTINGS_SAVE_FAILED.to_owned(),
+                    t => t,
+                };
+                if let Some(s) = self.submissions.get_mut(&key) {
+                    s.running = false;
+                    s.error = Some(text);
+                    s.unknown = unknown;
+                }
+            }
+            // A failure after a complete save shows with the form rather than with each change.
+            failed => {
+                if let Some(e) = failed {
+                    self.notes
+                        .insert(Spot::SettingsNote(key.0.clone(), key.1), words::failure(e));
+                }
                 self.submissions.remove(&key);
                 if let Some(drafts) = self.setting_drafts.get_mut(&key) {
                     for (k, draft) in sent {
@@ -641,22 +674,6 @@ impl<F: Fleet> Model<F> {
                 }
                 if *gamepad && let Some(d) = self.device(&key.0, key.1).cloned() {
                     self.save_device(&d, Tab::Settings);
-                }
-            }
-            Err(e) => {
-                let unknown = e
-                    .dongle
-                    .as_ref()
-                    .is_some_and(|w| w.code() == ErrorCode::StorageFailed && w.outcome_unknown)
-                    || words::failure(e) == words::CLOSED;
-                let text = match words::failure(e) {
-                    t if t.is_empty() => words::SETTINGS_SAVE_FAILED.to_owned(),
-                    t => t,
-                };
-                if let Some(s) = self.submissions.get_mut(&key) {
-                    s.running = false;
-                    s.error = Some(text);
-                    s.unknown = unknown;
                 }
             }
         }
@@ -772,7 +789,7 @@ impl<F: Fleet> Model<F> {
                 items: vec![("Save Current Value", can_keep.then_some(Action::Keep(key)))],
             };
         }
-        match s.status {
+        match &s.status {
             Some(Ok(SettingState::ChangedOnDevice)) => Marker {
                 text: "◆ Changed on Device",
                 look: warn(),
@@ -781,13 +798,13 @@ impl<F: Fleet> Model<F> {
                     forget,
                 ],
             },
-            Some(Err(_)) => Marker {
-                text: "▲ Failed",
+            Some(Err(e)) if model::unsupported(e) => Marker {
+                text: "▲ Can't Apply Now",
                 look: warn(),
                 items: vec![forget],
             },
-            Some(Ok(SettingState::Unsupported)) => Marker {
-                text: "▲ Can't Apply Now",
+            Some(Err(_)) => Marker {
+                text: "▲ Failed",
                 look: warn(),
                 items: vec![forget],
             },
@@ -1032,8 +1049,13 @@ impl<F: Fleet> Model<F> {
                         dim(),
                     ));
                 }
-                if let Some(Err(code)) = s.status {
-                    notes.push((words::reason(&words::code_text(code)).to_owned(), dim()));
+                if let Some(Err(e)) = &s.status
+                    && !(model::unsupported(e) && words::plain(e))
+                {
+                    notes.push((
+                        words::reason(&words::error_text(e, words::Scope::Apply)).to_owned(),
+                        dim(),
+                    ));
                 }
                 if !notes.is_empty() {
                     let mut line = Line::from(span("  ", Style::new()));
@@ -1088,7 +1110,7 @@ impl<F: Fleet> Model<F> {
                     .map(|s| format!("Couldn't Save {}", s.fields.len()))
             })
             .or_else(|| match model::hidpp_up(&d.d) {
-                model::Up::Error(code) => Some(words::code_text(code)),
+                model::Up::Error(e) => Some(words::error_text(&e, words::Scope::Apply)),
                 _ => None,
             });
         if let Some(note) = note {
@@ -1118,7 +1140,9 @@ impl<F: Fleet> Model<F> {
         );
         let failed: Vec<&Setting> = settings
             .iter()
-            .filter(|s| matches!(s.status, Some(Err(_))) && s.saved.is_some())
+            .filter(|s| {
+                matches!(&s.status, Some(Err(e)) if !model::unsupported(e)) && s.saved.is_some()
+            })
             .collect();
         if !failed.is_empty() {
             let any_free = failed.iter().any(|s| self.draft_of(d, &s.field).is_none());

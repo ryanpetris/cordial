@@ -29,6 +29,24 @@ All three keep their view of the Dongle the same way:
 - Failed changes: only after an error, including a storage failure whose outcome is unknown, may a
   client query again to learn the current state, and only when it needs that state.
 
+Clients preserve full `Error` messages through decoding, library errors and state updates,
+including reason, outcome and related errors recursively. A familiar code does not justify
+discarding details or inferring an outcome. Missing details confirm neither an unchanged value
+nor success and never authorize retry. Related cleanup failures do not replace a primary failure
+or its outcome; a pairing error with `COMPLETE` confirms the bond save while still reporting the
+later failure. See [Errors](limits-and-errors.md#errors).
+
+A device listing's `RecordError` retains any previously known device as last-known data. It does
+not confirm its connection or preferences. Fresh records and events replace that data; actual
+absence from a completed list or a removal event removes it. A profile read-error placeholder does
+not require retaining its cached record. A listing continuation failure instead rejects the
+entire partial list and leaves the previous collection intact.
+
+`ScanDone` reports retained candidate count and an optional full error. Scan errors leave those
+candidates usable until a new scan or session end, subject to adapter readiness for pairing.
+Clients distinguish a scan failure from an ordinary timeout and preserve candidate-loss details
+related to a primary radio error.
+
 ## Client library listings
 
 Rust `Connection` methods `list_devices()`, `list_profiles()`, `list_settings(device)`,
@@ -190,8 +208,9 @@ The desktop application uses the same commands and session rules as the CLI.
   stay hidden. An unexpectedly disconnected adapter keeps its page and last reported settings for 15
   seconds while awaiting reconnection. Its devices leave the list immediately and configuration
   controls are disabled. The selected device page keeps its tab, staged changes and save result
-  while the adapter reconnects and reads its devices again. If that read fails, the device is no
-  longer listed, or the wait expires, the application leaves the page. A selected adapter tab also
+  while the adapter reconnects and reads its devices again. If the whole listing fails, the device
+  is actually absent, or the wait expires, the application leaves the page. A per-record read
+  error retains last-known device data as described above. A selected adapter tab also
   stays selected.
   A session that ends after running normally is reopened once if its port is still present.
 - Sessions: after `GetStatus` it reads the complete device list and each device's settings, then
@@ -260,12 +279,13 @@ a saved choice can still be cleared with Disabled. `SLOTS.limit` in `OutputModeS
 limits USB allocation, not the number of paired devices that may select a mode. Each change uses
 `SetDevice.output_preferences` for the Gamepad role and preserves unrelated preferences.
 
-The saved choice is separate from live output state. Clients use `Device.outputs`
-for the current mode, state and optional slot, never infer a slot from pairing
-order, and never treat a saved choice as proof of active input. Human-readable
-slots start at 1; raw JSON and protocol slots start at 0. A slot is temporary
-and is not a Windows XInput user index. Technical output states and device errors
-belong on Diagnostics. The CLI's `device get DEV` shows Gamepad Output and,
+The saved choice is separate from live output status. Clients use `Device.outputs` for the current
+mode, state or full error, and optional slot. They never infer a slot from pairing order or treat
+a saved choice as proof of active input. Human-readable slots start at 1; raw JSON and protocol
+slots start at 0. A slot is temporary and is not a Windows XInput user index. Only Active carries a
+slot. Unsupported backend and input layout errors retain their distinct reasons; Pending alone
+is not an error. Technical output states and device errors belong on Diagnostics.
+The CLI's `device get DEV` shows Gamepad Output and,
 when reported for an enabled choice, Gamepad Status and Gamepad Slot.
 `device list` uses `gamepad-output`, `gamepad-state` and `gamepad-slot` tokens.
 `adapter status` shows each advertised mode's pool, such as `Gamepad Slots (HID): 2 of 4`,

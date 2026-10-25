@@ -27,14 +27,16 @@ import {
   batteryStale,
   batteryText,
   choiceText,
-  codeText,
+  connected as isConnected,
   connectionError,
   deviceStatus,
   displayUnit,
+  errorText,
   fieldName,
   identifierFacts,
   identityFacts,
   integrationText,
+  integrationUnsupported,
   kindText,
   neverValue,
   profileError,
@@ -44,6 +46,8 @@ import {
   securityFacts,
   settingInfo,
   settingOrder,
+  stateText,
+  unsupportedError,
   versionText,
   wheelFigures,
   type FieldName,
@@ -383,8 +387,8 @@ function SettingRow({ entry, s, drafts, guards, item }: {
     [shape, state, options] = ["outline", SETTING_STATES.unmanaged, [keep("Save Current Value")]];
   } else if (s.state === "changed_on_device") {
     [shape, state, options] = ["differs", SETTING_STATES.changed_on_device, [keep("Save Device Value"), forget]];
-  } else if (s.error || s.state === "unsupported") {
-    [shape, state, options] = ["problem", SETTING_STATES[s.error ? "error" : "unsupported"], [forget]];
+  } else if (s.error) {
+    [shape, state, options] = ["problem", SETTING_STATES[s.error.code === "unsupported" ? "unsupported" : "error"], [forget]];
   } else {
     [shape, state, options] = ["filled", SETTING_STATES[s.state ?? "pending"], [forget]];
   }
@@ -394,7 +398,7 @@ function SettingRow({ entry, s, drafts, guards, item }: {
   else if (item?.status === "unknown" && item.error) notes.push(<span key="save" className="error-text">{reasonText(item.error)}</span>);
   if (invalid) notes.push(<span key="range" className="error-text">{rangeText(typedRange(s))}</span>);
   if (saved(s) && s.state === "changed_on_device" && fresh) notes.push(<span key="device">Device: {valueText(fieldName(s), s.value)}</span>);
-  if (s.error) notes.push(<span key="error">{reasonText(codeText(s.error))}</span>);
+  if (s.error && !unsupportedError(s.error)) notes.push(<span key="error">{reasonText(errorText(s.error, "apply"))}</span>);
 
   const labelId = `setting-${id}`;
   return (
@@ -452,7 +456,7 @@ function hasSettings(entry: DeviceEntry) {
 }
 
 /** HID++ is coming up on the connected device, reading its settings. */
-const starting = (entry: DeviceEntry) => entry.device.state === "connected" && entry.device.hidpp?.state === "starting";
+const starting = (entry: DeviceEntry) => isConnected(entry) && entry.device.hidpp?.state === "starting";
 
 /** The settings form: every staged change goes to the device together with
  * Save. Its buttons go in the page bar, `bar`, outside the form. */
@@ -484,7 +488,8 @@ function Settings({ entry, live, adapter, drafts, details, onDetails, bar }: {
   const { rows: settings, readings, figures } = settingsView(entry);
   const categories = [...new Set([...settings.map(ref), ...readings].sort((a, b) => settingOrder(a) - settingOrder(b)).map((f) => settingInfo(f).category))];
   if (figures.length && !categories.includes("Wheel")) categories.push("Wheel");
-  const connected = d.state === "connected";
+  // A record that is only last known leaves Refresh to the adapter.
+  const connected = isConnected(entry) || !!entry.readError;
   const reachable = live && adapter?.connection === "connected";
   const occupied = saving || refreshing || settingsBusy(entry);
   // Saving needs the adapter ready; refreshing a connected device doesn't.
@@ -500,7 +505,7 @@ function Settings({ entry, live, adapter, drafts, details, onDetails, bar }: {
   const canSave = !busy && (changes.length > 0 || outputChange !== undefined) && !invalid;
   // Retry saves a failed setting's value again, which applies it again; a
   // draft of that setting stands in its way.
-  const retryable = staged.filter((r) => r.s.error && saved(r.s));
+  const retryable = staged.filter((r) => r.s.error && r.s.error.code !== "unsupported" && saved(r.s));
   const retry = retryable.filter((r) => !r.change && !r.invalid);
   const canRetry = !busy && retry.length > 0;
 
@@ -555,7 +560,7 @@ function Settings({ entry, live, adapter, drafts, details, onDetails, bar }: {
       </button>
     </>
   );
-  const hidppError = d.hidpp?.error ?? null;
+  const hidppError = integrationUnsupported(d.hidpp?.error ?? null) ? null : (d.hidpp?.error ?? null);
   // A change whose outcome was unknown no longer is once the device reports it saved.
   useEffect(() => {
     if (outputChange === undefined) setProblem(null);
@@ -567,7 +572,7 @@ function Settings({ entry, live, adapter, drafts, details, onDetails, bar }: {
   const notSaved = items.filter((i) => i.status === "not_saved").length;
   const unknown = items.find((i) => i.status === "unknown")?.error ?? "";
   const failures = submission && !submission.running ? (notSaved ? `Couldn't Save ${notSaved}` : unknown) : "";
-  const note = problem ?? (failures || (hidppError ? codeText(hidppError) : null));
+  const note = problem ?? (failures || (hidppError ? errorText(hidppError, "apply") : null));
   const refresh = async () => {
     setProblem(null);
     const result = await runRefresh({ type: "device.refresh", key: entry.key });
@@ -736,7 +741,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
   const [settingsBar, setSettingsBar] = useState<HTMLElement | null>(null);
   const d = entry.device;
   const adapter = state.adapters.find((a) => a.id === entry.adapterId);
-  const connected = d.state === "connected";
+  const connected = isConnected(entry);
   const live = state.devices.some((x) => x.key === entry.key);
   const settings = hasSettings(entry) || offersGamepadOutput(d, adapter?.status ?? null);
   useEffect(() => setFailure(null), [d.state]);
@@ -754,7 +759,8 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
   const low = isLow(entry.battery, state.preferences.lowBatteryPercent);
   const battery = batteryText(entry.battery);
   const ready = live && adapter?.connection === "connected" && !!adapter.status?.ready;
-  const canConnect = ready && d.inactive === null && d.state === "disconnected";
+  // A record that is only last known leaves Connect to the adapter.
+  const canConnect = ready && (!!entry.readError || (d.inactive === null && d.state === "disconnected"));
   const peers = state.devices.filter((x) => x.adapterId === entry.adapterId).map((x) => x.device);
   const info = identityFacts(d.information);
   const identifiers = identifierFacts(d.information);
@@ -812,9 +818,9 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
   }, []);
   const gamepadStatus = d.outputs.find((o) => o.role === "gamepad");
   // A failed list read is retried by reading the list again rather than asking the device.
-  const listsFailed = !!entry.settingsError;
+  const listsFailed = !!entry.settingsError || !!entry.readError;
   const lastError = connectionError(d);
-  const unloaded = profileError(d);
+  const unloaded = entry.readError ? null : profileError(d);
 
   return (
     <Page
@@ -824,7 +830,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
       status={
         <>
           <Pill tone={connected ? "ok" : d.blocked ? "warn" : "neutral"} dot>
-            {deviceStatus(d)}
+            {deviceStatus(entry)}
           </Pill>
           {entry.battery && battery ? (
             <Pill tone={low ? "low" : "neutral"} dim={batteryStale(entry.battery)}>
@@ -907,7 +913,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
         )
       }
     >
-      {d.inactive !== null && d.inactive !== "disabled" ? <Banner>{inactiveText(d)}</Banner> : null}
+      {!entry.readError && d.inactive !== null && d.inactive !== "disabled" ? <Banner>{inactiveText(d)}</Banner> : null}
 
       <TabPanel id={tabs} value={tab}>
         {tab === "settings" ? (
@@ -926,7 +932,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
             {lastError ? (
               <Card title="Connection">
                 <Facts>
-                  <Fact label="Last Error">{codeText(lastError)}</Fact>
+                  <Fact label="Last Error">{errorText(lastError, "other")}</Fact>
                 </Facts>
               </Card>
             ) : null}
@@ -939,6 +945,18 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
                     <span className="fact-detail">{profileErrorText(unloaded)}</span>
                   </Fact>
                 </Facts>
+              </Card>
+            ) : null}
+
+            {entry.readError ? (
+              <Card title="Saved Data">
+                <Row
+                  title={
+                    errorText(entry.readError, "read") === READ_FAILED
+                      ? "The adapter couldn't read this device's saved data. Try again."
+                      : `The adapter couldn't read this device's saved data. ${errorText(entry.readError, "read")}`
+                  }
+                />
               </Card>
             ) : null}
 
@@ -966,7 +984,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
             {gamepadStatus && gamepadStatus.state !== "disabled" ? (
               <Card title="Gamepad Output">
                 <Facts>
-                  <Fact label="Status">{OUTPUT_STATES[gamepadStatus.state]}</Fact>
+                  <Fact label="Status">{stateText(gamepadStatus.state && OUTPUT_STATES[gamepadStatus.state], gamepadStatus.error)}</Fact>
                   {gamepadStatus.slot !== null ? <Fact label="Slot">{gamepadStatus.slot + 1}</Fact> : null}
                 </Facts>
               </Card>

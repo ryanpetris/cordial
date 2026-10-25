@@ -15,7 +15,20 @@ fn main() {
 
     let descriptors =
         protox::compile(["cordial.proto", "storage.proto"], [&proto]).expect("compile schemas");
-    prost_build::Config::new()
+    let mut config = prost_build::Config::new();
+    config.type_attribute(".cordial.Error", "#[derive(Eq, PartialOrd, Ord)]");
+    #[cfg(feature = "json")]
+    {
+        config.type_attribute(".cordial.Error", "#[derive(serde::Serialize, serde::Deserialize)] #[serde(default, deny_unknown_fields)]");
+        for field in ["code", "reason", "outcome"] {
+            config.field_attribute(format!(".cordial.Error.{field}"), format!("#[serde(with = \"crate::error_json::{field}\", skip_serializing_if = \"crate::error_json::is_zero\")]"));
+        }
+        config.field_attribute(
+            ".cordial.Error.related",
+            "#[serde(skip_serializing_if = \"alloc::vec::Vec::is_empty\")]",
+        );
+    }
+    config
         .compile_fds(descriptors.clone())
         .expect("generate messages");
     #[cfg(feature = "json")]
@@ -25,6 +38,7 @@ fn main() {
             .register_descriptors(&descriptors.encode_to_vec())
             .expect("register descriptors")
             .preserve_proto_field_names()
+            .exclude([".cordial.Error"])
             .build(&[".cordial"])
             .expect("generate JSON mapping");
     }

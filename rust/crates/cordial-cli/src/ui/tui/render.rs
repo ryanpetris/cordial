@@ -7,7 +7,7 @@ use super::{
         self, Layout, Styled, Tone, accent, bold, dim, err, join, line_width, ok, pad, span,
         spread, styled, title, truncate, warn,
     },
-    spinner, words,
+    spinner,
     world::Conn,
 };
 use crate::ui::text;
@@ -359,7 +359,7 @@ impl<F: Fleet> Model<F> {
             .style(base);
             let second = pad(
                 Line::from(vec![span(
-                    format!("   {}", words::device_status(&d.d)),
+                    format!("   {}", d.status()),
                     layout::inherit(dim(), base),
                 )]),
                 w,

@@ -1,15 +1,16 @@
 // State the main process publishes to the window, and the actions the window
 // asks it to perform. Plain data only: everything crosses the IPC boundary
 // and the development server's JSON. Enum values are the protocol's names in
-// lower case; a value this app doesn't know reads as the enum's zero value.
+// lower case; a value this app doesn't know reads as the enum's zero value, except in errors.
 import type {
   BacklightEffect,
   BacklightMode,
   BacklightStatus,
-  CapacityReason,
   CodeKind,
   DeviceState,
   ErrorCode,
+  ErrorOutcome,
+  ErrorReason,
   FunctionRowMode,
   InactiveReason,
   IntegrationState,
@@ -58,13 +59,20 @@ export type VendorRegistryName = Name<typeof VendorRegistry>;
 export type Scalar = boolean | number | string;
 export type ValueType = "bool" | "integer" | "enum";
 
-/** A protocol error, with what the Dongle added to it. */
+export type ErrorReasonName = Name<typeof ErrorReason>;
+export type ErrorOutcomeName = Name<typeof ErrorOutcome>;
+
+/** A protocol error with every detail the Dongle added to it. A code, reason or outcome this app
+ * doesn't know keeps its number, so errors that differ only in those stay distinct. */
 export interface WireError {
-  code: Code;
-  /** What ran out, for `no_capacity`. */
-  reason: Name<typeof CapacityReason> | null;
-  /** For `storage_failed`: the save may or may not have happened. */
-  outcomeUnknown: boolean;
+  code: Code | number;
+  /** Further context; `unknown` when none was given. */
+  reason: ErrorReasonName | number;
+  /** What is known of the failed operation's effects or results; `unspecified` when nothing was
+   * given, which implies neither success nor unchanged data. */
+  outcome: ErrorOutcomeName | number;
+  /** Further failures, in the adapter's order; they never replace this one. */
+  related: WireError[];
 }
 
 /** Facts about the adapter itself; each is null while unknown. */
@@ -130,7 +138,7 @@ export interface AdapterStatus {
   platform: HostPlatform;
   ready: boolean;
   /** The adapter's current problems. */
-  errors: Code[];
+  errors: WireError[];
   /** USB usage: `interfaces` counts the exposed USB interfaces. */
   resources: Resource[];
   /** Transports the firmware supports and whether each is enabled, with their `devices` and
@@ -176,8 +184,8 @@ export interface Profile {
 /** The shown page of the adapter's profiles. */
 export interface ProfilePage {
   profiles: Profile[];
-  /** Profiles on the page whose record the adapter couldn't read. */
-  unreadable: number[];
+  /** Profiles on the page whose record the adapter couldn't read, with why. */
+  unreadable: { id: number; error: WireError }[];
   /** Whether a previous or a following page exists. */
   previous: boolean;
   next: boolean;
@@ -202,7 +210,7 @@ export interface Integration {
   version: { major: number; minor: number } | null;
   /** Null when starting failed with `error`. */
   state: IntegrationStateName | null;
-  error: Code | null;
+  error: WireError | null;
 }
 
 export interface DeviceRecord {
@@ -221,7 +229,7 @@ export interface DeviceRecord {
   /** Null when the adapter uses the device. */
   inactive: Inactive | null;
   /** The last failed connection attempt, and why a connected device's profiles aren't loaded. */
-  errors: Code[];
+  errors: WireError[];
   security: Security | null;
   hidpp: Integration | null;
   information: DeviceInformation;
@@ -231,8 +239,9 @@ export interface DeviceRecord {
   /** Saved output choices; a missing gamepad choice means Disabled. A mode this app doesn't know
    * is null. */
   outputPreferences: { role: RoleName; mode: OutputModeName | null }[];
-  /** Output state, independent of the Bluetooth connection; `slot` is set only while active. */
-  outputs: { role: RoleName; mode: OutputModeName | null; state: OutputStateName; slot: number | null }[];
+  /** Output state, independent of the Bluetooth connection; `state` is null when setting the
+   * output up failed with `error`. `slot` is set only while active. */
+  outputs: { role: RoleName; mode: OutputModeName | null; state: OutputStateName | null; error: WireError | null; slot: number | null }[];
 }
 
 /** The protocol's field names of each settings group, with the backlight delay's fields at the
@@ -270,7 +279,7 @@ export type Setting = SettingField & {
   /** How applying the saved value went; null without a saved value or after a failure. */
   state: SettingStateName | null;
   /** The last apply's failure. */
-  error: Code | null;
+  error: WireError | null;
   /** Accepted enum or integer values; empty when not a fixed list. An enum setting without choices
    * takes no value. */
   choices: Scalar[];
@@ -352,6 +361,9 @@ export interface AdapterEntry {
   /** The profile picker's page, paged separately so paging it leaves the list where it is; null
    * without profile support or before the picker first opens. */
   pickerPage: ProfilePage | null;
+  /** Saved devices whose record the latest listing couldn't read and that this session knows
+   * nothing else of, with why, in ID order. */
+  unreadableDevices: { id: number; error: WireError }[];
   /** The profiles this session has seen, by ID, for naming layers and interface profiles. */
   profileNames: Record<string, Profile>;
 }
@@ -372,6 +384,9 @@ export interface DeviceEntry {
   settings: Setting[] | null;
   /** Why the last read of the settings list failed, in words. */
   settingsError: string | null;
+  /** Why the adapter's last device listing couldn't read this device's record. `device` then holds
+   * what was known before, which is only last known until the next device event. */
+  readError: WireError | null;
   /** The current or most recent settings submission in this adapter session. */
   settingsSave: SettingsSave | null;
 }
@@ -390,6 +405,8 @@ export interface ScanState {
   running: boolean;
   candidates: Candidate[];
   error: string | null;
+  /** The adapter's error behind `error`, with every detail. */
+  failure: WireError | null;
 }
 
 /** What the pairing asks of the user. */
@@ -410,13 +427,15 @@ export interface PairingState {
   deviceKey: string | null;
   /** Explanation for the saved-but-not-connected and failed phases. */
   message: string | null;
+  /** The adapter's error behind a failed or cancelled pairing, with every detail. */
+  failure: WireError | null;
 }
 
 /** Profile problems worth a notification: the adapter's profile memory nearly full, or a connected
  * device whose profiles aren't loaded. */
 export type ProfileAlert =
   | { kind: "memory"; adapterId: string; name: string }
-  | { kind: "device"; key: string; name: string; code: Code };
+  | { kind: "device"; key: string; name: string; error: WireError };
 
 export interface Preferences {
   startAtLogin: boolean;
@@ -469,8 +488,8 @@ export type Action =
   | { type: "profile.delete"; adapterId: string; profile: number }
   /** Shows the first, next or previous page of profiles. */
   | { type: "profiles.page"; adapterId: string; page: "first" | "next" | "previous"; picker?: boolean }
-  /** `adapter.reload` reads the shown profile page again. */
-  | { type: "adapter.connect" | "adapter.disconnect" | "adapter.menu" | "adapter.reload"; adapterId: string }
+  /** `adapter.reload` reads the shown profile page again; `devices.reload` lists the devices again. */
+  | { type: "adapter.connect" | "adapter.disconnect" | "adapter.menu" | "adapter.reload" | "devices.reload"; adapterId: string }
   | { type: "adapters.refresh" }
   /** Opens the window's app menu at a point in CSS pixels from the window's top left. */
   | { type: "app.menu"; x: number; y: number }

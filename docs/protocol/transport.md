@@ -63,6 +63,12 @@ requests back to back but never needs to match responses to requests.
   preferences, such as `SetAdapter`, `SetDevice`, `SetSettings` and `SetProfileRules`, respond this
   way once the change is durably saved.
 
+A failed request returns a complete `Response.error`, including its reason, outcome and related
+errors. Neither a code nor missing outcome details proves that nothing happened. A listing's
+per-record `RecordError` is an entry, not a second response; a failure to continue the listing
+replaces the partial list with `Response.error` in the same frame. See
+[Listings](compatibility.md#listings) and [Errors](limits-and-errors.md#errors).
+
 Every command returns promptly. A command responds once it is accepted and any saved value is
 written; Bluetooth work that takes longer, such as connecting, pairing, scanning or disconnecting,
 reports its progress through events.
@@ -85,6 +91,11 @@ by integration, group and optional component index, and ignores removal of an en
 hold. A completed listing replaces the list before later events apply. There are no revisions.
 Profile rules have no change event; a client lists them again when it needs a fresh view, such as
 in a new session.
+
+Error payloads remain complete when events are coalesced. Each adapter or device error list
+replaces the preceding set and uses complete-error ordering and deduplication. Adapter radio and
+storage faults clear on their respective recovery; aggregate `ready = false` does not identify
+which subsystem is ready. Radio recovery cannot clear an unresolved save.
 
 The Dongle keeps one pending slot per thing. When a thing changes again before its event is
 written, the event that goes out carries the newer state, and a change event covers every change

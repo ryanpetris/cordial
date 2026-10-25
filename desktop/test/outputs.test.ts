@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { DeviceSchema, ErrorCode, OutputMode, OutputState, ResourceType, Role, StatusSchema } from "@cordial/protocol";
+import { DeviceSchema, ErrorCode, ErrorReason, OutputMode, OutputState, ResourceType, Role, StatusSchema } from "@cordial/protocol";
 import { describe, expect, it } from "vitest";
 import { isAction } from "../src/core/actions.ts";
 import * as convert from "../src/core/convert.ts";
@@ -7,7 +7,7 @@ import { FakeAdapter, device } from "../src/fake/adapter.ts";
 import { trayModel } from "../src/main/tray-model.ts";
 import { resource } from "../src/shared/capacity.ts";
 import { gamepadModes, gamepadOutput, offersGamepadOutput } from "../src/shared/outputs.ts";
-import type { AdapterStatus, AppState } from "../src/shared/state.ts";
+import type { AdapterStatus, AppState, Code } from "../src/shared/state.ts";
 import { codeText } from "../src/shared/text.ts";
 import { controller, record, until } from "./helpers.ts";
 
@@ -55,20 +55,24 @@ describe("Output conversion", () => {
     expect(s.outputSupport).toEqual([{ role: "gamepad", modes: [{ mode: "disabled", resources: slots(0, 0) }, { mode: "xinput", resources: slots(null, 4) }] }]);
   });
 
-  it("reads output preferences and states, with unknown modes as null and unknown states as unknown", () => {
+  it("reads output preferences and states, with unknown modes as null and unknown or unset states as unknown", () => {
     const d = convert.device(create(DeviceSchema, {
       id: 1,
       outputPreferences: [{ role: Role.GAMEPAD, mode: 7 as OutputMode }, { role: 42 as Role, mode: OutputMode.HID }],
       outputs: [
-        { role: Role.GAMEPAD, mode: OutputMode.HID, state: OutputState.ACTIVE, slot: 0 },
-        { role: Role.GAMEPAD, mode: 7 as OutputMode, state: 99 as OutputState },
-        { role: Role.UNKNOWN, mode: OutputMode.HID, state: OutputState.PENDING },
+        { role: Role.GAMEPAD, mode: OutputMode.HID, status: { case: "state", value: OutputState.ACTIVE }, slot: 0 },
+        { role: Role.GAMEPAD, mode: 7 as OutputMode, status: { case: "state", value: 99 as OutputState } },
+        { role: Role.GAMEPAD, mode: OutputMode.XINPUT },
+        { role: Role.GAMEPAD, mode: OutputMode.HID, status: { case: "error", value: { code: ErrorCode.UNSUPPORTED, reason: ErrorReason.INPUT_LAYOUT } } },
+        { role: Role.UNKNOWN, mode: OutputMode.HID, status: { case: "state", value: OutputState.PENDING } },
       ],
     }));
     expect(d.outputPreferences).toEqual([{ role: "gamepad", mode: null }]);
     expect(d.outputs).toEqual([
-      { role: "gamepad", mode: "hid", state: "active", slot: 0 },
-      { role: "gamepad", mode: null, state: "unknown", slot: null },
+      { role: "gamepad", mode: "hid", state: "active", error: null, slot: 0 },
+      { role: "gamepad", mode: null, state: "unknown", error: null, slot: null },
+      { role: "gamepad", mode: "xinput", state: "unknown", error: null, slot: null },
+      { role: "gamepad", mode: "hid", state: null, error: { code: "unsupported", reason: "input_layout", outcome: "unspecified", related: [] }, slot: null },
     ]);
     expect(gamepadOutput(d)).toBeNull();
     expect(gamepadOutput(record(2))).toBe("disabled");
@@ -122,8 +126,8 @@ describe("Gamepad Output changes", () => {
     const adapter = () => state()!.adapters[0]!;
     const pools = () => adapter().status!.outputSupport[0]!.modes.map((m) => [m.mode, resource(m.resources, "slots")?.count]);
     expect(pools()).toEqual([["disabled", 0], ["hid", 3], ["xinput", 0]]);
-    expect(entry(1).outputs).toEqual([{ role: "gamepad", mode: "disabled", state: "disabled", slot: null }]);
-    expect(entry(2).outputs).toEqual([{ role: "gamepad", mode: "hid", state: "disconnected", slot: null }]);
+    expect(entry(1).outputs).toEqual([{ role: "gamepad", mode: "disabled", state: "disabled", error: null, slot: null }]);
+    expect(entry(2).outputs).toEqual([{ role: "gamepad", mode: "hid", state: "disconnected", error: null, slot: null }]);
     expect(entry(3).outputs).toEqual([]);
 
     // A connected XInput controller takes a slot ahead of the unconfigured HID ones.
@@ -139,7 +143,7 @@ describe("Gamepad Output changes", () => {
     await c.manager.rescan();
     await until(() => adapter().connection === "connected" && loaded(state(), 3));
     expect(entry(1).outputPreferences).toEqual([{ role: "gamepad", mode: "xinput" }]);
-    expect(entry(1).outputs).toEqual([{ role: "gamepad", mode: "xinput", state: "active", slot: 0 }]);
+    expect(entry(1).outputs).toEqual([{ role: "gamepad", mode: "xinput", state: "active", error: null, slot: 0 }]);
     expect(pools()).toEqual([["disabled", 0], ["hid", 2], ["xinput", 1]]);
     expect(adapter().status!.errors).toEqual([]);
 
@@ -196,7 +200,7 @@ describe("Gamepad Output changes", () => {
     await until(() => loaded(state(), 3));
     const entry = (id: number) => state()!.devices.find((d) => d.key === `${ID}/${id}`)!.device;
     expect(state()!.adapters[0]!.status!.outputSupport).toEqual([]);
-    expect(entry(2).outputs).toEqual([{ role: "gamepad", mode: "hid", state: "unsupported", slot: null }]);
+    expect(entry(2).outputs).toEqual([{ role: "gamepad", mode: "hid", state: null, error: { code: "unsupported", reason: "output_backend", outcome: "unspecified", related: [] }, slot: null }]);
     const before = fake.received.length;
     expect(await c.act({ type: "device.update", key: `${ID}/1`, gamepadOutput: "xinput" })).toEqual({ ok: false, message: codeText("unsupported") });
     expect(fake.received.length).toBe(before);
@@ -218,7 +222,7 @@ describe("Gamepad Output changes", () => {
     ];
     // Serial takes two interfaces, the connected HID controller one, the first XInput slot one and
     // the second HID slot one.
-    const cases: [number, string[]][] = [
+    const cases: [number, Code[]][] = [
       [3, ["usb_required_capacity_exceeded", "usb_reserved_capacity_exceeded"]],
       [4, ["usb_reserved_capacity_exceeded"]],
       [5, []],
@@ -229,7 +233,7 @@ describe("Gamepad Output changes", () => {
       await c.manager.rescan();
       await until(() => loaded(state(), 3));
       const adapter = state()!.adapters[0]!;
-      expect(adapter.status!.errors).toEqual(errors);
+      expect(adapter.status!.errors).toEqual(errors.map((code) => ({ code, reason: "output_backend", outcome: "unspecified", related: [] })));
       expect(resource(adapter.status!.resources, "interfaces")).toEqual({ type: "interfaces", count: usbInterfaces, limit: usbInterfaces });
       // Only the required capacity needs attention, on the adapter and in the tray.
       const required = errors.includes("usb_required_capacity_exceeded");

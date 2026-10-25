@@ -11,9 +11,9 @@ use crate::{
 };
 use cordial_client::serial::PortInfo;
 use cordial_protocol::{
-    self as p, CapacityReason, CodeKind, DeviceState, ErrorCode, InactiveReason, Kind, OutputMode,
-    OutputState, Platform, ResourceType, Role, Transport, VendorRegistry, event,
-    profile_list_entry,
+    self as p, CodeKind, DeviceState, ErrorCode, ErrorOutcome, ErrorReason, InactiveReason, Kind,
+    OutputMode, OutputState, Platform, ResourceType, Role, Transport, VendorRegistry, event,
+    output_status, profile_list_entry,
 };
 use ratatui::buffer::CellWidth;
 use std::fmt::Write;
@@ -246,15 +246,33 @@ pub fn output_mode_token(m: OutputMode) -> String {
     model::token(m.as_str_name())
 }
 
+/// An output's state, or why setting it up failed; unset or unknown reads as unknown.
+pub fn output_state(o: &p::OutputStatus) -> Result<OutputState, &p::Error> {
+    match &o.status {
+        Some(output_status::Status::Error(e)) => Err(e),
+        Some(output_status::Status::State(n)) => Ok(OutputState::try_from(*n).unwrap_or_default()),
+        None => Ok(OutputState::Unknown),
+    }
+}
+
 /// An output's state for details.
-pub fn output_state_words(o: &p::OutputStatus) -> &'static str {
-    match o.state() {
-        OutputState::Unknown => "Unknown",
-        OutputState::Disabled => "Disabled",
-        OutputState::Disconnected => "Waiting to Connect",
-        OutputState::Pending => "Setting Up",
-        OutputState::Active => "Active",
-        OutputState::Unsupported => "Unsupported",
+pub fn output_state_words(o: &p::OutputStatus) -> String {
+    match output_state(o) {
+        Ok(OutputState::Unknown) => "Unknown".into(),
+        Ok(OutputState::Disabled) => "Disabled".into(),
+        Ok(OutputState::Disconnected) => "Waiting to Connect".into(),
+        Ok(OutputState::Pending) => "Setting Up".into(),
+        Ok(OutputState::Active) => "Active".into(),
+        Err(e) if model::unsupported(e) && model::plain(e) => "Unsupported".into(),
+        Err(e) => format!("Failed: {}", hidpp_error_words(e)),
+    }
+}
+
+/// An output's state as the CLI spells it.
+pub fn output_state_token(o: &p::OutputStatus) -> String {
+    match output_state(o) {
+        Ok(state) => model::token(state.as_str_name()),
+        Err(e) => format!("error:{}", error_token(e)),
     }
 }
 
@@ -395,6 +413,19 @@ pub fn hidpp_words(code: ErrorCode) -> String {
         .unwrap_or_else(|| unknown_code(code))
 }
 
+/// Explains an integration, setting or output failure with its details.
+pub fn hidpp_error_words(e: &p::Error) -> String {
+    detailed(
+        e,
+        reason_words(e).map_or_else(|| hidpp_words(e.code()), str::to_owned),
+    )
+}
+
+/// An error's code, or None for one this app doesn't know.
+fn known_code(e: &p::Error) -> Option<ErrorCode> {
+    ErrorCode::try_from(e.code).ok()
+}
+
 fn unknown_code(code: ErrorCode) -> String {
     format!(
         "the adapter reported error {}",
@@ -439,21 +470,141 @@ fn code_text(code: ErrorCode, command: Option<&str>) -> String {
         .unwrap_or_else(|| unknown_code(code))
 }
 
-/// Why a capacity error happened.
-pub fn capacity_words(reason: CapacityReason) -> &'static str {
-    match reason {
-        CapacityReason::Enabled => {
-            "every enabled-device place is in use. Disable another device first"
-        }
-        CapacityReason::Storage => {
-            "the adapter's storage has no room for another paired device. Remove unused devices or saved settings"
-        }
-        CapacityReason::Connections => "every connection is in use. Disconnect a device first",
-        CapacityReason::ProfileMemory => {
-            "the adapter doesn't have enough profile memory for this change"
-        }
-        CapacityReason::Unknown => "the adapter has no room for that right now",
+/// What failed, when the error's code and reason together say more than its code.
+fn reason_words(e: &p::Error) -> Option<&'static str> {
+    use {ErrorCode as C, ErrorReason as R};
+    Some(
+        match (known_code(e)?, ErrorReason::try_from(e.reason).ok()?) {
+            (C::NoCapacity, R::EnabledDevices) => {
+                "every enabled-device place is in use. Disable another device first"
+            }
+            (C::NoCapacity, R::Storage) => {
+                "the adapter's storage has no room for another paired device. Remove unused devices or saved settings"
+            }
+            (C::NoCapacity, R::Connections) => {
+                "every connection is in use. Disconnect a device first"
+            }
+            (C::NoCapacity, R::ProfileMemory) => {
+                "the adapter doesn't have enough profile memory for this change"
+            }
+            (C::NoCapacity, R::ScanCandidates) => {
+                "the adapter had no room to list every device it found"
+            }
+            (C::NoCapacity, R::OutputBackend) => {
+                "the adapter doesn't have enough USB capacity for this output"
+            }
+            (C::NotReady, R::Radio) => "the adapter's Bluetooth radio isn't ready",
+            (C::NotReady, R::Storage) => "the adapter's storage isn't ready",
+            (C::Unsupported, R::OutputBackend) => "the adapter doesn't support this output",
+            (C::Unsupported, R::InputLayout) => {
+                "the adapter can't use this device's input layout for this output"
+            }
+            (C::Internal, R::ScanCandidates) => {
+                "the adapter couldn't keep track of every device it found"
+            }
+            _ => return None,
+        },
+    )
+}
+
+/// What an error's reason concerns, when neither its code's nor `reason_words` already say.
+fn context_words(e: &p::Error) -> Option<&'static str> {
+    use {ErrorCode as C, ErrorReason as R};
+    if reason_words(e).is_some() {
+        return None;
     }
+    let reason = ErrorReason::try_from(e.reason).ok()?;
+    let implied = match known_code(e) {
+        Some(C::StorageFailed | C::StorageFull) => Some(R::Storage),
+        Some(C::ProfileMemoryLow | C::ProfileMemoryExceeded) => Some(R::ProfileMemory),
+        Some(C::UsbRequiredCapacityExceeded | C::UsbReservedCapacityExceeded) => {
+            Some(R::OutputBackend)
+        }
+        _ => None,
+    };
+    if implied == Some(reason) {
+        return None;
+    }
+    Some(match reason {
+        R::Unknown => return None,
+        R::EnabledDevices => "involves enabled devices",
+        R::Connections => "involves the adapter's connections",
+        R::ScanCandidates => "involves the devices found while scanning",
+        R::Storage => "involves the adapter's storage",
+        R::ProfileMemory => "involves profile memory",
+        R::Radio => "involves the adapter's Bluetooth radio",
+        R::OutputBackend => "involves the adapter's USB output",
+        R::InputLayout => "involves the device's input layout",
+    })
+}
+
+/// What is known of a failed operation's effects; nothing when the adapter gave no outcome, gave
+/// one this app doesn't know, or confirmed there were none.
+fn outcome_words(e: &p::Error) -> Option<&'static str> {
+    match ErrorOutcome::try_from(e.outcome).ok()? {
+        ErrorOutcome::Unknown => Some(
+            "outcome unknown: the adapter couldn't confirm what took effect; check the current state before trying again",
+        ),
+        ErrorOutcome::Partial => Some("it partly completed"),
+        ErrorOutcome::Complete => Some("its intended effects completed"),
+        ErrorOutcome::Unspecified | ErrorOutcome::NoEffect => None,
+    }
+}
+
+/// An explanation followed by what the error's reason concerns, its outcome and each related
+/// failure. A related failure's own details stay inside its parentheses.
+fn detailed(e: &p::Error, explanation: String) -> String {
+    let mut parts = vec![explanation];
+    parts.extend(context_words(e).map(str::to_owned));
+    parts.extend(outcome_words(e).map(str::to_owned));
+    parts.extend(
+        e.related
+            .iter()
+            .map(|r| format!("also ({})", related_line(r))),
+    );
+    parts.join("; ")
+}
+
+/// A related failure with its code. It concerns a step other than the command's own, such as a
+/// failed pairing's cleanup, so it takes the general wording and its outcome stays its own.
+fn related_line(r: &p::Error) -> String {
+    let explanation = reason_words(r).map_or_else(|| code_text(r.code(), None), str::to_owned);
+    format!("{}: {}", code_token(r), detailed(r, explanation))
+}
+
+/// A protocol enum value as the CLI spells it, or its number when this app doesn't know it.
+fn detail_token<E: TryFrom<i32>>(n: i32, name: impl Fn(E) -> &'static str) -> String {
+    E::try_from(n).map_or_else(|_| n.to_string(), |v| model::token(name(v)))
+}
+
+/// An error's code as the CLI spells it, or its number when this app doesn't know it.
+fn code_token(e: &p::Error) -> String {
+    known_code(e).map_or_else(|| e.code.to_string(), model::code_token)
+}
+
+/// An error as the CLI spells it: its code, then its reason and outcome when given, then its
+/// related errors in parentheses. Details this app doesn't know keep their numbers.
+pub fn error_token(e: &p::Error) -> String {
+    let mut token = code_token(e);
+    if e.reason != ErrorReason::Unknown as i32 {
+        let _ = write!(
+            token,
+            ":{}",
+            detail_token(e.reason, |r: ErrorReason| r.as_str_name())
+        );
+    }
+    if e.outcome != ErrorOutcome::Unspecified as i32 {
+        let _ = write!(
+            token,
+            ":{}",
+            detail_token(e.outcome, |o: ErrorOutcome| o.as_str_name())
+        );
+    }
+    if !e.related.is_empty() {
+        let related: Vec<String> = e.related.iter().map(error_token).collect();
+        let _ = write!(token, "({})", related.join(";"));
+    }
+    token
 }
 
 /// Why work on a transport is refused, and its saved devices are unused, while the adapter has
@@ -502,19 +653,34 @@ pub fn enabled_word(on: bool) -> &'static str {
     if on { "enabled" } else { "disabled" }
 }
 
-/// Explains an adapter error without its code.
+/// Explains an adapter error without its code, with its outcome and related failures.
 pub fn wire_text(e: &p::Error, command: Option<&str>) -> String {
-    match e.code() {
-        ErrorCode::NoCapacity => capacity_words(e.reason()).into(),
-        ErrorCode::StorageFailed if e.outcome_unknown => "save status unknown: the adapter couldn't confirm whether the change was saved, and didn't apply it; check the current state before trying again".into(),
-        code => code_text(code, command),
+    if known_code(e) == Some(ErrorCode::StorageFailed) && e.outcome == ErrorOutcome::Unknown as i32
+    {
+        let unknown = p::Error {
+            outcome: ErrorOutcome::Unspecified as i32,
+            ..e.clone()
+        };
+        let what = if command == Some("pair start") {
+            "it saved the device"
+        } else {
+            "the change was saved"
+        };
+        return detailed(
+            &unknown,
+            format!(
+                "save status unknown: the adapter couldn't confirm whether {what}; check the current state before trying again"
+            ),
+        );
     }
+    let explanation = reason_words(e).map_or_else(|| code_text(e.code(), command), str::to_owned);
+    detailed(e, explanation)
 }
 
 /// An adapter error with its code before the explanation, as the shell and
 /// device details show it.
 pub fn wire_line(e: &p::Error, command: Option<&str>) -> String {
-    format!("{}: {}", model::code_token(e.code()), wire_text(e, command))
+    format!("{}: {}", code_token(e), wire_text(e, command))
 }
 
 /// An error for the shell, unescaped. An adapter error names its code
@@ -567,26 +733,28 @@ pub fn sentence(s: &str) -> String {
 }
 
 /// HID++'s status as the CLI spells it.
-pub fn up_token(up: Up) -> String {
+pub fn up_token(up: &Up) -> String {
     match up {
         Up::Off => "off".into(),
         Up::Disconnected => "disconnected".into(),
         Up::Starting => "starting".into(),
         Up::Active => "active".into(),
-        Up::Unsupported => "unsupported".into(),
-        Up::Error(code) => format!("error:{}", model::code_token(code)),
+        Up::Unsupported(e) | Up::Error(e) => match error_token(e) {
+            token if token == "unsupported" => token,
+            token => format!("error:{token}"),
+        },
     }
 }
 
 /// HID++'s status for details.
-pub fn up_words(up: Up) -> String {
+pub fn up_words(up: &Up) -> String {
     match up {
         Up::Off => "Off".into(),
         Up::Disconnected => "Waiting to Connect".into(),
         Up::Starting => "Setting Up".into(),
         Up::Active => "Active".into(),
-        Up::Unsupported => "Unsupported".into(),
-        Up::Error(code) => format!("Failed: {}", hidpp_words(code)),
+        Up::Unsupported(e) if model::plain(e) => "Unsupported".into(),
+        Up::Unsupported(e) | Up::Error(e) => format!("Failed: {}", hidpp_error_words(e)),
     }
 }
 
@@ -594,7 +762,7 @@ pub fn up_words(up: Up) -> String {
 pub fn hidpp_protocol_text(d: &p::Device) -> String {
     match (model::hidpp_version(d), model::hidpp_up(d)) {
         (Some((major, minor)), _) => format!("{major}.{minor}"),
-        (None, Up::Unsupported) => "Unavailable".into(),
+        (None, Up::Unsupported(_)) => "Unavailable".into(),
         (None, Up::Starting) => "Checking".into(),
         _ => "Unknown".into(),
     }
@@ -673,10 +841,13 @@ pub fn state_token(d: &p::Device) -> String {
 }
 
 /// Why a connected device's profiles aren't loaded, as sentences for its diagnostics.
-pub fn profile_error_words(code: ErrorCode) -> String {
-    match code {
-        ErrorCode::ProfileMemoryExceeded => "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.".into(),
-        code => sentence(&code_text(code, None)),
+pub fn profile_error_words(e: &p::Error) -> String {
+    match e.code() {
+        ErrorCode::ProfileMemoryExceeded => detailed(
+            e,
+            "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles".into(),
+        ) + ".",
+        _ => sentence(&wire_text(e, None)),
     }
 }
 
@@ -715,14 +886,14 @@ pub fn device_line(d: &p::Device) -> String {
         };
         let _ = write!(line, " security={words}");
     }
-    if let Some(code) = model::last_error(d) {
-        let _ = write!(line, " error={}", model::code_token(code));
+    if let Some(e) = model::last_error(d) {
+        let _ = write!(line, " error={}", error_token(e));
     }
     let _ = write!(
         line,
         " hidpp={} hidpp-state={}",
         on_off(model::hidpp_enabled(d)),
-        up_token(model::hidpp_up(d))
+        up_token(&model::hidpp_up(d))
     );
     if let Some((major, minor)) = model::hidpp_version(d) {
         let _ = write!(line, " hidpp-protocol={major}.{minor}");
@@ -732,11 +903,7 @@ pub fn device_line(d: &p::Device) -> String {
         let token = mode.map_or_else(|| "unknown".into(), output_mode_token);
         let _ = write!(line, " gamepad-output={token}");
         if let Some(o) = model::gamepad_output(d).filter(|_| model::gamepad_saved(d)) {
-            let _ = write!(
-                line,
-                " gamepad-state={}",
-                model::token(o.state().as_str_name())
-            );
+            let _ = write!(line, " gamepad-state={}", output_state_token(o));
             if let Some(slot) = o.slot {
                 let _ = write!(line, " gamepad-slot={}", slot_number(slot));
             }
@@ -747,8 +914,8 @@ pub fn device_line(d: &p::Device) -> String {
         let ids: Vec<String> = layers.iter().map(u32::to_string).collect();
         let _ = write!(line, " profiles={}", ids.join(","));
     }
-    if let Some(code) = model::profile_error(d) {
-        let _ = write!(line, " profile-error={}", model::code_token(code));
+    if let Some(e) = model::profile_error(d) {
+        let _ = write!(line, " profile-error={}", error_token(e));
     }
     line
 }
@@ -784,6 +951,9 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
         }
     }
     field("Ready", &yes_no(st.ready).to_lowercase());
+    for e in &st.errors {
+        field("Error", &wire_line(e, None));
+    }
     field(
         "Storage Full",
         &yes_no(model::storage_full(st)).to_lowercase(),
@@ -880,31 +1050,27 @@ pub fn device_info(d: &p::Device) -> String {
     field("Reconnect", if d.paused { "paused" } else { "automatic" });
     field("Logitech Features", on_off(model::hidpp_enabled(d)));
     field("HID++ Protocol", &hidpp_protocol_text(d));
-    field("HID++ Status", &up_words(model::hidpp_up(d)));
+    field("HID++ Status", &up_words(&model::hidpp_up(d)));
     if model::gamepad(d) {
         let mode = model::gamepad_mode(d).map_or("Unknown", output_mode_name);
         field("Gamepad Output", mode);
         if let Some(o) = model::gamepad_output(d).filter(|_| model::gamepad_saved(d)) {
-            field("Gamepad Status", output_state_words(o));
+            field("Gamepad Status", &safe(&output_state_words(o)));
             if let Some(slot) = o.slot {
                 field("Gamepad Slot", &slot_number(slot));
             }
         }
     }
-    if let Some(code) = model::last_error(d) {
-        let e = p::Error {
-            code: code as i32,
-            ..Default::default()
-        };
-        field("Last Error", &safe(&wire_line(&e, None)));
+    if let Some(e) = model::last_error(d) {
+        field("Last Error", &safe(&wire_line(e, None)));
     }
-    if let Some(code) = model::profile_error(d).filter(|_| model::connected(d)) {
+    if let Some(e) = model::profile_error(d).filter(|_| model::connected(d)) {
         field(
             "Profiles",
             &format!(
                 "Not Loaded ({}): {}",
-                model::code_token(code),
-                safe(&profile_error_words(code))
+                error_token(e),
+                safe(&profile_error_words(e))
             ),
         );
     }
@@ -1067,15 +1233,15 @@ pub fn battery_list(d: &p::Device) -> Option<String> {
     Some(battery(d.information.as_ref())?.compact("(charging)"))
 }
 
-pub fn scan_summary(count: u32, truncated: bool) -> String {
+pub fn scan_summary(count: u32, error: Option<&p::Error>) -> String {
     let noun = if count == 1 {
         "candidate"
     } else {
         "candidates"
     };
     let mut text = format!("Discovery finished: {count} {noun}.");
-    if truncated {
-        text.push_str(" Candidate limit reached; restart discovery to look for more devices.");
+    if let Some(e) = error {
+        let _ = write!(text, " Error: {}", safe(&wire_line(e, Some("scan start"))));
     }
     text
 }
@@ -1100,7 +1266,10 @@ pub fn devices(st: &State, filter: Filter) -> String {
         .filter(|d| match filter {
             Filter::All | Filter::Saved => true,
             Filter::Enabled => d.enabled,
-            Filter::Connected => d.state() == DeviceState::Connected,
+            // A record the listing couldn't read confirms no connection.
+            Filter::Connected => {
+                d.state() == DeviceState::Connected && !st.unreadable.contains_key(&d.id)
+            }
             Filter::Trusted => d.trusted,
         })
         .map(|d| {
@@ -1108,11 +1277,20 @@ pub fn devices(st: &State, filter: Filter) -> String {
             if let Some(b) = battery_list(d) {
                 let _ = write!(line, " battery={b}");
             }
+            // The record is the last one read before the listing failed to read it.
+            if let Some(e) = st.unreadable.get(&d.id) {
+                let _ = write!(line, " read-error={}", error_token(e));
+            }
             line
         })
         .collect();
     if matches!(filter, Filter::All | Filter::Saved) {
-        lines.extend(st.unreadable.iter().map(|id| format!("{id}  unreadable")));
+        lines.extend(
+            st.unreadable
+                .iter()
+                .filter(|(id, _)| st.device(**id).is_none())
+                .map(|(id, e)| format!("{id}  unreadable read-error={}", error_token(e))),
+        );
     }
     if filter == Filter::All {
         lines.extend(st.candidates.iter().map(candidate_line));
@@ -1239,7 +1417,7 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Outcome::ScanFinished { count, truncated } => scan_summary(*count, *truncated),
+        Outcome::ScanFinished { count, error } => scan_summary(*count, error.as_ref()),
         Outcome::ScanStopped { was_running } => {
             if *was_running {
                 String::new()
@@ -1452,7 +1630,7 @@ fn profile_text(profile: &p::Profile) -> String {
     )
 }
 
-/// `profile list`: profiles and unreadable ones in ID order.
+/// `profile list`: profiles and unreadable ones, with why, in ID order.
 fn profiles_text(list: &p::ProfileList) -> String {
     let mut b = "Profiles".to_owned();
     if list.entries.is_empty() {
@@ -1463,8 +1641,11 @@ fn profiles_text(list: &p::ProfileList) -> String {
             Some(profile_list_entry::Entry::Profile(profile)) => {
                 let _ = write!(b, "\n  {}", profile_line(profile));
             }
-            Some(profile_list_entry::Entry::Unreadable(id)) => {
-                let _ = write!(b, "\n  {id}\tunreadable");
+            Some(profile_list_entry::Entry::Error(r)) => {
+                let _ = write!(b, "\n  {}\tunreadable", r.id);
+                if let Some(e) = &r.error {
+                    let _ = write!(b, ": {}", safe(&wire_line(e, Some("profile list"))));
+                }
             }
             None => {}
         }
@@ -1517,7 +1698,7 @@ pub fn paired_disabled(subject: &Subject, reason: InactiveReason, transport: Tra
 /// A failed command's error line for the shell and scripts. The caller adds the `Error: `
 /// prefix where the shell uses one. A save cut off by the connection's end may have been stored.
 pub fn failure_text(command: &Command, error: &Error) -> String {
-    if command.saves() && error.unanswered() {
+    if command.saves() && error.unconfirmed() {
         return "the adapter couldn't confirm whether the change was saved".into();
     }
     safe(&error_line(error))
@@ -1552,7 +1733,7 @@ fn event_line(
     match kind {
         event::Kind::ScanFound(c) if first => Some(format!("[NEW] {}", candidate_line(c))),
         event::Kind::ScanFound(_) => None,
-        event::Kind::ScanDone(done) => Some(scan_summary(done.count, done.truncated)),
+        event::Kind::ScanDone(done) => Some(scan_summary(done.count, done.error.as_ref())),
         event::Kind::Device(d) if first => Some(format!("[NEW] {}", device_line(d))),
         event::Kind::Device(d) => Some(format!("[CHG] {}", device_line(d))),
         event::Kind::DeviceRemoved(r) => Some(format!("[DEL] {}", r.id)),
@@ -1579,11 +1760,7 @@ fn event_line(
                     line.push_str(",inactive");
                 }
             }
-            let errors: Vec<String> = a
-                .errors
-                .iter()
-                .map(|n| model::code_token(model::code(*n)))
-                .collect();
+            let errors: Vec<String> = a.errors.iter().map(error_token).collect();
             if !errors.is_empty() {
                 let _ = write!(line, " errors={}", errors.join(","));
             }
@@ -1646,6 +1823,14 @@ pub fn prompt_line(candidate: u32, prompt: &Prompt) -> String {
 mod tests {
     use super::*;
 
+    /// An error with only a code.
+    fn err(code: ErrorCode) -> p::Error {
+        p::Error {
+            code: code as i32,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn gamepad_output_reads_its_mode_state_and_slot() {
         let keyboard = p::Device {
@@ -1661,7 +1846,7 @@ mod tests {
             outputs: vec![p::OutputStatus {
                 role: Role::Gamepad as i32,
                 mode: OutputMode::Disabled as i32,
-                state: OutputState::Disabled as i32,
+                status: Some(output_status::Status::State(OutputState::Disabled as i32)),
                 slot: None,
             }],
             ..Default::default()
@@ -1677,7 +1862,7 @@ mod tests {
         pad.outputs[0] = p::OutputStatus {
             role: Role::Gamepad as i32,
             mode: OutputMode::Xinput as i32,
-            state: OutputState::Active as i32,
+            status: Some(output_status::Status::State(OutputState::Active as i32)),
             slot: Some(1),
         };
         assert!(
@@ -1699,7 +1884,7 @@ mod tests {
         unknown.outputs = vec![p::OutputStatus {
             role: Role::Gamepad as i32,
             mode: 7,
-            state: OutputState::Pending as i32,
+            status: Some(output_status::Status::State(OutputState::Pending as i32)),
             slot: None,
         }];
         assert_eq!(model::gamepad_mode(&unknown), None);
@@ -1809,18 +1994,186 @@ mod tests {
     }
 
     #[test]
+    fn errors_show_every_detail() {
+        let e = p::Error {
+            code: ErrorCode::Timeout as i32,
+            reason: ErrorReason::Connections as i32,
+            outcome: ErrorOutcome::Unknown as i32,
+            related: vec![p::Error {
+                code: ErrorCode::StorageFailed as i32,
+                reason: ErrorReason::Storage as i32,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(
+            error_token(&e),
+            "timeout:connections:unknown(storage_failed:storage)"
+        );
+        assert_eq!(
+            wire_line(&e, None),
+            "timeout: this device didn't respond in time; involves the adapter's connections; outcome unknown: the adapter couldn't confirm what took effect; check the current state before trying again; also (storage_failed: the adapter couldn't read or write its saved data)"
+        );
+        // A related failure's outcome stays with it.
+        let pairing = p::Error {
+            code: ErrorCode::AuthFailed as i32,
+            outcome: ErrorOutcome::NoEffect as i32,
+            related: vec![p::Error {
+                code: ErrorCode::Internal as i32,
+                reason: ErrorReason::Radio as i32,
+                outcome: ErrorOutcome::Unknown as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            wire_line(&pairing, Some("pair start")),
+            "auth_failed: Bluetooth authentication with this device failed; also (internal: the adapter hit an unexpected failure; involves the adapter's Bluetooth radio; outcome unknown: the adapter couldn't confirm what took effect; check the current state before trying again)"
+        );
+        // A related failure's outcome doesn't become the command's own.
+        let cleanup = p::Error {
+            code: ErrorCode::AuthFailed as i32,
+            outcome: ErrorOutcome::NoEffect as i32,
+            related: vec![p::Error {
+                code: ErrorCode::StorageFailed as i32,
+                outcome: ErrorOutcome::Unknown as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            wire_line(&cleanup, Some("pair start")),
+            "auth_failed: Bluetooth authentication with this device failed; also (storage_failed: the adapter couldn't read or write its saved data; outcome unknown: the adapter couldn't confirm what took effect; check the current state before trying again)"
+        );
+        // A reason gives context without replacing what the code means.
+        let starting = p::Error {
+            code: ErrorCode::NotReady as i32,
+            reason: ErrorReason::Radio as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            wire_line(&starting, None),
+            "not_ready: the adapter's Bluetooth radio isn't ready"
+        );
+        let usb = p::Error {
+            code: ErrorCode::UsbRequiredCapacityExceeded as i32,
+            reason: ErrorReason::OutputBackend as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            wire_line(&usb, None),
+            "usb_required_capacity_exceeded: the adapter doesn't have enough USB capacity for every required interface"
+        );
+        // An unknown save is reported as unknown, not as failed.
+        let unknown = p::Error {
+            code: ErrorCode::StorageFailed as i32,
+            outcome: ErrorOutcome::Unknown as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            wire_text(&unknown, None),
+            "save status unknown: the adapter couldn't confirm whether the change was saved; check the current state before trying again"
+        );
+        assert_eq!(
+            wire_text(&unknown, Some("pair start")),
+            "save status unknown: the adapter couldn't confirm whether it saved the device; check the current state before trying again"
+        );
+        // Details this build doesn't know keep their numbers, and their explanation adds nothing.
+        let newer = p::Error {
+            code: 99,
+            reason: 98,
+            outcome: 97,
+            related: vec![p::Error {
+                code: ErrorCode::Timeout as i32,
+                reason: 96,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(error_token(&newer), "99:98:97(timeout:96)");
+        assert!(
+            wire_line(&newer, None).starts_with("99: the adapter reported error"),
+            "{}",
+            wire_line(&newer, None)
+        );
+    }
+
+    #[test]
+    fn a_device_the_listing_couldnt_read_keeps_its_last_record() {
+        let mut st = State::default();
+        st.devices.push(p::Device {
+            id: 3,
+            name: "Desk".into(),
+            ..Default::default()
+        });
+        let read = p::Error {
+            code: ErrorCode::StorageFailed as i32,
+            reason: ErrorReason::Storage as i32,
+            outcome: ErrorOutcome::NoEffect as i32,
+            related: Vec::new(),
+        };
+        st.unreadable.insert(3, read.clone());
+        st.unreadable.insert(5, read);
+        let list = devices(&st, Filter::Saved);
+        assert!(
+            list.contains(" read-error=storage_failed:storage:no_effect"),
+            "{list}"
+        );
+        assert!(
+            list.contains("\n5  unreadable read-error=storage_failed:storage:no_effect"),
+            "{list}"
+        );
+        assert_eq!(list.matches("unreadable").count(), 1, "{list}");
+    }
+
+    #[test]
+    fn unsupported_outputs_and_integrations_keep_their_labels() {
+        let output = |error: p::Error| p::OutputStatus {
+            role: Role::Gamepad as i32,
+            mode: OutputMode::Hid as i32,
+            status: Some(output_status::Status::Error(error)),
+            slot: None,
+        };
+        let layout = p::Error {
+            code: ErrorCode::Unsupported as i32,
+            reason: ErrorReason::InputLayout as i32,
+            ..Default::default()
+        };
+        assert_eq!(output_state_words(&output(layout.clone())), "Unsupported");
+        assert_eq!(
+            output_state_token(&output(layout)),
+            "error:unsupported:input_layout"
+        );
+        assert_eq!(
+            output_state_words(&output(err(ErrorCode::Timeout))),
+            "Failed: this device didn't respond in time"
+        );
+        assert_eq!(output_state_token(&p::OutputStatus::default()), "unknown");
+        assert_eq!(
+            up_token(&Up::Unsupported(err(ErrorCode::Unsupported))),
+            "unsupported"
+        );
+        assert_eq!(
+            up_token(&Up::Unsupported(err(ErrorCode::ProtocolUnsupported))),
+            "error:protocol_unsupported"
+        );
+        assert_eq!(
+            up_words(&Up::Unsupported(err(ErrorCode::ProtocolUnsupported))),
+            "Unsupported"
+        );
+    }
+
+    #[test]
     fn device_errors_split_into_connection_and_profile_errors() {
         let mut d = p::Device {
             errors: vec![
-                ErrorCode::Timeout as i32,
-                ErrorCode::ProfileMemoryExceeded as i32,
+                err(ErrorCode::Timeout),
+                err(ErrorCode::ProfileMemoryExceeded),
             ],
             ..Default::default()
         };
-        assert_eq!(model::last_error(&d), Some(ErrorCode::Timeout));
+        assert_eq!(model::last_error(&d), Some(&err(ErrorCode::Timeout)));
         assert_eq!(
             model::profile_error(&d),
-            Some(ErrorCode::ProfileMemoryExceeded)
+            Some(&err(ErrorCode::ProfileMemoryExceeded))
         );
         assert!(device_line(&d).contains(" error=timeout"));
         assert!(device_line(&d).contains(" profile-error=profile_memory_exceeded"));
@@ -1828,7 +2181,7 @@ mod tests {
         assert!(device_info(&d).contains(
             "Profiles: Not Loaded (profile_memory_exceeded): The adapter doesn't have room for them."
         ));
-        d.errors = vec![ErrorCode::ProfileLoadFailed as i32];
+        d.errors = vec![err(ErrorCode::ProfileLoadFailed)];
         assert_eq!(model::last_error(&d), None);
         assert!(
             device_info(&d).contains("The adapter couldn't read one of this device's profiles.")
@@ -1871,16 +2224,20 @@ mod tests {
         );
         assert!(info.contains("\n  USB Interfaces: up to 8"), "{info}");
         status.errors = vec![
-            ErrorCode::StorageFull as i32,
-            ErrorCode::UsbRequiredCapacityExceeded as i32,
-            ErrorCode::UsbReservedCapacityExceeded as i32,
+            err(ErrorCode::StorageFull),
+            err(ErrorCode::UsbRequiredCapacityExceeded),
+            err(ErrorCode::UsbReservedCapacityExceeded),
         ];
         let info = adapter_info("", &status, &[]);
         assert!(info.contains("\n  Storage Full: yes"));
         assert!(
+            info.contains("\n  Error: storage_full: the adapter's storage is full\n"),
+            "{info}"
+        );
+        assert!(
             info.contains("\n  USB: Required Capacity Exceeded\n  USB: Reserved Capacity Exceeded")
         );
-        status.errors = vec![ErrorCode::UsbReservedCapacityExceeded as i32];
+        status.errors = vec![err(ErrorCode::UsbReservedCapacityExceeded)];
         let info = adapter_info("", &status, &[]);
         assert!(!info.contains("Required") && info.contains("Reserved Capacity Exceeded"));
         let line = event_line(&event::Kind::Adapter(status), false, &[], None).unwrap();

@@ -98,7 +98,7 @@ struct Pair {
     deadline: u64,
     name: Box<str>,
     /// Set once the attempt is ending, with the error it ends with.
-    cancelling: Option<Error>,
+    cancelling: Option<p::Error>,
     prompt: Option<Prompt>,
     /// The session that started the attempt has ended, so its remaining events go nowhere.
     quiet: bool,
@@ -297,7 +297,7 @@ pub struct Application {
     scan: Option<Scan>,
     scan_seq: u64,
     radio_scan: Option<(u64, bool, bool)>,
-    truncated: bool,
+    scan_error: Option<p::Error>,
     pair: Option<Pair>,
     pairing: Option<p::Pairing>,
     pairing_dirty: bool,
@@ -371,11 +371,20 @@ fn failure(code: Error) -> p::Error {
     wire::error(code, None, false)
 }
 
+fn pair_failure(code: Error) -> p::Error {
+    let mut error = failure(code);
+    error.outcome = p::ErrorOutcome::NoEffect as i32;
+    if code == Error::Capacity {
+        error.reason = p::ErrorReason::Connections as i32;
+    }
+    error
+}
+
 fn bad_args() -> p::Error {
     failure(Error::InvalidArgs)
 }
 
-fn capacity(reason: p::CapacityReason) -> p::Error {
+fn capacity(reason: p::ErrorReason) -> p::Error {
     wire::error(Error::Capacity, Some(reason), false)
 }
 
@@ -489,7 +498,7 @@ impl Application {
             scan: None,
             scan_seq: 0,
             radio_scan: None,
-            truncated: false,
+            scan_error: None,
             pair: None,
             pairing: None,
             pairing_dirty: false,
@@ -547,24 +556,48 @@ impl Application {
             board_name: Some(self.build.board.into()),
             development_build: Some(self.development()),
         });
-        let mut errors = Vec::new();
+        let mut errors: Vec<p::Error> = self
+            .manager
+            .radio_error
+            .iter()
+            .chain(self.manager.storage_error.iter())
+            .cloned()
+            .collect();
         if self.manager.storage_ready && (self.manager.storage_full() || self.manager.unsaved_full)
         {
-            errors.push(p::ErrorCode::StorageFull as i32);
+            errors.push(p::Error {
+                code: p::ErrorCode::StorageFull as i32,
+                reason: p::ErrorReason::Storage as i32,
+                ..Default::default()
+            });
         }
         if self.manager.profile_budget.is_some_and(|budget| {
             budget != 0
                 && self.manager.profiles.used().saturating_mul(100) >= budget.saturating_mul(85)
         }) {
-            errors.push(p::ErrorCode::ProfileMemoryLow as i32);
+            errors.push(p::Error {
+                code: p::ErrorCode::ProfileMemoryLow as i32,
+                reason: p::ErrorReason::ProfileMemory as i32,
+                ..Default::default()
+            });
         }
         let allocation = self.manager.usb_allocation();
         if allocation.required_exceeded {
-            errors.push(p::ErrorCode::UsbRequiredCapacityExceeded as i32);
+            errors.push(p::Error {
+                code: p::ErrorCode::UsbRequiredCapacityExceeded as i32,
+                reason: p::ErrorReason::OutputBackend as i32,
+                ..Default::default()
+            });
         }
         if allocation.reserved_exceeded {
-            errors.push(p::ErrorCode::UsbReservedCapacityExceeded as i32);
+            errors.push(p::Error {
+                code: p::ErrorCode::UsbReservedCapacityExceeded as i32,
+                reason: p::ErrorReason::OutputBackend as i32,
+                ..Default::default()
+            });
         }
+        errors.sort_unstable();
+        errors.dedup();
         let gamepad = self.gamepad_profiles_supported();
         let profile_support = self.manager.profile_budget.map(|budget| p::ProfileSupport {
             ranges: ranges(&profiles::REMAP_INPUTS, p::usage_range::Kind::RemapInput)
@@ -828,14 +861,37 @@ impl Application {
         self.serial.fail(error);
     }
 
+    fn not_ready(&self, gate: p::ErrorReason) -> p::Error {
+        let mut related: Vec<_> = self
+            .manager
+            .storage_error
+            .iter()
+            .chain(self.manager.radio_error.iter())
+            .cloned()
+            .collect();
+        let fault = match gate {
+            p::ErrorReason::Storage => self.manager.storage_error.as_ref(),
+            p::ErrorReason::Radio => self.manager.radio_error.as_ref(),
+            _ => None,
+        };
+        let reason = fault.map_or(p::ErrorReason::Unknown as i32, |error| error.reason);
+        related.sort_unstable();
+        related.dedup();
+        p::Error {
+            reason,
+            related,
+            ..failure(Error::RadioUnavailable)
+        }
+    }
+
     pub(crate) fn storage_error(&mut self, error: crate::storage::Error) -> p::Error {
         if error == crate::storage::Error::Unknown {
-            self.manager.fail_storage();
             self.manager.write_uncertain = true;
+            self.manager.fail_unknown_save();
             self.adapter_dirty = true;
         }
         match error {
-            crate::storage::Error::Full => capacity(p::CapacityReason::Storage),
+            crate::storage::Error::Full => capacity(p::ErrorReason::Storage),
             crate::storage::Error::Missing => failure(Error::NotFound),
             error => wire::error(
                 Error::StorageFailed,
@@ -878,7 +934,7 @@ impl Application {
             return Ok((policy, slot, None));
         }
         if !self.manager.storage_ready {
-            return Err(failure(Error::RadioUnavailable));
+            return Err(self.not_ready(p::ErrorReason::Storage));
         }
         match self.manager.policy_record(id, store, radio).await {
             Ok((policy, bond)) => Ok((policy, slot, Some(bond))),
@@ -924,7 +980,11 @@ impl Application {
             let uncertain = self.manager.write_uncertain;
             let saved = self.manager.save_policy(policy, None, store, radio).await;
             self.manager.write_uncertain = uncertain;
-            if saved.is_ok() {
+            if saved.is_ok()
+                || saved
+                    .as_ref()
+                    .is_err_and(|e| e.outcome == p::ErrorOutcome::Complete as i32)
+            {
                 if let Some(live) = self.manager.devices[slot]
                     .as_mut()
                     .and_then(|d| d.live.as_mut())
@@ -1010,7 +1070,7 @@ impl Application {
         // records left out.
         if self.pending.is_some() && !self.manager.storage_ready {
             self.pending = None;
-            return self.fail(failure(Error::RadioUnavailable));
+            return self.fail(self.not_ready(p::ErrorReason::Storage));
         }
         match self.pending.take() {
             None => {}
@@ -1140,7 +1200,7 @@ impl Application {
             }
             Command::ListProfiles(_) if profiles => {
                 if !self.manager.storage_ready {
-                    return self.fail(failure(Error::RadioUnavailable));
+                    return self.fail(self.not_ready(p::ErrorReason::Storage));
                 }
                 self.pending = Some(Pending::Profiles(Records::new(profiles::METADATA)));
             }
@@ -1193,7 +1253,7 @@ impl Application {
             }
             Command::ListDevices(_) => {
                 if !self.manager.storage_ready {
-                    return self.fail(failure(Error::RadioUnavailable));
+                    return self.fail(self.not_ready(p::ErrorReason::Storage));
                 }
                 self.pending = Some(Pending::Devices(Records::new(2)));
             }
@@ -1261,7 +1321,13 @@ impl Application {
                         Some(Entry::Device(wire::device(&self.manager, &policy, slot)))
                     }
                     Err(e) if e.code == p::ErrorCode::StorageFailed as i32 => {
-                        Some(Entry::Unreadable(id as u32))
+                        Some(Entry::Error(p::RecordError {
+                            id: id as u32,
+                            error: Some(p::Error {
+                                outcome: p::ErrorOutcome::NoEffect as i32,
+                                ..e
+                            }),
+                        }))
                     }
                     Err(_) => None,
                 };
@@ -1338,7 +1404,7 @@ impl Application {
             return Err(failure(Error::NotFound));
         }
         if !self.manager.storage_ready {
-            return Err(failure(Error::RadioUnavailable));
+            return Err(self.not_ready(p::ErrorReason::Storage));
         }
         match profiles::metadata(store, id).await {
             Ok(meta) => Ok(p::Profile {
@@ -1397,7 +1463,13 @@ impl Application {
                 let entry = match self.profile_record(id as u32, store, radio).await {
                     Ok(profile) => Some(Entry::Profile(profile)),
                     Err(e) if e.code == p::ErrorCode::StorageFailed as i32 => {
-                        Some(Entry::Unreadable(id as u32))
+                        Some(Entry::Error(p::RecordError {
+                            id: id as u32,
+                            error: Some(p::Error {
+                                outcome: p::ErrorOutcome::NoEffect as i32,
+                                ..e
+                            }),
+                        }))
                     }
                     Err(_) => None,
                 };
@@ -1596,7 +1668,7 @@ impl Application {
             return Err(failure(Error::UnknownCommand));
         };
         if !self.manager.storage_ready {
-            return Err(failure(Error::RadioUnavailable));
+            return Err(self.not_ready(p::ErrorReason::Storage));
         }
         let mut meta = match profiles::metadata(store, id).await {
             Ok(meta) => meta,
@@ -1625,7 +1697,7 @@ impl Application {
         }
         let memory = rules.memory();
         if memory > budget || !self.manager.profiles.fits(id, memory, budget) {
-            return Err(capacity(p::CapacityReason::ProfileMemory));
+            return Err(capacity(p::ErrorReason::ProfileMemory));
         }
         if let Err(error) = profiles::save_rules(store, id, &rules).await {
             return Err(self.storage_error(error));
@@ -1898,9 +1970,17 @@ impl Application {
                 if policy.profiles.contains(&id) {
                     policy.profiles.retain(|p| *p != id);
                     if self.manager.find(device).is_some() {
-                        self.manager
+                        let result = self
+                            .manager
                             .save_policy(policy, Some(&bond), store, radio)
-                            .await?;
+                            .await;
+                        if result
+                            .as_ref()
+                            .is_err_and(|e| e.outcome == p::ErrorOutcome::Complete as i32)
+                        {
+                            self.mark(device, DEVICE);
+                        }
+                        result.map_err(|_| Error::StorageFailed)?;
                     } else {
                         // Nothing is resident for this device, so only its record changes. It
                         // takes no room in the stack, whether or not it is enabled.
@@ -1937,7 +2017,7 @@ impl Application {
         now: u64,
     ) {
         if !self.manager.storage_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+            return self.fail(self.not_ready(p::ErrorReason::Storage));
         }
         let mut preference = self.manager.preference.clone();
         let name = match args.name.as_deref() {
@@ -2013,7 +2093,7 @@ impl Application {
                 .filter(|p| p.enabled)
                 .any(|p| interfaces::preference(before, p.interface).profile != p.profile);
         if !self.manager.storage_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+            return self.fail(self.not_ready(p::ErrorReason::Storage));
         }
         let platform_changed = platform != self.manager.preference.host_platform;
         let changed: Vec<Transport> = devices::Transports::ALL
@@ -2151,20 +2231,23 @@ impl Application {
             return self.fail(failure(Error::UnsupportedTransport));
         }
         if !self.manager.radio_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+            return self.fail(self.not_ready(p::ErrorReason::Radio));
         }
         let Some(token) = self.scan_seq.checked_add(1) else {
             return self.fail(failure(Error::InternalError));
         };
         if let Err(e) = radio.scan(token, classic, ble) {
-            return self.fail(failure(e));
+            return self.fail(p::Error {
+                reason: p::ErrorReason::Radio as i32,
+                ..failure(e)
+            });
         }
         self.scan_seq = token;
         self.radio_scan = Some((token, classic, ble));
         // A new scan invalidates earlier candidates, except one a pairing already captured.
         let pairing = self.pair.as_ref().map(|p| p.candidate);
         self.candidates.retain(|c| Some(c.id) == pairing);
-        self.truncated = false;
+        self.scan_error = None;
         self.scan_done = None;
         self.scan = Some(Scan {
             token,
@@ -2175,13 +2258,48 @@ impl Application {
         self.reply(None);
     }
 
+    fn candidate_id(&mut self) -> Option<u32> {
+        let Some(id) = self.candidate_seq.checked_add(1) else {
+            self.scan_error = Some(p::Error {
+                code: p::ErrorCode::Internal as i32,
+                reason: p::ErrorReason::ScanCandidates as i32,
+                ..Default::default()
+            });
+            return None;
+        };
+        self.candidate_seq = id;
+        Some(id)
+    }
+
+    fn scan_result(&self, primary: Option<Error>) -> Option<p::Error> {
+        let outcome = if self.candidates.is_empty() {
+            p::ErrorOutcome::NoEffect
+        } else {
+            p::ErrorOutcome::Partial
+        } as i32;
+        let retained = self.scan_error.clone().map(|mut error| {
+            error.outcome = outcome;
+            error
+        });
+        primary
+            .map(|code| p::Error {
+                reason: p::ErrorReason::Radio as i32,
+                outcome,
+                related: retained.clone().into_iter().collect(),
+                ..failure(code)
+            })
+            .or(retained)
+    }
+
     fn stop_scan<B: Bluetooth>(&mut self, radio: &mut B) {
         if let Some(scan) = self.scan.take() {
-            let _ = radio.scan(scan.token, false, false);
-            self.radio_scan = None;
+            let error = radio.scan(scan.token, false, false).err();
+            if error.is_none() {
+                self.radio_scan = None;
+            }
             self.scan_done = Some(p::ScanDone {
                 count: self.candidates.len() as u32,
-                truncated: self.truncated,
+                error: self.scan_result(error),
             });
         }
     }
@@ -2202,7 +2320,12 @@ impl Application {
             name: c.name.clone(),
         };
         if !self.manager.storage_ready || !self.manager.radio_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+            let gate = if !self.manager.storage_ready {
+                p::ErrorReason::Storage
+            } else {
+                p::ErrorReason::Radio
+            };
+            return self.fail(self.not_ready(gate));
         }
         if !self
             .manager
@@ -2258,7 +2381,12 @@ impl Application {
     ) {
         // Readiness can change between steps; nothing else that matters here can.
         if !self.manager.storage_ready || !self.manager.radio_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+            let gate = if !self.manager.storage_ready {
+                p::ErrorReason::Storage
+            } else {
+                p::ErrorReason::Radio
+            };
+            return self.fail(self.not_ready(gate));
         }
 
         let slot = self.manager.peer(start.peer);
@@ -2268,7 +2396,7 @@ impl Application {
         }
         if self.manager.storage_full() {
             self.adapter_dirty = true;
-            return self.fail(capacity(p::CapacityReason::Storage));
+            return self.fail(capacity(p::ErrorReason::Storage));
         }
         // The selected device's link and background setup can free a slot. Keep
         // unrelated established input links intact.
@@ -2281,7 +2409,7 @@ impl Application {
             .map(|c| c.id)
             .collect();
         if self.manager.connections.iter().all(Option::is_some) && closing.is_empty() {
-            return self.fail(capacity(p::CapacityReason::Connections));
+            return self.fail(capacity(p::ErrorReason::Connections));
         }
         for link in closing {
             self.close(link, None, radio);
@@ -2336,7 +2464,8 @@ impl Application {
         let Some(pair) = &mut self.pair else {
             return self.fail(failure(Error::StalePrompt));
         };
-        let (Some(link), None, Some(prompt)) = (pair.link, pair.cancelling, &mut pair.prompt)
+        let (Some(link), None, Some(prompt)) =
+            (pair.link, pair.cancelling.as_ref(), &mut pair.prompt)
         else {
             return self.fail(failure(Error::StalePrompt));
         };
@@ -2380,7 +2509,7 @@ impl Application {
         if pair.cancelling.is_some() {
             return;
         }
-        pair.cancelling = Some(reason);
+        pair.cancelling = Some(pair_failure(reason));
         pair.prompt = None;
         if let Some(link) = pair.link {
             // A user cancellation is a request result, not a link/profile failure.
@@ -2395,7 +2524,7 @@ impl Application {
         radio: &mut B,
     ) {
         if !self.manager.storage_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+            return self.fail(self.not_ready(p::ErrorReason::Storage));
         }
         let (original, slot, bond) = match self.policy_record(args.device, store, radio).await {
             Ok(found) => found,
@@ -2466,7 +2595,7 @@ impl Application {
             policy.blocked = blocked;
         }
         if !self.manager.storage_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+            return self.fail(self.not_ready(p::ErrorReason::Storage));
         }
         if policy == original {
             return self.reply(None);
@@ -2478,25 +2607,14 @@ impl Application {
         }
         let id = policy.id;
         let hidpp = policy.hidpp_enabled();
-        let capacity_reason = if slot.is_none()
-            && self.manager.eligible(&policy)
-            && !self.manager.room(policy.peer.transport)
-        {
-            p::CapacityReason::Enabled
-        } else {
-            p::CapacityReason::Unknown
-        };
-        if let Err(code) = self
+        let result = self
             .manager
             .save_policy(policy, bond.as_ref(), store, radio)
-            .await
+            .await;
+        if let Err(error) = &result
+            && error.outcome != p::ErrorOutcome::Complete as i32
         {
-            let error = if code == Error::Capacity {
-                capacity(capacity_reason)
-            } else {
-                wire::error(code, None, self.manager.write_uncertain)
-            };
-            return self.fail(error);
+            return self.fail(error.clone());
         }
         if let Some(setup) = setup
             && let Some(live) = self
@@ -2517,7 +2635,10 @@ impl Application {
                 DEVICE
             },
         );
-        self.reply(None);
+        match result {
+            Ok(()) => self.reply(None),
+            Err(error) => self.fail(error),
+        }
     }
 
     async fn connect<S: RecordStore, B: Bluetooth>(
@@ -2532,7 +2653,12 @@ impl Application {
             Err(e) => return self.fail(e),
         };
         if !self.manager.storage_ready || !self.manager.radio_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+            let gate = if !self.manager.storage_ready {
+                p::ErrorReason::Storage
+            } else {
+                p::ErrorReason::Radio
+            };
+            return self.fail(self.not_ready(gate));
         }
         if self.pair.is_some() {
             return self.fail(failure(Error::Busy));
@@ -2550,7 +2676,7 @@ impl Application {
             {
                 failure(Error::UnsupportedTransport)
             } else {
-                capacity(p::CapacityReason::Enabled)
+                capacity(p::ErrorReason::EnabledDevices)
             });
         };
         let d = self.manager.devices[slot].as_ref().unwrap();
@@ -2570,7 +2696,7 @@ impl Application {
                 self.mark(id.into(), DEVICE);
                 self.device_result(id, store, radio).await;
             }
-            Err(Error::Capacity) => self.fail(capacity(p::CapacityReason::Connections)),
+            Err(Error::Capacity) => self.fail(capacity(p::ErrorReason::Connections)),
             Err(e) => self.fail(failure(e)),
         }
     }
@@ -2589,9 +2715,11 @@ impl Application {
             return self.fail(failure(Error::Busy));
         }
         if !self.manager.storage_ready {
-            return self.fail(failure(Error::RadioUnavailable));
+            return self.fail(self.not_ready(p::ErrorReason::Storage));
         }
         if let Some(slot) = slot {
+            self.manager.devices[slot].as_mut().unwrap().unpair_policy =
+                Some(Box::new(policy.clone()));
             self.manager.disconnect(slot, radio).ok();
             if self.manager.link_for(slot).is_some() {
                 self.manager.devices[slot].as_mut().unwrap().deleting = true;
@@ -2604,9 +2732,9 @@ impl Application {
         }
         match self.remove(policy.id, policy.peer, store, radio).await {
             Ok(()) => self.reply(None),
-            Err(code) => {
-                let uncertain = self.manager.write_uncertain;
-                self.fail(wire::error(code, None, uncertain));
+            Err(error) => {
+                self.mark(policy.id, DEVICE);
+                self.fail(error);
             }
         }
     }
@@ -2617,8 +2745,18 @@ impl Application {
         peer: Peer,
         store: &mut S,
         radio: &mut B,
-    ) -> Result<(), Error> {
-        self.manager.unpair(id, peer, store, radio).await?;
+    ) -> Result<(), p::Error> {
+        if let Err(error) = self.manager.unpair(id, peer, store, radio).await {
+            if let Some(slot) = self.manager.find(id) {
+                let device = self.manager.devices[slot].as_mut().unwrap();
+                device.deleting = false;
+                if error.outcome != p::ErrorOutcome::Unknown as i32 {
+                    device.unpair_policy = None;
+                }
+                device.error = Some(error.clone());
+            }
+            return Err(error);
+        }
         self.forget_device(id);
         self.removed.push_back(id);
         self.adapter_dirty = true;
@@ -2765,7 +2903,8 @@ impl Application {
         };
         if let Err(error) = result {
             if error == crate::settings::Error::StorageUnknown {
-                self.manager.fail_storage();
+                self.manager.write_uncertain = true;
+                self.manager.fail_unknown_save();
                 self.adapter_dirty = true;
             }
             return self.fail(wire::error(
@@ -2945,13 +3084,13 @@ impl Application {
                         c.dirty = true;
                     }
                 } else if self.candidates.len() == devices::SCAN_CANDIDATES {
-                    self.truncated = true;
+                    self.scan_error = Some(p::Error {
+                        code: p::ErrorCode::NoCapacity as i32,
+                        reason: p::ErrorReason::ScanCandidates as i32,
+                        ..Default::default()
+                    });
                 } else {
-                    let Some(seq) = self.candidate_seq.checked_add(1) else {
-                        self.truncated = true;
-                        return None;
-                    };
-                    self.candidate_seq = seq;
+                    let seq = self.candidate_id()?;
                     self.candidates.push(Candidate {
                         id: seq,
                         peer,
@@ -3227,21 +3366,54 @@ impl Application {
     /// with the loaded ones.
     async fn ready<S: RecordStore, B: Bluetooth>(&mut self, store: &mut S, radio: &mut B) {
         self.manager.radio_ready = true;
+        self.manager.radio_error = None;
+        let unresolved = self
+            .manager
+            .storage_error
+            .as_ref()
+            .is_some_and(|error| error.outcome == p::ErrorOutcome::Unknown as i32);
+        let loaded = self.manager.storage_ready || unresolved;
         // A change the backend could not apply before it restarted is applied now.
-        let ready = if self.manager.storage_ready {
+        let ready = if loaded {
             match self.manager.apply_transports(radio) {
                 Ok(()) => self.manager.sync_bonds(store, radio).await,
-                Err(error) => Err(error),
+                Err(error) => Err((error, p::ErrorReason::Radio)),
             }
         } else {
-            self.manager.load(store, radio).await
+            self.manager.load(store, radio).await.map_err(|error| {
+                let reason = self.manager.radio_error.as_ref().map_or(
+                    if error == Error::StorageFailed {
+                        p::ErrorReason::Storage
+                    } else {
+                        p::ErrorReason::Unknown
+                    },
+                    |_| p::ErrorReason::Radio,
+                );
+                (error, reason)
+            })
         };
         match ready {
-            // Loading resolves nothing of a write whose outcome is unknown, so storage stays not
-            // ready until that write is.
+            // Radio recovery leaves an unresolved save's storage guard in place.
             Ok(()) => self.writes_recovered(),
-            Err(Error::StorageFailed) => self.manager.fail_storage(),
-            Err(_) => self.manager.radio_ready = false,
+            Err((Error::StorageFailed, p::ErrorReason::Storage)) => {
+                if !unresolved {
+                    self.manager.fail_storage();
+                }
+            }
+            Err((error, reason)) => {
+                if reason == p::ErrorReason::Radio {
+                    self.manager.radio_ready = false;
+                    self.manager.radio_error = Some(p::Error {
+                        reason: p::ErrorReason::Radio as i32,
+                        ..failure(error)
+                    });
+                } else if !loaded {
+                    self.manager
+                        .storage_error
+                        .get_or_insert_with(|| failure(error));
+                }
+                // Loaded records whose cleanup fails stay queued for background retry.
+            }
         }
         self.adapter_dirty = true;
     }
@@ -3255,7 +3427,7 @@ impl Application {
             self.radio_scan = None;
             self.scan_done = Some(p::ScanDone {
                 count: self.candidates.len() as u32,
-                truncated: self.truncated,
+                error: self.scan_result(Some(error)),
             });
         }
         for slot in 0..devices::ACTIVE_CONNECTIONS {
@@ -3266,6 +3438,11 @@ impl Application {
         self.manager.radio_ready = false;
         if error == Error::StorageFailed {
             self.manager.fail_storage();
+        } else {
+            self.manager.radio_error = Some(p::Error {
+                reason: p::ErrorReason::Radio as i32,
+                ..failure(error)
+            });
         }
         self.adapter_dirty = true;
     }
@@ -3491,7 +3668,7 @@ impl Application {
         if self.manager.storage_ready {
             Ok(())
         } else {
-            Err(failure(Error::RadioUnavailable))
+            Err(self.not_ready(p::ErrorReason::Storage))
         }
     }
 
@@ -3628,13 +3805,15 @@ impl Application {
         }
         let unknown = self.unsaved.rules_failed(E::Unknown) || editor(E::Unknown);
         if unknown && self.manager.storage_ready {
-            self.manager.fail_storage();
+            self.manager.write_uncertain = true;
+            self.manager.fail_unknown_save();
             self.manager.unsaved_unready = true;
             self.adapter_dirty = true;
         } else if !unknown && core::mem::take(&mut self.manager.unsaved_unready) {
             // Storage that another failure has made not ready since stays so: that failure
             // cleared `unsaved_unready`.
             self.manager.storage_ready = true;
+            self.manager.storage_error = None;
             self.adapter_dirty = true;
         }
     }
@@ -3710,8 +3889,7 @@ impl Application {
         if let Some(pair) = &mut self.pair
             && pair.expected.is_none()
         {
-            // Adopt may already have succeeded before the record write
-            // failed. Explicit cleanup waits for disconnection.
+            // The stack holds provisional keys until disconnection permits cleanup.
             pair.cleanup = Some(identity);
         }
         self.stop_pairing(error, radio);
@@ -3787,7 +3965,7 @@ impl Application {
             .bonded(link, identity, saved, name.as_bytes(), store, radio)
             .await;
         match result {
-            Ok((id, slot)) => {
+            Ok((id, slot, error)) => {
                 if let Some(c) = self.manager.connection_mut(link) {
                     c.deadline = now.saturating_add(CONNECT_TIMEOUT_MS);
                 }
@@ -3805,10 +3983,22 @@ impl Application {
                 self.adapter_dirty = true;
                 self.pairing_ended(
                     &pair,
-                    p::pairing::Step::Done(p::PairingDone { device: id as u32 }),
+                    match error {
+                        Some(error) => p::pairing::Step::Error(error),
+                        None => p::pairing::Step::Done(p::PairingDone { device: id as u32 }),
+                    },
                 );
             }
-            Err(error) => self.bond_failed(identity, error, radio),
+            Err(error) => {
+                if let Some(pair) = &mut self.pair {
+                    if pair.expected.is_none() {
+                        pair.cleanup = Some(identity);
+                    }
+                    pair.cancelling = Some(error);
+                    pair.prompt = None;
+                }
+                self.close(link, None, radio);
+            }
         }
     }
 
@@ -3842,7 +4032,7 @@ impl Application {
             }
             return false;
         }
-        if let Some(error) = pair.cancelling {
+        if let Some(mut error) = pair.cancelling.clone() {
             let cleanup = self.pair.as_mut().unwrap().cleanup.take();
             let result = if let Some(peer) = cleanup {
                 radio.forget(peer).await
@@ -3850,12 +4040,18 @@ impl Application {
                 Ok(())
             };
             let restored = self.manager.finish_pair(store).await;
-            let code = result.err().or(restored.err()).unwrap_or(error);
+            if let Err(code) = result {
+                let mut secondary = failure(code);
+                secondary.reason = p::ErrorReason::Radio as i32;
+                error.related.push(secondary);
+            }
+            if let Err(code) = restored {
+                error.related.push(failure(code));
+            }
+            error.related.sort_unstable();
+            error.related.dedup();
             let pair = self.pair.take().unwrap();
-            self.pairing_ended(
-                &pair,
-                p::pairing::Step::Failed(wire::error_code(code) as i32),
-            );
+            self.pairing_ended(&pair, p::pairing::Step::Error(error));
             return true;
         }
         if now >= pair.deadline {
@@ -3890,12 +4086,12 @@ impl Application {
         match result {
             Ok(id) => self.pair.as_mut().unwrap().link = Some(id),
             Err(error) => {
-                let error = self.manager.finish_pair(store).await.err().unwrap_or(error);
+                let mut error = pair_failure(error);
+                if let Err(cleanup) = self.manager.finish_pair(store).await {
+                    error.related.push(failure(cleanup));
+                }
                 let pair = self.pair.take().unwrap();
-                self.pairing_ended(
-                    &pair,
-                    p::pairing::Step::Failed(wire::error_code(error) as i32),
-                );
+                self.pairing_ended(&pair, p::pairing::Step::Error(error));
             }
         }
         true
@@ -3947,6 +4143,8 @@ impl Application {
         }
         if wanted != self.radio_scan {
             let (token, classic, ble) = wanted.unwrap_or((self.scan_seq, false, false));
+            // A rejected command leaves the previous scan state in effect. Retry it on
+            // the next poll; radio failure events handle lost links and readiness.
             if radio.scan(token, classic, ble).is_ok() {
                 self.radio_scan = wanted;
             }
@@ -3977,11 +4175,7 @@ impl Application {
             }
             self.unpairing.swap_remove(i);
             let peer = self.manager.devices[slot].as_ref().unwrap().peer;
-            if let Err(code) = self.remove(id, peer, store, radio).await
-                && let Some(d) = self.manager.devices[slot].as_mut()
-            {
-                d.deleting = false;
-                d.error = Some(code);
+            if self.remove(id, peer, store, radio).await.is_err() {
                 self.mark(id, DEVICE);
             }
             return true;
@@ -4357,6 +4551,7 @@ impl Application {
                     .manager
                     .import(slot, store, radio)
                     .await
+                    .map_err(|(error, _)| error)
                     .map(|()| Some(BondSync::Import(slot + 1))),
                 None => Ok(None),
             },
@@ -4677,7 +4872,24 @@ impl Application {
             let ready = !self.manager.waiting_for_input(id, now);
             let loaded = self.policy_loaded(id);
             let event = if bits & DEVICE != 0 && ready && (loaded || self.event_due(device, now)) {
-                let result = self.policy_of(id as u32, store, radio).await;
+                let snapshot = self.manager.find(id).and_then(|slot| {
+                    let d = self.manager.devices[slot].as_ref()?;
+                    (!self.manager.storage_ready
+                        && d.error
+                            .as_ref()
+                            .is_some_and(|e| e.outcome == p::ErrorOutcome::Unknown as i32))
+                    .then(|| {
+                        d.unpair_policy
+                            .as_deref()
+                            .cloned()
+                            .map(|policy| (policy, Some(slot)))
+                    })
+                    .flatten()
+                });
+                let result = match snapshot {
+                    Some(policy) => Ok(policy),
+                    None => self.policy_of(id as u32, store, radio).await,
+                };
                 if self.event_settled(device, result.as_ref().err(), now) {
                     self.dirty[index].1 &= !DEVICE;
                 }
@@ -4890,9 +5102,13 @@ impl Application {
                 pair.link = None;
                 pair.prompt = None;
                 if pair.cancelling.is_none() {
-                    pair.cancelling = Some(error.unwrap_or(Error::ConnectionFailed));
+                    pair.cancelling = Some(pair_failure(error.unwrap_or(Error::ConnectionFailed)));
                 }
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/application/errors.rs"]
+mod error_tests;

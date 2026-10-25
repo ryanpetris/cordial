@@ -208,3 +208,89 @@ fn incremental_encoder_matches_contiguous_encoding_at_every_split() {
         }
     }
 }
+
+#[test]
+fn complete_errors_roundtrip_and_order_by_every_detail_recursively() {
+    use cordial_protocol::{Error, ErrorCode, ErrorOutcome, ErrorReason};
+    let base = Error {
+        code: ErrorCode::Timeout as i32,
+        ..Default::default()
+    };
+    let mut errors = vec![
+        Error {
+            code: ErrorCode::UnsupportedHid as i32,
+            ..base.clone()
+        },
+        Error {
+            related: vec![base.clone(), base.clone()],
+            ..base.clone()
+        },
+        Error {
+            related: vec![base.clone()],
+            ..base.clone()
+        },
+        Error {
+            outcome: ErrorOutcome::Complete as i32,
+            ..base.clone()
+        },
+        Error {
+            outcome: ErrorOutcome::Unknown as i32,
+            ..base.clone()
+        },
+        Error {
+            reason: ErrorReason::Radio as i32,
+            ..base.clone()
+        },
+        base.clone(),
+        base.clone(),
+    ];
+    errors.sort();
+    errors.dedup();
+    assert_eq!(errors.len(), 7);
+    assert_eq!(errors[0], base);
+    assert_eq!(errors[1].related, core::slice::from_ref(&base));
+    assert_eq!(errors[2].related, [base.clone(), base.clone()]);
+    assert_eq!(errors[3].outcome(), ErrorOutcome::Unknown);
+    assert_eq!(errors[4].outcome(), ErrorOutcome::Complete);
+    assert_eq!(errors[5].reason(), ErrorReason::Radio);
+    assert_eq!(errors[6].code(), ErrorCode::UnsupportedHid);
+    for error in errors {
+        assert_eq!(
+            Error::decode(error.encode_to_vec().as_slice()).unwrap(),
+            error
+        );
+    }
+    let unknown = Error {
+        code: 201,
+        reason: 202,
+        outcome: 203,
+        related: vec![base],
+    };
+    assert_eq!(
+        Error::decode(unknown.encode_to_vec().as_slice()).unwrap(),
+        unknown
+    );
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn json_keeps_generic_error_details_and_nested_failures() {
+    use cordial_protocol::{Error, ErrorCode, ErrorOutcome, ErrorReason};
+    let error = Error {
+        code: ErrorCode::Internal as i32,
+        reason: ErrorReason::ScanCandidates as i32,
+        outcome: ErrorOutcome::Partial as i32,
+        related: vec![Error {
+            code: 201,
+            reason: 202,
+            outcome: 203,
+            related: vec![],
+        }],
+    };
+    let json = serde_json::to_string(&error).unwrap();
+    assert!(json.contains("ERROR_REASON_SCAN_CANDIDATES"));
+    assert!(json.contains("ERROR_OUTCOME_PARTIAL"));
+    assert_eq!(serde_json::from_str::<Error>(&json).unwrap(), error);
+    let absent = serde_json::from_str::<Error>("{\"code\":\"ERROR_CODE_STORAGE_FAILED\"}").unwrap();
+    assert_eq!(absent.outcome(), ErrorOutcome::Unspecified);
+}

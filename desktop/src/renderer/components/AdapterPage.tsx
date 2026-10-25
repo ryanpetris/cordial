@@ -4,12 +4,27 @@ import { adapterName } from "../../shared/adapter-name.ts";
 import { resource } from "../../shared/capacity.ts";
 import { stagedInterfaces } from "../../shared/profiles.ts";
 import type { AdapterChanges, AdapterEntry, AdapterStatus, AppState, HostPlatform, InterfaceChange, TransportName } from "../../shared/state.ts";
-import { PLATFORMS, STORAGE_FULL, TRANSPORTS, USB_CAPACITY, adapterStatus, batteryStale, capacityText, deviceStatus, storageFull } from "../../shared/text.ts";
+import {
+  PLATFORMS,
+  READ_FAILED,
+  STORAGE_FULL,
+  TRANSPORTS,
+  USB_CAPACITY,
+  adapterStatus,
+  batteryStale,
+  capacityText,
+  connected as isConnected,
+  deviceStatus,
+  errorText,
+  hasError,
+  reasonText,
+  storageFull,
+} from "../../shared/text.ts";
 import { useAction } from "../api.ts";
 import type { Selection } from "../App.tsx";
-import { Banner, Card, Dialog, Fact, Facts, Meter, Page, Pill, Segmented, Spinner, Staged, SwitchRow, TabBar, TabPanel } from "./common.tsx";
+import { Banner, Card, Dialog, Fact, Facts, Meter, Page, Pill, Row, Segmented, Spinner, Staged, SwitchRow, TabBar, TabPanel } from "./common.tsx";
 import { AdapterProfiles, ConfigurationInterfaces, ProfileMemory } from "./Profiles.tsx";
-import { AdapterIcon, CheckIcon, ChevronIcon, CloseIcon, DeviceIcon, PencilIcon, PlugIcon, SwapIcon, UndoIcon, UnplugIcon } from "./icons.tsx";
+import { AdapterIcon, CheckIcon, ChevronIcon, CloseIcon, DeviceIcon, PencilIcon, PlugIcon, RefreshIcon, SwapIcon, UndoIcon, UnplugIcon } from "./icons.tsx";
 
 /** The rename dialog's contents; mounted each time it opens, so it starts from the current name. */
 function Rename({ adapter, busy, error, onRename, onDone }: {
@@ -200,7 +215,7 @@ export function AdapterPage({
   // Details reports the adapter's live state, so it shows only while connected.
   const live = connected ? view : null;
   const usbInterfaces = resource(live?.resources, "interfaces");
-  const usbErrors = USB_CAPACITY.filter(([code]) => live?.errors.includes(code));
+  const usbErrors = USB_CAPACITY.filter(([code]) => hasError(live?.errors, code));
   const enabledDevices = live?.transports.flatMap((t) => {
     const r = resource(t.resources, "devices");
     return t.enabled && r && (r.count !== null || r.limit !== null) ? [{ transport: t.transport, r }] : [];
@@ -340,11 +355,35 @@ export function AdapterPage({
             empty
           )
         ) : tab === "diagnostics" ? (
-          <Card title="Identifiers">
-            <Facts>
-              <Fact label="Adapter ID">{adapter.id}</Fact>
-            </Facts>
-          </Card>
+          <>
+            {connected && s?.errors.length ? (
+              <Card title="Errors">
+                {s.errors.map((e) => (
+                  <Row key={JSON.stringify(e)} title={errorText(e)} />
+                ))}
+              </Card>
+            ) : null}
+            {adapter.unreadableDevices.length ? (
+              <Card
+                title="Saved Devices"
+                footer={
+                  <button disabled={busy || !connected} onClick={() => void run({ type: "devices.reload", adapterId: adapter.id })}>
+                    <RefreshIcon /> Retry
+                  </button>
+                }
+              >
+                {adapter.unreadableDevices.map(({ id, error }) => {
+                  const detail = errorText(error, "read");
+                  return <Row key={id} title={`Device ${id}`} subtitle={detail === READ_FAILED ? "Couldn't Read" : `Couldn't Read: ${reasonText(detail)}`} dim />;
+                })}
+              </Card>
+            ) : null}
+            <Card title="Identifiers">
+              <Facts>
+                <Fact label="Adapter ID">{adapter.id}</Fact>
+              </Facts>
+            </Card>
+          </>
         ) : (
           <>
             {live ? null : empty}
@@ -354,12 +393,12 @@ export function AdapterPage({
                   const low = isLow(d.battery, threshold);
                   return (
                     <button key={d.key} className="row clickable" onClick={() => onSelect({ page: "device", key: d.key })}>
-                      <span className={d.device.state === "connected" ? "row-icon on" : "row-icon"}>
+                      <span className={isConnected(d) ? "row-icon on" : "row-icon"}>
                         <DeviceIcon kind={d.kind} />
                       </span>
                       <span className="row-text">
                         <span className="row-title strong">{d.name}</span>
-                        <span className="row-subtitle">{deviceStatus(d.device)}</span>
+                        <span className="row-subtitle">{deviceStatus(d)}</span>
                       </span>
                       {d.battery?.percent != null ? <span className={`value${low ? " low" : ""}${batteryStale(d.battery) ? " dim" : ""}`}>{d.battery.percent}%</span> : null}
                       <ChevronIcon />

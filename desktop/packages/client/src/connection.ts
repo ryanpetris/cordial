@@ -4,9 +4,11 @@
 // sent before the answer to that first request is ignored.
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import {
-  CapacityReason,
   DELIMITER,
   ErrorCode,
+  ErrorOutcome,
+  ErrorReason,
+  ErrorSchema,
   FrameDecoder,
   MAX_REQUEST_BYTES,
   MessageSchema,
@@ -16,6 +18,7 @@ import {
   type DeviceList,
   type DeviceListEntry,
   type DeviceSettings,
+  type Error as ErrorMessage,
   type Event,
   type Feature,
   type FeatureList,
@@ -47,18 +50,21 @@ type ResultOf<C extends ResultCase> = Extract<Response["result"], { case: C }>["
 export class CordialError extends Error {
   /** The command's field name, such as `setDevice`. */
   readonly command: string;
+  /** Codes, reasons and outcomes keep their numbers, including ones this client doesn't know. */
   readonly code: ErrorCode;
-  readonly reason: CapacityReason;
-  readonly outcomeUnknown: boolean;
-  constructor(command: string, code: ErrorCode, reason = CapacityReason.UNKNOWN, outcomeUnknown = false) {
-    // Codes and reasons this client doesn't know read as UNKNOWN.
-    const known = code in ErrorCode ? code : ErrorCode.UNKNOWN;
-    super(`${command} failed: ${ErrorCode[known]}`);
+  readonly reason: ErrorReason;
+  readonly outcome: ErrorOutcome;
+  /** Further failures, as the Dongle sent them; they never replace this one. */
+  readonly related: ErrorMessage[];
+  constructor(command: string, error: MessageInitShape<typeof ErrorSchema>) {
+    const { code = ErrorCode.UNKNOWN, reason = ErrorReason.UNKNOWN, outcome = ErrorOutcome.UNSPECIFIED } = error;
+    super(`${command} failed: ${ErrorCode[code] ?? code}`);
     this.name = "CordialError";
     this.command = command;
-    this.code = known;
-    this.reason = reason in CapacityReason ? reason : CapacityReason.UNKNOWN;
-    this.outcomeUnknown = outcomeUnknown;
+    this.code = code;
+    this.reason = reason;
+    this.outcome = outcome;
+    this.related = (error.related ?? []).map((r) => create(ErrorSchema, r));
   }
 }
 
@@ -75,7 +81,7 @@ export class UnexpectedResponseError extends Error {
 /** The ID a device or profile listing entry is listed by; undefined for an entry of a kind this
  * client doesn't know. */
 export const entryId = (e: DeviceListEntry | ProfileListEntry): number | undefined =>
-  e.entry.case === "device" || e.entry.case === "profile" ? e.entry.value.id : e.entry.case === "unreadable" ? e.entry.value : undefined;
+  e.entry.case === "device" || e.entry.case === "profile" ? e.entry.value.id : e.entry.case === "error" ? e.entry.value.id : undefined;
 
 /** The session ended before a request was answered. */
 export class ConnectionClosedError extends Error {
@@ -176,7 +182,8 @@ export class Connection {
     if (this.#closed) return Promise.reject(new ConnectionClosedError());
     const request = create(RequestSchema, { command });
     const bytes = toBinary(RequestSchema, request);
-    if (bytes.length > MAX_REQUEST_BYTES) return Promise.reject(new CordialError(command.case, ErrorCode.TOO_LONG));
+    // Never sent, so it had no effect.
+    if (bytes.length > MAX_REQUEST_BYTES) return Promise.reject(new CordialError(command.case, { code: ErrorCode.TOO_LONG, outcome: ErrorOutcome.NO_EFFECT }));
     const encoded = encodeFrame(bytes);
     const frame = first ? new Uint8Array([DELIMITER, ...encoded]) : encoded;
     return new Promise<Response>((resolve, reject) => {
@@ -244,7 +251,7 @@ export class Connection {
   cancelPairing(): Promise<void> {
     return this.#void({ case: "cancelPairing", value: {} });
   }
-  /** Every saved device, including IDs whose records could not be read. */
+  /** Every saved device, including the IDs and read errors of records the Dongle couldn't read. */
   listDevices(): Promise<DeviceList> {
     return this.#call({ case: "listDevices", value: {} }, "devices");
   }
@@ -284,7 +291,7 @@ export class Connection {
   setSettings(update: MessageInitShape<typeof SetSettingsSchema>): Promise<void> {
     return this.#void({ case: "setSettings", value: update });
   }
-  /** Every saved profile, including IDs whose records could not be read. */
+  /** Every saved profile, including the IDs and read errors of records the Dongle couldn't read. */
   listProfiles(): Promise<ProfileList> {
     return this.#call({ case: "listProfiles", value: {} }, "profiles");
   }
@@ -377,7 +384,7 @@ export class Connection {
     this.#notify(() => this.#options.onResponse?.(pending.request, response));
     const result = response.result;
     if (result.case === "error")
-      pending.reject(new CordialError(pending.request.command.case ?? "request", result.value.code, result.value.reason, result.value.outcomeUnknown));
+      pending.reject(new CordialError(pending.request.command.case ?? "request", result.value));
     else pending.resolve(response);
     this.#next();
   }

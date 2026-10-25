@@ -15,10 +15,20 @@ platform reads as Linux and the transport defaults apply.
 
 `Status.information` holds `firmware_version`, `board_name` and `development_build`, each with
 independent presence. The Dongle always supplies these known values, including false for a
-production build. `Status.errors` is the complete current set of adapter
-problems, without duplicates, in numeric order. Empty clears all adapter problems. An `adapter`
-event replaces the complete `Status`, including its errors and resource counts. Storage readiness
-and storage space are separate: a ready adapter can report `ERROR_CODE_STORAGE_FULL`.
+production build. `Status.errors` is the complete current set of adapter problems as full `Error`
+messages, ordered and deduplicated by complete error as defined in
+[Errors](limits-and-errors.md#errors). Empty clears all adapter problems. An `adapter` event
+replaces the complete `Status`, including its errors and resource counts.
+
+`ready` means Bluetooth and storage are both usable. False gives no claim about which subsystem
+is ready, and pairing remains blocked while storage is unavailable. Ordinary startup reports no
+error merely because `ready` is false. A radio fault reports its known cause with reason `RADIO`,
+or code `NOT_READY` when only unavailability is known. Storage initialization or access faults
+report `STORAGE_FAILED` with reason `STORAGE`. Each source error clears independently when its
+subsystem recovers. An unresolved save reports outcome `UNKNOWN` and keeps storage not ready
+until its outcome is resolved or a restart successfully reloads saved state; radio recovery does
+not clear it. Storage readiness and storage space are separate: `STORAGE_FULL` uses reason
+`STORAGE`, follows its own clearing rule and does not make storage unready.
 
 ### Resource capacities
 
@@ -117,10 +127,12 @@ peripheral paired over both Classic and BLE has two records. Names are labels, n
 - `inactive` says why the Dongle will not use the device, in this order: its transport is not
   supported by this firmware, its transport is disabled on the Dongle, it is blocked, the device is
   disabled, or the stack's bond table is full.
-- `errors` is the complete set of connection and profile problems, without duplicates, in numeric
-  order. At most one connection failure is present; a new one replaces it. A successful connection,
-  disabling the device or restarting the Dongle clears it. Integration and setting failures stay on
-  their own records.
+- `errors` is the complete set of connection, unpair and profile problems as full `Error` messages,
+  ordered and deduplicated by complete error. Outcomes describe the failed connection attempt,
+  unpair or profile load. An unresolved unpair reports `UNKNOWN`; related errors describe restoring
+  the native bond. At most one connection or unpair failure is present; a new one replaces it.
+  A successful connection, disabling the device or restarting the Dongle clears it. Integration and
+  setting failures stay on their own records.
 - `security` describes the live link while connected; each property is missing when the stack cannot
   report it, which does not mean false. Values describe the negotiated link and key, never the
   requested policy; for example, Secure Connections Just Works reports `encrypted`,
@@ -135,8 +147,13 @@ peripheral paired over both Classic and BLE has two records. Names are labels, n
 
 A `device` event carries the whole record whenever anything in it changes, including battery and
 other information; `device_removed` follows an unpair or a lost record. `ListDevices` returns every
-saved device in one response in ascending ID order. A device whose record cannot be read is listed
-by ID as an `unreadable` entry.
+saved device in one response in ascending ID order. A read failure is an `error` entry containing
+`RecordError { id, error }`. Its `STORAGE_FAILED` error has reason `STORAGE` and outcome `NO_EFFECT`,
+which means no record was returned, not that saved data is unchanged. The listing continues.
+Clients retain an already known device as last-known data; this does not confirm its connection or
+preferences. Fresh records and events supersede it, and actual absence or removal clears it.
+Profile read-error placeholders do not require preserving a cached profile. An undecodable record
+is removed as lost and omitted, as described under [Lost records](commands.md#lost-records).
 
 `Device.output_preferences` holds saved output choices as `role` and `mode`. Only Gamepad is
 configurable, with Disabled, HID and XInput choices. A missing gamepad choice means Disabled.
@@ -151,7 +168,10 @@ a failed save on a later connection. Completed setup never automatically enables
 Gamepad selection does not finish pending HID++ detection. See the
 [storage rules](../storage-format.md#devices) for setup persistence.
 
-`Device.outputs` reports output state independently of Bluetooth state and `inactive`:
+`Device.outputs` reports output status independently of Bluetooth state and `inactive`.
+Each `OutputStatus.status` selects either a `state` or a full `error`. Producers always set one;
+`state = UNKNOWN` explicitly reports unknown. Consumers treat an unset or unknown status variant
+as Unknown. The state variants are:
 
 | State | Meaning |
 | --- | --- |
@@ -160,13 +180,14 @@ Gamepad selection does not finish pending HID++ detection. See the
 | Disconnected | The selected backend is supported and the device has no live connection. |
 | Pending | Connection setup or required USB enumeration is incomplete. |
 | Active | A supported translation owns an enumerated slot. |
-| Unsupported | The selected backend or connected device layout cannot provide translation. |
 
 Only Active carries `slot`, a zero-based temporary slot within its role and mode pool. It is not a
-Windows XInput user index. A saved enabled choice whose backend is unavailable reports Unsupported.
-A connected layout without supported gamepad controls also reports Unsupported. Connection setup,
-unavailable storage and USB setup report Pending. Disabled or blocked devices have no assignment.
-Active requires a supported layout, an assigned slot and a ready USB backend.
+Windows XInput user index. An unavailable selected backend reports `error` with code `UNSUPPORTED`
+and reason `OUTPUT_BACKEND`; a connected layout without supported gamepad controls uses the same
+code with reason `INPUT_LAYOUT`. Outcomes describe output setup. Connection setup, unavailable
+storage and USB setup report Pending; Pending alone is not an error. USB capacity errors belong
+to `Status.errors`. Disabled or blocked devices have no assignment. Active requires a supported
+layout, an assigned slot and a ready USB backend.
 
 USB allocation considers saved roles, output preferences and profile outputs, together with live
 connections. Each gamepad mode has up to four independently enumerated slots where supported.
@@ -202,8 +223,8 @@ allocations are needed by the runtime pools.
 
 `Device.integrations` lists each integration the device has a saved preference for or is detected
 with on the current link. `enabled` is the saved preference. `detected` is present when the device
-speaks the integration on the current link, with the protocol version it reported. `status` is one
-of:
+speaks the integration on the current link, with the protocol version it reported. The `status`
+oneof contains a state or full `Error`; an unset or unknown variant means Off. The states are:
 
 | State | Meaning |
 | --- | --- |
@@ -211,8 +232,9 @@ of:
 | Disconnected | Turned on, and the device is not connected. |
 | Starting | Connected; detecting the integration, reading its settings and applying saved values. |
 | Active | Up: its settings have been read and saved values are applied. |
-| Unsupported | Connected, and the device cannot use the integration at all. |
-| an error code | Connected, and starting failed. |
+
+An integration that cannot start reports `error`. Missing required protocol versions or reports
+use `PROTOCOL_UNSUPPORTED`. Outcomes describe integration setup on the current connection.
 
 For HID++, a device qualifies when its HID descriptor has usable HID++ reports. Detection reads the
 HID++ version and the device's settings even while HID++ is off; turning it on starts special-key
@@ -246,7 +268,7 @@ bytes without control characters.
 Values a device only reports, such as the backlight's current level and status or the wheel's
 resolution multiplier, are information too, decoded by the Dongle. A setting the device does not
 accept writes for, on its firmware revision, is reported in the corresponding information field.
-A saved preference for that field remains a setting with Unsupported status.
+A saved preference for that field remains a setting with an `UNSUPPORTED` error.
 
 ## Settings
 
@@ -265,16 +287,21 @@ outside the choices. Saved fields retain their full limits and choices while dis
 
 | Status | Meaning |
 | --- | --- |
+| Unknown | No confirmation that the saved preference took effect. |
 | Pending | Saved, and waiting until the device can confirm it. |
 | Applied | The device reports the saved value. |
 | Changed on device | The device reports another value; the next apply writes the saved one back. |
-| Unsupported | The device does not support this saved setting. |
-| an error code | The last apply failed for this field. |
+
+`SettingStatus.result` contains a state from this table or a full `Error`. An unsupported saved
+setting uses code `UNSUPPORTED`; other apply failures preserve their code and details. Outcomes
+describe applying that field to the device, independently of saving its preference on the Dongle.
+A write that may have taken effect but cannot be confirmed uses outcome `UNKNOWN`. An unset or
+unknown status variant provides no confirmation that the preference took effect.
 
 Discovery, reads, notifications and applies never create a saved preference; only `SetSettings`
 does. Unpairing deletes the device's saved settings. A field appears only when discovered as
 configurable on this connection or when it has a saved preference. If its capability disappears,
-a saved field remains with Unsupported status. Disconnect removes unsaved fields and clears
+a saved field remains with an `UNSUPPORTED` error. Disconnect removes unsaved fields and clears
 readings on the rest. The integration state determines availability and freshness.
 
 `SettingsRef` identifies an entire domain by integration, group and optional `index`. Pointer

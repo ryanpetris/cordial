@@ -107,7 +107,11 @@ fn status(record: &Record) -> Option<p::SettingStatus> {
     record.preference.as_ref()?;
     use p::setting_status::Result as R;
     let result = if !record.writable {
-        R::State(p::SettingState::Unsupported as i32)
+        R::Error(super::error(
+            crate::model::errors::ErrorCode::UnsupportedSetting,
+            None,
+            false,
+        ))
     } else {
         match record.state {
             SettingState::Unmanaged | SettingState::Pending | SettingState::Applying => {
@@ -115,13 +119,25 @@ fn status(record: &Record) -> Option<p::SettingStatus> {
             }
             SettingState::Applied => R::State(p::SettingState::Applied as i32),
             SettingState::ChangedOnDevice => R::State(p::SettingState::ChangedOnDevice as i32),
-            SettingState::Unsupported => R::State(p::SettingState::Unsupported as i32),
-            SettingState::Uncertain => R::Error(p::ErrorCode::Timeout as i32),
-            SettingState::Error => R::Error(super::error_code(
+            SettingState::Unsupported => R::Error(super::error(
+                crate::model::errors::ErrorCode::UnsupportedSetting,
+                None,
+                false,
+            )),
+            SettingState::Uncertain => R::Error(super::error(
+                record
+                    .error
+                    .unwrap_or(crate::model::errors::ErrorCode::Timeout),
+                None,
+                true,
+            )),
+            SettingState::Error => R::Error(super::error(
                 record
                     .error
                     .unwrap_or(crate::model::errors::ErrorCode::InternalError),
-            ) as i32),
+                None,
+                false,
+            )),
         }
     };
     Some(p::SettingStatus {
@@ -560,6 +576,29 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_apply_keeps_its_cause_and_explicit_unknown_outcome() {
+        let mut value = record(SettingKey::BacklightEnabled);
+        value.state = SettingState::Uncertain;
+        value.error = Some(crate::model::errors::ErrorCode::HidppInvalidResponse);
+        let Some(p::SettingStatus {
+            result: Some(p::setting_status::Result::Error(error)),
+        }) = status(&value)
+        else {
+            panic!("missing apply error")
+        };
+        assert_eq!(error.code(), p::ErrorCode::InvalidResponse);
+        assert_eq!(error.outcome(), p::ErrorOutcome::Unknown);
+        value.state = SettingState::Error;
+        let Some(p::SettingStatus {
+            result: Some(p::setting_status::Result::Error(error)),
+        }) = status(&value)
+        else {
+            panic!("missing apply error")
+        };
+        assert_eq!(error.outcome(), p::ErrorOutcome::Unspecified);
+    }
+
+    #[test]
     fn complete_catalog_preserves_typed_presence() {
         let mut catalog = Catalog {
             records: SettingKey::ALL
@@ -615,9 +654,11 @@ mod tests {
         assert_eq!(enabled.saved, Some(false));
         assert_eq!(
             enabled.status.as_ref().unwrap().result,
-            Some(p::setting_status::Result::State(
-                p::SettingState::Unsupported as i32
-            ))
+            Some(p::setting_status::Result::Error(crate::wire::error(
+                crate::model::errors::ErrorCode::UnsupportedSetting,
+                None,
+                false
+            )))
         );
         catalog.records[0].preference = None;
         assert!(settings(&catalog).unwrap().is_empty());

@@ -54,15 +54,15 @@ impl ProfilePage {
         self.index + 1 < self.pages()
     }
 
-    /// The shown page's readable profiles, and the IDs of those that can't be read.
-    pub fn shown(&self) -> (Vec<&p::Profile>, Vec<u32>) {
+    /// The shown page's readable profiles, and the read errors of those that can't be read.
+    pub fn shown(&self) -> (Vec<&p::Profile>, Vec<&p::RecordError>) {
         let start = self.index * PER_PAGE;
         let mut profiles = Vec::new();
         let mut unreadable = Vec::new();
         for e in self.entries.iter().skip(start).take(PER_PAGE) {
             match &e.entry {
                 Some(profile_list_entry::Entry::Profile(profile)) => profiles.push(profile),
-                Some(profile_list_entry::Entry::Unreadable(id)) => unreadable.push(*id),
+                Some(profile_list_entry::Entry::Error(r)) => unreadable.push(r),
                 None => {}
             }
         }
@@ -484,10 +484,13 @@ impl<F: Fleet> Model<F> {
             );
             b.labelled(label, row);
         }
-        for id in unreadable {
+        for r in unreadable {
             b.line(Line::from(vec![
-                layout::span(format!("Profile {id}"), dim()),
-                layout::span("  Couldn't Read", dim()),
+                layout::span(format!("Profile {}", r.id), dim()),
+                layout::span(
+                    format!("  {}", words::couldnt_read(r.error.as_ref())),
+                    dim(),
+                ),
             ]));
         }
         let mut footer = Layout::new(b.width);

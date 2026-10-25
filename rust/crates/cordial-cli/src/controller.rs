@@ -345,9 +345,10 @@ pub enum Outcome {
     Interface(p::ConfigurationInterface, p::Status),
     Bootloader,
     ScanStarted(Vec<p::Transport>),
+    /// `error` says why the scan ended early or lost candidates; the found ones stay usable.
     ScanFinished {
         count: u32,
-        truncated: bool,
+        error: Option<p::Error>,
     },
     ScanStopped {
         was_running: bool,

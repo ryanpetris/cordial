@@ -1,4 +1,4 @@
-import { ErrorCode } from "@cordial/protocol";
+import { ErrorCode, ErrorOutcome, ErrorReason } from "@cordial/protocol";
 import { describe, expect, it } from "vitest";
 import { isAction } from "../src/core/actions.ts";
 import { FakeAdapter, device, setting } from "../src/fake/adapter.ts";
@@ -85,7 +85,7 @@ describe("settings form submission", () => {
   it("shows a refused save without retrying", async () => {
     const fake = keyboard();
     const { c, row, state } = await start(fake);
-    fake.failures.setSettings = [ErrorCode.STORAGE_FAILED];
+    fake.failures.setSettings = [{ code: ErrorCode.STORAGE_FAILED, reason: ErrorReason.STORAGE, outcome: ErrorOutcome.NO_EFFECT }];
     const result = await c.act({
       type: "settings.save",
       key: KEY,
@@ -110,8 +110,37 @@ describe("settings form submission", () => {
     fake.failures.setSettings = [ErrorCode.STORAGE_FAILED];
     fake.uncertainWrites = true;
     const result = await c.act({ type: "settings.save", key: KEY, changes: [{ type: "set", setting: field("backlight", "brightness"), value: 5 }] });
-    expect(result).toMatchObject({ ok: false, inline: true, message: "The adapter couldn't confirm whether the change was saved. Check before trying again." });
+    expect(result).toMatchObject({
+      ok: false,
+      inline: true,
+      message: "The adapter couldn't read or write its saved data. The adapter couldn't confirm whether the change was saved. Check before trying again.",
+    });
     expect(result.settingsSave!.items.map((i) => i.status)).toEqual(["unknown"]);
+    await c.stop();
+  });
+
+  it("reads each change's status from the failure's outcome, not its code", async () => {
+    const fake = keyboard();
+    const { c } = await start(fake);
+    const change = [{ type: "set" as const, setting: field("backlight", "brightness"), value: 5 }];
+    fake.failures.setSettings = [
+      { code: ErrorCode.TIMEOUT, outcome: ErrorOutcome.PARTIAL },
+      { code: ErrorCode.INTERNAL, outcome: ErrorOutcome.COMPLETE },
+      { code: ErrorCode.TIMEOUT },
+      { code: ErrorCode.STORAGE_FAILED, reason: ErrorReason.STORAGE, outcome: 9 as ErrorOutcome },
+      { code: ErrorCode.TIMEOUT, outcome: ErrorOutcome.NO_EFFECT },
+    ];
+    const partial = await c.act({ type: "settings.save", key: KEY, changes: change });
+    expect(partial.settingsSave!.items).toMatchObject([{ status: "unknown", error: "This device didn't respond in time. The adapter confirmed saving only part of the change." }]);
+    const complete = await c.act({ type: "settings.save", key: KEY, changes: change });
+    expect(complete).toMatchObject({ ok: false, settingsSave: { items: [{ status: "saved", error: null }] } });
+    // Without an outcome, or with one this app doesn't know, nothing confirms the change wasn't saved.
+    const unspecified = await c.act({ type: "settings.save", key: KEY, changes: change });
+    expect(unspecified.settingsSave!.items).toMatchObject([{ status: "unknown", error: "This device didn't respond in time." }]);
+    const newer = await c.act({ type: "settings.save", key: KEY, changes: change });
+    expect(newer.settingsSave!.items).toMatchObject([{ status: "unknown", error: "The adapter couldn't read or write its saved data." }]);
+    const none = await c.act({ type: "settings.save", key: KEY, changes: change });
+    expect(none.settingsSave!.items).toMatchObject([{ status: "not_saved", error: "This device didn't respond in time." }]);
     await c.stop();
   });
 
@@ -135,7 +164,7 @@ describe("settings form submission", () => {
     brightness.fails = ErrorCode.DEVICE_ERROR;
     const { c, row } = await start(fake);
     expect(await c.act({ type: "settings.save", key: KEY, changes: [{ type: "set", setting: field("backlight", "brightness"), value: 6 }] })).toMatchObject({ ok: true });
-    await until(() => row("backlight", "brightness").error === "device_error");
+    await until(() => row("backlight", "brightness").error?.code === "device_error");
     expect(row("backlight", "brightness")).toMatchObject({ saved: 6, value: 3, state: null });
     // Saving the value again applies it again.
     brightness.fails = null;

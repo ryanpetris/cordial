@@ -1,16 +1,18 @@
 // Converts protocol messages into the app's plain state, and app values back
 // into protocol values. Unknown enum values read as the enum's zero value,
-// unknown oneof cases as unset, and settings of a group or field this app
-// doesn't know are left out.
-import type { MessageInitShape } from "@bufbuild/protobuf";
+// except in errors, which keep them as numbers. Unknown oneof cases read as
+// unset, and settings of a group or field this app doesn't know are left out.
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import {
   BacklightEffect,
   BacklightMode,
   BacklightStatus,
-  CapacityReason,
   CodeKind,
   DeviceState,
   ErrorCode,
+  ErrorOutcome,
+  ErrorReason,
+  ErrorSchema,
   FunctionRowMode,
   InactiveReason,
   IntegrationKind,
@@ -30,7 +32,9 @@ import {
   type Candidate as WireCandidate,
   type Device,
   type DeviceInformation as WireDeviceInformation,
+  type Error as ProtocolError,
   type Pairing,
+  type RecordError,
   type Profile as WireProfile,
   type ResourceCapacity,
   type SettingsObject,
@@ -39,11 +43,9 @@ import {
   type SettingsUpdateSchema,
   type Status,
 } from "@cordial/protocol";
-import type { CordialError } from "@cordial/client";
 import type {
   AdapterStatus,
   Candidate,
-  Code,
   DeviceInformation,
   DeviceRecord,
   Integration,
@@ -80,15 +82,16 @@ const optional = <T>(value: T | undefined): T | null => (value === undefined ? n
 /** Device values fit in a double; larger ones only lose precision. */
 const number = (n: bigint) => Number(n);
 
-export const errorCode = (code: ErrorCode) => name(ErrorCode, code);
+/** An enum value by lower-case name, or its number when this app doesn't know it. */
+const named = <E extends Record<string, string | number>>(e: E, value: number) => (value in e ? name(e, value) : value);
 
-export function wireError(error: CordialError): WireError {
-  return {
-    code: errorCode(error.code),
-    reason: error.code === ErrorCode.NO_CAPACITY ? name(CapacityReason, error.reason) : null,
-    outcomeUnknown: error.outcomeUnknown,
-  };
+/** An error from a message or a CordialError, with every detail it carries. */
+export function wireError(e: Pick<ProtocolError, "code" | "reason" | "outcome" | "related">): WireError {
+  return { code: named(ErrorCode, e.code), reason: named(ErrorReason, e.reason), outcome: named(ErrorOutcome, e.outcome), related: e.related.map(wireError) };
 }
+
+/** A record's read failure; a missing error reads as an unknown one. */
+export const recordError = (r: RecordError): WireError => wireError(r.error ?? create(ErrorSchema));
 
 /** Resource entries of known types, the first of each type. */
 export function resources(list: ResourceCapacity[]): Resource[] {
@@ -100,8 +103,8 @@ export function resources(list: ResourceCapacity[]): Resource[] {
   });
 }
 
-/** Distinct error codes; ones this app doesn't know read as `unknown`. */
-export const errors = (list: ErrorCode[]): Code[] => [...new Set(list.map(errorCode))];
+/** Distinct complete errors in the adapter's order. */
+export const errors = (list: ProtocolError[]): WireError[] => [...new Map(list.map(wireError).map((e) => [JSON.stringify(e), e])).values()];
 
 export function status(s: Status): AdapterStatus {
   const p = s.profileSupport;
@@ -164,7 +167,7 @@ function hidpp(d: Device): Integration | null {
     version: version ? { major: version.major, minor: version.minor } : null,
     // A status this app doesn't know reads as off.
     state: s.case === "error" ? null : name(IntegrationState, s.case === "state" ? s.value : IntegrationState.OFF),
-    error: s.case === "error" ? errorCode(s.value) : null,
+    error: s.case === "error" ? wireError(s.value) : null,
   };
 }
 
@@ -199,7 +202,10 @@ export function device(d: Device): DeviceRecord {
     }),
     outputs: d.outputs.flatMap((o) => {
       const r = role(o.role);
-      return r ? [{ role: r, mode: outputMode(o.mode), state: name(OutputState, o.state), slot: optional(o.slot) }] : [];
+      // An unset status, or one this app doesn't know, reads as unknown.
+      const s = o.status;
+      const state = s.case === "error" ? null : name(OutputState, s.case === "state" ? s.value : OutputState.UNKNOWN);
+      return r ? [{ role: r, mode: outputMode(o.mode), state, error: s.case === "error" ? wireError(s.value) : null, slot: optional(o.slot) }] : [];
     }),
   };
 }
@@ -335,7 +341,7 @@ export function objectSettings(o: SettingsObject): Setting[] {
       value: scalar(s, w.value),
       saved: scalar(s, w.saved),
       state: status?.case === "state" ? name(SettingState, status.value) : null,
-      error: status?.case === "error" ? errorCode(status.value) : null,
+      error: status?.case === "error" ? wireError(status.value) : null,
       choices: [] as Scalar[],
       min: null as number | null,
       max: null as number | null,
@@ -410,7 +416,7 @@ export type PairingStep =
   | { kind: "progress" }
   | { kind: "prompt"; prompt: PairingPrompt }
   | { kind: "done"; device: number }
-  | { kind: "failed"; code: ReturnType<typeof errorCode> };
+  | { kind: "failed"; error: WireError };
 
 export function pairingStep(p: Pairing): PairingStep {
   const step = p.step;
@@ -423,8 +429,8 @@ export function pairingStep(p: Pairing): PairingStep {
       return { kind: "prompt", prompt: { kind: "show", code: name(CodeKind, step.value.kind), value: step.value.value } };
     case "done":
       return { kind: "done", device: step.value.device };
-    case "failed":
-      return { kind: "failed", code: errorCode(step.value) };
+    case "error":
+      return { kind: "failed", error: wireError(step.value) };
     default:
       // Connecting, or a step this app doesn't know: still in progress.
       return { kind: "progress" };

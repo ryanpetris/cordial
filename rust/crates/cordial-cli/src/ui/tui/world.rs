@@ -32,6 +32,9 @@ pub struct AdapterView {
     /// Opening finished without the adapter becoming usable.
     pub failed: bool,
     pub connect_error: Option<String>,
+    /// Saved devices the adapter's last listing couldn't read and that this session has no record
+    /// of, with why, in ID order.
+    pub unreadable: Vec<(u32, p::Error)>,
 }
 
 impl AdapterView {
@@ -55,6 +58,9 @@ impl AdapterView {
             Conn::Disconnected => ("Disconnected", false),
             Conn::Connecting => ("Connecting…", false),
             Conn::Connected if self.failed => ("Needs Attention", true),
+            Conn::Connected if !self.ready && !self.faults().is_empty() => {
+                ("Needs Attention", true)
+            }
             Conn::Connected if !self.ready => ("Starting…", false),
             Conn::Connected if !self.attention.is_empty() => ("Needs Attention", true),
             Conn::Connected => ("Ready", false),
@@ -63,6 +69,23 @@ impl AdapterView {
 
     pub fn profile_support(&self) -> bool {
         self.status.as_ref().is_some_and(profiles::available)
+    }
+
+    /// The adapter's radio, storage and other faults, which a starting adapter doesn't report:
+    /// every error other than those shown in their own places.
+    pub fn faults(&self) -> Vec<&p::Error> {
+        use ErrorCode::*;
+        let shown = [
+            StorageFull,
+            ProfileMemoryLow,
+            UsbRequiredCapacityExceeded,
+            UsbReservedCapacityExceeded,
+        ];
+        self.status
+            .iter()
+            .flat_map(|s| &s.errors)
+            .filter(|e| !shown.iter().any(|c| *c as i32 == e.code))
+            .collect()
     }
 }
 
@@ -73,6 +96,9 @@ pub struct DeviceView {
     pub name: String,
     pub kind: DisplayKind,
     pub battery: Option<Battery>,
+    /// Why the adapter's last listing couldn't read the device's record; `d` is then the record
+    /// read before.
+    pub read_error: Option<p::Error>,
 }
 
 impl DeviceView {
@@ -80,8 +106,19 @@ impl DeviceView {
         Page::Device(self.adapter.clone(), self.d.id)
     }
 
+    /// Whether the device is connected as far as the adapter last confirmed; a record the latest
+    /// listing couldn't read confirms nothing.
     pub fn connected(&self) -> bool {
-        model::connected(&self.d)
+        self.read_error.is_none() && model::connected(&self.d)
+    }
+
+    /// The device's state in a few words, as lists show it.
+    pub fn status(&self) -> &'static str {
+        if self.read_error.is_some() {
+            "Couldn't Read"
+        } else {
+            words::device_status(&self.d)
+        }
     }
 
     pub fn low(&self) -> bool {
@@ -137,6 +174,15 @@ impl<F: Fleet> Model<F> {
                 attention,
                 failed: s.unready.is_some(),
                 connect_error: None,
+                unreadable: if s.listed {
+                    st.unreadable
+                        .iter()
+                        .filter(|(id, _)| !st.devices.iter().any(|d| d.id == **id))
+                        .map(|(id, e)| (*id, e.clone()))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             });
         }
         for (id, h) in &self.held {
@@ -152,6 +198,7 @@ impl<F: Fleet> Model<F> {
                 attention: Vec::new(),
                 failed: false,
                 connect_error: None,
+                unreadable: Vec::new(),
             });
         }
         for (id, o) in &self.off {
@@ -171,6 +218,7 @@ impl<F: Fleet> Model<F> {
                 attention: Vec::new(),
                 failed: false,
                 connect_error: o.error.clone(),
+                unreadable: Vec::new(),
             });
         }
         adapters.sort_by(|a, b| order(&a.name, &b.name).then_with(|| a.id.cmp(&b.id)));
@@ -183,11 +231,13 @@ impl<F: Fleet> Model<F> {
                 continue;
             };
             for d in &st.devices {
+                let read_error = st.unreadable.get(&d.id).cloned();
                 devices.push(DeviceView {
                     adapter: s.id.clone(),
                     name: words::device_name(d),
                     kind: words::display_kind(&d.kinds, &d.roles),
-                    battery: Battery::of(d),
+                    battery: Battery::of(d, read_error.is_none()),
+                    read_error,
                     d: d.clone(),
                 });
             }

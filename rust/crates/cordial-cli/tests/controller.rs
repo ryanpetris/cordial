@@ -1,6 +1,6 @@
 mod common;
 
-use common::{Dongle, Plan, device, dpi};
+use common::{Dongle, Plan, device, dpi, read_error, refusal};
 use cordial_cli::{
     controller::{
         AdapterUpdate, Command, Controller, Event, Outcome, Phase, Pick, RunOptions, SettingInput,
@@ -96,7 +96,10 @@ fn run_with(
 fn opening_loads_status_and_devices_then_events_keep_the_view() {
     let dongle = Dongle::with(|sim| {
         sim.devices[0].state = DeviceState::Connected as i32;
-        sim.devices[0].errors = vec![ErrorCode::ProfileLoadFailed as i32];
+        sim.devices[0].errors = vec![p::Error {
+            code: ErrorCode::ProfileLoadFailed as i32,
+            ..Default::default()
+        }];
         sim.settings.insert(1, vec![dpi(0, 800, None)]);
     });
     let (c, rx) = ready(&dongle);
@@ -104,7 +107,7 @@ fn opening_loads_status_and_devices_then_events_keep_the_view() {
     assert_eq!(st.status.name, "Desk");
     assert_eq!(st.devices.len(), 2);
     assert_eq!(
-        cordial_cli::model::profile_error(st.device(1).unwrap()),
+        cordial_cli::model::profile_error(st.device(1).unwrap()).map(p::Error::code),
         Some(ErrorCode::ProfileLoadFailed)
     );
     assert!(st.ready());
@@ -134,7 +137,7 @@ fn opening_lists_every_device_in_one_response() {
     let st = c.state().unwrap();
     let ids: Vec<u32> = st.devices.iter().map(|d| d.id).collect();
     assert_eq!(ids, [1, 2, 3, 5, 6]);
-    assert!(st.unreadable.contains(&4));
+    assert_eq!(st.unreadable.get(&4), read_error(4).error.as_ref());
     let lists = || {
         dongle
             .sent()
@@ -365,7 +368,7 @@ fn a_one_shot_scan_waits_for_its_end() {
         outcome,
         Outcome::ScanFinished {
             count: 1,
-            truncated: false
+            error: None
         }
     ));
 }
@@ -450,7 +453,8 @@ fn saving_settings_sends_one_write_and_events_report_the_apply() {
 #[test]
 fn a_dongle_refusal_is_reported_without_a_refresh() {
     let dongle = Dongle::with(|sim| {
-        sim.refuse.insert("disconnect_device", ErrorCode::Busy);
+        sim.refuse
+            .insert("disconnect_device", refusal(ErrorCode::Busy));
     });
     let (c, rx) = ready(&dongle);
     let before = dongle.sent().len();
@@ -632,7 +636,7 @@ fn layers_are_saved_in_order_and_profiles_in_use_stay() {
         .lock()
         .unwrap()
         .refuse
-        .insert("delete_profile", ErrorCode::InUse);
+        .insert("delete_profile", refusal(ErrorCode::InUse));
     let error = run(&c, &rx, Command::ProfileDelete(id(3))).unwrap_err();
     assert_eq!(error.code_of(), Some(ErrorCode::InUse));
 }
@@ -899,7 +903,7 @@ fn a_missing_device_and_a_missing_profile_are_told_apart() {
         .lock()
         .unwrap()
         .refuse
-        .insert("set_device", ErrorCode::NotFound);
+        .insert("set_device", refusal(ErrorCode::NotFound));
     let error = run(&c, &rx, Command::Set(id(1), Toggle::Trusted, false)).unwrap_err();
     assert_eq!(
         cordial_cli::ui::text::error_line(&error),

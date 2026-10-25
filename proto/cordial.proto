@@ -116,7 +116,7 @@ message Event {
     DeviceRemoved device_removed = 3;
     // A scan found a candidate, or a candidate's name or signal changed.
     Candidate scan_found = 4;
-    // A scan ended, by timeout or StopScan.
+    // A scan ended, by timeout, StopScan or failure.
     ScanDone scan_done = 5;
     // The pairing changed state.
     Pairing pairing = 6;
@@ -183,13 +183,21 @@ message Status {
   string name = 2;
   // Saved host platform used for special-key translation.
   Platform platform = 3;
-  // Bluetooth and storage have started. Until then, commands that need either return
-  // ERROR_CODE_NOT_READY.
+  // Bluetooth and storage are usable. False makes no claim about which subsystem is ready.
+  // Commands that need an unready subsystem return ERROR_CODE_NOT_READY; pairing requires both.
   bool ready = 4;
-  // Complete set of current adapter problems, without duplicates, in numeric order. Empty clears
-  // all adapter errors. Each applicable code is reported and shown independently, including when
-  // both USB capacity codes apply. Changes arrive in Event.adapter.
-  repeated ErrorCode errors = 5;
+  // Complete set of current adapter problems, ordered and deduplicated as described by Error.
+  // Empty clears all adapter errors. Each problem is reported independently, including when both
+  // USB capacity codes apply. Changes arrive in Event.adapter.
+  // Ordinary startup has no error merely because ready is false. Radio failures use reason RADIO
+  // with the reported cause mapped to ErrorCode, or NOT_READY when only unavailability is known.
+  // Storage initialization or access failures use STORAGE_FAILED with reason STORAGE. These radio
+  // and storage failures clear independently when their subsystem recovers. An unresolved save
+  // uses STORAGE_FAILED with reason STORAGE and outcome UNKNOWN. It keeps storage not ready until
+  // the outcome is resolved or an adapter restart successfully reloads saved state. Radio recovery
+  // alone does not clear it. STORAGE_FULL also uses reason STORAGE, but follows its own clearing
+  // rule and does not make storage unready. Clients use ready, not a reason, for readiness.
+  repeated Error errors = 5;
   // Current resource usage, at most one entry per type. Missing types are not reported; clients
   // ignore unknown types. Changes arrive in Event.adapter.
   // INTERFACES counts USB interfaces actually exposed; limit is the compiled interface maximum.
@@ -348,9 +356,16 @@ message Candidate {
 }
 
 message ScanDone {
+  // Number of retained candidates. An error does not discard them or invalidate their IDs;
+  // pairing still requires adapter readiness.
   uint32 count = 1;
-  // The candidate limit was reached.
-  bool truncated = 2;
+  // Absent after an ordinary timeout or StopScan with no lost results. Dropping candidates at the
+  // limit reports NO_CAPACITY with reason SCAN_CANDIDATES; exhausting candidate IDs reports
+  // INTERNAL with that reason. A radio failure uses the code and RADIO reason described by
+  // Status.errors and is primary, with any earlier candidate error in related.
+  // Outcome describes collected results: PARTIAL when some were retained,
+  // NO_EFFECT when none were retained. Starting another scan clears the previous result.
+  Error error = 2;
 }
 
 message Pairing {
@@ -364,8 +379,13 @@ message Pairing {
     ConfirmCode confirm_code = 4;
     ShowCode show_code = 5;
     PairingDone done = 6;
-    // Pairing ended. Existing bonds are unchanged.
-    ErrorCode failed = 7;
+    // Pairing ended with a failure. Outcome describes the saved bond: NO_EFFECT confirms that
+    // saved bonds are unchanged; UNKNOWN means the save could not be confirmed. COMPLETE confirms
+    // that the bond was saved despite a later failure. Other outcomes retain their generic meanings.
+    // Capacity failures identify the resource in reason. Cleanup failures appear in related without
+    // replacing the primary failure or its outcome; their outcomes describe cleanup, not the bond
+    // save.
+    Error error = 7;
   }
 }
 
@@ -423,9 +443,11 @@ message DeviceListEntry {
   // Required.
   oneof entry {
     Device device = 1;
-    // The ID of a device whose saved record could not be read from flash. The listing continues
-    // past it. An undecodable record is removed as lost and is not listed.
-    uint32 unreadable = 2;
+    // The device ID and its read failure. The listing continues past it. Clients preserve previously
+    // known device information as last-known data, not confirmation of a connection or preferences.
+    // Fresh records and events supersede it; actual absence or removal clears it. An undecodable
+    // record is removed as lost and not listed.
+    RecordError error = 2;
   }
 }
 
@@ -442,7 +464,7 @@ message SetDevice {
   uint32 device = 1;
   // Whether the device is loaded into the Bluetooth stack so it can connect. False unloads and
   // disconnects it; it stays saved. True returns ERROR_CODE_NO_CAPACITY with
-  // CAPACITY_REASON_ENABLED when the transport's RESOURCE_TYPE_DEVICES allowance is full.
+  // ERROR_REASON_ENABLED_DEVICES when the transport's RESOURCE_TYPE_DEVICES allowance is full.
   optional bool enabled = 2;
   // Whether the device may reconnect on its own.
   optional bool trusted = 3;
@@ -470,7 +492,7 @@ message IntegrationUpdate {
 
 // Clears a disconnect pause and starts connecting. An immediate refusal responds with Error.
 // An accepted attempt responds with Device; a later failure arrives in Event.device as
-// DEVICE_STATE_DISCONNECTED with the failure code in Device.errors.
+// DEVICE_STATE_DISCONNECTED with the failure in Device.errors.
 message ConnectDevice {
   // Required.
   uint32 device = 1;
@@ -520,13 +542,15 @@ message Device {
   bool paused = 9;
   // Missing when the Dongle will use this device. Otherwise why not.
   optional InactiveReason inactive = 10;
-  // Complete set of connection and profile problems, without duplicates, in numeric order.
-  // Integration and setting failures stay on their respective records. At most one connection
-  // failure is present; a new failure replaces it. It clears after a successful connection,
-  // disabling the device or restarting the Dongle.
+  // Complete set of connection, unpair and profile problems, ordered and deduplicated as described
+  // by Error. Integration and setting failures stay on their respective records. At most one
+  // connection or unpair failure is present; a new failure replaces it. It clears after a successful
+  // connection, disabling the device or restarting the Dongle.
   // Profile errors apply only while connected and clear when profiles load or the device
-  // disconnects. Empty clears all device errors. Changes arrive in Event.device.
-  repeated ErrorCode errors = 11;
+  // disconnects. Outcomes describe the failed connection attempt, unpair or profile load.
+  // An unresolved unpair reports UNKNOWN; related errors describe restoring the native bond.
+  // Empty clears all device errors. Changes arrive in Event.device.
+  repeated Error errors = 11;
   // Link security while connected.
   Security security = 12;
   // Every integration the device has a saved preference for or is detected with on the current
@@ -592,9 +616,17 @@ message OutputStatus {
   // Required.
   Role role = 1;
   OutputMode mode = 2;
-  OutputState state = 3;
+  // Required. The producer always sets state or error; state UNKNOWN explicitly reports unknown.
+  // Consumers treat an unset or unknown variant as UNKNOWN. Unsupported backends report UNSUPPORTED
+  // with reason OUTPUT_BACKEND; unsupported device layouts use INPUT_LAYOUT. Outcomes describe
+  // output setup.
+  // USB capacity problems belong to Status.errors; a pending output alone is not a failure.
+  oneof status {
+    OutputState state = 3;
+    Error error = 4;
+  }
   // Zero-based temporary slot within the role and mode, only while Active.
-  optional uint32 slot = 4;
+  optional uint32 slot = 5;
 }
 
 enum OutputState {
@@ -603,7 +635,6 @@ enum OutputState {
   OUTPUT_STATE_DISCONNECTED = 2;
   OUTPUT_STATE_PENDING = 3;
   OUTPUT_STATE_ACTIVE = 4;
-  OUTPUT_STATE_UNSUPPORTED = 5;
 }
 
 enum Transport {
@@ -671,12 +702,10 @@ message Integration {
   // treats the integration as off.
   oneof status {
     IntegrationState state = 4;
-    // Connected, and starting failed.
-    ErrorCode error = 5;
+    // Connected, and starting failed. Missing required protocol versions or reports use
+    // PROTOCOL_UNSUPPORTED. Outcome describes integration setup on the current connection.
+    Error error = 5;
   }
-
-  // Fields 20 and up carry details specific to one kind, which a client never needs in order to
-  // show or use the integration.
 }
 
 message IntegrationDetection {
@@ -702,9 +731,6 @@ enum IntegrationState {
   // Up: its settings have been read and saved values are applied. Special-key translation runs
   // wherever the device supports it and is never reported.
   INTEGRATION_STATE_ACTIVE = 3;
-  // Connected, and the device cannot use this integration at all, such as a device without usable
-  // HID++ reports.
-  INTEGRATION_STATE_UNSUPPORTED = 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -728,7 +754,7 @@ message AdapterInformation {
 // valid standard-service readings apply. A failed preferred read permits a valid fallback,
 // except for battery readings, whose source rules are defined on BatteryInformation.
 // Configurable behavior appears here only when the device does not accept writes for it.
-// A saved preference for such a field remains in DeviceSettings with UNSUPPORTED status.
+// A saved preference for such a field remains in DeviceSettings with an UNSUPPORTED error.
 message DeviceInformation {
   DeviceIdentity identity = 1;
   BatteryInformation battery = 2;
@@ -942,7 +968,7 @@ enum SettingsGroup {
 // Missing fields leave their preferences unchanged. Each present field must select a value or
 // forget; an empty change is invalid. Changes apply in list order, with the last change to each
 // field winning. Validation failure saves and applies nothing. A save failure starts no apply;
-// Error.outcome_unknown reports when durability cannot be determined. Clients then read back
+// Error.outcome = UNKNOWN reports when durability cannot be determined. Clients then read back
 // saved values. A confirmed storage failure leaves the previous preferences unchanged.
 //
 // Validation uses the advertised limits, retained with saved preferences while disconnected.
@@ -959,8 +985,9 @@ enum SettingsGroup {
 // device setter are written together, preserving unsaved fields. A failed setter does not undo
 // other setters or integrations. Failures belong to each affected field's SettingStatus,
 // separately from Integration.error; saved preferences survive for the next apply attempt.
-// A timeout uses ERROR_CODE_TIMEOUT: the write may have taken effect, so the next apply reads
-// before writing. A forgotten setting is no longer written; its actual device value is unchanged.
+// A timeout uses ERROR_CODE_TIMEOUT with outcome UNKNOWN when the write may have taken effect,
+// so the next apply reads before writing. A forgotten setting is no longer written; its actual
+// device value is unchanged.
 // Only this command creates saved preferences. SettingsChanged follows every resulting change.
 message SetSettings {
   // Required.
@@ -1008,8 +1035,8 @@ message SettingsChanged {
 // A complete domain, owned by integration. Its SettingsRef is derived from the selected group
 // and its component index when applicable. At most one object exists for each identity.
 // Only configurable fields discovered on this connection or fields with a saved preference appear.
-// A field with a saved preference remains even when its capability disappears, with UNSUPPORTED
-// status. On disconnect, fields without saved preferences disappear; the rest retain their
+// A field with a saved preference remains even when its capability disappears, with an UNSUPPORTED
+// error. On disconnect, fields without saved preferences disappear; the rest retain their
 // saved metadata and clear value. Integration.state determines availability and freshness.
 message SettingsObject {
   // Required. Matches a Device.integrations entry.
@@ -1125,7 +1152,10 @@ message SettingStatus {
   // Required.
   oneof result {
     SettingState state = 1;
-    ErrorCode error = 2;
+    // Unsupported saved settings use UNSUPPORTED. Outcome describes applying this field to the
+    // device, independently of saving its preference on the adapter. UNKNOWN means readback or
+    // confirmation could not establish whether the field took effect.
+    Error error = 2;
   }
 }
 
@@ -1137,8 +1167,6 @@ enum SettingState {
   SETTING_STATE_APPLIED = 2;
   // The device reports another value. The next apply restores the saved preference.
   SETTING_STATE_CHANGED_ON_DEVICE = 3;
-  // The device does not support this saved setting.
-  SETTING_STATE_UNSUPPORTED = 4;
 }
 
 // Explicitly forget one field's saved preference. Never resets the actual device value.
@@ -1380,9 +1408,9 @@ message ProfileListEntry {
   // Required.
   oneof entry {
     Profile profile = 1;
-    // The ID of a profile whose saved record could not be read from flash. The listing continues
-    // past it. An undecodable record is removed as lost and is not listed.
-    uint32 unreadable = 2;
+    // The profile ID and its read failure. The listing continues past it. An undecodable record
+    // is removed as lost and not listed.
+    RecordError error = 2;
   }
 }
 
@@ -1454,7 +1482,7 @@ message ListProfileRules {
 // input; a held input keeps the outputs it was pressed with until it is released. If any change is invalid or the save
 // fails, nothing is saved. A save that would make the profile larger than the
 // MEMORY limit in ProfileSupport.resources, or grow a loaded profile beyond the remaining budget,
-// returns ERROR_CODE_NO_CAPACITY with CAPACITY_REASON_PROFILE_MEMORY.
+// returns ERROR_CODE_NO_CAPACITY with ERROR_REASON_PROFILE_MEMORY.
 //
 // The complete Request must fit in 1024 protobuf bytes. Clients divide larger sets of changes
 // into separate requests that each fit, waiting for success before sending the next batch. There
@@ -1615,12 +1643,36 @@ message FileData {
 // Errors
 // ---------------------------------------------------------------------------
 
+// A failed read of one saved record. The containing list determines the record kind. The read
+// failure uses STORAGE_FAILED with reason STORAGE and outcome NO_EFFECT: no record was returned.
+// This outcome describes the read result, not whether saved data changed. It does not turn the
+// entire listing into a failed response.
+message RecordError {
+  // Required. Positive. The saved record's ID.
+  uint32 id = 1;
+  // Required.
+  Error error = 2;
+}
+
+// A failure in the operation or record that contains it. Every code may carry a reason, outcome
+// and related errors; their specific meanings are documented by the containing operation.
+// Missing or unknown details never imply success, unchanged data or permission to retry.
+// An unknown code is a generic failure; unknown reasons and outcomes provide no further detail.
+// Error lists are ordered lexicographically by numeric code, reason, outcome and then related
+// errors recursively. A shorter related list sorts first when it is a prefix of another. Only
+// identical complete errors are duplicates; equal codes with different details stay distinct.
 message Error {
   ErrorCode code = 1;
-  // For ERROR_CODE_NO_CAPACITY.
-  CapacityReason reason = 2;
-  // For ERROR_CODE_STORAGE_FAILED: the Dongle cannot tell whether the save took effect.
-  bool outcome_unknown = 3;
+  // Further context for the failure, independent of its code.
+  ErrorReason reason = 2;
+  // What is known about the operation's effects or results. For a command response this concerns
+  // the requested changes, or returned results for a read. A containing record may define a more
+  // specific scope. An outcome describes evidence, not an inference from the error code.
+  ErrorOutcome outcome = 3;
+  // Additional failures associated with this one, ordered and deduplicated as described above.
+  // They preserve their own reasons and outcomes and never replace the primary failure. A related
+  // error's outcome concerns its documented operation, such as cleanup after a pairing failure.
+  repeated Error related = 4;
 }
 
 enum ErrorCode {
@@ -1632,7 +1684,7 @@ enum ErrorCode {
   ERROR_CODE_UNKNOWN_COMMAND = 2;  // No such command in this firmware.
   ERROR_CODE_BAD_ARGS = 3;         // Missing Required field, wrong value type, or out of range.
   ERROR_CODE_TOO_LONG = 4;         // The Request exceeded 1024 protobuf bytes before COBS encoding.
-  ERROR_CODE_NOT_READY = 5;        // Bluetooth or storage has not started, or failed to start.
+  ERROR_CODE_NOT_READY = 5;        // A required subsystem is not ready. See Status.ready.
   ERROR_CODE_NOT_FOUND = 6;        // No such device, candidate, profile, setting or file.
   ERROR_CODE_NOT_CONNECTED = 7;    // The command needs a connected device.
   ERROR_CODE_BUSY = 8;             // A pairing is running, or the device is doing something that conflicts.
@@ -1641,7 +1693,7 @@ enum ErrorCode {
   ERROR_CODE_UNSUPPORTED = 11;     // Transport, interface, setting or value not supported.
   ERROR_CODE_NO_CAPACITY = 12;     // See Error.reason.
   ERROR_CODE_NO_PROMPT = 13;       // AcceptPrompt or RejectPrompt with no open prompt.
-  ERROR_CODE_STORAGE_FAILED = 14;  // Reading or writing saved data failed. See Error.outcome_unknown.
+  ERROR_CODE_STORAGE_FAILED = 14;  // Reading or writing saved data failed. See Error.outcome.
   ERROR_CODE_INTERNAL = 15;
   ERROR_CODE_IN_USE = 16;          // A saved preference refers to the profile.
 
@@ -1682,16 +1734,40 @@ enum ErrorCode {
   ERROR_CODE_PROFILE_LOAD_FAILED = 35;      // A profile could not be read or decoded.
 }
 
-enum CapacityReason {
-  CAPACITY_REASON_UNKNOWN = 0;
-  // The transport's RESOURCE_TYPE_DEVICES allowance is full.
-  CAPACITY_REASON_ENABLED = 1;
-  // Flash is full.
-  CAPACITY_REASON_STORAGE = 2;
-  // ConnectDevice or StartPairing cannot obtain a connection slot. For normal connections this
-  // includes the RESOURCE_TYPE_CONNECTIONS allowance; a slot still closing is not available yet.
-  CAPACITY_REASON_CONNECTIONS = 3;
-  // The profile would exceed the MEMORY limit in ProfileSupport.resources or a loaded profile's
-  // growth would exceed the remaining budget.
-  CAPACITY_REASON_PROFILE_MEMORY = 4;
+// Context for any error code. The containing operation defines what failed in this context.
+enum ErrorReason {
+  ERROR_REASON_UNKNOWN = 0;
+  // Enabled-device admission, including the transport's RESOURCE_TYPE_DEVICES allowance.
+  ERROR_REASON_ENABLED_DEVICES = 1;
+  // Connection slots, including the transport's RESOURCE_TYPE_CONNECTIONS allowance.
+  ERROR_REASON_CONNECTIONS = 2;
+  // Scan candidate retention or candidate ID allocation.
+  ERROR_REASON_SCAN_CANDIDATES = 3;
+  // Reading, writing or allocating persistent storage.
+  ERROR_REASON_STORAGE = 4;
+  // Memory for a profile or the shared loaded-profile budget.
+  ERROR_REASON_PROFILE_MEMORY = 5;
+  // Bluetooth radio initialization or operation.
+  ERROR_REASON_RADIO = 6;
+  // The selected USB output backend.
+  ERROR_REASON_OUTPUT_BACKEND = 7;
+  // The device's input layout for the requested translation.
+  ERROR_REASON_INPUT_LAYOUT = 8;
+}
+
+// Evidence about the effects or results defined by the containing operation. None of these values
+// turns an error into success or authorizes an automatic retry.
+enum ErrorOutcome {
+  // No outcome information is supplied. Unknown enum values also provide no information.
+  ERROR_OUTCOME_UNSPECIFIED = 0;
+  // The adapter explicitly cannot determine the outcome.
+  ERROR_OUTCOME_UNKNOWN = 1;
+  // The operation is confirmed to have produced no effects or results in its documented scope.
+  ERROR_OUTCOME_NO_EFFECT = 2;
+  // Some effects or results are confirmed, but the operation did not complete fully. This does
+  // not confirm that all remaining effects were absent.
+  ERROR_OUTCOME_PARTIAL = 3;
+  // The intended effects or results are confirmed despite a failure in another part of the
+  // operation, such as subsequent cleanup.
+  ERROR_OUTCOME_COMPLETE = 4;
 }

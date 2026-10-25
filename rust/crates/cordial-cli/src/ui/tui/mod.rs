@@ -128,6 +128,8 @@ pub enum Action {
     /// Shows the next page of profiles when true, else the previous one.
     ProfilePage(bool),
     ProfilesRetry,
+    /// Lists the adapter's devices again, as after records couldn't be read.
+    DevicesRetry,
     ProfileMenu(u32),
     ProfileNew,
     ProfileCopy(u32),

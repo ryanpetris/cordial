@@ -95,13 +95,14 @@ try {
   // a banner.
   const required = "The adapter doesn't have enough USB capacity for every required interface.";
   const usbFact = page.locator(".fact").filter({ has: page.locator("dt", { hasText: /^Interfaces$/ }) });
-  status.errors = ["usb_required_capacity_exceeded", "usb_reserved_capacity_exceeded"];
+  const problem = (code) => ({ code, reason: "unknown", outcome: "unspecified", related: [] });
+  status.errors = [problem("usb_required_capacity_exceeded"), problem("usb_reserved_capacity_exceeded")];
   ready.adapters[0].attention = [required];
   await publish(ready);
   await page.locator(".banner").getByText(required, { exact: true }).waitFor();
   await usbFact.getByText("Required Capacity Exceeded", { exact: true }).waitFor();
   await usbFact.getByText("Reserved Capacity Exceeded", { exact: true }).waitFor();
-  status.errors = ["usb_reserved_capacity_exceeded"];
+  status.errors = [problem("usb_reserved_capacity_exceeded")];
   ready.adapters[0].attention = [];
   await publish(ready);
   await page.locator(".banner").getByText(required, { exact: true }).waitFor({ state: "detached" });
@@ -110,6 +111,24 @@ try {
   status.errors = [];
   await publish(ready);
   await usbFact.getByText("Reserved Capacity Exceeded", { exact: true }).waitFor({ state: "detached" });
+
+  // Diagnostics lists the adapter's errors with every detail, and the saved devices it couldn't
+  // read, which Retry lists again.
+  status.errors = [{ code: "storage_failed", reason: "storage", outcome: "unknown", related: [] }];
+  ready.adapters[0].unreadableDevices = [{ id: 9, error: { code: "storage_failed", reason: "storage", outcome: "no_effect", related: [] } }];
+  await publish(ready);
+  await tab("Diagnostics").click();
+  await page.getByText("The adapter couldn't read or write its saved data. The adapter couldn't confirm whether the change was saved. Check before trying again.", { exact: true }).waitFor();
+  await page.getByText("Device 9", { exact: true }).waitFor();
+  await page.getByText("Couldn't Read", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  assert.deepEqual(await actions(), [{ type: "devices.reload", adapterId: adapter.id }]);
+  await app.evaluate(() => { globalThis.uiActions = []; });
+  status.errors = [];
+  ready.adapters[0].unreadableDevices = [];
+  await publish(ready);
+  await page.getByText("Device 9", { exact: true }).waitFor({ state: "detached" });
+  await tab("Details").click();
 
   // Each profile shows an icon for each role it changes.
   await tab("Profiles").click();
@@ -151,6 +170,12 @@ try {
   await empty("Starting…").waitFor();
   await selected("Profiles");
   assert.equal(await via.count(), 0);
+  // A fault reported while starting needs attention rather than reading as starting.
+  const fault = { ...status, ready: false, errors: [{ code: "not_ready", reason: "radio", outcome: "unspecified", related: [] }] };
+  await publish({ ...starting, adapters: [{ ...starting.adapters[0], status: fault }] });
+  await empty("Needs Attention").waitFor();
+  await publish(starting);
+  await empty("Starting…").waitFor();
 
   // A name dialog opened while ready can't submit once USB goes away.
   await publish(ready);

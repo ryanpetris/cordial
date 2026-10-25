@@ -4,8 +4,9 @@
 
 Each command is one `Request.command` variant; its message in
 [`proto/cordial.proto`](../../proto/cordial.proto) documents its fields. This page describes what
-each command does. Commands that need Bluetooth or storage return `ERROR_CODE_NOT_READY` until both
-have started.
+each command does. A command that needs an unavailable subsystem returns `ERROR_CODE_NOT_READY`.
+Pairing requires both Bluetooth and storage to be ready; aggregate `Status.ready = false` does not
+identify which subsystem is unavailable.
 
 Every `List` command returns its complete list in one response frame; see
 [Listings](compatibility.md#listings) for ordering and streaming.
@@ -49,29 +50,39 @@ interfaces, readiness or adapter information.
 | `CancelPairing` | none | Cancels a pairing that has not saved its bond. |
 
 Candidates arrive as `scan_found` events, again whenever a candidate's name, kinds or signal
-changes, and the scan ends with a `scan_done` event. At most 32 candidates are kept; past that,
-`scan_done` reports `truncated`. Candidate IDs stay valid until the next scan starts or the session
-ends. Results are candidates, not a promise of HID support. An enabled saved BLE device advertising
-its identity alone is not a fresh candidate.
+changes, and the scan ends with a `scan_done` event. `ScanDone.count` is the number retained.
+At most 32 candidates are kept; dropping candidates reports `NO_CAPACITY` with reason
+`SCAN_CANDIDATES` in `ScanDone.error`. Exhausting candidate IDs reports `INTERNAL` with the same
+reason. A radio failure is primary with reason `RADIO` and keeps earlier candidate failures in
+`related`. The outcome describes collected results: `PARTIAL` when some candidates were retained,
+`NO_EFFECT` when none were retained. An ordinary timeout or `StopScan` with no lost results has no
+error. Candidate IDs remain valid until the next scan starts or the session ends, including after
+a scan error, but pairing still requires adapter readiness. Results are candidates, not a promise
+of HID support. An enabled saved BLE device advertising its identity alone is not a fresh candidate.
 
 `StartPairing` refuses a blocked saved device, a transport the firmware cannot pair or has
-disabled, a full flash (`ERROR_CODE_NO_CAPACITY` with `CAPACITY_REASON_STORAGE`, also reported as
+disabled, a full flash (`ERROR_CODE_NO_CAPACITY` with `ERROR_REASON_STORAGE`, also reported as
 `ERROR_CODE_STORAGE_FULL` in `Status.errors`) and a full connection table
-(`CAPACITY_REASON_CONNECTIONS`). A saved device is recognized from the candidate's address when the address is its identity or the stack can resolve
-it; a disabled device advertising a private address is recognized only once pairing reveals its
+(`ERROR_REASON_CONNECTIONS`). A saved device is recognized from the candidate's address when the
+address is its identity or the stack can resolve it; a disabled device advertising a private
+address is recognized only once pairing reveals its
 identity, and a blocked one then fails with `ERROR_CODE_BLOCKED` without changing its bond. It
 closes the selected device's own link and any setup link first, and never an unrelated working
 device.
 
 Progress arrives as `pairing` events: `connecting`, then `enter_code`, `confirm_code` or
-`show_code` when the method needs the user, then `done` with the saved device ID or `failed` with
-an error code. Just Works pairing goes straight from `connecting` to `done`. A prompt expires after
+`show_code` when the method needs the user, then `done` with the saved device ID or `error` with
+a full `Error`. Just Works pairing goes straight from `connecting` to `done`. A prompt expires after
 30 seconds and the whole pairing after 120.
 
-The bond is committed only once pairing completes. Failure, cancellation, the session ending or a
-restart before that leaves every existing bond unchanged. Pairing a device that is already saved
-renews its bond in place, keeping its ID, name and preferences, including whether it is enabled; a
-disabled device connects once it is enabled.
+The bond is committed only once pairing completes. A failure before saving leaves existing bonds
+unchanged. In a pairing error, `NO_EFFECT` confirms unchanged saved bonds, `UNKNOWN` means the save
+cannot be confirmed, and `COMPLETE` confirms the bond save despite a later failure. The other
+generic outcomes retain their meanings; these values are not exhaustive. Cleanup failures remain
+in `related` with their own cleanup outcomes and never replace uncertain bond-save evidence.
+Cancellation, session end and restart do not undo a bond already saved. Pairing a device that is
+already saved renews its bond in place, keeping its ID, name and preferences, including whether it
+is enabled; a disabled device connects once it is enabled.
 
 A newly paired device is saved trusted and unblocked, with no integration enabled; its first
 connection turns on each integration it detects. It is saved enabled when the number enabled for
@@ -82,7 +93,7 @@ its own; there is no separate connect step.
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListDevices` | `DeviceList` | All saved devices in ascending ID order. A device whose record cannot be read is listed by ID as `unreadable` and the listing continues past it. |
+| `ListDevices` | `DeviceList` | All saved devices in ascending ID order. A record read failure is an `error` entry carrying `RecordError { id, error }`; the listing continues past it. |
 | `GetDevice` | `Device` | One saved device. |
 | `SetDevice` | none | Partial update of `enabled`, `trusted`, `blocked`, integration preferences, output preferences and profile layers, saved in one write. Integration and output updates apply in order. Turning `enabled` off or `blocked` on closes the device's link. |
 | `ConnectDevice` | `Device` | Clears a disconnect pause and starts connecting, or joins an attempt already running. Refused for a disabled or blocked device and while a pairing runs. |
@@ -104,7 +115,7 @@ a disabled device stays saved but cannot connect. Each transport reports its all
 for pairing. The table holds every enabled, unblocked
 device whose transport the firmware supports and has enabled. A `SetDevice` that changes anything
 about a device without an entry, and leaves it enabled and unblocked on such a transport, is refused
-with `ERROR_CODE_NO_CAPACITY` and `CAPACITY_REASON_ENABLED` while that transport's table is full. A
+with `ERROR_CODE_NO_CAPACITY` and `ERROR_REASON_ENABLED_DEVICES` while that transport's table is full. A
 `SetDevice` that changes nothing succeeds without the check, and a device that has an entry keeps
 it, including a device turned off or blocked whose link is still closing. If firmware with a
 smaller table starts
@@ -152,7 +163,8 @@ Only Gamepad is configurable. Disabled clears its saved enabled choice and works
 support. HID and XInput require that role and mode in `Status.output_support`; otherwise the command
 returns `ERROR_CODE_UNSUPPORTED`. Unknown numeric roles or modes and an unspecified role return
 `ERROR_CODE_BAD_ARGS`. Other known roles return `ERROR_CODE_UNSUPPORTED`. Invalid updates and
-failed saves leave the previous policy and desired pools unchanged. An empty list changes nothing.
+confirmed no-effect save failures leave the previous policy and desired pools unchanged. A save
+with outcome `UNKNOWN` does not confirm which policy is durable. An empty list changes nothing.
 Clients gate these writes on advertised support because older firmware ignores unknown fields.
 
 A missing Gamepad preference means Disabled. Saving HID or XInput contributes configured candidates
@@ -190,11 +202,12 @@ go out together), and reads back to confirm. Only saved settings are written.
 
 The routine runs when an integration comes up (on connect, or when it is turned on), when the
 adapter platform changes, and after every `SetSettings` for each integration in the request, once
-the command has responded. A failure sets the affected settings' status to an error code in a
+the command has responded. A failure sets the affected settings' status to a full `Error` in a
 `settings_changed` event, keeps their saved values, and is tried again at the next apply. Different
 setters and integrations are separate device writes, so one failing does not undo the others. A
-write the device does not answer is reported as `ERROR_CODE_TIMEOUT`; it may or may not have taken
-effect, and the next apply settles it by reading first.
+write the device does not answer uses `ERROR_CODE_TIMEOUT` with outcome `UNKNOWN` when it may have
+taken effect. The next apply settles it by reading first. These outcomes describe applying the
+setting to the device, independently of the durable preference save.
 
 A setting that only applies while another has a particular value is still saved: a configured
 backlight level saved while the mode is automatic waits as pending and is written once the mode
@@ -207,7 +220,7 @@ See [HID++](../hidpp.md) for the device operations behind each HID++ setting.
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListProfiles` | `ProfileList` | All saved profiles in ascending ID order. A profile whose record cannot be read is listed by ID as `unreadable` and the listing continues past it. |
+| `ListProfiles` | `ProfileList` | All saved profiles in ascending ID order. A record read failure is an `error` entry carrying `RecordError { id, error }`; the listing continues past it. |
 | `GetProfile` | `Profile` | One saved profile. |
 | `CreateProfile` | `ProfileCreated` | Saves a new, empty profile and returns its ID; a `profile` event follows. |
 | `CopyProfile` | `ProfileCreated` | Saves a new profile with the source's rules and returns its ID; a `profile` event follows. |
@@ -228,9 +241,10 @@ when a scale has a zero numerator or denominator. An axis rule's `destination` m
 capability. Axis rules apply only to absolute Game Pad axes; `invert` reverses the normalized
 axis range. They add no deadzones, curves or sensitivity settings. A save that would make the
 profile larger than `MEMORY.limit` in `ProfileSupport.resources` returns `ERROR_CODE_NO_CAPACITY` with
-`CAPACITY_REASON_PROFILE_MEMORY`, since it could never be loaded. The Dongle applies every rule it accepts to every device that uses the profile, whatever
-kind of device it is. The number of saved profiles is limited only by flash; creating or copying one
-that does not fit returns `ERROR_CODE_NO_CAPACITY` with `CAPACITY_REASON_STORAGE`.
+`ERROR_REASON_PROFILE_MEMORY`, since it could never be loaded. The Dongle applies every rule it
+accepts to every device that uses the profile, whatever kind of device it is. The number of saved
+profiles is limited only by flash; creating or copying one
+that does not fit returns `ERROR_CODE_NO_CAPACITY` with `ERROR_REASON_STORAGE`.
 
 The complete `SetProfileRules` request, including its command envelope and every change, must fit
 1024 protobuf bytes before COBS encoding. Clients reject an oversized request without sending it
@@ -310,7 +324,7 @@ profile in its layers is edited, and after a failed read it also retries with th
 backoff, from two seconds to five minutes. Saving layers never depends on loading the profiles.
 
 An edit that would grow a loaded profile beyond what is left of the budget is refused with
-`ERROR_CODE_NO_CAPACITY` and `CAPACITY_REASON_PROFILE_MEMORY`, through the serial API and through a
+`ERROR_CODE_NO_CAPACITY` and `ERROR_REASON_PROFILE_MEMORY`, through the serial API and through a
 configuration interface alike, so a device never loses its loaded profiles because of an edit. A
 configuration interface loads its profile when an editor first uses it; when it does not fit, the
 editor's requests fail and no device's profiles are unloaded to make room.
@@ -346,8 +360,8 @@ which profile directories exist without reading them. Before USB starts, it clea
 configuration interface whose profile does not exist, so the adapter still enumerates once. While
 reading device policies, it removes such references from device layers. Deleting a lost profile
 removes its references the same way, and USB reconnects if the actual allocation changes.
-`device` and `adapter` events follow. A listing leaves out a lost record it removes; an `unreadable`
-entry names only a record whose flash read failed. As for devices, a failed read is never proof that
+`device` and `adapter` events follow. A listing leaves out a lost record it removes; a `RecordError`
+names only a record whose flash read failed. As for devices, a failed read is never proof that
 data is missing and deletes nothing.
 
 ## Development

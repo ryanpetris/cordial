@@ -3,6 +3,8 @@ import {
   BacklightMode,
   DeviceSchema,
   ErrorCode,
+  ErrorOutcome,
+  ErrorReason,
   FunctionRowMode,
   IntegrationKind,
   KeyboardPlatform,
@@ -74,10 +76,10 @@ describe("settings objects", () => {
     const [mode] = convert.settings([
       create(SettingsObjectSchema, {
         integration: HIDPP,
-        group: { case: "wheel", value: { mode: { value: 9 as WheelMode, saved: WheelMode.STEPPED, status: { result: { case: "error", value: ErrorCode.TIMEOUT } }, choices: [WheelMode.STEPPED, WheelMode.STEPPED, WheelMode.UNKNOWN, 9 as WheelMode] } } },
+        group: { case: "wheel", value: { mode: { value: 9 as WheelMode, saved: WheelMode.STEPPED, status: { result: { case: "error", value: { code: ErrorCode.TIMEOUT, outcome: ErrorOutcome.UNKNOWN } } }, choices: [WheelMode.STEPPED, WheelMode.STEPPED, WheelMode.UNKNOWN, 9 as WheelMode] } } },
       }),
     ]);
-    expect(mode).toMatchObject({ value: "unknown", saved: "stepped", state: null, error: "timeout", choices: ["stepped"] });
+    expect(mode).toMatchObject({ value: "unknown", saved: "stepped", state: null, error: { code: "timeout", reason: "unknown", outcome: "unknown", related: [] }, choices: ["stepped"] });
     const [dpi, other] = convert.settings([
       create(SettingsObjectSchema, {
         integration: HIDPP,
@@ -139,5 +141,21 @@ describe("information", () => {
     expect(s.information).toEqual({ firmwareVersion: "1.0.0", boardName: null, developmentBuild: false });
     expect(s.resources).toEqual([{ type: "interfaces", count: null, limit: 16 }]);
     expect(s.profileSupport!.resources).toEqual([{ type: "memory", count: 0, limit: 0 }]);
+  });
+
+  it("keeps error details it doesn't know as numbers, so distinct errors stay distinct", () => {
+    const s = convert.status(create(StatusSchema, {
+      errors: [
+        { code: ErrorCode.INTERNAL, reason: 99 as ErrorReason },
+        { code: ErrorCode.INTERNAL, reason: 100 as ErrorReason },
+        { code: ErrorCode.INTERNAL, reason: 100 as ErrorReason },
+        { code: 77 as ErrorCode, outcome: 66 as ErrorOutcome, related: [{ code: ErrorCode.TIMEOUT, reason: 55 as ErrorReason }] },
+      ],
+    }));
+    expect(s.errors).toEqual([
+      { code: "internal", reason: 99, outcome: "unspecified", related: [] },
+      { code: "internal", reason: 100, outcome: "unspecified", related: [] },
+      { code: 77, reason: "unknown", outcome: 66, related: [{ code: "timeout", reason: 55, outcome: "unspecified", related: [] }] },
+    ]);
   });
 });

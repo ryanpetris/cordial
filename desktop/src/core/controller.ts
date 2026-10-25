@@ -3,8 +3,8 @@
 // Refusals the adapter would make that this app can predict from what it
 // knows are made here, before sending; one the adapter makes anyway is shown
 // as it is, without retrying or reading anything again.
-import { ConnectionClosedError, CordialError } from "@cordial/client";
-import { IntegrationKind, OutputMode, Platform, Role, Transport, type Event, type Request, type Response } from "@cordial/protocol";
+import { CordialError } from "@cordial/client";
+import { ErrorCode, IntegrationKind, OutputMode, Platform, Role, Transport, type Event, type Request, type Response } from "@cordial/protocol";
 import { adapterName } from "../shared/adapter-name.ts";
 import {
   DEFAULT_PREFERENCES,
@@ -34,10 +34,13 @@ import {
   TRANSPORTS,
   clean,
   codeText,
+  connected,
   connectionError,
   displayKind,
   errorText,
+  hasError,
   inactiveText,
+  plainError,
   profileError,
   storageFull,
   transportDisabledText,
@@ -64,7 +67,8 @@ const SCAN_SECONDS = 30;
 
 const failed = (error: unknown): ActionResult => ({ ok: false, message: failure(error) });
 
-const unsupported = (error: unknown) => error instanceof CordialError && convert.errorCode(error.code) === "unsupported";
+/** Whether the adapter refused with nothing more to report than that it doesn't support the work. */
+const unsupported = (error: unknown) => error instanceof CordialError && error.code === ErrorCode.UNSUPPORTED && plainError(convert.wireError(error));
 
 /** Whether the adapter supports `t` and has it disabled. */
 const disabled = (session: AdapterSession, t: TransportName | null) => session.status.transports.some((x) => x.transport === t && !x.enabled);
@@ -160,18 +164,20 @@ export class Controller {
   #profileAlerts(state: AppState) {
     for (const a of state.adapters) {
       if (a.connection !== "connected" || !a.status) continue;
-      if (!a.status.errors.includes("profile_memory_low")) this.#memoryAlerted.delete(a.id);
+      if (!hasError(a.status.errors, "profile_memory_low")) this.#memoryAlerted.delete(a.id);
       else if (!this.#memoryAlerted.has(a.id)) {
         this.#memoryAlerted.add(a.id);
         this.#deps.profileAlert({ kind: "memory", adapterId: a.id, name: a.name });
       }
     }
     for (const d of state.devices) {
-      const code = profileError(d.device);
-      if (!code) this.#profileAlerted.delete(d.key);
+      // A record the adapter couldn't read says nothing current of the device's profiles.
+      if (d.readError) continue;
+      const error = profileError(d.device);
+      if (!error) this.#profileAlerted.delete(d.key);
       else if (!this.#profileAlerted.has(d.key)) {
         this.#profileAlerted.add(d.key);
-        this.#deps.profileAlert({ kind: "device", key: d.key, name: d.name, code });
+        this.#deps.profileAlert({ kind: "device", key: d.key, name: d.name, error });
       }
     }
   }
@@ -187,7 +193,7 @@ export class Controller {
       const attention: string[] = [];
       if (status.ready && storageFull(status))
         attention.push("The adapter's storage is full. Remove an unused device or forget a saved setting to pair another device.");
-      if (status.errors.includes("usb_required_capacity_exceeded")) attention.push(codeText("usb_required_capacity_exceeded"));
+      if (hasError(status.errors, "usb_required_capacity_exceeded")) attention.push(codeText("usb_required_capacity_exceeded"));
       adapters.push({
         name: status.name,
         id,
@@ -200,6 +206,7 @@ export class Controller {
         profilePage: session.profilePage,
         pickerPage: session.pickerPage,
         profileNames: Object.fromEntries(session.profileNames),
+        unreadableDevices: session.listed ? session.unreadableDevices : [],
       });
       devices.push(...entries);
     }
@@ -216,6 +223,7 @@ export class Controller {
         profilePage: retained.profilePage,
         pickerPage: retained.pickerPage,
         profileNames: retained.profileNames,
+        unreadableDevices: [],
       });
     }
     for (const d of this.manager.disconnected.values()) {
@@ -232,6 +240,7 @@ export class Controller {
         profilePage: null,
         pickerPage: null,
         profileNames: {},
+        unreadableDevices: [],
       });
     }
     adapters.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
@@ -255,6 +264,7 @@ export class Controller {
         running: this.#scan.running,
         candidates: this.#scan.candidates,
         error: this.#scan.error,
+        failure: this.#scan.failure,
       },
       pairing: pairing && {
         adapterId: pairing.adapterId,
@@ -264,6 +274,7 @@ export class Controller {
         prompt: pairing.prompt,
         deviceKey: pairing.deviceKey,
         message: pairing.message,
+        failure: pairing.failure,
       },
       preferences: this.#preferences,
       hostPlatform: this.#deps.hostPlatform,
@@ -285,16 +296,18 @@ export class Controller {
   #device(adapterId: string, session: AdapterSession, device: DeviceRecord): DeviceEntry {
     const key = `${adapterId}/${device.id}`;
     const save = this.#settingsSaves.get(key);
+    const readError = session.readErrors.get(device.id) ?? null;
     return {
       key,
       adapterId,
       device,
       name: clean(device.name) || "Unnamed device",
       kind: displayKind(device.kinds, device.roles),
-      battery: batteryOf(device.information, device.state === "connected"),
+      battery: batteryOf(device.information, connected({ device, readError })),
       pending: session.pendingFor(device.id),
       settings: session.settings.get(device.id) ?? null,
       settingsError: session.settingsErrors.get(device.id) ?? null,
+      readError,
       settingsSave: save?.session === session ? save.save : null,
     };
   }
@@ -314,7 +327,7 @@ export class Controller {
         : `The device is paired but can't connect. ${inactiveText(d)}`;
     } else if (d.state === "disconnected" && connectionError(d)) {
       p.phase = "saved";
-      p.message = `The device is paired, but the adapter couldn't connect to it. ${codeText(connectionError(d)!)}`;
+      p.message = `The device is paired, but the adapter couldn't connect to it. ${errorText(connectionError(d)!, "other")}`;
     }
     if (p.phase !== "connecting" && p.dismissed) this.#pairing = null;
   }
@@ -325,12 +338,13 @@ export class Controller {
     return this.manager.connected.get(adapterId)?.session ?? null;
   }
 
-  #target(key: string): { session: AdapterSession; id: number; device: DeviceRecord } | null {
+  /** A device by key; `current` is false while its record is only last known. */
+  #target(key: string): { session: AdapterSession; id: number; device: DeviceRecord; current: boolean } | null {
     const slash = key.indexOf("/");
     const session = this.#session(key.slice(0, slash));
     const id = Number(key.slice(slash + 1));
     const device = session?.devices.get(id);
-    return session && device ? { session, id, device } : null;
+    return session && device ? { session, id, device, current: !session.readErrors.has(id) } : null;
   }
 
   async #saveSettings(key: string, changes: SettingsChange[]): Promise<ActionResult> {
@@ -349,19 +363,23 @@ export class Controller {
     this.#settingsSaves.set(key, { save, session });
     this.#publish();
     // Saved values and forgotten ones go in one write, all or nothing.
+    let reason: string | null = null;
     try {
       await session.perform(id, "settings", (c) => c.setSettings({ device: id, changes: changes.map(convert.settingsUpdate) }));
       for (const item of items) item.status = "saved";
     } catch (error) {
-      const reason = failure(error);
-      const unknown = error instanceof ConnectionClosedError || (error instanceof CordialError && error.outcomeUnknown);
-      for (const item of items) Object.assign(item, { status: unknown ? "unknown" : "not_saved", error: reason });
+      reason = failure(error);
+      // Only an outcome confirms what was saved. The changes are saved together, so a partial save
+      // leaves each one's outcome unknown, as does a failure without an outcome.
+      const outcome = error instanceof CordialError ? convert.wireError(error).outcome : null;
+      const status = outcome === "no_effect" ? "not_saved" : outcome === "complete" ? "saved" : "unknown";
+      for (const item of items) Object.assign(item, { status, error: status === "saved" ? null : reason });
     } finally {
       save.running = false;
       this.#publish();
     }
-    const failed = items.find((i) => i.status !== "saved");
-    return failed ? { ok: false, message: failed.error ?? "The adapter couldn't save the settings.", inline: true, settingsSave: save } : { ok: true, settingsSave: save };
+    // A failure after a complete save shows with the form rather than with each change.
+    return reason === null ? { ok: true, settingsSave: save } : { ok: false, message: reason, inline: items.some((i) => i.status !== "saved"), settingsSave: save };
   }
 
   /** The adapter's session when it can change profiles, else why not. */
@@ -399,13 +417,13 @@ export class Controller {
   async #updateDevice(action: Extract<Action, { type: "device.update" }>): Promise<ActionResult> {
     const t = this.#target(action.key);
     if (!t) return GONE;
-    const { session, id, device } = t;
+    const { session, id, device, current } = t;
     const { enabled, trusted, blocked, hidpp, profiles, gamepadOutput } = action;
     if (enabled === undefined && trusted === undefined && blocked === undefined && hidpp === undefined && profiles === undefined && gamepadOutput === undefined)
       return { ok: true };
     if (!session.status.ready) return { ok: false, message: codeText("not_ready") };
-    if (enabledFull(session.status, [...session.devices.values()], device, { enabled, trusted, blocked, hidpp, profiles }))
-      return { ok: false, message: errorText({ code: "no_capacity", reason: "enabled", outcomeUnknown: false }) };
+    if (current && enabledFull(session.status, [...session.devices.values()], device, { enabled, trusted, blocked, hidpp, profiles }))
+      return { ok: false, message: errorText({ code: "no_capacity", reason: "enabled_devices", outcome: "unspecified", related: [] }) };
     if (hidpp !== undefined && settingsBusy(this.#device(session.adapterId, session, device))) return { ok: false, message: codeText("busy") };
     if (profiles !== undefined) {
       const support = session.status.profileSupport;
@@ -461,13 +479,13 @@ export class Controller {
         case "device.refresh": {
           const t = this.#target(action.key);
           if (!t) return GONE;
-          const { session, id, device } = t;
+          const { session, id, device, current } = t;
           // Disconnecting, and refreshing a connected device, need neither Bluetooth nor storage
-          // to have started.
+          // to have started. A record that is only last known leaves the rest to the adapter.
           if ((action.type === "device.connect" || action.type === "device.unpair") && !session.status.ready) return { ok: false, message: codeText("not_ready") };
-          if (action.type === "device.refresh" && device.state !== "connected") return { ok: false, message: codeText("not_connected") };
+          if (action.type === "device.refresh" && current && device.state !== "connected") return { ok: false, message: codeText("not_connected") };
           if (action.type === "device.connect") {
-            if (device.inactive === "transport_disabled" && device.transport) return { ok: false, message: transportDisabledText(device.transport) };
+            if (current && device.inactive === "transport_disabled" && device.transport) return { ok: false, message: transportDisabledText(device.transport) };
             try {
               await session.perform(id, "connect", (c) => c.connectDevice(id));
             } catch (error) {
@@ -498,6 +516,12 @@ export class Controller {
           const session = this.#session(action.adapterId);
           if (!session) return GONE;
           session.reloadProfiles();
+          return { ok: true };
+        }
+        case "devices.reload": {
+          const session = this.#session(action.adapterId);
+          if (!session) return GONE;
+          session.relist();
           return { ok: true };
         }
         case "adapter.name": {
@@ -573,8 +597,9 @@ export class Controller {
     if (stopped) return;
     if (response.result.case === "error") {
       scan.running = false;
-      const error = new CordialError("startScan", response.result.value.code, response.result.value.reason, response.result.value.outcomeUnknown);
+      const error = new CordialError("startScan", response.result.value);
       scan.error = transportFailure(error, session, request.command.value.transports.map(convert.transport));
+      scan.failure = convert.wireError(error);
     }
     this.#scan = scan;
     this.changed();
@@ -591,6 +616,11 @@ export class Controller {
       else scan.candidates[i] = c;
     } else if (kind.case === "scanDone" && scan) {
       scan.running = false;
+      // The candidates found stay listed and usable.
+      if (kind.value.error) {
+        scan.failure = convert.wireError(kind.value.error);
+        scan.error = errorText(scan.failure, "read");
+      }
     } else if (kind.case === "pairing" && pairing && kind.value.candidate === pairing.candidateId && pairing.phase === "pairing") {
       const step = convert.pairingStep(kind.value);
       if (step.kind === "progress") pairing.prompt = null;
@@ -603,11 +633,15 @@ export class Controller {
         if (pairing.dismissed) this.#pairing = null;
       } else {
         pairing.prompt = null;
-        pairing.phase = step.code === "cancelled" ? "cancelled" : "failed";
+        const { code } = step.error;
+        pairing.failure = step.error;
+        // The short wordings apply only while the error has nothing more to report.
+        const plain = plainError(step.error);
+        pairing.phase = code === "cancelled" && plain ? "cancelled" : "failed";
         pairing.message =
-          step.code === "cancelled" ? "Pairing was cancelled."
-            : step.code === "unsupported" && pairing.transport && disabled(session, pairing.transport) ? transportDisabledText(pairing.transport)
-              : codeText(step.code);
+          code === "cancelled" && plain ? "Pairing was cancelled."
+            : code === "unsupported" && plain && pairing.transport && disabled(session, pairing.transport) ? transportDisabledText(pairing.transport)
+              : errorText(step.error, "pair");
         if (pairing.dismissed) this.#pairing = null;
       }
     } else return;
@@ -625,7 +659,7 @@ export class Controller {
     if (this.#scan?.running && this.#scan.session !== session) await this.#stopScan();
     // Events before the adapter answers the scan still belong to the earlier one; the new scan
     // replaces it, and its candidates, at its response.
-    const scan: Scan = { adapterId, running: true, candidates: [], error: null, session };
+    const scan: Scan = { adapterId, running: true, candidates: [], error: null, failure: null, session };
     this.#starts.push({ scan, stopped: false });
     try {
       await session.connection.startScan(transports, SCAN_SECONDS);
@@ -651,7 +685,7 @@ export class Controller {
     const session = this.#session(adapterId);
     if (!session) return { ok: false, message: "This adapter is no longer available." };
     if (this.#pairing?.phase === "pairing" && !this.#pairing.dismissed) return { ok: false, message: "Another device is being added." };
-    if (storageFull(session.status)) return { ok: false, message: errorText({ code: "no_capacity", reason: "storage", outcomeUnknown: false }) };
+    if (storageFull(session.status)) return { ok: false, message: errorText({ code: "no_capacity", reason: "storage", outcome: "unspecified", related: [] }) };
     const candidate = this.#scan?.candidates.find((c) => c.id === candidateId);
     const transport = candidate?.transport ?? null;
     if (transport && disabled(session, transport)) return { ok: false, message: transportDisabledText(transport) };
@@ -668,6 +702,7 @@ export class Controller {
       prompt: null,
       deviceKey: null,
       message: null,
+      failure: null,
       session,
       dismissed: false,
       transport,
@@ -680,6 +715,7 @@ export class Controller {
       if (this.#pairing === pairing) {
         pairing.phase = "failed";
         pairing.message = transportFailure(error, session, [transport]);
+        pairing.failure = error instanceof CordialError ? convert.wireError(error) : null;
         if (pairing.dismissed) this.#pairing = null;
         this.changed();
       }
@@ -698,7 +734,7 @@ export class Controller {
       this.changed();
       return { ok: true };
     } catch (error) {
-      if (error instanceof CordialError && convert.errorCode(error.code) === "no_prompt") {
+      if (error instanceof CordialError && error.code === ErrorCode.NO_PROMPT) {
         if (pairing.prompt === prompt) pairing.prompt = null;
         this.changed();
       }

@@ -16,8 +16,11 @@ runtime, and no serial or DTR sequence, can enable them on production firmware.
 File paths are absolute ASCII, at most 255 bytes, with no `.` or `..` components or control bytes,
 and can name any file of the application filesystem, including identity and bond files. There is no
 raw flash access and no write command. A path that does not exist returns `ERROR_CODE_NOT_FOUND`;
-any other read failure returns `ERROR_CODE_STORAGE_FAILED`. File access works while Bluetooth is
-unavailable.
+any other read failure returns a full `Error` with code `STORAGE_FAILED` and reason `STORAGE`.
+Its outcome concerns the read result, not whether the stored file changed. A `ListFiles` failure
+to continue replaces the partial list with `Response.error`; it never returns a successful partial
+directory listing. File access works while Bluetooth is unavailable. Development commands follow
+the same [error semantics](limits-and-errors.md#errors) as production commands.
 
 After `EnterBootloader`, the host expects the Dongle to reappear in USB programming mode: UF2 or
 `picotool` for Pico, `esptool` for ESP32-S3. A missing response does not prove the reboot failed;

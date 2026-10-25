@@ -2,8 +2,8 @@
 //! Messages are complete sentences; labels and status words are Title Case.
 use crate::{error::Error, model, ui::text};
 use cordial_protocol::{
-    self as p, CapacityReason, DeviceState, ErrorCode, InactiveReason, Kind, ResourceType, Role,
-    Transport,
+    self as p, DeviceState, ErrorCode, ErrorOutcome, ErrorReason, InactiveReason, Kind,
+    ResourceType, Role, Transport,
 };
 
 fn error_clause(code: ErrorCode) -> &'static str {
@@ -25,7 +25,7 @@ fn error_clause(code: ErrorCode) -> &'static str {
         Unsupported => "the adapter or device doesn't support this action",
         NoCapacity => "the adapter has no room for that right now",
         NoPrompt => "that pairing prompt is no longer waiting for an answer",
-        StorageFailed => "the adapter couldn't save the change. Your saved data hasn't changed",
+        StorageFailed => "the adapter couldn't save the change",
         InUse => {
             "this profile is still in use. Remove it from every device and interface before deleting it"
         }
@@ -55,20 +55,120 @@ fn error_clause(code: ErrorCode) -> &'static str {
     }
 }
 
-fn capacity_clause(reason: CapacityReason) -> &'static str {
-    match reason {
-        CapacityReason::Unknown => error_clause(ErrorCode::NoCapacity),
-        CapacityReason::Enabled => {
+/// Wording for a code whose reason changes what failed.
+fn specific(code: ErrorCode, reason: ErrorReason) -> Option<&'static str> {
+    use {ErrorCode as C, ErrorReason as R};
+    Some(match (code, reason) {
+        (C::NoCapacity, R::EnabledDevices) => {
             "every enabled-device place is in use. Turn off another device first"
         }
-        CapacityReason::Storage => {
+        (C::NoCapacity, R::Storage) => {
             "the adapter's storage is full. Remove an unused device or forget a saved setting, then try again"
         }
-        CapacityReason::Connections => "every connection is in use. Disconnect a device first",
-        CapacityReason::ProfileMemory => {
+        (C::NoCapacity, R::Connections) => "every connection is in use. Disconnect a device first",
+        (C::NoCapacity, R::ProfileMemory) => {
             "the adapter doesn't have enough profile memory for this change"
         }
+        (C::NoCapacity, R::ScanCandidates) => {
+            "the adapter had no room to list every device it found"
+        }
+        (C::NoCapacity, R::OutputBackend) => {
+            "the adapter doesn't have enough USB capacity for this output"
+        }
+        (C::NotReady, R::Radio) => {
+            "the adapter's Bluetooth radio isn't ready. Try again in a moment"
+        }
+        (C::NotReady, R::Storage) => "the adapter's storage isn't ready. Try again in a moment",
+        (C::Unsupported, R::OutputBackend) => "the adapter doesn't support this output",
+        (C::Unsupported, R::InputLayout) => {
+            "the adapter can't use this device's input layout for this output"
+        }
+        (C::Internal, R::ScanCandidates) => {
+            "the adapter couldn't keep track of every device it found"
+        }
+        _ => return None,
+    })
+}
+
+/// What a reason concerns, for a code whose wording doesn't already say.
+fn context(reason: ErrorReason) -> Option<&'static str> {
+    Some(match reason {
+        ErrorReason::Unknown => return None,
+        ErrorReason::EnabledDevices => "enabled devices",
+        ErrorReason::Connections => "the adapter's connections",
+        ErrorReason::ScanCandidates => "the devices found while searching",
+        ErrorReason::Storage => "the adapter's storage",
+        ErrorReason::ProfileMemory => "profile memory",
+        ErrorReason::Radio => "the adapter's Bluetooth radio",
+        ErrorReason::OutputBackend => "the adapter's USB output",
+        ErrorReason::InputLayout => "this device's input layout",
+    })
+}
+
+/// The reason a code's wording already names.
+fn implied(code: ErrorCode) -> Option<ErrorReason> {
+    use ErrorCode::*;
+    Some(match code {
+        StorageFailed | StorageFull => ErrorReason::Storage,
+        ProfileMemoryLow | ProfileMemoryExceeded => ErrorReason::ProfileMemory,
+        UsbRequiredCapacityExceeded | UsbReservedCapacityExceeded => ErrorReason::OutputBackend,
+        _ => return None,
+    })
+}
+
+/// What an error's outcome is about: a change saved on the adapter, a change applied to the
+/// device, a read, a pairing's saved device, the cleanup after a failed pairing, or another
+/// operation, as for related failures with no more specific scope.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Scope {
+    Save,
+    Apply,
+    Read,
+    Pair,
+    Cleanup,
+    Other,
+}
+
+impl Scope {
+    /// The scope of the related failures of an error in this scope.
+    fn related(self) -> Self {
+        match self {
+            Scope::Read => Scope::Read,
+            Scope::Pair => Scope::Cleanup,
+            _ => Scope::Other,
+        }
     }
+}
+
+fn outcome_text(outcome: ErrorOutcome, scope: Scope) -> Option<&'static str> {
+    use ErrorOutcome::*;
+    Some(match (scope, outcome) {
+        (_, Unspecified | NoEffect) => return None,
+        (Scope::Save, Unknown) => {
+            "The adapter couldn't confirm whether the change was saved. Check before trying again."
+        }
+        (Scope::Save, Partial) => "The adapter confirmed saving only part of the change.",
+        (Scope::Save, Complete) => "The adapter saved the change despite this.",
+        (Scope::Apply, Unknown) => "The adapter couldn't confirm whether the change took effect.",
+        (Scope::Apply, Partial) => "Only part of the change is confirmed to have taken effect.",
+        (Scope::Apply, Complete) => "The change took effect despite this.",
+        (Scope::Read, Unknown) => "The adapter couldn't confirm whether the results are complete.",
+        (Scope::Read, Partial) => "The adapter returned only some of the results.",
+        (Scope::Read, Complete) => "The results are complete despite this.",
+        (Scope::Pair, Unknown) => {
+            "The adapter couldn't confirm whether it saved the device. Check its saved devices before pairing again."
+        }
+        (Scope::Pair, Partial) => "The adapter confirmed saving only part of the pairing.",
+        (Scope::Pair, Complete) => "The adapter saved the device despite this.",
+        (Scope::Cleanup, Unknown) => {
+            "The adapter couldn't confirm whether it finished cleaning up."
+        }
+        (Scope::Cleanup, Partial) => "The adapter finished only part of the cleanup.",
+        (Scope::Cleanup, Complete) => "The adapter finished cleaning up despite this.",
+        (Scope::Other, Unknown) => "Its outcome is unknown.",
+        (Scope::Other, Partial) => "It partly completed.",
+        (Scope::Other, Complete) => "Its intended effects completed.",
+    })
 }
 
 /// A clause as a complete sentence: capitalized, with a final period.
@@ -86,16 +186,70 @@ pub fn reason(message: &str) -> &str {
     message.strip_suffix('.').unwrap_or(message)
 }
 
-/// An adapter error as a sentence.
-pub fn error_text(e: &p::Error) -> String {
-    match e.code() {
-        ErrorCode::NoCapacity => sentence(capacity_clause(e.reason())),
-        ErrorCode::StorageFailed if e.outcome_unknown => {
-            "The adapter couldn't confirm whether the change was saved. Check before trying again."
-                .into()
-        }
-        code => code_text(code),
+/// The error's outcome, or None for one this app doesn't know.
+fn outcome(e: &p::Error) -> Option<ErrorOutcome> {
+    ErrorOutcome::try_from(e.outcome).ok()
+}
+
+pub use model::plain;
+
+/// What failed, as a clause, with what its reason concerns.
+fn failure_clause(e: &p::Error, scope: Scope) -> String {
+    let Ok(code) = ErrorCode::try_from(e.code) else {
+        return error_clause(ErrorCode::Unknown).into();
+    };
+    let why = ErrorReason::try_from(e.reason).unwrap_or_default();
+    if let Some(words) = specific(code, why) {
+        return words.into();
     }
+    // Only an outcome of no effect confirms that nothing was saved.
+    let none = outcome(e) == Some(ErrorOutcome::NoEffect);
+    let clause = match (code, scope) {
+        (ErrorCode::StorageFailed, Scope::Read) => reason(READ_FAILED),
+        (ErrorCode::StorageFailed, Scope::Save) if none => error_clause(code),
+        (ErrorCode::StorageFailed, Scope::Pair) if none => "the adapter couldn't save the device",
+        (ErrorCode::StorageFailed, _) => "the adapter couldn't read or write its saved data",
+        _ => error_clause(code),
+    };
+    match context(why).filter(|_| implied(code) != Some(why)) {
+        Some(context) => format!("{clause}. This involves {context}"),
+        None => clause.into(),
+    }
+}
+
+/// A record's read failure as its placeholder's status: "Couldn't Read", with the error when it
+/// says more than that.
+pub fn couldnt_read(e: Option<&p::Error>) -> String {
+    match e.map(|e| error_text(e, Scope::Read)) {
+        Some(text) if text != READ_FAILED => format!("Couldn't Read: {}", reason(&text)),
+        _ => "Couldn't Read".into(),
+    }
+}
+
+/// An adapter error as sentences: what failed, what is known of its effects, then each related
+/// failure with its own outcome.
+pub fn error_text(e: &p::Error, scope: Scope) -> String {
+    sentences(e, scope, false)
+}
+
+fn sentences(e: &p::Error, scope: Scope, also: bool) -> String {
+    let clause = failure_clause(e, scope);
+    let mut parts = vec![if also {
+        format!("Also, {clause}.")
+    } else {
+        sentence(&clause)
+    }];
+    parts.extend(
+        outcome(e)
+            .and_then(|o| outcome_text(o, scope))
+            .map(str::to_owned),
+    );
+    parts.extend(
+        e.related
+            .iter()
+            .map(|r| sentences(r, scope.related(), true)),
+    );
+    parts.join(" ")
 }
 
 pub const GONE: &str = "This device or adapter is no longer available.";
@@ -123,6 +277,7 @@ pub const STORAGE_FULL: &str = "Storage Full";
 pub const REQUIRED_CAPACITY: &str = text::USB_CAPACITY[0].1;
 pub const STORAGE_FULL_ATTENTION: &str = "The adapter's storage is full. Remove an unused device or forget a saved setting to pair another device.";
 pub const SETTINGS_READ_FAILED: &str = "The adapter couldn't read the device's settings.";
+pub const DEVICE_READ_FAILED: &str = "The adapter couldn't read this device's saved data.";
 pub const SETTINGS_SAVE_FAILED: &str = "The adapter couldn't save the settings.";
 pub const FORGET_TEXT: &str =
     "Forgetting this device deletes its pairing and saved settings from the adapter.";
@@ -131,8 +286,13 @@ pub const PROFILE_NAME_INVALID: &str = "Enter a profile name of up to 64 bytes."
 
 /// A failed action as a sentence: the adapter's refusal, or the local reason.
 pub fn failure(e: &Error) -> String {
+    failure_in(e, Scope::Save)
+}
+
+/// A failed action as `failure` words it, with the adapter's outcome in `scope`.
+pub fn failure_in(e: &Error, scope: Scope) -> String {
     if let Some(w) = &e.dongle {
-        return error_text(w);
+        return error_text(w, scope);
     }
     match e.message.as_str() {
         "the connection to the adapter closed" => CLOSED.into(),
@@ -145,21 +305,24 @@ pub fn failure(e: &Error) -> String {
 
 /// A failed read: a storage failure reads as one of the saved data, not of a save.
 pub fn read_failure(e: &Error) -> String {
-    match e.code_of() {
-        Some(ErrorCode::StorageFailed) => READ_FAILED.into(),
-        _ if e.dongle.is_none() && e.message == "the connection to the adapter closed" => {
-            READ_CLOSED.into()
-        }
-        _ => failure(e),
+    match &e.dongle {
+        Some(w) => error_text(w, Scope::Read),
+        None if e.message == "the connection to the adapter closed" => READ_CLOSED.into(),
+        None => failure(e),
     }
 }
 
-/// A failure that refuses work on a disabled transport names the transport.
-pub fn transport_failure(e: &Error, status: &p::Status, t: Transport) -> String {
-    if e.code_of() == Some(ErrorCode::Unsupported) && model::transport_disabled(status, t) {
+/// A failure that refuses work on a disabled transport names the transport; otherwise it reads
+/// as `failure_in` words it.
+pub fn transport_failure(e: &Error, status: &p::Status, t: Transport, scope: Scope) -> String {
+    let refused = e
+        .dongle
+        .as_ref()
+        .is_some_and(|w| w.code() == ErrorCode::Unsupported && plain(w));
+    if refused && model::transport_disabled(status, t) {
         return transport_disabled_text(t);
     }
-    failure(e)
+    failure_in(e, scope)
 }
 
 pub fn transport_name(t: Transport) -> &'static str {
@@ -293,12 +456,26 @@ pub fn role_text(r: Role) -> Option<&'static str> {
     })
 }
 
-/// Why a connected device's profiles aren't loaded.
-pub fn profile_error_text(code: ErrorCode) -> String {
-    match code {
-        ErrorCode::ProfileMemoryExceeded => "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.".into(),
-        code => code_text(code),
+/// Why a connected device's profiles aren't loaded. The short wording of a lack of room is for a
+/// plain error whose reason, if any, is profile memory.
+pub fn profile_error_text(e: &p::Error) -> String {
+    let room = e.code() == ErrorCode::ProfileMemoryExceeded
+        && plain(e)
+        && [
+            ErrorReason::Unknown as i32,
+            ErrorReason::ProfileMemory as i32,
+        ]
+        .contains(&e.reason);
+    if room {
+        "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.".into()
+    } else {
+        error_text(e, Scope::Apply)
     }
+}
+
+/// A failure as "Failed: {reason}".
+pub fn failed_text(e: &p::Error) -> String {
+    format!("Failed: {}", reason(&error_text(e, Scope::Apply)))
 }
 
 /// HID++'s state, as Diagnostics shows it.
@@ -308,8 +485,8 @@ pub fn integration_text(i: &p::Integration) -> String {
         model::Up::Disconnected => "Waiting to Connect".into(),
         model::Up::Starting => "Setting Up".into(),
         model::Up::Active => "Active".into(),
-        model::Up::Unsupported => "Unsupported".into(),
-        model::Up::Error(code) => format!("Failed: {}", reason(&code_text(code))),
+        model::Up::Unsupported(e) if model::plain(&e) => "Unsupported".into(),
+        model::Up::Unsupported(e) | model::Up::Error(e) => failed_text(&e),
     }
 }
 
@@ -364,12 +541,14 @@ pub enum Level {
 }
 
 impl Battery {
-    pub fn of(d: &p::Device) -> Option<Self> {
+    /// The device's last reading; fresh only while `current`, the record is the adapter's
+    /// latest, and the device is connected.
+    pub fn of(d: &p::Device, current: bool) -> Option<Self> {
         let b = text::battery(d.information.as_ref())?;
         Some(Self {
             percent: b.percent,
             charging: b.charging,
-            fresh: model::connected(d),
+            fresh: current && model::connected(d),
         })
     }
 
@@ -472,7 +651,10 @@ mod tests {
         // The adapter decides when memory is low.
         let mut low = status(Some(1), Some(200));
         assert!(!memory_alert(&low));
-        low.errors.push(ErrorCode::ProfileMemoryLow as i32);
+        low.errors.push(p::Error {
+            code: ErrorCode::ProfileMemoryLow as i32,
+            ..Default::default()
+        });
         assert!(memory_alert(&low));
     }
 
@@ -486,11 +668,27 @@ mod tests {
             reason(&code_text(ErrorCode::TransportError)),
             "The adapter couldn't exchange messages with this device"
         );
-        let storage = Error::code(ErrorCode::StorageFailed, Some("setting list"));
+        let storage = Error::dongle(
+            p::Error {
+                code: ErrorCode::StorageFailed as i32,
+                ..Default::default()
+            },
+            Some("setting list"),
+        );
         assert_eq!(read_failure(&storage), READ_FAILED);
+        // Only an outcome of no effect confirms the save failed.
         assert_eq!(
             failure(&storage),
-            "The adapter couldn't save the change. Your saved data hasn't changed."
+            "The adapter couldn't read or write its saved data."
+        );
+        let refused = p::Error {
+            code: ErrorCode::StorageFailed as i32,
+            outcome: ErrorOutcome::NoEffect as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            failure(&Error::dongle(refused, None)),
+            "The adapter couldn't save the change."
         );
         let closed = Error::new("the connection to the adapter closed");
         assert_eq!(read_failure(&closed), READ_CLOSED);
@@ -499,6 +697,110 @@ mod tests {
             other_adapter("Desk"),
             "Cordial couldn't connect to Desk. Another adapter answered on its port."
         );
+    }
+
+    #[test]
+    fn outcomes_are_reported_whatever_the_code_and_related_failures_follow() {
+        let e = p::Error {
+            code: ErrorCode::Timeout as i32,
+            outcome: ErrorOutcome::Unknown as i32,
+            related: vec![p::Error {
+                code: ErrorCode::TransportError as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            error_text(&e, Scope::Save),
+            "This device didn't respond in time. The adapter couldn't confirm whether the change was saved. Check before trying again. Also, the adapter couldn't exchange messages with this device."
+        );
+        assert_eq!(
+            error_text(&e, Scope::Apply),
+            "This device didn't respond in time. The adapter couldn't confirm whether the change took effect. Also, the adapter couldn't exchange messages with this device."
+        );
+        let unknown = p::Error {
+            code: ErrorCode::StorageFailed as i32,
+            outcome: ErrorOutcome::Unknown as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            failure(&Error::dongle(unknown, None)),
+            "The adapter couldn't read or write its saved data. The adapter couldn't confirm whether the change was saved. Check before trying again."
+        );
+        let radio = p::Error {
+            code: ErrorCode::Internal as i32,
+            reason: ErrorReason::Radio as i32,
+            outcome: ErrorOutcome::Partial as i32,
+            related: vec![p::Error {
+                code: ErrorCode::NoCapacity as i32,
+                reason: ErrorReason::ScanCandidates as i32,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(
+            error_text(&radio, Scope::Read),
+            "The adapter hit an unexpected failure. This involves the adapter's Bluetooth radio. The adapter returned only some of the results. Also, the adapter had no room to list every device it found."
+        );
+        let starting = p::Error {
+            code: ErrorCode::NotReady as i32,
+            reason: ErrorReason::Radio as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            error_text(&starting, Scope::Save),
+            "The adapter's Bluetooth radio isn't ready. Try again in a moment."
+        );
+        let newer = p::Error {
+            code: 99,
+            reason: 98,
+            outcome: 97,
+            ..Default::default()
+        };
+        assert_eq!(
+            error_text(&newer, Scope::Save),
+            "The adapter hit an unexpected failure."
+        );
+    }
+
+    #[test]
+    fn related_failures_keep_their_own_scope() {
+        let cleanup = p::Error {
+            code: ErrorCode::StorageFailed as i32,
+            reason: ErrorReason::Storage as i32,
+            outcome: ErrorOutcome::Unknown as i32,
+            ..Default::default()
+        };
+        let e = p::Error {
+            code: ErrorCode::AuthFailed as i32,
+            outcome: ErrorOutcome::NoEffect as i32,
+            related: vec![cleanup],
+            ..Default::default()
+        };
+        assert_eq!(
+            error_text(&e, Scope::Pair),
+            "Bluetooth authentication with this device failed. Also, the adapter couldn't read or write its saved data. The adapter couldn't confirm whether it finished cleaning up."
+        );
+        let saved = p::Error {
+            code: ErrorCode::StorageFailed as i32,
+            reason: ErrorReason::Storage as i32,
+            outcome: ErrorOutcome::Complete as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            error_text(&saved, Scope::Pair),
+            "The adapter couldn't read or write its saved data. The adapter saved the device despite this."
+        );
+        let unsupported = p::Error {
+            code: ErrorCode::Unsupported as i32,
+            outcome: ErrorOutcome::Unknown as i32,
+            ..Default::default()
+        };
+        assert!(!plain(&unsupported));
+        assert!(plain(&p::Error {
+            code: ErrorCode::Unsupported as i32,
+            outcome: 97,
+            ..Default::default()
+        }));
     }
 
     #[test]
@@ -515,6 +817,30 @@ mod tests {
         );
         assert_eq!(role_text(Role::Gamepad), Some("Gamepad"));
         assert_eq!(text::unnamed(&[Kind::Gamepad]), "Unnamed Gamepad");
+    }
+
+    #[test]
+    fn a_lack_of_profile_room_is_short_only_when_plain() {
+        let room = p::Error {
+            code: ErrorCode::ProfileMemoryExceeded as i32,
+            reason: ErrorReason::ProfileMemory as i32,
+            ..Default::default()
+        };
+        let short = "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.";
+        assert_eq!(profile_error_text(&room), short);
+        let unknown = p::Error {
+            outcome: ErrorOutcome::Unknown as i32,
+            ..room.clone()
+        };
+        assert_eq!(
+            profile_error_text(&unknown),
+            "The adapter doesn't have room for this device's profiles. The adapter couldn't confirm whether the change took effect."
+        );
+        let elsewhere = p::Error {
+            reason: ErrorReason::Storage as i32,
+            ..room
+        };
+        assert_ne!(profile_error_text(&elsewhere), short);
     }
 
     #[test]

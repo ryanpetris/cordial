@@ -376,7 +376,9 @@ pub struct Device {
     pub layers: Vec<u64>,
     pub state: ConnectionState,
     pub paused: bool,
-    pub error: Option<ErrorCode>,
+    pub error: Option<cordial_protocol::Error>,
+    /// The policy before an unpair, retained to report an unresolved deletion.
+    pub unpair_policy: Option<Box<Policy>>,
     /// The entry leaves the resident set once its link has closed, because the device was
     /// disabled, blocked or its transport turned off.
     pub retiring: bool,
@@ -407,6 +409,7 @@ impl Device {
             state: ConnectionState::Disconnected,
             paused: false,
             error: None,
+            unpair_policy: None,
             retiring: false,
             deleting: false,
             live: None,
@@ -465,9 +468,10 @@ impl Device {
                 .connection(state == ConnectionState::Connected, self.hidpp_enabled);
         }
         if error.is_some() || state == ConnectionState::Connected {
-            self.error = error;
+            self.error = error.map(|e| crate::wire::error(e, None, false));
         }
         if state == ConnectionState::Connected {
+            self.unpair_policy = None;
             self.connected_at = Some(now);
             self.retry_delay = 0;
         }

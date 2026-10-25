@@ -68,20 +68,20 @@ pub fn error_code(code: E) -> p::ErrorCode {
     }
 }
 
-/// The wire error for an internal error. `reason` says what ran out for a capacity error.
-pub fn error(code: E, reason: Option<p::CapacityReason>, outcome_unknown: bool) -> p::Error {
-    let wire = error_code(code);
+/// The wire error for an internal error, with context and evidence retained for every code.
+pub fn error(code: E, reason: Option<p::ErrorReason>, outcome_unknown: bool) -> p::Error {
     p::Error {
-        code: wire as i32,
-        reason: if wire == p::ErrorCode::NoCapacity {
-            reason.unwrap_or(match code {
-                E::StorageFull | E::SettingsLimit => p::CapacityReason::Storage,
-                _ => p::CapacityReason::Unknown,
-            }) as i32
+        code: error_code(code) as i32,
+        reason: reason.unwrap_or(match code {
+            E::StorageFull | E::SettingsLimit | E::StorageFailed => p::ErrorReason::Storage,
+            _ => p::ErrorReason::Unknown,
+        }) as i32,
+        outcome: if outcome_unknown {
+            p::ErrorOutcome::Unknown
         } else {
-            0
-        },
-        outcome_unknown: wire == p::ErrorCode::StorageFailed && outcome_unknown,
+            p::ErrorOutcome::Unspecified
+        } as i32,
+        related: Vec::new(),
     }
 }
 
@@ -375,8 +375,10 @@ fn hidpp(
         Status::State(p::IntegrationState::Off as i32)
     } else if let Some(runtime) = runtime {
         match protocol {
-            ProtocolState::Unavailable => Status::State(p::IntegrationState::Unsupported as i32),
-            ProtocolState::Error { code } => Status::Error(error_code(code) as i32),
+            ProtocolState::Unavailable => {
+                Status::Error(error(E::HidppProtocolUnsupported, None, false))
+            }
+            ProtocolState::Error { code } => Status::Error(error(code, None, false)),
             ProtocolState::Unknown | ProtocolState::Probing => {
                 Status::State(p::IntegrationState::Starting as i32)
             }
@@ -384,9 +386,11 @@ fn hidpp(
                 SettingsState::Ready | SettingsState::Applying | SettingsState::Unsupported => {
                     Status::State(p::IntegrationState::Active as i32)
                 }
-                SettingsState::Error => Status::Error(error_code(
+                SettingsState::Error => Status::Error(error(
                     runtime.settings.error.unwrap_or(E::InternalError),
-                ) as i32),
+                    None,
+                    false,
+                )),
                 SettingsState::Off | SettingsState::Pending | SettingsState::Discovering => {
                     Status::State(p::IntegrationState::Starting as i32)
                 }
@@ -463,16 +467,20 @@ pub fn device(manager: &Manager, policy: &Policy, slot: Option<usize>) -> p::Dev
         paused: d.is_some_and(|d| d.paused),
         inactive: inactive.map(|r| r as i32),
         errors: {
-            let mut errors: Vec<i32> = d
-                .and_then(|d| d.error)
-                .map(|e| error_code(e) as i32)
-                .into_iter()
-                .collect();
+            let mut errors: Vec<p::Error> = d.and_then(|d| d.error.clone()).into_iter().collect();
             if let Some(error) = live.and_then(|l| l.profile_error) {
-                errors.push(match error {
-                    E::Capacity => p::ErrorCode::ProfileMemoryExceeded,
-                    _ => p::ErrorCode::ProfileLoadFailed,
-                } as i32);
+                errors.push(p::Error {
+                    code: match error {
+                        E::Capacity => p::ErrorCode::ProfileMemoryExceeded,
+                        _ => p::ErrorCode::ProfileLoadFailed,
+                    } as i32,
+                    reason: if error == E::Capacity {
+                        p::ErrorReason::ProfileMemory
+                    } else {
+                        p::ErrorReason::Storage
+                    } as i32,
+                    ..Default::default()
+                });
             }
             errors.sort_unstable();
             errors.dedup();

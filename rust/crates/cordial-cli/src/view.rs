@@ -37,8 +37,9 @@ pub struct State {
     pub status: p::Status,
     /// Saved devices in ascending ID order.
     pub devices: Vec<p::Device>,
-    /// Saved devices whose records the Dongle couldn't read when it last listed them.
-    pub unreadable: BTreeSet<u32>,
+    /// Saved devices whose records the Dongle couldn't read when it last listed them, with why. A
+    /// device known before keeps its last known record in `devices`.
+    pub unreadable: BTreeMap<u32, p::Error>,
     /// Candidates of the current scan, in the order found.
     pub candidates: Vec<p::Candidate>,
     /// The transports of the running scan, from its start until scan_done.
@@ -113,7 +114,7 @@ impl State {
             .devices
             .iter()
             .map(|d| d.id)
-            .chain(self.unreadable.iter().copied())
+            .chain(self.unreadable.keys().copied())
             .filter(|id| !listed.contains(id))
             .collect();
         for id in gone {
@@ -122,9 +123,9 @@ impl State {
         for entry in &list.entries {
             match &entry.entry {
                 Some(device_list_entry::Entry::Device(d)) => self.put_device(d.clone()),
-                Some(device_list_entry::Entry::Unreadable(id)) => {
-                    self.devices.retain(|d| d.id != *id);
-                    self.unreadable.insert(*id);
+                Some(device_list_entry::Entry::Error(r)) => {
+                    self.unreadable
+                        .insert(r.id, r.error.clone().unwrap_or_default());
                 }
                 None => {}
             }
@@ -283,7 +284,7 @@ impl State {
             },
             event::Kind::ScanDone(done) => {
                 self.scanning = None;
-                self.last_scan = Some(*done);
+                self.last_scan = Some(done.clone());
             }
             event::Kind::Pairing(pairing) => self.pairing = Some(pairing.clone()),
             event::Kind::Profile(profile) => {
@@ -381,6 +382,18 @@ mod tests {
         (request, response)
     }
 
+    fn read_error(id: u32) -> p::RecordError {
+        p::RecordError {
+            id,
+            error: Some(p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                reason: p::ErrorReason::Storage as i32,
+                outcome: p::ErrorOutcome::NoEffect as i32,
+                related: Vec::new(),
+            }),
+        }
+    }
+
     fn device(id: u32) -> p::Device {
         p::Device {
             id,
@@ -430,26 +443,40 @@ mod tests {
             st.event(&event::Kind::Device(device(id)));
         }
         st.settings.insert(3, Vec::new());
-        // 3 and 5 are gone and 2 can't be read.
+        // 3 and 5 are gone, and 2 and 8 can't be read.
         let entry = |entry| p::DeviceListEntry { entry: Some(entry) };
         let (request, response) = answered(
             Command::ListDevices(p::ListDevices {}),
             response::Result::Devices(p::DeviceList {
                 entries: vec![
                     entry(device_list_entry::Entry::Device(device(1))),
-                    entry(device_list_entry::Entry::Unreadable(2)),
+                    entry(device_list_entry::Entry::Error(read_error(2))),
                     entry(device_list_entry::Entry::Device(device(4))),
-                    entry(device_list_entry::Entry::Device(device(8))),
+                    entry(device_list_entry::Entry::Error(read_error(8))),
                 ],
             }),
         );
         st.response(&request, &response);
         let ids = |st: &State| st.devices.iter().map(|d| d.id).collect::<Vec<_>>();
+        // A device known before keeps its last known record.
         assert_eq!(ids(&st), [1, 4, 8]);
         assert!(!st.settings.contains_key(&3));
-        assert_eq!(st.unreadable, BTreeSet::from([2]));
+        let errors = |st: &State| {
+            st.unreadable
+                .iter()
+                .map(|(id, e)| (*id, e.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            errors(&st),
+            [
+                (2, read_error(2).error.unwrap()),
+                (8, read_error(8).error.unwrap())
+            ]
+        );
         // A device that becomes readable again leaves the unreadable list.
         st.event(&event::Kind::Device(device(2)));
+        st.event(&event::Kind::Device(device(8)));
         assert!(st.unreadable.is_empty());
         assert_eq!(ids(&st), [1, 2, 4, 8]);
         // An empty listing removes every device.
@@ -500,7 +527,7 @@ mod tests {
                         entry: Some(profile_list_entry::Entry::Profile(profile(2, "Desk"))),
                     },
                     p::ProfileListEntry {
-                        entry: Some(profile_list_entry::Entry::Unreadable(5)),
+                        entry: Some(profile_list_entry::Entry::Error(read_error(5))),
                     },
                 ],
             }),
@@ -746,7 +773,10 @@ mod tests {
         let mut st = State::default();
         st.event(&event::Kind::Pairing(p::Pairing {
             candidate: 1,
-            step: Some(pairing::Step::Failed(p::ErrorCode::Timeout as i32)),
+            step: Some(pairing::Step::Error(p::Error {
+                code: p::ErrorCode::Timeout as i32,
+                ..Default::default()
+            })),
         }));
         let (request, response) = accepted(Command::StartPairing(p::StartPairing { candidate: 1 }));
         st.response(&request, &response);

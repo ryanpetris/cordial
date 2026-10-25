@@ -24,6 +24,8 @@ pub mod storage {
     include!(concat!(env!("OUT_DIR"), "/cordial.storage.serde.rs"));
 }
 
+#[cfg(feature = "json")]
+mod error_json;
 pub mod frame;
 
 /// USB vendor ID of every Dongle (pid.codes).

@@ -16,7 +16,8 @@ pub fn token(name: &str) -> String {
 
 const PREFIXES: &[&str] = &[
     "ERROR_CODE_",
-    "CAPACITY_REASON_",
+    "ERROR_REASON_",
+    "ERROR_OUTCOME_",
     "DEVICE_STATE_",
     "INACTIVE_REASON_",
     "INTEGRATION_STATE_",
@@ -70,24 +71,37 @@ const PROFILE_ERRORS: [ErrorCode; 2] = [
 ];
 
 /// The last failed connection attempt.
-pub fn last_error(d: &p::Device) -> Option<ErrorCode> {
+pub fn last_error(d: &p::Device) -> Option<&p::Error> {
     d.errors
         .iter()
-        .map(|n| code(*n))
-        .find(|c| !PROFILE_ERRORS.contains(c))
+        .find(|e| !PROFILE_ERRORS.contains(&code(e.code)))
 }
 
 /// Why a connected device's profiles aren't loaded, while they aren't.
-pub fn profile_error(d: &p::Device) -> Option<ErrorCode> {
+pub fn profile_error(d: &p::Device) -> Option<&p::Error> {
     d.errors
         .iter()
-        .map(|n| code(*n))
-        .find(|c| PROFILE_ERRORS.contains(c))
+        .find(|e| PROFILE_ERRORS.contains(&code(e.code)))
 }
 
-/// Whether the adapter reports a problem.
+/// Whether the adapter reports a problem with this code.
 pub fn has_error(st: &p::Status, error: ErrorCode) -> bool {
-    st.errors.contains(&(error as i32))
+    st.errors.iter().any(|e| e.code == error as i32)
+}
+
+/// Whether an error says the adapter or device doesn't support what it applies to.
+pub fn unsupported(e: &p::Error) -> bool {
+    code(e.code) == ErrorCode::Unsupported
+}
+
+/// Whether an error reports nothing beyond its code and reason, so a short wording of it loses
+/// nothing: no outcome that is evidence, and no related failures. An outcome this app doesn't
+/// know is none.
+pub fn plain(e: &p::Error) -> bool {
+    !matches!(
+        p::ErrorOutcome::try_from(e.outcome),
+        Ok(p::ErrorOutcome::Unknown | p::ErrorOutcome::Partial | p::ErrorOutcome::Complete)
+    ) && e.related.is_empty()
 }
 
 /// The entry of a resource type in a list of resources.
@@ -130,24 +144,27 @@ pub fn hidpp_enabled(d: &p::Device) -> bool {
 }
 
 /// Whether an integration is up, or why it failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Up {
     Off,
     Disconnected,
     Starting,
     Active,
-    Unsupported,
-    Error(ErrorCode),
+    /// The device can't use the integration at all.
+    Unsupported(p::Error),
+    Error(p::Error),
 }
 
 pub fn up(i: &p::Integration) -> Up {
-    match i.status {
-        Some(integration::Status::Error(n)) => Up::Error(code(n)),
-        Some(integration::Status::State(n)) => match IntegrationState::try_from(n) {
+    match &i.status {
+        Some(integration::Status::Error(e)) => match code(e.code) {
+            ErrorCode::Unsupported | ErrorCode::ProtocolUnsupported => Up::Unsupported(e.clone()),
+            _ => Up::Error(e.clone()),
+        },
+        Some(integration::Status::State(n)) => match IntegrationState::try_from(*n) {
             Ok(IntegrationState::Disconnected) => Up::Disconnected,
             Ok(IntegrationState::Starting) => Up::Starting,
             Ok(IntegrationState::Active) => Up::Active,
-            Ok(IntegrationState::Unsupported) => Up::Unsupported,
             _ => Up::Off,
         },
         None => Up::Off,
@@ -301,7 +318,7 @@ pub fn prompt(p: &p::Pairing) -> Option<Prompt> {
 pub fn pairing_running(p: &p::Pairing) -> bool {
     !matches!(
         p.step,
-        Some(pairing::Step::Done(_) | pairing::Step::Failed(_))
+        Some(pairing::Step::Done(_) | pairing::Step::Error(_))
     )
 }
 

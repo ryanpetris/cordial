@@ -1,10 +1,10 @@
-import { ErrorCode, Transport } from "@cordial/protocol";
+import { ErrorCode, ErrorOutcome, ErrorReason, Transport } from "@cordial/protocol";
 import { describe, expect, it, vi } from "vitest";
 import { AdapterManager } from "../src/core/manager.ts";
 import { AdapterSession } from "../src/core/session.ts";
 import { FakeAdapter, device, profile } from "../src/fake/adapter.ts";
 import type { AppState } from "../src/shared/state.ts";
-import { codeText, inactiveText, transportDisabledText } from "../src/shared/text.ts";
+import { adapterStatus, codeText, connected, deviceStatus, inactiveText, transportDisabledText } from "../src/shared/text.ts";
 import { controller, openSession, until } from "./helpers.ts";
 
 /** Every adapter is ready and `devices` devices are listed. */
@@ -88,6 +88,49 @@ describe("Controller", () => {
     // Only setting values the device accepts writes for are settings; readings are information.
     expect(mouse.settings!.map((x) => `${x.group}.${x.field}`)).toEqual(["pointer_sensor.dpi", "wheel.mode", "wheel.invert"]);
     expect(mouse.device.information.wheel).toMatchObject({ diameter: 50, mode: null });
+    await c.stop();
+  });
+
+  it("shows a record the adapter couldn't read as last known, and one it never read as a placeholder", async () => {
+    const a = new FakeAdapter({ adapterId: "AAAA0001" });
+    a.unreadableDevices.add(4);
+    const { c, state } = controller({ "/a": a });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 3));
+    const error = { code: "storage_failed", reason: "storage", outcome: "no_effect", related: [] };
+    expect(state()!.adapters[0]!.unreadableDevices).toEqual([{ id: 4, error }]);
+    // A connected device whose record can't be read again keeps its last record, not its state.
+    a.unreadableDevices.add(2);
+    a.unreadableDevices.delete(4);
+    expect(await c.act({ type: "devices.reload", adapterId: "AAAA0001" })).toEqual({ ok: true });
+    await until(() => !!state()!.devices.find((d) => d.key === "AAAA0001/2")?.readError && state()!.devices.length === 4);
+    const mouse = state()!.devices.find((d) => d.key === "AAAA0001/2")!;
+    expect(mouse).toMatchObject({ readError: error, device: { state: "connected" } });
+    expect(deviceStatus(mouse)).toBe("Couldn't Read");
+    expect(connected(mouse)).toBe(false);
+    expect(mouse.battery).toMatchObject({ percent: 12, percentFresh: false });
+    expect(state()!.adapters[0]!.unreadableDevices).toEqual([]);
+    // Refresh goes to the adapter rather than being refused from the last record.
+    expect(await c.act({ type: "device.refresh", key: "AAAA0001/2" })).toEqual({ ok: true });
+    // The device's next record is current again.
+    a.unreadableDevices.clear();
+    a.changeDevice(2, { name: "Renamed" });
+    await until(() => state()!.devices.find((d) => d.key === "AAAA0001/2")?.readError === null);
+    expect(deviceStatus(state()!.devices.find((d) => d.key === "AAAA0001/2")!)).toBe("Connected");
+    await c.stop();
+  });
+
+  it("reports a radio or storage fault in place of starting", async () => {
+    const a = new FakeAdapter({ adapterId: "AAAA0001", ready: false });
+    const { c, state } = controller({ "/a": a });
+    await c.manager.rescan();
+    await until(() => state()?.adapters[0]?.connection === "connected");
+    expect(adapterStatus(state()!.adapters[0]!)).toEqual({ text: "Starting…", warn: false });
+    a.faults = [{ code: ErrorCode.NOT_READY, reason: ErrorReason.RADIO }];
+    a.changeAdapter({});
+    await until(() => state()!.adapters[0]!.status!.errors.length === 1);
+    expect(adapterStatus(state()!.adapters[0]!)).toEqual({ text: "Needs Attention", warn: true });
+    expect(state()!.adapters[0]!.attention).toEqual([]);
     await c.stop();
   });
 
@@ -455,6 +498,93 @@ describe("Controller", () => {
     }
   });
 
+  it("keeps a failed scan's candidates and reports its failure with the related one", async () => {
+    const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true } });
+    const { c, state } = controller({ "/a": a });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 4));
+    a.scanError = {
+      code: ErrorCode.INTERNAL,
+      reason: ErrorReason.RADIO,
+      outcome: ErrorOutcome.PARTIAL,
+      related: [{ code: ErrorCode.NO_CAPACITY, reason: ErrorReason.SCAN_CANDIDATES, outcome: ErrorOutcome.PARTIAL }],
+    };
+    await c.act({ type: "scan.start", adapterId: "AAAA0001" });
+    await until(() => state()!.scan?.running === false);
+    expect(state()!.scan).toMatchObject({
+      candidates: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }],
+      error:
+        "The adapter hit an unexpected failure. This involves the adapter's Bluetooth radio. The adapter returned only some of the results. Also, the adapter had no room to list every device it found. The adapter returned only some of the results.",
+      failure: {
+        code: "internal",
+        reason: "radio",
+        outcome: "partial",
+        related: [{ code: "no_capacity", reason: "scan_candidates", outcome: "partial", related: [] }],
+      },
+    });
+    // The candidates stay usable, and searching again clears the failure.
+    expect(await c.act({ type: "pair.start", adapterId: "AAAA0001", candidateId: 1 })).toEqual({ ok: true });
+    await c.act({ type: "pair.cancel" });
+    await c.act({ type: "pair.dismiss" });
+    await c.act({ type: "scan.start", adapterId: "AAAA0001" });
+    expect(c.state().scan).toMatchObject({ running: true, error: null, failure: null });
+    await c.act({ type: "scan.stop" });
+    await c.stop();
+  });
+
+  it("reports a pairing whose saved bond is unknown as failed, with its cleanup failure", async () => {
+    const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true } });
+    const { c, state } = controller({ "/a": a });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 4));
+    await c.act({ type: "scan.start", adapterId: "AAAA0001" });
+    await until(() => state()!.scan?.candidates.length === 4);
+    a.pairingError = {
+      code: ErrorCode.CANCELLED,
+      outcome: ErrorOutcome.UNKNOWN,
+      related: [{ code: ErrorCode.STORAGE_FAILED, reason: ErrorReason.STORAGE, outcome: ErrorOutcome.NO_EFFECT }],
+    };
+    await c.act({ type: "pair.start", adapterId: "AAAA0001", candidateId: 1 });
+    await until(() => state()!.pairing?.phase === "failed");
+    expect(state()!.pairing!.message).toBe(
+      "The operation was cancelled. The adapter couldn't confirm whether it saved the device. Check its saved devices before pairing again. Also, the adapter couldn't read or write its saved data.",
+    );
+    expect(state()!.pairing!.failure).toEqual({
+      code: "cancelled",
+      reason: "unknown",
+      outcome: "unknown",
+      related: [{ code: "storage_failed", reason: "storage", outcome: "no_effect", related: [] }],
+    });
+    // Nothing is retried.
+    expect(commands(a).filter((x) => x === "startPairing")).toHaveLength(1);
+    await c.stop();
+  });
+
+  it("keeps a confirmed bond save and cleanup uncertainty apart, and never words either as a plain cancel", async () => {
+    const a = new FakeAdapter({ adapterId: "AAAA0001", enabled: { classic: true } });
+    const { c, state } = controller({ "/a": a });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 4));
+    await c.act({ type: "scan.start", adapterId: "AAAA0001" });
+    await until(() => state()!.scan?.candidates.length === 4);
+    a.pairingError = { code: ErrorCode.CANCELLED, outcome: ErrorOutcome.COMPLETE };
+    await c.act({ type: "pair.start", adapterId: "AAAA0001", candidateId: 1 });
+    await until(() => state()!.pairing?.phase === "failed");
+    expect(state()!.pairing!.message).toBe("The operation was cancelled. The adapter saved the device despite this.");
+    await c.act({ type: "pair.dismiss" });
+    a.pairingError = {
+      code: ErrorCode.AUTH_FAILED,
+      outcome: ErrorOutcome.NO_EFFECT,
+      related: [{ code: ErrorCode.INTERNAL, reason: ErrorReason.RADIO, outcome: ErrorOutcome.UNKNOWN }],
+    };
+    await c.act({ type: "pair.start", adapterId: "AAAA0001", candidateId: 2 });
+    await until(() => state()!.pairing?.candidateId === 2 && state()!.pairing?.phase === "failed");
+    expect(state()!.pairing!.message).toBe(
+      "Bluetooth authentication with this device failed. Also, the adapter hit an unexpected failure. This involves the adapter's Bluetooth radio. The adapter couldn't confirm whether it finished cleaning up.",
+    );
+    await c.stop();
+  });
+
   it("ends discovery and pairing with their adapter's session", async () => {
     const a = new FakeAdapter({ adapterId: "AAAA0001" });
     const { c, deps, state } = controller({ "/a": a });
@@ -558,10 +688,10 @@ it("enables and disables each transport and explains a disabled transport's devi
   expect(commands(a).filter((x) => x === "startScan").length).toBe(scans);
 
   // Saving the setting can fail like the other adapter settings.
-  a.failures.setAdapter = [ErrorCode.STORAGE_FAILED];
+  a.failures.setAdapter = [{ code: ErrorCode.STORAGE_FAILED, reason: ErrorReason.STORAGE, outcome: ErrorOutcome.NO_EFFECT }];
   expect(await c.act({ type: "adapter.settings", adapterId: "AAAA0001", transports: { ble: true } })).toEqual({
     ok: false,
-    message: "The adapter couldn't save the change. Your saved data hasn't changed.",
+    message: "The adapter couldn't save the change.",
   });
   await c.stop();
 });

@@ -6,7 +6,7 @@ use super::{
     fleet::{Fleet, Slot},
     layout::{self, Layout, Tone, dim, err, ok, span, styled},
     render::{DialogView, busy, button_if},
-    words,
+    words::{self, Scope},
 };
 use crate::{
     commands,
@@ -14,9 +14,7 @@ use crate::{
     error::Error,
     model::{self, Prompt},
 };
-use cordial_protocol::{
-    self as p, CapacityReason, CodeKind, DeviceState, ErrorCode, InactiveReason,
-};
+use cordial_protocol::{self as p, CodeKind, DeviceState, ErrorCode, ErrorReason, InactiveReason};
 use ratatui::{style::Style, text::Line};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,11 +284,11 @@ impl<F: Fleet> Model<F> {
                                 words::inactive_text(d)
                             ));
                         }
-                        (DeviceState::Disconnected, None, Some(code)) => {
+                        (DeviceState::Disconnected, None, Some(e)) => {
                             pairing.phase = Phase::Saved;
                             pairing.message = Some(format!(
                                 "The device is paired, but the adapter couldn't connect to it. {}",
-                                words::code_text(code)
+                                words::error_text(e, Scope::Other)
                             ));
                         }
                         _ => {}
@@ -406,11 +404,14 @@ impl<F: Fleet> Model<F> {
             return;
         };
         let problem = if model::storage_full(&st.status) {
-            Some(words::error_text(&p::Error {
-                code: ErrorCode::NoCapacity as i32,
-                reason: CapacityReason::Storage as i32,
-                ..Default::default()
-            }))
+            Some(words::error_text(
+                &p::Error {
+                    code: ErrorCode::NoCapacity as i32,
+                    reason: ErrorReason::Storage as i32,
+                    ..Default::default()
+                },
+                Scope::Save,
+            ))
         } else if model::transport_disabled(&st.status, c.transport()) {
             Some(words::transport_disabled_text(c.transport()))
         } else {
@@ -497,7 +498,7 @@ impl<F: Fleet> Model<F> {
                     Some(status) => {
                         let t = model::enabled_transports(status);
                         match t.first() {
-                            Some(t) => words::transport_failure(e, status, *t),
+                            Some(t) => words::transport_failure(e, status, *t, Scope::Save),
                             None => words::failure(e),
                         }
                     }
@@ -522,7 +523,12 @@ impl<F: Fleet> Model<F> {
                         }
                     }
                     Ok(_) => {}
-                    Err(e) if e.code_of() == Some(ErrorCode::Cancelled) => {
+                    // The short wording applies only while the error has nothing more to report.
+                    Err(e)
+                        if e.dongle.as_ref().is_some_and(|w| {
+                            w.code() == ErrorCode::Cancelled && words::plain(w)
+                        }) =>
+                    {
                         pairing.phase = Phase::Cancelled;
                         pairing.message = Some("Pairing was cancelled.".into());
                     }
@@ -535,8 +541,10 @@ impl<F: Fleet> Model<F> {
                                 .map(p::Candidate::transport),
                         );
                         pairing.message = Some(match transport {
-                            Some((status, t)) => words::transport_failure(e, status, t),
-                            None => words::failure(e),
+                            Some((status, t)) => {
+                                words::transport_failure(e, status, t, Scope::Pair)
+                            }
+                            None => words::failure_in(e, Scope::Pair),
                         });
                     }
                 }
@@ -582,10 +590,16 @@ impl<F: Fleet> Model<F> {
         let scan = add.scan.as_ref().filter(|s| s.adapter == adapter);
         let st = scan.and_then(|s| self.states.get(&s.slot));
         let scanning = add.starting || st.is_some_and(|st| st.scanning.is_some());
+        // A scan that ended in a failure keeps the candidates it found.
+        let ended = st
+            .filter(|st| st.scanning.is_none())
+            .and_then(|st| st.last_scan.as_ref()?.error.as_ref())
+            .map(|e| words::error_text(e, Scope::Read));
         let error = add
             .error
             .clone()
-            .or_else(|| scan.and_then(|s| s.error.clone()));
+            .or_else(|| scan.and_then(|s| s.error.clone()))
+            .or(ended);
         if scanning {
             body.line(busy("Searching…"));
         } else if let Some(e) = &error {

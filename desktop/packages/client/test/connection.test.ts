@@ -1,5 +1,5 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
-import { ErrorCode, FrameDecoder, MessageSchema, RequestSchema, ResourceType, Transport, UsageRange_Kind, encodeFrame, type Request, type ResponseSchema } from "@cordial/protocol";
+import { ErrorCode, ErrorOutcome, ErrorReason, FrameDecoder, MessageSchema, RequestSchema, ResourceType, Transport, UsageRange_Kind, encodeFrame, type Request, type ResponseSchema } from "@cordial/protocol";
 import { describe, expect, it, vi } from "vitest";
 import { Connection, ConnectionClosedError, CordialError, UnexpectedResponseError, type ByteStream } from "../src/index.ts";
 
@@ -86,11 +86,11 @@ describe("Connection", () => {
     ];
     peer.onRequest = () => queueMicrotask(() => peer.send({
       kind: { case: "response", value: { result: { case: "status", value: {
-        id: "A1", errors: [ErrorCode.USB_REQUIRED_CAPACITY_EXCEEDED, ErrorCode.USB_RESERVED_CAPACITY_EXCEEDED], profileSupport: { ranges, resources },
+        id: "A1", errors: [{ code: ErrorCode.USB_REQUIRED_CAPACITY_EXCEEDED }, { code: ErrorCode.USB_RESERVED_CAPACITY_EXCEEDED }], profileSupport: { ranges, resources },
       } } } },
     }));
     const connection = await Connection.open(peer);
-    expect(connection.status.errors).toEqual([ErrorCode.USB_REQUIRED_CAPACITY_EXCEEDED, ErrorCode.USB_RESERVED_CAPACITY_EXCEEDED]);
+    expect(connection.status.errors.map((e) => e.code)).toEqual([ErrorCode.USB_REQUIRED_CAPACITY_EXCEEDED, ErrorCode.USB_RESERVED_CAPACITY_EXCEEDED]);
     expect(connection.status.profileSupport).toMatchObject({ ranges, resources });
     // Absent values stay absent rather than reading as zero.
     const [memory, outputs, layers] = connection.status.profileSupport!.resources;
@@ -126,14 +126,16 @@ describe("Connection", () => {
     expect(order.at(-1)).toBe("resolved");
   });
 
-  it("rejects an error response with its code and reason and keeps going", async () => {
+  it("rejects an error response with every detail and keeps going", async () => {
     const { peer, connection } = await open();
     const failing = connection.setDevice({ device: 1, enabled: true });
     await Promise.resolve();
-    peer.send({ kind: { case: "response", value: { result: { case: "error", value: { code: ErrorCode.NO_CAPACITY, reason: 1 } } } } });
+    const related = [{ code: ErrorCode.STORAGE_FAILED, reason: ErrorReason.STORAGE, outcome: ErrorOutcome.UNKNOWN, related: [{ code: ErrorCode.TIMEOUT }] }];
+    peer.send({ kind: { case: "response", value: { result: { case: "error", value: { code: ErrorCode.NO_CAPACITY, reason: ErrorReason.ENABLED_DEVICES, outcome: ErrorOutcome.NO_EFFECT, related } } } } });
     const error = await failing.catch((e: unknown) => e);
     expect(error).toBeInstanceOf(CordialError);
-    expect(error).toMatchObject({ command: "setDevice", code: ErrorCode.NO_CAPACITY, reason: 1 });
+    expect(error).toMatchObject({ command: "setDevice", code: ErrorCode.NO_CAPACITY, reason: ErrorReason.ENABLED_DEVICES, outcome: ErrorOutcome.NO_EFFECT });
+    expect((error as CordialError).related).toMatchObject([{ code: ErrorCode.STORAGE_FAILED, reason: ErrorReason.STORAGE, outcome: ErrorOutcome.UNKNOWN, related: [{ code: ErrorCode.TIMEOUT }] }]);
     const next = connection.getStatus();
     await Promise.resolve();
     peer.send(status);
@@ -184,14 +186,16 @@ describe("Connection", () => {
     expect(await created).toBe(9);
   });
 
-  it("reads unknown error codes as unknown", () => {
-    expect(new CordialError("x", 999 as ErrorCode).code).toBe(ErrorCode.UNKNOWN);
+  it("keeps the numbers of error details it doesn't know", () => {
+    const error = new CordialError("x", { code: 999 as ErrorCode, reason: 998 as ErrorReason, outcome: 997 as ErrorOutcome, related: [{ code: 996 as ErrorCode, reason: 995 as ErrorReason }] });
+    expect(error).toMatchObject({ code: 999, reason: 998, outcome: 997, related: [{ code: 996, reason: 995, outcome: 0, related: [] }] });
+    expect(error.message).toBe("x failed: 999");
   });
 
   it("refuses a request over the size limit without sending it", async () => {
     const { peer, connection } = await open();
     const error = await connection.setAdapter({ name: "x".repeat(2000) }).catch((e: unknown) => e);
-    expect(error).toMatchObject({ code: ErrorCode.TOO_LONG });
+    expect(error).toMatchObject({ code: ErrorCode.TOO_LONG, outcome: ErrorOutcome.NO_EFFECT });
     expect(peer.requests).toHaveLength(1);
   });
 
@@ -258,8 +262,8 @@ type ListKind = typeof listKinds[number];
 function listResult(kind: ListKind, start: number, count: number): NonNullable<MessageInitShape<typeof ResponseSchema>["result"]> {
   const ids = Array.from({ length: count }, (_, i) => start + i + 1);
   switch (kind) {
-    case "devices": return { case: kind, value: { entries: ids.map((id) => ({ entry: { case: "unreadable", value: id } })) } };
-    case "profiles": return { case: kind, value: { entries: ids.map((id) => ({ entry: { case: "unreadable", value: id } })) } };
+    case "devices": return { case: kind, value: { entries: ids.map((id) => ({ entry: { case: "error", value: { id, error: { code: ErrorCode.STORAGE_FAILED } } } })) } };
+    case "profiles": return { case: kind, value: { entries: ids.map((id) => ({ entry: { case: "error", value: { id, error: { code: ErrorCode.STORAGE_FAILED } } } })) } };
     case "settings": return { case: kind, value: { device: 7, objects: ids.map((integration) => ({ integration })) } };
     case "profileRules": return { case: kind, value: { profile: 7, rules: ids.map((usage) => ({ input: { usagePage: 9, usage }, collection: { usagePage: 1, usage: 5 } })) } };
     case "features": return { case: kind, value: { features: ids.map((integration) => ({ integration })) } };

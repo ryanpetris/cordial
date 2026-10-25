@@ -15,7 +15,7 @@ use crate::{
     view::State,
 };
 use cordial_protocol::{
-    self as p, CapacityReason, CodeKind, ErrorCode, IntegrationKind, pairing, profile_list_entry,
+    self as p, CodeKind, ErrorCode, ErrorReason, IntegrationKind, pairing, profile_list_entry,
     profile_rule_change, request::Command as C, response,
 };
 use std::time::Duration;
@@ -46,12 +46,12 @@ fn refused(code: ErrorCode, command: &'static str) -> Error {
     Error::code(code, Some(command))
 }
 
-fn no_capacity(reason: CapacityReason, command: &'static str) -> Error {
-    Error::dongle(
+fn no_capacity(reason: ErrorReason, command: &'static str) -> Error {
+    Error::refusal(
         p::Error {
             code: ErrorCode::NoCapacity as i32,
             reason: reason as i32,
-            outcome_unknown: false,
+            ..Default::default()
         },
         Some(command),
     )
@@ -470,9 +470,13 @@ pub(crate) fn execute(
 }
 
 /// An adapter's UNSUPPORTED refusal of work on `transports`, as the reason when the adapter now
-/// has one of them disabled.
+/// has one of them disabled. A refusal with more to report stays as it is.
 fn transport_refusal(session: &Session, transports: &[p::Transport], error: Error) -> Error {
-    if error.code_of() != Some(ErrorCode::Unsupported) {
+    let plain = error
+        .dongle
+        .as_ref()
+        .is_some_and(|e| e.code() == ErrorCode::Unsupported && model::plain(e));
+    if !plain {
         return error;
     }
     let st = session.state();
@@ -486,7 +490,7 @@ fn transport_refusal(session: &Session, transports: &[p::Transport], error: Erro
 }
 
 fn unexpected() -> Error {
-    Error::new("the adapter returned an unexpected result")
+    Error::new(crate::error::UNEXPECTED)
 }
 
 fn list_profiles(session: &Session, reported: bool) -> Result<p::ProfileList, Error> {
@@ -675,14 +679,14 @@ fn scan(
         return Ok(Outcome::ScanStarted(transports));
     }
     let done = session.cell.wait_for(&options.wait, |st| {
-        st.scanning.is_none().then_some(st.last_scan)
+        st.scanning.is_none().then(|| st.last_scan.clone())
     });
     match done {
         Ok(done) => {
             let done = done.unwrap_or_default();
             Ok(Outcome::ScanFinished {
                 count: done.count,
-                truncated: done.truncated,
+                error: done.error,
             })
         }
         Err(error) => {
@@ -732,7 +736,7 @@ fn pair(session: &Session, target: &Target, options: &RunOptions) -> Result<Outc
     }
     let candidate = resolve_candidate(&st, target)?;
     if model::storage_full(&st.status) {
-        return Err(no_capacity(CapacityReason::Storage, "pair start"));
+        return Err(no_capacity(ErrorReason::Storage, "pair start"));
     }
     if st.pairing.as_ref().is_some_and(model::pairing_running) {
         return Err(refused(ErrorCode::Busy, "pair start"));
@@ -761,17 +765,17 @@ fn pair(session: &Session, target: &Target, options: &RunOptions) -> Result<Outc
             .filter(|p| p.candidate == candidate.id)?;
         match &p.step {
             Some(pairing::Step::Done(done)) => Some(Ok(done.device)),
-            Some(pairing::Step::Failed(code)) => Some(Err(model::code(*code))),
+            Some(pairing::Step::Error(e)) => Some(Err(e.clone())),
             _ => None,
         }
     });
     let device = match ended {
         Ok(Ok(device)) => device,
-        Ok(Err(code)) => {
+        Ok(Err(e)) => {
             return Err(transport_refusal(
                 session,
                 &[transport],
-                Error::code(code, Some("pair start")),
+                Error::dongle(e, Some("pair start")),
             ));
         }
         Err(error) => {
@@ -909,7 +913,7 @@ fn device_command(
                 return Err(refused(ErrorCode::Disabled, "device connect"));
             }
             if model::inactive(&d) == Some(p::InactiveReason::Capacity) {
-                return Err(no_capacity(CapacityReason::Enabled, "device connect"));
+                return Err(no_capacity(ErrorReason::EnabledDevices, "device connect"));
             }
             let transport = d.transport();
             let _pending = session.pending("device connect", id);
@@ -1080,7 +1084,7 @@ fn save_device(
             .as_ref()
             .is_some_and(|l| l.as_slice() != profiles::layers(d));
     if changes && capacity_refused(st, d, enabled, blocked) {
-        return Err(no_capacity(CapacityReason::Enabled, "device set"));
+        return Err(no_capacity(ErrorReason::EnabledDevices, "device set"));
     }
     if let Some(layers) = &update.layers {
         if !profiles::available(&st.status) {

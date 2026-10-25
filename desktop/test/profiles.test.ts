@@ -5,7 +5,7 @@ import { isAction } from "../src/core/actions.ts";
 import { FakeAdapter, axis, device, profile, remap, scale } from "../src/fake/adapter.ts";
 import { canEnable, copyName, interfaceProblem, profileInUse, stagedInterfaces } from "../src/shared/profiles.ts";
 import type { AdapterStatus, AppState, DeviceEntry } from "../src/shared/state.ts";
-import { memoryPercent, profileAlertText } from "../src/shared/text.ts";
+import { hasError, memoryPercent, profileAlertText } from "../src/shared/text.ts";
 import { PROFILES_PER_PAGE } from "../src/core/session.ts";
 import { controller, record, until } from "./helpers.ts";
 
@@ -171,7 +171,7 @@ describe("Profiles", () => {
     const { c, state } = controller({ "/a": fake });
     await c.manager.rescan();
     await until(() => !!state()?.adapters[0]?.profilePage && !state()!.adapters[0]!.profilePage!.loading);
-    expect(state()!.adapters[0]!.profilePage).toMatchObject({ profiles: [{ id: 1 }], unreadable: [2] });
+    expect(state()!.adapters[0]!.profilePage).toMatchObject({ profiles: [{ id: 1 }], unreadable: [{ id: 2, error: { code: "storage_failed", reason: "storage", outcome: "no_effect", related: [] } }] });
     await c.stop();
   });
 
@@ -357,14 +357,15 @@ describe("Profiles", () => {
     const { fake, c, deps, state } = await start({ profiles: [profile(1, "Big", [], 900), profile(2, "Small", [], 200)], memoryBudget: 1000 });
     const alerts = () => deps.profileAlert.mock.calls.map(([a]) => a);
     await c.act({ type: "device.update", key: KEY, profiles: [1] });
-    await until(() => adapter(state).status!.errors.includes("profile_memory_low"));
+    await until(() => hasError(adapter(state).status!.errors, "profile_memory_low"));
     await until(() => alerts().length === 1);
     expect(alerts()[0]).toEqual({ kind: "memory", adapterId: ID, name: "Pico 2 W" });
     expect(profileAlertText(alerts()[0]!)).toEqual({ title: "Pico 2 W is almost out of profile memory.", body: null });
     await c.act({ type: "device.update", key: `${ID}/2`, profiles: [2] });
     await until(() => alerts().length === 2);
-    expect(alerts()[1]).toEqual({ kind: "device", key: `${ID}/2`, name: "Keyboard", code: "profile_memory_exceeded" });
-    expect(state().devices[1]!.device.errors).toEqual(["profile_memory_exceeded"]);
+    const exceeded = { code: "profile_memory_exceeded", reason: "profile_memory", outcome: "unspecified", related: [] };
+    expect(alerts()[1]).toEqual({ kind: "device", key: `${ID}/2`, name: "Keyboard", error: exceeded });
+    expect(state().devices[1]!.device.errors).toEqual([exceeded]);
     expect(profileAlertText(alerts()[1]!)).toEqual({
       title: "Keyboard connected without its profiles.",
       body: "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.",
@@ -376,7 +377,7 @@ describe("Profiles", () => {
     expect(alerts()).toHaveLength(2);
     // Each notifies again once the condition returns.
     await c.act({ type: "device.update", key: KEY, profiles: [1] });
-    await until(() => state().devices[0]!.device.errors.includes("profile_memory_exceeded"));
+    await until(() => hasError(state().devices[0]!.device.errors, "profile_memory_exceeded"));
     await until(() => alerts().length === 3);
     expect(alerts()[2]).toMatchObject({ kind: "device", key: KEY });
     fake.changeAdapter({ memoryBudget: 1100 });

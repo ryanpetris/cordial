@@ -175,7 +175,9 @@ impl<F: Fleet> Model<F> {
                 if !self.adapter_ready(&d) {
                     self.notes
                         .insert(spot, words::code_text(ErrorCode::NotReady));
-                } else if model::inactive(&d.d) == Some(InactiveReason::TransportDisabled) {
+                } else if d.read_error.is_none()
+                    && model::inactive(&d.d) == Some(InactiveReason::TransportDisabled)
+                {
                     self.notes
                         .insert(spot, words::transport_disabled_text(d.d.transport()));
                 } else {
@@ -251,7 +253,7 @@ impl<F: Fleet> Model<F> {
             }
             Action::DiagnosticsRefresh if !self.device_busy(&d) && self.adapter_ready(&d) => {
                 let spot = Spot::Diagnostics(key.0.clone(), key.1);
-                let read_failed = self.settings_errors.contains_key(&key);
+                let read_failed = self.settings_errors.contains_key(&key) || d.read_error.is_some();
                 if read_failed || !d.connected() {
                     self.notes.remove(&spot);
                     self.list_settings(adapter, id);
@@ -286,12 +288,16 @@ impl<F: Fleet> Model<F> {
         let refusal = self.state_of(&a).and_then(|st| {
             let enabled = sent.enabled.unwrap_or(d.d.enabled);
             let blocked = sent.blocked.unwrap_or(d.d.blocked);
-            if commands::capacity_refused(st, &d.d, enabled, blocked) {
-                return Some(words::error_text(&p::Error {
-                    code: ErrorCode::NoCapacity as i32,
-                    reason: cordial_protocol::CapacityReason::Enabled as i32,
-                    ..Default::default()
-                }));
+            // A record that is only last known leaves capacity to the adapter.
+            if d.read_error.is_none() && commands::capacity_refused(st, &d.d, enabled, blocked) {
+                return Some(words::error_text(
+                    &p::Error {
+                        code: ErrorCode::NoCapacity as i32,
+                        reason: p::ErrorReason::EnabledDevices as i32,
+                        ..Default::default()
+                    },
+                    words::Scope::Save,
+                ));
             }
             if sent.hidpp.is_some() && self.settings_busy(d) {
                 return Some(words::code_text(ErrorCode::Busy));
@@ -390,7 +396,9 @@ impl<F: Fleet> Model<F> {
                                 .device(&adapter, job_device(job))
                                 .map(|d| d.d.transport());
                             match t {
-                                Some(t) => words::transport_failure(e, &status, t),
+                                Some(t) => {
+                                    words::transport_failure(e, &status, t, words::Scope::Save)
+                                }
                                 None => words::failure(e),
                             }
                         }
@@ -461,7 +469,7 @@ impl<F: Fleet> Model<F> {
         let Some(d) = self.device(adapter, id).cloned() else {
             return PageView::new(Line::default(), w);
         };
-        let status = words::device_status(&d.d);
+        let status = d.status();
         let tone = match () {
             _ if d.connected() => layout::ok(),
             _ if d.d.blocked => warn(),
@@ -499,7 +507,7 @@ impl<F: Fleet> Model<F> {
         } else {
             Tab::Details
         };
-        if let Some(reason) = model::inactive(&d.d)
+        if let Some(reason) = model::inactive(&d.d).filter(|_| d.read_error.is_none())
             && reason != InactiveReason::Disabled
         {
             v.banners.push((words::inactive_text(&d.d), info_style()));
@@ -625,8 +633,9 @@ impl<F: Fleet> Model<F> {
                 !busy_now && ready,
             );
         } else {
-            let can_connect =
-                model::inactive(&d.d).is_none() && d.d.state() == DeviceState::Disconnected;
+            // A record that is only last known leaves Connect to the adapter.
+            let can_connect = d.read_error.is_some()
+                || (model::inactive(&d.d).is_none() && d.d.state() == DeviceState::Disconnected);
             let tone = if can_connect && !dirty {
                 Tone::Primary
             } else {
@@ -758,16 +767,30 @@ impl<F: Fleet> Model<F> {
             dim()
         };
         let b = &mut v.body;
-        if let Some(code) = model::last_error(&d.d) {
+        if let Some(e) = model::last_error(&d.d) {
             b.section("Connection");
-            b.fact("Last Error", &words::code_text(code), layout::plain());
+            b.fact(
+                "Last Error",
+                &words::error_text(e, words::Scope::Other),
+                layout::plain(),
+            );
         }
         if d.connected()
-            && let Some(code) = model::profile_error(&d.d)
+            && let Some(e) = model::profile_error(&d.d)
         {
             b.section("Profiles");
             b.fact("Status", "Not Loaded", err());
-            b.fact("", &words::profile_error_text(code), dim());
+            b.fact("", &words::profile_error_text(e), dim());
+        }
+        if let Some(e) = &d.read_error {
+            b.section("Saved Data");
+            let text = match words::error_text(e, words::Scope::Read) {
+                read if read == words::READ_FAILED => {
+                    format!("{} Try again.", words::DEVICE_READ_FAILED)
+                }
+                read => format!("{} {read}", words::DEVICE_READ_FAILED),
+            };
+            b.para(&text, layout::plain());
         }
         if let Some(e) = self.settings_errors.get(&(a.clone(), id)) {
             b.section("Device Settings");
@@ -789,7 +812,7 @@ impl<F: Fleet> Model<F> {
         }
         if let Some(o) = model::gamepad_output(&d.d).filter(|_| model::gamepad_saved(&d.d)) {
             b.section("Gamepad Output");
-            b.fact("Status", text::output_state_words(o), layout::plain());
+            b.fact("Status", &text::output_state_words(o), layout::plain());
             if let Some(slot) = o.slot {
                 b.fact("Slot", &text::slot_number(slot), layout::plain());
             }
@@ -817,7 +840,9 @@ impl<F: Fleet> Model<F> {
         if busy_now {
             bar.label(&format!("{}", super::spinner()), layout::accent());
         }
-        let retry = self.settings_errors.contains_key(&(a, id)) || self.notes.contains_key(&spot);
+        let retry = self.settings_errors.contains_key(&(a, id))
+            || self.notes.contains_key(&spot)
+            || d.read_error.is_some();
         let label = if retry { "Retry" } else { "Refresh" };
         let mut right = Layout::new(bar.width);
         button_if(

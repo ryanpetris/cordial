@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 pub fn device_entry_id(entry: &p::DeviceListEntry) -> u32 {
     match entry.entry {
         Some(device_list_entry::Entry::Device(ref d)) => d.id,
-        Some(device_list_entry::Entry::Unreadable(id)) => id,
+        Some(device_list_entry::Entry::Error(ref error)) => error.id,
         None => 0,
     }
 }
@@ -15,7 +15,7 @@ pub fn device_entry_id(entry: &p::DeviceListEntry) -> u32 {
 pub fn profile_entry_id(entry: &p::ProfileListEntry) -> u32 {
     match entry.entry {
         Some(profile_list_entry::Entry::Profile(ref profile)) => profile.id,
-        Some(profile_list_entry::Entry::Unreadable(id)) => id,
+        Some(profile_list_entry::Entry::Error(ref error)) => error.id,
         None => 0,
     }
 }
