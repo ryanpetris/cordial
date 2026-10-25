@@ -20,7 +20,7 @@ describe("AdapterSession", () => {
     ]);
     expect(session.status.errors).toEqual([]);
     expect(session.status.resources).toEqual([usage("interfaces", 11, 16), usage("storage", 24576, 524288)]);
-    expect(session.status.information.storageFormat).toBe(1);
+    expect(session.status.information.storageFormat).toBe(2);
     // Limit-only entries keep their count unknown.
     expect(session.status.profileSupport).toEqual({ resources: [usage("memory", 0, 4096), usage("outputs", null, 8), usage("layers", null, 4)] });
     expect(session.status.interfaces).toEqual([

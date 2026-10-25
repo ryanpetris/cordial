@@ -1,12 +1,13 @@
 // The records the Dongle saves in its LittleFS filesystem. Each file holds one message, encoded as
 // protobuf without framing or length prefix; docs/storage-format.md names the message of each path.
-// An empty file holds no record, so every record has a field that writers always set.
+// Every file has exactly one nonzero uint32 format field at tag 1. Its number, type and meaning
+// remain stable across formats, so readers check it before interpreting the remaining fields.
 //
 // Fields follow the kinds in docs/protocol/compatibility.md. A field marked Required must be set
 // for the record to be valid, and the firmware checks it. A plain field reads its zero value as its
 // default. An `optional` scalar or a message field has explicit presence. Later firmware adds
 // fields whose zero value or absence means what earlier firmware did, and never changes the number,
-// type or meaning of an existing field, so records can gain fields without a new storage layout.
+// type or meaning of an existing field within a format. Breaking changes use a new format.
 // Firmware ignores unknown fields, and leaves out entries of repeated fields whose transport,
 // integration, configuration interface or role is unknown or unspecified. An unknown host platform
 // reads as Linux.
@@ -16,7 +17,7 @@ package cordial.storage;
 
 // /format.pb: the filesystem's root record, written when storage is provisioned.
 message Format {
-  // Required. Always 1.
+  // Required. The storage format of this file.
   uint32 format = 1;
   // Whether the identity and the initial sequence have been committed.
   bool initialized = 2;
@@ -24,31 +25,35 @@ message Format {
 
 // /identity.pb: the adapter's Bluetooth identity. Keys are most-significant byte first.
 message Identity {
+  // Required. The storage format of this file.
+  uint32 format = 1;
   // Required. The adapter's 6-byte Bluetooth address, which must match the radio's.
-  bytes address = 1;
+  bytes address = 2;
   // Required. The 16-byte identity root.
-  bytes ir = 2;
+  bytes ir = 3;
   // Required. The 16-byte encryption root.
-  bytes er = 3;
+  bytes er = 4;
   // Required. The 16-byte identity resolving key: AES-128 under `ir` of the block whose last byte
   // is 1 and whose other bytes are 0.
-  bytes irk = 4;
+  bytes irk = 5;
 }
 
 // /adapter.pb: the adapter's preferences. Without the file, the adapter uses the image's default
 // name, Linux, BLE alone and no configuration interface.
 message Adapter {
+  // Required. The storage format of this file.
+  uint32 format = 1;
   // The name override: 1..64 UTF-8 bytes, trimmed, without control characters. Absent selects the
   // image's default name.
-  optional string name = 1;
-  HostPlatform host_platform = 2;
+  optional string name = 2;
+  HostPlatform host_platform = 3;
   // Whether each transport is enabled, at most one entry per transport. A transport without an
   // entry uses its default: BLE enabled, Classic disabled. Writers list every transport.
-  repeated TransportPreference transports = 3;
+  repeated TransportPreference transports = 4;
   // The saved preferences of each configuration interface that has any, at most one entry per
   // interface. An interface without an entry is disabled with no profile, and writers omit such
   // entries. An enabled interface has a profile, and no two enabled interfaces conflict.
-  repeated InterfacePreference configuration_interfaces = 4;
+  repeated InterfacePreference configuration_interfaces = 5;
 }
 
 enum HostPlatform {
@@ -86,20 +91,24 @@ message InterfacePreference {
 // /sequence.pb: the next device and profile IDs. Each is saved before a record with the ID it
 // replaces is published, so IDs are never reused.
 message Sequence {
+  // Required. The storage format of this file.
+  uint32 format = 1;
   // Required. The ID the next paired device gets: 1 at first, and 4294967296 once every 32-bit ID
   // has been used.
-  uint64 next_device = 1;
+  uint64 next_device = 2;
   // Required. The ID the next created profile gets, likewise.
-  uint64 next_profile = 2;
+  uint64 next_profile = 3;
 }
 
 // /devices/<id>/device.pb: a paired device's policy and complete bond. This file commits the
 // device's existence.
 message Device {
+  // Required. The storage format of this file.
+  uint32 format = 1;
   // Required.
-  Policy policy = 1;
+  Policy policy = 2;
   // Required.
-  Bond bond = 2;
+  Bond bond = 3;
 }
 
 // A Bluetooth peer's identity.
@@ -222,8 +231,10 @@ message Security {
 // /devices/<id>/settings.pb: the device's explicitly saved preferences. Forgetting the last one
 // deletes the file.
 message Settings {
+  // Required. The storage format of this file.
+  uint32 format = 1;
   // Required: at least one. Each integration and key at most once.
-  repeated Preference preferences = 1;
+  repeated Preference preferences = 2;
 }
 
 message Preference {
@@ -267,14 +278,16 @@ message Range {
 // /devices/<id>/layout.pb: the device's HID layout, an optional cache that lets a later connection
 // forward input without rediscovering the device.
 message Layout {
+  // Required. The storage format of this file.
+  uint32 format = 1;
   // Required: 1..3. The raw report map of each HID service, 1..2048 bytes each, in service order.
   // A Classic device has one.
-  repeated bytes maps = 1;
+  repeated bytes maps = 2;
   // A BLE device's report characteristics, at least one of them an input report. A Classic device
   // has none.
-  repeated Report reports = 2;
+  repeated Report reports = 3;
   // The device's 16-byte GATT Database Hash. Empty when the device exposes none.
-  bytes database_hash = 3;
+  bytes database_hash = 4;
 }
 
 enum ReportType {
@@ -304,17 +317,21 @@ message Report {
 // /profiles/<id>/profile.pb: a profile's record. Its directory supplies its ID. This file commits
 // the profile's existence.
 message Profile {
+  // Required. The storage format of this file.
+  uint32 format = 1;
   // Required. 1..64 UTF-8 bytes without control characters.
-  string name = 1;
+  string name = 2;
   // The roles of the input the profile's rules change, worked out when the rules are saved.
-  repeated Role roles = 2;
+  repeated Role roles = 3;
 }
 
 // /profiles/<id>/rules.pb: a profile's rules. Forgetting the last rule deletes the file.
 message Rules {
+  // Required. The storage format of this file.
+  uint32 format = 1;
   // Required: at least one. Sorted by input, then collection, with at most one rule for each
   // input and collection together, so rules can be searched, read or skipped one at a time.
-  repeated Rule rules = 1;
+  repeated Rule rules = 2;
 }
 
 // A HID usage is a uint32 with the usage page in its high 16 bits and the usage ID in its low 16.

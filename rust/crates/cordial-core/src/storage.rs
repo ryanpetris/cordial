@@ -256,8 +256,10 @@ pub fn encode<M: prost::Message>(message: &M) -> Result<Vec<u8>, Error> {
     message.encode(&mut bytes).map_err(|_| Error::TooLarge)?;
     Ok(bytes)
 }
-/// The saved record in `bytes`. `Corrupt` when they do not decode as `M`.
+/// The saved record in `bytes`. Checks the format before decoding its payload as `M`.
+/// `Corrupt` when its format is unsupported or its bytes do not decode.
 pub fn decode<M: prost::Message + Default>(bytes: &[u8]) -> Result<M, Error> {
+    saved::validate_format(bytes).map_err(|_| Error::Corrupt)?;
     M::decode(bytes).map_err(|_| Error::Corrupt)
 }
 /// A fixed-length byte field of a saved record. `Corrupt` when it has another length.
@@ -273,6 +275,7 @@ pub fn narrow<T: TryFrom<u32>>(value: u32) -> Result<T, Error> {
 const SEQUENCE: RecordKey = [7, 0, 0, 0, 0, 0, 0, 0, 0];
 /// The sequence a new filesystem starts with.
 const FIRST: saved::Sequence = saved::Sequence {
+    format: saved::CURRENT_FORMAT,
     next_device: 1,
     next_profile: 1,
 };
@@ -398,6 +401,7 @@ impl<S: RecordStore> Preferences<'_, S> {
             self.store.remove(self.key()).await
         } else {
             let saved = saved::Settings {
+                format: saved::CURRENT_FORMAT,
                 preferences: values.iter().map(preference).collect(),
             };
             self.store.save(self.key(), &encode(&saved)?).await
@@ -466,20 +470,14 @@ impl<S: RecordStore> crate::settings::PreferenceStore for Preferences<'_, S> {
     }
 }
 const FORMAT: RecordKey = [0; 9];
-/// The value of `Format.format`.
-const FORMAT_VALUE: u32 = 1;
 /// The filesystem's root record. `Layout` when it is missing or is not this firmware's.
 pub async fn format<S: RecordStore>(store: &mut S) -> Result<saved::Format, Error> {
     let bytes = store.load_owned(FORMAT).await?.ok_or(Error::Layout)?;
-    let value: saved::Format = decode(&bytes).map_err(|_| Error::Layout)?;
-    if value.format != FORMAT_VALUE {
-        return Err(Error::Layout);
-    }
-    Ok(value)
+    decode(&bytes).map_err(|_| Error::Layout)
 }
 fn format_record(initialized: bool) -> Result<Vec<u8>, Error> {
     encode(&saved::Format {
-        format: FORMAT_VALUE,
+        format: saved::CURRENT_FORMAT,
         initialized,
     })
 }

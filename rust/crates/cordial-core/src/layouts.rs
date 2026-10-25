@@ -43,25 +43,31 @@ fn report(report: &saved::Report) -> Result<LayoutReport, Error> {
     })
 }
 
-/// The saved form of `layout`. Its report maps are written straight from the layout, followed by
-/// the rest of the message.
+/// The saved form of `layout`. After the format field, report maps are written straight from the
+/// layout, followed by the remaining fields.
 pub fn encode(layout: &Layout) -> Result<Vec<u8>, Error> {
     let rest = saved::Layout {
         maps: Vec::new(),
         reports: layout.reports.iter().map(saved_report).collect(),
         database_hash: layout.hash.map_or_else(Vec::new, |hash| hash.0.into()),
+        ..saved::Layout::default()
     };
     let maps: usize = layout
         .maps
         .iter()
-        .map(|map| prost::encoding::bytes::encoded_len(1, &map.0))
+        .map(|map| prost::encoding::bytes::encoded_len(2, &map.0))
         .sum();
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(maps + rest.encoded_len())
+        .try_reserve_exact(
+            prost::encoding::uint32::encoded_len(1, &saved::CURRENT_FORMAT)
+                + maps
+                + rest.encoded_len(),
+        )
         .map_err(|_| Error::Unavailable)?;
+    prost::encoding::uint32::encode(1, &saved::CURRENT_FORMAT, &mut bytes);
     for map in &layout.maps {
-        prost::encoding::bytes::encode(1, &map.0, &mut bytes);
+        prost::encoding::bytes::encode(2, &map.0, &mut bytes);
     }
     rest.encode(&mut bytes).map_err(|_| Error::TooLarge)?;
     Ok(bytes)

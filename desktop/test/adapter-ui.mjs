@@ -132,7 +132,7 @@ try {
   await publish(ready);
   const formatFact = page.locator(".fact").filter({ has: page.locator("dt", { hasText: /^Storage Format$/ }) });
   await tab("Diagnostics").click();
-  await formatFact.getByText("1", { exact: true }).waitFor();
+  await formatFact.getByText("2", { exact: true }).waitFor();
   const information = status.information;
   status.information = { ...information, storageFormat: null };
   await publish(ready);

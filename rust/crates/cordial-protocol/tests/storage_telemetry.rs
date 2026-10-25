@@ -3,7 +3,11 @@ use prost::Message;
 
 #[test]
 fn storage_telemetry_preserves_independent_presence_on_the_wire() {
-    for storage_format in [None, Some(0), Some(1)] {
+    for storage_format in [
+        None,
+        Some(0),
+        Some(cordial_protocol::storage::CURRENT_FORMAT),
+    ] {
         for count in [None, Some(0), Some(4096)] {
             for limit in [None, Some(0), Some(1 << 20)] {
                 let status = Status {
@@ -30,7 +34,11 @@ fn storage_telemetry_preserves_independent_presence_on_the_wire() {
 #[cfg(feature = "json")]
 #[test]
 fn storage_telemetry_raw_json_preserves_unknown_and_explicit_zero() {
-    for storage_format in [None, Some(0), Some(1)] {
+    for storage_format in [
+        None,
+        Some(0),
+        Some(cordial_protocol::storage::CURRENT_FORMAT),
+    ] {
         for count in [None, Some(0), Some(4096)] {
             for limit in [None, Some(0), Some(1 << 20)] {
                 let status = Status {

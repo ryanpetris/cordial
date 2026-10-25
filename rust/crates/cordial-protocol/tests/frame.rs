@@ -138,7 +138,7 @@ fn typed_information_preserves_unknown_false_zero_and_enum_readings() {
         firmware_version: Some("0.0.0".into()),
         board_name: Some("Board".into()),
         development_build: Some(false),
-        storage_format: Some(1),
+        storage_format: Some(cordial_protocol::storage::CURRENT_FORMAT),
     };
     assert_eq!(
         AdapterInformation::decode(adapter.encode_to_vec().as_slice()).unwrap(),

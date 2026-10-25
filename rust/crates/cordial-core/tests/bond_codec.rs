@@ -128,6 +128,7 @@ fn initialized_store_requires_the_monotonic_sequence_even_without_devices() {
     assert_eq!(
         prost::Message::decode(store.records[&sequence].as_slice()),
         Ok(cordial_protocol::storage::Sequence {
+            format: cordial_protocol::storage::CURRENT_FORMAT,
             next_device: 1,
             next_profile: 1,
         })

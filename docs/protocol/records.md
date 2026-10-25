@@ -15,9 +15,10 @@ platform reads as Linux and the transport defaults apply.
 
 `Status.information` holds `firmware_version`, `board_name`, `development_build` and `storage_format`, each with
 independent presence. The Dongle always supplies these known values, including false for a
-production build, except `storage_format`, which is the validated `Format.format` epoch and is
-omitted when unknown. The current storage epoch is 1. A radio failure does not make a validated
-storage epoch unknown. `Status.errors` is the complete current set of adapter problems as full `Error`
+production build, except `storage_format`, which is the validated `Format.format` version and is
+omitted when unknown. The current storage format is 2, shared by all nine saved
+file messages. A radio failure does not make a validated storage format unknown.
+`Status.errors` is the complete current set of adapter problems as full `Error`
 messages, ordered and deduplicated by complete error as defined in
 [Errors](limits-and-errors.md#errors). Empty clears all adapter problems. An `adapter` event
 replaces the complete `Status`, including its errors and resource counts.

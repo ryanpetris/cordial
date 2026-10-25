@@ -536,6 +536,7 @@ pub struct AdapterPreference {
 impl AdapterPreference {
     pub fn saved(&self) -> saved::Adapter {
         saved::Adapter {
+            format: saved::CURRENT_FORMAT,
             name: self.name.clone(),
             host_platform: match self.host_platform {
                 HostPlatform::Linux => saved::HostPlatform::Linux,

@@ -24,6 +24,19 @@ mod support;
 
 /// The saved bytes decode as `M` and encode back to the same bytes.
 fn canonical<M: Message + Default>(bytes: &[u8]) -> M {
+    use prost::encoding::{DecodeContext, decode_key, encode_key, skip_field};
+    assert_eq!(saved::extract_format(bytes), Ok(saved::CURRENT_FORMAT));
+    // Format detection does not depend on any of the payload's field numbers.
+    let mut unknown = Vec::new();
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let (tag, wire) = decode_key(&mut remaining).unwrap();
+        let value = remaining;
+        skip_field(wire, tag, &mut remaining, DecodeContext::default()).unwrap();
+        encode_key(if tag == 1 { 1 } else { tag + 100 }, wire, &mut unknown);
+        unknown.extend_from_slice(&value[..value.len() - remaining.len()]);
+    }
+    assert_eq!(saved::extract_format(&unknown), Ok(saved::CURRENT_FORMAT));
     let message = M::decode(bytes).unwrap();
     assert_eq!(message.encode_to_vec(), bytes);
     message
@@ -40,7 +53,7 @@ fn startup_records_round_trip() {
     assert_eq!(
         format,
         saved::Format {
-            format: 1,
+            format: cordial_protocol::storage::CURRENT_FORMAT,
             initialized: true
         }
     );
@@ -66,12 +79,14 @@ fn startup_records_round_trip() {
     assert_eq!(
         sequence,
         saved::Sequence {
+            format: cordial_protocol::storage::CURRENT_FORMAT,
             next_device: 3,
             next_profile: 2
         }
     );
     // Once every 32-bit ID has been used, the sequence is full.
     let last = saved::Sequence {
+        format: cordial_protocol::storage::CURRENT_FORMAT,
         next_device: u64::from(u32::MAX),
         next_profile: 1,
     };
@@ -93,7 +108,7 @@ fn a_store_from_another_format_is_refused() {
     for root in [
         &br#"{"format":1,"initialized":true}"#[..],
         &saved::Format {
-            format: 2,
+            format: 1,
             initialized: true,
         }
         .encode_to_vec(),
@@ -106,6 +121,13 @@ fn a_store_from_another_format_is_refused() {
             Err(storage::Error::Layout)
         );
         assert_eq!(store.records, before);
+        store.reads.clear();
+        store.fail_load = Some(cordial_core::identity::KEY);
+        assert_eq!(
+            block_on(storage::validate_roots(&mut store)),
+            Err(storage::Error::Layout)
+        );
+        assert_eq!(store.reads, [record_key(0, 0)]);
     }
 }
 
@@ -342,6 +364,7 @@ fn layouts_round_trip_with_report_maps_as_bytes() {
     }
     // A hash of another length, or a report of an unknown type, is undecodable.
     let mut bad = saved::Layout {
+        format: cordial_protocol::storage::CURRENT_FORMAT,
         maps: vec![vec![1]],
         reports: Vec::new(),
         database_hash: vec![1; 15],
@@ -382,6 +405,7 @@ fn profile_records_round_trip() {
     store.records.insert(
         record_key(profiles::METADATA, id),
         saved::Profile {
+            format: cordial_protocol::storage::CURRENT_FORMAT,
             name: String::new(),
             roles: Vec::new(),
         }
@@ -408,6 +432,7 @@ fn saved_remaps_reject_outputs_that_alias_supported_controls() {
         store.records.insert(
             record_key(profiles::RULES, id),
             saved::Rules {
+                format: cordial_protocol::storage::CURRENT_FORMAT,
                 rules: vec![saved::Rule {
                     input: profiles::usage(profiles::KEYBOARD_PAGE, 4),
                     collection: profiles::KEYBOARD,

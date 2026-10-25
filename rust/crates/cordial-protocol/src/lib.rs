@@ -17,12 +17,7 @@ pub use generated::*;
 
 /// The records the Dongle saves in its filesystem, generated from `proto/storage.proto`. Each file
 /// holds one of these messages.
-#[allow(clippy::all, clippy::pedantic, missing_docs)]
-pub mod storage {
-    include!(concat!(env!("OUT_DIR"), "/cordial.storage.rs"));
-    #[cfg(feature = "json")]
-    include!(concat!(env!("OUT_DIR"), "/cordial.storage.serde.rs"));
-}
+pub mod storage;
 
 #[cfg(feature = "json")]
 mod error_json;

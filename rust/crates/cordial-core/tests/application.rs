@@ -6301,13 +6301,52 @@ fn saved_pages_match_the_decoded_file_and_find_damage() {
             assert_eq!(page, expected, "after {after:?}, {count}");
         }
     }
-    // A file cut short, or with rules out of order, is undecodable once reading reaches it.
     let key = record_key(9, id as u32);
     let bytes = t.store.records[&key].clone();
+    let header = storage::Rules {
+        format: storage::CURRENT_FORMAT,
+        rules: Vec::new(),
+    }
+    .encode_to_vec();
+    let payload = &bytes[header.len()..];
+    let trailing = [payload, header.as_slice()].concat();
+    t.store.records.insert(key, trailing.clone());
+    t.store.part_bytes = 0;
+    assert_eq!(
+        block_on(profiles::saved_page(&mut t.store, id, None, 3)).unwrap(),
+        all[..3]
+    );
+    // Preflight reads the whole file; paging stops after the requested rules.
+    assert!(t.store.part_bytes > trailing.len());
+    assert!(t.store.part_bytes < 2 * trailing.len());
+    for invalid in [
+        payload.to_vec(),
+        [bytes.as_slice(), header.as_slice()].concat(),
+        [payload, &[8, 1]].concat(),
+        [payload, &[8, 0]].concat(),
+        [payload, &[10, 1, 2]].concat(),
+        [payload, &[8, 0x80]].concat(),
+    ] {
+        t.store.records.insert(key, invalid);
+        assert_eq!(
+            block_on(profiles::rules(&mut t.store, id)),
+            Err(cordial_core::storage::Error::Corrupt)
+        );
+        for count in [0, 3] {
+            assert_eq!(
+                block_on(profiles::saved_page(&mut t.store, id, None, count)),
+                Err(cordial_core::storage::Error::Corrupt)
+            );
+        }
+    }
+    // Preflight rejects broken framing even beyond the requested page.
     t.store
         .records
         .insert(key, bytes[..bytes.len() - 1].to_vec());
-    assert!(block_on(profiles::saved_page(&mut t.store, id, None, 3)).is_ok());
+    assert_eq!(
+        block_on(profiles::saved_page(&mut t.store, id, None, 3)),
+        Err(cordial_core::storage::Error::Corrupt)
+    );
     assert_eq!(
         block_on(profiles::saved_page(&mut t.store, id, None, 1000)),
         Err(cordial_core::storage::Error::Corrupt)
@@ -6320,6 +6359,7 @@ fn saved_pages_match_the_decoded_file_and_find_damage() {
         })),
     };
     let unsorted = storage::Rules {
+        format: cordial_protocol::storage::CURRENT_FORMAT,
         rules: vec![rule(9), rule(8)],
     };
     t.store.records.insert(key, unsorted.encode_to_vec());

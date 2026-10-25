@@ -73,6 +73,7 @@ impl Identity {
             .save(
                 KEY,
                 &storage::encode(&saved::Identity {
+                    format: saved::CURRENT_FORMAT,
                     address: address.into(),
                     ir: bytes[8..24].into(),
                     er: bytes[24..40].into(),

@@ -78,7 +78,7 @@ fn nonblank_and_stale_markers_recover_only_the_owned_filesystem() {
                 .unwrap();
             assert_eq!(
                 cordial_core::storage::format(&mut fs).await.unwrap().format,
-                1
+                cordial_protocol::storage::CURRENT_FORMAT
             );
             assert!(flash.0.borrow()[..4096].iter().all(|v| *v == 0x42));
             assert!(flash.0.borrow()[128 * 1024..].iter().all(|v| *v == 0x24));
@@ -262,6 +262,17 @@ impl NorFlash for CutFlash {
 }
 #[test]
 fn interrupted_replacements_preserve_old_or_new_complete_file() {
+    use cordial_protocol::storage::{CURRENT_FORMAT, Sequence};
+    use prost::Message;
+    let sequence = |next_device| {
+        Sequence {
+            format: CURRENT_FORMAT,
+            next_device,
+            next_profile: 1,
+        }
+        .encode_to_vec()
+    };
+    interrupted_replacement(sequence(1), sequence(2));
     // Inline and block-backed contents, growing and shrinking.
     for (old, new) in [(7000, 11000), (11000, 300), (100, 200), (300, 5000)] {
         interrupted_replacement(vec![13; old], vec![27; new]);
@@ -506,7 +517,7 @@ fn matching_guard_with_broken_filesystem_is_reformatted() {
                 .await
                 .unwrap()
                 .format,
-            1
+            cordial_protocol::storage::CURRENT_FORMAT
         );
     });
 }
@@ -533,7 +544,7 @@ fn interrupted_startup_recovers_with_a_bounded_retry() {
                     .await
                     .unwrap()
                     .format,
-                1
+                cordial_protocol::storage::CURRENT_FORMAT
             );
             if result.is_ok() {
                 completed = true;
@@ -1072,7 +1083,7 @@ fn startup_preserves_valid_roots_and_recovers_a_mismatched_epoch() {
         assert_eq!(
             cordial_protocol::storage::Format::decode(&bytes[..n]).unwrap(),
             cordial_protocol::storage::Format {
-                format: 1,
+                format: cordial_protocol::storage::CURRENT_FORMAT,
                 initialized: true
             }
         );
@@ -1080,6 +1091,7 @@ fn startup_preserves_valid_roots_and_recovers_a_mismatched_epoch() {
         assert_eq!(
             cordial_protocol::storage::Sequence::decode(&bytes[..n]).unwrap(),
             cordial_protocol::storage::Sequence {
+                format: cordial_protocol::storage::CURRENT_FORMAT,
                 next_device: 1,
                 next_profile: 1
             }
@@ -1101,7 +1113,7 @@ fn startup_preserves_valid_roots_and_recovers_a_mismatched_epoch() {
             .await
             .unwrap();
         assert!(Identity::load(&mut store).await.unwrap().is_some());
-        store.replace_file("/format.pb", &[8, 2, 16, 1]).unwrap();
+        store.replace_file("/format.pb", &[8, 1, 16, 1]).unwrap();
         drop(store);
         let mut store = Storage::open_or_recover(flash, range, [2; 32])
             .await
@@ -1470,7 +1482,7 @@ fn invalid_epochs_and_essential_roots_reset_the_whole_filesystem() {
             let invalid_value = if root == "/sequence.pb" {
                 &[8, 0, 16, 1]
             } else {
-                &[8, 2, 16, 1]
+                &[8, 1, 16, 1]
             };
             for bytes in [
                 None,

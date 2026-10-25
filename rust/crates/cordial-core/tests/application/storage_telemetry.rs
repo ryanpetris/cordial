@@ -12,11 +12,17 @@ fn storage(status: &p::Status) -> &p::ResourceCapacity {
 #[test]
 fn storage_format_is_validated_independently_of_radio_readiness() {
     let mut t = Test::new(false);
-    assert_eq!(t.status().information.unwrap().storage_format, Some(1));
+    assert_eq!(
+        t.status().information.unwrap().storage_format,
+        Some(storage::CURRENT_FORMAT)
+    );
     t.event(Event::Failed(ErrorCode::RadioUnavailable));
     let status = t.status();
     assert!(!status.ready);
-    assert_eq!(status.information.unwrap().storage_format, Some(1));
+    assert_eq!(
+        status.information.unwrap().storage_format,
+        Some(storage::CURRENT_FORMAT)
+    );
     let valid = t.store.records[&[0; 9]].clone();
 
     for format in [
@@ -24,7 +30,7 @@ fn storage_format_is_validated_independently_of_radio_readiness() {
         Some(vec![0xff]),
         Some(
             storage::Format {
-                format: 2,
+                format: 1,
                 initialized: true,
             }
             .encode_to_vec(),
@@ -86,7 +92,10 @@ fn storage_bytes_keep_zero_unknown_and_failed_measurements_distinct() {
     );
     assert_eq!(t.app.manager.available_bytes, last_admission);
     assert!(status.ready);
-    assert_eq!(status.information.unwrap().storage_format, Some(1));
+    assert_eq!(
+        status.information.unwrap().storage_format,
+        Some(storage::CURRENT_FORMAT)
+    );
 
     t.store.fail_count = false;
     t.store.total_bytes = None;

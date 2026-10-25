@@ -190,6 +190,7 @@ impl Bond {
 /// The saved record of device `policy.id`: its policy and its bond.
 pub fn record(policy: &Policy, bond: &Bond) -> Result<Vec<u8>, Error> {
     storage::encode(&saved::Device {
+        format: saved::CURRENT_FORMAT,
         policy: Some(policy.saved()),
         bond: Some(bond.saved()),
     })

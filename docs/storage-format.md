@@ -66,10 +66,12 @@ because a driver can read SFDP while checking its addressing support.
 ## Startup recovery
 
 Startup mounts LittleFS and validates `Format.format` before reading saved USB
-configuration or other application data. Its epoch remains `1`; changing that
-value in firmware resets saved data. Missing, corrupt or mismatched epochs,
-invalid filesystems and invalid essential identity or sequence roots trigger one
-LittleFS format and root initialization attempt when formatting is permitted.
+configuration or other application data. The shared storage format is `2`.
+Format `1` has no migration and resets the adapter's Bluetooth identity, saved
+devices, preferences and profiles. Devices must pair again. Missing, corrupt or
+unsupported root formats, invalid filesystems and invalid essential identity or
+sequence roots trigger one LittleFS format and root initialization attempt when
+formatting is permitted.
 Recovery never zero-fills or securely wipes flash. Driver I/O errors stop
 initialization without a format retry loop. A later boot may retry.
 
@@ -102,13 +104,13 @@ extent. Reads and writes are bounded to that extent or a larger measured capacit
 before validation of application roots, growth, cleanup or guard repair can write.
 With no valid filesystem geometry, formatting uses only measured capacity or the
 board minimum, never the exploratory address window. With valid geometry, an
-epoch mismatch or invalid roots reset the selected Pico filesystem in place,
+format mismatch or invalid roots reset the selected Pico filesystem in place,
 using its checked extent or a larger measured capacity. This preserves the start
 and extent on later boots with missing measurements, even when the filesystem
 extends beyond the board minimum. A successful below-minimum measurement still
 forbids this reset. Actual flash I/O failures never trigger format.
 
-ESP32-S3 resets invalid roots or epochs within the measured capacity or, without
+ESP32-S3 resets invalid roots or root formats within the measured capacity or, without
 a measurement, the board minimum. A later successful measurement can grow the
 filesystem again.
 
@@ -133,7 +135,7 @@ geometry. Current inspection and flashing tools reject schema `1` artifacts.
 
 | Path | Message | Contents |
 | --- | --- | --- |
-| `/format.pb` | `Format` | `format: 1` and `initialized`, recording whether roots have been committed |
+| `/format.pb` | `Format` | `format: 2` and `initialized`, recording whether roots have been committed |
 | `/identity.pb` | `Identity` | Bluetooth address, IR, ER and derived IRK |
 | `/adapter.pb` | `Adapter` | Adapter preferences; without the file, use Linux, the image's default name, BLE alone and no configuration interface |
 | `/sequence.pb` | `Sequence` | The next device and profile IDs |
@@ -146,12 +148,48 @@ geometry. Current inspection and flashing tools reject schema `1` artifacts.
 IDs are positive decimal integers without padding or prefixes. Devices and profiles have separate
 sequences; `/devices/1/device.pb` and `/profiles/1/profile.pb` can both exist.
 
+## File format versions
+
+All nine file messages have a required `uint32 format = 1` field with the same
+value, `2`. The field's name, number and type are permanent, so readers can
+extract the version independently before interpreting the payload with the
+current schema. Protobuf fields may appear in any order; `format` need not be
+the first encoded field. A missing, zero, malformed, duplicate or unsupported
+`format` makes the record invalid. An empty file holds no record and reads as
+missing.
+
+The remaining outer fields have these numbers:
+
+| Message | Payload fields |
+| --- | --- |
+| `Format` | `initialized = 2` |
+| `Identity` | `address = 2`, `ir = 3`, `er = 4`, `irk = 5` |
+| `Adapter` | `name = 2`, `host_platform = 3`, `transports = 4`, `configuration_interfaces = 5` |
+| `Sequence` | `next_device = 2`, `next_profile = 3` |
+| `Device` | `policy = 2`, `bond = 3` |
+| `Settings` | `preferences = 2` |
+| `Layout` | `maps = 2`, `reports = 3`, `database_hash = 4` |
+| `Profile` | `name = 2`, `roles = 3` |
+| `Rules` | `rules = 2` |
+
+Nested messages have no file-format field. Their field numbers and meanings
+remain as defined in the schema, including `Rule.input = 1` and
+`Rule.collection = 2`.
+
+The version applies to the entire storage format, not to individual file types.
+A version change updates all nine messages together. Compatible additions whose
+zero value or absence preserves the existing meaning do not require a version
+bump. There is no generic migration engine; support for a future migration
+requires a separate implementation. Firmware downgrades are not supported.
+A release that changes the storage format must increment the minor version
+before `1.0`, or the major version from `1.0`.
+
 The schema's comments document each message, its fields, and firmware validation that requires
 relationships between records. Fields follow the kinds of the [compatibility
 rules](protocol/compatibility.md#fields): the firmware checks each Required field, reads a missing
 plain field as its zero value, and gives `optional` and message fields presence. Later firmware adds
 fields whose zero value or absence keeps the earlier meaning, so records gain fields without a new
-format epoch. The firmware ignores unknown fields; it leaves out entries of repeated fields
+format version. The firmware ignores unknown fields; it leaves out entries of repeated fields
 whose transport, integration, configuration interface or role is unknown or unspecified, and reads
 an unknown host platform as Linux. Otherwise a record whose Required field is missing or out of
 range is undecodable.
@@ -161,10 +199,12 @@ report types and configuration interfaces. A setting is saved by its name. HID u
 with the usage page in the high 16 bits and the usage ID in the low 16. Keys, addresses and report
 maps are bytes.
 
-Every record has a field writers always set, so no record encodes as an empty file: `format` in
-the format record, the keys of the identity, an entry for every transport in the adapter
-preferences, both next IDs of the sequence, the policy and bond of a device, at least one setting,
-the report maps of a layout, a profile's name and at least one rule.
+Writers always set `format`, so every saved record is nonempty. This does not
+replace payload requirements: identity keys, both next IDs of the sequence, a
+device's policy and bond, at least one saved setting, the report maps of a layout,
+a profile's name and at least one rule remain required. Adapter writers still
+include an entry for every transport. Forgetting the last setting or rule deletes
+its file rather than saving a message containing only `format`.
 
 ## Adapter
 
@@ -275,8 +315,9 @@ devices.
 `profile.pb` contains `name` and `roles`, the roles the profile's rules change, worked out when
 the rules are saved. The directory supplies the profile's ID.
 
-`rules.pb` contains `rules`; an absent file means no rules. Each rule requires an `input` usage
-at field 1 and its application `collection` at field 2. Both are packed `uint32` usages, with the
+`rules.pb` contains `format` at field 1 and repeated `rules` at field 2; an absent
+file means no rules. Each nested `Rule` requires an `input` usage at field 1 and
+its application `collection` at field 2. Both are packed `uint32` usages, with the
 usage page in the high 16 bits and the usage ID in the low 16. Missing or zero input or collection
 makes the record undecodable; no collection is inferred. The required `effect` is one of `remap`
 at field 3, `scale` at field 4 or `axis` at field 5:
@@ -377,8 +418,9 @@ responds.
 
 A file is saved in place: it is opened truncated, written and closed. LittleFS keeps an existing
 file's old contents until the close commits the new contents in one metadata commit, so an
-interrupted save leaves either the old or the new contents. Creating a file commits it empty before
-its contents are written, so an interrupted creation can leave an empty file. Every record is a
+interrupted save leaves either the old or the new contents, including the format
+and payload together. Creating a file commits it empty before its contents are
+written, so an interrupted creation can leave an empty file. Every record is a
 nonempty message, and an empty file holds no record: it reads as missing and is not listed as a key.
 Equal bytes skip the write; old contents of the same length that cannot be read are written over,
 but a file that cannot be looked up fails the save. A failed write of the contents leaves the file

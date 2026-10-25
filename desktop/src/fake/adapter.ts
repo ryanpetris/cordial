@@ -805,7 +805,7 @@ export class FakeAdapter implements ByteStream {
           { type: ResourceType.CONNECTIONS, count: this.devices.filter((d) => d.transport === t && d.state === "connected").length, limit: this.maxEnabled },
         ],
       })),
-      information: { firmwareVersion: "0.0.0-dev", boardName: this.board, developmentBuild: true, storageFormat: 1 },
+      information: { firmwareVersion: "0.0.0-dev", boardName: this.board, developmentBuild: true, storageFormat: 2 },
       outputSupport: this.gamepadOutputs
         ? [{
             role: Role.GAMEPAD,

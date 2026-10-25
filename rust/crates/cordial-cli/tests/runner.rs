@@ -452,6 +452,7 @@ fn file_get_saves_records_as_json_unless_raw() {
         Box::leak(dir.join(name).display().to_string().into_boxed_str())
     };
     let profile = p::storage::Profile {
+        format: cordial_protocol::storage::CURRENT_FORMAT,
         name: "Work".into(),
         roles: vec![p::storage::Role::Keyboard.into()],
     }
@@ -475,7 +476,7 @@ fn file_get_saves_records_as_json_unless_raw() {
         serde_json::from_slice(&fs::read(dir.join("profile.json")).unwrap()).unwrap();
     assert_eq!(
         json,
-        serde_json::json!({"name": "Work", "roles": ["ROLE_KEYBOARD"]})
+        serde_json::json!({"format": p::storage::CURRENT_FORMAT, "name": "Work", "roles": ["ROLE_KEYBOARD"]})
     );
     // An existing JSON file is not replaced.
     let (result, _, _) = script(

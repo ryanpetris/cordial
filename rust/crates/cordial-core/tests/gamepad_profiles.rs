@@ -654,6 +654,7 @@ fn corrupt_assigned_remaps_keep_builtin_mapping_disabled() {
         store.records.insert(
             record_key(profiles::RULES, 23),
             saved::Rules {
+                format: cordial_protocol::storage::CURRENT_FORMAT,
                 rules: vec![saved::Rule {
                     input: profiles::usage(profiles::BUTTON_PAGE, 5),
                     collection: GAMEPAD,

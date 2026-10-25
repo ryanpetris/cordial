@@ -655,7 +655,7 @@ impl Rules {
 }
 
 /// The encoded bytes of each length-delimited field `tag` of a message, in order, without decoding
-/// them. Other fields are skipped. For a rules file, field 1 holds the rules.
+/// them. Other fields are skipped. For a rules file, field 2 holds the rules.
 fn fields(mut bytes: &[u8], tag: u32) -> impl Iterator<Item = Result<&[u8], storage::Error>> {
     use prost::encoding::{DecodeContext, WireType, decode_key, decode_varint, skip_field};
     core::iter::from_fn(move || {
@@ -693,9 +693,10 @@ impl Rules {
     /// sorted by input usage and collection, so the table is filled in file order; a file that
     /// does not is undecodable.
     fn decode(bytes: &[u8]) -> Result<Self, storage::Error> {
+        saved::validate_format(bytes).map_err(|_| storage::Error::Corrupt)?;
         let count = |bytes, tag| fields(bytes, tag).try_fold(0usize, |n, e| e.map(|_| n + 1));
         let (mut rules, mut outputs, mut scales, mut axes) = (0, 0, 0, 0);
-        for rule in fields(bytes, 1) {
+        for rule in fields(bytes, 2) {
             let rule = rule?;
             rules += 1;
             for remap in fields(rule, 3) {
@@ -719,7 +720,7 @@ impl Rules {
             .try_reserve_exact(scales)
             .map_err(unavailable)?;
         table.axes.try_reserve_exact(axes).map_err(unavailable)?;
-        for entry in fields(bytes, 1) {
+        for entry in fields(bytes, 2) {
             let rule = saved::Rule::decode(entry?).map_err(|_| storage::Error::Corrupt)?;
             if rule.input == 0
                 || rule.collection == 0
@@ -835,21 +836,22 @@ impl Rules {
     /// The saved form of the table: its rules in order, each converted and encoded on its own
     /// into a buffer of exactly the file's length, which the table gives.
     fn encode(&self) -> Result<Vec<u8>, storage::Error> {
-        use prost::encoding::{encoded_len_varint, key_len, message};
+        use prost::encoding::{encoded_len_varint, key_len, message, uint32};
         let len: usize = self
             .entries
             .iter()
             .map(|e| {
                 let len = self.rule_len(e);
-                key_len(1) + encoded_len_varint(len as u64) + len
+                key_len(2) + encoded_len_varint(len as u64) + len
             })
             .sum();
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(len)
+            .try_reserve_exact(len + uint32::encoded_len(1, &saved::CURRENT_FORMAT))
             .map_err(|_| storage::Error::Unavailable)?;
+        uint32::encode(1, &saved::CURRENT_FORMAT, &mut bytes);
         for entry in &self.entries {
-            message::encode(1, &self.saved_rule(entry), &mut bytes);
+            message::encode(2, &self.saved_rule(entry), &mut bytes);
         }
         Ok(bytes)
     }
@@ -864,6 +866,7 @@ pub struct Metadata {
 impl Metadata {
     fn encode(&self) -> Result<Vec<u8>, storage::Error> {
         storage::encode(&saved::Profile {
+            format: saved::CURRENT_FORMAT,
             name: self.name.clone(),
             roles: self.roles.saved(),
         })
@@ -916,7 +919,7 @@ fn varint(bytes: &[u8]) -> Result<Option<(u64, usize)>, storage::Error> {
         Ok(None)
     }
 }
-/// The length of a whole field of a message and, when it is field 1, where its contents are.
+/// The length of a whole field of a message and, when it is field 2, where its contents are.
 type Field = (usize, Option<core::ops::Range<usize>>);
 /// The field at the front of a message's `bytes`. `None` when `bytes` end inside it.
 fn next_field(bytes: &[u8]) -> Result<Option<Field>, storage::Error> {
@@ -945,11 +948,11 @@ fn next_field(bytes: &[u8]) -> Result<Option<Field>, storage::Error> {
         },
         _ => return Err(corrupt),
     };
-    if tag == 0 || (tag == 1 && contents.is_none()) {
+    if tag == 0 || (tag == 2 && contents.is_none()) {
         return Err(corrupt);
     }
     let end = at.checked_add(len).ok_or(corrupt)?;
-    Ok((end <= bytes.len()).then(|| (end, contents.filter(|_| tag == 1))))
+    Ok((end <= bytes.len()).then(|| (end, contents.filter(|_| tag == 2))))
 }
 /// The input and collection of a saved rule, read without decoding its effect.
 fn saved_input(mut rule: &[u8]) -> Result<RuleRef, storage::Error> {
@@ -1091,14 +1094,30 @@ impl Pager {
     }
 }
 /// Up to `count` of profile `id`'s saved rules for inputs above `after`, in ascending input order.
-/// The rules file is read from its start only until they are found, a part at a time; the rules
-/// before them are checked for order and skipped without being decoded.
+/// A bounded first pass validates the format across the whole file. A second pass reads until
+/// the page is found; preceding rules are checked for order without decoding their effects.
 pub async fn saved_page<S: RecordStore>(
     store: &mut S,
     id: u64,
     after: Option<RuleRef>,
     count: usize,
 ) -> Result<Vec<Rule>, storage::Error> {
+    let mut header = saved::FormatReader::default();
+    let mut error = None;
+    let found = store
+        .read_parts(record_key(RULES, id), &mut |part| {
+            error = header.feed(part).err();
+            error.is_none()
+        })
+        .await?;
+    if !found {
+        return Ok(Vec::new());
+    }
+    if error.is_some() {
+        return Err(storage::Error::Corrupt);
+    }
+    saved::check_format(header.finish().map_err(|_| storage::Error::Corrupt)?)
+        .map_err(|_| storage::Error::Corrupt)?;
     let mut pager = Pager {
         after,
         count,
@@ -2184,7 +2203,7 @@ mod tests {
             file.rules.iter().map(|r| r.input).collect::<Vec<_>>(),
             [AXES[2], key(0x39), usage(CONSUMER_PAGE, 0xcd)]
         );
-        assert_eq!(fields(&bytes, 1).count(), 3);
+        assert_eq!(fields(&bytes, 2).count(), 3);
         // The buffer is reserved at the file's exact length.
         assert_eq!(bytes.capacity(), bytes.len());
         for (rule, entry) in file.rules.iter().zip(&table.entries) {
@@ -2199,7 +2218,13 @@ mod tests {
         assert_eq!(decoded.outputs.capacity(), decoded.outputs.len());
         assert_eq!(decoded.scales.capacity(), decoded.scales.len());
         assert_eq!(decoded.entries.capacity(), decoded.entries.len());
-        let encode = |rules: Vec<saved::Rule>| saved::Rules { rules }.encode_to_vec();
+        let encode = |rules: Vec<saved::Rule>| {
+            saved::Rules {
+                format: saved::CURRENT_FORMAT,
+                rules,
+            }
+            .encode_to_vec()
+        };
         let scale = |input| saved::Rule {
             input,
             collection: MOUSE,
@@ -2228,7 +2253,7 @@ mod tests {
         assert!(Rules::decode(&bytes[..bytes.len() - 1]).is_err());
         // Fields a later firmware adds are skipped.
         let mut extended = bytes.clone();
-        prost::encoding::uint32::encode(2, &7, &mut extended);
+        prost::encoding::uint32::encode(3, &7, &mut extended);
         assert_eq!(Rules::decode(&extended).unwrap(), table);
     }
     fn axis(input: Usage, destination: Usage, invert: bool) -> Rule {

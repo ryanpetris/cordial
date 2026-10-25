@@ -31,6 +31,8 @@ pub enum Unconverted {
     /// The record holds an enum value this build has no name for, which protobuf JSON cannot
     /// show, such as one a newer firmware saved.
     Newer,
+    /// The file declares a storage format this build cannot interpret.
+    Format,
 }
 impl Unconverted {
     /// The reason, as a lowercase clause.
@@ -39,6 +41,7 @@ impl Unconverted {
             Self::Unknown => "the file isn't a known record",
             Self::Empty => "the file is empty",
             Self::Undecodable => "the file doesn't decode as its record",
+            Self::Format => "the file uses an unsupported storage format",
             Self::Newer => "the file holds values this version of Cordial doesn't know",
         }
     }
@@ -85,6 +88,10 @@ pub fn to_json(record: Record, bytes: &[u8]) -> Result<Vec<u8>, Unconverted> {
     if bytes.is_empty() {
         return Err(Unconverted::Empty);
     }
+    saved::validate_format(bytes).map_err(|error| match error {
+        saved::FormatError::Malformed => Unconverted::Undecodable,
+        saved::FormatError::Unsupported(_) => Unconverted::Format,
+    })?;
     match record {
         Record::Format => json::<saved::Format>(bytes),
         Record::Identity => json::<saved::Identity>(bytes),
@@ -183,6 +190,7 @@ mod tests {
     #[test]
     fn known_records_become_protobuf_json() {
         let layout = saved::Layout {
+            format: cordial_protocol::storage::CURRENT_FORMAT,
             maps: vec![vec![5, 1, 9, 6]],
             reports: vec![saved::Report {
                 service: 0,
@@ -203,6 +211,7 @@ mod tests {
         assert_eq!(unconverted, None);
         let value: serde_json::Value = serde_json::from_slice(&text).unwrap();
         // Bytes are base64 and enums are named, with the schema's field names.
+        assert_eq!(value["format"], saved::CURRENT_FORMAT);
         assert_eq!(value["maps"][0], "BQEJBg==");
         assert_eq!(value["reports"][0]["type"], "REPORT_TYPE_INPUT");
         assert_eq!(value["reports"][0]["value_handle"], 16);
@@ -212,6 +221,7 @@ mod tests {
             layout
         );
         let sequence = saved::Sequence {
+            format: cordial_protocol::storage::CURRENT_FORMAT,
             next_device: 3,
             next_profile: 1,
         };
@@ -223,7 +233,7 @@ mod tests {
         // 64-bit integers are strings in protobuf JSON.
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&text).unwrap(),
-            serde_json::json!({"next_device": "3", "next_profile": "1"})
+            serde_json::json!({"format": saved::CURRENT_FORMAT, "next_device": "3", "next_profile": "1"})
         );
     }
 
@@ -252,6 +262,7 @@ mod tests {
         );
         // An enum value without a name in this build has no protobuf JSON form.
         let newer = saved::Profile {
+            format: cordial_protocol::storage::CURRENT_FORMAT,
             name: "Work".into(),
             roles: vec![99],
         }
@@ -272,6 +283,45 @@ mod tests {
                 Some(Unconverted::Unknown)
             )
         );
+    }
+
+    #[test]
+    fn invalid_formats_keep_raw_bytes_before_payload_conversion() {
+        for format in [0, 1, saved::CURRENT_FORMAT + 1] {
+            // The payload uses a wire type the current Profile schema cannot decode.
+            let mut bytes = vec![16, 9];
+            prost::encoding::uint32::encode(1, &format, &mut bytes);
+            let reason = if format == 0 {
+                Unconverted::Undecodable
+            } else {
+                Unconverted::Format
+            };
+            assert_eq!(
+                convert(
+                    "/profiles/1/profile.pb",
+                    Path::new("profile.json"),
+                    bytes.clone()
+                ),
+                (PathBuf::from("profile.pb"), bytes, Some(reason))
+            );
+        }
+        for bytes in [vec![8, 2, 8, 2], vec![8, 0x80], vec![10, 1, 2]] {
+            assert_eq!(
+                to_json(Record::Profile, &bytes),
+                Err(Unconverted::Undecodable)
+            );
+        }
+        let mut bytes = saved::Profile {
+            format: 0,
+            name: "Work".into(),
+            roles: Vec::new(),
+        }
+        .encode_to_vec();
+        prost::encoding::uint32::encode(1, &saved::CURRENT_FORMAT, &mut bytes);
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_json(Record::Profile, &bytes).unwrap()).unwrap();
+        assert_eq!(value["format"], saved::CURRENT_FORMAT);
+        assert_eq!(value["name"], "Work");
     }
 
     #[test]

@@ -159,10 +159,13 @@ $ cordial --port PORT
 The adapter sends a file's bytes as it saved them; it never converts them. Each saved record holds
 one message from `proto/storage.proto`, named by its path as listed in the [storage
 format](../storage-format.md#files). `file get` decodes a file at such a path and saves the message
-as indented protobuf JSON with the schema's field names, the mapping `--json` uses, under the
-destination name with `.json` in place of `.pb`. A file at any other path, an empty file, one that
-doesn't decode, or one holding an enum value this version of Cordial has no name for is saved
-unconverted under its original name, with `.pb` in place of a destination's `.json`, and the result
+as indented protobuf JSON with the schema's field names, including `format`, the
+mapping `--json` uses, under the destination name with `.json` in place of `.pb`.
+It checks the file's format independently before decoding the current payload.
+A file at any other path, an empty file, one with a missing, zero, malformed,
+duplicate or unsupported format, one that doesn't decode, or one holding an enum
+value this version of Cordial has no name for is saved unconverted under its
+original name, with `.pb` in place of a destination's `.json`, and the result
 says why. `--raw` saves the bytes unconverted under the destination name as given.
 
 ## TUI

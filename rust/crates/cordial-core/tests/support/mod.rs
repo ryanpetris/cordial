@@ -449,6 +449,7 @@ pub fn setup() -> (Manager, Store, Radio) {
     store.records.insert(
         storage::record_key(7, 0),
         prost::Message::encode_to_vec(&cordial_protocol::storage::Sequence {
+            format: cordial_protocol::storage::CURRENT_FORMAT,
             next_device: 78,
             next_profile: 1,
         }),

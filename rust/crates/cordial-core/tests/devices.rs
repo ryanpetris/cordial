@@ -308,6 +308,7 @@ fn only_ble_is_enabled_unless_saved_otherwise() {
         // A saved preference without transports.
         let adapter = |transports| {
             cordial_protocol::storage::Adapter {
+                format: cordial_protocol::storage::CURRENT_FORMAT,
                 name: Some("Desk".into()),
                 host_platform: cordial_protocol::storage::HostPlatform::Mac.into(),
                 transports,

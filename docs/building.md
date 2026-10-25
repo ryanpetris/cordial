@@ -221,8 +221,8 @@ provide overflow detection.
 storage-preserving development updates. See its `--help` for identity and mount
 arguments. ESP32-S3 uses its ROM download protocol and the regions in `flash.json`.
 
-Startup mounts storage and checks the epoch in `Format.format` before using saved
-configuration. Invalid filesystems or essential roots and incompatible epochs
+Startup mounts storage and checks the shared version in `Format.format` before
+using saved configuration. Invalid filesystems or essential roots and incompatible formats
 reset the filesystem automatically. Driver I/O failures keep storage unavailable.
 Compatible updates at the same filesystem start preserve saved data and can grow
 the filesystem to the detected capacity. See the [storage format](storage-format.md)
