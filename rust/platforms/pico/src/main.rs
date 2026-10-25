@@ -146,13 +146,13 @@ async fn main(spawner: Spawner) {
         board::STORAGE_IDENTITY,
     )
     .await;
-    // USB allocates the saved pools before its first enumeration.
-    let interfaces =
-        cordial_usb::saved_interfaces(&mut records, board::PROFILE_MEMORY_BUDGET.is_some()).await;
-    let topology = Topology {
-        interfaces,
-        gamepads: cordial_usb::outputs::saved_plan(&mut records).await,
-    };
+    let topology = cordial_usb::saved_topology(
+        &mut records,
+        board::PROFILE_MEMORY_BUDGET.is_some(),
+        cordial_usb::Budget::PICO,
+    )
+    .await;
+    let interfaces = topology.interfaces;
     USB_IO.set_topology(topology);
     let store = Box::leak(Box::new(Storage::new(records)));
     let unique = identity.unique;

@@ -114,9 +114,9 @@ readings and transient errors are not persisted.
   Unknown roles or modes are ignored, and duplicate known roles make the record undecodable.
   Missing entries do not change keyboard or mouse behavior.
   Preferences survive renewing an existing bond. Unpairing deletes them. Each gamepad mode's
-  desired USB pool is the number of paired records selecting it, capped at four, including
-  disabled, blocked and nonresident devices and devices whose transport is disabled. Connection
-  state does not change these counts.
+  configured USB candidates include paired records selecting it, including disabled, blocked and
+  nonresident devices and devices whose transport is disabled. Connection state changes allocation
+  priority; the [USB allocator](protocol/hid-forwarding.md#usb-allocation) selects what fits.
 - `profiles` is the device's layers: the profile IDs it applies, in order. A new device has none,
   and an empty list passes everything through.
 
@@ -140,6 +140,33 @@ Metadata contains the setting's name as `key`, such as `backlight.level`, featur
 revision, scope, choices and optional min/max/step range, which is enough to list the setting while
 the device is disconnected. One settings file is rewritten for a setting change. Forgetting the
 last setting deletes the file.
+
+Typed serial settings map to these persisted names. Storage names, numeric values and metadata
+are independent of the serial domain and field names.
+
+| Serial field | Persisted `metadata.key` |
+| --- | --- |
+| `keyboard.function_row` | `fn.row_default` |
+| `keyboard.platform` | `keyboard.platform` |
+| `power.auto_off` | `power.auto_off` |
+| `backlight.enabled` | `backlight.enabled` |
+| `backlight.mode` | `backlight.mode` |
+| `backlight.brightness` | `backlight.level` |
+| `backlight.delay.hands_away` | `backlight.delay.hands_out` |
+| `backlight.delay.hands_nearby` | `backlight.delay.hands_in` |
+| `backlight.delay.external_power` | `backlight.delay.powered` |
+| `backlight.startup_effect` | `backlight.power_on` |
+| `backlight.dial_effect` | `backlight.crown` |
+| `backlight.power_save` | `backlight.power_save` |
+| `backlight.effect` | `backlight.effect` |
+| Pointer Sensor `dpi`, index 0 or 1 | `pointer.dpi.0` or `pointer.dpi.1` |
+| `wheel.mode` | `wheel.mode` |
+| `wheel.free_spin_threshold` | `wheel.threshold` |
+| `wheel.invert` | `wheel.invert` |
+| `thumbwheel.invert` | `thumbwheel.invert` |
+
+Stored wheel mode 1 means free spin and 2 means stepped. The serial enum names are
+`WHEEL_MODE_FREE_SPIN` and `WHEEL_MODE_STEPPED`.
 
 The HID layout file holds each HID service's raw report map as bytes in `maps`. A BLE layout also
 lists its report characteristics in `reports`: owning service index, report type, report ID, value
@@ -245,9 +272,9 @@ if power is removed before they reach flash.
 
 A dirty `rules.pb` that cannot be written stays dirty and is retried with its own backoff, starting
 at 2 s and doubling to 10 s. While the last try of a dirty `rules.pb` found the filesystem full,
-`storage.full` is set, so a client can free space, and while the last try of one ended with an
-unknown outcome, storage is not ready, as when a command's write ends so. A later try that fails
-ends an unknown outcome only once the file is read back: holding the new rules, it counts as
+`ERROR_CODE_STORAGE_FULL` is present in `Status.errors`, so a client can free space. While the last
+try of one ended with an unknown outcome, storage is not ready, as when a command's write ends so.
+A later try that fails ends an unknown outcome only once the file is read back: holding the new rules, it counts as
 written, and holding other contents, the failure is definite. A try that fails before reaching the
 file, or whose file cannot be read, leaves the outcome unknown. Loading storage again, after the
 radio restarts, resolves none of this, so storage stays not ready until the file's write is
@@ -321,8 +348,9 @@ RAM holds only what accepting connections and translating input need:
 - for each enabled device on an enabled transport that the Bluetooth stack has room for, a
   reconnection entry: ID, peer address, address type and transport, trust and HID++ preferences, its
   profile layers, disconnect pause, backoff and last connection error. The native bond table holds
-  its keys. This is bounded by `max_enabled` per transport, and its layers by `max_layers`;
-- for each connected device, its policy, HID forwarding state, readings and warnings, and the
+  its keys. The advertised `DEVICES.limit` bounds resident entries per transport, and `LAYERS.limit`
+  bounds their layers;
+- for each connected device, its policy, HID forwarding state, readings and errors, and the
   profiles it uses;
 - each profile in use by a connected device or a configuration interface, or with edits waiting to
   be written, once, shared by ID. A loaded profile holds its rules sorted for lookup, so its size
@@ -335,7 +363,7 @@ and profile listings, `GetDevice`, `GetProfile`, settings lists and every profil
 files they need for each request. Saved device preferences are read when an integration applies
 them, when a reading is compared with them, and when a client lists them.
 
-For change events, the serial session tracks which settings and warnings the client may hold only
+For change events, the serial session tracks which settings the client may hold only
 for devices with a connection, from the session's listings and events. A device's entry stays until
 the events that follow the end of its connection have been written, so listing disabled or
 disconnected devices keeps nothing. A settings event for a device that is not tracked reports each
@@ -375,8 +403,8 @@ opening them; a directory whose record file is missing is left out when its reco
 page can list fewer records than its size while more follow. A page of a device's settings reads the
 device's policy and, while it is disconnected, its saved preferences, one per step; a page of a
 profile's rules reads its metadata and then its rules file from the start only as far as the page, a
-part at a time, skipping earlier rules without decoding them, or uses the loaded rules. Warnings and
-features come from memory. A directory page reads one entry per step and keeps the lowest names
+part at a time, skipping earlier rules without decoding them, or uses the loaded rules. Features
+come from memory. A directory page reads one entry per step and keeps the lowest names
 after `after`. Each response and event is encoded into one frame buffer, held until the USB endpoint
 has written it; requests are not read while a response waits. File reads use one 512-byte chunk and
 return the whole file in one response.

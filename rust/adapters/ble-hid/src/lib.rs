@@ -172,7 +172,7 @@ pub struct Backend<H> {
     now: fn() -> u64,
     ready: bool,
     sequence: u32,
-    links: [Option<Link>; 4],
+    links: [Option<Link>; cordial_core::devices::ACTIVE_CONNECTIONS],
     events: VecDeque<Event>,
     incoming: Option<(u32, Peer)>,
     /// The accept list the host currently holds.
@@ -264,7 +264,7 @@ impl<H: Host> Backend<H> {
             return Err(Error::UnsupportedTransport);
         }
         let slot = usize::from(id.slot);
-        if id.generation == 0 || slot >= 4 {
+        if id.generation == 0 || slot >= cordial_core::devices::ACTIVE_CONNECTIONS {
             return Err(Error::InvalidArgs);
         }
         if self.links[slot].is_some()
@@ -1352,11 +1352,17 @@ impl<H: Host> Bluetooth for Backend<H> {
             }
             self.setup(&mut link, Step::Hash).map(|()| {
                 link.adopted = true;
-                link.pairing = false;
             })
         };
         self.links[slot] = Some(link);
         result
+    }
+    fn promote(&mut self, id: LinkId) {
+        if let Ok(slot) = self.slot(id) {
+            let link = self.links[slot].as_mut().unwrap();
+            self.host.promote(link.token);
+            link.pairing = false;
+        }
     }
     fn pair_reply(
         &mut self,

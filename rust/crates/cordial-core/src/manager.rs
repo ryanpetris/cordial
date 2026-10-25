@@ -2,7 +2,7 @@
 //! vendor procedures; this module owns admission, persistence and HID forwarding.
 //!
 //! Only enabled devices the Bluetooth stack has room for are resident, as reconnection entries.
-//! A connected device's policy, settings, readings and warnings live with its connection. Every
+//! A connected device's policy, settings and readings live with its connection. Every
 //! other saved device is read from flash when a command needs it.
 use crate::model::{
     errors::ErrorCode as Error,
@@ -28,6 +28,8 @@ pub struct Connection {
     pub runtime: Option<Box<Link>>,
     pub security: Option<ConnectionSecurity>,
     pub closing: bool,
+    /// Pairing links do not consume a normal connection allowance.
+    pub pairing: bool,
     pub error: Option<Error>,
     pub deadline: u64,
     /// A setup save failed; setup resumes on the device's next connection.
@@ -57,11 +59,12 @@ type OutputObservation = (
 pub struct Manager {
     /// Resident reconnection entries.
     pub devices: Vec<Option<Device>>,
-    pub connections: [Option<Connection>; ACTIVE_CONNECTIONS],
+    pub connections: Box<[Option<Connection>]>,
     pub forward: Forwarder,
     pub outputs: crate::outputs::Planner,
+    pub usb_budget: crate::usb::Budget,
     output_runtime: crate::outputs::Runtime,
-    output_states: [Option<OutputObservation>; ACTIVE_CONNECTIONS],
+    output_states: Box<[Option<OutputObservation>]>,
     pub output_support: &'static [crate::outputs::Support],
     pub profiles: profiles::Cache,
     /// Bytes of memory for loaded profiles, or `None` on a board without profile support.
@@ -102,11 +105,14 @@ impl Default for Manager {
     fn default() -> Self {
         Self {
             devices: Vec::new(),
-            connections: core::array::from_fn(|_| None),
+            connections: core::iter::repeat_with(|| None)
+                .take(ACTIVE_CONNECTIONS)
+                .collect(),
             forward: Forwarder::default(),
             outputs: crate::outputs::Planner::default(),
+            usb_budget: crate::usb::Budget::default(),
             output_runtime: crate::outputs::Runtime::default(),
-            output_states: [None; ACTIVE_CONNECTIONS],
+            output_states: alloc::vec![None; ACTIVE_CONNECTIONS].into_boxed_slice(),
             output_support: &[],
             profiles: profiles::Cache::default(),
             profile_budget: None,
@@ -159,6 +165,106 @@ async fn profile_ids<S: RecordStore>(store: &mut S) -> Result<Vec<u64>, Error> {
     }
 }
 impl Manager {
+    /// Computes the complete allocation using saved users and current connections.
+    pub fn usb_allocation(&self) -> crate::usb::Allocation {
+        use cordial_protocol::{OutputMode, Role};
+        let connected = |id| {
+            self.find(id)
+                .and_then(|slot| self.devices[slot].as_ref())
+                .is_some_and(|d| d.state == State::Connected)
+        };
+        let mut demand = crate::usb::Demand::default();
+        let mut counts = [0usize; 2];
+        let mut active = [0usize; 2];
+        for user in &self.outputs.selections {
+            let live = connected(user.id);
+            if user.desktop() {
+                demand.desktop = demand.desktop.min(if live { 0x41 } else { 0x81 });
+            }
+            let mode = match user.mode {
+                OutputMode::Hid => 0,
+                OutputMode::Xinput => 1,
+                _ => continue,
+            };
+            counts[mode] += 1;
+            active[mode] += usize::from(live);
+        }
+        // A newly admitted device can report its roles before its policy is hydrated.
+        if self.devices.iter().flatten().any(|d| {
+            d.state == State::Connected && d.live.as_ref().is_some_and(|l| l.roles & 31 != 0)
+        }) {
+            demand.desktop = 0x41;
+        }
+        for (mode, priorities) in [&mut demand.hid, &mut demand.xinput]
+            .into_iter()
+            .enumerate()
+        {
+            for (slot, priority) in priorities.iter_mut().enumerate() {
+                *priority = if slot < active[mode] {
+                    0x42 + mode as u8
+                } else if slot < counts[mode] {
+                    if slot == 0 {
+                        0x82 + mode as u8
+                    } else {
+                        0xc2 + mode as u8
+                    }
+                } else {
+                    0xe2 + mode as u8
+                };
+            }
+        }
+        if self.profiles_supported() {
+            for editor in self
+                .preference
+                .configuration_interfaces
+                .iter()
+                .filter(|e| e.enabled && e.profile.is_some())
+            {
+                // Conflicting corrupt startup preferences choose the first stable interface.
+                if demand.interfaces != 0 {
+                    break;
+                }
+                demand.interfaces = editor.interface.bit();
+                demand.editor = if self.devices.iter().flatten().any(|d| {
+                    d.state == State::Connected
+                        && editor.profile.is_some_and(|id| d.layers.contains(&id))
+                }) {
+                    0x44
+                } else {
+                    0xc4
+                };
+            }
+        }
+        let mut budget = self.usb_budget;
+        if !crate::outputs::supports(self.output_support, Role::Gamepad, OutputMode::Hid) {
+            budget.hid_slots = 0;
+        }
+        if !crate::outputs::supports(self.output_support, Role::Gamepad, OutputMode::Xinput) {
+            budget.xinput_slots = 0;
+        }
+        let mut allocation = crate::usb::allocate(demand, budget);
+        for mode in 0..2 {
+            allocation.required_exceeded |= active[mode] > 4;
+            allocation.reserved_exceeded |= counts[mode] > active[mode].max(4);
+        }
+        allocation
+    }
+    /// Saved enabled device count, including nonresident devices and disabled transports.
+    pub fn enabled_count(&self, transport: Transport) -> usize {
+        self.outputs
+            .selections
+            .iter()
+            .filter(|s| s.transport == transport && s.enabled)
+            .count()
+    }
+    /// Occupied normal connection slots, including closing links until their slot is released.
+    pub fn connection_count(&self, transport: Transport) -> usize {
+        self.connections
+            .iter()
+            .flatten()
+            .filter(|c| !c.pairing && c.peer.transport == transport)
+            .count()
+    }
     /// Publishes the USB owner's actual configuration. None means enumeration is unknown.
     /// A new enumeration generation invalidates every assignment, even when counts are equal.
     pub fn set_output_enumeration(
@@ -305,8 +411,8 @@ impl Manager {
                     .update(c.id, self.forward.gamepad(c.id.slot as usize));
             }
         }
-        let candidates = self.connections.each_ref().map(|entry| {
-            let c = entry.as_ref()?;
+        let candidates: [_; ACTIVE_CONNECTIONS] = core::array::from_fn(|index| {
+            let c = self.connections[index].as_ref()?;
             let d = self.devices[c.device?].as_ref()?;
             let mode = self.outputs.mode(d.id);
             (self.output_candidate(c)
@@ -419,8 +525,12 @@ impl Manager {
             .map_err(|_| Error::StorageFailed)?;
         self.caps = radio.capabilities();
         self.native_limits = [
-            radio.bond_capacity(Transport::Classic),
-            radio.bond_capacity(Transport::Ble),
+            radio
+                .bond_capacity(Transport::Classic)
+                .min(crate::devices::CLASSIC_CONNECTIONS + 1),
+            radio
+                .bond_capacity(Transport::Ble)
+                .min(crate::devices::BLE_CONNECTIONS + 1),
         ];
         let existing = profile_ids(store).await?;
         self.clear_interfaces(store, &existing).await;
@@ -460,7 +570,8 @@ impl Manager {
                 peers.push(policy.peer);
                 let mode = crate::outputs::gamepad(&policy.output_preferences);
                 self.outputs.prepare(policy.id, mode)?;
-                self.outputs.set(policy.id, mode);
+                let configured = crate::outputs::Configured::load(&policy, store).await;
+                self.outputs.configure(configured);
                 // A reference that cannot be removed now is skipped, and removed again at the
                 // next startup.
                 if policy.profiles.iter().any(|p| !existing.contains(p)) {
@@ -657,10 +768,13 @@ impl Manager {
             }
         }
     }
-    /// How many devices of `transport` can be enabled at once: the native bond
-    /// table less the entry kept free for pairing.
+    /// Normal connection and enabled-device allowance, with a native bond reserved for pairing.
     pub fn max_enabled(&self, transport: Transport) -> usize {
         self.native_limits[kind(transport)].saturating_sub(1)
+    }
+    /// Closing links keep their normal allowance until the backend releases the slot.
+    pub fn connection_room(&self, transport: Transport) -> bool {
+        self.connection_count(transport) < self.max_enabled(transport)
     }
     /// No room to save another device.
     /// Storage stops being ready after a failure.
@@ -717,6 +831,9 @@ impl Manager {
             .iter()
             .position(Option::is_none)
             .ok_or(Error::Capacity)?;
+        if device.is_some() && !self.connection_room(peer.transport) {
+            return Err(Error::Capacity);
+        }
         self.generation = self.generation.checked_add(1).ok_or(Error::InternalError)?;
         let id = LinkId {
             slot: slot as u8,
@@ -729,6 +846,7 @@ impl Manager {
             runtime: None,
             security: None,
             closing: false,
+            pairing: device.is_none(),
             error: None,
             deadline,
             setup_failed: false,
@@ -808,12 +926,7 @@ impl Manager {
         if self.storage_full() {
             return Err(Error::StorageFull);
         }
-        if self
-            .connections
-            .iter()
-            .flatten()
-            .any(|c| c.device.is_none())
-        {
+        if self.connections.iter().flatten().any(|c| c.pairing) {
             return Err(Error::Busy);
         }
         let id = self.allocate(peer, None, deadline)?;
@@ -991,7 +1104,7 @@ impl Manager {
     /// pairing's setup and any closing link do.
     pub fn ble_admission(&self) -> bool {
         let mut connections = self.connections.iter().flatten();
-        connections.clone().count() < ACTIVE_CONNECTIONS - 1
+        self.connection_room(Transport::Ble)
             && !connections.any(|c| {
                 c.closing
                     || (c.runtime.is_none()
@@ -1003,6 +1116,7 @@ impl Manager {
         self.peer(peer).filter(|&slot| {
             self.storage_ready
                 && self.radio_ready
+                && self.connection_room(peer.transport)
                 && self.devices[slot].as_ref().is_some_and(|d| {
                     d.allow_incoming()
                         && d.state == State::Disconnected
@@ -1124,6 +1238,7 @@ impl Manager {
         policy.bond = policy.id;
         let mode = crate::outputs::gamepad(&policy.output_preferences);
         self.outputs.prepare(policy.id, mode)?;
+        let configured = crate::outputs::Configured::load(&policy, store).await;
         // Adopt before commit; a failed commit is restored from the old record
         // after teardown. Resolve ambiguous write errors by reading the record.
         radio.adopt(id)?;
@@ -1138,7 +1253,7 @@ impl Manager {
                 Error::StorageFailed
             });
         }
-        self.outputs.set(policy.id, mode);
+        self.outputs.configure(configured);
         self.reconcile_outputs();
         if retained {
             // The new bond's connection discovers the device and saves its layout again.
@@ -1151,6 +1266,7 @@ impl Manager {
             }
             None => None,
         };
+        let slot = slot.filter(|_| self.connection_room(identity.transport));
         if let Some(slot) = slot {
             let d = self.devices[slot].as_mut().unwrap();
             d.update(&policy);
@@ -1160,6 +1276,8 @@ impl Manager {
             let c = self.connection_mut(id).unwrap();
             c.peer = identity;
             c.device = Some(slot);
+            radio.promote(id);
+            c.pairing = false;
         }
         if self.finish_pair(store).await.is_err() {
             self.fail_storage();
@@ -1434,7 +1552,6 @@ impl Manager {
         {
             link.report_read_complete(read.id, read.kind, Err(e), &mut live.catalog, now);
         }
-        changed |= live.update_warnings(&link.warnings)?;
         Ok(changed.then_some(slot))
     }
     pub fn written(
@@ -1459,9 +1576,8 @@ impl Manager {
         let Some(live) = self.devices[slot].as_mut().and_then(|d| d.live.as_mut()) else {
             return Ok(None);
         };
-        let mut changed =
+        let changed =
             link.output_complete(id, result, &mut live.catalog, &mut self.forward, now)?;
-        changed |= live.update_warnings(&link.warnings)?;
         Ok(changed.then_some(slot))
     }
     /// Reads a connected device's saved policy and preferences once its connection has forwarded
@@ -1620,6 +1736,7 @@ impl Manager {
             .retain(|p| p.mode != cordial_protocol::OutputMode::Disabled || policy.setup_pending);
         let mode = crate::outputs::gamepad(&policy.output_preferences);
         self.outputs.prepare(policy.id, mode)?;
+        let configured = crate::outputs::Configured::load(&policy, store).await;
         let saved = match bond {
             Some(bond) => Policies { store }.save_with(&policy, bond).await,
             None => Policies { store }.save(&policy).await,
@@ -1639,7 +1756,7 @@ impl Manager {
                 _ => Error::StorageFailed,
             }
         })?;
-        self.outputs.set(policy.id, mode);
+        self.outputs.configure(configured);
         self.reconcile_outputs();
         match slot {
             None if eligible => {
@@ -1929,7 +2046,7 @@ fn parsed(descriptors: Vec<Descriptor>) -> Result<Vec<Profile>, Error> {
         .map(|d| Profile::from_map(d.service, d.map))
         .collect()
 }
-/// Builds a link's runtime and records the roles, kind and warnings it reports.
+/// Builds a link's runtime and records the roles and kind it reports.
 fn runtime(
     id: LinkId,
     hidpp_enabled: bool,
@@ -1958,6 +2075,5 @@ fn runtime(
             _ => crate::model::link::DeviceKind::Unknown,
         },
     );
-    live.update_warnings(&runtime.warnings)?;
     Ok(Box::new(runtime))
 }

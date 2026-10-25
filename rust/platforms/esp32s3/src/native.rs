@@ -2,9 +2,7 @@
 //! owner runs the common BLE HID profile; native tasks retain their own bonds.
 use cordial_ble_hid::native::{Data, Event, Host};
 use cordial_core::devices::{Peer, display_name};
-use cordial_core::model::{
-    errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod,
-};
+use cordial_core::model::{errors::ErrorCode as Error, identifiers::Transport, link::PromptMethod};
 use embassy_sync::{
     blocking_mutex::{Mutex, raw::CriticalSectionRawMutex as Raw},
     channel::Channel,
@@ -28,7 +26,10 @@ pub async fn changed() {
 }
 // Identities only, not a mirror of opaque keys. Updated by native store owners
 // before Ready, after bonding and after explicit removal.
-type BondIdentities = ([ffi::cordial_ble_peer; 8], usize);
+type BondIdentities = (
+    [ffi::cordial_ble_peer; cordial_core::devices::BLE_CONNECTIONS + 1],
+    usize,
+);
 static BONDS: Mutex<Raw, RefCell<Option<BondIdentities>>> = Mutex::new(RefCell::new(None));
 
 fn error(code: u8) -> Error {
@@ -172,13 +173,15 @@ fn copy_event(e: &ffi::cordial_ble_event) -> Result<(), Error> {
         },
         ffi::cordial_ble_kind_CORDIAL_BLE_BONDS => {
             let size = std::mem::size_of::<ffi::cordial_ble_peer>();
-            if bytes.len() % size != 0 || bytes.len() / size > 8 {
+            if bytes.len() % size != 0
+                || bytes.len() / size > cordial_core::devices::BLE_CONNECTIONS + 1
+            {
                 return Err(Error::StorageFailed);
             }
             let mut peers = [ffi::cordial_ble_peer {
                 address: [0; 6],
                 random: 0,
-            }; 8];
+            }; cordial_core::devices::BLE_CONNECTIONS + 1];
             for (out, data) in peers.iter_mut().zip(bytes.chunks_exact(size)) {
                 *out = unsafe { std::ptr::read_unaligned(data.as_ptr().cast()) };
             }
@@ -253,6 +256,9 @@ impl Host for Native {
             0,
         ))
     }
+    fn promote(&mut self, token: u32) {
+        unsafe { ffi::cordial_ble_promote(token) };
+    }
     async fn changed(&self) {
         changed().await;
     }
@@ -281,7 +287,7 @@ impl Host for Native {
         Self::submit(&c)
     }
     fn reconnect(&mut self, peers: &[Peer]) -> Result<(), Error> {
-        if peers.len() > self.bond_capacity() {
+        if peers.len() > self.bond_capacity().saturating_sub(1) {
             return Err(Error::Capacity);
         }
         let mut c = Self::command(ffi::cordial_ble_command_kind_CORDIAL_BLE_RECONNECT, 0, 0);

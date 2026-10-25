@@ -50,16 +50,6 @@ export function interfaceProblem(interfaces: InterfaceState[]): string | null {
   return null;
 }
 
-/** Whether saving `changes` reconnects the adapter's USB: an interface turned on or off, or an
- * enabled interface given another profile. */
-export function reconnectsUsb(status: AdapterStatus, changes: AdapterChanges): boolean {
-  const after = stagedInterfaces(status, changes);
-  return status.interfaces.some((before, n) => {
-    const i = after[n]!;
-    return i.enabled !== before.enabled || (i.enabled && i.profile !== before.profile);
-  });
-}
-
 /** Why the adapter would refuse to delete `profile`, or null when nothing uses it. */
 export function profileInUse(status: AdapterStatus | null, devices: DeviceEntry[], profile: number): string | null {
   const selected = status?.interfaces.find((i) => i.profile === profile);

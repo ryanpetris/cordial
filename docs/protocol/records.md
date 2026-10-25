@@ -7,35 +7,57 @@ what the records mean and how their values are chosen.
 
 ## Status
 
-`Status` identifies the Dongle and says what it can do: its adapter ID (16 uppercase hexadecimal
-digits that also begin the USB serial number), the effective name, the saved host platform, whether
-Bluetooth and storage have started (`ready`), and one `TransportSupport` per transport the firmware
-supports, with `max_enabled` and whether the transport is enabled (`enabled`, always set; missing
-means enabled, as firmware that predates the field omits it). Classic starts disabled and BLE
-enabled. A disabled transport's devices are inactive, and the Dongle does not scan, connect or
-accept connections on it. `Status.info` holds facts about the Dongle with keys from the
-[catalog](keys.md): the firmware version, the hardware configuration (`board.name`),
-`build.development` on development firmware, and `storage.full` when there is no room to save
-another device. The `adapter` event carries a `Status` whenever any of this changes.
+`Status` identifies the Dongle and reports its readiness, saved host platform, supported transports,
+output backends, profiles and configuration interfaces. The adapter ID is 16 uppercase hexadecimal
+digits and begins the USB serial number. Classic starts disabled and BLE enabled. A disabled
+transport does not scan, connect or accept connections. Until saved adapter settings load, the host
+platform reads as Linux and the transport defaults apply.
 
-The host platform selects special-key translation and survives removing every device. Until the
-saved adapter settings have loaded, the platform reads as Linux, Classic as disabled and BLE as
-enabled.
+`Status.information` holds `firmware_version`, `board_name` and `development_build`, each with
+independent presence. The Dongle always supplies these known values, including false for a
+production build. `Status.errors` is the complete current set of adapter
+problems, without duplicates, in numeric order. Empty clears all adapter problems. An `adapter`
+event replaces the complete `Status`, including its errors and resource counts. Storage readiness
+and storage space are separate: a ready adapter can report `ERROR_CODE_STORAGE_FULL`.
 
-`Status.profile_support` says what profile rules this firmware can apply: the input usages and
-collections a remap, scale or absolute axis rule can name, the outputs a remap or axis rule can
-produce, how many outputs a remap and profiles a layer list can hold, the memory budget for loaded profiles and how much of it is in use. It is missing on
-a board configured without profile support, such as the Pico W. `Status.configuration_interfaces`
-has one `ConfigurationInterfaceSupport` per configuration interface the firmware supports, enabled
-or not: whether it is enabled, its profile, and the interfaces it cannot be enabled alongside.
+### Resource capacities
 
-`Status.output_support` lists implemented USB output backends by role and mode. Unlisted enabled
-modes are unsupported. Gamepad Disabled is always accepted, including when no backends are listed.
-Each mode reports `max_slots`; `slots` is the enumerated pool size, absent
-until known. Disabled has zero capacity and no enumerated slots. Each gamepad HID or XInput pool
-has at most four slots. Board compositions advertise modes only when their USB backends are usable.
-An actual enumerated pool can differ from the desired pool while USB is being configured. Reset
-or suspend makes selected outputs Pending while the enumerated pool sizes remain known.
+Every resource entry is a `ResourceCapacity` with a `ResourceType` and independently optional
+`count` and `limit`. An absent count is unknown, not zero. An absent limit is unknown, not
+unlimited. Explicit zero remains zero. Each containing object reports at most one entry per type;
+clients ignore unknown types and leave missing types unreported. The containing object defines
+what is counted and its units:
+
+| Container | Type | Count | Limit |
+| --- | --- | --- | --- |
+| `Status.resources` | `INTERFACES` | USB interfaces actually exposed, including each interface of a multi-interface function | Compiled USB interface maximum |
+| `TransportSupport.resources` | `DEVICES` | Saved devices enabled for that transport, even while the transport is disabled; excludes pairing | Enabled-device allowance, equal to the normal connection allowance |
+| `TransportSupport.resources` | `CONNECTIONS` | Occupied normal connection slots, including connecting and closing slots until freed; excludes pairing | Normal connection allowance, equal to the enabled-device allowance |
+| `OutputModeSupport.resources` | `SLOTS` | Enumerated pool size for that role and mode, absent until known | Compiled slot maximum, at most four per gamepad mode |
+| `ProfileSupport.resources` | `MEMORY` | Bytes used by loaded profiles, shared by ID | Shared loaded-profile budget in bytes |
+| `ProfileSupport.resources` | `OUTPUTS` | Omitted | Maximum outputs in one remap and after every applied layer for one held input |
+| `ProfileSupport.resources` | `LAYERS` | Omitted | Maximum profile IDs in one device's layer list |
+
+Saved enabled-device count can exceed its allowance; the saved preferences remain intact.
+Connection counts describe occupied slots, not just fully connected devices. Firmware reports its
+current transport allowances; a client does not infer them from board names or USB slot counts.
+The allowances are independent per transport, so Classic enablement does not lower BLE capacity.
+One additional pairing connection is reserved overall, outside both transport allowances. See
+[Bluetooth capacity](limits-and-errors.md#bluetooth-capacity) for the configured board limits.
+
+`Status.profile_support.ranges` describes supported rule inputs and outputs by kind, collection
+and usage. A board without profile support, such as Pico W, omits `profile_support` and reports
+no configuration interfaces. Each `ConfigurationInterfaceSupport` separates the saved `enabled`
+preference from `active`, which says whether USB currently exposes it. Its profile stays selected
+while disabled or omitted for lack of USB capacity. `conflicts` names interfaces that cannot be
+enabled together.
+
+`Status.output_support` lists implemented output backends by role and mode. Unlisted enabled
+modes are unsupported. Gamepad Disabled is always accepted, including when no backends are listed;
+its `SLOTS` count and limit are both zero. USB reset or suspend can make device outputs Pending
+while their enumerated slot counts remain known. USB resources other than interfaces can limit an
+allocation even when `INTERFACES.count` is below `INTERFACES.limit`. See
+[USB allocation](hid-forwarding.md#usb-allocation) for selection priorities and reporting.
 
 ## Profiles
 
@@ -97,8 +119,10 @@ peripheral paired over both Classic and BLE has two records. Names are labels, n
 - `inactive` says why the Dongle will not use the device, in this order: its transport is not
   supported by this firmware, its transport is disabled on the Dongle, it is blocked, the device is
   disabled, or the stack's bond table is full.
-- `error` is the last failed connection attempt, cleared by a successful connection. The Dongle
-  keeps it only while the device is enabled and until it restarts.
+- `errors` is the complete set of connection and profile problems, without duplicates, in numeric
+  order. At most one connection failure is present; a new one replaces it. A successful connection,
+  disabling the device or restarting the Dongle clears it. Integration and setting failures stay on
+  their own records.
 - `security` describes the live link while connected; each property is missing when the stack cannot
   report it, which does not mean false. Values describe the negotiated link and key, never the
   requested policy; for example, Secure Connections Just Works reports `encrypted`,
@@ -107,8 +131,9 @@ peripheral paired over both Classic and BLE has two records. Names are labels, n
   such as media and volume keys, system controls such as power and sleep, and gamepads. They are
   saved when the descriptor is read, so they are known while the device is disconnected.
 - `profiles` is the device's saved layers, empty for a new device.
-- `profile_error` is set while the device is connected without its profiles loaded, because they do
-  not fit in the memory budget or one could not be read. Its input then passes through unchanged.
+- `ERROR_CODE_PROFILE_MEMORY_EXCEEDED` or `ERROR_CODE_PROFILE_LOAD_FAILED` in `errors` means a
+  connected device has no loaded profiles. Its input passes through unchanged. These errors clear
+  when profiles load or the device disconnects. An empty `errors` list clears all device problems.
 
 A `device` event carries the whole record whenever anything in it changes, including battery and
 other information; `device_removed` follows an unpair or a lost record. `ListDevices` returns saved
@@ -145,17 +170,17 @@ A connected layout without supported gamepad controls also reports Unsupported. 
 unavailable storage and USB setup report Pending. Disabled or blocked devices have no assignment.
 Active requires a supported layout, an assigned slot and a ready USB backend.
 
-Each gamepad mode's desired USB pool is the number of paired devices selecting it, capped at four.
-HID and XInput have independent pools. Disabled output choices contribute nothing. Disabled or
-blocked devices, disabled transports and nonresident records still contribute their saved enabled
-choices. Connections and disconnections do not change the desired pools. Pool sizes describe USB
-allocation, not the number of Bluetooth connections or support for a particular device layout.
+USB allocation considers saved roles, output preferences and profile outputs, together with live
+connections. Each gamepad mode has up to four independently enumerated slots where supported.
+Configured disconnected slots have lower priority than connected-device outputs. Unconfigured
+extra slots use spare resources and yield when a higher-priority interface needs them. Saving a
+preference is allowed even when the corresponding interface cannot fit. See
+[USB allocation](hid-forwarding.md#usb-allocation).
 
 Runtime assignments use the lowest free slot in the selected mode's actual enumerated pool.
 Surviving assignments keep their slots when other devices connect or disconnect. Closing a link,
 changing its mode, replacing its layout or losing storage readiness releases its controls. A mode
-change can move an assignment even when both desired pools remain capped at four. It does not
-require USB enumeration when the desired counts stay the same.
+change can move an assignment without rebuilding USB when the actual allocation stays the same.
 
 The USB owner supplies `outputs::Enumeration` through `Application::set_output_enumeration`, with
 an actual `Plan`, a generation that changes when endpoints are rebuilt, and USB readiness. No
@@ -170,10 +195,10 @@ USB class workers own report encoding and transmission. Before sending queued co
 compare the current occupant and assignment generation, discard stale work, and send neutral
 controls before a replacement occupant's controls. Reading snapshots consumes nothing, so workers
 can resend current controls after reset or resume. The application caches controls when reports
-arrive and when a slot is assigned. Reconciliation checks at most four connections and eight
-slots; surviving assignments do not walk HID fields on each priority poll. The decoder permits
-at most sixteen reports and ninety-six fields per map. No USB queues or per-report allocations
-are needed by the runtime pools.
+arrive and when a slot is assigned. Reconciliation checks the board's runtime connection slots and
+eight output slots; surviving assignments do not walk HID fields on each priority poll. The decoder
+permits at most sixteen reports and ninety-six fields per map. No USB queues or per-report
+allocations are needed by the runtime pools.
 
 ## Integrations
 
@@ -200,10 +225,10 @@ translated, and the rest behave as the device sends them. Ordinary input never w
 
 ## Information
 
-`Device.info` lists what the device reports about itself, from any integration or standard service,
-with keys from the [catalog](keys.md); a key whose value is unknown is left out. Nothing here is
-saved to flash. Information belongs to the current connection: it is cleared on disconnect and is
-unknown until read again on the next connection.
+`Device.information` contains typed identity, battery, keyboard, power, backlight, pointer-sensor,
+wheel and thumbwheel facts. Missing scalars are unknown, never false or zero. Nothing here is saved
+to flash. An event replaces the whole information object, clearing absent fields. Information
+belongs to the current connection and clears on disconnect.
 
 | Connection | Battery source |
 | --- | --- |
@@ -222,43 +247,58 @@ bytes without control characters.
 
 Values a device only reports, such as the backlight's current level and status or the wheel's
 resolution multiplier, are information too, decoded by the Dongle. A setting the device does not
-accept writes for, on its firmware revision, is reported as information under the same key.
+accept writes for, on its firmware revision, is reported in the corresponding information field.
+A saved preference for that field remains a setting with Unsupported status.
 
 ## Settings
 
-`Setting` is one value the Dongle can change on the device and save. Its `type` holds the value last
-read from the device, the saved value, and the type's limits: integer ranges or choices, enum
-choices, or a text length limit. `value` is current while the setting's integration is active and
-is otherwise the last reading on the current connection, shown as possibly out of date; it is
-missing when the setting has not been read on the current connection. While the device is
-disconnected, the list holds its saved settings, with the limits saved alongside them. `saved` is
-missing for a setting the Dongle leaves alone, and then `status` is missing too.
+`SettingsObject` is a complete domain owned by an integration. Its group is Keyboard, Power,
+Backlight, Pointer Sensor, Wheel or Thumbwheel. Each configurable field has a typed wrapper.
+`value` is the last actual reading, never an echo of `saved`. It is current while the owning
+integration is Active, otherwise possibly stale on the current connection, and absent before the
+first read or after disconnect. `saved` exists only for an explicit preference stored on the
+Dongle; `status` is present exactly when `saved` is present.
+
+Integer limits are a range or a complete discrete set. A range accepts `min + n * step` through
+`max`, with a zero step meaning one. A discrete set has at most six distinct values. Neither limit
+means any integer is accepted. Enum choices contain each writable known member at most once and
+exclude Unknown. An empty choice list grants no writable value, and an actual reading may be
+outside the choices. Saved fields retain their full limits and choices while disconnected.
 
 | Status | Meaning |
 | --- | --- |
-| Pending | Saved, and waiting until the device can take it. |
+| Pending | Saved, and waiting until the device can confirm it. |
 | Applied | The device reports the saved value. |
 | Changed on device | The device reports another value; the next apply writes the saved one back. |
 | Unsupported | The device does not support this saved setting. |
-| an error code | The last apply failed. |
+| an error code | The last apply failed for this field. |
 
-An enum setting's `value` can hold a choice that is not in `choices`, such as a backlight mode the
-device reports but does not accept as a write. Discovery, reads, notifications and applies never
-create a saved value; only `SetSettings` does. Unpairing removes a device's saved settings.
+Discovery, reads, notifications and applies never create a saved preference; only `SetSettings`
+does. Unpairing deletes the device's saved settings. A field appears only when discovered as
+configurable on this connection or when it has a saved preference. If its capability disappears,
+a saved field remains with Unsupported status. Disconnect removes unsaved fields and clears
+readings on the rest. The integration state determines availability and freshness.
 
-A `settings_changed` event follows whenever any setting changes, appears or goes away: it carries
-each setting that changed or appeared, whole, and a `SettingRef`, the integration and key, for each
-one that went away. Disconnecting, for example, removes the settings that have no saved value and
-changes the rest. `ListSettings` lists the settings a page at a time in ascending order of
-integration, then key compared bytewise.
+`SettingsRef` identifies an entire domain by integration, group and optional `index`. Pointer
+Sensor requires a zero-based physical sensor index, stable across connections to the same device.
+At most two sensors are supported; other groups omit `index`. `ListSettings` sorts by integration,
+group, then index, and its next cursor is the identity of the last complete object received.
 
-## Warnings
+Each `settings_changed.changed` object replaces the whole object with that identity. Omitted
+fields remove prior capabilities, a present wrapper without `value` clears the reading, and absent
+`saved` clears the preference. An object with no fields is removed instead. `removed` contains
+whole-object references. Objects not named in either list stay unchanged. Each identity appears
+at most once in an event and never in both lists.
 
-`DeviceWarnings` lists the HID inputs and outputs the Dongle cannot translate or update. The device
-keeps working; only the identified field is affected. Each warning names a code and where it is: the
-HID service on the device, the report type and ID, the field's bit offset and its usage page and
-usage. Input and indicator limitations last for the connection; indicator read and write failures
-clear at the next successful update. A reconnect replaces the earlier connection's warnings, and the
-list is empty while the device is disconnected. `ListWarnings` lists the warnings a page at a time,
-and a `warnings_changed` event carries the warnings added and removed whenever the list changes. See
-[HID forwarding](hid-forwarding.md) for what produces each warning.
+Settings pages and change events fit their enclosing `Message` in 1024 protobuf bytes before
+COBS encoding. They never split an object, whose maximum is 960 protobuf bytes including identity
+and saved metadata. Limits are complete and never truncated. A page returns at least one object
+unless `end` is true. Events may split between whole objects or references, and changes across
+separate events are not atomic.
+
+`SettingsUpdate` chooses one domain and changes only its present fields, including nested delay
+fields. Each field must select either a typed value or the empty `SettingForget` marker; an empty
+update is invalid. Forget removes the saved preference while leaving the actual device value
+unchanged. Changes apply in order, with the last change to each field winning. The complete request
+must fit the 1024-byte request limit. Validation saves nothing if any field is invalid. See
+[settings commands](commands.md#settings) for persistence and readback behavior.

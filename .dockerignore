@@ -4,7 +4,6 @@
 target
 rust/target
 rust/platforms/*/target
-rust/tests/memory-arm/target
 build
 desktop/out
 desktop/dist

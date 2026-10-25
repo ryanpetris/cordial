@@ -5,7 +5,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential ca-certificates clang cmake curl gcc-arm-none-eabi git \
         libclang-dev libnewlib-arm-none-eabi libusb-1.0-0 make ninja-build pkg-config \
-        python3 python3-venv qemu-system-arm \
+        python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/opt/rustup PATH=/opt/cargo/bin:$PATH

@@ -1,4 +1,4 @@
-import type { DeviceEntry } from "./state.ts";
+import type { DeviceEntry, SettingField } from "./state.ts";
 
 /** A settings submission or HID++ switch is in flight for the device. */
 export function settingsBusy(entry: Pick<DeviceEntry, "pending" | "settingsSave">): boolean {
@@ -13,3 +13,11 @@ export function settingsCurrent(entry: Pick<DeviceEntry, "device">): boolean {
 export function hidppBusy(entry: Pick<DeviceEntry, "pending">): boolean {
   return entry.pending.includes("hidpp");
 }
+
+/** A setting field's identity alone, without its values. */
+export const fieldOf = (s: SettingField): SettingField => ({ integration: s.integration, group: s.group, index: s.index, field: s.field } as SettingField);
+
+/** A string naming one setting field, for maps and element IDs. */
+export const settingId = (s: SettingField) => `${s.integration}-${s.group}-${s.index ?? ""}-${s.field}`;
+
+export const sameField = (a: SettingField, b: SettingField) => settingId(a) === settingId(b);

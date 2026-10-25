@@ -354,7 +354,14 @@ impl Run<'_> {
                     );
                     stopped = true;
                 } else if !timed_scan || Instant::now() >= d + SCAN_STOP {
-                    return Err(Error::new("operation timed out"));
+                    // A save already sent may have been stored without its answer arriving.
+                    let timed_out = Error::from_client(cordial_client::Error::Timeout, "");
+                    return Err(Error::new(
+                        match self.pending.values().find(|(c, _)| c.saves()) {
+                            Some((command, _)) => text::failure_text(command, &timed_out),
+                            None => "operation timed out".into(),
+                        },
+                    ));
                 }
             }
             if opened && next.is_none() {
@@ -508,7 +515,7 @@ impl Run<'_> {
                                 write_line(dest, &line)?;
                             }
                             Err(error) => {
-                                let error = text::failure_text(&error);
+                                let error = text::failure_text(&command, &error);
                                 if self.foreground == Some(ticket) {
                                     return Err(Error::new(error));
                                 }

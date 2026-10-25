@@ -1,5 +1,5 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
-import { ErrorCode, FrameDecoder, MessageSchema, RequestSchema, Transport, UsageRange_Kind, encodeFrame, type Request } from "@cordial/protocol";
+import { ErrorCode, FrameDecoder, MessageSchema, RequestSchema, ResourceType, SettingsGroup, Transport, UsageRange_Kind, encodeFrame, type Request } from "@cordial/protocol";
 import { describe, expect, it, vi } from "vitest";
 import { Connection, ConnectionClosedError, CordialError, UnexpectedResponseError, type ByteStream } from "../src/index.ts";
 
@@ -74,18 +74,27 @@ describe("Connection", () => {
     expect(events).not.toHaveBeenCalled();
   });
 
-  it("preserves capability kinds and collection-qualified ranges in status", async () => {
+  it("preserves capability kinds, collection-qualified ranges and resource values in status", async () => {
     const peer = new Peer();
     const ranges = [UsageRange_Kind.REMAP_INPUT, UsageRange_Kind.REMAP_OUTPUT, UsageRange_Kind.UNSPECIFIED, 99].map((kind) => ({
       kind, collection: { usagePage: 1, usage: 5 }, usagePage: 9, min: 1, max: 32,
     }));
+    const resources = [
+      { type: ResourceType.MEMORY, count: 0, limit: 4096 },
+      { type: ResourceType.OUTPUTS, limit: 8 },
+      { type: ResourceType.LAYERS, count: 2 },
+    ];
     peer.onRequest = () => queueMicrotask(() => peer.send({
       kind: { case: "response", value: { result: { case: "status", value: {
-        id: "A1", profileSupport: { ranges, memoryBudget: 4096, memoryUsed: 128, maxLayers: 8, maxRemapOutputs: 8 },
+        id: "A1", errors: [ErrorCode.USB_REQUIRED_CAPACITY_EXCEEDED, ErrorCode.USB_RESERVED_CAPACITY_EXCEEDED], profileSupport: { ranges, resources },
       } } } },
     }));
     const connection = await Connection.open(peer);
-    expect(connection.status.profileSupport).toMatchObject({ ranges, memoryBudget: 4096, memoryUsed: 128, maxLayers: 8, maxRemapOutputs: 8 });
+    expect(connection.status.errors).toEqual([ErrorCode.USB_REQUIRED_CAPACITY_EXCEEDED, ErrorCode.USB_RESERVED_CAPACITY_EXCEEDED]);
+    expect(connection.status.profileSupport).toMatchObject({ ranges, resources });
+    // Absent values stay absent rather than reading as zero.
+    const [memory, outputs, layers] = connection.status.profileSupport!.resources;
+    expect([memory!.count, memory!.limit, outputs!.count, outputs!.limit, layers!.count, layers!.limit]).toEqual([0, 4096, undefined, 8, 2, undefined]);
     await connection.close();
   });
 
@@ -140,8 +149,9 @@ describe("Connection", () => {
     const saved = connection.setSettings({
       device: 4,
       changes: [
-        { integration: 1, key: "wheel.invert", change: { case: "value", value: { value: { case: "bool", value: true } } } },
-        { integration: 1, key: "wheel.invert", change: { case: "forget", value: {} } },
+        { integration: 1, group: { case: "wheel", value: { invert: { change: { case: "value", value: false } } } } },
+        { integration: 1, group: { case: "pointerSensor", value: { index: 0, dpi: { change: { case: "value", value: 0n } } } } },
+        { integration: 1, group: { case: "wheel", value: { invert: { change: { case: "forget", value: {} } } } } },
       ],
     });
     await Promise.resolve();
@@ -149,22 +159,31 @@ describe("Connection", () => {
     await saved;
     const [list, set] = peer.requests.slice(1);
     expect(list!.command).toMatchObject({ case: "listProfiles", value: { after: 7 } });
-    expect(set!.command.case === "setSettings" && set!.command.value.changes.map((c) => c.change.case)).toEqual(["value", "forget"]);
+    // False and zero stay explicit writes rather than reading as unset.
+    const changes = set!.command.case === "setSettings" ? set!.command.value.changes.map((c) => c.group) : [];
+    expect(changes).toMatchObject([
+      { case: "wheel", value: { invert: { change: { case: "value", value: false } } } },
+      { case: "pointerSensor", value: { index: 0, dpi: { change: { case: "value", value: 0n } } } },
+      { case: "wheel", value: { invert: { change: { case: "forget" } } } },
+    ]);
   });
 
   it("reads a listing page by page, passing the key of the last entry received", async () => {
     const { peer, connection } = await open();
     const all = connection.listAllSettings(4);
-    const setting = (key: string) => ({ integration: 1, key, type: { case: "bool" as const, value: {} } });
+    const sensor = (index: number) => ({ integration: 1, group: { case: "pointerSensor" as const, value: { index, dpi: { value: 800n } } } });
+    const wheel = { integration: 1, group: { case: "wheel" as const, value: { invert: { value: true } } } };
+    const keyboard = { integration: 1, group: { case: "keyboard" as const, value: { functionRow: { value: 1 } } } };
     await Promise.resolve();
-    peer.send({ kind: { case: "response", value: { result: { case: "settings", value: { device: 4, settings: [setting("a"), setting("b")] } } } } });
+    peer.send({ kind: { case: "response", value: { result: { case: "settings", value: { device: 4, objects: [keyboard, sensor(0)] } } } } });
     await new Promise((r) => setTimeout(r, 0));
-    peer.send({ kind: { case: "response", value: { result: { case: "settings", value: { device: 4, settings: [setting("c")], end: true } } } } });
-    expect((await all).map((s) => s.key)).toEqual(["a", "b", "c"]);
+    peer.send({ kind: { case: "response", value: { result: { case: "settings", value: { device: 4, objects: [sensor(1), wheel], end: true } } } } });
+    expect((await all).map((o) => o.group.case)).toEqual(["keyboard", "pointerSensor", "pointerSensor", "wheel"]);
     const [first, second] = peer.requests.slice(1);
     expect(first!.command).toMatchObject({ case: "listSettings", value: { device: 4 } });
     expect(first!.command.case === "listSettings" && first!.command.value.after).toBeUndefined();
-    expect(second!.command).toMatchObject({ case: "listSettings", value: { device: 4, after: { integration: 1, key: "b" } } });
+    // Component index 0 is sent, not left out.
+    expect(second!.command).toMatchObject({ case: "listSettings", value: { device: 4, after: { integration: 1, group: SettingsGroup.POINTER_SENSOR, index: 0 } } });
   });
 
   it("rejects an empty page that does not end the listing", async () => {
@@ -239,7 +258,7 @@ describe("Connection", () => {
     const closed = vi.fn();
     const { peer, connection } = await open({ onClose: closed });
     const pending = connection.listSettings(1).catch((e: unknown) => e);
-    const queued = connection.listWarnings(1).catch((e: unknown) => e);
+    const queued = connection.listProfiles().catch((e: unknown) => e);
     peer.unplug();
     expect(await pending).toBeInstanceOf(ConnectionClosedError);
     expect(await queued).toBeInstanceOf(ConnectionClosedError);

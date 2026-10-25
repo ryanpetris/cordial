@@ -1,33 +1,38 @@
-import { ErrorCode, IntegrationState, OutputMode, Role } from "@cordial/protocol";
+import { ErrorCode, IntegrationState, OutputMode, Role, SettingsGroup } from "@cordial/protocol";
 import { describe, expect, it } from "vitest";
 import { FakeAdapter, device, setting } from "../src/fake/adapter.ts";
+import * as convert from "../src/core/convert.ts";
 import { AdapterSession } from "../src/core/session.ts";
-import { settingsCurrent } from "../src/shared/settings.ts";
+import { sameField, settingsCurrent } from "../src/shared/settings.ts";
 import { integrationText, versionText } from "../src/shared/text.ts";
-import { openSession, until } from "./helpers.ts";
+import { field, openSession, until } from "./helpers.ts";
 import { vi } from "vitest";
 
 describe("AdapterSession", () => {
-  it("reads the status, then every device with its warnings and settings", async () => {
+  it("reads the status, then every device with its settings", async () => {
     const { fake, session } = await openSession();
     // Both transports are supported; Classic starts disabled and BLE enabled, as in the firmware.
     expect(session.status).toMatchObject({ id: fake.id, name: "Pico 2 W", platform: "linux", ready: true });
+    const usage = (type: string, count: number | null, limit: number | null) => ({ type, count, limit });
     expect(session.status.transports).toEqual([
-      { transport: "classic", maxEnabled: 7, enabled: false },
-      { transport: "ble", maxEnabled: 7, enabled: true },
+      { transport: "classic", enabled: false, resources: [usage("devices", 1, 7), usage("connections", 0, 7)] },
+      { transport: "ble", enabled: true, resources: [usage("devices", 2, 7), usage("connections", 2, 7)] },
     ]);
-    expect(session.status.profileSupport).toEqual({ memoryBudget: 4096, memoryUsed: 0, maxLayers: 4 });
+    expect(session.status.errors).toEqual([]);
+    expect(session.status.resources).toEqual([usage("interfaces", 11, 16)]);
+    // Limit-only entries keep their count unknown.
+    expect(session.status.profileSupport).toEqual({ resources: [usage("memory", 0, 4096), usage("outputs", null, 8), usage("layers", null, 4)] });
     expect(session.status.interfaces).toEqual([
-      { interface: 1, enabled: false, profile: 0, conflicts: [2] },
-      { interface: 2, enabled: false, profile: 0, conflicts: [1] },
+      { interface: 1, enabled: false, active: false, profile: 0, conflicts: [2] },
+      { interface: 2, enabled: false, active: false, profile: 0, conflicts: [1] },
     ]);
     await until(() => session.listed && session.settings.size === 4);
     expect([...session.devices.keys()]).toEqual([1, 2, 3, 4]);
     expect(fake.received.map((r) => r.command.case)).toEqual([
       "getStatus", "listDevices", "listProfiles",
-      "listWarnings", "listSettings", "listWarnings", "listSettings", "listWarnings", "listSettings", "listWarnings", "listSettings",
+      "listSettings", "listSettings", "listSettings", "listSettings",
     ]);
-    expect(session.devices.get(4)).toMatchObject({ enabled: false, inactive: "disabled", kinds: ["mouse"], profiles: [], profileError: null });
+    expect(session.devices.get(4)).toMatchObject({ enabled: false, inactive: "disabled", kinds: ["mouse"], profiles: [], errors: [] });
     await session.close();
   });
 
@@ -64,20 +69,63 @@ describe("AdapterSession", () => {
     await session.close();
   });
 
-  it("reads every page of settings in the adapter's order and merges change events", async () => {
-    const settings = ["wheel.mode", "backlight.level", "wheel.invert", "backlight.enabled"].map((key, i) => setting(key, { value: true, saved: i === 0 ? true : null, state: "applied" }));
+  it("reads every page of settings objects in the adapter's order and applies change events", async () => {
+    const settings = [
+      setting("wheel", "mode", { choices: ["free_spin", "stepped"], value: "stepped", saved: "free_spin", state: "applied" }),
+      setting("backlight", "brightness", { value: 3 }),
+      setting("pointer_sensor", "dpi", { index: 1, value: 800 }),
+      setting("wheel", "invert", { value: false }),
+      setting("pointer_sensor", "dpi", { index: 0, value: 400 }),
+      setting("backlight", "enabled", { value: true }),
+    ];
     const { fake, session } = await openSession({ devices: [device(1, { state: "connected", settings })], pageSize: 1 });
-    await until(() => session.listed && session.settings.has(1));
-    expect(session.settings.get(1)!.map((x) => x.key)).toEqual(["backlight.enabled", "backlight.level", "wheel.invert", "wheel.mode"]);
-    const afters = fake.received.flatMap((r) => (r.command.case === "listSettings" ? [r.command.value.after?.key] : []));
-    expect(afters).toEqual([undefined, "backlight.enabled", "backlight.level", "wheel.invert"]);
-    // Disconnecting leaves only the saved setting: the event removes the others and changes it.
+    await until(() => session.listed && session.settings.get(1)?.length === 6);
+    const fields = () => session.settings.get(1)!.map((x) => [x.group, x.index, x.field]);
+    expect(fields()).toEqual([
+      ["backlight", null, "enabled"],
+      ["backlight", null, "brightness"],
+      ["pointer_sensor", 0, "dpi"],
+      ["pointer_sensor", 1, "dpi"],
+      ["wheel", null, "mode"],
+      ["wheel", null, "invert"],
+    ]);
+    // One page per object; a sensor index of 0 stays in the cursor.
+    const afters = fake.received.flatMap((r) => (r.command.case === "listSettings" ? [r.command.value.after && [r.command.value.after.group, r.command.value.after.index]] : []));
+    expect(afters).toEqual([undefined, [SettingsGroup.BACKLIGHT, undefined], [SettingsGroup.POINTER_SENSOR, 0], [SettingsGroup.POINTER_SENSOR, 1]]);
+    // Disconnecting leaves only the saved field: the event replaces its object and removes the others.
     fake.changeDevice(1, { state: "disconnected" });
     await until(() => session.settings.get(1)!.length === 1);
-    expect(session.settings.get(1)).toMatchObject([{ key: "wheel.mode", value: null, saved: true }]);
+    expect(session.settings.get(1)).toMatchObject([{ group: "wheel", field: "mode", value: null, saved: "free_spin" }]);
     const event = fake.events.findLast((e) => e.case === "settingsChanged");
-    expect(event?.case === "settingsChanged" && event.value.changed?.map((x) => x.key)).toEqual(["wheel.mode"]);
-    expect(event?.case === "settingsChanged" && event.value.removed?.map((x) => x.key)).toEqual(["backlight.enabled", "backlight.level", "wheel.invert"]);
+    expect(event?.case === "settingsChanged" && event.value.changed?.map((x) => x.group?.case)).toEqual(["wheel"]);
+    expect(event?.case === "settingsChanged" && event.value.removed?.map((x) => [x.group, x.index])).toEqual([
+      [SettingsGroup.BACKLIGHT, undefined],
+      [SettingsGroup.POINTER_SENSOR, 0],
+      [SettingsGroup.POINTER_SENSOR, 1],
+    ]);
+    await session.close();
+  });
+
+  it("replaces every field of a changed object, including saved values and their status", async () => {
+    const enabled = setting("backlight", "enabled", { value: false, saved: false, state: "applied" });
+    const brightness = setting("backlight", "brightness", { value: 0, saved: 0, state: "changed_on_device" });
+    const thumbwheel = setting("thumbwheel", "invert", { value: true });
+    const d = device(1, { state: "connected", settings: [enabled, brightness, thumbwheel] });
+    const { session } = await openSession({ devices: [d] });
+    await until(() => session.settings.get(1)?.length === 3);
+    // False and zero readings and saved values are known, not missing.
+    expect(session.settings.get(1)!.slice(0, 2)).toMatchObject([
+      { field: "enabled", value: false, saved: false, state: "applied" },
+      { field: "brightness", value: 0, saved: 0, state: "changed_on_device" },
+    ]);
+    // The device stops reporting brightness and the adapter forgets the saved Backlight.
+    d.settings = [{ ...enabled, saved: null, value: null }, thumbwheel];
+    await session.connection.refreshDevice(1);
+    await until(() => session.settings.get(1)!.length === 2);
+    expect(session.settings.get(1)).toMatchObject([
+      { group: "backlight", field: "enabled", value: null, saved: null, state: null, error: null },
+      { group: "thumbwheel", field: "invert", value: true },
+    ]);
     await session.close();
   });
 
@@ -90,12 +138,23 @@ describe("AdapterSession", () => {
     await session.connection.setAdapter({ name: "Desk", platform: 2, transports: [{ transport: 1, enabled: true }] });
     expect(session.status).toMatchObject({ name: "Desk", platform: "mac" });
     expect(session.status.transports.find((t) => t.transport === "classic")!.enabled).toBe(true);
-    const key = session.settings.get(1)!.find((x) => x.type === "bool")!.key;
-    await session.connection.setSettings({ device: 1, changes: [{ integration: 1, key, change: { case: "value", value: { value: { case: "bool", value: false } } } }] });
-    expect(session.settings.get(1)!.find((x) => x.key === key)).toMatchObject({ saved: false });
+    // False and zero are saved as values.
+    const backlight = field("backlight", "enabled");
+    const autoOff = field("power", "auto_off");
+    await session.connection.setSettings({
+      device: 1,
+      changes: [
+        convert.settingsUpdate({ type: "set", setting: backlight, value: false }),
+        convert.settingsUpdate({ type: "set", setting: autoOff, value: 0 }),
+      ],
+    });
+    expect(session.settings.get(1)!.find((x) => sameField(x, backlight))).toMatchObject({ saved: false, state: "pending" });
+    expect(session.settings.get(1)!.find((x) => sameField(x, autoOff))).toMatchObject({ saved: 0, state: "pending" });
+    await session.connection.setSettings({ device: 1, changes: [convert.settingsUpdate({ type: "forget", setting: backlight })] });
+    expect(session.settings.get(1)!.find((x) => sameField(x, backlight))).toMatchObject({ saved: null, state: null });
     const id = await session.connection.createProfile("Work");
     expect(session.profileNames.get(id)).toEqual({ id, name: "Work", roles: [] });
-    expect(fake.received.slice(sent).map((r) => r.command.case)).toEqual(["setDevice", "setAdapter", "setSettings", "createProfile"]);
+    expect(fake.received.slice(sent).map((r) => r.command.case)).toEqual(["setDevice", "setAdapter", "setSettings", "setSettings", "createProfile"]);
     // A saved disable or block also leaves the reason the device is inactive.
     await session.connection.setDevice({ device: 1, enabled: false });
     expect(session.devices.get(1)).toMatchObject({ enabled: false, inactive: "disabled" });
@@ -156,17 +215,17 @@ describe("AdapterSession", () => {
     await session.close();
   });
 
-  it("reads a newly paired device's lists and drops a removed device", async () => {
+  it("reads a newly paired device's settings and drops a removed device", async () => {
     const { fake, session } = await openSession({ devices: [device(1)] });
     await until(() => session.settings.size === 1);
-    const added = device(9, { state: "connected", settings: [setting("wheel.invert", { value: true })] });
+    const added = device(9, { state: "connected", settings: [setting("wheel", "invert", { value: true })] });
     fake.devices.push(added);
     fake.changeDevice(9, {});
-    await until(() => !!session.settings.get(9)?.length && session.warnings.has(9));
-    expect(session.settings.get(9)![0]).toMatchObject({ key: "wheel.invert", type: "bool", value: true, saved: null, state: null });
+    await until(() => !!session.settings.get(9)?.length);
+    expect(session.settings.get(9)![0]).toMatchObject({ group: "wheel", field: "invert", type: "bool", value: true, saved: null, state: null });
     expect(await session.connection.unpairDevice(9)).toBeUndefined();
     await until(() => !session.devices.has(9));
-    expect(session.settings.has(9) || session.warnings.has(9)).toBe(false);
+    expect(session.settings.has(9)).toBe(false);
     await session.close();
   });
 
@@ -178,9 +237,9 @@ describe("AdapterSession", () => {
           hidppEnabled: true,
           hidpp: [4, 2],
           settings: [
-            setting("backlight.level", { type: "integer", min: 0, max: 7, step: 1, value: 3, saved: 5, state: "changed_on_device" }),
-            setting("pointer.sensor.1.dpi", { type: "integer", choices: [400, 800], value: 800 }),
-            setting("wheel.mode", { type: "enum", choices: ["freespin", "ratchet"], value: "ratchet", saved: "freespin", error: ErrorCode.TIMEOUT }),
+            setting("backlight", "brightness", { min: 0, max: 7, step: 1, value: 3, saved: 5, state: "changed_on_device" }),
+            setting("pointer_sensor", "dpi", { index: 1, choices: [400, 800], value: 800 }),
+            setting("wheel", "mode", { choices: ["free_spin", "stepped"], value: "stepped", saved: "free_spin", error: ErrorCode.TIMEOUT }),
           ],
         }),
       ],
@@ -189,9 +248,9 @@ describe("AdapterSession", () => {
     session.run();
     await until(() => !!session.settings.get(1)?.length);
     expect(session.settings.get(1)).toEqual([
-      { integration: 1, key: "backlight.level", type: "integer", value: 3, saved: 5, state: "changed_on_device", error: null, choices: [], min: 0, max: 7, step: 1, maxBytes: null },
-      { integration: 1, key: "pointer.sensor.1.dpi", type: "integer", value: 800, saved: null, state: null, error: null, choices: [400, 800], min: null, max: null, step: null, maxBytes: null },
-      { integration: 1, key: "wheel.mode", type: "enum", value: "ratchet", saved: "freespin", state: null, error: "timeout", choices: ["freespin", "ratchet"], min: null, max: null, step: null, maxBytes: null },
+      { integration: 1, group: "backlight", index: null, field: "brightness", type: "integer", value: 3, saved: 5, state: "changed_on_device", error: null, choices: [], min: 0, max: 7, step: 1 },
+      { integration: 1, group: "pointer_sensor", index: 1, field: "dpi", type: "integer", value: 800, saved: null, state: null, error: null, choices: [400, 800], min: null, max: null, step: null },
+      { integration: 1, group: "wheel", index: null, field: "mode", type: "enum", value: "stepped", saved: "free_spin", state: null, error: "timeout", choices: ["free_spin", "stepped"], min: null, max: null, step: null },
     ]);
     const entry = () => ({ device: session.devices.get(1)! });
     expect(settingsCurrent(entry())).toBe(true);
@@ -206,8 +265,8 @@ describe("AdapterSession", () => {
     // While disconnected, the list holds the saved settings, with their limits and without readings.
     fake.changeDevice(1, { hidppError: null, state: "disconnected" });
     await until(() => session.devices.get(1)!.hidpp?.state === "disconnected" && session.settings.get(1)!.length === 2);
-    expect(session.settings.get(1)!.map((s) => [s.key, s.value, s.saved, s.max])).toEqual([["backlight.level", null, 5, 7], ["wheel.mode", null, "freespin", null]]);
-    expect(session.devices.get(1)!.info).toEqual([]);
+    expect(session.settings.get(1)!.map((s) => [s.field, s.value, s.saved, s.max])).toEqual([["brightness", null, 5, 7], ["mode", null, "free_spin", null]]);
+    expect(session.devices.get(1)!.information).toEqual(convert.information(undefined));
     expect(settingsCurrent(entry())).toBe(false);
     await session.close();
   });

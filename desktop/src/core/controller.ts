@@ -14,9 +14,9 @@ import {
   type AppState,
   type Battery,
   type DeviceEntry,
+  type DeviceInformation,
   type DeviceRecord,
   type HostPlatform,
-  type InfoEntry,
   type PairingState,
   type Preferences,
   type ProfileAlert,
@@ -25,18 +25,27 @@ import {
   type SettingsSave,
   type TransportName,
 } from "../shared/state.ts";
-import { enabledFull } from "../shared/capacity.ts";
+import { enabledFull, resource } from "../shared/capacity.ts";
 import { gamepadModes } from "../shared/outputs.ts";
 import { interfaceProblem, profileInUse, profileName, stagedInterfaces } from "../shared/profiles.ts";
-import { settingsBusy } from "../shared/settings.ts";
-import { PLATFORMS, TRANSPORTS, clean, codeText, displayKind, errorText, inactiveText, infoOf, storageFull, transportDisabledText } from "../shared/text.ts";
+import { settingId, settingsBusy } from "../shared/settings.ts";
+import {
+  PLATFORMS,
+  TRANSPORTS,
+  clean,
+  codeText,
+  connectionError,
+  displayKind,
+  errorText,
+  inactiveText,
+  profileError,
+  storageFull,
+  transportDisabledText,
+} from "../shared/text.ts";
 import { BatteryAlerts, CRITICAL_PERCENT, type Alert } from "./battery.ts";
 import * as convert from "./convert.ts";
 import { AdapterManager, type ManagerDeps } from "./manager.ts";
 import { AdapterSession, failure } from "./session.ts";
-
-/** The share of profile memory in use, in percent, from which the adapter is nearly full. */
-export const MEMORY_ALERT_PERCENT = 85;
 
 export interface ControllerDeps extends Omit<ManagerDeps, "changed" | "event"> {
   preferences: Preferences;
@@ -67,16 +76,17 @@ function transportFailure(error: unknown, session: AdapterSession, transports: (
   return off ? transportDisabledText(off) : failure(error);
 }
 
+/** The type of value each setting type takes. */
+const VALUE_TYPES = { bool: "boolean", integer: "number", enum: "string" } as const;
+
 const GONE: ActionResult = { ok: false, message: "This device or adapter is no longer available." };
 
-export function batteryOf(info: InfoEntry[], current = true): Battery | null {
-  const percent = infoOf(info, "battery.level");
-  const charging = infoOf(info, "battery.charging");
+export function batteryOf({ battery }: DeviceInformation, current = true): Battery | null {
   const b: Battery = {
-    percent: typeof percent === "number" ? percent : null,
-    charging: typeof charging === "boolean" ? charging : null,
-    percentFresh: current && typeof percent === "number",
-    chargingFresh: current && typeof charging === "boolean",
+    percent: battery.level,
+    charging: battery.charging,
+    percentFresh: current && battery.level !== null,
+    chargingFresh: current && battery.charging !== null,
   };
   return b.percent == null && b.charging == null ? null : b;
 }
@@ -144,22 +154,20 @@ export class Controller {
     this.#deps.published(state);
   }
 
-  /** Notifies once when an adapter's profile memory reaches MEMORY_ALERT_PERCENT and once when a
+  /** Notifies once when an adapter reports its profile memory nearly full and once when a
    * connected device's profiles aren't loaded, again only after the condition has cleared. Adapters
    * and devices that are absent keep their state. */
   #profileAlerts(state: AppState) {
     for (const a of state.adapters) {
-      const p = a.connection === "connected" ? a.status?.profileSupport : undefined;
-      if (p === undefined) continue;
-      const full = !!p && p.memoryBudget > 0 && p.memoryUsed * 100 >= p.memoryBudget * MEMORY_ALERT_PERCENT;
-      if (!full) this.#memoryAlerted.delete(a.id);
+      if (a.connection !== "connected" || !a.status) continue;
+      if (!a.status.errors.includes("profile_memory_low")) this.#memoryAlerted.delete(a.id);
       else if (!this.#memoryAlerted.has(a.id)) {
         this.#memoryAlerted.add(a.id);
-        this.#deps.profileAlert({ kind: "memory", adapterId: a.id, name: a.name, percent: Math.round((p.memoryUsed / p.memoryBudget) * 100) });
+        this.#deps.profileAlert({ kind: "memory", adapterId: a.id, name: a.name });
       }
     }
     for (const d of state.devices) {
-      const code = d.device.state === "connected" ? d.device.profileError : null;
+      const code = profileError(d.device);
       if (!code) this.#profileAlerted.delete(d.key);
       else if (!this.#profileAlerted.has(d.key)) {
         this.#profileAlerted.add(d.key);
@@ -179,6 +187,7 @@ export class Controller {
       const attention: string[] = [];
       if (status.ready && storageFull(status))
         attention.push("The adapter's storage is full. Remove an unused device or forget a saved setting to pair another device.");
+      if (status.errors.includes("usb_required_capacity_exceeded")) attention.push(codeText("usb_required_capacity_exceeded"));
       adapters.push({
         name: status.name,
         id,
@@ -282,10 +291,8 @@ export class Controller {
       device,
       name: clean(device.name) || "Unnamed device",
       kind: displayKind(device.kinds, device.roles),
-      battery: batteryOf(device.info, device.state === "connected"),
+      battery: batteryOf(device.information, device.state === "connected"),
       pending: session.pendingFor(device.id),
-      warnings: session.warnings.get(device.id) ?? null,
-      warningsError: session.warningsErrors.get(device.id) ?? null,
       settings: session.settings.get(device.id) ?? null,
       settingsError: session.settingsErrors.get(device.id) ?? null,
       settingsSave: save?.session === session ? save.save : null,
@@ -305,9 +312,9 @@ export class Controller {
       p.message = d.inactive === "disabled"
         ? "The device is paired but turned off in Cordial. Turn on “Use This Device” to connect it."
         : `The device is paired but can't connect. ${inactiveText(d)}`;
-    } else if (d.state === "disconnected" && d.error) {
+    } else if (d.state === "disconnected" && connectionError(d)) {
       p.phase = "saved";
-      p.message = `The device is paired, but the adapter couldn't connect to it. ${codeText(d.error)}`;
+      p.message = `The device is paired, but the adapter couldn't connect to it. ${codeText(connectionError(d)!)}`;
     }
     if (p.phase !== "connecting" && p.dismissed) this.#pairing = null;
   }
@@ -334,27 +341,16 @@ export class Controller {
     const entry = this.#device(session.adapterId, session, target.device);
     if (settingsBusy(entry)) return { ok: false, message: codeText("busy") };
     if (!changes.length) return { ok: true };
-    const known = new Map((entry.settings ?? []).map((s) => [s.key, s]));
-    if (changes.some((c) => !known.has(c.setting))) return { ok: false, message: codeText("not_found") };
+    const known = new Map((entry.settings ?? []).map((s) => [settingId(s), s.type]));
+    if (changes.some((c) => !known.has(settingId(c.setting)))) return { ok: false, message: codeText("not_found") };
+    if (changes.some((c) => c.type === "set" && typeof c.value !== VALUE_TYPES[known.get(settingId(c.setting))!])) return { ok: false, message: codeText("bad_args") };
     const items: SettingsSave["items"] = changes.map((change) => ({ change, status: "saving", error: null }));
     const save: SettingsSave = { running: true, items };
     this.#settingsSaves.set(key, { save, session });
     this.#publish();
     // Saved values and forgotten ones go in one write, all or nothing.
     try {
-      await session.perform(id, "settings", (c) =>
-        c.setSettings({
-          device: id,
-          changes: changes.map((change) => {
-            const s = known.get(change.setting)!;
-            return {
-              integration: s.integration,
-              key: change.setting,
-              change: change.type === "set" ? { case: "value", value: convert.value(s.type, change.value) } : { case: "forget", value: {} },
-            };
-          }),
-        }),
-      );
+      await session.perform(id, "settings", (c) => c.setSettings({ device: id, changes: changes.map(convert.settingsUpdate) }));
       for (const item of items) item.status = "saved";
     } catch (error) {
       const reason = failure(error);
@@ -414,7 +410,8 @@ export class Controller {
     if (profiles !== undefined) {
       const support = session.status.profileSupport;
       if (!support) return { ok: false, message: codeText("unsupported") };
-      if (profiles.length > support.maxLayers || profiles.includes(0)) return { ok: false, message: codeText("bad_args") };
+      const layers = resource(support.resources, "layers")?.limit;
+      if ((layers != null && profiles.length > layers) || profiles.includes(0)) return { ok: false, message: codeText("bad_args") };
     }
     if (gamepadOutput !== undefined && !gamepadModes(session.status).includes(gamepadOutput)) return { ok: false, message: codeText("unsupported") };
     // A change to HID++ is tracked as such, so the settings it starts or stops wait for it.

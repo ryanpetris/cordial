@@ -20,7 +20,7 @@
 
 void ble_store_config_init(void);
 _Static_assert(MYNEWT_VAL(BLE_GATTS),"HID peers require ATT server replies");
-_Static_assert(MYNEWT_VAL(BLE_STORE_MAX_BONDS)==8,"portable bond table capacity");
+
 _Static_assert(!MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC),"custom IRK requires static NimBLE privacy state");
 typedef struct {
     uint32_t token;
@@ -29,15 +29,15 @@ typedef struct {
     bool started;
     uint16_t connection, mtu, read_length;
     uint8_t prompt, error;
-    bool pairing, closing, secure, mtu_done, reported, read_found;
+    bool pairing, adopted, closing, secure, mtu_done, reported, read_found;
 } link;
-static link links[4];
+static link links[MYNEWT_VAL(BLE_MAX_CONNECTIONS)];
 static cordial_ble_emit emit;
 static QueueHandle_t commands;
 static struct ble_npl_event command_event;
 static uint64_t scan_id;
 static bool is_synced, scan_unresolved;
-static ble_addr_t reconnect_peers[8];
+static ble_addr_t reconnect_peers[MYNEWT_VAL(BLE_MAX_CONNECTIONS) - 1];
 static unsigned reconnect_count;
 static bool auto_active, auto_cancel, auto_dirty, auto_consumed;
 static struct { uint32_t attempt; uint16_t handle; } incoming={.handle=BLE_HS_CONN_HANDLE_NONE};
@@ -96,7 +96,7 @@ static int unpair_view(const ble_addr_t *p) {
 }
 static int start_scan(void) {
     if (!scan_id || auto_active || ble_gap_disc_active()) return 0;
-    for(unsigned i=0;i<4;i++)
+    for(unsigned i=0;i<MYNEWT_VAL(BLE_MAX_CONNECTIONS);i++)
         if(links[i].token && links[i].connection==BLE_HS_CONN_HANDLE_NONE) return 0;
     int status=ble_hs_pvcy_set_resolve_enabled(0);
     if(status) return status;
@@ -126,11 +126,11 @@ static ble_addr_t address(cordial_ble_peer peer) {
 }
 static link *by_token(uint32_t token) {
     if(!token)return NULL;
-    for (unsigned i=0;i<4;i++) if (links[i].token==token) return &links[i];
+    for (unsigned i=0;i<MYNEWT_VAL(BLE_MAX_CONNECTIONS);i++) if (links[i].token==token) return &links[i];
     return NULL;
 }
 static link *by_handle(uint16_t handle) {
-    for (unsigned i=0;i<4;i++) if (links[i].token && links[i].connection==handle) return &links[i];
+    for (unsigned i=0;i<MYNEWT_VAL(BLE_MAX_CONNECTIONS);i++) if (links[i].token && links[i].connection==handle) return &links[i];
     return NULL;
 }
 // ATT failures distinguish an unavailable operation from a transport failure.
@@ -149,9 +149,9 @@ static void complete(uint32_t request,int status) {
     cordial_ble_event e={.kind=CORDIAL_BLE_COMPLETE,.request=request,.code=operation_error(status)}; emit(&e);
 }
 static bool bonds(const ble_addr_t *absent) {
-    ble_addr_t addresses[8]; int count=0;
-    if (cordial_bonds_peers(addresses,&count,8) || count<0 || count>8) return false;
-    cordial_ble_peer peers[8];
+    ble_addr_t addresses[MYNEWT_VAL(BLE_STORE_MAX_BONDS)]; int count=0;
+    if (cordial_bonds_peers(addresses,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) || count<0 || count>MYNEWT_VAL(BLE_STORE_MAX_BONDS)) return false;
+    cordial_ble_peer peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
     for (int i=0;i<count;i++) {
         // ble_gap_unpair may log a native deletion failure yet return success.
         if(absent && addresses[i].type==absent->type && !memcmp(addresses[i].val,absent->val,6)) return false;
@@ -184,8 +184,10 @@ static void fail(link *l,uint8_t code) {
 static void resume_radio(void) {
     if(!is_synced)return;
     link *pending=NULL;
-    for(unsigned i=0;i<4;i++) if(links[i].token && links[i].connection==BLE_HS_CONN_HANDLE_NONE) {
-        pending=&links[i];break;
+    unsigned normal=0;
+    for(unsigned i=0;i<MYNEWT_VAL(BLE_MAX_CONNECTIONS);i++) if(links[i].token) {
+        normal+=!links[i].pairing;
+        if(!pending && links[i].connection==BLE_HS_CONN_HANDLE_NONE) pending=&links[i];
     }
     if(auto_active) {
         if(!auto_cancel && (pending || scan_id || auto_dirty || !reconnect_count || auto_consumed)) {
@@ -209,7 +211,7 @@ static void resume_radio(void) {
         return;
     }
     if(scan_id) { if(start_scan())goto failed;return; }
-    if(!reconnect_count || auto_consumed)return;
+    if(!reconnect_count || auto_consumed || normal>=MYNEWT_VAL(BLE_MAX_CONNECTIONS)-1)return;
     if(stop_scan())goto failed;
     if(ble_gap_wl_set(reconnect_peers,reconnect_count))goto failed;
     auto_dirty=false;
@@ -338,7 +340,7 @@ static int gap(struct ble_gap_event *event,void *arg) {
         l->secure=true;security_ready(l);return 0;
     }
     case BLE_GAP_EVENT_PASSKEY_ACTION: {
-        l=by_handle(event->passkey.conn_handle);if (!l || !l->pairing || l->closing) { if(l) fail(l,CORDIAL_BLE_AUTH);return 0; }
+        l=by_handle(event->passkey.conn_handle);if (!l || !l->pairing || l->adopted || l->closing) { if(l) fail(l,CORDIAL_BLE_AUTH);return 0; }
         cordial_ble_event e={.kind=CORDIAL_BLE_PROMPT,.token=l->token};
         l->prompt=event->passkey.params.action;
         if (l->prompt==BLE_SM_IOACT_DISP) {
@@ -354,8 +356,8 @@ static int gap(struct ble_gap_event *event,void *arg) {
     case BLE_GAP_EVENT_REPEAT_PAIRING: {
         l=by_handle(event->repeat_pairing.conn_handle);
         // A saved device that asks to pair again has lost its bond.
-        if(l && !l->pairing && !l->closing) { fail(l,CORDIAL_BLE_AUTH);return BLE_GAP_REPEAT_PAIRING_IGNORE; }
-        if(!l || !l->pairing || l->closing)return BLE_GAP_REPEAT_PAIRING_IGNORE;
+        if(l && (!l->pairing || l->adopted) && !l->closing) { fail(l,CORDIAL_BLE_AUTH);return BLE_GAP_REPEAT_PAIRING_IGNORE; }
+        if(!l || !l->pairing || l->adopted || l->closing)return BLE_GAP_REPEAT_PAIRING_IGNORE;
         struct ble_gap_conn_desc desc;
         if(ble_gap_conn_find(l->connection,&desc))return BLE_GAP_REPEAT_PAIRING_IGNORE;
         struct ble_store_key_sec key={.peer_addr=desc.peer_id_addr};
@@ -442,7 +444,7 @@ static void command(const cordial_ble_command *c) {
         return;
     }
     if(c->kind==CORDIAL_BLE_RECONNECT) {
-        if(c->length>sizeof(cordial_ble_peer)*8 || c->length%sizeof(cordial_ble_peer)) {
+        if(c->length>sizeof(cordial_ble_peer)*(MYNEWT_VAL(BLE_MAX_CONNECTIONS) - 1) || c->length%sizeof(cordial_ble_peer)) {
             cordial_ble_event e={.kind=CORDIAL_BLE_FAILED,.code=CORDIAL_BLE_CAPACITY};emit(&e);return;
         }
         reconnect_count=c->length/sizeof(cordial_ble_peer);
@@ -460,8 +462,12 @@ static void command(const cordial_ble_command *c) {
         uint16_t handle=incoming.handle;
         incoming.attempt=0;ble_npl_callout_stop(&incoming_timeout);
         if(!c->token) { reject_incoming();return; }
-        for(unsigned i=0;i<4;i++)if(!links[i].token){l=&links[i];break;}
-        if(!l) {
+        unsigned normal=0;
+        for(unsigned i=0;i<MYNEWT_VAL(BLE_MAX_CONNECTIONS);i++) {
+            if(links[i].token) normal+=!links[i].pairing;
+            else if(!l) l=&links[i];
+        }
+        if(!l || normal>=MYNEWT_VAL(BLE_MAX_CONNECTIONS)-1) {
             reject_incoming();
             cordial_ble_event e={.kind=CORDIAL_BLE_DISCONNECTED,.token=c->token,.code=CORDIAL_BLE_CAPACITY};emit(&e);return;
         }
@@ -521,14 +527,20 @@ static void command(const cordial_ble_command *c) {
         return;
     }
     if (c->kind==CORDIAL_BLE_CONNECT) {
-        for (unsigned i=0;i<4;i++) if (!links[i].token) { l=&links[i];break; }
-        if (!l) { cordial_ble_event e={.kind=CORDIAL_BLE_DISCONNECTED,.token=c->token,.code=CORDIAL_BLE_CAPACITY};emit(&e);return; }
+        unsigned normal=0;
+        bool pairing=false;
+        for(unsigned i=0;i<MYNEWT_VAL(BLE_MAX_CONNECTIONS);i++) {
+            if(links[i].token) { normal+=!links[i].pairing;pairing|=links[i].pairing; }
+            else if(!l) l=&links[i];
+        }
+        if (!l || (c->pairing ? pairing : normal>=MYNEWT_VAL(BLE_MAX_CONNECTIONS)-1)) { cordial_ble_event e={.kind=CORDIAL_BLE_DISCONNECTED,.token=c->token,.code=CORDIAL_BLE_CAPACITY};emit(&e);return; }
         *l=(link){.token=c->token,.connection=BLE_HS_CONN_HANDLE_NONE,.pairing=c->pairing,.mtu=23};
         l->peer=c->peer;
         return;
     }
+    if (c->kind==CORDIAL_BLE_PROMOTE) { if(l) l->pairing=false;return; }
     if (!l || l->closing) { if(c->request) complete(c->request,BLE_HS_ENOTCONN);return; }
-    if (c->kind==CORDIAL_BLE_ADOPT) { l->pairing=false;return; }
+    if (c->kind==CORDIAL_BLE_ADOPT) { l->adopted=true;return; }
     if (c->kind==CORDIAL_BLE_DISCONNECT) {
         l->closing=true;
         if (l->connection==BLE_HS_CONN_HANDLE_NONE) { if (!l->started || ble_gap_conn_cancel()) fail(l,CORDIAL_BLE_OK); }
@@ -536,7 +548,7 @@ static void command(const cordial_ble_command *c) {
         return;
     }
     if (c->kind==CORDIAL_BLE_REPLY) {
-        if (!c->accept || !l->pairing) { fail(l,CORDIAL_BLE_AUTH);return; }
+        if (!c->accept || !l->pairing || l->adopted) { fail(l,CORDIAL_BLE_AUTH);return; }
         struct ble_sm_io io={.action=l->prompt};
         if (l->prompt==BLE_SM_IOACT_INPUT && c->method==CORDIAL_BLE_ENTER) io.passkey=c->number;
         else if (l->prompt==BLE_SM_IOACT_NUMCMP && c->method==CORDIAL_BLE_CONFIRM) io.numcmp_accept=1;
@@ -600,7 +612,7 @@ static void reset(int reason) {
     bool stored=bonds(NULL);
     // NimBLE reports established disconnects before reset_cb. Retire any
     // remaining initiation as well, before the shared Restarting event.
-    for(unsigned i=0;i<4;i++) if(links[i].token) {
+    for(unsigned i=0;i<MYNEWT_VAL(BLE_MAX_CONNECTIONS);i++) if(links[i].token) {
         cordial_ble_event e={.kind=CORDIAL_BLE_DISCONNECTED,.token=links[i].token,
             .code=stored ? CORDIAL_BLE_RADIO:CORDIAL_BLE_STORAGE};emit(&e);memset(&links[i],0,sizeof(links[i]));
     }
@@ -638,6 +650,15 @@ int cordial_ble_start(cordial_ble_emit callback) {
 int cordial_ble_submit(const cordial_ble_command *c) {
     if (!commands || !c || xQueueSend(commands,c,0)!=pdTRUE) return CORDIAL_BLE_CAPACITY;
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(),&command_event);return CORDIAL_BLE_OK;
+}
+
+// The bond is committed before promotion. Wait for queue space so admission
+// cannot overtake the handoff or turn a saved bond into a failed pairing.
+// The native task never waits for the application to consume its callbacks.
+void cordial_ble_promote(uint32_t token) {
+    cordial_ble_command c={.kind=CORDIAL_BLE_PROMOTE,.token=token};
+    xQueueSend(commands,&c,portMAX_DELAY);
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(),&command_event);
 }
 
 unsigned cordial_ble_bond_capacity(void) { return MYNEWT_VAL(BLE_STORE_MAX_BONDS); }

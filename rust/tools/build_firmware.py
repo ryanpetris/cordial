@@ -159,6 +159,15 @@ def package(config, built, elf, output, name, gcc, env):
             raise ValueError("ESP SDK flash size differs from board configuration")
         sdkconfig = dict(line.split("=", 1) for line in (sdk.parent / "sdkconfig").read_text().splitlines()
                          if line.startswith("CONFIG_"))
+        from bluetooth_config import limits
+        _, ble = limits(config)
+        expected = {"CONFIG_BT_CTRL_BLE_MAX_ACT": ble + 2}
+        if config["bluetooth_backend"] == "esp-nimble":
+            expected.update(CONFIG_BT_NIMBLE_MAX_CONNECTIONS=ble + 1,
+                            CONFIG_BT_NIMBLE_MAX_BONDS=ble + 1)
+        for key, value in expected.items():
+            if sdkconfig.get(key) != str(value):
+                raise ValueError(f"ESP Bluetooth capacity differs from board configuration: {key}")
         revisions = tuple(int(sdkconfig[f"CONFIG_ESP_REV_{bound}_FULL"]) for bound in ("MIN", "MAX"))
         bootloader = sdk / "bootloader/bootloader.bin"
         partitions = sdk / "partition_table/partition-table.bin"

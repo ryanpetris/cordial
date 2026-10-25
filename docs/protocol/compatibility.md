@@ -2,8 +2,8 @@
 
 [Protocol index](README.md)
 
-The schema only grows. Old clients keep working with new firmware, and new clients with old
-firmware, because every message follows the rules below. There is no protocol version number.
+Firmware and clients must use matching serial schemas. The rules below govern compatible changes
+within a release series. There is no separate protocol version number.
 
 ## Fields
 
@@ -30,11 +30,10 @@ understood are Required.
   still means inactive.
 - A `oneof` that holds a variant newer than the client reads as unset, with a documented meaning:
   an unknown pairing step means pairing is still in progress, an unknown integration status means
-  off, an unknown setting type means the client skips the setting, and an unknown listing entry
+  off, an unknown settings group means the client skips the object, and an unknown listing entry
   means the client skips the entry.
-- `ErrorCode` and `WarningCode` are wire enums, separate from the firmware's internal error types.
-  The firmware maps an internal error to the wire code that describes it to a user, or to a
-  warning when the device keeps working.
+- `ErrorCode` is a wire enum, separate from the firmware's internal error types. The firmware maps
+  internal failures to the appropriate request, adapter, device, integration or setting record.
 
 ## Changing the schema
 
@@ -75,7 +74,7 @@ wants to change, and every missing field keeps its current value.
 - Fields that only make sense together are grouped in one message, replaced or kept as a whole.
 - Because a missing field means unchanged, clearing a value needs an explicit form, such as `name:
   ""` restoring the default adapter name, or a `forget` entry in a list of changes, such as
-  `SettingChange.forget`.
+  `BoolSettingUpdate.forget`.
 - A set command responds with no result once the change is applied, and the changed object's
   event announces it when anything changed. A success means the Dongle holds what was sent, in the
   saved form the command defines, so a client sends a newer field only when `Status` shows the
@@ -91,11 +90,10 @@ wants to change, and every missing field keeps its current value.
 
 Settings, features and device-protocol state are not tied to HID++ on the wire. Each belongs to an
 integration named by `IntegrationKind`; HID++ is the only kind so far. A new integration is a new
-enum value; it reports itself as another `Device.integrations` entry, its readings as `Info`
-records, its settings as `Setting` records with its kind, and its feature table as `Feature`
-records with a new `detail` variant. Details only one integration has go in fields 20 and up of
-`Integration` and `Setting`, or in a `Feature.detail` variant; the shared fields carry everything a
-client needs to show, enable and edit them.
+enum value; it reports itself as another `Device.integrations` entry, its readings in typed
+`DeviceInformation` fields, its settings as `SettingsObject` records with its kind, and its
+feature table as `Feature` records with a new `detail` variant. Settings domains describe device
+behavior, independently of the integration providing it.
 
 - A client keeps the number of a kind it does not know and passes it back unchanged.
 - Integration failures use the shared error codes.
@@ -110,7 +108,7 @@ Profiles are not tied to keyboards, mice or any other kind of device. A profile 
 keyed by HID usage and application collection, and the Dongle applies whichever of them match the
 input a device produces. A new kind of input or output, such as a joystick axis or a gamepad report,
 is a new usage range in `ProfileSupport`, never a new field, message or command. HID usages and
-collections are typed fields, decoded by the Dongle, as for warnings.
+collections are typed fields, decoded by the Dongle.
 
 Each rule and rule reference requires both input usage and collection. Capability ranges in
 `ProfileSupport.ranges` include a `UsageRange.Kind` and collection for inputs and outputs.
@@ -152,8 +150,7 @@ Every `List` command reads its list in pages, the same way:
 | `ListDevices` | Device ID | Ascending ID |
 | `ListProfiles` | Profile ID | Ascending ID |
 | `ListProfileRules` | `ProfileRuleRef`: input usage and collection | Input usage page, input usage, collection usage page, then collection usage |
-| `ListSettings` | `SettingRef`: integration and key | Integration, then key compared bytewise |
-| `ListWarnings` | The last `DeviceWarning` itself | Service, report type, report ID, bit offset, usage page, usage, then code; a missing field orders before any value |
+| `ListSettings` | `SettingsRef`: integration, group and optional component index | Integration, group, then component index |
 | `ListFeatures` | `FeatureRef`: integration and index | Integration, then index |
 | `ListFiles` | Entry name | Name compared bytewise |
 
@@ -169,15 +166,24 @@ the listing as failed.
 
 ## Information and settings
 
-Everything about a device beyond its record is a keyed value in one of two lists. `Device.info`,
-and `Status.info` for the Dongle itself, hold what is only reported: identity, battery, current
-state. Settings hold values the Dongle can change on the device and save; every setting is
-writable. Both use string keys from the [key catalog](keys.md) and the shared `Value` type, so a new
-piece of information or a new setting is a new key, not a schema change.
+`Status.information` and `Device.information` contain typed read-only facts. Each scalar has
+independent presence. Missing means unknown, including for false and zero. A device event replaces
+the whole information object, so absent fields clear prior readings. Device information belongs to
+the current connection and clears on disconnect.
 
-- A key means the same thing in every list. A value that can be changed on one device but only read
-  on another uses one key: a setting where it can be written, information where it cannot.
-- Keys name what they describe, never the protocol they came from, so a client that knows a key
-  can show it whichever integration provides it.
-- A client shows only keys it knows; labels and formatting live in the client. An unknown enum
-  value is shown as unknown, never guessed.
+Settings use complete domain objects owned by an integration. The domain is selected by a
+`SettingsObject.group` oneof. Every configurable field has a typed wrapper with independent
+`value` and `saved` presence, optional per-field `status`, and its accepted range or choices where
+applicable. Unknown enum readings provide no confirmation of a writable choice. Clients preserve
+unknown integration kinds but skip unknown groups.
+
+`SettingsUpdate` is partial, down to each nested field. Every present field chooses a typed value
+or an empty `SettingForget` marker. Missing leaves the preference unchanged; `forget` removes only
+the saved preference and never resets the actual device value. False and zero remain explicit
+writes. See [settings records](records.md#settings) for metadata and event replacement rules.
+
+Settings pages and change events pack whole objects into at most 1024 protobuf bytes for the
+enclosing `Message`. An object, including its integration, selected group and saved metadata, is
+at most 960 protobuf bytes. These bounds apply to typed settings messages, not general response
+frames. Other lists retain Dongle-selected entry counts, with at least one entry unless `end` is
+set. Clients do not infer a general response-size limit from the 1024-byte request limit.

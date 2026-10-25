@@ -67,7 +67,6 @@ fn new_gamepad_enables_hid_after_saving_and_reports_the_output() {
     assert_eq!(gamepad(&saved.output_preferences), p::OutputMode::Hid);
     assert!(!saved.setup_pending);
     assert_eq!(t.app.manager.outputs.plan().hid_gamepads, 1);
-    assert!(!t.app.usb_reconnect);
     let device = events
         .iter()
         .rev()
@@ -94,7 +93,6 @@ fn new_gamepad_enables_hid_after_saving_and_reports_the_output() {
     t.poll();
     reconnect(&mut t, link, descriptors());
     assert_eq!(t.app.manager.outputs.plan(), plan);
-    assert!(!t.app.usb_reconnect);
 }
 
 #[test]
@@ -249,7 +247,6 @@ fn gamepad_setup_keeps_hidpp_detection_pending() {
     assert!(!t.saved(SAVED).setup_pending);
     assert!(t.saved(SAVED).hidpp_enabled());
     assert_eq!(t.app.manager.outputs.plan(), plan);
-    assert!(!t.app.usb_reconnect);
 }
 
 #[test]
@@ -296,7 +293,6 @@ fn failed_saves_keep_the_mode_and_plan_until_the_next_connection_retries() {
     assert_eq!(t.app.manager.outputs.plan(), Plan::default());
     assert!(!t.live(SAVED).setup.gamepad);
     assert!(t.app.manager.connection(link).unwrap().setup_failed);
-    assert!(!t.app.usb_reconnect);
     t.store.fail_save = None;
     finish(&mut t);
     assert_eq!(t.app.manager.outputs.plan(), Plan::default());
@@ -470,7 +466,6 @@ fn an_uncertain_save_stops_runtime_output_until_storage_recovers() {
     finish(&mut t);
     assert!(!t.app.manager.storage_ready);
     assert_eq!(t.app.manager.outputs.plan(), Plan::default());
-    assert!(!t.app.usb_reconnect);
     t.store.unknown = None;
     t = Test::with(t.store, Radio::default(), build(false, None));
     assert_eq!(

@@ -14,7 +14,7 @@ describe("setting value units", () => {
   });
 
   it("keeps the unit for zero on other settings", () => {
-    expect(neverValue("backlight.delay.powered", 0)).toBe(false);
-    expect(displayUnit("backlight.delay.powered", 0)).toBe("s");
+    expect(neverValue("backlight.external_power", 0)).toBe(false);
+    expect(displayUnit("backlight.external_power", 0)).toBe("s");
   });
 });

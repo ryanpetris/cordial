@@ -196,6 +196,9 @@ pub struct Radio {
     pub layouts: Vec<Option<Layout>>,
     pub closes: Vec<LinkId>,
     pub adopted: Vec<LinkId>,
+    pub promoted: Vec<LinkId>,
+    pub native_links: Option<Vec<(LinkId, Peer, bool)>>,
+    pub incoming_peer: Option<Peer>,
     pub writes: Vec<(WriteId, Vec<u8>)>,
     pub transports: Option<Capabilities>,
     pub reject_adoption: bool,
@@ -210,6 +213,33 @@ pub struct Radio {
     pub reject_transport: Option<Error>,
     /// Events for an owner loop to handle, in order.
     pub events: std::collections::VecDeque<Event>,
+}
+impl Radio {
+    pub fn native_room(&self, transport: Transport) -> bool {
+        self.native_links
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|(_, peer, pairing)| peer.transport == transport && !pairing)
+            .count()
+            < cordial_core::devices::connection_limit(transport)
+    }
+    fn native_connect(&mut self, id: LinkId, peer: Peer, pairing: bool) -> Result<(), Error> {
+        if let Some(links) = &self.native_links {
+            if if pairing {
+                links.iter().any(|(_, _, pair)| *pair)
+            } else {
+                !self.native_room(peer.transport)
+            } {
+                return Err(Error::Capacity);
+            }
+            self.native_links
+                .as_mut()
+                .unwrap()
+                .push((id, peer, pairing));
+        }
+        Ok(())
+    }
 }
 impl EventSource for Radio {
     async fn poll(&mut self) {}
@@ -230,7 +260,7 @@ impl Bluetooth for Radio {
     }
     fn bond_capacity(&self, t: Transport) -> usize {
         if self.capabilities().supports(t) {
-            8
+            cordial_core::devices::connection_limit(t) + 1
         } else {
             0
         }
@@ -267,6 +297,7 @@ impl Bluetooth for Radio {
         if let Some(error) = self.reject_connect {
             return Err(error);
         }
+        self.native_connect(link, peer, pairing)?;
         self.addresses.push(peer);
         self.connects.push((link, pairing));
         self.layouts.push(layout.cloned());
@@ -280,6 +311,9 @@ impl Bluetooth for Radio {
     ) -> Result<(), Error> {
         self.incoming.push(accept);
         if let Some(id) = accept {
+            if let Some(peer) = self.incoming_peer {
+                self.native_connect(id, peer, false)?;
+            }
             self.connects.push((id, false));
             self.layouts.push(layout.cloned());
         } else {
@@ -296,6 +330,13 @@ impl Bluetooth for Radio {
         }
         self.adopted.push(link);
         Ok(())
+    }
+    fn promote(&mut self, link: LinkId) {
+        assert!(self.adopted.contains(&link));
+        if let Some(links) = &mut self.native_links {
+            links.iter_mut().find(|(id, _, _)| *id == link).unwrap().2 = false;
+        }
+        self.promoted.push(link);
     }
     fn pair_reply(
         &mut self,

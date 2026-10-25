@@ -35,10 +35,14 @@ try {
   const state = await page.evaluate(() => window.cordial.state());
   const entry = state.devices.find((d) => d.name === "Example Keys Wireless");
   assert.ok(entry?.settings?.length);
-  const row = (key) => entry.settings.find((s) => s.key === key);
-  const enabled = row("backlight.enabled");
+  const row = (group, field) => entry.settings.find((s) => s.group === group && s.field === field);
+  /** A HID++ setting's identity, as the window sends it. */
+  const F = (group, field) => ({ integration: 1, group, index: null, field });
+  /** Information with every field unknown. */
+  const blank = (o) => (Array.isArray(o) ? [] : o && typeof o === "object" ? Object.fromEntries(Object.entries(o).map(([k, v]) => [k, blank(v)])) : null);
+  const enabled = row("backlight", "enabled");
   Object.assign(enabled, { value: null, saved: null, state: null });
-  entry.settings.push({ ...enabled, key: "wheel.threshold", type: "integer", min: 1, max: 255, step: 1, value: 30 });
+  entry.settings.push({ ...enabled, group: "wheel", field: "free_spin_threshold", type: "integer", min: 1, max: 255, step: 1, value: 30 });
   await app.evaluate(({ ipcMain }, state) => {
     globalThis.uiState = state;
     globalThis.uiActions = [];
@@ -93,19 +97,19 @@ try {
   assert.equal(await save.getAttribute("aria-disabled"), "true");
   assert.equal(await discard.getAttribute("aria-disabled"), "true");
   await page.getByRole("button", { name: "Backlight, Not Saved, Options", exact: true }).waitFor();
-  await page.getByRole("button", { name: "Timeout With Hands Away, Changed on Device, Options", exact: true }).waitFor();
+  await page.getByRole("button", { name: "Hands Away Timeout, Changed on Device, Options", exact: true }).waitFor();
   await page.getByText("Device: 60", { exact: true }).waitFor();
   // A value the device only reports sits with the settings it belongs to.
-  await page.getByRole("group", { name: "Current Backlight Level", exact: true }).getByText("3", { exact: true }).waitFor();
+  await page.getByRole("group", { name: "Current Brightness", exact: true }).getByText("3", { exact: true }).waitFor();
 
   // Values equal to what the device keeps are no change: a typed 030 against
   // a saved 30, and choosing the reading of an unsaved setting again.
-  const hands = page.getByRole("spinbutton", { name: "Timeout With Hands Away" });
+  const hands = page.getByRole("spinbutton", { name: "Hands Away Timeout" });
   await hands.fill("030");
   assert.equal(await save.getAttribute("aria-disabled"), "true");
   assert.equal(await discard.getAttribute("aria-disabled"), "true");
   // It leaves no draft behind to show once the saved value changes.
-  const handsSaved = row("backlight.delay.hands_out");
+  const handsSaved = row("backlight", "hands_away");
   handsSaved.saved = 45;
   await publish();
   assert.equal(await hands.inputValue(), "45");
@@ -114,10 +118,10 @@ try {
   await publish();
   await hands.press("Escape");
 
-  // SmartShift's threshold stays in place while its text is empty or invalid;
+  // The automatic free spin threshold stays in place while its text is empty or invalid;
   // Off is its own value, and On again starts from the reading.
-  const smart = page.locator('input.switch[aria-label="SmartShift"]');
-  const threshold = page.getByRole("spinbutton", { name: "SmartShift Threshold", exact: true });
+  const smart = page.locator('input.switch[aria-label="Automatic Free Spin"]');
+  const threshold = page.getByRole("spinbutton", { name: "Automatic Free Spin Threshold", exact: true });
   assert.equal(await smart.getAttribute("role"), "switch");
   assert.equal(await smart.isChecked(), true);
   await threshold.fill("");
@@ -185,71 +189,27 @@ try {
   await bar.getByRole("button", { name: "Discard", exact: true }).click();
   await tab("Settings").click();
   assert.equal(await outputMode("HID").getAttribute("aria-checked"), "true");
-  // A change to a pool's size asks before anything is saved. Cancel and Escape send nothing and
-  // keep every staged change.
+  // Gamepad Output saves after the device's settings, and only once they saved, without asking
+  // first, even when the adapter then reconnects USB.
   const padSettings = pad.settings;
-  pad.settings = [structuredClone(row("backlight.delay.hands_out"))];
+  pad.settings = [structuredClone(row("backlight", "hands_away"))];
   await publish();
-  const padHands = page.getByRole("spinbutton", { name: "Timeout With Hands Away" });
+  const padHands = page.getByRole("spinbutton", { name: "Hands Away Timeout" });
   await padHands.fill("40");
   await fail("settings.save");
   const outputStart = (await actions()).length;
-  const confirm = page.getByRole("dialog", { name: "USB Reconnect Required" });
-  const confirmSave = confirm.getByRole("button", { name: "Save", exact: true });
   await save.click();
-  await confirm.getByText("The adapter will disconnect from this computer for a moment after it saves these changes.", { exact: true }).waitFor();
-  await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
-  await confirm.waitFor({ state: "hidden" });
-  await page.keyboard.press("Control+s");
-  await confirm.waitFor();
-  await page.keyboard.press("Escape");
-  await confirm.waitFor({ state: "hidden" });
-  assert.equal((await actions()).length, outputStart);
-  assert.equal(await outputMarker.count(), 1);
-  assert.equal(await padHands.inputValue(), "40");
-  // It saves after the device's settings, and only once they saved.
-  await page.keyboard.press("Control+s");
-  await confirmSave.click();
   await page.getByText("Couldn't save this value.", { exact: true }).waitFor();
   assert.deepEqual((await actions()).slice(outputStart).map((a) => a.type), ["settings.save"]);
   assert.equal(await outputMarker.count(), 1);
+  assert.equal(await padHands.inputValue(), "40");
   await fail(null);
-  await save.click();
-  await confirmSave.click();
+  await page.keyboard.press("Control+s");
   await outputMarker.waitFor({ state: "detached" });
-  assert.equal(await confirm.isVisible(), false);
+  assert.equal(await page.getByRole("dialog").count(), 0);
   assert.deepEqual((await actions()).slice(outputStart + 1).map((a) => a.type), ["settings.save", "device.update"]);
   assert.deepEqual((await actions()).at(-1), { type: "device.update", key: pad.key, gamepadOutput: "hid" });
   pad.settings = padSettings;
-  await publish();
-  // Pools already full before and after the change keep their sizes, so it saves without asking.
-  const unspared = state.devices;
-  const spares = [1, 2, 3, 4, 5, 6, 7, 8].map((n) => ({
-    ...structuredClone(pad),
-    key: `${pad.adapterId}/${100 + n}`,
-    name: `Spare Pad ${n}`,
-    device: { ...structuredClone(pad.device), id: 100 + n, outputPreferences: [{ role: "gamepad", mode: n > 4 ? "xinput" : "hid" }] },
-  }));
-  state.devices = [...unspared, ...spares];
-  await publish();
-  await outputMode("HID").click();
-  const quiet = (await actions()).length;
-  await save.click();
-  await outputMarker.waitFor({ state: "detached" });
-  assert.equal(await confirm.isVisible(), false);
-  assert.deepEqual((await actions()).slice(quiet), [{ type: "device.update", key: pad.key, gamepadOutput: "hid" }]);
-  // With three others choosing XInput, leaving it shrinks XInput.
-  state.devices = [...unspared, ...spares.slice(0, -1)];
-  await publish();
-  await outputMode("HID").click();
-  await save.click();
-  await confirm.waitFor();
-  await confirm.getByRole("button", { name: "Cancel", exact: true }).click();
-  await confirm.waitFor({ state: "hidden" });
-  assert.equal((await actions()).length, quiet + 1);
-  await discard.click();
-  await outputMarker.waitFor({ state: "detached" });
-  state.devices = unspared;
   await publish();
   // Without the adapter's support only Disabled is offered, besides the saved choice.
   const padStatus = state.adapters.find((a) => a.id === pad.adapterId).status;
@@ -258,12 +218,10 @@ try {
   await publish();
   await output.getByRole("radio").nth(1).filter({ hasText: "XInput" }).waitFor();
   assert.deepEqual(await output.getByRole("radio").allTextContents(), ["Disabled", "XInput"]);
-  // Clearing that choice changes no pool the adapter offers, so it saves without asking.
   await outputMode("Disabled").click();
   const stale = (await actions()).length;
   await save.click();
   await outputMarker.waitFor({ state: "detached" });
-  assert.equal(await confirm.isVisible(), false);
   assert.deepEqual((await actions()).slice(stale), [{ type: "device.update", key: pad.key, gamepadOutput: "disabled" }]);
   padStatus.outputSupport = advertised;
   await publish();
@@ -289,12 +247,11 @@ try {
   await outputMode("HID").click();
   await app.evaluate(() => { globalThis.uiHold = "device.update"; });
   await save.click();
-  await confirmSave.click();
   await reconnect({ connection: "connecting", readiness: "waiting", listing: true }, others);
   await output.locator("xpath=ancestor::fieldset[1][@disabled]").waitFor();
   assert.equal(await tab("Settings").getAttribute("aria-selected"), "true");
   assert.equal(await save.getAttribute("aria-disabled"), "true");
-  const lost = "The adapter disconnected before the change finished.";
+  const lost = "The adapter couldn't confirm whether the change was saved.";
   await app.evaluate((_electron, message) => {
     globalThis.uiHold = null;
     globalThis.uiReply({ ok: false, message });
@@ -316,7 +273,6 @@ try {
   // A save the adapter confirmed before USB dropped shows the saved choice throughout.
   await outputMode("XInput").click();
   await save.click();
-  await confirmSave.click();
   await outputMarker.waitFor({ state: "detached" });
   padOutput.mode = "xinput";
   await publish();
@@ -343,7 +299,7 @@ try {
   await page.getByRole("button", { name: /Example Keys/ }).first().click();
   await tab("Settings").click();
 
-  // Escape undoes only the typed row; Enter submits every staged change in catalog order.
+  // Escape undoes only the typed row; Enter submits every staged change in display order.
   assert.equal(await hands.inputValue(), "30");
   await hands.fill("45");
   await hands.press("Escape");
@@ -361,20 +317,20 @@ try {
     type: "settings.save",
     key: entry.key,
     changes: [
-      { type: "set", setting: "backlight.enabled", value: false },
-      { type: "set", setting: "backlight.delay.hands_out", value: 45 },
+      { type: "set", setting: F("backlight", "enabled"), value: false },
+      { type: "set", setting: F("backlight", "hands_away"), value: 45 },
     ],
   });
   // A rejected submission keeps its drafts.
   assert.equal(await save.getAttribute("aria-disabled"), "false");
 
   // Marker menus stage policy changes: forgetting, and saving what the device shows.
-  await page.getByRole("button", { name: "Timeout With Hands Away, Changed, Options", exact: true }).click();
+  await page.getByRole("button", { name: "Hands Away Timeout, Changed, Options", exact: true }).click();
   await page.getByRole("menuitem", { name: "Undo Change", exact: true }).click();
   assert.equal(await hands.inputValue(), "30");
-  await page.getByRole("button", { name: "Timeout With Hands Away, Changed on Device, Options", exact: true }).click();
+  await page.getByRole("button", { name: "Hands Away Timeout, Changed on Device, Options", exact: true }).click();
   await page.getByRole("menuitem", { name: "Save Device Value", exact: true }).click();
-  await page.getByRole("button", { name: "Timeout With Hands Away, Changed, Options", exact: true }).waitFor();
+  await page.getByRole("button", { name: "Hands Away Timeout, Changed, Options", exact: true }).waitFor();
   await page.getByRole("button", { name: "Backlight, Changed, Options", exact: true }).click();
   await page.getByRole("menuitem", { name: "Undo Change", exact: true }).click();
 
@@ -383,15 +339,15 @@ try {
   await app.evaluate(() => { globalThis.uiFail = null; globalThis.uiHold = "settings.save"; });
   await save.focus();
   await page.keyboard.press("Control+s");
-  assert.deepEqual((await saves()).at(-1).changes, [{ type: "set", setting: "backlight.delay.hands_out", value: 60 }]);
-  const running = { running: true, items: [{ change: { type: "set", setting: "backlight.delay.hands_out", value: 60 }, status: "saving", error: null }] };
+  assert.deepEqual((await saves()).at(-1).changes, [{ type: "set", setting: F("backlight", "hands_away"), value: 60 }]);
+  const running = { running: true, items: [{ change: { type: "set", setting: F("backlight", "hands_away"), value: 60 }, status: "saving", error: null }] };
   entry.settingsSave = running;
   await publish();
   assert.equal(await page.evaluate(() => document.activeElement?.textContent?.trim()), "Save");
   assert.equal(await refresh.getAttribute("aria-disabled"), "true");
   assert.equal(await discard.getAttribute("aria-disabled"), "true");
   assert.equal(await backlight.isDisabled(), true);
-  await page.getByRole("img", { name: "Timeout With Hands Away, Sending", exact: true }).waitFor();
+  await page.getByRole("img", { name: "Hands Away Timeout, Sending", exact: true }).waitFor();
   assert.equal(await page.locator("form[aria-busy=true]").count(), 1);
   // Logitech Features waits for the settings work too.
   await tab("Details").click();
@@ -405,7 +361,7 @@ try {
   entry.settingsSave = outcome;
   await publish();
   await app.evaluate((_electron, outcome) => { globalThis.uiReply({ ok: true, settingsSave: outcome }); globalThis.uiHold = null; }, outcome);
-  await page.getByRole("button", { name: "Timeout With Hands Away, Failed, Options", exact: true }).waitFor();
+  await page.getByRole("button", { name: "Hands Away Timeout, Failed, Options", exact: true }).waitFor();
   await page.getByText("This device didn't respond in time", { exact: true }).waitFor();
   assert.equal(await save.getAttribute("aria-disabled"), "true");
   // Retry works beside other drafts and leaves them staged, but not while
@@ -419,21 +375,21 @@ try {
   await hands.fill("60");
   assert.equal(await retryButton.getAttribute("aria-disabled"), "false");
   await retryButton.click();
-  assert.deepEqual((await saves()).at(-1).changes, [{ type: "set", setting: "backlight.delay.hands_out", value: 60 }]);
+  assert.deepEqual((await saves()).at(-1).changes, [{ type: "set", setting: F("backlight", "hands_away"), value: 60 }]);
   await page.getByRole("button", { name: "Backlight, Changed, Options", exact: true }).click();
   await page.getByRole("menuitem", { name: "Undo Change", exact: true }).click();
   // Once the setting shows the saved value applied, the failure and Retry go away.
   Object.assign(handsSaved, { state: "applied", error: null, value: 60 });
   await publish();
-  await page.getByRole("button", { name: "Timeout With Hands Away, Saved, Options", exact: true }).waitFor();
+  await page.getByRole("button", { name: "Hands Away Timeout, Saved, Options", exact: true }).waitFor();
   assert.equal(await page.getByText("This device didn't respond in time", { exact: true }).count(), 0);
   assert.equal(await retryButton.count(), 0);
   // A refused save says why for each change it held.
   entry.settingsSave = {
     running: false,
     items: [
-      { change: { type: "set", setting: "backlight.level", value: 5 }, status: "not_saved", error: "The adapter is busy. Try again when the current operation finishes." },
-      { change: { type: "forget", setting: "backlight.mode" }, status: "not_saved", error: "The adapter is busy. Try again when the current operation finishes." },
+      { change: { type: "set", setting: F("backlight", "brightness"), value: 5 }, status: "not_saved", error: "The adapter is busy. Try again when the current operation finishes." },
+      { change: { type: "forget", setting: F("backlight", "mode") }, status: "not_saved", error: "The adapter is busy. Try again when the current operation finishes." },
     ],
   };
   await publish();
@@ -442,7 +398,7 @@ try {
   await page.getByText("Couldn't Save 2", { exact: true }).waitFor();
   // A save whose outcome is unknown says so, without reporting a failure.
   const unconfirmed = "The adapter couldn't confirm whether the change was saved. Check before trying again.";
-  entry.settingsSave = { running: false, items: [{ change: { type: "set", setting: "backlight.level", value: 5 }, status: "unknown", error: unconfirmed }] };
+  entry.settingsSave = { running: false, items: [{ change: { type: "set", setting: F("backlight", "brightness"), value: 5 }, status: "unknown", error: unconfirmed }] };
   await publish();
   // The bar shows the message; the setting's row notes it without the final period.
   await page.getByText(unconfirmed, { exact: true }).waitFor();
@@ -473,8 +429,8 @@ try {
   assert.equal(await save.getAttribute("aria-disabled"), "false");
   await save.click();
   assert.deepEqual((await saves()).at(-1).changes, [
-    { type: "forget", setting: "backlight.enabled" },
-    { type: "set", setting: "backlight.delay.hands_out", value: 45 },
+    { type: "forget", setting: F("backlight", "enabled") },
+    { type: "set", setting: F("backlight", "hands_away"), value: 45 },
   ]);
   await discard.click();
 
@@ -486,23 +442,23 @@ try {
   assert.ok((await actions()).some((a) => a.type === "device.disconnect" && a.key === entry.key));
   // A failed connection says why on Diagnostics, never as a banner.
   entry.device.state = "disconnected";
-  entry.device.error = "connection_failed";
+  entry.device.errors = ["connection_failed"];
   await publish();
   await tab("Diagnostics").click();
   await page.getByText("The adapter couldn't connect to this device.", { exact: true }).waitFor();
   assert.equal(await page.locator(".banner").count(), 0);
   await tab("Details").click();
   assert.equal(await page.getByText("The adapter couldn't connect to this device.", { exact: true }).count(), 0);
-  entry.device.error = null;
+  entry.device.errors = [];
 
   // There is no Settings tab until the device has settings, even while HID++ starts; a failed
   // read is shown on Diagnostics.
   entry.device.state = "connected";
   entry.device.hidpp = { ...entry.device.hidpp, state: "starting" };
   const settings = entry.settings;
-  const info = entry.device.info;
+  const info = entry.device.information;
   entry.settings = [];
-  entry.device.info = [];
+  entry.device.information = blank(info);
   await publish();
   await tab("Diagnostics").waitFor();
   assert.equal(await tab("Settings").count(), 0);
@@ -516,14 +472,14 @@ try {
   assert.equal((await actions()).at(-1).type, "device.reload");
   entry.settingsError = null;
   entry.settings = settings;
-  entry.device.info = info;
+  entry.device.information = info;
   entry.device.hidpp = { ...entry.device.hidpp, state: "active" };
   await publish();
   await tab("Settings").click();
   await page.getByRole("group", { name: "Backlight", exact: true }).waitFor();
 
-  // Details keeps the device's own facts; HID++, warnings, security and
-  // identifiers are on Diagnostics, which refreshes the connected device.
+  // Details keeps the device's own facts; HID++, security and identifiers are
+  // on Diagnostics, which refreshes the connected device.
   await tab("Details").click();
   const fact = (label) => page.locator(".fact").filter({ has: page.locator("dt", { hasText: new RegExp(`^${label}$`) }) }).locator("dd");
   await fact("Manufacturer").waitFor();
@@ -533,8 +489,6 @@ try {
   assert.equal(await fact("Status").textContent(), "Active");
   await fact("Device ID").waitFor();
   assert.equal(await page.getByText("Special-Key Translation", { exact: true }).count(), 0);
-  // A device without warnings has no warnings section.
-  assert.equal(await page.getByRole("heading", { name: "Device Warnings" }).count(), 0);
   entry.device.hidpp = { ...entry.device.hidpp, state: null, error: "protocol_unsupported" };
   await publish();
   await page.getByText("Failed: This device doesn't support this feature", { exact: true }).waitFor();
@@ -547,34 +501,6 @@ try {
   await bar.getByRole("button", { name: "Retry", exact: true }).click();
   await bar.getByRole("button", { name: "Refresh", exact: true }).waitFor();
 
-  // HID warnings are listed on Diagnostics, naming where they apply, never as a banner.
-  const fieldWarning = "The adapter can't derive a value from this numeric selector field.";
-  entry.warnings = [
-    { code: "numeric_selector_unsupported", service: 1, reportId: 3, reportType: "input", bitOffset: 16, usagePage: 0x0c, usage: 0x238 },
-    { code: "indicator_write_failed", service: 0, reportId: null, reportType: "output", bitOffset: null, usagePage: null, usage: null },
-  ];
-  await publish();
-  await page.getByText(fieldWarning).waitFor();
-  const labels = await page.locator(".fact dt").filter({ visible: true }).allTextContents();
-  assert.deepEqual(labels.slice(0, 2), ["Input Field", "Lock Indicators"]);
-  await page.getByText("Service 1, Input Report 3, Bit 16, Usage 000C:0238", { exact: true }).waitFor();
-  await page.getByText("Service 0, Output Report", { exact: true }).waitFor();
-  assert.equal(await page.locator(".banner").filter({ hasText: fieldWarning }).count(), 0);
-  await tab("Details").click();
-  await fact("Manufacturer").waitFor();
-  assert.equal(await page.getByText(fieldWarning).count(), 0);
-  await tab("Diagnostics").click();
-  // A failed read of the list reports in the card and offers Retry.
-  entry.warnings = null;
-  entry.warningsError = "The adapter is busy. Try again when the current operation finishes.";
-  await publish();
-  await page.getByText("The adapter couldn't read the device's warnings.", { exact: true }).waitFor();
-  await bar.getByRole("button", { name: "Retry", exact: true }).click();
-  assert.equal((await actions()).at(-1).type, "device.reload");
-  entry.warnings = [];
-  entry.warningsError = null;
-  await publish();
-  await bar.getByRole("button", { name: "Refresh", exact: true }).waitFor();
   await tab("Details").click();
 
   // Turning a device on isn't offered while its transport's places are full.
@@ -582,7 +508,7 @@ try {
   assert.equal(await use.isDisabled(), false);
   entry.device.enabled = false;
   entry.device.inactive = "disabled";
-  state.adapters.find((a) => a.id === entry.adapterId).status.transports.find((t) => t.transport === "ble").maxEnabled = 1;
+  state.adapters.find((a) => a.id === entry.adapterId).status.transports.find((t) => t.transport === "ble").resources.find((r) => r.type === "devices").limit = 1;
   await publish();
   await use.and(page.locator(":disabled")).waitFor();
   // Turning on a blocked device leaves it unused, so it needs no place; unblocking it then does.
@@ -595,7 +521,7 @@ try {
   entry.device.enabled = true;
   await publish();
   await block.and(page.locator(":disabled")).waitFor();
-  state.adapters.find((a) => a.id === entry.adapterId).status.transports.find((t) => t.transport === "ble").maxEnabled = 7;
+  state.adapters.find((a) => a.id === entry.adapterId).status.transports.find((t) => t.transport === "ble").resources.find((r) => r.type === "devices").limit = 7;
   await publish();
   await use.and(page.locator(":enabled")).waitFor();
   await block.and(page.locator(":enabled")).waitFor();
@@ -634,7 +560,7 @@ try {
   // the tab chosen earlier returns with it. A focused control keeps its focus.
   await tab("Settings").click();
   entry.settings = [];
-  entry.device.info = info.filter((f) => f.key.startsWith("device."));
+  entry.device.information = { ...blank(info), identity: info.identity };
   entry.device.hidpp = { ...entry.device.hidpp, state: "unsupported" };
   await publish();
   await tab("Settings").waitFor({ state: "detached" });
@@ -655,7 +581,7 @@ try {
   await tab("Settings").waitFor({ state: "detached" });
   assert.equal(await automatic.evaluate((e) => e === document.activeElement), true);
   entry.settings = settings;
-  entry.device.info = info;
+  entry.device.information = info;
   entry.device.hidpp = { ...entry.device.hidpp, state: "active" };
   await publish();
   await page.getByRole("tab", { name: "Details", selected: true }).waitFor();
@@ -690,12 +616,12 @@ try {
   await publish();
   await page.getByRole("img", { name: "Profiles, Changed", exact: true }).waitFor({ state: "detached" });
   // A connected device whose profiles aren't loaded says why on Diagnostics.
-  entry.device.profileError = "no_capacity";
+  entry.device.errors = ["profile_memory_exceeded"];
   await publish();
   await tab("Diagnostics").click();
   await page.getByText("The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.", { exact: true }).waitFor();
   await tab("Details").click();
-  entry.device.profileError = null;
+  entry.device.errors = [];
   await publish();
 
   state.scan = { adapterId: entry.adapterId, running: false, candidates: [], error: null };
@@ -722,11 +648,11 @@ try {
   await fail(null);
   // A full adapter can't add another device.
   const status = state.adapters.find((a) => a.id === entry.adapterId).status;
-  status.info.push({ key: "storage.full", type: "bool", value: true });
+  status.errors.push("storage_full");
   await publish();
   await pairing.getByText("Storage Full", { exact: true }).waitFor();
   assert.equal(await pairing.getByRole("button", { name: "Pair", exact: true }).count(), 0);
-  status.info.pop();
+  status.errors.pop();
   await publish();
   // Each prompt step asks for what it needs.
   state.pairing = { adapterId: entry.adapterId, candidateId: 7, name: "Nearby Keyboard", phase: "pairing", prompt: null, deviceKey: null, message: null };

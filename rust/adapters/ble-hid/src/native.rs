@@ -113,6 +113,8 @@ pub trait Host {
     fn incoming(&mut self, attempt: u32, token: Option<u32>) -> Result<(), Error>;
     fn connect(&mut self, token: u32, peer: Peer, pairing: bool) -> Result<(), Error>;
     fn adopt(&mut self, token: u32) -> Result<(), Error>;
+    /// Promote an adopted link before any subsequent admission commands.
+    fn promote(&mut self, token: u32);
     /// An error means the host could not accept the request now; the link
     /// is unchanged and the profile repeats the request later.
     fn disconnect(&mut self, token: u32) -> Result<(), Error>;

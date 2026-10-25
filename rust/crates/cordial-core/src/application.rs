@@ -21,12 +21,13 @@
 //! once. Work that outlives a command (scanning, pairing, matching a pairing's bond with a saved
 //! device, an unpair waiting for its link to close, settings jobs) lives here and reports its
 //! progress through events. Adapter, device, profile, scan and pairing events carry the complete
-//! current state of one thing; settings and warnings events carry what changed since the client
+//! current state of one thing; settings events carry what changed since the client
 //! last listed or was told. Changed things are marked dirty and written one frame at a
 //! time when the serial output is free.
 use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
 
 use cordial_protocol::{self as p, event::Kind as Ev, request::Command, response::Result as R};
+use prost::Message;
 
 use crate::{
     bluetooth::{Bluetooth, Event},
@@ -37,13 +38,13 @@ use crate::{
     link::LinkId,
     manager::Manager,
     model::{
-        errors::{DeviceWarning, ErrorCode as Error},
+        errors::ErrorCode as Error,
         identifiers::{ConnectionState, Transport},
         link::{DeviceKind, PromptMethod},
         settings::SettingKey,
     },
     profiles,
-    settings::{Catalog, Change},
+    settings::Catalog,
     storage::{Preferences, RecordStore},
     wire,
 };
@@ -223,7 +224,7 @@ enum Pending {
     Devices(Listing, p::DeviceList),
     Profiles(Listing, p::ProfileList),
     /// A page of a disconnected device's saved settings, once its policy has been read.
-    Settings(Policy, Option<p::SettingRef>),
+    Settings(Policy, Option<p::SettingsRef>),
     /// A page of a profile's rules, once its record has been read.
     Rules(u32, Option<profiles::RuleRef>),
     Files(FileListing),
@@ -281,13 +282,12 @@ struct Jobs {
     apply: bool,
 }
 
-/// The settings and warnings of one device that a client may hold.
+/// The settings of one device that a client may hold.
 #[derive(Default)]
 struct Reported {
     id: u64,
     /// Settings, as [`key_bit`]s.
     keys: u32,
-    warnings: Vec<DeviceWarning>,
 }
 
 /// A pending event that reads records, by its kind and its device or profile ID. Each backs off
@@ -301,14 +301,10 @@ enum EventRead {
 
 /// The bit standing for setting `key` in a set of settings.
 fn key_bit(key: SettingKey) -> u32 {
-    SettingKey::ALL
-        .iter()
-        .position(|k| *k == key)
-        .map_or(0, |i| 1 << i)
+    wire::settings_bit(&wire::settings_ref(key))
 }
-/// Every setting.
-const ALL_KEYS: u32 = u32::MAX;
-const _: () = assert!(SettingKey::ALL.len() <= 32);
+/// Every settings object.
+const ALL_KEYS: u32 = 127;
 
 /// The profile a configuration interface's editor uses, loaded while the editor sends packets.
 /// Edits change the loaded table at once; they are handed to storage as one change once the
@@ -329,12 +325,9 @@ pub(crate) struct Editor {
 
 const DEVICE: u8 = 1;
 const SETTINGS: u8 = 2;
-const WARNINGS: u8 = 4;
 
 /// Entries in one page of a list held in memory. Pages of records read from flash use the
 /// page sizes of their records.
-const SETTINGS_PAGE: usize = 8;
-const WARNINGS_PAGE: usize = 16;
 const RULES_PAGE: usize = 32;
 const FEATURES_PAGE: usize = 32;
 const FILES_PAGE: usize = 16;
@@ -369,12 +362,12 @@ pub struct Application {
     /// Devices whose unpair waits for their link to close.
     unpairing: Vec<u64>,
     jobs: Vec<(u64, Jobs)>,
-    /// Pending device, settings and warnings events, by device ID.
+    /// Pending device, settings events, by device ID.
     dirty: Vec<(u64, u8)>,
     /// Settings whose state may have changed since the last settings event, by device ID, as
     /// [`key_bit`]s.
     touched: Vec<(u64, u32)>,
-    /// What the client may hold of the settings and warnings of each device with a connection,
+    /// What the client may hold of the settings of each device with a connection,
     /// from listings and events since the session started. An entry stays until the events that
     /// follow the end of the connection have been written, so it is bounded by the connections
     /// and nothing is kept for other devices.
@@ -388,11 +381,13 @@ pub struct Application {
     profile_dirty: Vec<u64>,
     profile_removed: VecDeque<u64>,
     pub(crate) editor: Option<Editor>,
-    pub usb_reconnect: bool,
+    pub usb_exposed: Option<crate::usb::Topology>,
     /// The readiness last reported, so any change sends an adapter event.
     reported_ready: bool,
     /// The profile memory in use last reported.
     reported_memory: usize,
+    reported_usb: crate::usb::Allocation,
+    reported_counts: [[usize; 2]; 2],
     /// Loaded profiles were released since devices that did not fit last tried again.
     profiles_released: bool,
     /// The dirty entry whose events go first next time, so devices take turns.
@@ -525,15 +520,52 @@ fn rule(value: &p::ProfileRule) -> Option<profiles::Rule> {
     })
 }
 /// One page of the settings `catalog` holds, after `after`, and whether nothing follows it.
-fn settings_page(catalog: &Catalog, after: Option<&p::SettingRef>) -> (Vec<p::Setting>, bool) {
-    let mut settings = wire::settings(catalog);
-    if let Some(after) = after {
-        let after = (after.integration, after.key.as_bytes());
-        settings.retain(|s| wire::setting_order(s) > after);
+fn settings_page(
+    catalog: &Catalog,
+    after: Option<&p::SettingsRef>,
+    device: u32,
+) -> Result<(Vec<p::SettingsObject>, bool), p::Error> {
+    if after.is_some_and(|r| wire::settings_bit(r) == 0) {
+        return Err(bad_args());
     }
-    let end = settings.len() <= SETTINGS_PAGE;
-    settings.truncate(SETTINGS_PAGE);
-    (settings, end)
+    let mut objects = wire::settings(catalog)?;
+    if let Some(after) = after {
+        objects
+            .retain(|s| wire::settings_order(&wire::object_ref(s)) > wire::settings_order(after));
+    }
+    let count = objects.len();
+    let mut page = p::DeviceSettings {
+        device,
+        objects,
+        end: true,
+    };
+    loop {
+        let message = p::Message {
+            kind: Some(p::message::Kind::Response(p::Response {
+                result: Some(R::Settings(page)),
+            })),
+        };
+        let length = message.encoded_len();
+        let Some(p::message::Kind::Response(p::Response {
+            result: Some(R::Settings(owned)),
+        })) = message.kind
+        else {
+            unreachable!()
+        };
+        page = owned;
+        if length <= 1024 || page.objects.is_empty() {
+            break;
+        }
+        page.objects.pop();
+    }
+    page.end = page.objects.len() == count;
+    if page.objects.is_empty() && !page.end {
+        return Err(p::Error {
+            code: p::ErrorCode::TooLong as i32,
+            ..Default::default()
+        });
+    }
+    Ok((page.objects, page.end))
 }
 
 fn wire_interface(interface: Interface) -> p::ConfigurationInterface {
@@ -572,9 +604,11 @@ impl Application {
             profile_dirty: Vec::new(),
             profile_removed: VecDeque::new(),
             editor: None,
-            usb_reconnect: false,
+            usb_exposed: None,
             reported_ready: false,
             reported_memory: 0,
+            reported_usb: Default::default(),
+            reported_counts: [[0; 2]; 2],
             profiles_released: false,
             next_dirty: 0,
             next_profile: 0,
@@ -603,27 +637,28 @@ impl Application {
     pub fn status<B: Bluetooth>(&self, radio: &B) -> p::Status {
         let supported = radio.capabilities();
         let enabled = self.manager.capabilities(radio);
-        let mut info = Vec::new();
-        let mut fact = |key: &str, value: p::value::Value| {
-            info.push(p::Info {
-                key: key.into(),
-                value: Some(p::Value { value: Some(value) }),
-            });
-        };
-        fact(
-            p::keys::FIRMWARE_VERSION,
-            p::value::Value::Text(self.build.version.into()),
-        );
-        fact(
-            p::keys::BOARD_NAME,
-            p::value::Value::Text(self.build.board.into()),
-        );
-        if self.development() {
-            fact(p::keys::BUILD_DEVELOPMENT, p::value::Value::Bool(true));
-        }
+        let information = Some(p::AdapterInformation {
+            firmware_version: Some(self.build.version.into()),
+            board_name: Some(self.build.board.into()),
+            development_build: Some(self.development()),
+        });
+        let mut errors = Vec::new();
         if self.manager.storage_ready && (self.manager.storage_full() || self.manager.unsaved_full)
         {
-            fact(p::keys::STORAGE_FULL, p::value::Value::Bool(true));
+            errors.push(p::ErrorCode::StorageFull as i32);
+        }
+        if self.manager.profile_budget.is_some_and(|budget| {
+            budget != 0
+                && self.manager.profiles.used().saturating_mul(100) >= budget.saturating_mul(85)
+        }) {
+            errors.push(p::ErrorCode::ProfileMemoryLow as i32);
+        }
+        let allocation = self.manager.usb_allocation();
+        if allocation.required_exceeded {
+            errors.push(p::ErrorCode::UsbRequiredCapacityExceeded as i32);
+        }
+        if allocation.reserved_exceeded {
+            errors.push(p::ErrorCode::UsbReservedCapacityExceeded as i32);
         }
         let gamepad = self.gamepad_profiles_supported();
         let profile_support = self.manager.profile_budget.map(|budget| p::ProfileSupport {
@@ -649,10 +684,23 @@ impl Application {
                     p::usage_range::Kind::AxisOutput,
                 ))
                 .collect(),
-            memory_budget: budget as u32,
-            max_remap_outputs: profiles::MAX_REMAP_OUTPUTS as u32,
-            max_layers: profiles::MAX_LAYERS as u32,
-            memory_used: self.manager.profiles.used() as u32,
+            resources: alloc::vec![
+                wire::resource(
+                    p::ResourceType::Memory,
+                    Some(self.manager.profiles.used() as u32),
+                    Some(budget as u32)
+                ),
+                wire::resource(
+                    p::ResourceType::Outputs,
+                    None,
+                    Some(profiles::MAX_REMAP_OUTPUTS as u32)
+                ),
+                wire::resource(
+                    p::ResourceType::Layers,
+                    None,
+                    Some(profiles::MAX_LAYERS as u32)
+                ),
+            ],
         });
         let configuration_interfaces = if self.manager.profiles_supported() {
             Interface::ALL
@@ -665,6 +713,9 @@ impl Application {
                     p::ConfigurationInterfaceSupport {
                         interface: wire_interface(interface) as i32,
                         enabled: saved.enabled,
+                        active: self
+                            .usb_exposed
+                            .is_some_and(|t| t.interfaces & interface.bit() != 0),
                         profile: saved.profile.unwrap_or(0) as u32,
                         conflicts: interface
                             .conflicts()
@@ -682,19 +733,39 @@ impl Application {
             name: self.adapter_name().into(),
             platform: wire::platform(self.manager.preference.host_platform) as i32,
             ready: self.manager.radio_ready && self.manager.storage_ready,
+            errors,
+            resources: alloc::vec![wire::resource(
+                p::ResourceType::Interfaces,
+                self.usb_exposed.map(|t| u32::from(t.cost().interfaces)),
+                Some(u32::from(self.manager.usb_budget.interfaces))
+            )],
             transports: devices::Transports::ALL
                 .into_iter()
                 .filter(|t| supported.supports(*t))
                 .map(|t| p::TransportSupport {
                     transport: wire::transport(t) as i32,
-                    max_enabled: self
-                        .manager
-                        .storage_ready
-                        .then(|| self.manager.max_enabled(t) as u32),
+                    resources: alloc::vec![
+                        wire::resource(
+                            p::ResourceType::Devices,
+                            self.manager
+                                .storage_ready
+                                .then(|| self.manager.enabled_count(t) as u32),
+                            self.manager
+                                .storage_ready
+                                .then(|| self.manager.max_enabled(t) as u32)
+                        ),
+                        wire::resource(
+                            p::ResourceType::Connections,
+                            Some(self.manager.connection_count(t) as u32),
+                            self.manager
+                                .storage_ready
+                                .then(|| self.manager.max_enabled(t) as u32)
+                        ),
+                    ],
                     enabled: Some(enabled.supports(t)),
                 })
                 .collect(),
-            info,
+            information,
             profile_support,
             configuration_interfaces,
             output_support: self
@@ -708,17 +779,31 @@ impl Application {
                         .iter()
                         .map(|&mode| p::OutputModeSupport {
                             mode: mode as i32,
-                            max_slots: if mode == p::OutputMode::Disabled {
-                                0
-                            } else {
-                                crate::outputs::MAX_SLOTS.into()
-                            },
-                            slots: self.manager.output_slots(mode),
+                            resources: alloc::vec![wire::resource(
+                                p::ResourceType::Slots,
+                                if mode == p::OutputMode::Disabled {
+                                    Some(0)
+                                } else {
+                                    self.manager.output_slots(mode)
+                                },
+                                Some(match mode {
+                                    p::OutputMode::Disabled => 0,
+                                    p::OutputMode::Hid => self.manager.usb_budget.hid_slots.into(),
+                                    p::OutputMode::Xinput =>
+                                        self.manager.usb_budget.xinput_slots.into(),
+                                })
+                            )],
                         })
                         .collect(),
                 })
                 .collect(),
         }
+    }
+
+    /// Publishes actual exposure separately from saved editor preferences.
+    pub fn set_usb_topology(&mut self, topology: crate::usb::Topology) {
+        self.adapter_dirty |= self.usb_exposed != Some(topology);
+        self.usb_exposed = Some(topology);
     }
 
     /// Supplies actual USB capacity and readiness, then marks changed status records.
@@ -785,7 +870,7 @@ impl Application {
         Some(&mut self.reported[index])
     }
 
-    /// The devices whose settings and warnings are tracked for change events.
+    /// The devices whose settings are tracked for change events.
     pub fn tracked_devices(&self) -> usize {
         self.reported.len()
     }
@@ -996,7 +1081,7 @@ impl Application {
             Some(Pending::Settings(policy, after)) => {
                 match self.saved_catalog(&policy, store).await {
                     Ok(catalog) => {
-                        let page = settings_page(&catalog, after.as_ref());
+                        let page = settings_page(&catalog, after.as_ref(), policy.id as u32);
                         self.reply_settings(policy.id, page);
                     }
                     Err(e) => self.fail(e),
@@ -1137,28 +1222,6 @@ impl Application {
             }
             Command::UnpairDevice(args) => self.unpair(args.device, store, radio).await,
             Command::RefreshDevice(args) => self.refresh(args.device, store, radio, now).await,
-            Command::ListWarnings(args) => match self.policy_of(args.device, store, radio).await {
-                Ok((policy, slot)) => {
-                    let mut warnings = self.warnings_of(slot);
-                    if let Some(after) = &args.after {
-                        let after = wire::warning_order(after);
-                        warnings.retain(|w| wire::warning_order(&wire::warning(w)) > after);
-                    }
-                    let end = warnings.len() <= WARNINGS_PAGE;
-                    warnings.truncate(WARNINGS_PAGE);
-                    if let Some(reported) = self.reported(policy.id) {
-                        for w in &warnings {
-                            if !reported.warnings.contains(w) {
-                                reported.warnings.push(*w);
-                            }
-                        }
-                    }
-                    let mut list = wire::warnings(policy.id, &warnings);
-                    list.end = end;
-                    self.reply(Some(R::Warnings(list)));
-                }
-                Err(e) => self.fail(e),
-            },
             Command::ListSettings(args) => {
                 let (policy, slot) = match self.policy_of(args.device, store, radio).await {
                     Ok(found) => found,
@@ -1167,7 +1230,7 @@ impl Application {
                 match self.live_catalog(slot) {
                     Some(catalog) => {
                         // The catalog is borrowed from the device; the page is built from it.
-                        let page = settings_page(catalog, args.after.as_ref());
+                        let page = settings_page(catalog, args.after.as_ref(), policy.id as u32);
                         self.reply_settings(policy.id, page);
                     }
                     None => self.pending = Some(Pending::Settings(policy, args.after)),
@@ -1280,13 +1343,13 @@ impl Application {
         id: u32,
         store: &mut S,
         radio: &mut B,
-    ) -> Result<Vec<p::Setting>, p::Error> {
+    ) -> Result<Vec<p::SettingsObject>, p::Error> {
         let (policy, slot) = self.policy_of(id, store, radio).await?;
         if let Some(catalog) = self.live_catalog(slot) {
-            return Ok(wire::settings(catalog));
+            return wire::settings(catalog);
         }
         let catalog = self.saved_catalog(&policy, store).await?;
-        Ok(wire::settings(&catalog))
+        wire::settings(&catalog)
     }
 
     /// The settings catalog of the connection of the device in `slot`, once it has read the
@@ -1298,27 +1361,21 @@ impl Application {
             .map(|l| &l.catalog)
     }
 
-    /// The current warnings of the device in `slot`, in listing order.
-    fn warnings_of(&self, slot: Option<usize>) -> Vec<DeviceWarning> {
-        let warnings = slot
-            .and_then(|s| self.manager.devices[s].as_ref())
-            .and_then(|d| d.live.as_ref())
-            .map_or(&[][..], |l| l.warnings.as_slice());
-        wire::sorted_warnings(warnings)
-    }
-
     /// Responds with a page of device `id`'s settings, which the client then holds.
-    fn reply_settings(&mut self, id: u64, (settings, end): (Vec<p::Setting>, bool)) {
-        let keys = settings
-            .iter()
-            .filter_map(|s| wire::parse_setting_key(&s.key))
-            .fold(0, |keys, key| keys | key_bit(key));
+    fn reply_settings(&mut self, id: u64, page: Result<(Vec<p::SettingsObject>, bool), p::Error>) {
+        let (objects, end) = match page {
+            Ok(page) => page,
+            Err(error) => return self.fail(error),
+        };
+        let keys = objects.iter().fold(0, |keys, object| {
+            keys | wire::settings_bit(&wire::object_ref(object))
+        });
         if let Some(reported) = self.reported(id) {
             reported.keys |= keys;
         }
         self.reply(Some(R::Settings(p::DeviceSettings {
             device: id as u32,
-            settings,
+            objects,
             end,
         })));
     }
@@ -1646,6 +1703,9 @@ impl Application {
         if let Err(error) = profiles::save_rules(store, id, &rules).await {
             return Err(self.storage_error(error));
         }
+        self.manager
+            .outputs
+            .profile_changed(id, rules.output_roles());
         let roles = devices::Roles(rules.roles());
         // The saved rules are the edit; the roles summary follows them.
         if let Some(map) = loaded {
@@ -1696,6 +1756,9 @@ impl Application {
         if rules.roles() != map.borrow().roles() {
             self.mark_profile(id);
         }
+        self.manager
+            .outputs
+            .profile_changed(id, rules.output_roles());
         *map.borrow_mut() = rules;
         self.retry_users(id);
         if let Some(editor) = self.editor.as_mut().filter(|e| e.profile == id) {
@@ -1878,7 +1941,6 @@ impl Application {
                 Err(_) => return Err(Error::StorageFailed),
             }
             let mut preference = self.manager.preference.clone();
-            let enabled = interfaces::enabled(&preference.configuration_interfaces);
             for entry in &mut preference.configuration_interfaces {
                 if entry.profile == Some(id) {
                     entry.profile = None;
@@ -1890,9 +1952,7 @@ impl Application {
                 .retain(|p| p.enabled || p.profile.is_some());
             if preference != self.manager.preference {
                 self.manager.adapter(preference, store).await?;
-                self.usb_reconnect |=
-                    interfaces::enabled(&self.manager.preference.configuration_interfaces)
-                        != enabled;
+
                 self.adapter_dirty = true;
             }
             return Ok(Some(Records::new(2)));
@@ -2040,7 +2100,6 @@ impl Application {
                 return self.fail(wire::error(code, None, uncertain));
             }
             self.adapter_dirty = true;
-            self.usb_reconnect |= reconnect;
             if reconnect {
                 self.drop_editor();
             }
@@ -2745,30 +2804,10 @@ impl Application {
             Ok(found) => found,
             Err(e) => return self.fail(e),
         };
-        if args.changes.is_empty() {
-            return self.fail(bad_args());
-        }
-        let mut parsed: Vec<Change> = Vec::new();
-        for change in &args.changes {
-            if change.integration != p::IntegrationKind::Hidpp as i32 {
-                return self.fail(failure(Error::NotFound));
-            }
-            let Some(key) = wire::parse_setting_key(&change.key) else {
-                return self.fail(failure(Error::NotFound));
-            };
-            use p::setting_change::Change as C;
-            let value = match &change.change {
-                Some(C::Value(value)) => match wire::setting_value(key.kind(), value) {
-                    Some(value) => Some(value),
-                    None => return self.fail(bad_args()),
-                },
-                Some(C::Forget(_)) => None,
-                None => return self.fail(bad_args()),
-            };
-            // Changes apply in order; a later change to the same setting replaces an earlier one.
-            parsed.retain(|c| c.key != key);
-            parsed.push(Change { key, value });
-        }
+        let parsed = match wire::settings_changes(&args.changes) {
+            Ok(parsed) => parsed,
+            Err(error) => return self.fail(error),
+        };
         // Free space is checked with every deferred save on flash.
         if let Err(e) = self.save_for_admission(store, now).await {
             return self.fail(e);
@@ -3173,7 +3212,7 @@ impl Application {
                 Ok(Some(slot)) => {
                     // The device's profiles load before its first input; nothing else does.
                     self.manager.load_profiles(slot, store).await;
-                    self.mark_slot(slot, DEVICE | SETTINGS | WARNINGS);
+                    self.mark_slot(slot, DEVICE | SETTINGS);
                     if let Some(layout) = layout {
                         let c = self.manager.connection_mut(link).unwrap();
                         c.maps = Some(crate::layouts::maps(&layout));
@@ -3217,7 +3256,7 @@ impl Application {
                         let c = self.manager.connection_mut(link).unwrap();
                         c.maps = Some(maps);
                         c.layout = Some(layout);
-                        self.mark_slot(slot, DEVICE | SETTINGS | WARNINGS);
+                        self.mark_slot(slot, DEVICE | SETTINGS);
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -3564,6 +3603,9 @@ impl Application {
                 // not be listed with the rules is listed now; without memory for it, listings
                 // report the saved summary until the next save of the rules.
                 if saved.is_ok() {
+                    self.manager
+                        .outputs
+                        .profile_changed(*id, map.borrow().output_roles());
                     if self.unsaved.lists(&Record::Roles(*id, roles)) {
                         self.unsaved.follow_rules(*id, roles);
                     } else if !self.unsaved.mark(Record::Roles(*id, roles), now) {
@@ -3600,6 +3642,9 @@ impl Application {
                     Err(E::Missing | E::Corrupt) => Err(E::Missing),
                     Err(error) => Err(error),
                 };
+                if saved.is_ok() {
+                    self.manager.outputs.roles_changed(*id, roles.0);
+                }
                 if saved == Err(E::Missing) {
                     if !self.manager.lost_devices.contains(id) {
                         self.manager.lost_devices.push(*id);
@@ -3815,7 +3860,7 @@ impl Application {
                 if slot.is_none() {
                     self.close(link, None, radio);
                 }
-                self.mark(id, DEVICE | SETTINGS | WARNINGS);
+                self.mark(id, DEVICE | SETTINGS);
                 self.adapter_dirty = true;
                 self.pairing_ended(
                     &pair,
@@ -4322,8 +4367,20 @@ impl Application {
         }
     }
 
-    /// Marks devices whose settings, information or warnings changed since the last check.
+    /// Marks devices whose settings or information changed since the last check.
     fn collect_changes(&mut self) {
+        let allocation = self.manager.usb_allocation();
+        let counts = devices::Transports::ALL.map(|t| {
+            [
+                self.manager.enabled_count(t),
+                self.manager.connection_count(t),
+            ]
+        });
+        if self.reported_usb != allocation || self.reported_counts != counts {
+            self.reported_usb = allocation;
+            self.reported_counts = counts;
+            self.adapter_dirty = true;
+        }
         self.manager.reconcile_outputs();
         for slot in 0..self.manager.devices.len() {
             let Some(d) = self.manager.devices[slot].as_mut() else {
@@ -4349,9 +4406,6 @@ impl Application {
             }
             if !live.catalog.info.changes().is_empty() {
                 bits |= DEVICE;
-            }
-            if core::mem::take(&mut live.warnings_changed) {
-                bits |= WARNINGS;
             }
             if keys != 0 {
                 self.touch(id, keys);
@@ -4517,77 +4571,73 @@ impl Application {
         store: &mut S,
         radio: &mut B,
     ) -> Result<Option<Ev>, p::Error> {
-        let settings = self.device_settings(id as u32, store, radio).await?;
+        let mut settings = self.device_settings(id as u32, store, radio).await?;
         let touched = match self.touched.iter().position(|(d, _)| *d == id) {
             Some(index) => self.touched.swap_remove(index).1,
             None => ALL_KEYS,
         };
         let present = settings
             .iter()
-            .filter_map(|s| wire::parse_setting_key(&s.key))
-            .fold(0, |keys, key| keys | key_bit(key));
-        let changed: Vec<p::Setting> = settings
-            .into_iter()
-            .filter(|s| wire::parse_setting_key(&s.key).is_some_and(|k| key_bit(k) & touched != 0))
-            .collect();
-        let sent = changed
+            .fold(0, |bits, s| bits | wire::settings_bit(&wire::object_ref(s)));
+        let held = self
+            .reported
             .iter()
-            .filter_map(|s| wire::parse_setting_key(&s.key))
-            .fold(0, |keys, key| keys | key_bit(key));
-        let (gone, held) = match self.reported.iter().find(|r| r.id == id) {
-            Some(reported) => (reported.keys & !present, reported.keys),
-            None => (touched & !present, ALL_KEYS),
+            .find(|r| r.id == id)
+            .map_or(ALL_KEYS, |r| r.keys);
+        let gone = held & touched & !present;
+        settings.retain(|object| touched & wire::settings_bit(&wire::object_ref(object)) != 0);
+        let mut event = p::SettingsChanged {
+            device: id as u32,
+            changed: settings,
+            removed: Vec::new(),
         };
-        if let Some(reported) = self.reported(id) {
-            reported.keys = (held & present) | sent;
+        let fits = |event: &mut p::SettingsChanged| {
+            let message = p::Message {
+                kind: Some(p::message::Kind::Event(p::Event {
+                    kind: Some(Ev::SettingsChanged(core::mem::take(event))),
+                })),
+            };
+            let fits = message.encoded_len() <= 1024;
+            let Some(p::message::Kind::Event(p::Event {
+                kind: Some(Ev::SettingsChanged(owned)),
+            })) = message.kind
+            else {
+                unreachable!()
+            };
+            *event = owned;
+            fits
+        };
+        while !event.changed.is_empty() && !fits(&mut event) {
+            event.changed.pop();
         }
-        let removed: Vec<p::SettingRef> = SettingKey::ALL
-            .into_iter()
-            .filter(|k| key_bit(*k) & gone != 0)
-            .map(|k| p::SettingRef {
-                integration: p::IntegrationKind::Hidpp as i32,
-                key: wire::setting_key(k),
-            })
-            .collect();
-        Ok(
-            (!changed.is_empty() || !removed.is_empty()).then_some(Ev::SettingsChanged(
-                p::SettingsChanged {
-                    device: id as u32,
-                    changed,
-                    removed,
-                },
-            )),
-        )
+        let sent = event.changed.iter().fold(0, |bits, object| {
+            bits | wire::settings_bit(&wire::object_ref(object))
+        });
+        let mut removed = 0;
+        for key in SettingKey::ALL {
+            let bit = key_bit(key);
+            if gone & bit == 0 || removed & bit != 0 {
+                continue;
+            }
+            event.removed.push(wire::settings_ref(key));
+            if !fits(&mut event) {
+                event.removed.pop();
+                break;
+            }
+            removed |= bit;
+        }
+        if let Some(reported) = self.reported(id) {
+            reported.keys = (held & !removed) | sent;
+        }
+        let pending = (touched & present & !sent) | (gone & !removed);
+        if pending != 0 {
+            self.touch(id, pending);
+        }
+        Ok((!event.changed.is_empty() || !event.removed.is_empty())
+            .then_some(Ev::SettingsChanged(event)))
     }
 
-    /// The changes to device `id`'s warnings since the client last saw them. Warnings exist only
-    /// while a device is connected, and a device stays tracked until the events that follow its
-    /// disconnection have been written, so the client holds none of an untracked device's.
-    fn warnings_event(&mut self, id: u64) -> Option<Ev> {
-        let current = self.warnings_of(self.manager.find(id));
-        let held = match self.reported(id) {
-            Some(reported) => core::mem::replace(&mut reported.warnings, current.clone()),
-            None => Vec::new(),
-        };
-        let added: Vec<DeviceWarning> = current
-            .iter()
-            .filter(|w| !held.contains(w))
-            .copied()
-            .collect();
-        let removed: Vec<DeviceWarning> = wire::sorted_warnings(&held)
-            .into_iter()
-            .filter(|w| !current.contains(w))
-            .collect();
-        (!added.is_empty() || !removed.is_empty()).then_some(Ev::WarningsChanged(
-            p::WarningsChanged {
-                device: id as u32,
-                added: added.iter().map(wire::warning).collect(),
-                removed: removed.iter().map(wire::warning).collect(),
-            },
-        ))
-    }
-
-    /// The next device, settings or warnings event, starting from the entry after the last one
+    /// The next device or settings event, starting from the entry after the last one
     /// sent. Device and settings events read the device's saved policy until its connection has
     /// read it, so for a connection that is starting they wait until it has forwarded input or
     /// waited for it; other devices' events go ahead meanwhile. A read that fails keeps its event
@@ -4615,13 +4665,12 @@ impl Application {
                     .map(|(policy, slot)| Ev::Device(wire::device(&self.manager, &policy, slot)))
             } else if bits & SETTINGS != 0 && ready && (loaded || self.event_due(settings, now)) {
                 let result = self.settings_event(id, store, radio).await;
-                if self.event_settled(settings, result.as_ref().err(), now) {
+                if self.event_settled(settings, result.as_ref().err(), now)
+                    && !self.touched.iter().any(|(device, _)| *device == id)
+                {
                     self.dirty[index].1 &= !SETTINGS;
                 }
                 result.ok().flatten()
-            } else if bits & WARNINGS != 0 {
-                self.dirty[index].1 &= !WARNINGS;
-                self.warnings_event(id)
             } else if bits == 0 {
                 self.dirty.remove(index);
                 continue;
@@ -4741,8 +4790,7 @@ impl Application {
         }
         if self.pair.is_none() && self.manager.storage_ready && self.manager.radio_ready {
             for slot in 0..self.manager.devices.len() {
-                if self.manager.connections.iter().flatten().count()
-                    >= devices::ACTIVE_CONNECTIONS - 1
+                if !self.manager.connection_room(Transport::Classic)
                     || self
                         .manager
                         .connections
@@ -4811,7 +4859,7 @@ impl Application {
     fn dropped(&mut self, link: LinkId, error: Option<Error>, now: u64) {
         if let Some(slot) = self.manager.disconnected(link, error, now) {
             if let Some(slot) = slot {
-                self.mark_slot(slot, DEVICE | SETTINGS | WARNINGS);
+                self.mark_slot(slot, DEVICE | SETTINGS);
             }
             if let Some(pair) = &mut self.pair
                 && pair.link == Some(link)

@@ -1,6 +1,6 @@
 // The Cordial serial API. A client sends one Request per frame and receives one Response for each,
-// in order; the Dongle also sends an Event whenever a device, its settings, its warnings, a
-// profile, the adapter, a scan or a pairing changes. Each frame is one protobuf message,
+// in order; the Dongle also sends an Event whenever a device, its settings, a profile, the adapter,
+// a scan or a pairing changes. Each frame is one protobuf message,
 // COBS-encoded and followed by a zero byte. docs/protocol describes framing, sessions and the
 // compatibility rules.
 syntax = "proto3";
@@ -32,23 +32,22 @@ message Request {
     DisconnectDevice disconnect_device = 14;
     UnpairDevice unpair_device = 15;
     RefreshDevice refresh_device = 16;
-    ListWarnings list_warnings = 17;
 
-    ListSettings list_settings = 18;
-    SetSettings set_settings = 19;
+    ListSettings list_settings = 17;
+    SetSettings set_settings = 18;
 
-    ListProfiles list_profiles = 20;
-    GetProfile get_profile = 21;
-    CreateProfile create_profile = 22;
-    CopyProfile copy_profile = 23;
-    DeleteProfile delete_profile = 24;
-    ListProfileRules list_profile_rules = 25;
-    SetProfileRules set_profile_rules = 26;
+    ListProfiles list_profiles = 19;
+    GetProfile get_profile = 20;
+    CreateProfile create_profile = 21;
+    CopyProfile copy_profile = 22;
+    DeleteProfile delete_profile = 23;
+    ListProfileRules list_profile_rules = 24;
+    SetProfileRules set_profile_rules = 25;
 
     // Development firmware only.
-    ListFeatures list_features = 27;
-    ListFiles list_files = 28;
-    ReadFile read_file = 29;
+    ListFeatures list_features = 26;
+    ListFiles list_files = 27;
+    ReadFile read_file = 28;
   }
 }
 
@@ -60,7 +59,14 @@ message Message {
   }
 }
 
-// The answer to one Request. No result set means success with no result.
+// The answer to one Request. No result set means success with no result. A successful save is
+// durable before its response is sent. If applying the saved preferences changes the USB layout,
+// the Dongle finishes transmitting the response before ending the serial session and reconnecting
+// USB, subject to a short response-drain deadline chosen by the backend. Continued host traffic
+// does not extend that deadline. At detach, the old serial session ends; after reconnecting, clients
+// read Status rather than waiting for an event from that session. The Dongle calculates the
+// allocation before disconnecting and exposes what fits without rolling back saved preferences.
+// USB capacity shortages appear in Status.errors and do not reject saves.
 message Response {
   oneof result {
     Error error = 1;
@@ -71,11 +77,10 @@ message Response {
     FeatureList features = 6;
     FileList files = 7;
     FileData file = 8;
-    DeviceWarnings warnings = 9;
-    Profile profile = 10;
-    ProfileList profiles = 11;
-    ProfileRules profile_rules = 12;
-    ProfileCreated profile_created = 13;
+    Profile profile = 9;
+    ProfileList profiles = 10;
+    ProfileRules profile_rules = 11;
+    ProfileCreated profile_created = 12;
   }
 }
 
@@ -83,7 +88,7 @@ message Response {
 // again from the start when it needs a fresh view, such as in a new session.
 message Event {
   oneof kind {
-    // An adapter preference, readiness or an adapter info value changed.
+    // An adapter preference, readiness, information, error list or resource count changed.
     Status adapter = 1;
     // Anything in a device record changed, including a newly paired device.
     Device device = 2;
@@ -101,8 +106,6 @@ message Event {
     ProfileRemoved profile_removed = 8;
     // Some of a device's settings changed, appeared or went away.
     SettingsChanged settings_changed = 9;
-    // A device's warnings changed.
-    WarningsChanged warnings_changed = 10;
   }
 }
 
@@ -126,12 +129,12 @@ message SetAdapter {
   repeated ConfigurationInterfaceUpdate configuration_interfaces = 4;
 }
 
-// Partial update of one configuration interface's preferences. Enabling or disabling an interface,
-// or changing the profile of an enabled one, reconnects USB after the response has been written.
+// Partial update of one configuration interface's preferences. USB reconnects only when the
+// resulting interface allocation changes, after the response has finished transmitting.
 message ConfigurationInterfaceUpdate {
   // Required.
   ConfigurationInterface interface = 1;
-  // Whether the Dongle exposes this interface over USB. An enabled interface needs a profile in
+  // Whether the interface is requested in the USB allocation. An enabled interface needs a profile in
   // the resulting configuration, or the request returns ERROR_CODE_BAD_ARGS. A resulting
   // configuration that enables it together with an interface listed in its conflicts returns
   // ERROR_CODE_UNSUPPORTED.
@@ -163,20 +166,61 @@ message Status {
   // Bluetooth and storage have started. Until then, commands that need either return
   // ERROR_CODE_NOT_READY.
   bool ready = 4;
+  // Complete set of current adapter problems, without duplicates, in numeric order. Empty clears
+  // all adapter errors. Each applicable code is reported and shown independently, including when
+  // both USB capacity codes apply. Changes arrive in Event.adapter.
+  repeated ErrorCode errors = 5;
+  // Current resource usage, at most one entry per type. Missing types are not reported; clients
+  // ignore unknown types. Changes arrive in Event.adapter.
+  // INTERFACES counts USB interfaces actually exposed; limit is the compiled interface maximum.
+  // Every interface of a multi-interface function counts. Other USB resource limits can cause
+  // allocation errors even when this count is below its limit.
+  // USB allocation prefers lower priorities: serial 0x00; keyboard/mouse required by a connected
+  // device 0x41; HID gamepad selected by a connected device 0x42; XInput selected by a connected
+  // device 0x43; enabled editor used by a connected device's selected profile 0x44; disconnected
+  // configured keyboard/mouse and the first configured HID/XInput slots 0x81..0x83; additional configured disconnected HID and
+  // XInput slots 0xC2/0xC3; an enabled editor without a connected user of its profile 0xC4;
+  // unconfigured HID/XInput slots up to the compiled maxima 0xE2/0xE3. Each slot uses the lowest
+  // applicable value. Configured users are saved devices whose roles, output preferences or
+  // profile outputs use the interface, regardless of connection state. Keyboard/mouse is absent
+  // without configured users. An editor uses 0x44 only when enabled and a connected device uses
+  // the editor's selected profile. An editor with enabled = false has priority 0xFF and is excluded.
+  repeated ResourceCapacity resources = 6;
   // One entry per transport this firmware supports, whether enabled or not. A transport that is
   // not listed is not supported.
-  repeated TransportSupport transports = 5;
-  // Facts about the Dongle itself, with keys from the same catalog as Device.info.
-  repeated Info info = 6;
+  repeated TransportSupport transports = 7;
+  // Complete facts about the Dongle itself. Missing fields are unknown.
+  AdapterInformation information = 8;
   // Missing when the board has no profile support, which also leaves configuration_interfaces
   // empty.
-  ProfileSupport profile_support = 7;
+  ProfileSupport profile_support = 9;
   // One entry per configuration interface this firmware supports, whether enabled or not. An
   // interface that is not listed is not supported.
-  repeated ConfigurationInterfaceSupport configuration_interfaces = 8;
+  repeated ConfigurationInterfaceSupport configuration_interfaces = 10;
   // Implemented output backends. Unlisted enabled modes are unsupported. Gamepad Disabled is
   // always accepted, including when no output backends are listed.
-  repeated OutputSupport output_support = 9;
+  repeated OutputSupport output_support = 11;
+}
+
+// A resource count and its allowance, scoped to the containing object, which defines the units
+// and meaning for each type. Either value can be reported independently. Missing values are
+// unknown, not zero or unlimited; limit-only entries omit count.
+message ResourceCapacity {
+  ResourceType type = 1;
+  optional uint32 count = 2;
+  optional uint32 limit = 3;
+}
+
+// Resource kinds whose scope and meaning are defined by the containing object's resources field.
+enum ResourceType {
+  RESOURCE_TYPE_UNKNOWN = 0;
+  RESOURCE_TYPE_INTERFACES = 1;
+  RESOURCE_TYPE_SLOTS = 2;
+  RESOURCE_TYPE_DEVICES = 3;
+  RESOURCE_TYPE_CONNECTIONS = 4;
+  RESOURCE_TYPE_MEMORY = 5;
+  RESOURCE_TYPE_OUTPUTS = 6;
+  RESOURCE_TYPE_LAYERS = 7;
 }
 
 // What the Dongle supports for one transport. Per-transport limits and capabilities are added here
@@ -184,14 +228,19 @@ message Status {
 message TransportSupport {
   // Required.
   Transport transport = 1;
-  // How many devices of this transport can be enabled at once: the size of the Bluetooth stack's
-  // bond table for it, less one entry kept free for pairing. Reported by the Dongle from its stack,
-  // never assumed by a client. Missing means unknown; the client lets the Dongle decide.
-  optional uint32 max_enabled = 2;
   // The transport is enabled on the Dongle. A disabled transport's devices are inactive, and the
   // Dongle does not scan, connect or accept connections on it. Classic starts disabled and BLE
   // enabled. The Dongle always sets it. Missing means enabled.
-  optional bool enabled = 3;
+  optional bool enabled = 2;
+  // Resource usage for this transport, at most one entry per type. Missing types are unknown,
+  // not zero; clients ignore unknown types and let the Dongle enforce its limits.
+  // DEVICES counts saved devices enabled for this transport, even when the transport is disabled;
+  // limit is its enabled allowance. count can exceed limit when saved preferences exceed the
+  // compiled capacity. CONNECTIONS counts occupied normal connection slots, including closing
+  // slots when admission still counts them; limit is their allowance.
+  // Both allowances are equal and exclude the additional pairing slot, as do both counts.
+  // Limits are independent across transports; enabling Classic does not lower the BLE limit.
+  repeated ResourceCapacity resources = 3;
 }
 
 enum Platform {
@@ -216,13 +265,15 @@ enum ConfigurationInterface {
 message ConfigurationInterfaceSupport {
   // Required. A client keeps an interface it does not know and passes it back unchanged.
   ConfigurationInterface interface = 1;
-  // The interface is exposed over USB.
+  // Saved preference requesting the interface in the USB allocation, even when it cannot fit.
   bool enabled = 2;
+  // Whether the interface is currently exposed over USB.
+  bool active = 3;
   // The profile the interface reads and changes, kept while the interface is disabled. 0 when
   // none is selected.
-  uint32 profile = 3;
+  uint32 profile = 4;
   // Interfaces this firmware cannot expose at the same time as this one.
-  repeated ConfigurationInterface conflicts = 4;
+  repeated ConfigurationInterface conflicts = 5;
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +429,7 @@ message SetDevice {
   uint32 device = 1;
   // Whether the device is loaded into the Bluetooth stack so it can connect. False unloads and
   // disconnects it; it stays saved. True returns ERROR_CODE_NO_CAPACITY with
-  // CAPACITY_REASON_ENABLED when the device's transport already has max_enabled devices enabled.
+  // CAPACITY_REASON_ENABLED when the transport's RESOURCE_TYPE_DEVICES allowance is full.
   optional bool enabled = 2;
   // Whether the device may reconnect on its own.
   optional bool trusted = 3;
@@ -404,8 +455,9 @@ message IntegrationUpdate {
   optional bool enabled = 2;
 }
 
-// Clears a disconnect pause and starts connecting. Responds with Device. A failure shows up as
-// DEVICE_STATE_DISCONNECTED with error set.
+// Clears a disconnect pause and starts connecting. An immediate refusal responds with Error.
+// An accepted attempt responds with Device; a later failure arrives in Event.device as
+// DEVICE_STATE_DISCONNECTED with the failure code in Device.errors.
 message ConnectDevice {
   // Required.
   uint32 device = 1;
@@ -455,32 +507,31 @@ message Device {
   bool paused = 9;
   // Missing when the Dongle will use this device. Otherwise why not.
   optional InactiveReason inactive = 10;
-  // The last failed connection attempt while the device is enabled. Cleared by a successful
-  // connection, and missing once the device is disabled or the Dongle restarts.
-  optional ErrorCode error = 11;
+  // Complete set of connection and profile problems, without duplicates, in numeric order.
+  // Integration and setting failures stay on their respective records. At most one connection
+  // failure is present; a new failure replaces it. It clears after a successful connection,
+  // disabling the device or restarting the Dongle.
+  // Profile errors apply only while connected and clear when profiles load or the device
+  // disconnects. Empty clears all device errors. Changes arrive in Event.device.
+  repeated ErrorCode errors = 11;
   // Link security while connected.
   Security security = 12;
   // Every integration the device has a saved preference for or is detected with on the current
   // link.
   repeated Integration integrations = 13;
-  // What the device reports about itself on the current connection. Empty while disconnected. A
-  // key whose value is unknown is left out.
-  repeated Info info = 14;
+  // Complete facts from the current connection. Missing while disconnected. Replaces the
+  // previous information, including clearing fields that are absent or unknown.
+  DeviceInformation information = 14;
   // The kinds of input the device produces, learned from its HID descriptor and saved. Empty until
   // the descriptor has first been read. A client skips roles it does not know.
   repeated Role roles = 15;
   // The device's saved profile layers. A new device has none. Missing when the board has no
   // profile support.
   ProfileLayers profiles = 16;
-  // Set while the device is connected and its profiles are not loaded, so its input passes through
-  // unchanged: ERROR_CODE_NO_CAPACITY when they do not fit in what is left of
-  // ProfileSupport.memory_budget, or ERROR_CODE_STORAGE_FAILED when one could not be read or
-  // decoded.
-  optional ErrorCode profile_error = 17;
   // Saved output choices. A missing gamepad choice means Disabled.
-  repeated OutputPreference output_preferences = 18;
+  repeated OutputPreference output_preferences = 17;
   // Current output state, independent of Bluetooth connection admission.
-  repeated OutputStatus outputs = 19;
+  repeated OutputStatus outputs = 18;
 }
 
 enum Role {
@@ -517,10 +568,11 @@ message OutputSupport {
 
 message OutputModeSupport {
   OutputMode mode = 1;
-  // At most four for each gamepad mode; zero for Disabled.
-  uint32 max_slots = 2;
-  // Enumerated slots, absent until known. Disabled has no slots.
-  optional uint32 slots = 3;
+  // Resource usage for this mode, at most one entry per type. Missing types are not reported;
+  // clients ignore unknown types. SLOTS counts the enumerated slot pool, not the number assigned
+  // to connected devices, and is absent until known. limit is the compiled slot maximum, at most
+  // four for each gamepad mode. Disabled has count and limit both zero.
+  repeated ResourceCapacity resources = 2;
 }
 
 message OutputStatus {
@@ -572,89 +624,11 @@ enum InactiveReason {
   INACTIVE_REASON_UNSUPPORTED_TRANSPORT = 1;
   INACTIVE_REASON_BLOCKED = 2;
   INACTIVE_REASON_DISABLED = 3;
-  // Enabled, but the stack's bond table has no room for it. Only happens when the table is
-  // smaller than the number of devices already enabled, such as after a firmware change.
+  // Enabled in saved preferences but excluded because the transport's
+  // RESOURCE_TYPE_DEVICES allowance cannot accommodate every enabled device.
   INACTIVE_REASON_CAPACITY = 4;
   // The firmware supports the device's transport, but it is disabled on the Dongle.
   INACTIVE_REASON_TRANSPORT_DISABLED = 5;
-}
-
-// One page of the device's current warnings, in ascending order of service, report type, report
-// ID, bit offset, usage page, usage and code, a missing field ordering before any value. Responds
-// with DeviceWarnings.
-message ListWarnings {
-  // Required.
-  uint32 device = 1;
-  // The last warning received. Missing starts from the beginning.
-  DeviceWarning after = 2;
-}
-
-// One page of a device's warnings, paged as DeviceList.
-message DeviceWarnings {
-  // Required.
-  uint32 device = 1;
-  // Empty when the device has none or is not connected.
-  repeated DeviceWarning warnings = 2;
-  // Nothing follows the last warning.
-  bool end = 3;
-}
-
-// Changes to a device's warnings since they were last listed or reported.
-message WarningsChanged {
-  // Required.
-  uint32 device = 1;
-  repeated DeviceWarning added = 2;
-  repeated DeviceWarning removed = 3;
-}
-
-// One HID input or output the Dongle cannot translate or update. The device keeps working; only
-// the identified field is affected.
-message DeviceWarning {
-  // Required.
-  WarningCode code = 1;
-  // Which HID service on the device, counting from 0. BLE devices can have several.
-  uint32 service = 2;
-  ReportType report_type = 3;
-  optional uint32 report_id = 4;
-  // Position of the field within its report.
-  optional uint32 bit_offset = 5;
-  // The field's USB HID usage, such as the Num Lock LED or Volume Up.
-  optional uint32 usage_page = 6;
-  optional uint32 usage = 7;
-}
-
-enum ReportType {
-  REPORT_TYPE_UNKNOWN = 0;
-  REPORT_TYPE_INPUT = 1;
-  REPORT_TYPE_OUTPUT = 2;
-  REPORT_TYPE_FEATURE = 3;
-}
-
-enum WarningCode {
-  // A warning this client does not know.
-  WARNING_CODE_UNKNOWN = 0;
-
-  // Input limitations.
-  WARNING_CODE_NUMERIC_SELECTOR_UNSUPPORTED = 1;
-  WARNING_CODE_POINTER_SELECTOR_UNSUPPORTED = 2;
-  WARNING_CODE_BUFFERED_INPUT_UNSUPPORTED = 3;
-
-  // Lock indicator limitations.
-  WARNING_CODE_INDICATOR_READ_UNSUPPORTED = 4;
-  WARNING_CODE_INDICATOR_WRITE_UNSUPPORTED = 5;
-  WARNING_CODE_INDICATOR_REPORT_TOO_LARGE = 6;
-  WARNING_CODE_BUFFERED_INDICATOR_UNSUPPORTED = 7;
-  WARNING_CODE_INDICATOR_ARRAY_FULL = 8;
-  WARNING_CODE_INDICATOR_RELATIVE_SELECTOR_UNSUPPORTED = 9;
-  WARNING_CODE_INDICATOR_RANGE_UNSUPPORTED = 10;
-  WARNING_CODE_INDICATOR_MODE_UNSUPPORTED = 11;
-  WARNING_CODE_INDICATOR_NONLINEAR_UNSUPPORTED = 12;
-  WARNING_CODE_INDICATOR_SCALE_UNSUPPORTED = 13;
-
-  // Lock indicator failures. Cleared by the next successful update.
-  WARNING_CODE_INDICATOR_STATE_UNKNOWN = 14;
-  WARNING_CODE_INDICATOR_READ_FAILED = 15;
-  WARNING_CODE_INDICATOR_WRITE_FAILED = 16;
 }
 
 // Each field is missing when the Bluetooth stack does not report it.
@@ -720,192 +694,602 @@ enum IntegrationState {
   INTEGRATION_STATE_UNSUPPORTED = 4;
 }
 
-// One fact about a device or the Dongle, read-only. For a device it comes from any integration or
-// standard service and is never saved to flash.
-message Info {
-  // Required. A key from the key catalog. Appears at most once per list. A client shows only keys
-  // it knows.
-  string key = 1;
-  // Required. Its type is fixed for the key by the catalog.
-  Value value = 2;
+// ---------------------------------------------------------------------------
+// Information
+// ---------------------------------------------------------------------------
+
+// Each scalar has independent presence. Missing means unknown, including for booleans and
+// numbers. Text is at most 64 UTF-8 bytes without control characters.
+message AdapterInformation {
+  optional string firmware_version = 1;
+  optional string board_name = 2;
+  optional bool development_build = 3;
+}
+
+// Read-only facts, never saved to flash. All readings belong to the current connection and
+// clear on disconnect. A missing scalar means unknown, not false, zero or an empty string.
+// Text is at most 64 UTF-8 bytes without control characters. A reported enum value that cannot
+// be interpreted uses its UNKNOWN member; it never implies a known mode.
+//
+// Valid integration readings take precedence while that integration is enabled; otherwise
+// valid standard-service readings apply. A failed preferred read permits a valid fallback,
+// except for battery readings, whose source rules are defined on BatteryInformation.
+// Configurable behavior appears here only when the device does not accept writes for it.
+// A saved preference for such a field remains in DeviceSettings with UNSUPPORTED status.
+message DeviceInformation {
+  DeviceIdentity identity = 1;
+  BatteryInformation battery = 2;
+  KeyboardInformation keyboard = 3;
+  PowerInformation power = 4;
+  BacklightInformation backlight = 5;
+  // At most two supported physical sensors, once each, in ascending index order.
+  repeated PointerSensorInformation pointer_sensors = 6;
+  WheelInformation wheel = 7;
+  ThumbwheelInformation thumbwheel = 8;
+}
+
+message DeviceIdentity {
+  optional string manufacturer = 1;
+  optional string model = 2;
+  optional string serial = 3;
+  optional string firmware_version = 4;
+  optional string bootloader_version = 5;
+  optional string hardware_revision = 6;
+  optional string software_revision = 7;
+  VendorIdentity vendor = 8;
+  ProductIdentity product = 9;
+}
+
+message VendorIdentity {
+  // Registry that assigns id. Missing means its registry is unknown.
+  optional VendorRegistry registry = 1;
+  // Unsigned 16-bit identifier in registry.
+  optional uint32 id = 2;
+}
+
+message ProductIdentity {
+  // Unsigned 16-bit product identifier assigned by the device's vendor.
+  optional uint32 id = 1;
+  // Unsigned 16-bit product version reported by the device, not a firmware version string.
+  optional uint32 version = 2;
+}
+
+enum VendorRegistry {
+  VENDOR_REGISTRY_UNKNOWN = 0;
+  VENDOR_REGISTRY_USB = 1;
+  VENDOR_REGISTRY_BLUETOOTH = 2;
+}
+
+// HID++ supplies battery readings while enabled and usable. Otherwise BLE uses its Battery
+// Service and Classic uses standard HID battery reports. A missing or failed reading never
+// falls back to a different source. With several batteries, use the explicitly identified main
+// battery, otherwise the lowest known level; charging must describe that same battery.
+message BatteryInformation {
+  // Percent, 0..100. Coarse readings map full to 100, high/good to 75, medium to 50, low to 20,
+  // critical to 5 and empty to 0. A level never implies a charging state.
+  optional uint32 level = 1;
+  optional bool charging = 2;
+}
+
+message KeyboardInformation {
+  // Key interpretation for the current device connection.
+  optional KeyboardPlatform platform = 1;
+  optional FunctionRowMode function_row = 2;
+}
+
+message PowerInformation {
+  // Seconds of inactivity before automatic power-off. Zero disables automatic power-off.
+  optional uint32 auto_off = 1;
+}
+
+message BacklightInformation {
+  // Actual brightness, in device-defined steps, independently of the configured brightness.
+  optional uint32 current_brightness = 1;
+  optional BacklightStatus status = 2;
+  optional bool enabled = 3;
+  optional BacklightMode mode = 4;
+  // Configured brightness, in device-defined steps.
+  optional uint32 brightness = 5;
+  BacklightDelayInformation delay = 6;
+  // Whether the device plays its backlight startup effect.
+  optional bool startup_effect = 7;
+  // Whether the device plays its dial lighting effect.
+  optional bool dial_effect = 8;
+  // Whether the device reduces backlight use at critical battery levels.
+  optional bool power_save = 9;
+  optional BacklightEffect effect = 10;
+}
+
+message BacklightDelayInformation {
+  // Seconds before dimming after hands leave the device.
+  optional uint32 hands_away = 1;
+  // Seconds before dimming with hands near the device.
+  optional uint32 hands_nearby = 2;
+  // Seconds before dimming while the device has external power.
+  optional uint32 external_power = 3;
+}
+
+message PointerSensorInformation {
+  // Zero-based physical sensor index, stable across connections to the same device.
+  uint32 index = 1;
+  // Dots per inch for this sensor.
+  optional uint32 dpi = 2;
+}
+
+message WheelInformation {
+  // High-resolution scroll units per ordinary wheel step.
+  optional uint32 resolution_multiplier = 1;
+  optional uint32 ratchets_per_rotation = 2;
+  // Wheel diameter in millimetres.
+  optional uint32 diameter = 3;
+  optional WheelMode mode = 4;
+  // Automatic free spin threshold in device-defined units, 1..255; 255 disables switching.
+  optional uint32 free_spin_threshold = 5;
+  // Whether the device reverses the wheel's scroll direction.
+  optional bool invert = 6;
+}
+
+message ThumbwheelInformation {
+  // Whether the device reverses the thumbwheel's scroll direction.
+  optional bool invert = 1;
+}
+
+// UNKNOWN means the reported platform cannot be interpreted. It is never a writable choice.
+enum KeyboardPlatform {
+  KEYBOARD_PLATFORM_UNKNOWN = 0;
+  KEYBOARD_PLATFORM_WINDOWS = 1;
+  KEYBOARD_PLATFORM_WINDOWS_EMBEDDED = 2;
+  KEYBOARD_PLATFORM_LINUX = 3;
+  KEYBOARD_PLATFORM_CHROME_OS = 4;
+  KEYBOARD_PLATFORM_ANDROID = 5;
+  KEYBOARD_PLATFORM_MAC = 6;
+  KEYBOARD_PLATFORM_IOS = 7;
+  KEYBOARD_PLATFORM_WEBOS = 8;
+  KEYBOARD_PLATFORM_TIZEN = 9;
+}
+
+enum FunctionRowMode {
+  FUNCTION_ROW_MODE_UNKNOWN = 0;
+  FUNCTION_ROW_MODE_FUNCTION_KEYS = 1;
+  FUNCTION_ROW_MODE_SPECIAL_ACTIONS = 2;
+}
+
+enum BacklightStatus {
+  BACKLIGHT_STATUS_UNKNOWN = 0;
+  BACKLIGHT_STATUS_DISABLED = 1;
+  // Illumination is limited by battery state.
+  BACKLIGHT_STATUS_BATTERY = 2;
+  BACKLIGHT_STATUS_AUTOMATIC = 3;
+  BACKLIGHT_STATUS_SATURATED = 4;
+  BACKLIGHT_STATUS_MANUAL = 5;
+  BACKLIGHT_STATUS_PERMANENT_MANUAL = 6;
+}
+
+enum BacklightMode {
+  BACKLIGHT_MODE_UNKNOWN = 0;
+  BACKLIGHT_MODE_NONE = 1;
+  BACKLIGHT_MODE_AUTOMATIC = 2;
+  BACKLIGHT_MODE_TEMPORARY_MANUAL = 3;
+  BACKLIGHT_MODE_PERMANENT_MANUAL = 4;
+}
+
+enum BacklightEffect {
+  BACKLIGHT_EFFECT_UNKNOWN = 0;
+  BACKLIGHT_EFFECT_STATIC = 1;
+  BACKLIGHT_EFFECT_NONE = 2;
+  BACKLIGHT_EFFECT_BREATHING = 3;
+  BACKLIGHT_EFFECT_CONTRAST = 4;
+  BACKLIGHT_EFFECT_REACTION = 5;
+  BACKLIGHT_EFFECT_RANDOM = 6;
+  BACKLIGHT_EFFECT_WAVES = 7;
+}
+
+enum WheelMode {
+  WHEEL_MODE_UNKNOWN = 0;
+  WHEEL_MODE_FREE_SPIN = 1;
+  WHEEL_MODE_STEPPED = 2;
 }
 
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
-// One page of every setting the Dongle knows for the device, across all integrations: those read
-// from the device on the current connection, plus every saved value. In ascending order of
-// integration, then key compared bytewise. Sends nothing to the device. The list grows or changes
-// as integrations come up, and a settings_changed event follows each change. Responds with
-// DeviceSettings.
+// Lists every configurable field discovered on this connection and every saved preference, across
+// integrations. Sends nothing to the device. Read-only behavior is in Device.information.
+// Objects are ordered by integration, then SettingsGroup number, then component index.
+// Listing is a live view, not a snapshot across requests; clients apply events as they arrive
+// and list again from the beginning when they need a fresh view. Responds with DeviceSettings.
 message ListSettings {
   // Required.
   uint32 device = 1;
-  // The last setting received. Missing starts from the beginning.
-  SettingRef after = 2;
+  // The identity of the last object received. Missing starts from the beginning.
+  SettingsRef after = 2;
 }
 
-// Identifies one setting of a device.
-message SettingRef {
-  // Required.
+// Identifies a complete domain object, never an individual setting.
+message SettingsRef {
+  // Required. The integration owning the settings.
   IntegrationKind integration = 1;
-  // Required.
-  string key = 2;
+  // Required. UNKNOWN does not identify an object.
+  SettingsGroup group = 2;
+  // Zero-based component index within group.
+  // Required for POINTER_SENSOR; absent for other current groups.
+  optional uint32 index = 3;
 }
 
-// Saves and forgets values on the Dongle in one storage write, responds with no result, then
-// re-applies every saved setting of each integration named in the request, as it does when the
-// device connects. A settings_changed event follows any change. If any change is invalid or the
-// save fails, nothing is saved and nothing is applied. A valid value is always saved, whatever the
-// device's current state; it stays SETTING_STATE_PENDING until an apply writes it. A forgotten
-// setting is never written to the device again; the device keeps whatever value it has.
+enum SettingsGroup {
+  SETTINGS_GROUP_UNKNOWN = 0;
+  SETTINGS_GROUP_KEYBOARD = 1;
+  SETTINGS_GROUP_POWER = 2;
+  SETTINGS_GROUP_BACKLIGHT = 3;
+  SETTINGS_GROUP_POINTER_SENSOR = 4;
+  SETTINGS_GROUP_WHEEL = 5;
+  SETTINGS_GROUP_THUMBWHEEL = 6;
+}
+
+// Saves and forgets preferences in one storage write and responds with no result once durable.
+// Missing fields leave their preferences unchanged. Each present field must select a value or
+// forget; an empty change is invalid. Changes apply in list order, with the last change to each
+// field winning. Validation failure saves and applies nothing. A save failure starts no apply;
+// Error.outcome_unknown reports when durability cannot be determined. Clients then read back
+// saved values. A confirmed storage failure leaves the previous preferences unchanged.
+//
+// Validation uses the advertised limits, retained with saved preferences while disconnected.
+// Unknown integrations, groups, fields and sensor indices cannot be saved. Read-only fields
+// cannot be saved. A value outside the advertised limits returns ERROR_CODE_BAD_ARGS; saving
+// an unavailable field returns ERROR_CODE_NOT_FOUND and a read-only field ERROR_CODE_UNSUPPORTED.
+// Forgetting a known field with no saved preference succeeds, including when it is read-only.
+//
+// A valid value is saved even while disconnected, busy, disabled, or in an inapplicable mode.
+// It stays PENDING until confirmed by readback or the device's documented confirmation.
+// After responding, the Dongle re-applies all saved settings of each named integration. The
+// same apply runs when an integration starts or the adapter platform changes. It reads first,
+// skips equal values, writes differences and confirms them. Fields sharing a
+// device setter are written together, preserving unsaved fields. A failed setter does not undo
+// other setters or integrations. Failures belong to each affected field's SettingStatus,
+// separately from Integration.error; saved preferences survive for the next apply attempt.
+// A timeout uses ERROR_CODE_TIMEOUT: the write may have taken effect, so the next apply reads
+// before writing. A forgotten setting is no longer written; its actual device value is unchanged.
+// Only this command creates saved preferences. SettingsChanged follows every resulting change.
 message SetSettings {
   // Required.
   uint32 device = 1;
-  // Required, at least one. Applied in order; a later change to the same setting replaces an
-  // earlier one.
-  repeated SettingChange changes = 2;
+  // Required, at least one changed field. The whole Request must fit in 1024 protobuf bytes.
+  repeated SettingsUpdate changes = 2;
 }
 
-message SettingChange {
-  // Required. The integration and key together identify the setting.
+// Partial update of one domain. A missing nested message or field leaves it unchanged.
+message SettingsUpdate {
+  // Required. The integration owning the settings.
   IntegrationKind integration = 1;
   // Required.
-  string key = 2;
-  // Required.
-  oneof change {
-    // Save this value. Must match the setting's type: bool, integer, text for enum and text
-    // settings, or color.
-    Value value = 3;
-    // Remove the saved value. Forgetting a setting with no saved value is accepted.
-    SettingForget forget = 4;
+  oneof group {
+    KeyboardSettingsUpdate keyboard = 2;
+    PowerSettingsUpdate power = 3;
+    BacklightSettingsUpdate backlight = 4;
+    PointerSensorSettingsUpdate pointer_sensor = 5;
+    WheelSettingsUpdate wheel = 6;
+    ThumbwheelSettingsUpdate thumbwheel = 7;
   }
 }
 
-message SettingForget {}
-
-// One page of a device's settings, paged as DeviceList.
+// One page, ordered as ListSettings. The Dongle packs whole objects so the enclosing Message
+// fits in 1024 protobuf bytes before COBS encoding. It never splits an object. At least one
+// object is returned unless end is true. Each object is at most 960 protobuf bytes, including
+// its integration and group. Limits include saved metadata and are never silently truncated.
 message DeviceSettings {
   // Required.
   uint32 device = 1;
-  repeated Setting settings = 2;
-  // Nothing follows the last setting.
+  repeated SettingsObject objects = 2;
+  // Nothing follows the last object in listing order.
   bool end = 3;
 }
 
-// Changes to a device's settings: each setting that changed or appeared, with its current state,
-// and each one that went away.
+// Each changed object replaces the entire previous object with that identity. Omitted fields
+// remove prior capabilities; a present field with value absent resets its reading to unknown;
+// saved absent clears a saved preference. An object without any fields is removed instead.
+// Objects not named in changed or removed are unchanged. A ref occurs at most once in an event
+// and cannot occur in both lists. Events are split between whole objects/references so each
+// enclosing Message fits in 1024 protobuf bytes. Changes across events are not atomic.
 message SettingsChanged {
   // Required.
   uint32 device = 1;
-  repeated Setting changed = 2;
-  repeated SettingRef removed = 3;
+  repeated SettingsObject changed = 2;
+  repeated SettingsRef removed = 3;
 }
 
-// A value the Dongle can change on the device and save. Values the device only reports are Info.
-message Setting {
-  // Required. The integration providing this setting.
+// A complete domain, owned by integration. Its SettingsRef is derived from the selected group
+// and its component index when applicable. At most one object exists for each identity.
+// Only configurable fields discovered on this connection or fields with a saved preference appear.
+// A field with a saved preference remains even when its capability disappears, with UNSUPPORTED
+// status. On disconnect, fields without saved preferences disappear; the rest retain their
+// saved metadata and clear value. Integration.state determines availability and freshness.
+message SettingsObject {
+  // Required. Matches a Device.integrations entry.
   IntegrationKind integration = 1;
-  // Required. A key from the key catalog. A client shows only keys it knows.
-  string key = 2;
-  // How applying the saved value went. Set exactly when the setting has a saved value; missing for
-  // a setting the Dongle leaves alone.
-  oneof status {
-    SettingState state = 3;
-    // The last apply failed.
-    ErrorCode error = 4;
+  // Required. At least one setting field is present in the selected domain.
+  oneof group {
+    KeyboardSettings keyboard = 2;
+    PowerSettings power = 3;
+    BacklightSettings backlight = 4;
+    PointerSensorSettings pointer_sensor = 5;
+    WheelSettings wheel = 6;
+    ThumbwheelSettings thumbwheel = 7;
   }
-
-  // Required. The setting's type, with its value, saved value and limits. In each type, value is
-  // the last value read from the device and saved is the value saved on the Dongle; saved is
-  // missing when the Dongle leaves the setting alone. A client ignores a setting whose type it does
-  // not know, which it sees as no type set.
-  //
-  // value is current while the setting's integration is INTEGRATION_STATE_ACTIVE. While the
-  // device is connected in any other state it is the last reading, which a client shows as possibly
-  // out of date. It is missing when the setting has not been read on the current connection.
-  oneof type {
-    BoolSetting bool = 5;
-    IntegerSetting integer = 6;
-    EnumSetting enum = 7;
-    TextSetting text = 8;
-    ColorSetting color = 9;
-  }
-
-  // Fields 20 and up carry details specific to one integration, which a client never needs in
-  // order to show or edit the setting.
 }
 
+message KeyboardSettings {
+  // Key interpretation for the current connection, including the current host slot when
+  // the device stores a platform per host. Other host slots are never read or changed.
+  KeyboardPlatformSetting platform = 1;
+  // Default function-row behavior, scoped to this connection or its current host slot.
+  FunctionRowModeSetting function_row = 2;
+}
+
+message PowerSettings {
+  // Device inactivity timeout in seconds. Zero disables automatic power-off.
+  IntegerSetting auto_off = 1;
+}
+
+message BacklightSettings {
+  BoolSetting enabled = 1;
+  BacklightModeSetting mode = 2;
+  // Configured brightness in device-defined steps. Remains PENDING in modes that cannot
+  // apply it, then applies when the device enters a compatible mode.
+  IntegerSetting brightness = 3;
+  BacklightDelaySettings delay = 4;
+  // Whether the device plays its backlight startup effect.
+  BoolSetting startup_effect = 5;
+  // Whether the device plays its dial lighting effect.
+  BoolSetting dial_effect = 6;
+  // Whether the device reduces backlight use at critical battery levels.
+  BoolSetting power_save = 7;
+  BacklightEffectSetting effect = 8;
+}
+
+message BacklightDelaySettings {
+  // Device timeout in seconds after hands leave the device.
+  IntegerSetting hands_away = 1;
+  // Device timeout in seconds with hands near the device.
+  IntegerSetting hands_nearby = 2;
+  // Device timeout in seconds while externally powered.
+  IntegerSetting external_power = 3;
+}
+
+message PointerSensorSettings {
+  // Zero-based physical sensor index, stable across connections to the same device.
+  uint32 index = 1;
+  // Dots per inch for this sensor, independent of any other sensor.
+  IntegerSetting dpi = 2;
+}
+
+message WheelSettings {
+  WheelModeSetting mode = 1;
+  // Automatic free spin threshold, 1..255; 255 disables automatic switching.
+  IntegerSetting free_spin_threshold = 2;
+  // Whether the device reverses the wheel's scroll direction.
+  BoolSetting invert = 3;
+}
+
+message ThumbwheelSettings {
+  // Whether the device reverses the thumbwheel's scroll direction.
+  BoolSetting invert = 1;
+}
+
+// Every setting wrapper has independent value and saved presence. value is the last actual
+// reading, never an echo of saved. It is current while the owning integration is ACTIVE and
+// otherwise possibly stale on the current connection. It is absent before the first read and
+// after disconnect. saved is present only for an explicit preference stored on the Dongle.
+// status is present exactly when saved is present, and describes only that field's last apply.
+// Integer units and scope come from the containing domain field. All writes affect only this
+// device and its current connection; no setting changes another paired host's preferences.
 message BoolSetting {
   optional bool value = 1;
   optional bool saved = 2;
+  SettingStatus status = 3;
 }
 
 message IntegerSetting {
   optional sint64 value = 1;
   optional sint64 saved = 2;
-  // The values the device accepts: a range, a fixed list, or neither for any integer.
+  SettingStatus status = 3;
+  // Accepted values. Neither means any integer; a saved field keeps its limits while offline.
   oneof limits {
-    IntegerRange range = 3;
-    IntegerChoices choices = 4;
+    IntegerRange range = 4;
+    IntegerChoices choices = 5;
   }
 }
 
 message IntegerRange {
   sint64 min = 1;
   sint64 max = 2;
-  // Accepted values are min, min + step, and so on up to max. Zero means 1.
+  // Accepted values are min, min + step, and so on through max. Zero means 1.
   uint64 step = 3;
 }
 
 message IntegerChoices {
+  // Complete nonempty discrete set, at most six distinct values. A contiguous or stepped set uses
+  // IntegerRange. Limits are retained in full, including while the device is disconnected.
   repeated sint64 values = 1;
 }
 
-message EnumSetting {
-  optional string value = 1;
-  optional string saved = 2;
-  // The values a client may save. value can hold one outside this list, such as a mode the
-  // device reports but does not accept as a write.
-  repeated string choices = 3;
-}
-
-message TextSetting {
-  optional string value = 1;
-  optional string saved = 2;
-  // The longest value the device accepts, in UTF-8 bytes, as the device reports it. Missing means
-  // no limit beyond the request size.
-  optional uint32 max_bytes = 3;
-}
-
-// A 24-bit RGB color, 0xRRGGBB.
-message ColorSetting {
-  optional uint32 value = 1;
-  optional uint32 saved = 2;
-}
-
-// A typed value: an information value, or a value to save in SetSettings.
-message Value {
-  oneof value {
-    bool bool = 1;
-    sint64 integer = 2;
-    // Enum value or text.
-    string text = 3;
-    // A 24-bit RGB color, 0xRRGGBB.
-    uint32 color = 4;
+// Per-field apply result, independent of the integration's own startup error.
+message SettingStatus {
+  // Required.
+  oneof result {
+    SettingState state = 1;
+    ErrorCode error = 2;
   }
 }
 
 enum SettingState {
-  // Saved, and waiting until the device can take it. Unknown states also read as this.
-  SETTING_STATE_PENDING = 0;
-  SETTING_STATE_APPLIED = 1;
-  // The device reports a value other than the saved one, such as after the user changed it on the
-  // device. The next apply writes the saved value back.
-  SETTING_STATE_CHANGED_ON_DEVICE = 2;
+  // An unrecognized apply state provides no confirmation that the preference took effect.
+  SETTING_STATE_UNKNOWN = 0;
+  SETTING_STATE_PENDING = 1;
+  // The actual value is confirmed equal to the saved preference.
+  SETTING_STATE_APPLIED = 2;
+  // The device reports another value. The next apply restores the saved preference.
+  SETTING_STATE_CHANGED_ON_DEVICE = 3;
   // The device does not support this saved setting.
-  SETTING_STATE_UNSUPPORTED = 3;
+  SETTING_STATE_UNSUPPORTED = 4;
+}
+
+// Explicitly forget one field's saved preference. Never resets the actual device value.
+message SettingForget {}
+
+message BoolSettingUpdate {
+  // Required. Selecting value preserves false as an explicit write.
+  oneof change {
+    bool value = 1;
+    SettingForget forget = 2;
+  }
+}
+
+message IntegerSettingUpdate {
+  // Required. Selecting value preserves zero as an explicit write.
+  oneof change {
+    sint64 value = 1;
+    SettingForget forget = 2;
+  }
+}
+
+// value may report a mode outside choices. UNKNOWN means an uninterpretable reading.
+// choices contains each writable, known enum member at most once and excludes UNKNOWN.
+// An empty choices list grants no writable value. saved metadata survives disconnect.
+message KeyboardPlatformSetting {
+  optional KeyboardPlatform value = 1;
+  optional KeyboardPlatform saved = 2;
+  SettingStatus status = 3;
+  repeated KeyboardPlatform choices = 4;
+}
+
+message KeyboardPlatformSettingUpdate {
+  // Required. UNKNOWN and unrecognized enum values cannot be saved.
+  oneof change {
+    KeyboardPlatform value = 1;
+    SettingForget forget = 2;
+  }
+}
+
+// value may report a mode outside choices. UNKNOWN means an uninterpretable reading.
+// choices contains each writable, known enum member at most once and excludes UNKNOWN.
+// An empty choices list grants no writable value. saved metadata survives disconnect.
+message FunctionRowModeSetting {
+  optional FunctionRowMode value = 1;
+  optional FunctionRowMode saved = 2;
+  SettingStatus status = 3;
+  repeated FunctionRowMode choices = 4;
+}
+
+message FunctionRowModeSettingUpdate {
+  // Required. UNKNOWN and unrecognized enum values cannot be saved.
+  oneof change {
+    FunctionRowMode value = 1;
+    SettingForget forget = 2;
+  }
+}
+
+// value may report a mode outside choices. UNKNOWN means an uninterpretable reading.
+// choices contains each writable, known enum member at most once and excludes UNKNOWN.
+// An empty choices list grants no writable value. saved metadata survives disconnect.
+message BacklightModeSetting {
+  optional BacklightMode value = 1;
+  optional BacklightMode saved = 2;
+  SettingStatus status = 3;
+  repeated BacklightMode choices = 4;
+}
+
+message BacklightModeSettingUpdate {
+  // Required. UNKNOWN and unrecognized enum values cannot be saved.
+  oneof change {
+    BacklightMode value = 1;
+    SettingForget forget = 2;
+  }
+}
+
+// value may report a mode outside choices. UNKNOWN means an uninterpretable reading.
+// choices contains each writable, known enum member at most once and excludes UNKNOWN.
+// An empty choices list grants no writable value. saved metadata survives disconnect.
+message BacklightEffectSetting {
+  optional BacklightEffect value = 1;
+  optional BacklightEffect saved = 2;
+  SettingStatus status = 3;
+  repeated BacklightEffect choices = 4;
+}
+
+message BacklightEffectSettingUpdate {
+  // Required. UNKNOWN and unrecognized enum values cannot be saved.
+  oneof change {
+    BacklightEffect value = 1;
+    SettingForget forget = 2;
+  }
+}
+
+// value may report a mode outside choices. UNKNOWN means an uninterpretable reading.
+// choices contains each writable, known enum member at most once and excludes UNKNOWN.
+// An empty choices list grants no writable value. saved metadata survives disconnect.
+message WheelModeSetting {
+  optional WheelMode value = 1;
+  optional WheelMode saved = 2;
+  SettingStatus status = 3;
+  repeated WheelMode choices = 4;
+}
+
+message WheelModeSettingUpdate {
+  // Required. UNKNOWN and unrecognized enum values cannot be saved.
+  oneof change {
+    WheelMode value = 1;
+    SettingForget forget = 2;
+  }
+}
+
+// Partial update of KeyboardSettings; units and scope are the same as its fields.
+message KeyboardSettingsUpdate {
+  KeyboardPlatformSettingUpdate platform = 1;
+  FunctionRowModeSettingUpdate function_row = 2;
+}
+
+// Partial update of PowerSettings; units and scope are the same as its fields.
+message PowerSettingsUpdate {
+  IntegerSettingUpdate auto_off = 1;
+}
+
+// Partial update of BacklightSettings; units and scope are the same as its fields.
+message BacklightSettingsUpdate {
+  BoolSettingUpdate enabled = 1;
+  BacklightModeSettingUpdate mode = 2;
+  IntegerSettingUpdate brightness = 3;
+  BacklightDelaySettingsUpdate delay = 4;
+  BoolSettingUpdate startup_effect = 5;
+  BoolSettingUpdate dial_effect = 6;
+  BoolSettingUpdate power_save = 7;
+  BacklightEffectSettingUpdate effect = 8;
+}
+
+// Partial update of BacklightDelaySettings; units and scope are the same as its fields.
+message BacklightDelaySettingsUpdate {
+  IntegerSettingUpdate hands_away = 1;
+  IntegerSettingUpdate hands_nearby = 2;
+  IntegerSettingUpdate external_power = 3;
+}
+
+// Partial update of PointerSensorSettings; units and scope are the same as its fields.
+message PointerSensorSettingsUpdate {
+  // Zero-based physical sensor index. Identifies the sensor; it is never changed.
+  uint32 index = 1;
+  IntegerSettingUpdate dpi = 2;
+}
+
+// Partial update of WheelSettings; units and scope are the same as its fields.
+message WheelSettingsUpdate {
+  WheelModeSettingUpdate mode = 1;
+  IntegerSettingUpdate free_spin_threshold = 2;
+  BoolSettingUpdate invert = 3;
+}
+
+// Partial update of ThumbwheelSettings; units and scope are the same as its fields.
+message ThumbwheelSettingsUpdate {
+  BoolSettingUpdate invert = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -917,18 +1301,15 @@ enum SettingState {
 message ProfileSupport {
   // Supported inputs and outputs, qualified by capability kind and application collection.
   repeated UsageRange ranges = 1;
-  // Bytes of memory for loaded profiles, shared by every connected device and configuration
-  // interface. A device whose layers do not fit in what is left loads none of them; see
-  // Device.profile_error. A profile larger than the whole budget cannot be saved.
-  uint32 memory_budget = 2;
-  // The most outputs one remap can hold, and the most outputs one held input produces after every
-  // layer has applied.
-  uint32 max_remap_outputs = 3;
-  // The most profiles one ProfileLayers can list, which bounds the layers each enabled device keeps
-  // in its resident reconnection entry.
-  uint32 max_layers = 4;
-  // Bytes of memory_budget in use by loaded profiles.
-  uint32 memory_used = 5;
+  // Profile resource usage, at most one entry per type. Missing types are not reported; clients
+  // ignore unknown types. MEMORY reports bytes used by loaded profiles and their shared budget
+  // in bytes, across connected devices and configuration interfaces. A device whose layers do
+  // not fit in the remaining budget loads none of them; see Device.errors. A profile larger than
+  // the whole budget cannot be saved.
+  // OUTPUTS limits both the outputs one remap can hold and those one held input produces after
+  // every layer has applied. LAYERS limits the profiles one ProfileLayers can list, bounding the
+  // layers each enabled device keeps in its resident reconnection entry. Both omit count.
+  repeated ResourceCapacity resources = 2;
 }
 
 // A contiguous range of HID usages on one usage page, in one application collection, for one
@@ -972,10 +1353,10 @@ message Usage {
 
 // Profiles applied to input in order. Each profile sees the input as the profile before it left it:
 // an input another profile remapped arrives as each of its outputs. An empty list passes all input
-// through unchanged. A profile that does not exist returns ERROR_CODE_NOT_FOUND, and more than
-// ProfileSupport.max_layers profiles returns ERROR_CODE_BAD_ARGS. A profile may appear more than
-// once. A saved reference to a profile that no longer exists is skipped until it is changed or the
-// Dongle next starts and removes it.
+// through unchanged. A profile that does not exist returns ERROR_CODE_NOT_FOUND. A list exceeding
+// the LAYERS limit in ProfileSupport.resources returns ERROR_CODE_BAD_ARGS. A profile may appear
+// more than once. A saved reference to a profile that no longer exists is skipped until it is
+// changed or the Dongle next starts and removes it.
 message ProfileLayers {
   repeated uint32 profiles = 1;
 }
@@ -1072,9 +1453,9 @@ message ListProfileRules {
 // itself in the same collection, scales it by a ratio equal to 1, or maps an axis to itself without
 // inversion is forgotten instead. Every device using the profile uses the new rules from its next
 // input; a held input keeps the outputs it was pressed with until it is released. If any change is invalid or the save
-// fails, nothing is saved. A save that would make the profile larger than
-// ProfileSupport.memory_budget, or grow a loaded profile beyond what is left of it, returns
-// ERROR_CODE_NO_CAPACITY with CAPACITY_REASON_PROFILE_MEMORY.
+// fails, nothing is saved. A save that would make the profile larger than the
+// MEMORY limit in ProfileSupport.resources, or grow a loaded profile beyond the remaining budget,
+// returns ERROR_CODE_NO_CAPACITY with CAPACITY_REASON_PROFILE_MEMORY.
 message SetProfileRules {
   // Required.
   uint32 profile = 1;
@@ -1130,8 +1511,8 @@ message ProfileRule {
   // input. A keyboard modifier is an output like any other key. A remap applies when the device
   // reports the input as a held control; other forms of the same usage keep their usual behavior.
   message Remap {
-    // Each within ProfileSupport.ranges of kind KIND_REMAP_OUTPUT, at most max_remap_outputs,
-    // each at most once.
+    // Each within ProfileSupport.ranges of kind KIND_REMAP_OUTPUT, at most the
+    // OUTPUTS limit in ProfileSupport.resources, each at most once.
     repeated Output outputs = 1;
   }
 
@@ -1293,16 +1674,37 @@ enum ErrorCode {
   ERROR_CODE_DEVICE_ERROR = 27;          // The device answered with an error.
   ERROR_CODE_INVALID_RESPONSE = 28;      // The device's answer could not be understood.
   ERROR_CODE_READBACK_MISMATCH = 29;     // A written value did not read back.
+
+  // Adapter problems, reported in Status.errors.
+  // Storage is ready but has insufficient free space to pair another device, or a deferred save
+  // failed for lack of space and has not succeeded yet. Clears when neither condition applies.
+  ERROR_CODE_STORAGE_FULL = 30;
+  // Loaded profiles use at least 85% of the nonzero profile memory budget.
+  ERROR_CODE_PROFILE_MEMORY_LOW = 31;
+  // At least one USB interface with priority below 0xC0 cannot fit. The client shows a prominent
+  // warning and changes the tray indicator. It also shows the reserved-capacity error if present.
+  ERROR_CODE_USB_REQUIRED_CAPACITY_EXCEEDED = 32;
+  // At least one USB interface with priority 0xC0 through 0xDF cannot fit. The client shows a
+  // subtle indicator independently of the required-capacity error. Omitting unconfigured
+  // interfaces at 0xE0 through 0xFE produces neither code; disabled interfaces at 0xFF are excluded.
+  ERROR_CODE_USB_RESERVED_CAPACITY_EXCEEDED = 33;
+
+  // Device profile problems, reported in Device.errors. No profiles are loaded for the device
+  // while either code applies, so its input passes through unchanged.
+  ERROR_CODE_PROFILE_MEMORY_EXCEEDED = 34;  // The profiles do not fit in the remaining memory budget.
+  ERROR_CODE_PROFILE_LOAD_FAILED = 35;      // A profile could not be read or decoded.
 }
 
 enum CapacityReason {
   CAPACITY_REASON_UNKNOWN = 0;
-  // max_enabled devices of this transport are already enabled.
+  // The transport's RESOURCE_TYPE_DEVICES allowance is full.
   CAPACITY_REASON_ENABLED = 1;
   // Flash is full.
   CAPACITY_REASON_STORAGE = 2;
-  // The connection table is full.
+  // ConnectDevice or StartPairing cannot obtain a connection slot. For normal connections this
+  // includes the RESOURCE_TYPE_CONNECTIONS allowance; a slot still closing is not available yet.
   CAPACITY_REASON_CONNECTIONS = 3;
-  // The profile would be larger than ProfileSupport.memory_budget.
+  // The profile would exceed the MEMORY limit in ProfileSupport.resources or a loaded profile's
+  // growth would exceed the remaining budget.
   CAPACITY_REASON_PROFILE_MEMORY = 4;
 }

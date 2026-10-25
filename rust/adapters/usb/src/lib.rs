@@ -14,7 +14,6 @@ pub use desktop::ReportHandler;
 pub mod gamepad;
 #[cfg(feature = "gamepad")]
 pub mod outputs;
-#[cfg(feature = "gamepad")]
 extern crate alloc;
 #[cfg(all(test, feature = "gamepad"))]
 mod gamepad_tests;
@@ -34,7 +33,7 @@ use cordial_core::{
 };
 use core::{
     cell::RefCell,
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
 #[cfg(feature = "gamepad")]
 use embassy_futures::join::join;
@@ -73,11 +72,30 @@ impl Status {
         self.configured && self.dtr
     }
 }
-/// Interfaces and saved gamepad pool sizes for one USB allocation.
-#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
-pub struct Topology {
-    pub interfaces: u8,
-    pub gamepads: cordial_core::outputs::Plan,
+pub use cordial_core::usb::{Budget, Topology};
+
+/// Match Embassy's compiled limits and this adapter's enabled classes.
+pub const fn compiled_budget(mut budget: Budget) -> Budget {
+    const fn number(value: Option<&str>, default: u8) -> u8 {
+        let Some(value) = value else {
+            return default;
+        };
+        let bytes = value.as_bytes();
+        let mut result = 0u8;
+        let mut i = 0;
+        while i < bytes.len() {
+            result = result.saturating_mul(10).saturating_add(bytes[i] - b'0');
+            i += 1;
+        }
+        result
+    }
+    budget.interfaces = number(option_env!("EMBASSY_USB_MAX_INTERFACE_COUNT"), 4);
+    budget.handlers = number(option_env!("EMBASSY_USB_MAX_HANDLER_COUNT"), 4);
+    if !cfg!(feature = "gamepad") {
+        budget.hid_slots = 0;
+        budget.xinput_slots = 0;
+    }
+    budget
 }
 
 const STATUS_RECEIVERS: usize = 3 + SLOTS + if cfg!(feature = "gamepad") { 12 } else { 0 };
@@ -137,6 +155,62 @@ pub async fn saved_interfaces<S: RecordStore>(store: &mut S, profiles_supported:
     }
     set
 }
+/// Scan validated saved policies before the first enumeration, using the runtime allocator.
+pub async fn saved_topology<S: RecordStore>(
+    store: &mut S,
+    profiles_supported: bool,
+    budget: Budget,
+) -> Topology {
+    let mut manager = cordial_core::manager::Manager::default();
+    manager.usb_budget = compiled_budget(budget);
+    manager.profile_budget = profiles_supported.then_some(0);
+    #[cfg(feature = "gamepad")]
+    {
+        manager.output_support = outputs::SUPPORT;
+    }
+    if let Ok(preference) = (Policies { store: &mut *store }).load_adapter().await {
+        manager.preference = preference;
+    }
+    let interfaces = saved_interfaces(store, profiles_supported).await;
+    manager
+        .preference
+        .configuration_interfaces
+        .retain(|p| interfaces & p.interface.bit() != 0);
+    let mut peers = alloc::vec::Vec::new();
+    let mut after = 0;
+    loop {
+        let Ok(ids) = store.record_ids(2, after, 8).await else {
+            break;
+        };
+        for &id in &ids {
+            after = id;
+            let Ok(Some(bytes)) = store.load_owned(records::record_key(2, id)).await else {
+                continue;
+            };
+            let Some((policy, _)) = cordial_core::bonds::decode(id, &bytes) else {
+                continue;
+            };
+            if peers.contains(&policy.peer) {
+                continue;
+            }
+            if peers.try_reserve(1).is_err() {
+                break;
+            }
+            peers.push(policy.peer);
+            let mode = cordial_core::outputs::gamepad(&policy.output_preferences);
+            if manager.outputs.prepare(id, mode).is_err() {
+                break;
+            }
+            let configured = cordial_core::outputs::Configured::load(&policy, store).await;
+            manager.outputs.configure(configured);
+        }
+        if ids.len() < 8 {
+            break;
+        }
+    }
+    manager.usb_allocation().topology
+}
+
 struct HidTx {
     generation: u64,
     sequence: u64,
@@ -197,6 +271,8 @@ pub struct Io {
     raw: [RawQueue; SLOTS],
     /// The enabled configuration interfaces the current enumeration exposes.
     interfaces: AtomicU8,
+    desktop: AtomicBool,
+    budget: Budget,
     reconnect: Signal<CS, Topology>,
     #[cfg(feature = "gamepad")]
     outputs: outputs::Outputs,
@@ -208,6 +284,9 @@ impl Default for Io {
 }
 impl Io {
     pub const fn new() -> Self {
+        Self::with_budget(Budget::PICO)
+    }
+    pub const fn with_budget(budget: Budget) -> Self {
         Self {
             status: Watch::new_with(Status {
                 generation: 0,
@@ -235,6 +314,8 @@ impl Io {
                 }
             }; SLOTS],
             interfaces: AtomicU8::new(0),
+            desktop: AtomicBool::new(false),
+            budget: compiled_budget(budget),
             reconnect: Signal::new(),
             #[cfg(feature = "gamepad")]
             outputs: outputs::Outputs::new(),
@@ -242,6 +323,7 @@ impl Io {
     }
     /// Set the allocation before starting the owner and when rebuilding USB.
     pub fn set_topology(&self, topology: Topology) {
+        self.desktop.store(topology.desktop, Ordering::Relaxed);
         self.set_interfaces(topology.interfaces);
         #[cfg(feature = "gamepad")]
         self.outputs.enumerate(topology.gamepads);
@@ -250,6 +332,7 @@ impl Io {
     }
     pub fn topology(&self) -> Topology {
         Topology {
+            desktop: self.desktop.load(Ordering::Relaxed),
             interfaces: self.interfaces(),
             #[cfg(feature = "gamepad")]
             gamepads: self.outputs.plan(),
@@ -380,7 +463,7 @@ impl<'a> Buffers<'a> {
 }
 pub struct Usb<'d, D: Driver<'d>> {
     device: UsbDevice<'d, serial::SessionDriver<'d, D>>,
-    hid: hid::HidWriter<'d, serial::SessionDriver<'d, D>, 69>,
+    hid: Option<hid::HidWriter<'d, serial::SessionDriver<'d, D>, 69>>,
     tx: cdc_acm::Sender<'d, serial::SessionDriver<'d, D>>,
     rx: cdc_acm::Receiver<'d, serial::SessionDriver<'d, D>>,
     io: &'d Io,
@@ -414,6 +497,12 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         config.max_power = 100;
         buffers.serial_number.bytes[..16].copy_from_slice(serial.as_bytes());
         buffers.serial_number.bytes[16..].copy_from_slice(configuration::VIAL_SERIAL_SUFFIX);
+        // A malformed startup allocation must still expose the management port.
+        let topology = if topology.fits(io.budget) {
+            topology
+        } else {
+            Topology::default()
+        };
         io.set_topology(topology);
         let mut builder = Builder::new(
             serial::SessionDriver { driver, io },
@@ -427,18 +516,20 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         builder.handler(&mut buffers.serial_number);
         builder.handler(&mut buffers.bus_handler);
         let cdc = cdc_acm::CdcAcmClass::new(&mut builder, &mut buffers.cdc, 64);
-        let hid = hid::HidWriter::new(
-            &mut builder,
-            &mut buffers.hid,
-            hid::Config {
-                report_descriptor: descriptor::REPORT_DESCRIPTOR,
-                request_handler: Some(&mut buffers.report_handler),
-                poll_ms: 1,
-                max_packet_size: 64,
-                hid_subclass: hid::HidSubclass::Boot,
-                hid_boot_protocol: hid::HidBootProtocol::Keyboard,
-            },
-        );
+        let hid = topology.desktop.then(|| {
+            hid::HidWriter::new(
+                &mut builder,
+                &mut buffers.hid,
+                hid::Config {
+                    report_descriptor: descriptor::REPORT_DESCRIPTOR,
+                    request_handler: Some(&mut buffers.report_handler),
+                    poll_ms: 1,
+                    max_packet_size: 64,
+                    hid_subclass: hid::HidSubclass::Boot,
+                    hid_boot_protocol: hid::HidBootProtocol::Keyboard,
+                },
+            )
+        });
         #[cfg(feature = "gamepad")]
         let (gamepads, receiver) = {
             assert!(topology.gamepads.hid_gamepads <= 4);
@@ -520,7 +611,11 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
                     }
                 }))
             },
-            desktop::run(hid, io),
+            async {
+                if let Some(hid) = hid {
+                    desktop::run(hid, io).await;
+                }
+            },
             async {
                 loop {
                     let packet = io.serial_tx.receive().await;

@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
+import { resource } from "../../shared/capacity.ts";
 import { canEnable, copyName, interfaceName, profileName, profileText } from "../../shared/profiles.ts";
 import type { AdapterEntry, AdapterStatus, DeviceEntry, InterfaceChange, InterfaceState, Profile, RoleName } from "../../shared/state.ts";
 import { READ_FAILED, ROLES, memoryPercent } from "../../shared/text.ts";
@@ -19,10 +20,6 @@ import {
   RefreshIcon,
   TrashIcon,
 } from "./icons.tsx";
-
-/** Shown before saving changes that reconnect the adapter's USB. */
-export const RECONNECT_TITLE = "USB Reconnect Required";
-export const RECONNECT_TEXT = "The adapter will disconnect from this computer for a moment after it saves these changes.";
 
 const ROLE_ICONS: Record<RoleName, (props: { size?: number }) => React.ReactNode> = {
   keyboard: KeyboardIcon,
@@ -240,7 +237,7 @@ export function ProfileMemory({ status }: { status: AdapterStatus }) {
           <span>In Use</span>
           <span className="value">{percent}%</span>
         </div>
-        <Meter fraction={percent / 100} low={percent >= 85} />
+        <Meter fraction={percent / 100} low={status.errors.includes("profile_memory_low")} />
       </div>
     </Card>
   );
@@ -319,7 +316,7 @@ export function ConfigurationInterfaces({ adapter, interfaces, changed, locked, 
         const staged = changed[i.interface];
         return (
           <Row key={i.interface} title={name}>
-            {staged ? <Staged label={name} /> : null}
+            {staged ? <Staged label={name} /> : i.enabled && !i.active ? <span className="muted small">Inactive</span> : null}
             <button aria-label={`${name} Profile`} aria-haspopup="dialog" disabled={locked} onClick={() => setPicking(i)}>
               {i.profile ? profileText(adapter, i.profile) : "Choose Profile"}
             </button>
@@ -359,6 +356,7 @@ export function DeviceLayers({ entry, adapter, layers, changed, locked, onChange
   const [adding, setAdding] = useState(false);
   const support = adapter?.status?.profileSupport;
   if (!adapter || !support || entry.device.profiles === null) return null;
+  const maxLayers = resource(support.resources, "layers")?.limit ?? null;
   const move = (from: number, to: number) => {
     const next = [...layers];
     next.splice(to, 0, ...next.splice(from, 1));
@@ -392,7 +390,7 @@ export function DeviceLayers({ entry, adapter, layers, changed, locked, onChange
         </div>
       ) : null}
       <div className="group-footer">
-        <button disabled={locked || layers.length >= support.maxLayers} onClick={() => setAdding(true)}>
+        <button disabled={locked || (maxLayers !== null && layers.length >= maxLayers)} onClick={() => setAdding(true)}>
           <PlusIcon /> Add Profile
         </button>
       </div>

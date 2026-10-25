@@ -247,6 +247,24 @@ static void saved_ble_layout_admits_input_at_reencryption(void) {
     cordial_profiles_poll(2);
     assert(!cordial_by_id(id) && !owner);
 }
+static void adopted_pairing_reserve_accepts_reencryption(void) {
+    cordial_peer peer = saved_ble();
+    cordial_link id = {.slot=0,.generation=450};
+    cordial_connection *l = allocate(id, peer, true);
+    assert(l); l->handle=0x40; l->bonded=true; l->security_requested=true;
+    assert(cordial_profiles_adopt(id)==CORDIAL_OK);
+    key_size=16; event_count=0;
+    reencrypted(0x40);
+    assert(l->authenticated && !l->closing && l->pairing && l->adopted);
+    assert(cordial_profiles_reply(id,CORDIAL_CONFIRM,true,NULL)==CORDIAL_AUTHENTICATION);
+    uint8_t started[]={SM_EVENT_PAIRING_STARTED,9,0x40,0};
+    sm_handler(HCI_EVENT_PACKET,0,started,sizeof started);
+    assert(l->closing && l->error==CORDIAL_AUTHENTICATION);
+    uint8_t ended[]={HCI_EVENT_DISCONNECTION_COMPLETE,4,0,0x40,0,0x16};
+    packet_handler(HCI_EVENT_PACKET,0,ended,sizeof ended); cordial_profiles_poll(2);
+    assert(!cordial_by_id(id) && has_key(peer));
+    query=NONE;
+}
 // GATT results for the fake device below.
 static void uuid(uint8_t *out, uint16_t value) {
     uint8_t full[16]; uuid_add_bluetooth_prefix(full, value); reverse_128(full, out);
@@ -389,6 +407,7 @@ static void early_input_is_bounded_and_survives_queue_pressure(void) {
 static const uint8_t unnumbered[] = {0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0xc0};
 static const uint8_t numbered[] = {0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x04, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0xc0};
 static cordial_link classic_admission(uint8_t last) {
+    cordial_bond_clear();
     cordial_peer peer = { .transport = CORDIAL_CLASSIC, .address = {0x10, 0x20, 0x30, 0x40, 0x50, last} };
     link_key_t key = {7};
     gap_store_link_key_for_bd_addr(peer.address, key, AUTHENTICATED_COMBINATION_KEY_GENERATED_FROM_P256);
@@ -653,6 +672,7 @@ static void close_bounds_start_once(void) {
 // A Classic offer in an entry a BLE offer used does not inherit its
 // supervision timeout.
 static void incoming_entries_start_clean(void) {
+    cordial_bond_clear();
     incoming[0] = (cordial_incoming){ .attempt = 0, .peer = { .transport = CORDIAL_BLE }, .handle = 0x40,
         .supervision_ms = 2560 };
     cordial_peer peer = { .transport = CORDIAL_CLASSIC, .address = {0x10, 0x20, 0x30, 0x40, 0x50, 0x71} };
@@ -756,6 +776,7 @@ int main(void) {
     assert(listener);
     ready = true;
     saved_ble_layout_admits_input_at_reencryption();
+    adopted_pairing_reserve_accepts_reencryption();
     discovered_ble_layout_reports_its_table();
     saved_hash_is_checked_before_admission();
     security_failures_are_classified();

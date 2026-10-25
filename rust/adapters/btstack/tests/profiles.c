@@ -5,14 +5,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gap.h"
+#include "hci.h"
+static btstack_linked_list_t test_hci_connections;
+static bool use_test_hci_connections;
+static void test_connection_iterator(btstack_linked_list_iterator_t *it) {
+    if (use_test_hci_connections) btstack_linked_list_iterator_init(it, &test_hci_connections);
+    else hci_connections_get_iterator(it);
+}
 static unsigned scan_parameter_updates;
 static void test_scan_parameters(uint8_t type, uint16_t interval, uint16_t window) {
     scan_parameter_updates++;
     gap_set_scan_parameters(type, interval, window);
 }
 #define gap_set_scan_parameters test_scan_parameters
+#define hci_connections_get_iterator test_connection_iterator
 #include "../c/profiles.c"
 #undef gap_set_scan_parameters
+#undef hci_connections_get_iterator
 #include "runtime.h"
 static struct { uint32_t tag; unsigned len; uint8_t data[512]; } records[32];
 static int get(void *ctx,uint32_t tag,uint8_t *out,uint32_t n){
@@ -115,7 +124,7 @@ static void resolved_reports_keep_identity_and_private_address(void) {
         assert(last_event.length==3 && !memcmp(last_event.data,"Key",3));
         assert(last_event.peer.random==(type&1) && last_event.peer.address[0]==6);
         assert(last_event.address.random && last_event.address.address[0]==0x45);
-        assert(last_event.address.address[5]==9 && rpa_read==8 && !rpa_reports[0].used);
+        assert(last_event.address.address[5]==9 && rpa_read==NVM_NUM_DEVICE_DB_ENTRIES && !rpa_reports[0].used);
         for(unsigned failure=0;failure<3;failure++) {
             memset(&last_event,0,sizeof last_event);
             packet_handler(HCI_EVENT_PACKET,0,report,sizeof report);
@@ -126,7 +135,7 @@ static void resolved_reports_keep_identity_and_private_address(void) {
             if(failure==0) bad[5]=ERROR_CODE_UNKNOWN_CONNECTION_IDENTIFIER;
             if(failure==2) { rpa_reports[0].scan=3;bad[11]=0x45; }
             packet_handler(HCI_EVENT_PACKET,0,bad,sizeof bad);
-            assert(!last_event.kind && rpa_read==8 && !rpa_reports[0].used);
+            assert(!last_event.kind && rpa_read==NVM_NUM_DEVICE_DB_ENTRIES && !rpa_reports[0].used);
         }
     }
     uint8_t report[]={GAP_EVENT_ADVERTISING_REPORT,10,0,2,1,2,3,4,5,6,0xd0,0};
@@ -164,8 +173,10 @@ static void classic_security_waits_for_key_size_completion(void) {
     packet_handler(HCI_EVENT_PACKET,0,ready,sizeof ready);
     assert(last_event.kind==CORDIAL_SECURITY);
     assert(last_event.number==((15u<<16)|(16u<<8)|7u));
-    // Retire the test adapter link. The native mock is unused by subsequent cases.
-    memset(l,0,sizeof *l);
+    uint8_t disconnected[]={HCI_EVENT_DISCONNECTION_COMPLETE,4,0,0x31,0,0x16};
+    cordial_runtime_receive(HCI_EVENT_PACKET,disconnected,sizeof disconnected);
+    cordial_profiles_poll(0);
+    assert(!hci_connection_for_bd_addr_and_type(addr,BD_ADDR_TYPE_ACL) && !l->used);
 }
 static void security_pressure_retries_without_disconnecting(void) {
     cordial_peer peer={.transport=CORDIAL_CLASSIC,.address={4,3,2,1,0,9}};
@@ -209,6 +220,173 @@ static void peer_service_queries(void) {
     n = att_handle_request(&connection, write, sizeof write, response);
     assert(n == 5 && response[0] == ATT_ERROR_RESPONSE && response[4] == ATT_ERROR_WRITE_NOT_PERMITTED);
 }
+static void capacity_boundaries(void) {
+    assert(sizeof classic_descriptors == (CORDIAL_CLASSIC_CONNECTIONS + 1) * CORDIAL_DESCRIPTOR_BYTES);
+    memset(cordial_connections, 0, sizeof cordial_connections);
+    memset(incoming, 0, sizeof incoming);
+    cordial_bond_clear();
+    ready = true;
+    transport_enabled[0] = transport_enabled[1] = true;
+    unsigned slot = 0;
+    for (unsigned transport = 0; transport < 2; ++transport) {
+        unsigned capacity = cordial_bond_capacity(transport + 1);
+        assert(capacity == normal_limit(transport) + 1);
+        for (unsigned i = 0; i < capacity; ++i) {
+            uint8_t record[145] = {0};
+            record[8] = transport + 1; record[10] = transport + 1; record[15] = i + 1;
+            assert(cordial_bond_import(record, transport ? 145 : 34) >= 0);
+            uint8_t copy[145] = {0};
+            assert(cordial_bond_export(transport + 1, 0, record + 10, copy) == (transport ? 145 : 34));
+            assert(!memcmp(copy + 10, record + 10, 6));
+        }
+        uint8_t extra[145] = {0};
+        extra[8] = transport + 1; extra[15] = 240;
+        assert(cordial_bond_import(extra, transport ? 145 : 34) < 0);
+        for (unsigned i = 0; i < normal_limit(transport); ++i) {
+            cordial_peer peer = {.transport = transport, .address = {transport + 1, 0, 0, 0, 0, i + 1}};
+            cordial_connection *link = allocate((cordial_link){.slot=slot, .generation=1000+slot}, peer, false);
+            assert(link); slot++;
+        }
+        cordial_peer extra_peer = {.transport=transport,.address={240}};
+        assert(!allocate((cordial_link){.slot=slot,.generation=2000}, extra_peer, false));
+    }
+    cordial_peer snapshot[NVM_NUM_LINK_KEYS + NVM_NUM_DEVICE_DB_ENTRIES + 1];
+    memset(snapshot, 0xa5, sizeof snapshot);
+    unsigned capacity = NVM_NUM_LINK_KEYS + NVM_NUM_DEVICE_DB_ENTRIES;
+    assert(cordial_profiles_bonds(snapshot, capacity) == (int)capacity);
+    for (unsigned i = 0; i < sizeof(cordial_peer); ++i) assert(((uint8_t *)&snapshot[capacity])[i] == 0xa5);
+    memset(snapshot, 0xa5, sizeof snapshot);
+    assert(cordial_profiles_bonds(snapshot, 1) == -CORDIAL_CAPACITY);
+    for (unsigned i = 0; i < sizeof(cordial_peer); ++i) assert(((uint8_t *)&snapshot[1])[i] == 0xa5);
+    cordial_peer reconnect[CORDIAL_BLE_CONNECTIONS + 1];
+    for (unsigned i=0;i<CORDIAL_BLE_CONNECTIONS+1;++i)
+        reconnect[i]=(cordial_peer){.transport=CORDIAL_BLE,.address={2,0,0,0,0,i+1}};
+    assert(cordial_profiles_reconnect(reconnect, CORDIAL_BLE_CONNECTIONS)==CORDIAL_OK);
+    assert(cordial_profiles_reconnect(reconnect, CORDIAL_BLE_CONNECTIONS+1)==CORDIAL_CAPACITY);
+    assert(!accept_classic((bd_addr_t){1,0,0,0,0,CORDIAL_CLASSIC_CONNECTIONS+1}, HCI_LINK_TYPE_ACL));
+    cordial_peer candidate={.transport=CORDIAL_BLE,.address={241}};
+    assert(slot==CORDIAL_LINKS-1);
+    cordial_connection *pair=allocate((cordial_link){.slot=slot,.generation=3000},candidate,true);
+    assert(pair && normal_links(CORDIAL_BLE)==CORDIAL_BLE_CONNECTIONS);
+    assert(!allocate((cordial_link){.slot=slot,.generation=3001},(cordial_peer){.transport=CORDIAL_CLASSIC,.address={242}},true));
+    memset(cordial_connections, 0, sizeof cordial_connections);
+    cordial_bond_clear();
+}
+
+static void pairing_preserves_normal_capacity(void) {
+    reconnect_count = 0;
+    for (unsigned transport = 0; transport < 2; ++transport) {
+        memset(cordial_connections, 0, sizeof cordial_connections);
+        memset(incoming, 0, sizeof incoming);
+        cordial_bond_clear();
+        ready = true;
+        unsigned limit = normal_limit(transport);
+        for (unsigned i = 0; i < limit - 1; ++i)
+            assert(allocate((cordial_link){.slot=i, .generation=4000+i},
+                (cordial_peer){.transport=transport, .address={1,0,0,0,0,i+1}}, false));
+        cordial_peer peer = {.transport=transport, .address={2}};
+        cordial_connection *pair = allocate((cordial_link){.slot=limit-1, .generation=5000}, peer, true);
+        assert(pair);
+        assert(!allocate((cordial_link){.slot=limit, .generation=5001},
+            (cordial_peer){.transport=1-transport, .address={3}}, true));
+        cordial_peer last = {.transport=transport, .address={4}};
+        if (transport == CORDIAL_BLE) {
+            reconnect_peers[0] = last; reconnect_count = 1;
+            auto_dirty = true; auto_consumed = false;
+            resume_radio();
+            assert(ready && auto_active);
+            assert(!gap_connect_cancel()); auto_active = false;
+        }
+        cordial_connection *normal = allocate((cordial_link){.slot=limit, .generation=5002}, last, false);
+        assert(normal && normal_links(transport) == limit);
+        if (transport == CORDIAL_BLE) {
+            resume_radio();
+            assert(!auto_active);
+            reconnect_count = 0;
+        }
+        cordial_peer extra = {.transport=transport, .address={5}};
+        cordial_link extra_id = {.slot=limit+1, .generation=5003};
+        assert(!allocate(extra_id, extra, false));
+        cordial_profiles_disconnect(normal->id);
+        assert(normal->used && normal->closing && !allocate(extra_id, extra, false));
+        cordial_profiles_poll(now_ms);
+        assert(!normal->used);
+        // A saved non-resident bond retains the reserve through physical teardown.
+        uint8_t record[145] = {0};
+        record[8] = transport + 1;
+        memcpy(record + 10, peer.address, 6);
+        if (transport == CORDIAL_BLE) { record[81] = 1; record[82] = 16; }
+        assert(cordial_bond_import(record, transport ? 145 : 34) >= 0);
+        pair->bonded = true;
+        assert(cordial_profiles_adopt(pair->id) == CORDIAL_OK);
+        assert(pair->adopted && pair->pairing && normal_links(transport) == limit - 1);
+        cordial_profiles_disconnect(pair->id);
+        if (transport == CORDIAL_CLASSIC) {
+            memcpy(record + 10, extra.address, 6);
+            assert(cordial_bond_import(record, 34) >= 0);
+            assert(accept_classic(extra.address, HCI_LINK_TYPE_ACL));
+        }
+        normal = allocate(extra_id, extra, false);
+        assert(normal && normal_links(transport) == limit);
+        assert(!allocate((cordial_link){.slot=limit+2,.generation=5004}, last, false));
+        if (transport == CORDIAL_CLASSIC) {
+            memcpy(record + 10, last.address, 6);
+            assert(cordial_bond_import(record, 34) >= 0);
+            assert(!accept_classic(last.address, HCI_LINK_TYPE_ACL));
+        }
+        cordial_profiles_poll(now_ms);
+        assert(!pair->used && has_key(peer) && normal_links(transport) == limit);
+        cordial_profiles_disconnect(normal->id);
+        cordial_profiles_poll(now_ms);
+        // Only promotion transfers an adopted link to the normal allowance.
+        pair = allocate((cordial_link){.slot=limit-1,.generation=5005}, peer, true);
+        assert(pair); pair->bonded = true;
+        assert(cordial_profiles_adopt(pair->id) == CORDIAL_OK);
+        cordial_profiles_promote(pair->id);
+        assert(!pair->pairing && pair->adopted && normal_links(transport) == limit);
+        cordial_profiles_disconnect(pair->id);
+        assert(!allocate(extra_id, extra, false));
+        cordial_profiles_poll(now_ms);
+        assert(has_key(peer) && allocate(extra_id, extra, false));
+    }
+    memset(cordial_connections, 0, sizeof cordial_connections);
+    cordial_bond_clear();
+}
+
+static void pending_classic_reserves_normal_capacity(void) {
+    memset(cordial_connections, 0, sizeof cordial_connections);
+    use_test_hci_connections = true;
+    hci_connection_t acl[CORDIAL_CLASSIC_CONNECTIONS + 1] = {0};
+    for (unsigned i = 0; i < CORDIAL_CLASSIC_CONNECTIONS + 1; ++i) {
+        acl[i].address_type = BD_ADDR_TYPE_ACL;
+        acl[i].address[0] = i + 1;
+        btstack_linked_list_add_tail(&test_hci_connections, (btstack_linked_item_t *)&acl[i]);
+    }
+    cordial_peer paired = {.transport=CORDIAL_CLASSIC, .address={1}};
+    cordial_connection *pair = allocate((cordial_link){.slot=0, .generation=6000}, paired, true);
+    assert(pair);
+    cordial_peer peer = {.transport=CORDIAL_CLASSIC, .address={2}};
+    uint8_t record[34] = {0};
+    record[8] = 1; memcpy(record + 10, peer.address, 6);
+    assert(cordial_bond_import(record, sizeof record) >= 0);
+    // The candidate's pending ACL transfers to normal ownership without double counting.
+    assert(accept_classic(peer.address, HCI_LINK_TYPE_ACL));
+    assert(allocate((cordial_link){.slot=1, .generation=6001}, peer, false));
+    cordial_peer extra = {.transport=CORDIAL_CLASSIC, .address={42}};
+    record[10] = 42;
+    assert(cordial_bond_import(record, sizeof record) >= 0);
+    assert(!accept_classic(extra.address, HCI_LINK_TYPE_ACL));
+    assert(!allocate((cordial_link){.slot=2, .generation=6002}, extra, false));
+    // Unowned ACLs awaiting teardown continue to reserve normal places.
+    btstack_linked_list_remove(&test_hci_connections, (btstack_linked_item_t *)&acl[CORDIAL_CLASSIC_CONNECTIONS]);
+    assert(accept_classic(extra.address, HCI_LINK_TYPE_ACL));
+    assert(allocate((cordial_link){.slot=2, .generation=6002}, extra, false));
+    test_hci_connections = NULL;
+    use_test_hci_connections = false;
+    memset(cordial_connections, 0, sizeof cordial_connections);
+    cordial_bond_clear();
+}
+
 int main(void){
     cordial_runtime_callbacks cb={.time_ms=time_cb,.wake=wake_cb,.fatal=fatal_cb,.can_send=can_send_cb,.send=send_cb};
     btstack_tlv_t tlv={.get_tag=get,.store_tag=save,.delete_tag=del};
@@ -316,5 +494,8 @@ int main(void){
     assert(!retried->closing);
     finish(retried);
     finish(other);
+    capacity_boundaries();
+    pairing_preserves_normal_capacity();
+    pending_classic_reserves_normal_capacity();
     puts("Native profile callback regressions passed");
 }

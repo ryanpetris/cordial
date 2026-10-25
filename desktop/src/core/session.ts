@@ -1,42 +1,27 @@
 // One adapter's session: a Connection and the adapter's state, kept current
 // from responses and events in the order the adapter sent them. Each device
-// record and profile arrives whole, so the latest one wins. Each page of a
-// listing replaces what was known in the range of keys it covers, and settings
-// and warning events carry only changes, which are merged into what has been
-// listed. A successful change command means the adapter saved exactly what was
-// sent, so its values are applied here without reading them back. Opening
+// record, profile and settings object arrives whole, so the latest one wins.
+// Each page of a listing replaces what was known in the range of keys it
+// covers, and settings events replace or remove only the objects they name. A
+// successful change command means the adapter saved exactly what was sent, so
+// its values are applied here without reading them back. Opening
 // reads every page of devices and, when the adapter has profiles, the first
-// page of profiles, then each device's warnings and settings. Profiles are
+// page of profiles, then each device's settings. Profiles are
 // shown a page at a time; profiles in a device's layers or selected by a
 // configuration interface that no page has shown are named with GetProfile.
-import { create } from "@bufbuild/protobuf";
 import {
   Connection,
   ConnectionClosedError,
   CordialError,
   UnexpectedResponseError,
-  compareSettingRefs,
+  compareSettingsRefs,
   entryId,
-  compareWarnings,
-  settingRef,
+  settingsRef,
   type ByteStream,
 } from "@cordial/client";
-import {
-  ErrorCode,
-  OutputMode,
-  Platform,
-  SettingSchema,
-  SettingState,
-  type DeviceWarning as WireWarning,
-  type Event,
-  type Request,
-  type Response,
-  type Setting as WireSetting,
-  type SetAdapter,
-  type SetDevice,
-  type SetSettings,
-} from "@cordial/protocol";
-import type { AdapterStatus, DeviceRecord, DeviceWarning, Profile, ProfilePage, Setting } from "../shared/state.ts";
+import { ErrorCode, OutputMode, Platform, type Event, type Request, type Response, type SetAdapter, type SetDevice, type SettingsObject } from "@cordial/protocol";
+import type { AdapterStatus, DeviceRecord, Profile, ProfilePage, Setting, SettingsChange } from "../shared/state.ts";
+import { sameField } from "../shared/settings.ts";
 import { READ_FAILED, asSentence, errorText } from "../shared/text.ts";
 import * as convert from "./convert.ts";
 
@@ -57,45 +42,30 @@ export const failure = (error: unknown, read = false) =>
   error instanceof CordialError && read && error.code === ErrorCode.STORAGE_FAILED ? READ_FAILED
   : error instanceof CordialError ? errorText(convert.wireError(error))
     : error instanceof ConnectionClosedError
-      ? read ? "The adapter disconnected before it answered." : "The adapter disconnected before the change finished."
+      ? read ? "The adapter disconnected before it answered." : "The adapter couldn't confirm whether the change was saved."
       : error instanceof UnexpectedResponseError ? "The adapter returned an unexpected result."
       : asSentence((error as Error).message);
 
 /** Whether `id` is in the range a page read after `after` covers, up to `next` (0 ends the listing). */
 const inPage = (id: number, after: number, next: number) => id > after && (next === 0 || id <= next);
 
-/**
- * Replaces the entries of `list` in the range of keys a page covers, after `after` (undefined from
- * the start) up to the page's last entry, or to the end of the listing when `end` is set, with the
- * page's entries, keeping the listing's order.
- */
-function mergePage<E, K>(list: E[], page: E[], after: K | undefined, end: boolean, key: (e: E) => K, compare: (a: K, b: K) => number): E[] {
-  const last = page.at(-1);
-  const hi = end || last === undefined ? undefined : key(last);
-  const covered = (e: E) => (after === undefined || compare(key(e), after) > 0) && (hi === undefined || compare(key(e), hi) <= 0);
-  return [...list.filter((e) => !covered(e)), ...page].sort((a, b) => compare(key(a), key(b)));
+/** The settings listed after a page of objects read after `after` (undefined from the start):
+ * the page's objects replace those in the range it covers, up to its last object, or to the end of
+ * the listing when `end` is set. */
+function mergeSettings(list: Setting[], page: SettingsObject[], after: Parameters<typeof compareSettingsRefs>[0] | undefined, end: boolean): Setting[] {
+  const hi = end ? undefined : page.map(settingsRef).findLast((r) => r !== undefined);
+  // A page without an object this app can name that doesn't end the listing covers nothing.
+  if (!end && hi === undefined) return list;
+  const covered = (s: Setting) => {
+    const ref = convert.objectRef(s);
+    return (after === undefined || compareSettingsRefs(ref, after) > 0) && (hi === undefined || compareSettingsRefs(ref, hi) <= 0);
+  };
+  return [...list.filter((s) => !covered(s)), ...convert.settings(page)].sort(convert.compareSettings);
 }
 
-/** A setting as the adapter would list it after SetSettings saved or forgot `change`'s value. */
-function changedSetting(s: WireSetting, change: SetSettings["changes"][number]): WireSetting {
-  const next = create(SettingSchema, s);
-  const t = next.type;
-  const c = change.change;
-  if (c.case === "forget") {
-    if (t.case) t.value.saved = undefined;
-    next.status = { case: undefined };
-    return next;
-  }
-  const v = c.value?.value;
-  if (!v) return next;
-  if (t.case === "bool" && v.case === "bool") t.value.saved = v.value;
-  else if (t.case === "integer" && v.case === "integer") t.value.saved = v.value;
-  else if ((t.case === "enum" || t.case === "text") && v.case === "text") t.value.saved = v.value;
-  else if (t.case === "color" && v.case === "color") t.value.saved = v.value;
-  else return next;
-  next.status = { case: "state", value: SettingState.PENDING };
-  return next;
-}
+/** A setting as the adapter lists it after SetSettings saved or forgot `change`'s value. */
+const changedSetting = (s: Setting, change: SettingsChange): Setting =>
+  change.type === "forget" ? { ...s, saved: null, state: null, error: null } : { ...s, saved: change.value, state: "pending", error: null };
 
 /** Which list of profiles a page belongs to: the adapter's Profiles list, or the profile picker,
  * which pages on its own. */
@@ -129,14 +99,9 @@ function inactiveAfter(d: DeviceRecord): DeviceRecord["inactive"] {
 export class AdapterSession {
   status: AdapterStatus;
   readonly devices = new Map<number, DeviceRecord>();
-  /** What has been listed and reported of each device's settings and warnings, in the adapter's
-   * order; `settings` and `warnings` are made from them. */
-  readonly #wireSettings = new Map<number, WireSetting[]>();
-  readonly #wireWarnings = new Map<number, WireWarning[]>();
+  /** What has been listed and reported of each device's settings, in the adapter's order. */
   readonly settings = new Map<number, Setting[]>();
   readonly settingsErrors = new Map<number, string>();
-  readonly warnings = new Map<number, DeviceWarning[]>();
-  readonly warningsErrors = new Map<number, string>();
   /** Every page of devices has been read. */
   listed = false;
   /** Profiles seen this session, by ID. */
@@ -214,7 +179,7 @@ export class AdapterSession {
     return [...(this.#pending.get(id) ?? [])];
   }
 
-  /** Reads every page of devices, then each device's warnings and settings (single flight). */
+  /** Reads every page of devices, then each device's settings (single flight). */
   #sync() {
     if (this.#syncing) {
       this.#syncAgain = true;
@@ -233,7 +198,7 @@ export class AdapterSession {
             if (this.#pages.picker) await this.readPage("again", "picker");
             await this.#nameReferences();
           }
-          for (const id of [...this.devices.keys()]) await this.#readLists(id);
+          for (const id of [...this.devices.keys()]) await this.#readSettings(id);
         } catch (error) {
           if (this.closed) break;
           this.#hooks.log(`listing devices failed: ${failure(error, true)}`);
@@ -331,30 +296,23 @@ export class AdapterSession {
     }
   }
 
-  async #readLists(id: number) {
-    if (!this.devices.has(id) || this.closed) return;
-    await this.#connection.listAllWarnings(id).then(
-      () => this.warningsErrors.delete(id),
-      (error: unknown) => this.#readFailed(id, this.warningsErrors, "warnings", error),
-    );
+  async #readSettings(id: number) {
     if (!this.devices.has(id) || this.closed) return;
     await this.#connection.listAllSettings(id).then(
       () => this.settingsErrors.delete(id),
-      (error: unknown) => this.#readFailed(id, this.settingsErrors, "settings", error),
+      (error: unknown) => {
+        if (this.closed || !this.devices.has(id)) return;
+        const reason = failure(error, true);
+        this.#hooks.log(`settings of ${id} unavailable: ${reason}`);
+        this.settingsErrors.set(id, reason);
+      },
     );
     this.#hooks.changed();
   }
 
-  #readFailed(id: number, errors: Map<number, string>, what: string, error: unknown) {
-    if (this.closed || !this.devices.has(id)) return;
-    const reason = failure(error, true);
-    this.#hooks.log(`${what} of ${id} unavailable: ${reason}`);
-    errors.set(id, reason);
-  }
-
-  /** Reads a device's warning and settings lists again, as after a failed read. */
+  /** Reads a device's settings list again, as after a failed read. */
   reload(id: number) {
-    void this.#readLists(id);
+    void this.#readSettings(id);
   }
 
   // ---- State --------------------------------------------------------------
@@ -392,17 +350,9 @@ export class AdapterSession {
         this.#putDevice(convert.device(result.value), false);
         break;
       case "settings": {
-        const { device, settings, end } = result.value;
+        const { device, objects, end } = result.value;
         if (!this.devices.has(device) || command.case !== "listSettings") break;
-        const after = command.value.after;
-        this.#putSettings(device, mergePage(this.#wireSettings.get(device) ?? [], settings, after, end, settingRef, compareSettingRefs));
-        break;
-      }
-      case "warnings": {
-        const { device, warnings, end } = result.value;
-        if (!this.devices.has(device) || command.case !== "listWarnings") break;
-        const after = command.value.after;
-        this.#putWarnings(device, mergePage(this.#wireWarnings.get(device) ?? [], warnings, after, end, (w) => w, compareWarnings));
+        this.settings.set(device, mergeSettings(this.settings.get(device) ?? [], objects, command.value.after, end));
         break;
       }
       case "profile":
@@ -431,10 +381,11 @@ export class AdapterSession {
         break;
       case "setSettings": {
         const { device, changes } = command.value;
-        const list = this.#wireSettings.get(device);
+        const list = this.settings.get(device);
         if (!list || !this.devices.has(device)) break;
-        const next = list.map((s) => changes.reduce((x, c) => (compareSettingRefs(settingRef(c), settingRef(x)) === 0 ? changedSetting(x, c) : x), s));
-        this.#putSettings(device, next);
+        // In order, so the last change to each field wins.
+        const applied = changes.flatMap(convert.updateChanges);
+        this.settings.set(device, list.map((s) => applied.reduce((x, c) => (sameField(c.setting, x) ? changedSetting(x, c) : x), s)));
         break;
       }
     }
@@ -480,16 +431,6 @@ export class AdapterSession {
     void this.#nameReferences();
   }
 
-  #putSettings(device: number, list: WireSetting[]) {
-    this.#wireSettings.set(device, list);
-    this.settings.set(device, convert.settings(list));
-  }
-
-  #putWarnings(device: number, list: WireWarning[]) {
-    this.#wireWarnings.set(device, list);
-    this.warnings.set(device, list.map(convert.warning));
-  }
-
   #event(event: Event) {
     const kind = event.kind;
     switch (kind.case) {
@@ -510,18 +451,10 @@ export class AdapterSession {
       case "settingsChanged": {
         const { device, changed, removed } = kind.value;
         if (!this.devices.has(device)) break;
-        const touched = (s: WireSetting) => changed.some((c) => compareSettingRefs(settingRef(c), settingRef(s)) === 0) || removed.some((r) => compareSettingRefs(r, settingRef(s)) === 0);
-        const list = (this.#wireSettings.get(device) ?? []).filter((s) => !touched(s));
-        this.#putSettings(device, [...list, ...changed].sort((a, b) => compareSettingRefs(settingRef(a), settingRef(b))));
-        break;
-      }
-      case "warningsChanged": {
-        const { device, added, removed } = kind.value;
-        if (!this.devices.has(device)) break;
-        // Warnings are a set: adding one already listed, or removing one never listed, changes nothing.
-        const list = (this.#wireWarnings.get(device) ?? []).filter((w) => !removed.some((r) => compareWarnings(r, w) === 0));
-        for (const w of added) if (!list.some((x) => compareWarnings(x, w) === 0)) list.push(w);
-        this.#putWarnings(device, list.sort(compareWarnings));
+        // A changed object replaces every field of the object with its identity, saved ones included.
+        const refs = [...changed.flatMap((o) => settingsRef(o) ?? []), ...removed];
+        const list = (this.settings.get(device) ?? []).filter((s) => !refs.some((r) => convert.inObject(s, r)));
+        this.settings.set(device, [...list, ...convert.settings(changed)].sort(convert.compareSettings));
         break;
       }
       case "profile":
@@ -583,19 +516,15 @@ export class AdapterSession {
   #putDevice(device: DeviceRecord, event: boolean) {
     const known = this.devices.has(device.id);
     this.devices.set(device.id, device);
-    // A newly paired device's lists are read once; events keep them current.
-    if (!known && event && this.listed) void this.#readLists(device.id);
+    // A newly paired device's settings are read once; events keep them current.
+    if (!known && event && this.listed) void this.#readSettings(device.id);
     void this.#nameReferences();
   }
 
   #remove(id: number) {
     this.devices.delete(id);
     this.settings.delete(id);
-    this.#wireSettings.delete(id);
     this.settingsErrors.delete(id);
-    this.warnings.delete(id);
-    this.#wireWarnings.delete(id);
-    this.warningsErrors.delete(id);
   }
 
   /** Ends the session; the adapter stops any scan and unsaved pairing. */

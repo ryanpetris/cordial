@@ -16,9 +16,7 @@
 //! data. Input waits for one step at a time. A step that wrote flash is followed by a rest at least
 //! as long as the step took, so input keeps at least half the time while writes continue.
 use crate::{HidTx, Io, RawPacket, SerialRx, SerialTx, Status, Topology};
-use cordial_core::{
-    application::Application, bluetooth::EventSource, interfaces, storage::RecordStore,
-};
+use cordial_core::{application::Application, bluetooth::EventSource, storage::RecordStore};
 use cordial_protocol::{Request, frame::DELIMITER};
 use core::cell::Cell;
 use embassy_futures::select::select;
@@ -59,7 +57,9 @@ pub struct Owner<'a, S, B> {
     rested: blocking_mutex::Mutex<NoopRawMutex, Cell<u64>>,
 }
 impl<'a, S: RecordStore, B: EventSource> Owner<'a, S, B> {
-    pub fn new(io: &'a Io, app: Application, store: S, radio: B) -> Self {
+    pub fn new(io: &'a Io, mut app: Application, store: S, radio: B) -> Self {
+        app.manager.usb_budget = io.budget;
+        app.set_usb_topology(io.topology());
         Self {
             io,
             shared: Mutex::new(Shared { app, store, radio }),
@@ -167,7 +167,9 @@ impl<'a> Priority<'a> {
             self.hid_since = None;
             app.manager.forward.resync();
         }
-        app.manager.forward.enable(status.input_ready());
+        app.manager
+            .forward
+            .enable(status.input_ready() && self.io.topology().desktop);
         self.seen = status;
         while let Ok(done) = self.io.hid_done.try_receive() {
             if self.hid_pending == Some((done.generation, done.sequence)) {
@@ -186,6 +188,7 @@ impl<'a> Priority<'a> {
             .outputs
             .publish(status.generation, app.gamepad_outputs());
         if status.input_ready()
+            && self.io.topology().desktop
             && self.hid_pending.is_none()
             && !self.io.hid_tx.is_full()
             && let Some(packet) = app.manager.forward.packet()
@@ -222,7 +225,9 @@ pub struct Secondary<'a> {
     offset: usize,
     /// The configuration interface set last requested from USB.
     interfaces: u8,
-    gamepads: cordial_core::outputs::Plan,
+    topology: Topology,
+    drain_since: Option<u64>,
+    editor_profile: Option<Option<u64>>,
 }
 impl<'a> Secondary<'a> {
     /// `interfaces` is the configuration interface set USB started with.
@@ -235,7 +240,12 @@ impl<'a> Secondary<'a> {
             input: None,
             offset: 0,
             interfaces,
-            gamepads: io.topology().gamepads,
+            topology: Topology {
+                interfaces,
+                ..io.topology()
+            },
+            drain_since: None,
+            editor_profile: None,
         }
     }
     /// Follows the serial port opening and closing. A command in progress belongs to the session
@@ -264,6 +274,24 @@ impl<'a> Secondary<'a> {
     ) {
         self.sync(shared);
         let Shared { app, store, radio } = shared;
+        let editor_profile = app
+            .manager
+            .preference
+            .configuration_interfaces
+            .iter()
+            .find(|p| p.enabled && p.interface.bit() & self.interfaces != 0)
+            .and_then(|p| p.profile);
+        if self
+            .editor_profile
+            .is_some_and(|previous| previous != editor_profile)
+        {
+            // Queued writes target the profile selected when the host submitted them.
+            for raw in &self.io.raw {
+                raw.rx.clear();
+                raw.tx.clear();
+            }
+        }
+        self.editor_profile = Some(editor_profile);
         let session = self.seen.session;
         while let Ok(done) = self.io.serial_done.try_receive() {
             if done.session == session {
@@ -276,15 +304,19 @@ impl<'a> Secondary<'a> {
             }
         }
         // Enumerating again goes before anything that could queue more output.
-        if self.reconnect_due(app) {
+        app.manager.usb_budget = self.io.budget;
+        app.set_usb_topology(self.io.topology());
+        if self.reconnect_due(app, now) {
             app.save_all(store, now).await;
-            self.reconnect(app);
+            self.reconnect(app, radio);
             return;
         }
         if app.command_pending() {
             app.proceed(store, radio, now).await;
         } else if app.save(store, now).await {
             // The step wrote a deferred save.
+        } else if self.drain_since.is_some() {
+            // Drain the durable response without accepting more work from the host.
         } else if let Some(request) = self.read(app) {
             app.begin(request, store, radio, now).await;
         } else if !self.edit(app, store, now).await {
@@ -312,25 +344,6 @@ impl<'a> Secondary<'a> {
         }
         request
     }
-    /// The configuration interfaces the saved preference enables.
-    fn wanted(app: &Application) -> u8 {
-        if app.manager.profiles_supported() {
-            interfaces::enabled(&app.manager.preference.configuration_interfaces)
-        } else {
-            0
-        }
-    }
-    fn wanted_gamepads(app: &Application) -> cordial_core::outputs::Plan {
-        #[cfg(feature = "gamepad")]
-        {
-            app.manager.outputs.plan()
-        }
-        #[cfg(not(feature = "gamepad"))]
-        {
-            let _ = app;
-            Default::default()
-        }
-    }
     /// Answers one configuration editor packet. Returns whether there was one.
     async fn edit<S: RecordStore>(
         &mut self,
@@ -347,8 +360,7 @@ impl<'a> Secondary<'a> {
                 continue;
             };
             let bytes = if packet.generation == status.generation
-                && !app.usb_reconnect
-                && Self::wanted(app) == self.interfaces
+                && app.manager.usb_allocation().topology == self.topology
                 && self.io.interfaces() == self.interfaces
                 && self.io.slot(slot) == Some(packet.interface)
             {
@@ -368,29 +380,32 @@ impl<'a> Secondary<'a> {
         }
         false
     }
-    /// Saved interfaces are known once storage is ready. USB enumerates again only when they
-    /// differ from the exposed set or the application requests it, once no command is in progress
-    /// and its output has been sent.
-    fn reconnect_due(&self, app: &Application) -> bool {
-        app.manager.storage_ready
-            && (Self::wanted(app) != self.interfaces
-                || Self::wanted_gamepads(app) != self.gamepads
-                || app.usb_reconnect)
-            && !app.command_pending()
-            && app.serial.queued() == 0
-            && !self.serial_pending
+    /// A stalled CDC reader cannot hold up USB reconfiguration indefinitely. The deadline starts
+    /// after the pending command responds and is unaffected by subsequent traffic or changes.
+    fn reconnect_due(&mut self, app: &Application, now: u64) -> bool {
+        if !app.manager.storage_ready || app.manager.usb_allocation().topology == self.topology {
+            self.drain_since = None;
+            return false;
+        }
+        if app.command_pending() {
+            return false;
+        }
+        let since = *self.drain_since.get_or_insert(now);
+        (app.serial.queued() == 0 && !self.serial_pending)
+            || now.saturating_sub(since) >= RESPONSE_DRAIN_MS
     }
-    /// Asks USB to enumerate again with the interfaces the saved preference enables.
-    fn reconnect(&mut self, app: &mut Application) {
-        let wanted = Self::wanted(app);
-        self.interfaces = wanted;
-        app.usb_reconnect = false;
+    fn reconnect<B: EventSource>(&mut self, app: &mut Application, radio: &mut B) {
+        self.topology = app.manager.usb_allocation().topology;
+        self.interfaces = self.topology.interfaces;
+        self.drain_since = None;
         self.io.reset(false);
-        self.gamepads = Self::wanted_gamepads(app);
-        self.io.reconnect.signal(Topology {
-            interfaces: wanted,
-            gamepads: self.gamepads,
-        });
+        app.session(false, radio);
+        self.input = None;
+        self.offset = 0;
+        self.serial_pending = false;
+        self.separator = false;
+        self.seen = self.io.status();
+        self.io.reconnect.signal(self.topology);
     }
     /// Hands the next chunk of serial output to USB, while the application follows the session
     /// USB has open.
@@ -424,3 +439,6 @@ impl<'a> Secondary<'a> {
         }
     }
 }
+
+/// Normal CDC replies drain first; an unread endpoint delays reconfiguration by at most 100 ms.
+pub const RESPONSE_DRAIN_MS: u64 = 100;

@@ -109,36 +109,28 @@ pub fn profile_entry_id(entry: &p::ProfileListEntry) -> u32 {
     }
 }
 
-/// What identifies a setting.
-pub fn setting_ref(setting: &p::Setting) -> p::SettingRef {
-    p::SettingRef {
-        integration: setting.integration,
-        key: setting.key.clone(),
+/// What identifies a complete settings object. An unknown group has no usable identity.
+pub fn settings_ref(object: &p::SettingsObject) -> p::SettingsRef {
+    use p::{SettingsGroup as G, settings_object::Group};
+    let (group, index) = match &object.group {
+        Some(Group::Keyboard(_)) => (G::Keyboard, None),
+        Some(Group::Power(_)) => (G::Power, None),
+        Some(Group::Backlight(_)) => (G::Backlight, None),
+        Some(Group::PointerSensor(sensor)) => (G::PointerSensor, Some(sensor.index)),
+        Some(Group::Wheel(_)) => (G::Wheel, None),
+        Some(Group::Thumbwheel(_)) => (G::Thumbwheel, None),
+        None => (G::Unknown, None),
+    };
+    p::SettingsRef {
+        integration: object.integration,
+        group: group as i32,
+        index,
     }
 }
 
-/// The order of settings: integration, then key compared bytewise.
-pub fn setting_order(a: &p::SettingRef, b: &p::SettingRef) -> Ordering {
-    a.integration
-        .cmp(&b.integration)
-        .then_with(|| a.key.as_bytes().cmp(b.key.as_bytes()))
-}
-
-/// The order of warnings: service, report type, report ID, bit offset, usage page, usage and
-/// code, a missing field ordering before any value.
-pub fn warning_order(a: &p::DeviceWarning, b: &p::DeviceWarning) -> Ordering {
-    let key = |w: &p::DeviceWarning| {
-        (
-            w.service,
-            w.report_type,
-            w.report_id,
-            w.bit_offset,
-            w.usage_page,
-            w.usage,
-            w.code,
-        )
-    };
-    key(a).cmp(&key(b))
+/// The order of settings objects: integration, group, then component index.
+pub fn settings_order(a: &p::SettingsRef, b: &p::SettingsRef) -> Ordering {
+    (a.integration, a.group, a.index).cmp(&(b.integration, b.group, b.index))
 }
 
 /// The order of usages: usage page, then usage.
@@ -257,8 +249,8 @@ impl Page for p::ProfileRules {
 }
 
 impl Page for p::DeviceSettings {
-    type Entry = p::Setting;
-    type Key = p::SettingRef;
+    type Entry = p::SettingsObject;
+    type Key = p::SettingsRef;
     fn from_result(result: response::Result) -> Option<Self> {
         match result {
             response::Result::Settings(settings) => Some(settings),
@@ -266,45 +258,22 @@ impl Page for p::DeviceSettings {
         }
     }
     fn entries(&self) -> &[Self::Entry] {
-        &self.settings
+        &self.objects
     }
     fn into_entries(self) -> Vec<Self::Entry> {
-        self.settings
+        self.objects
     }
     fn end(&self) -> bool {
         self.end
     }
-    fn key(entry: &Self::Entry) -> p::SettingRef {
-        setting_ref(entry)
+    fn key(entry: &Self::Entry) -> p::SettingsRef {
+        settings_ref(entry)
     }
-    fn order(a: &p::SettingRef, b: &p::SettingRef) -> Ordering {
-        setting_order(a, b)
+    fn keyed(entry: &Self::Entry) -> bool {
+        entry.group.is_some()
     }
-}
-
-impl Page for p::DeviceWarnings {
-    type Entry = p::DeviceWarning;
-    type Key = p::DeviceWarning;
-    fn from_result(result: response::Result) -> Option<Self> {
-        match result {
-            response::Result::Warnings(warnings) => Some(warnings),
-            _ => None,
-        }
-    }
-    fn entries(&self) -> &[Self::Entry] {
-        &self.warnings
-    }
-    fn into_entries(self) -> Vec<Self::Entry> {
-        self.warnings
-    }
-    fn end(&self) -> bool {
-        self.end
-    }
-    fn key(entry: &Self::Entry) -> p::DeviceWarning {
-        *entry
-    }
-    fn order(a: &p::DeviceWarning, b: &p::DeviceWarning) -> Ordering {
-        warning_order(a, b)
+    fn order(a: &p::SettingsRef, b: &p::SettingsRef) -> Ordering {
+        settings_order(a, b)
     }
 }
 
@@ -454,33 +423,62 @@ mod tests {
     }
 
     #[test]
-    fn warnings_order_missing_fields_first() {
-        let a = p::DeviceWarning {
-            service: 0,
-            report_id: None,
+    fn settings_objects_derive_identity_and_skip_unknown_groups_for_cursors() {
+        let object = p::SettingsObject {
+            integration: p::IntegrationKind::Hidpp as i32,
+            group: Some(p::settings_object::Group::PointerSensor(
+                p::PointerSensorSettings {
+                    index: 0,
+                    dpi: Some(p::IntegerSetting::default()),
+                },
+            )),
+        };
+        let key = p::SettingsRef {
+            integration: p::IntegrationKind::Hidpp as i32,
+            group: p::SettingsGroup::PointerSensor as i32,
+            index: Some(0),
+        };
+        assert_eq!(settings_ref(&object), key);
+        let page = p::DeviceSettings {
+            device: 1,
+            objects: vec![
+                object,
+                p::SettingsObject {
+                    integration: 1,
+                    group: None,
+                },
+            ],
+            end: false,
+        };
+        assert_eq!(page.next(), Some(key));
+        let unknown = p::DeviceSettings {
+            objects: vec![p::SettingsObject {
+                integration: 1,
+                group: None,
+            }],
             ..Default::default()
         };
-        let b = p::DeviceWarning {
-            service: 0,
-            report_id: Some(0),
-            ..Default::default()
-        };
-        assert_eq!(warning_order(&a, &b), Ordering::Less);
-        let c = p::DeviceWarning {
-            service: 1,
-            ..Default::default()
-        };
-        assert_eq!(warning_order(&b, &c), Ordering::Less);
+        assert!(read_pages(|_| Ok::<_, ()>(unknown.clone()), || ()).is_err());
     }
 
     #[test]
-    fn settings_order_by_integration_then_key_bytes() {
-        let r = |integration: i32, key: &str| p::SettingRef {
+    fn settings_order_by_integration_group_and_index() {
+        let r = |integration, group, index| p::SettingsRef {
             integration,
-            key: key.into(),
+            group,
+            index,
         };
-        assert_eq!(setting_order(&r(1, "b"), &r(1, "a.z")), Ordering::Greater);
-        assert_eq!(setting_order(&r(0, "z"), &r(1, "a")), Ordering::Less);
-        assert_eq!(setting_order(&r(1, "Z"), &r(1, "a")), Ordering::Less);
+        assert_eq!(
+            settings_order(&r(1, 2, None), &r(1, 1, None)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            settings_order(&r(0, 6, None), &r(1, 1, None)),
+            Ordering::Less
+        );
+        assert_eq!(
+            settings_order(&r(1, 4, Some(0)), &r(1, 4, Some(1))),
+            Ordering::Less
+        );
     }
 }

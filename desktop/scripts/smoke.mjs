@@ -73,7 +73,8 @@ await page.getByRole("tab", { name: "Profiles" }).click();
 const smokeAdapter = (await page.evaluate(() => window.cordial.state())).adapters.find((a) => a.name.startsWith("Pico 2 W") && a.status?.profileSupport);
 const viaEnabled = () => page.evaluate((id) => window.cordial.state().then((s) => s.adapters.find((a) => a.id === id)?.status?.interfaces.find((i) => i.interface === 1)?.enabled), smokeAdapter.id);
 const save = page.locator(".page-bar").getByRole("button", { name: "Save", exact: true });
-// Interface changes stage until Save; one that reconnects USB asks first.
+// Interface changes stage until Save, which saves without asking, even when the adapter then
+// reconnects USB.
 const via = page.getByRole("switch", { name: "VIA", exact: true });
 const before = await viaEnabled();
 if (!before) {
@@ -84,14 +85,8 @@ if (!before) {
   await picker.waitFor({ state: "hidden" });
 }
 await via.click();
-const confirm = page.getByRole("dialog", { name: "USB Reconnect Required" });
-await save.click();
-await confirm.getByText("The adapter will disconnect from this computer for a moment after it saves these changes.").waitFor();
 await shot("adapter-interface");
-await confirm.getByRole("button", { name: "Cancel" }).click();
-await confirm.waitFor({ state: "hidden" });
-if ((await viaEnabled()) !== before) throw new Error("the interface changed without confirmation");
-await save.click();
+if ((await viaEnabled()) !== before) throw new Error("the interface changed before Save");
 // The accepted save shows its values at once, before the adapter reconnects USB, so the run
 // follows the published state and notes the adapter leaving to tell the reconnect apart from
 // the state before it. waitForFunction needs a synchronous predicate: it treats a returned
@@ -103,8 +98,8 @@ await page.evaluate((id) => {
     if (window.smokeAdapter?.connection !== "connected") window.smokeLeft = true;
   });
 }, smokeAdapter.id);
-await confirm.getByRole("button", { name: "Save" }).click();
-await confirm.waitFor({ state: "hidden" });
+await save.click();
+if (await page.getByRole("dialog").count()) throw new Error("saving an interface change opened a dialog");
 // The adapter reconnects USB; its page and chosen tab stay through it.
 const profilesTab = page.getByRole("tab", { name: "Profiles" });
 await page.waitForFunction((v) => {

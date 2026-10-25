@@ -1,7 +1,12 @@
 //! The foreground session with one adapter, shared by the shell, scripts and the TUI. It keeps
 //! the view current from the Dongle's events and runs each command on its own thread.
 pub use crate::view::{SessionId, State};
-use crate::{error::Error, profiles::InterfaceUpdate, view::Pending};
+use crate::{
+    error::Error,
+    profiles::InterfaceUpdate,
+    settings::{self, Field, Setting},
+    view::Pending,
+};
 use cordial_client::{Connection, Received};
 use cordial_protocol::{self as p, request};
 use std::{
@@ -59,11 +64,11 @@ pub enum Phase {
 #[allow(clippy::large_enum_variant)]
 pub enum Notice {
     /// An event, already applied to the view. `first` marks a candidate or device the view
-    /// didn't hold before; `changed` lists the setting keys a settings_changed event changed.
+    /// didn't hold before; `changed` lists the fields a settings_changed event added or changed.
     Event {
         event: p::Event,
         first: bool,
-        changed: Vec<String>,
+        changed: Vec<Field>,
     },
     /// A response to a command an interface ran.
     Response(p::Response),
@@ -192,7 +197,7 @@ impl DeviceUpdate {
 pub enum SettingInput {
     /// Text typed in the shell, typed by the setting.
     Text(String),
-    Value(p::value::Value),
+    Value(settings::Value),
 }
 
 /// A profile chosen for a configuration interface.
@@ -241,16 +246,15 @@ pub enum Command {
     GamepadOutput(Target, p::OutputMode),
     /// Sets a device's layers: profiles in the order they apply, or none.
     Layers(Target, Vec<Target>),
-    Warnings(Target),
     Settings(Target),
-    SettingGet(Target, String),
-    SettingSet(Target, String, SettingInput),
-    SettingForget(Target, String),
+    SettingGet(Target, Field),
+    SettingSet(Target, Field, SettingInput),
+    SettingForget(Target, Field),
     /// Saves and forgets several settings of one device in one request.
     SettingsSave {
         device: u32,
-        set: Vec<(String, p::value::Value)>,
-        forget: Vec<String>,
+        set: Vec<(Field, settings::Value)>,
+        forget: Vec<Field>,
     },
     Features(Target),
     /// One page of saved profiles with IDs above `after`.
@@ -294,6 +298,30 @@ impl Command {
         matches!(
             self,
             Self::Status | Self::Bootloader | Self::Files(_) | Self::FileGet { .. }
+        )
+    }
+
+    /// Saves a change on the adapter.
+    pub fn saves(&self) -> bool {
+        matches!(
+            self,
+            Self::Name(_)
+                | Self::Platform(_)
+                | Self::Transport(..)
+                | Self::Interface { .. }
+                | Self::Unpair(_)
+                | Self::Set(..)
+                | Self::GamepadOutput(..)
+                | Self::Layers(..)
+                | Self::SettingSet(..)
+                | Self::SettingForget(..)
+                | Self::SettingsSave { .. }
+                | Self::ProfileCreate(_)
+                | Self::ProfileCopy(..)
+                | Self::ProfileDelete(_)
+                | Self::RuleChange(..)
+                | Self::AdapterSave(_)
+                | Self::DeviceSave(..)
         )
     }
 }
@@ -342,21 +370,17 @@ pub enum Outcome {
     },
     Unpaired(Subject),
     Refreshing(Subject),
-    Warnings {
-        subject: Subject,
-        warnings: Vec<p::DeviceWarning>,
-    },
     Settings(Subject),
     Setting {
         subject: Subject,
-        setting: p::Setting,
+        setting: Setting,
     },
-    /// Saved values and forgotten keys of one device, with the settings as saved.
+    /// Saved and forgotten fields of one device, with the settings as saved.
     Saved {
         subject: Subject,
-        set: Vec<String>,
-        forget: Vec<String>,
-        settings: Vec<p::Setting>,
+        set: Vec<Field>,
+        forget: Vec<Field>,
+        settings: Vec<Setting>,
     },
     Features {
         subject: Subject,
@@ -492,29 +516,15 @@ impl Session {
         Ok(response)
     }
 
-    /// Reads every page of saved devices and the warnings of each connected one, and the
-    /// names of the profiles devices and configuration interfaces use.
+    /// Reads every page of saved devices, and the names of the profiles devices and
+    /// configuration interfaces use.
     fn load(&self) -> Result<(), Error> {
-        let devices = self
-            .connection
+        self.connection
             .all_devices()
             .map_err(|e| Error::from_client(e, "device list"))?;
         for id in crate::profiles::unnamed(&self.state()) {
             // A name that can't be read is shown as the profile's ID.
             let _ = self.connection.get_profile(id);
-        }
-        // A device has warnings only while it has a link.
-        for d in devices.iter().filter_map(|e| match &e.entry {
-            Some(p::device_list_entry::Entry::Device(d))
-                if d.state() != p::DeviceState::Disconnected =>
-            {
-                Some(d)
-            }
-            _ => None,
-        }) {
-            self.connection
-                .all_warnings(d.id)
-                .map_err(|e| Error::from_client(e, "warning list"))?;
         }
         self.cell.update(|st| st.loaded = true);
         Ok(())
@@ -728,10 +738,10 @@ fn open(inner: &Arc<Shared>, id: SessionId, port: String, old: Option<Arc<Sessio
                     let changed = match kind {
                         p::event::Kind::SettingsChanged(s) => {
                             let old = st.settings_of(s.device);
-                            s.changed
-                                .iter()
+                            settings::settings(&s.changed)
+                                .into_iter()
                                 .filter(|n| !old.contains(n))
-                                .map(|n| n.key.clone())
+                                .map(|n| n.field)
                                 .collect()
                         }
                         _ => Vec::new(),

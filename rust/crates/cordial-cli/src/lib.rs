@@ -7,6 +7,7 @@ pub mod model;
 pub mod profiles;
 pub mod records;
 pub mod runner;
+pub mod settings;
 pub mod storage;
 pub mod ui;
 pub mod view;

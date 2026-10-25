@@ -3,10 +3,10 @@
 #include "host/ble_hs.h"
 #include "store/config/ble_store_config.h"
 #include <string.h>
-static unsigned char records[8][145];
+static unsigned char records[MYNEWT_VAL(BLE_STORE_MAX_BONDS)][145];
 // A repeat-pair callback can remove host keys while the controller still has
 // the old IRK. Retain only its identity until the live link is gone.
-static ble_addr_t dirty[8];
+static ble_addr_t dirty[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
 static unsigned dirty_count;
 void cordial_bonds_clear(void) {
   memset(records, 0, sizeof(records));
@@ -21,7 +21,7 @@ int cordial_bonds_dirty(const ble_addr_t *addr) {
 int cordial_bonds_mark_dirty(const ble_addr_t *addr) {
   if (cordial_bonds_dirty(addr))
     return 0;
-  if (dirty_count == 8)
+  if (dirty_count == MYNEWT_VAL(BLE_STORE_MAX_BONDS))
     return BLE_HS_ENOMEM;
   dirty[dirty_count++] = *addr;
   return 0;
@@ -43,13 +43,13 @@ static int match(const unsigned char *r, const ble_addr_t *addr) {
   return r[8] && r[9] == addr->type && !memcmp(r + 10, a, 6);
 }
 static int find(const ble_addr_t *addr) {
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < MYNEWT_VAL(BLE_STORE_MAX_BONDS); i++)
     if (match(records[i], addr))
       return i;
   return -1;
 }
 static int free_record(void) {
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < MYNEWT_VAL(BLE_STORE_MAX_BONDS); i++)
     if (!records[i][8])
       return i;
   return -1;
@@ -87,7 +87,7 @@ int cordial_bonds_read(int type, const union ble_store_key *key,
   if (!security(type))
     return ble_store_config_read(type, key, value);
   unsigned skip = key->sec.idx;
-  for (int i = 0; i < 8; i++) {
+  for (int i = 0; i < MYNEWT_VAL(BLE_STORE_MAX_BONDS); i++) {
     const unsigned char *r = records[i], *p = r + offset(type);
     if (!r[8] || !(p[0] & 7) ||
         (ble_addr_cmp(&key->sec.peer_addr, BLE_ADDR_ANY) != 0 &&
@@ -169,7 +169,7 @@ int cordial_bonds_delete(int type, const union ble_store_key *key) {
 
 int cordial_bonds_peers(ble_addr_t *out, int *count, int capacity) {
   *count = 0;
-  for (unsigned i = 0; i < 8; i++) {
+  for (unsigned i = 0; i < MYNEWT_VAL(BLE_STORE_MAX_BONDS); i++) {
     if (!records[i][8])
       continue;
     if (*count >= capacity)
@@ -185,7 +185,7 @@ extern int cordial_ble_resolve_key(const uint8_t *irk, const uint8_t *rpa);
 int cordial_bonds_resolve_rpa(const uint8_t *rpa, uint8_t *identity, uint8_t *type) {
   if ((rpa[5] & 0xc0) != 0x40)
     return 0;
-  for (unsigned i = 0; i < 8; i++) {
+  for (unsigned i = 0; i < MYNEWT_VAL(BLE_STORE_MAX_BONDS); i++) {
     if (records[i][8] && (records[i][81] & 2) &&
         cordial_ble_resolve_key(records[i] + 109, rpa)) {
       *type = records[i][9];

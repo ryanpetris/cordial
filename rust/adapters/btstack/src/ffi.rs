@@ -122,6 +122,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn cordial_profiles_disconnect(link: Link);
     pub fn cordial_profiles_adopt(link: Link) -> c_int;
+    pub fn cordial_profiles_promote(link: Link);
     pub fn cordial_profiles_reply(
         link: Link,
         method: u8,

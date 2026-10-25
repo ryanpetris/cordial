@@ -70,10 +70,7 @@ fn update(
             link.report_read_complete(read.id, read.kind, Ok(&report), catalog, now);
         }
     }
-    panic!(
-        "indicator update did not produce a report: {:?}",
-        link.warnings
-    );
+    panic!("indicator update did not produce a report");
 }
 #[test]
 fn mode_selectors_work_as_arrays_and_separate_boolean_fields() {
@@ -136,7 +133,6 @@ fn rgb_color_and_brightness_survive_off_and_on_with_shared_companions() {
         update(&mut link, &mut catalog, &mut forward, true, &off),
         [255, 0, 0, 30, 42]
     );
-    assert!(link.warnings.is_empty());
 }
 #[test]
 fn an_intensity_gate_restores_a_visible_color_from_black() {
@@ -252,7 +248,7 @@ fn relative_caps(
     writes
 }
 #[test]
-fn only_the_unknown_scoped_indicator_gets_an_unknown_state_warning() {
+fn unknown_scoped_indicator_preserves_known_feedback() {
     let bytes = descriptor(&[
         5, 8, 9, 2, 0xa1, 0, 0x75, 1, 0x95, 1, 9, 2, 0x91, 6, 9, 2, 0x81, 2, 0xc0, 9, 2, 0xa1, 0,
         9, 2, 0x91, 6, 0xc0,
@@ -262,14 +258,6 @@ fn only_the_unknown_scoped_indicator_gets_an_unknown_state_warning() {
         relative_caps(&mut link, &mut catalog, &mut forward, 0, 0),
         vec![vec![0], vec![1]]
     );
-    assert_eq!(link.warnings.len(), 1);
-    let warning = link.warnings[0];
-    assert_eq!(
-        warning.code,
-        cordial_core::model::errors::WarningCode::IndicatorStateUnknown
-    );
-    assert_eq!(warning.bit_offset, Some(1));
-    assert_eq!(warning.report_type, Some(ReportType::Output));
 }
 #[test]
 fn conflicting_live_feedback_is_reread_and_actual_device_resets_are_corrected() {
@@ -295,7 +283,6 @@ fn conflicting_live_feedback_is_reread_and_actual_device_resets_are_corrected() 
         .unwrap();
     let writes = relative_caps(&mut link, &mut catalog, &mut forward, 0, 81);
     assert_eq!(writes.iter().filter(|bytes| bytes == &&vec![1]).count(), 1);
-    assert!(link.warnings.is_empty());
 }
 #[test]
 fn positive_only_rgb_channels_can_use_a_separate_intensity_gate() {
@@ -360,7 +347,6 @@ fn rgb_colors_survive_updates_across_output_and_feature_reports() {
         }
         assert_eq!(reports[0].2, if on { vec![255] } else { vec![0] });
         assert_eq!(reports[1].2, if on { vec![128, 0] } else { vec![0, 0] });
-        assert!(link.warnings.is_empty(), "{:?}", link.warnings);
     }
 }
 fn relative_rgb(
@@ -410,7 +396,6 @@ fn relative_rgb_deltas_restore_the_whole_tuple_without_edge_rearm() {
         }
         assert_eq!(color, if on { [30, 0, 10] } else { [0, 0, 0] });
         assert_eq!(writes, 3);
-        assert!(link.warnings.is_empty(), "{:?}", link.warnings);
     }
 }
 
@@ -441,7 +426,6 @@ fn live_numeric_feedback_before_ack_is_not_applied_twice_and_neutral_updates_con
         writes, 3,
         "two real deltas and one confirmed neutral update"
     );
-    assert!(link.warnings.is_empty(), "{:?}", link.warnings);
 }
 
 #[test]
@@ -473,7 +457,6 @@ fn numeric_aliases_use_one_writer_for_each_shared_channel() {
         }
     }
     assert_eq!(color, [0, 0, 0]);
-    assert!(link.warnings.is_empty(), "{:?}", link.warnings);
 }
 
 #[test]
@@ -492,11 +475,6 @@ fn nonlinear_numeric_leds_have_a_specific_diagnostic() {
             link.report_read_complete(read.id, read.kind, Ok(&report), &mut catalog, now);
         }
     }
-    assert_eq!(link.warnings.len(), 1);
-    assert_eq!(
-        link.warnings[0].code,
-        cordial_core::model::errors::WarningCode::IndicatorNonlinearUnsupported
-    );
 }
 
 #[test]
@@ -532,7 +510,6 @@ fn relative_selector_aliases_have_independent_feedback_states() {
         }
     }
     assert_eq!(writes, [vec![0, 0], vec![2, 0]]);
-    assert!(link.warnings.is_empty(), "{:?}", link.warnings);
 }
 
 #[test]
@@ -597,7 +574,6 @@ fn relative_values_use_physical_scales_and_equivalent_unit_systems() {
     }
     assert_eq!(color, [0, 0, 0]);
     assert_eq!(writes, 4);
-    assert!(link.warnings.is_empty(), "{:?}", link.warnings);
 }
 
 #[test]
@@ -616,11 +592,6 @@ fn unreachable_relative_targets_report_a_range_error_without_writing() {
             link.report_read_complete(read.id, read.kind, Ok(&report), &mut catalog, now);
         }
     }
-    assert_eq!(link.warnings.len(), 1);
-    assert_eq!(
-        link.warnings[0].code,
-        cordial_core::model::errors::WarningCode::IndicatorRangeUnsupported
-    );
 }
 
 #[test]
@@ -647,15 +618,7 @@ fn an_indicator_whose_range_does_not_fit_its_field_is_left_unused() {
         indicator.extend_from_slice(globals);
         indicator.extend_from_slice(&[0x95, 1, 0x91, 6]);
         let map = Map::compile(&descriptor(&indicator)).unwrap();
-        let limitation = map.limitations()[0];
-        assert_eq!(
-            limitation.code,
-            cordial_core::model::errors::WarningCode::IndicatorRangeUnsupported
-        );
-        assert_eq!(
-            (limitation.kind, limitation.usage_page, limitation.usage),
-            (1, 8, 2)
-        );
+
         // The keyboard's own input still decodes.
         let input = map.decode(&mut map.state().unwrap(), 0, &[1]).unwrap();
         assert!(input.held.keys[0] & 0x10 != 0);
@@ -664,7 +627,7 @@ fn an_indicator_whose_range_does_not_fit_its_field_is_left_unused() {
 
 #[test]
 fn transient_feedback_reads_retry_with_the_feedback_report_context() {
-    use cordial_core::model::errors::{ErrorCode, WarningCode};
+    use cordial_core::model::errors::ErrorCode;
     let mut toggle = descriptor(&[
         5, 8, 9, 2, 0xa1, 0, 0x85, 1, 0x75, 1, 0x95, 1, 9, 2, 0x91, 6, 0x85, 2, 9, 2, 0x81, 2, 0xc0,
     ]);
@@ -694,13 +657,6 @@ fn transient_feedback_reads_retry_with_the_feedback_report_context() {
                         &mut catalog,
                         now,
                     );
-                    assert!(
-                        link.warnings
-                            .iter()
-                            .any(|w| w.code == WarningCode::IndicatorReadFailed
-                                && w.report_id == Some(2)
-                                && w.report_type == Some(ReportType::Input))
-                    );
                 } else {
                     assert!(now >= failed_at + 1000);
                     let report = InputReport::new(link.id, read.service, 2, &feedback).unwrap();
@@ -710,13 +666,12 @@ fn transient_feedback_reads_retry_with_the_feedback_report_context() {
             }
         }
         assert!(reads >= 2);
-        assert!(link.warnings.is_empty(), "{:?}", link.warnings);
     }
 }
 
 #[test]
 fn permanent_read_capacity_errors_allow_optional_colors_and_settle_required_baselines() {
-    use cordial_core::model::errors::{ErrorCode, WarningCode};
+    use cordial_core::model::errors::ErrorCode;
     let pure_rgb = descriptor(&[
         5, 8, 9, 2, 0xa1, 2, 9, 0x52, 0xa1, 2, 0x15, 0, 0x26, 0xff, 0, 0x75, 8, 0x95, 3, 0x19,
         0x53, 0x29, 0x55, 0x91, 2, 0xc0, 0xc0,
@@ -747,13 +702,7 @@ fn permanent_read_capacity_errors_allow_optional_colors_and_settle_required_base
         }
         assert_eq!(reads, 1);
         assert_eq!(writes > 0, can_write);
-        if !can_write {
-            assert!(
-                link.warnings
-                    .iter()
-                    .any(|w| w.code == WarningCode::IndicatorReportTooLarge)
-            );
-        }
+        if !can_write {}
     }
 }
 
@@ -797,8 +746,6 @@ fn a_report_with_an_unused_relative_field_is_not_written() {
         5, 8, 9, 1, 0x15, 0, 0x26, 0xff, 0, 0x75, 4, 0x95, 1, 0x91, 2, 9, 3, 0x91, 6, 9, 2, 0x25,
         1, 0x75, 1, 0x95, 1, 0x91, 2, 0x75, 7, 0x95, 1, 0x91, 1,
     ]);
-    let map = Map::compile(&bytes).unwrap();
-    assert_eq!(map.limitations().len(), 2);
     for baseline in [None, Some(&[0x35, 0][..])] {
         assert!(matches!(
             encode(&bytes, true, baseline),

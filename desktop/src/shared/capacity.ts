@@ -1,4 +1,7 @@
-import type { AdapterStatus, DeviceChanges, DeviceRecord } from "./state.ts";
+import type { AdapterStatus, DeviceChanges, DeviceRecord, Resource, ResourceTypeName } from "./state.ts";
+
+/** The entry of `type` in a resource list, if reported. */
+export const resource = (list: Resource[] | undefined, type: ResourceTypeName): Resource | undefined => list?.find((r) => r.type === type);
 
 const sameLayers = (a: number[], b: number[]) => a.length === b.length && a.every((x, i) => x === b[i]);
 
@@ -23,7 +26,7 @@ export function enabledFull(status: AdapterStatus | null, devices: DeviceRecord[
   if (!enabled || blocked || device.inactive === null) return false;
   if (device.inactive === "unsupported_transport" || device.inactive === "transport_disabled") return false;
   if (!changesAnything(device, changes)) return false;
-  const limit = status?.transports.find((t) => t.transport === device.transport)?.maxEnabled;
+  const limit = resource(status?.transports.find((t) => t.transport === device.transport)?.resources, "devices")?.limit;
   if (limit == null) return false;
   return devices.filter((d) => d.id !== device.id && d.transport === device.transport && d.inactive === null).length >= limit;
 }

@@ -237,37 +237,17 @@ impl Test {
         }
     }
     /// Every setting of device `id`, read page by page.
-    fn settings(&mut self, id: u32) -> Vec<p::Setting> {
-        let mut settings: Vec<p::Setting> = Vec::new();
+    fn settings(&mut self, id: u32) -> Vec<p::SettingsObject> {
+        let mut settings: Vec<p::SettingsObject> = Vec::new();
         loop {
-            let after = settings.last().map(|s| p::SettingRef {
-                integration: s.integration,
-                key: s.key.clone(),
-            });
+            let after = settings.last().map(cordial_core::wire::object_ref);
             match self.ok(Command::ListSettings(p::ListSettings { device: id, after })) {
                 Some(R::Settings(page)) => {
                     assert_eq!(page.device, id);
-                    assert!(page.end || !page.settings.is_empty());
-                    settings.extend(page.settings);
+                    assert!(page.end || !page.objects.is_empty());
+                    settings.extend(page.objects);
                     if page.end {
                         return settings;
-                    }
-                }
-                other => panic!("{other:?}"),
-            }
-        }
-    }
-    /// Every warning of device `id`, read page by page.
-    fn warnings(&mut self, id: u32) -> Vec<p::DeviceWarning> {
-        let mut warnings: Vec<p::DeviceWarning> = Vec::new();
-        loop {
-            let after = warnings.last().cloned();
-            match self.ok(Command::ListWarnings(p::ListWarnings { device: id, after })) {
-                Some(R::Warnings(page)) => {
-                    assert!(page.end || !page.warnings.is_empty());
-                    warnings.extend(page.warnings);
-                    if page.end {
-                        return warnings;
                     }
                 }
                 other => panic!("{other:?}"),
@@ -308,7 +288,7 @@ impl Test {
         self.status()
     }
     /// Applies `args`, which responds with no result, and reads the settings back.
-    fn set_settings(&mut self, args: p::SetSettings) -> Vec<p::Setting> {
+    fn set_settings(&mut self, args: p::SetSettings) -> Vec<p::SettingsObject> {
         let id = args.device;
         assert_eq!(self.ok(Command::SetSettings(args)), None);
         self.settings(id)
@@ -425,12 +405,30 @@ fn pairing_steps(events: &[Ev]) -> Vec<p::pairing::Step> {
         .collect()
 }
 
-fn info(device: &p::Device, key: &str) -> Option<p::value::Value> {
-    device
-        .info
-        .iter()
-        .find(|i| i.key == key)
-        .and_then(|i| i.value.clone()?.value)
+fn backlight_update(change: Option<p::bool_setting_update::Change>) -> p::SettingsUpdate {
+    p::SettingsUpdate {
+        integration: p::IntegrationKind::Hidpp as i32,
+        group: Some(p::settings_update::Group::Backlight(
+            p::BacklightSettingsUpdate {
+                enabled: Some(p::BoolSettingUpdate { change }),
+                ..Default::default()
+            },
+        )),
+    }
+}
+fn backlight_value(value: bool) -> p::SettingsUpdate {
+    backlight_update(Some(p::bool_setting_update::Change::Value(value)))
+}
+fn backlight_forget() -> p::SettingsUpdate {
+    backlight_update(Some(p::bool_setting_update::Change::Forget(
+        p::SettingForget {},
+    )))
+}
+fn backlight_enabled(object: &p::SettingsObject) -> &p::BoolSetting {
+    let Some(p::settings_object::Group::Backlight(settings)) = &object.group else {
+        panic!("{object:?}")
+    };
+    settings.enabled.as_ref().unwrap()
 }
 
 fn hidpp(device: &p::Device) -> &p::Integration {
@@ -472,22 +470,42 @@ fn status_reports_identity_transports_and_facts() {
         vec![
             p::TransportSupport {
                 transport: p::Transport::Classic as i32,
-                max_enabled: Some(7),
+                resources: vec![
+                    cordial_core::wire::resource(
+                        p::ResourceType::Devices,
+                        Some(0),
+                        Some(cordial_core::devices::CLASSIC_CONNECTIONS as u32)
+                    ),
+                    cordial_core::wire::resource(
+                        p::ResourceType::Connections,
+                        Some(0),
+                        Some(cordial_core::devices::CLASSIC_CONNECTIONS as u32)
+                    )
+                ],
                 enabled: Some(true),
             },
             p::TransportSupport {
                 transport: p::Transport::Ble as i32,
-                max_enabled: Some(7),
+                resources: vec![
+                    cordial_core::wire::resource(
+                        p::ResourceType::Devices,
+                        Some(0),
+                        Some(cordial_core::devices::BLE_CONNECTIONS as u32)
+                    ),
+                    cordial_core::wire::resource(
+                        p::ResourceType::Connections,
+                        Some(0),
+                        Some(cordial_core::devices::BLE_CONNECTIONS as u32)
+                    )
+                ],
                 enabled: Some(true),
             },
         ]
     );
-    let facts: Vec<_> = status.info.iter().map(|i| i.key.as_str()).collect();
-    assert_eq!(
-        facts,
-        [p::keys::FIRMWARE_VERSION, p::keys::BOARD_NAME],
-        "production firmware with free storage reports neither development nor storage.full"
-    );
+    let information = status.information.unwrap();
+    assert!(information.firmware_version.is_some());
+    assert!(information.board_name.is_some());
+    assert_eq!(information.development_build, Some(false));
 }
 
 #[test]
@@ -620,8 +638,11 @@ fn enabling_past_the_stack_limit_is_refused() {
     let mut t = Test::new(true);
     let ids: Vec<u32> = (2..=8).map(|n| t.add_saved(n)).collect();
     let last = *ids.last().unwrap();
-    // Eight saved Classic devices: seven fit the stack's table, the eighth waits.
-    assert_eq!(t.app.manager.devices.iter().flatten().count(), 7);
+    // Saved devices beyond the normal allowance wait for a resident entry.
+    assert_eq!(
+        t.app.manager.devices.iter().flatten().count(),
+        cordial_core::devices::CLASSIC_CONNECTIONS
+    );
     assert!(t.app.manager.find(last.into()).is_none());
     assert_eq!(
         t.device(last).inactive,
@@ -942,9 +963,8 @@ fn pairing_with_full_storage_has_a_reason_and_scanning_stays_available() {
     assert!(t.radio.connects.is_empty());
     assert!(
         t.status()
-            .info
-            .iter()
-            .any(|i| i.key == p::keys::STORAGE_FULL)
+            .errors
+            .contains(&(p::ErrorCode::StorageFull as i32))
     );
 }
 
@@ -980,7 +1000,10 @@ fn a_connect_that_times_out_keeps_automatic_reconnection() {
         !d.paused,
         "a timeout must not pause trusted automatic reconnection"
     );
-    assert_eq!(d.error, Some(p::ErrorCode::Timeout as i32));
+    assert_eq!(
+        d.errors.first().copied(),
+        Some(p::ErrorCode::Timeout as i32)
+    );
 }
 
 #[test]
@@ -1143,47 +1166,21 @@ fn settings_are_saved_and_forgotten_while_disconnected() {
     // A disconnected device's settings are its saved ones, read from flash.
     let settings = t.settings(SAVED);
     assert_eq!(settings.len(), 1);
-    assert_eq!(settings[0].key, p::keys::BACKLIGHT_ENABLED);
+    let enabled = backlight_enabled(&settings[0]);
     assert_eq!(
-        settings[0].status,
-        Some(p::setting::Status::State(p::SettingState::Pending as i32))
+        enabled.status.as_ref().unwrap().result,
+        Some(p::setting_status::Result::State(
+            p::SettingState::Pending as i32
+        ))
     );
-    assert_eq!(
-        settings[0].r#type,
-        Some(p::setting::Type::Bool(p::BoolSetting {
-            value: None,
-            saved: Some(true)
-        }))
-    );
-    let change = |key: &str, value: p::value::Value| p::SettingChange {
-        integration: p::IntegrationKind::Hidpp as i32,
-        key: key.into(),
-        change: Some(p::setting_change::Change::Value(p::Value {
-            value: Some(value),
-        })),
-    };
-    let forget = |key: &str| p::SettingChange {
-        integration: p::IntegrationKind::Hidpp as i32,
-        key: key.into(),
-        change: Some(p::setting_change::Change::Forget(p::SettingForget {})),
-    };
-    // A valid value saves while the device is away; it waits as pending.
-    {
-        let settings = t.set_settings(p::SetSettings {
-            device: SAVED,
-            changes: vec![change(
-                p::keys::BACKLIGHT_ENABLED,
-                p::value::Value::Bool(false),
-            )],
-        });
-        assert_eq!(
-            settings[0].r#type,
-            Some(p::setting::Type::Bool(p::BoolSetting {
-                value: None,
-                saved: Some(false)
-            }))
-        );
-    }
+    assert_eq!(enabled.value, None);
+    assert_eq!(enabled.saved, Some(true));
+    let settings = t.set_settings(p::SetSettings {
+        device: SAVED,
+        changes: vec![backlight_value(false)],
+    });
+    assert_eq!(backlight_enabled(&settings[0]).value, None);
+    assert_eq!(backlight_enabled(&settings[0]).saved, Some(false));
     let load = |t: &mut Test| {
         block_on(
             Preferences {
@@ -1198,32 +1195,22 @@ fn settings_are_saved_and_forgotten_while_disconnected() {
     for (changes, code) in [
         (vec![], p::ErrorCode::BadArgs),
         (
-            vec![change(
-                p::keys::BACKLIGHT_ENABLED,
-                p::value::Value::Integer(3),
-            )],
-            p::ErrorCode::BadArgs,
-        ),
-        (
-            vec![change("no.such_key", p::value::Value::Bool(true))],
+            vec![p::SettingsUpdate {
+                integration: 99,
+                ..backlight_value(true)
+            }],
             p::ErrorCode::NotFound,
         ),
+        (vec![backlight_update(None)], p::ErrorCode::BadArgs),
         (
-            vec![p::SettingChange {
-                change: None,
-                ..forget(p::keys::BACKLIGHT_ENABLED)
-            }],
+            vec![backlight_value(true), backlight_update(None)],
             p::ErrorCode::BadArgs,
         ),
-        // One invalid change refuses the whole request.
         (
-            vec![
-                change(p::keys::BACKLIGHT_ENABLED, p::value::Value::Bool(true)),
-                change(
-                    p::keys::BACKLIGHT_ENABLED,
-                    p::value::Value::Text("on".into()),
-                ),
-            ],
+            vec![p::SettingsUpdate {
+                integration: p::IntegrationKind::Hidpp as i32,
+                group: None,
+            }],
             p::ErrorCode::BadArgs,
         ),
     ] {
@@ -1238,27 +1225,9 @@ fn settings_are_saved_and_forgotten_while_disconnected() {
     assert_eq!(load(&mut t)[0].value, 0, "a refused change saves nothing");
     // Changes apply in order: a later change to the same setting replaces an earlier one.
     for (changes, saved) in [
-        (
-            vec![
-                change(p::keys::BACKLIGHT_ENABLED, p::value::Value::Bool(false)),
-                change(p::keys::BACKLIGHT_ENABLED, p::value::Value::Bool(true)),
-            ],
-            Some(1),
-        ),
-        (
-            vec![
-                forget(p::keys::BACKLIGHT_ENABLED),
-                change(p::keys::BACKLIGHT_ENABLED, p::value::Value::Bool(false)),
-            ],
-            Some(0),
-        ),
-        (
-            vec![
-                change(p::keys::BACKLIGHT_ENABLED, p::value::Value::Bool(true)),
-                forget(p::keys::BACKLIGHT_ENABLED),
-            ],
-            None,
-        ),
+        (vec![backlight_value(false), backlight_value(true)], Some(1)),
+        (vec![backlight_forget(), backlight_value(false)], Some(0)),
+        (vec![backlight_value(true), backlight_forget()], None),
     ] {
         t.ok(Command::SetSettings(p::SetSettings {
             device: SAVED,
@@ -1271,9 +1240,9 @@ fn settings_are_saved_and_forgotten_while_disconnected() {
         {
             let settings = t.set_settings(p::SetSettings {
                 device: SAVED,
-                changes: vec![forget(p::keys::BACKLIGHT_ENABLED)],
+                changes: vec![backlight_forget()],
             });
-            assert!(settings.iter().all(|s| s.status.is_none()));
+            assert!(settings.is_empty());
         }
         assert!(load(&mut t).is_empty());
     }
@@ -1329,21 +1298,12 @@ fn read_only_values_are_information_and_wheel_capabilities_are_decoded() {
         .unwrap();
     assert!(t.settings(SAVED).is_empty());
     let d = t.device(SAVED);
-    use p::value::Value as V;
-    assert_eq!(
-        info(&d, p::keys::WHEEL_RESOLUTION_MULTIPLIER),
-        Some(V::Integer(8))
-    );
-    assert_eq!(
-        info(&d, p::keys::WHEEL_RATCHETS_PER_ROTATION),
-        Some(V::Integer(0x18))
-    );
-    assert_eq!(info(&d, p::keys::WHEEL_DIAMETER), Some(V::Integer(0x32)));
-    assert_eq!(
-        info(&d, p::keys::BACKLIGHT_CURRENT_LEVEL),
-        Some(V::Integer(3))
-    );
-    assert!(d.info.iter().all(|i| !i.key.contains("info")));
+    let info = d.information.unwrap();
+    let wheel = info.wheel.unwrap();
+    assert_eq!(wheel.resolution_multiplier, Some(8));
+    assert_eq!(wheel.ratchets_per_rotation, Some(0x18));
+    assert_eq!(wheel.diameter, Some(0x32));
+    assert_eq!(info.backlight.unwrap().current_brightness, Some(3));
 }
 
 #[test]
@@ -1473,11 +1433,9 @@ fn development_files_are_listed_and_read_whole() {
         })),
         p::ErrorCode::BadArgs
     );
-    assert!(
-        t.status()
-            .info
-            .iter()
-            .any(|i| i.key == p::keys::BUILD_DEVELOPMENT)
+    assert_eq!(
+        t.status().information.unwrap().development_build,
+        Some(true)
     );
 }
 
@@ -1681,7 +1639,7 @@ fn discovery_shares_time_with_reconnection_only_for_exclusive_backends() {
 #[test]
 fn background_reconnect_leaves_room_for_a_pairing() {
     let mut t = Test::new(true);
-    for n in 2..=5 {
+    for n in 2..=5.min(cordial_core::devices::CLASSIC_CONNECTIONS as u8) {
         t.add_saved(n);
         t.app.manager.devices[usize::from(n - 1)]
             .as_mut()
@@ -1692,11 +1650,11 @@ fn background_reconnect_leaves_room_for_a_pairing() {
     assert_eq!(t.radio.connects.len(), 1);
     t.event(Event::Incoming {
         attempt: 1,
-        peer: peer(4),
+        peer: peer(2),
     });
     assert_eq!(t.radio.connects.len(), 2);
     t.poll();
-    assert_eq!(t.radio.connects.len(), 2, "one connection stays free");
+    assert_eq!(t.radio.connects.len(), 2, "the pairing reserve stays free");
 }
 
 #[test]
@@ -1763,97 +1721,6 @@ fn radio_restart_releases_keys_then_reconnects_saved_devices_after_ready() {
     assert_eq!(t.radio.connects.len(), 2);
     assert_ne!(t.radio.connects[1].0, link);
     assert_eq!(t.store.records, saved);
-}
-
-#[test]
-fn warnings_are_listed_and_reported_when_they_change() {
-    use cordial_core::model::errors::{DeviceWarning, HidReportType, WarningCode};
-    let mut t = Test::new(true);
-    let warnings: Vec<_> = (0..200)
-        .map(|bit| DeviceWarning {
-            code: WarningCode::IndicatorStateUnknown,
-            service: 1,
-            report_type: Some(HidReportType::Output),
-            report_id: Some(3),
-            bit_offset: Some(bit),
-            usage_page: Some(8),
-            usage: None,
-        })
-        .collect();
-    let link = connect_saved(&mut t, descriptor());
-    t.events();
-    t.app
-        .manager
-        .connection_mut(link)
-        .unwrap()
-        .runtime
-        .as_mut()
-        .unwrap()
-        .warnings = warnings.clone();
-    let changes = |events: Vec<Ev>| {
-        events
-            .into_iter()
-            .filter_map(|e| match e {
-                Ev::WarningsChanged(w) => Some(w),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    };
-    let reported = changes(t.events());
-    assert_eq!(reported.len(), 1);
-    assert_eq!(reported[0].device, SAVED);
-    assert_eq!(reported[0].added.len(), 200);
-    assert!(reported[0].removed.is_empty());
-    let warning = |bit| p::DeviceWarning {
-        code: p::WarningCode::IndicatorStateUnknown as i32,
-        service: 1,
-        report_type: p::ReportType::Output as i32,
-        report_id: Some(3),
-        bit_offset: Some(bit),
-        usage_page: Some(8),
-        usage: None,
-    };
-    assert_eq!(reported[0].added[5], warning(5));
-    // The listing takes several pages, in order.
-    let listed = t.warnings(SAVED);
-    assert_eq!(listed, reported[0].added);
-    assert!(listed.windows(2).all(|w| w[0].bit_offset < w[1].bit_offset));
-    match t.ok(Command::ListWarnings(p::ListWarnings {
-        device: SAVED,
-        after: Some(warning(197)),
-    })) {
-        Some(R::Warnings(w)) => {
-            assert_eq!(w.warnings, [warning(198), warning(199)]);
-            assert!(w.end);
-        }
-        other => panic!("{other:?}"),
-    }
-    // A change reports only the warnings that came and went.
-    let mut next = warnings[1..].to_vec();
-    next.push(DeviceWarning {
-        bit_offset: None,
-        ..warnings[0]
-    });
-    t.app
-        .manager
-        .connection_mut(link)
-        .unwrap()
-        .runtime
-        .as_mut()
-        .unwrap()
-        .warnings = next;
-    let reported = changes(t.events());
-    assert_eq!(reported.len(), 1);
-    assert_eq!(
-        reported[0].added,
-        [p::DeviceWarning {
-            bit_offset: None,
-            ..warning(0)
-        }]
-    );
-    assert_eq!(reported[0].removed, [warning(0)]);
-    // A missing field orders before any value.
-    assert_eq!(t.warnings(SAVED)[0].bit_offset, None);
 }
 
 #[test]
@@ -2171,7 +2038,7 @@ fn a_connected_device_going_away_records_no_error() {
     });
     let d = t.device(SAVED);
     assert_eq!(d.state, p::DeviceState::Disconnected as i32);
-    assert_eq!(d.error, None);
+    assert_eq!(d.errors.first().copied(), None);
 }
 
 #[test]
@@ -2184,7 +2051,7 @@ fn a_link_lost_while_connecting_records_its_error() {
         error: Some(cordial_core::model::errors::ErrorCode::ConnectionFailed),
     });
     assert_eq!(
-        t.device(SAVED).error,
+        t.device(SAVED).errors.first().copied(),
         Some(p::ErrorCode::ConnectionFailed as i32)
     );
 }
@@ -2200,7 +2067,10 @@ fn a_device_failing_authentication_keeps_reconnecting() {
         error: Some(cordial_core::model::errors::ErrorCode::AuthenticationFailed),
     });
     let failed = t.now;
-    assert_eq!(t.device(SAVED).error, Some(p::ErrorCode::AuthFailed as i32));
+    assert_eq!(
+        t.device(SAVED).errors.first().copied(),
+        Some(p::ErrorCode::AuthFailed as i32)
+    );
     // Anyone can fail a handshake with the device's address, so this only backs off.
     let attempts = t.radio.connects.len();
     t.now = failed + FIRST_RETRY - 2;
@@ -2236,7 +2106,10 @@ fn no_error_stops_automatic_reconnection() {
             error: Some(error),
         });
         let failed = t.now;
-        assert!(t.device(SAVED).error.is_some(), "{error:?}");
+        assert!(
+            t.device(SAVED).errors.first().copied().is_some(),
+            "{error:?}"
+        );
         t.now = failed + FIRST_RETRY - 2;
         t.poll();
         assert_eq!(t.radio.connects.len(), 1, "{error:?}");
@@ -2750,7 +2623,7 @@ fn disabling_classic_closes_its_links_and_refuses_classic_work() {
         d.inactive,
         Some(p::InactiveReason::TransportDisabled as i32)
     );
-    assert_eq!(d.error, None);
+    assert_eq!(d.errors.first().copied(), None);
     assert!(!t.radio.bonds.contains(&peer(1)));
     // Classic devices are neither paged nor admitted, and Classic commands are refused as for
     // an unsupported transport. BLE is unaffected.
@@ -3459,11 +3332,7 @@ fn forgetting_a_setting_without_a_saved_value_is_accepted() {
     t.app.manager.devices[0].as_mut().unwrap().paused = true;
     let settings = t.set_settings(p::SetSettings {
         device: SAVED,
-        changes: vec![p::SettingChange {
-            integration: p::IntegrationKind::Hidpp as i32,
-            key: p::keys::BACKLIGHT_ENABLED.into(),
-            change: Some(p::setting_change::Change::Forget(p::SettingForget {})),
-        }],
+        changes: vec![backlight_forget()],
     });
     assert!(settings.is_empty());
 }
@@ -3684,7 +3553,15 @@ fn set_interfaces(t: &mut Test, updates: Vec<p::ConfigurationInterfaceUpdate>) -
     }))
 }
 fn memory_used(t: &mut Test) -> u32 {
-    t.status().profile_support.unwrap().memory_used
+    t.status()
+        .profile_support
+        .unwrap()
+        .resources
+        .into_iter()
+        .find(|r| r.r#type == p::ResourceType::Memory as i32)
+        .unwrap()
+        .count
+        .unwrap()
 }
 /// Presses exactly `keys` (4..=11) on the test keyboard and returns the keys the adapter's USB
 /// keyboard report holds afterwards.
@@ -3708,7 +3585,16 @@ fn sent_keys(t: &mut Test) -> Vec<u16> {
     t.keys.clone()
 }
 fn profile_error(d: &p::Device) -> Option<p::ErrorCode> {
-    d.profile_error.map(|e| p::ErrorCode::try_from(e).unwrap())
+    d.errors
+        .iter()
+        .copied()
+        .filter_map(|e| p::ErrorCode::try_from(e).ok())
+        .find(|e| {
+            matches!(
+                e,
+                p::ErrorCode::ProfileMemoryExceeded | p::ErrorCode::ProfileLoadFailed
+            )
+        })
 }
 
 #[test]
@@ -3716,10 +3602,10 @@ fn status_reports_profile_support_and_configuration_interfaces() {
     let mut t = Test::new(false);
     let status = t.status();
     let support = status.profile_support.unwrap();
-    assert_eq!(support.memory_budget, PROFILE_BUDGET);
-    assert_eq!(support.memory_used, 0);
-    assert_eq!(support.max_layers, 8);
-    assert_eq!(support.max_remap_outputs, 8);
+    assert_eq!(support.resources[0].limit, Some(PROFILE_BUDGET));
+    assert_eq!(support.resources[0].count, Some(0));
+    assert_eq!(support.resources[2].limit, Some(8));
+    assert_eq!(support.resources[1].limit, Some(8));
     for kind in [
         p::usage_range::Kind::RemapInput,
         p::usage_range::Kind::ScaleInput,
@@ -3732,12 +3618,14 @@ fn status_reports_profile_support_and_configuration_interfaces() {
         status.configuration_interfaces,
         [
             p::ConfigurationInterfaceSupport {
+                active: false,
                 interface: via,
                 enabled: false,
                 profile: 0,
                 conflicts: vec![vial],
             },
             p::ConfigurationInterfaceSupport {
+                active: false,
                 interface: vial,
                 enabled: false,
                 profile: 0,
@@ -4302,12 +4190,12 @@ fn a_device_whose_layers_do_not_fit_loads_none_of_them() {
     assert_eq!(memory_used(&mut t), 0);
     assert_eq!(
         profile_error(&t.device(SAVED)),
-        Some(p::ErrorCode::NoCapacity)
+        Some(p::ErrorCode::ProfileMemoryExceeded)
     );
     let events = t.events();
     assert!(events.iter().any(|e| matches!(
         e,
-        Ev::Device(d) if d.profile_error == Some(p::ErrorCode::NoCapacity as i32)
+        Ev::Device(d) if d.errors.contains(&(p::ErrorCode::ProfileMemoryExceeded as i32))
     )));
     // Changing the layers loads the new ones at once.
     let d = set_layers(&mut t, SAVED, &[small]);
@@ -4343,7 +4231,10 @@ fn a_device_retries_its_layers_once_memory_is_released() {
         layout: None,
     });
     t.events();
-    assert_eq!(profile_error(&t.device(78)), Some(p::ErrorCode::NoCapacity));
+    assert_eq!(
+        profile_error(&t.device(78)),
+        Some(p::ErrorCode::ProfileMemoryExceeded)
+    );
     assert_eq!(press(&mut t, link, &[4]), [4]);
     assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
     // Other background work is waiting when the memory is released.
@@ -4378,7 +4269,7 @@ fn a_profile_that_cannot_be_read_is_retried_with_backoff() {
     let link = connect_saved(&mut t, descriptor());
     assert_eq!(
         profile_error(&t.device(SAVED)),
-        Some(p::ErrorCode::StorageFailed)
+        Some(p::ErrorCode::ProfileLoadFailed)
     );
     assert_eq!(press(&mut t, link, &[4]), [4]);
     assert_eq!(press(&mut t, link, &[]), Vec::<u16>::new());
@@ -4388,7 +4279,7 @@ fn a_profile_that_cannot_be_read_is_retried_with_backoff() {
     t.events();
     assert_eq!(
         profile_error(&t.device(SAVED)),
-        Some(p::ErrorCode::StorageFailed)
+        Some(p::ErrorCode::ProfileLoadFailed)
     );
     assert!(t.store.records.contains_key(&rules));
     t.now += FIRST_RETRY;
@@ -4396,7 +4287,7 @@ fn a_profile_that_cannot_be_read_is_retried_with_backoff() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, Ev::Device(d) if d.profile_error.is_none()))
+            .any(|e| matches!(e, Ev::Device(d) if profile_error(d).is_none()))
     );
     assert_eq!(press(&mut t, link, &[4]), [5]);
 }
@@ -4540,7 +4431,6 @@ fn configuration_interfaces_need_a_profile_and_refuse_conflicts() {
         assert!(code(set_interfaces(&mut t, vec![update])).is_some());
     }
     assert_eq!(state(&mut t), [(false, 0), (false, 0)]);
-    assert!(!t.app.usb_reconnect);
     // Selecting a profile for a disabled interface needs no USB reconnect.
     assert_eq!(
         code(set_interfaces(
@@ -4549,7 +4439,6 @@ fn configuration_interfaces_need_a_profile_and_refuse_conflicts() {
         )),
         None
     );
-    assert!(!t.app.usb_reconnect);
     assert!(t.events().iter().any(|e| matches!(e, Ev::Adapter(_))));
     assert_eq!(
         code(set_interfaces(
@@ -4558,7 +4447,6 @@ fn configuration_interfaces_need_a_profile_and_refuse_conflicts() {
         )),
         None
     );
-    assert!(std::mem::take(&mut t.app.usb_reconnect));
     assert_eq!(state(&mut t), [(true, first), (false, 0)]);
     // A configuration that enables conflicting interfaces changes nothing.
     assert_eq!(
@@ -4580,9 +4468,8 @@ fn configuration_interfaces_need_a_profile_and_refuse_conflicts() {
         )),
         None
     );
-    assert!(std::mem::take(&mut t.app.usb_reconnect));
     assert_eq!(state(&mut t), [(false, first), (true, second)]);
-    // Changing an enabled interface's profile reconnects USB; a disabled one's does not.
+    // Profile selection preserves the enabled interface set.
     assert_eq!(
         code(set_interfaces(
             &mut t,
@@ -4590,7 +4477,6 @@ fn configuration_interfaces_need_a_profile_and_refuse_conflicts() {
         )),
         None
     );
-    assert!(std::mem::take(&mut t.app.usb_reconnect));
     assert_eq!(
         code(set_interfaces(
             &mut t,
@@ -4598,7 +4484,6 @@ fn configuration_interfaces_need_a_profile_and_refuse_conflicts() {
         )),
         None
     );
-    assert!(!t.app.usb_reconnect);
     // An enabled interface keeps needing its profile; a disabled one can clear it.
     assert_eq!(
         code(set_interfaces(&mut t, vec![interface(vial, None, Some(0))])),
@@ -4807,7 +4692,6 @@ fn a_lost_profile_is_removed_with_its_references() {
             Some(lost),
         )],
     );
-    t.app.usb_reconnect = false;
     t.events();
     t.store.records.insert(
         cordial_core::storage::record_key(8, lost.into()),
@@ -4824,10 +4708,10 @@ fn a_lost_profile_is_removed_with_its_references() {
     assert!(t.saved(other).profiles.is_empty());
     assert_eq!(t.entry(SAVED).layers, [u64::from(kept)]);
     // Disabling the interface that used it reconnects USB.
-    assert!(t.app.usb_reconnect);
     assert_eq!(
         t.status().configuration_interfaces[0],
         p::ConfigurationInterfaceSupport {
+            active: false,
             interface: p::ConfigurationInterface::Via as i32,
             enabled: false,
             profile: 0,
@@ -4858,7 +4742,7 @@ fn an_undecodable_rules_file_leaves_the_profile_empty_after_the_first_input() {
     });
     assert_eq!(
         profile_error(&t.device(SAVED)),
-        Some(p::ErrorCode::StorageFailed)
+        Some(p::ErrorCode::ProfileLoadFailed)
     );
     assert_eq!(press(&mut t, link, &[4]), [4]);
     // No cleanup runs between the connection starting and its policy being read, nor until
@@ -5126,13 +5010,7 @@ fn a_change_saved_before_the_policy_is_read_keeps_the_saved_settings() {
     assert_eq!(t.live(SAVED).catalog.preferences().count(), 2);
     t.ok(Command::SetSettings(p::SetSettings {
         device: SAVED,
-        changes: vec![p::SettingChange {
-            integration: p::IntegrationKind::Hidpp as i32,
-            key: p::keys::BACKLIGHT_ENABLED.into(),
-            change: Some(p::setting_change::Change::Value(p::Value {
-                value: Some(p::value::Value::Bool(false)),
-            })),
-        }],
+        changes: vec![backlight_value(false)],
     }));
     let saved = block_on(
         Preferences {
@@ -5272,7 +5150,7 @@ fn lose_profile(t: &mut Test, id: u32) {
 fn a_lost_profile_is_removed_from_an_enabled_device_without_room_in_the_stack() {
     let mut t = Test::new(true);
     let lost = create(&mut t, "Lost");
-    // Seven devices fill the stack; the eighth is enabled without being resident.
+    // Enabled devices beyond the native allowance remain nonresident.
     for n in 2..=8 {
         t.add_saved(n);
     }
@@ -5414,7 +5292,7 @@ fn a_repaired_device_is_found_by_the_secondary_loop() {
     use cordial_core::storage::record_key;
     let mut t = Test::new(true);
     t.app.manager.devices[0].as_mut().unwrap().paused = true;
-    for n in 2..=5 {
+    for n in 2..=5.min(cordial_core::devices::CLASSIC_CONNECTIONS as u8) {
         t.add_saved(n);
     }
     let rpa = Peer {
@@ -5475,17 +5353,25 @@ fn settings_events_carry_only_what_changed() {
     t.app.manager.devices[0].as_mut().unwrap().paused = true;
     t.events();
     let listed = t.settings(SAVED);
-    let keys: Vec<&str> = listed.iter().map(|s| s.key.as_str()).collect();
-    assert_eq!(keys, [p::keys::BACKLIGHT_ENABLED, p::keys::WHEEL_INVERT]);
+    let groups: Vec<i32> = listed
+        .iter()
+        .map(|s| cordial_core::wire::object_ref(s).group)
+        .collect();
+    assert_eq!(
+        groups,
+        [
+            p::SettingsGroup::Backlight as i32,
+            p::SettingsGroup::Wheel as i32
+        ]
+    );
     match t.ok(Command::ListSettings(p::ListSettings {
         device: SAVED,
-        after: Some(p::SettingRef {
-            integration: p::IntegrationKind::Hidpp as i32,
-            key: p::keys::BACKLIGHT_ENABLED.into(),
-        }),
+        after: Some(cordial_core::wire::settings_ref(
+            SettingKey::BacklightEnabled,
+        )),
     })) {
         Some(R::Settings(page)) => {
-            assert_eq!(page.settings, listed[1..]);
+            assert_eq!(page.objects, listed[1..]);
             assert!(page.end);
         }
         other => panic!("{other:?}"),
@@ -5499,20 +5385,10 @@ fn settings_events_carry_only_what_changed() {
             })
             .collect()
     };
-    let setting = |key: &str, change| p::SettingChange {
-        integration: p::IntegrationKind::Hidpp as i32,
-        key: key.into(),
-        change: Some(change),
-    };
     assert_eq!(
         t.ok(Command::SetSettings(p::SetSettings {
             device: SAVED,
-            changes: vec![setting(
-                p::keys::BACKLIGHT_ENABLED,
-                p::setting_change::Change::Value(p::Value {
-                    value: Some(p::value::Value::Bool(false)),
-                }),
-            )],
+            changes: vec![backlight_value(false)],
         })),
         None
     );
@@ -5525,10 +5401,15 @@ fn settings_events_carry_only_what_changed() {
     assert_eq!(
         t.ok(Command::SetSettings(p::SetSettings {
             device: SAVED,
-            changes: vec![setting(
-                p::keys::WHEEL_INVERT,
-                p::setting_change::Change::Forget(p::SettingForget {}),
-            )],
+            changes: vec![p::SettingsUpdate {
+                integration: p::IntegrationKind::Hidpp as i32,
+                group: Some(p::settings_update::Group::Wheel(p::WheelSettingsUpdate {
+                    invert: Some(p::BoolSettingUpdate {
+                        change: Some(p::bool_setting_update::Change::Forget(p::SettingForget {}))
+                    }),
+                    ..Default::default()
+                }))
+            }],
         })),
         None
     );
@@ -5537,10 +5418,84 @@ fn settings_events_carry_only_what_changed() {
     assert!(reported[0].changed.is_empty());
     assert_eq!(
         reported[0].removed,
-        [p::SettingRef {
-            integration: p::IntegrationKind::Hidpp as i32,
-            key: p::keys::WHEEL_INVERT.into(),
-        }]
+        [cordial_core::wire::settings_ref(SettingKey::WheelInvert)]
+    );
+}
+
+#[test]
+fn settings_pages_and_events_preserve_whole_objects_and_order() {
+    use cordial_core::compact::Record;
+    let mut t = Test::new(true);
+    let link = connect_saved(&mut t, descriptor());
+    press(&mut t, link, &[4]);
+    t.events();
+    let records = [
+        SettingKey::WheelMode,
+        SettingKey::BacklightMode,
+        SettingKey::FnRowDefault,
+    ]
+    .map(|key| {
+        let mut metadata = preference(key, FeatureId::BACKLIGHT, 1).metadata;
+        metadata.choices = vec![1; 600].into_boxed_slice();
+        Record::new(metadata, true)
+    });
+    t.live(SAVED)
+        .catalog
+        .replace_discovery(records.into(), vec![])
+        .unwrap();
+    let expected = cordial_core::wire::settings(&t.live(SAVED).catalog).unwrap();
+    assert_eq!(expected.len(), 3);
+    let mut listed = Vec::new();
+    for index in 0..=expected.len() {
+        let after = listed.last().map(cordial_core::wire::object_ref);
+        let Some(R::Settings(page)) = t.ok(Command::ListSettings(p::ListSettings {
+            device: SAVED,
+            after,
+        })) else {
+            panic!("missing settings page")
+        };
+        assert_eq!(
+            page.objects,
+            expected[index..(index + 1).min(expected.len())]
+        );
+        assert_eq!(page.end, index + 1 >= expected.len());
+        let message = p::Message {
+            kind: Some(M::Response(p::Response {
+                result: Some(R::Settings(page.clone())),
+            })),
+        };
+        assert!(message.encoded_len() <= 1024);
+        listed.extend(page.objects);
+    }
+    assert_eq!(listed, expected);
+    let mut changed = Vec::new();
+    for event in t.events() {
+        if let Ev::SettingsChanged(settings) = event {
+            assert_eq!(settings.changed.len(), 1);
+            assert!(settings.removed.is_empty());
+            changed.extend(settings.changed.iter().cloned());
+            let message = p::Message {
+                kind: Some(M::Event(p::Event {
+                    kind: Some(Ev::SettingsChanged(settings)),
+                })),
+            };
+            assert!(message.encoded_len() <= 1024);
+        }
+    }
+    assert_eq!(changed, expected);
+
+    let mut metadata = preference(SettingKey::FnRowDefault, FeatureId::BACKLIGHT, 1).metadata;
+    metadata.choices = vec![1; 961].into_boxed_slice();
+    t.live(SAVED)
+        .catalog
+        .replace_discovery(vec![Record::new(metadata, true)], vec![])
+        .unwrap();
+    assert_eq!(
+        t.code(Command::ListSettings(p::ListSettings {
+            device: SAVED,
+            after: None,
+        })),
+        p::ErrorCode::TooLong
     );
 }
 
@@ -5622,7 +5577,6 @@ fn set_commands_respond_with_no_result_and_creation_with_the_id() {
 
 #[test]
 fn change_events_track_only_connected_devices() {
-    use cordial_core::model::errors::{DeviceWarning, HidReportType, WarningCode};
     let mut t = Test::new(true);
     // Disabled and disconnected devices, listed in full, leave nothing tracked.
     let mut ids = vec![SAVED];
@@ -5634,7 +5588,6 @@ fn change_events_track_only_connected_devices() {
     t.events();
     for &id in &ids {
         t.settings(id);
-        assert!(t.warnings(id).is_empty());
     }
     t.events();
     assert_eq!(t.app.tracked_devices(), 0);
@@ -5644,41 +5597,11 @@ fn change_events_track_only_connected_devices() {
         InputReport::new(link, ServiceId(7), 0, &[1]).unwrap(),
     ));
     t.events();
-    let warning = DeviceWarning {
-        code: WarningCode::IndicatorStateUnknown,
-        service: 1,
-        report_type: Some(HidReportType::Output),
-        report_id: Some(3),
-        bit_offset: Some(0),
-        usage_page: Some(8),
-        usage: None,
-    };
-    t.app
-        .manager
-        .connection_mut(link)
-        .unwrap()
-        .runtime
-        .as_mut()
-        .unwrap()
-        .warnings = vec![warning];
-    t.events();
-    assert_eq!(t.warnings(SAVED).len(), 1);
     t.settings(SAVED);
     assert_eq!(t.app.tracked_devices(), 1);
-    // Its warnings go away with it, and then nothing is tracked.
     t.event(Event::Disconnected { link, error: None });
-    let removed: Vec<_> = t
-        .events()
-        .into_iter()
-        .filter_map(|e| match e {
-            Ev::WarningsChanged(w) if w.device == SAVED => Some(w.removed),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(removed.len(), 1);
-    assert_eq!(removed[0].len(), 1);
+    t.events();
     assert_eq!(t.app.tracked_devices(), 0);
-    assert!(t.warnings(SAVED).is_empty());
     t.events();
     assert_eq!(t.app.tracked_devices(), 0);
 }
@@ -5716,13 +5639,7 @@ fn failed_event_reads_are_retried_after_a_backoff() {
                 assert_eq!(
                     t.ok(Command::SetSettings(p::SetSettings {
                         device: SAVED,
-                        changes: vec![p::SettingChange {
-                            integration: p::IntegrationKind::Hidpp as i32,
-                            key: p::keys::BACKLIGHT_ENABLED.into(),
-                            change: Some(p::setting_change::Change::Value(p::Value {
-                                value: Some(p::value::Value::Bool(false)),
-                            })),
-                        }],
+                        changes: vec![backlight_value(false)],
                     })),
                     None
                 );
@@ -5836,13 +5753,7 @@ fn healthy_device_events(t: &mut Test, round: u64) -> bool {
     assert_eq!(
         t.ok(Command::SetSettings(p::SetSettings {
             device: SAVED,
-            changes: vec![p::SettingChange {
-                integration: p::IntegrationKind::Hidpp as i32,
-                key: p::keys::BACKLIGHT_ENABLED.into(),
-                change: Some(p::setting_change::Change::Value(p::Value {
-                    value: Some(p::value::Value::Bool(round.is_multiple_of(2))),
-                })),
-            }],
+            changes: vec![backlight_value(round.is_multiple_of(2))],
         })),
         None
     );
@@ -6001,13 +5912,7 @@ fn a_settings_event_backoff_grows_across_device_events() {
     assert_eq!(
         t.ok(Command::SetSettings(p::SetSettings {
             device: SAVED,
-            changes: vec![p::SettingChange {
-                integration: p::IntegrationKind::Hidpp as i32,
-                key: p::keys::BACKLIGHT_ENABLED.into(),
-                change: Some(p::setting_change::Change::Value(p::Value {
-                    value: Some(p::value::Value::Bool(false)),
-                })),
-            }],
+            changes: vec![backlight_value(false)],
         })),
         None
     );
@@ -6037,7 +5942,6 @@ fn editing(t: &mut Test) -> (u32, cordial_core::link::LinkId) {
             Some(id),
         )],
     );
-    t.app.usb_reconnect = false;
     t.events();
     t.now += cordial_core::deferred::MAX_DELAY_MS;
     t.events();
@@ -6172,7 +6076,7 @@ fn a_failed_deferred_save_is_reported_and_retried_with_a_backoff() {
     t.now += cordial_core::application::EDITOR_BATCH_MS;
     let events = t.events();
     assert!(events.iter().any(|e| matches!(e, Ev::Adapter(s)
-        if s.ready && s.info.iter().any(|i| i.key == p::keys::STORAGE_FULL))));
+        if s.ready && s.errors.contains(&(p::ErrorCode::StorageFull as i32)))));
     assert_eq!(rules_writes(&t, id), 1);
     // The edit stays in use, and nothing is tried again before the backoff.
     assert_eq!(press(&mut t, link, &[4]), [5]);
@@ -6221,7 +6125,7 @@ fn a_failed_deferred_save_is_reported_and_retried_with_a_backoff() {
     let events = t.events();
     assert_eq!(rules_writes(&t, id), 4);
     assert!(events.iter().any(|e| matches!(e, Ev::Adapter(s)
-        if s.ready && s.info.iter().all(|i| i.key != p::keys::STORAGE_FULL))));
+        if s.ready && !s.errors.contains(&(p::ErrorCode::StorageFull as i32)))));
     assert_eq!(
         saved_rules(&mut t, id),
         [remap_rule(KEYBOARD_COLLECTION, key(4), &[6])]
@@ -6615,7 +6519,6 @@ fn editing_alone(t: &mut Test) -> u32 {
             Some(id),
         )],
     );
-    t.app.usb_reconnect = false;
     t.store.writes.clear();
     id
 }
@@ -6873,7 +6776,7 @@ fn a_full_filesystem_for_edits_written_from_the_editor_is_reported() {
     fail_next_allocation();
     block_on(t.app.save_all(&mut t.store, t.now));
     assert!(allocation_failed());
-    let full = |s: &p::Status| s.info.iter().any(|i| i.key == p::keys::STORAGE_FULL);
+    let full = |s: &p::Status| s.errors.contains(&(p::ErrorCode::StorageFull as i32));
     let status = t.status();
     assert!(status.ready && full(&status));
     t.store.full = None;
@@ -6909,9 +6812,10 @@ fn output_planner_allocation_failure_has_no_enabled_device_capacity_reason() {
         })),
     };
     t.store.writes.clear();
+    t.app.manager.outputs = Default::default();
     FAIL_LAYOUT.with(|f| {
         f.set(Some(
-            std::alloc::Layout::array::<(u64, p::OutputMode)>(4).unwrap(),
+            std::alloc::Layout::array::<cordial_core::outputs::Configured>(4).unwrap(),
         ));
     });
     block_on(t.app.dispatch(request, &mut t.store, &mut t.radio, t.now));
@@ -7034,7 +6938,12 @@ fn output_updates_save_once_in_order_and_failed_saves_leave_runtime_unchanged() 
     }];
     let advertised = t.status().output_support;
     assert_eq!(advertised.len(), 1);
-    assert!(advertised[0].modes.iter().all(|m| m.slots.is_none()));
+    assert!(
+        advertised[0]
+            .modes
+            .iter()
+            .all(|m| m.resources[0].count.is_none() || m.mode == p::OutputMode::Disabled as i32)
+    );
     let key = record_key(2, SAVED.into());
     t.store.writes.clear();
     let d = t.set_device(p::SetDevice {
@@ -7719,9 +7628,18 @@ fn gamepad_enumeration_reports_capacity_and_device_state_changes() {
     active.outputs.clone_from(&before.outputs);
     assert_eq!(active, before);
     let mut status = t.status();
-    assert_eq!(status.output_support[0].modes[0].slots, None);
-    assert_eq!(status.output_support[0].modes[1].slots, Some(1));
-    assert_eq!(status.output_support[0].modes[2].slots, Some(2));
+    assert_eq!(
+        status.output_support[0].modes[0].resources[0].count,
+        Some(0)
+    );
+    assert_eq!(
+        status.output_support[0].modes[1].resources[0].count,
+        Some(1)
+    );
+    assert_eq!(
+        status.output_support[0].modes[2].resources[0].count,
+        Some(2)
+    );
     status.output_support = status_before.output_support.clone();
     assert_eq!(status, status_before);
     let held = t.app.gamepad_outputs();
@@ -7769,7 +7687,7 @@ fn gamepad_enumeration_reports_capacity_and_device_state_changes() {
         t.status().output_support[0]
             .modes
             .iter()
-            .all(|m| m.slots.is_none())
+            .all(|m| m.resources[0].count.is_none() || m.mode == p::OutputMode::Disabled as i32)
     );
 }
 
@@ -8038,4 +7956,67 @@ fn configuration_editors_preserve_unrelated_rules_on_writes_and_reset_the_whole_
         t.quiet();
         assert!(saved_rules(&mut t, id).is_empty());
     }
+}
+
+#[test]
+fn disabled_nonresident_profile_outputs_reserve_usb_and_release_on_edit() {
+    let mut t = nonresident_gamepad_output();
+    assert!(!t.app.manager.usb_allocation().topology.desktop);
+    let profile = profile_with(&mut t, "Keyboard output", [4]);
+    set_layers(&mut t, SAVED, &[profile]);
+    assert!(t.app.manager.find(SAVED.into()).is_none());
+    assert!(t.app.manager.usb_allocation().topology.desktop);
+    assert_eq!(t.app.manager.profiles.used(), 0);
+    set_rules(
+        &mut t,
+        profile,
+        vec![forget_rule(KEYBOARD_COLLECTION, key(4))],
+    );
+    assert!(!t.app.manager.usb_allocation().topology.desktop);
+    assert!(!t.saved(SAVED).enabled);
+}
+
+#[test]
+fn required_and_reserved_usb_errors_are_independent_and_resources_keep_unknown_presence() {
+    let mut t = nonresident_gamepad_output();
+    t.app.manager.usb_budget.interfaces = 2;
+    t.app
+        .manager
+        .outputs
+        .prepare(88, p::OutputMode::Hid)
+        .unwrap();
+    t.app.manager.outputs.set(88, p::OutputMode::Hid);
+    let status = t.status();
+    assert!(
+        status
+            .errors
+            .contains(&(p::ErrorCode::UsbRequiredCapacityExceeded as i32))
+    );
+    assert!(
+        status
+            .errors
+            .contains(&(p::ErrorCode::UsbReservedCapacityExceeded as i32))
+    );
+    let interfaces = status
+        .resources
+        .iter()
+        .find(|r| r.r#type == p::ResourceType::Interfaces as i32)
+        .unwrap();
+    assert_eq!(interfaces.count, None);
+    assert_eq!(interfaces.limit, Some(2));
+    t.app.set_usb_topology(Default::default());
+    let status = t.status();
+    assert_eq!(status.resources[0].count, Some(2));
+    t.app.manager.outputs.remove(88);
+    let status = t.status();
+    assert!(
+        status
+            .errors
+            .contains(&(p::ErrorCode::UsbRequiredCapacityExceeded as i32))
+    );
+    assert!(
+        !status
+            .errors
+            .contains(&(p::ErrorCode::UsbReservedCapacityExceeded as i32))
+    );
 }

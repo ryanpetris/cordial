@@ -8,7 +8,7 @@ use super::{
     words::{self, Battery, DisplayKind},
 };
 use crate::{model, profiles, view::State};
-use cordial_protocol::{self as p, keys};
+use cordial_protocol::{self as p, ErrorCode};
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +121,10 @@ impl<F: Fleet> Model<F> {
             if st.status.ready && model::storage_full(&st.status) {
                 attention.push(words::STORAGE_FULL_ATTENTION.to_owned());
             }
+            // Missing required USB interfaces need attention; missing reserved ones don't.
+            if model::has_error(&st.status, ErrorCode::UsbRequiredCapacityExceeded) {
+                attention.push(words::code_text(ErrorCode::UsbRequiredCapacityExceeded));
+            }
             if let Some(why) = &s.unready {
                 attention.push(why.clone());
             }
@@ -214,7 +218,7 @@ impl<F: Fleet> Model<F> {
             }
         }
         // The shown device keeps its page, locked, while its adapter is held and until the
-        // adapter lists its devices again, as across the USB reconnect a gamepad pool change
+        // adapter lists its devices again, as across the USB reconnect an allocation change
         // causes.
         let kept = self.kept.take();
         self.kept = match &self.page {
@@ -307,13 +311,15 @@ impl<F: Fleet> Model<F> {
             .unwrap_or_default()
     }
 
-    /// A text information entry an adapter reports, cleaned.
-    pub(super) fn info_text(status: &p::Status, key: &str) -> Option<String> {
-        model::info_text(&status.info, key).map(words::clean)
+    /// The adapter's firmware version, cleaned.
+    pub(super) fn firmware(status: &p::Status) -> Option<String> {
+        let info = status.information.as_ref()?;
+        info.firmware_version.as_deref().map(words::clean)
     }
 
     pub(super) fn board(status: &p::Status) -> Option<String> {
-        Self::info_text(status, keys::BOARD_NAME)
+        let info = status.information.as_ref()?;
+        info.board_name.as_deref().map(words::clean)
     }
 }
 
@@ -356,17 +362,22 @@ impl<F: Fleet> Model<F> {
             if let Some(status) = &a.status
                 && words::memory_alert(status)
             {
-                let percent = words::memory_percent(status).unwrap_or(0);
+                let detail = match words::memory_percent(status) {
+                    Some(percent) => format!("Profile Memory {percent}%"),
+                    None => "Profile Memory".into(),
+                };
                 out.push(Alert {
                     name: a.name.clone(),
                     title: format!("{} is almost out of profile memory.", a.name),
-                    detail: format!("Profile Memory {percent}%"),
+                    detail,
                     page: page.clone(),
                 });
             }
             for text in &a.attention {
                 let detail = if text == words::STORAGE_FULL_ATTENTION {
                     words::STORAGE_FULL.to_owned()
+                } else if *text == words::code_text(ErrorCode::UsbRequiredCapacityExceeded) {
+                    words::REQUIRED_CAPACITY.to_owned()
                 } else {
                     text.clone()
                 };
@@ -395,6 +406,8 @@ impl<F: Fleet> Model<F> {
 /// Whether the device's settings tab has anything to show.
 pub fn has_settings(st: Option<&State>, d: &p::Device) -> bool {
     let listed =
-        st.is_some_and(|st| !crate::ui::catalog::presented(st.settings_of(d.id)).is_empty());
-    listed || !super::settings::readings(d).is_empty() || !words::wheel_figures(&d.info).is_empty()
+        st.is_some_and(|st| !crate::ui::catalog::presented(&st.settings_of(d.id)).is_empty());
+    listed
+        || !super::settings::readings(d).is_empty()
+        || !words::wheel_figures(d.information.as_ref()).is_empty()
 }

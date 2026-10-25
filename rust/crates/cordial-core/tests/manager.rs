@@ -301,16 +301,28 @@ fn additional_pairs_are_saved_disabled_and_enable_does_not_evict() {
             &mut radio,
         ))
         .unwrap();
-        // The stack holds seven devices; later ones are saved disabled and are not resident.
-        assert_eq!(policy(&mut store, id).enabled, n <= 7);
-        assert_eq!(slot.is_some(), n <= 7);
+        // Devices beyond the normal allowance are saved disabled.
+        assert_eq!(
+            policy(&mut store, id).enabled,
+            usize::from(n) <= cordial_core::devices::CLASSIC_CONNECTIONS
+        );
+        assert_eq!(
+            slot.is_some(),
+            usize::from(n) <= cordial_core::devices::CLASSIC_CONNECTIONS
+        );
         manager.disconnected(link, None, 0);
         block_on(manager.finish_pair(&mut store)).unwrap();
         block_on(manager.sync_bonds(&mut store, &mut radio)).unwrap();
         ids.push(id);
     }
-    assert_eq!(manager.devices.iter().flatten().count(), 7);
-    assert_eq!(radio.bonds.len(), 7);
+    assert_eq!(
+        manager.devices.iter().flatten().count(),
+        cordial_core::devices::CLASSIC_CONNECTIONS
+    );
+    assert_eq!(
+        radio.bonds.len(),
+        cordial_core::devices::CLASSIC_CONNECTIONS
+    );
     let last = *ids.last().unwrap();
     assert_eq!(
         change(&mut manager, &mut store, &mut radio, last, |p| p.enabled =
@@ -342,6 +354,14 @@ fn ambiguous_device_commit_is_resolved_from_storage() {
             &mut radio,
         ));
         assert_eq!(result.is_ok(), committed);
+        assert_eq!(radio.adopted, [link]);
+        assert_eq!(radio.promoted.contains(&link), committed);
+        assert_eq!(manager.connection(link).unwrap().pairing, !committed);
+        manager.close(link, None, &mut radio);
+        assert_eq!(
+            manager.connection_count(Transport::Classic),
+            usize::from(committed)
+        );
         manager.disconnected(link, None, 0);
         block_on(manager.finish_pair(&mut store)).unwrap();
         block_on(manager.sync_bonds(&mut store, &mut radio)).unwrap();
@@ -441,8 +461,9 @@ fn unblock_at_capacity_preserves_the_working_selection() {
     }
     block_on(manager.load(&mut store, &mut radio)).unwrap();
     manager.radio_ready = true;
-    assert_eq!(resident(&manager), (102..=108).collect::<Vec<_>>());
-    let slot = manager.find(108).unwrap();
+    let end = 102 + cordial_core::devices::CLASSIC_CONNECTIONS as u64;
+    assert_eq!(resident(&manager), (102..end).collect::<Vec<_>>());
+    let slot = manager.find(end - 1).unwrap();
     let link = manager
         .connect(slot, true, 90_000, None, &mut radio)
         .unwrap()
@@ -653,17 +674,24 @@ fn disabling_ble_hidpp_requests_fresh_standard_battery() {
 #[test]
 fn only_enabled_devices_the_stack_has_room_for_are_resident() {
     let (mut manager, mut store, mut radio) = setup();
-    // Ten more saved devices: three disabled, one blocked and six enabled.
-    for n in 2..=11u8 {
+    // Saved devices include disabled and blocked entries.
+    for n in 2..=10u8 {
         add(&mut store, u64::from(n), peer(n), |p| {
             p.enabled = !(2..=4).contains(&n);
             p.blocked = n == 5;
         });
     }
     block_on(manager.load(&mut store, &mut radio)).unwrap();
-    // Seven fit: the lowest enabled IDs. The rest stay on flash.
-    assert_eq!(resident(&manager), [6, 7, 8, 9, 10, 11, 77]);
-    assert_eq!(radio.bonds.len(), 7);
+    // The lowest enabled IDs fit. Disabled and blocked devices stay on flash.
+    let expected: Vec<_> = [6, 7, 8, 9, 10, 77]
+        .into_iter()
+        .take(cordial_core::devices::CLASSIC_CONNECTIONS)
+        .collect();
+    assert_eq!(resident(&manager), expected);
+    assert_eq!(
+        radio.bonds.len(),
+        cordial_core::devices::CLASSIC_CONNECTIONS
+    );
     for (id, reason) in [
         (2, p::InactiveReason::Disabled),
         (5, p::InactiveReason::Blocked),
@@ -673,17 +701,19 @@ fn only_enabled_devices_the_stack_has_room_for_are_resident() {
             Some(reason as i32)
         );
     }
-    assert_eq!(record(&manager, &mut store, 77).inactive, None);
+    let last = *expected.last().unwrap();
+    assert_eq!(record(&manager, &mut store, last).inactive, None);
     // Disabling a device without a link leaves at once and frees room for another.
-    change(&mut manager, &mut store, &mut radio, 77, |p| {
+    let removed_peer = policy(&mut store, last).peer;
+    change(&mut manager, &mut store, &mut radio, last, |p| {
         p.enabled = false
     })
     .unwrap();
-    assert!(manager.find(77).is_none());
-    assert!(!radio.bonds.contains(&peer(1)));
+    assert!(manager.find(last).is_none());
+    assert!(!radio.bonds.contains(&removed_peer));
     assert!(manager.vacated);
     assert_eq!(
-        record(&manager, &mut store, 77).inactive,
+        record(&manager, &mut store, last).inactive,
         Some(p::InactiveReason::Disabled as i32)
     );
     change(&mut manager, &mut store, &mut radio, 2, |p| {
@@ -707,8 +737,9 @@ fn a_smaller_stack_loads_the_lowest_ids_and_fill_adds_the_rest_when_room_frees()
         add(&mut store, u64::from(n), peer(n), |_| {});
     }
     block_on(manager.load(&mut store, &mut radio)).unwrap();
-    // Nine enabled devices, room for seven: the two highest IDs report capacity.
-    assert_eq!(resident(&manager), [2, 3, 4, 5, 6, 7, 8]);
+    // The lowest enabled IDs fit; the highest IDs report capacity.
+    let end = 2 + cordial_core::devices::CLASSIC_CONNECTIONS as u64;
+    assert_eq!(resident(&manager), (2..end).collect::<Vec<_>>());
     assert_eq!(
         record(&manager, &mut store, 77).inactive,
         Some(p::InactiveReason::Capacity as i32)
@@ -720,9 +751,12 @@ fn a_smaller_stack_loads_the_lowest_ids_and_fill_adds_the_rest_when_room_frees()
     })
     .unwrap();
     assert_eq!(block_on(manager.fill(&mut store, &mut radio)), Ok(true));
-    assert_eq!(resident(&manager), [2, 4, 5, 6, 7, 8, 9]);
-    assert_eq!(manager.changed, [9]);
-    assert!(radio.bonds.contains(&peer(9)));
+    assert_eq!(
+        resident(&manager),
+        (2..=end).filter(|&id| id != 3).collect::<Vec<_>>()
+    );
+    assert_eq!(manager.changed, [end]);
+    assert!(radio.bonds.contains(&peer(end as u8)));
     assert_eq!(block_on(manager.fill(&mut store, &mut radio)), Ok(false));
 }
 #[test]
@@ -1117,7 +1151,14 @@ fn output_manager(modes: &[p::OutputMode]) -> (Manager, Store, Radio) {
         add(
             &mut store,
             77 + index as u64,
-            peer(1 + index as u8),
+            Peer {
+                transport: if index < cordial_core::devices::CLASSIC_CONNECTIONS {
+                    Transport::Classic
+                } else {
+                    Transport::Ble
+                },
+                ..peer(1 + index as u8)
+            },
             |policy| {
                 policy.roles.0 = cordial_core::outputs::GAMEPAD;
                 if mode != p::OutputMode::Disabled {
@@ -1159,6 +1200,40 @@ fn enumerate_outputs(manager: &mut Manager, hid: u8, xinput: u8, generation: u64
         generation,
         ready,
     }));
+}
+
+#[test]
+fn connected_slot_zero_leaves_further_disconnected_slots_reserved() {
+    use cordial_core::outputs::Plan;
+    use p::OutputMode::{Hid, Xinput};
+    for (connected, other) in [(Hid, Xinput), (Xinput, Hid)] {
+        let (mut manager, _, mut radio) = output_manager(&[connected, connected, other]);
+        connect_pad(&mut manager, &mut radio, 77);
+        manager.usb_budget.interfaces = 4;
+        let allocation = manager.usb_allocation();
+        assert_eq!(
+            allocation.topology.gamepads,
+            Plan {
+                hid_gamepads: 1,
+                xinput_gamepads: 1
+            }
+        );
+        assert!(!allocation.required_exceeded);
+        assert!(allocation.reserved_exceeded);
+
+        manager.outputs.remove(79);
+        manager.usb_budget.interfaces = 3;
+        let allocation = manager.usb_allocation();
+        assert_eq!(
+            allocation.topology.gamepads,
+            Plan {
+                hid_gamepads: u8::from(connected == Hid),
+                xinput_gamepads: u8::from(connected == Xinput),
+            }
+        );
+        assert!(!allocation.required_exceeded);
+        assert!(allocation.reserved_exceeded);
+    }
 }
 
 #[test]
@@ -1460,4 +1535,316 @@ fn losing_a_connected_gamepad_record_releases_its_slot_and_pending_notifications
     assert_eq!(manager.outputs.plan(), Default::default());
     assert_eq!(manager.removed, [77]);
     assert!(!manager.changed.contains(&77));
+}
+
+#[test]
+fn transport_allowances_are_independent_and_pairing_has_one_reserved_slot() {
+    use cordial_core::devices::{ACTIVE_CONNECTIONS, connection_limit};
+    for pairing_transport in [Transport::Classic, Transport::Ble] {
+        let (mut manager, mut store, mut radio) = setup();
+        block_on(Policies { store: &mut store }.remove(77)).unwrap();
+        for transport in [Transport::Classic, Transport::Ble] {
+            for n in 1..=connection_limit(transport) + 1 {
+                let id = n as u64 + if transport == Transport::Ble { 100 } else { 0 };
+                add(
+                    &mut store,
+                    id,
+                    Peer {
+                        transport,
+                        ..peer(n as u8)
+                    },
+                    |_| {},
+                );
+            }
+        }
+        block_on(manager.load(&mut store, &mut radio)).unwrap();
+        manager.radio_ready = true;
+        for transport in [Transport::Classic, Transport::Ble] {
+            assert_eq!(manager.max_enabled(transport), connection_limit(transport));
+            let ids: Vec<_> = manager
+                .devices
+                .iter()
+                .flatten()
+                .filter(|d| d.peer.transport == transport)
+                .map(|d| d.id)
+                .collect();
+            assert_eq!(ids.len(), connection_limit(transport));
+            for id in ids {
+                let slot = manager.find(id).unwrap();
+                if transport == Transport::Ble {
+                    assert!(manager.ble_admission());
+                    let p = manager.devices[slot].as_ref().unwrap().peer;
+                    assert_eq!(
+                        manager.incoming(id as u32, p, 0, None, &mut radio),
+                        Ok(Some(slot))
+                    );
+                } else {
+                    manager
+                        .connect(slot, false, 30_000, None, &mut radio)
+                        .unwrap();
+                }
+                let link = manager.link_for(slot).unwrap();
+                manager.connected(link, descriptor(), 255, 0).unwrap();
+            }
+            assert_eq!(
+                manager.connection_count(transport),
+                connection_limit(transport)
+            );
+            assert!(!manager.connection_room(transport));
+        }
+        assert_eq!(
+            manager.connections.iter().flatten().count(),
+            ACTIVE_CONNECTIONS - 1
+        );
+        assert!(!manager.ble_admission());
+        let pairing_peer = Peer {
+            transport: pairing_transport,
+            ..peer(200)
+        };
+        block_on(manager.prepare_pair(pairing_peer, None, &mut store, &mut radio)).unwrap();
+        let pairing = manager.pair(pairing_peer, 90_000, &mut radio).unwrap();
+        assert_eq!(
+            manager.connections.iter().flatten().count(),
+            ACTIVE_CONNECTIONS
+        );
+        assert_eq!(
+            manager.connection_count(pairing_transport),
+            connection_limit(pairing_transport)
+        );
+        assert_eq!(
+            manager.pair(
+                Peer {
+                    transport: Transport::Ble,
+                    ..peer(201)
+                },
+                90_000,
+                &mut radio
+            ),
+            Err(Error::Busy)
+        );
+        let (saved, slot) = block_on(manager.bonded(
+            pairing,
+            pairing_peer,
+            None,
+            b"Extra",
+            &mut store,
+            &mut radio,
+        ))
+        .unwrap();
+        assert_eq!(slot, None);
+        assert!(!policy(&mut store, saved).enabled);
+        assert!(manager.connection(pairing).unwrap().pairing);
+        manager.close(pairing, None, &mut radio);
+        assert_eq!(
+            manager.pair(pairing_peer, 90_000, &mut radio),
+            Err(Error::Busy)
+        );
+        manager.disconnected(pairing, None, 1).unwrap();
+
+        // Retiring a saved device frees an enabled entry, but its closing link still
+        // consumes a normal slot. Neither explicit nor incoming reconnection may use the reserve.
+        for transport in [Transport::Classic, Transport::Ble] {
+            let base = if transport == Transport::Ble { 100 } else { 0 };
+            let slot = manager.find(base + 1).unwrap();
+            let old = manager.link_for(slot).unwrap();
+            block_on(manager.lose(base + 1, &mut store, &mut radio)).unwrap();
+            assert!(manager.connection(old).unwrap().closing);
+            assert_eq!(
+                manager.connection_count(transport),
+                connection_limit(transport)
+            );
+            block_on(manager.fill(&mut store, &mut radio)).unwrap();
+            let waiting = base + connection_limit(transport) as u64 + 1;
+            let slot = manager.find(waiting).unwrap();
+            let p = manager.devices[slot].as_ref().unwrap().peer;
+            assert_eq!(
+                manager.connect(slot, false, 30_000, None, &mut radio),
+                Err(Error::Capacity)
+            );
+            assert_eq!(manager.incoming(500, p, 0, None, &mut radio), Ok(None));
+            manager.disconnected(old, None, 1).unwrap();
+            radio.reject_connect = Some(Error::Busy);
+            assert_eq!(
+                manager.connect(slot, false, 30_000, None, &mut radio),
+                Err(Error::Busy)
+            );
+            assert_eq!(
+                manager.connection_count(transport),
+                connection_limit(transport) - 1
+            );
+            radio.reject_connect = None;
+            let new = manager
+                .connect(slot, false, 30_000, None, &mut radio)
+                .unwrap()
+                .unwrap();
+            assert_ne!(new.generation, old.generation);
+            assert!(manager.disconnected(old, None, 2).is_none());
+            manager.connected(new, descriptor(), 255, 2).unwrap();
+        }
+    }
+}
+
+#[test]
+fn unsupported_classic_has_no_enabled_or_connection_allowance() {
+    let (mut manager, mut store, mut radio) = setup();
+    radio.transports = classic_unsupported();
+    block_on(manager.load(&mut store, &mut radio)).unwrap();
+    assert_eq!(manager.max_enabled(Transport::Classic), 0);
+    assert_eq!(manager.connection_count(Transport::Classic), 0);
+    assert!(!manager.connection_room(Transport::Classic));
+    assert_eq!(
+        manager.max_enabled(Transport::Ble),
+        cordial_core::devices::BLE_CONNECTIONS
+    );
+}
+
+#[test]
+fn saved_disabled_pair_keeps_reserve_until_disconnect_and_normal_admission_still_fits() {
+    use cordial_core::devices::connection_limit;
+    for transport in [Transport::Classic, Transport::Ble] {
+        for incoming in [false, true] {
+            // BLE incoming is intentionally suspended during teardown.
+            if incoming && transport == Transport::Ble {
+                continue;
+            }
+            let (mut manager, mut store, mut radio) = setup();
+            block_on(Policies { store: &mut store }.remove(77)).unwrap();
+            let limit = connection_limit(transport);
+            for n in 1..=limit {
+                add(
+                    &mut store,
+                    n as u64,
+                    Peer {
+                        transport,
+                        ..peer(n as u8)
+                    },
+                    |_| {},
+                );
+            }
+            block_on(manager.load(&mut store, &mut radio)).unwrap();
+            manager.radio_ready = true;
+            radio.native_links = Some(Vec::new());
+            for n in 1..limit {
+                let slot = manager.find(n as u64).unwrap();
+                let link = manager
+                    .connect(slot, true, 30_000, None, &mut radio)
+                    .unwrap()
+                    .unwrap();
+                manager.connected(link, descriptor(), 255, 0).unwrap();
+            }
+            let candidate = Peer {
+                transport,
+                ..peer(200)
+            };
+            block_on(manager.prepare_pair(candidate, None, &mut store, &mut radio)).unwrap();
+            let pairing = manager.pair(candidate, 90_000, &mut radio).unwrap();
+            let (saved, slot) = block_on(
+                manager.bonded(pairing, candidate, None, b"Extra", &mut store, &mut radio),
+            )
+            .unwrap();
+            assert_eq!(slot, None);
+            assert!(!policy(&mut store, saved).enabled);
+            assert_eq!(radio.adopted, [pairing]);
+            assert!(radio.promoted.is_empty());
+            manager.close(pairing, None, &mut radio);
+            assert!(manager.connection(pairing).unwrap().closing);
+            assert!(manager.connection(pairing).unwrap().pairing);
+            assert!(radio.native_room(transport));
+            assert!(manager.connection_room(transport));
+            let slot = manager.find(limit as u64).unwrap();
+            let waiting = manager.devices[slot].as_ref().unwrap().peer;
+            if incoming {
+                radio.incoming_peer = Some(waiting);
+                assert_eq!(
+                    manager.incoming(1, waiting, 1, None, &mut radio),
+                    Ok(Some(slot))
+                );
+            } else {
+                manager
+                    .connect(slot, true, 30_000, None, &mut radio)
+                    .unwrap()
+                    .unwrap();
+            }
+            let normal = manager.link_for(slot).unwrap();
+            manager.connected(normal, descriptor(), 255, 1).unwrap();
+            assert!(!radio.native_room(transport));
+            assert!(!manager.connection_room(transport));
+
+            // Retirement frees an enabled entry; the closing normal link still owns capacity.
+            block_on(manager.lose(limit as u64, &mut store, &mut radio)).unwrap();
+            let extra = Peer {
+                transport,
+                ..peer(201)
+            };
+            add(&mut store, 900, extra, |_| {});
+            block_on(manager.fill(&mut store, &mut radio)).unwrap();
+            let next = manager.find(900).unwrap();
+            assert_eq!(
+                manager.connect(next, true, 30_000, None, &mut radio),
+                Err(Error::Capacity)
+            );
+            assert_eq!(manager.incoming(2, extra, 1, None, &mut radio), Ok(None));
+            assert!(!radio.native_room(transport));
+            radio
+                .native_links
+                .as_mut()
+                .unwrap()
+                .retain(|(id, _, _)| *id != pairing);
+            manager.disconnected(pairing, None, 2);
+            assert!(!radio.native_room(transport));
+            radio
+                .native_links
+                .as_mut()
+                .unwrap()
+                .retain(|(id, _, _)| *id != normal);
+            manager.disconnected(normal, None, 2);
+            assert!(radio.native_room(transport));
+            manager
+                .connect(next, true, 30_000, None, &mut radio)
+                .unwrap()
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn resident_promotion_follows_commit_and_failed_commit_keeps_reserve() {
+    for transport in [Transport::Classic, Transport::Ble] {
+        for commit in [false, true] {
+            let (mut manager, mut store, mut radio) = setup();
+            radio.native_links = Some(Vec::new());
+            let candidate = Peer {
+                transport,
+                ..peer(200)
+            };
+            block_on(manager.prepare_pair(candidate, None, &mut store, &mut radio)).unwrap();
+            let pairing = manager.pair(candidate, 90_000, &mut radio).unwrap();
+            if !commit {
+                store.fail_save = Some((record_key(2, last_device(&store)), false));
+            }
+            let result =
+                block_on(manager.bonded(pairing, candidate, None, b"New", &mut store, &mut radio));
+            if commit {
+                let (_, slot) = result.unwrap();
+                assert!(slot.is_some());
+                assert_eq!(radio.promoted, [pairing]);
+            } else {
+                assert_eq!(result, Err(Error::StorageFailed));
+                assert!(radio.promoted.is_empty());
+            }
+            assert_eq!(radio.adopted, [pairing]);
+            assert_eq!(radio.native_links.as_ref().unwrap()[0].2, !commit);
+            assert_eq!(manager.connection(pairing).unwrap().pairing, !commit);
+            manager.close(pairing, None, &mut radio);
+            assert_eq!(manager.connection_count(transport), usize::from(commit));
+            assert_eq!(radio.native_links.as_ref().unwrap()[0].2, !commit);
+            radio
+                .native_links
+                .as_mut()
+                .unwrap()
+                .retain(|(id, _, _)| *id != pairing);
+            manager.disconnected(pairing, None, 1);
+            assert!(radio.native_links.as_ref().unwrap().is_empty());
+        }
+    }
 }

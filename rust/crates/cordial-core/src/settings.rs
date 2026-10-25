@@ -82,6 +82,11 @@ impl Catalog {
         self.enabled = enabled;
         if !connected {
             self.busy = false;
+            for record in &mut self.records {
+                record.observed = Observed::Missing;
+                record.observed_at = None;
+                record.source = None;
+            }
         }
     }
     pub fn invalidate(&mut self) {
@@ -210,10 +215,6 @@ impl Catalog {
                     let compatible = record.writable
                         && record.metadata.feature == preference.metadata.feature
                         && record.metadata.scope == preference.metadata.scope;
-                    if !compatible {
-                        *record = Record::new(preference.metadata.clone(), true);
-                        record.available = false;
-                    }
                     record.state = if compatible && record.metadata.accepts(preference.value) {
                         SettingState::Pending
                     } else {
@@ -332,7 +333,17 @@ impl Catalog {
         key: SettingKey,
         store: &mut S,
     ) -> Result<(), Error> {
-        let index = self.editable(key)?;
+        if self.busy {
+            return Err(Error::Busy);
+        }
+        if !self.discovered && self.records.is_empty() {
+            return Err(Error::SettingsUnavailable);
+        }
+        let index = self
+            .records
+            .iter()
+            .position(|r| r.metadata.key == key)
+            .ok_or(Error::NotFound)?;
         let record = &mut self.records[index];
         if record.preference.is_some() {
             self.busy = true;
@@ -363,7 +374,7 @@ impl Catalog {
             let Some(index) = self
                 .records
                 .iter()
-                .position(|r| r.metadata.key == change.key && r.writable)
+                .position(|r| r.metadata.key == change.key)
             else {
                 // Forgetting a setting that has no saved value changes nothing.
                 if change.value.is_none() {
@@ -375,6 +386,12 @@ impl Catalog {
                 None => None,
                 Some(value) => {
                     let record = &self.records[index];
+                    if !record.writable {
+                        return Err(Error::ReadOnly);
+                    }
+                    if !record.available && record.preference.is_none() {
+                        return Err(Error::NotFound);
+                    }
                     let value = number(change.key, value)?;
                     let candidate = Preference {
                         metadata: record.metadata.clone(),

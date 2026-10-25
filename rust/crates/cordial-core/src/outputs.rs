@@ -101,50 +101,115 @@ pub struct Plan {
     pub xinput_gamepads: u8,
 }
 
-/// Non-disabled choices of all paired devices, including nonresident devices.
+/// Saved USB requirements, including devices that are not Bluetooth residents.
+#[derive(Clone)]
+pub struct Configured {
+    pub id: u64,
+    pub mode: p::OutputMode,
+    pub roles: u8,
+    pub transport: crate::model::identifiers::Transport,
+    pub enabled: bool,
+    profiles: heapless::Vec<(u64, u8), { crate::profiles::MAX_LAYERS }>,
+}
+impl Configured {
+    pub async fn load<S: crate::storage::RecordStore>(
+        policy: &crate::devices::Policy,
+        store: &mut S,
+    ) -> Self {
+        let mut profiles = heapless::Vec::new();
+        for &id in &policy.profiles {
+            let roles = crate::profiles::rules(store, id)
+                .await
+                .map_or(0, |rules| rules.output_roles());
+            let _ = profiles.push((id, roles));
+        }
+        Self {
+            id: policy.id,
+            mode: gamepad(&policy.output_preferences),
+            roles: policy.roles.0,
+            transport: policy.peer.transport,
+            enabled: policy.enabled,
+            profiles,
+        }
+    }
+    pub fn desktop(&self) -> bool {
+        (self.roles | self.profiles.iter().fold(0, |roles, p| roles | p.1)) & 31 != 0
+    }
+}
+
 #[derive(Default)]
 pub struct Planner {
-    selections: Vec<(u64, p::OutputMode)>,
-    counts: [u32; 3],
+    pub(crate) selections: Vec<Configured>,
 }
 impl Planner {
     pub(crate) fn mode(&self, id: u64) -> p::OutputMode {
         self.selections
             .iter()
-            .find(|s| s.0 == id)
-            .map_or(p::OutputMode::Disabled, |s| s.1)
+            .find(|s| s.id == id)
+            .map_or(p::OutputMode::Disabled, |s| s.mode)
     }
     pub(crate) fn contains(&self, id: u64) -> bool {
-        self.selections.iter().any(|s| s.0 == id)
+        self.selections.iter().any(|s| s.id == id)
     }
-    /// Reserves any memory needed before a record is committed.
-    pub fn prepare(&mut self, id: u64, mode: p::OutputMode) -> Result<(), ErrorCode> {
-        if mode != p::OutputMode::Disabled && !self.contains(id) {
+    /// Reserves memory before committing a saved device.
+    pub fn prepare(&mut self, id: u64, _: p::OutputMode) -> Result<(), ErrorCode> {
+        if !self.contains(id) {
             self.selections
                 .try_reserve(1)
                 .map_err(|_| ErrorCode::Capacity)?;
         }
         Ok(())
     }
-    /// Records a committed selection after `prepare` succeeds.
+    pub fn configure(&mut self, value: Configured) {
+        self.remove(value.id);
+        self.selections.push(value);
+    }
+    /// Sets an output selection for a device without changing its other requirements.
     pub fn set(&mut self, id: u64, mode: p::OutputMode) {
-        self.remove(id);
-        if mode != p::OutputMode::Disabled {
-            self.selections.push((id, mode));
-            self.counts[mode as usize] += 1;
+        if let Some(value) = self.selections.iter_mut().find(|s| s.id == id) {
+            value.mode = mode;
+        } else {
+            self.selections.push(Configured {
+                id,
+                mode,
+                roles: 0,
+                transport: crate::model::identifiers::Transport::Ble,
+                enabled: true,
+                profiles: heapless::Vec::new(),
+            });
+        }
+    }
+    pub fn roles_changed(&mut self, id: u64, roles: u8) {
+        if let Some(device) = self.selections.iter_mut().find(|s| s.id == id) {
+            device.roles = roles;
         }
     }
     pub fn remove(&mut self, id: u64) {
-        if let Some(index) = self.selections.iter().position(|s| s.0 == id) {
-            let (_, mode) = self.selections.swap_remove(index);
-            self.counts[mode as usize] -= 1;
+        self.selections.retain(|s| s.id != id);
+    }
+    pub fn profile_changed(&mut self, id: u64, roles: u8) {
+        for device in &mut self.selections {
+            for profile in &mut device.profiles {
+                if profile.0 == id {
+                    profile.1 = roles;
+                }
+            }
         }
     }
     pub fn plan(&self) -> Plan {
         Plan {
-            hid_gamepads: self.counts[p::OutputMode::Hid as usize].min(MAX_SLOTS.into()) as u8,
-            xinput_gamepads: self.counts[p::OutputMode::Xinput as usize].min(MAX_SLOTS.into())
-                as u8,
+            hid_gamepads: self
+                .selections
+                .iter()
+                .filter(|s| s.mode == p::OutputMode::Hid)
+                .count()
+                .min(4) as u8,
+            xinput_gamepads: self
+                .selections
+                .iter()
+                .filter(|s| s.mode == p::OutputMode::Xinput)
+                .count()
+                .min(4) as u8,
         }
     }
 }

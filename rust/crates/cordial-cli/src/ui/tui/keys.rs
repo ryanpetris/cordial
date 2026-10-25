@@ -326,14 +326,14 @@ impl<F: Fleet> Model<F> {
                 "enter" => {
                     self.commit_editing();
                     if let Page::Device(a, id) = self.shown() {
-                        self.save_settings(&a, id, false);
+                        self.save_settings(&a, id);
                     }
                 }
                 "esc" => self.revert_editing(),
                 "ctrl+s" => {
                     self.commit_editing();
                     if let Page::Device(a, id) = self.shown() {
-                        self.save_settings(&a, id, false);
+                        self.save_settings(&a, id);
                     }
                 }
                 "ctrl+n" | "ctrl+r" | "f5" => {
@@ -654,15 +654,8 @@ impl<F: Fleet> Model<F> {
         let Some(dialog) = self.dialog.clone() else {
             return;
         };
-        if self.adapter_confirm(&dialog) {
-            return;
-        }
         match dialog {
             Dialog::Forget(a, id) => self.forget_confirm(&a, id),
-            Dialog::SaveSettings(a, id) => {
-                self.dialog = None;
-                self.save_settings(&a, id, true);
-            }
             Dialog::ProfileDelete(a, id) => self.delete_profile(&a, id),
             Dialog::Bootloader(a) => {
                 self.dialog = None;

@@ -10,7 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 def run_c(source):
     with tempfile.TemporaryDirectory() as directory:
         cfile, binary = Path(directory, "test.c"), Path(directory, "test")
-        cfile.write_text(source)
+        cfile.write_text("#define MYNEWT_VAL(x) MYNEWT_VAL_ ## x\n"
+                         "#define MYNEWT_VAL_BLE_MAX_CONNECTIONS 9\n"
+                         "#define MYNEWT_VAL_BLE_STORE_MAX_BONDS 9\n" + source)
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
                         "-I", str(ROOT / "platforms/esp32s3/components/platform"),
                         str(cfile), "-o", str(binary)], check=True)
@@ -18,6 +20,101 @@ def run_c(source):
 
 
 class CacheWalkTests(unittest.TestCase):
+    def test_normal_links_leave_one_pairing_slot_and_closing_links_hold_capacity(self):
+        native = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
+        connect = native[native.index("    if (c->kind==CORDIAL_BLE_CONNECT) {"):
+                         native.index("    if (!l || l->closing)")]
+        accept = native[native.index("    if(c->kind==CORDIAL_BLE_ACCEPT) {"):
+                        native.index("    if (c->kind==CORDIAL_BLE_SCAN)")]
+        adopt = native[native.index("    if (c->kind==CORDIAL_BLE_ADOPT)"):
+                       native.index("    if (c->kind==CORDIAL_BLE_DISCONNECT)")]
+        promote = native[native.index("void cordial_ble_promote("):
+                         native.index("unsigned cordial_ble_bond_capacity(")]
+        run_c(r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <string.h>
+#include "ble.h"
+#define BLE_HS_CONN_HANDLE_NONE 65535
+struct link {unsigned token,connection,mtu;bool pairing,adopted,closing;cordial_ble_peer peer;};
+typedef struct link link;
+static link links[MYNEWT_VAL(BLE_MAX_CONNECTIONS)];
+static cordial_ble_event last;
+static void emit(const cordial_ble_event *e) {last=*e;}
+static struct {uint32_t attempt;uint16_t handle;} incoming;
+static int incoming_timeout;
+static unsigned rejected,accepted;
+static void reject_incoming(void) {rejected++;}
+static void connected(link *l) {assert(l->connection==42);accepted++;}
+static void ble_npl_callout_stop(int *callout) {assert(callout==&incoming_timeout);}
+static void command(const cordial_ble_command *c) {link *l=NULL;
+    for(unsigned i=0;i<MYNEWT_VAL(BLE_MAX_CONNECTIONS);i++)
+        if(links[i].token==c->token) l=&links[i];
+''' + connect + accept + adopt + r'''
+}
+#define portMAX_DELAY 0xffffffffu
+static int commands, command_event;
+static cordial_ble_command queued[8];
+static unsigned queued_count, waits, wakes;
+static void drain_one(void) {
+    assert(queued_count);command(&queued[0]);
+    memmove(queued,queued+1,--queued_count*sizeof(*queued));
+}
+static int xQueueSend(int q,const cordial_ble_command *c,unsigned timeout) {
+    assert(q==commands);
+    if(queued_count==8) {
+        if(timeout!=portMAX_DELAY)return 0;
+        waits++;drain_one();
+    }
+    queued[queued_count++]=*c;return 1;
+}
+static int nimble_port_get_dflt_eventq(void) {return 1;}
+static void ble_npl_eventq_put(int q,int *event) {assert(q==1 && event==&command_event);wakes++;}
+''' + promote + r'''
+int main(void) {
+    cordial_ble_command c={.kind=CORDIAL_BLE_CONNECT};
+    for(unsigned i=0;i<7;i++) {c.token=i+1;command(&c);assert(links[i].token==i+1);}
+    c.token=9;c.pairing=1;command(&c);assert(links[7].token==9 && links[7].pairing);
+    c.token=10;command(&c);assert(last.token==10 && !links[8].token);
+    c.token=8;c.pairing=0;command(&c);assert(links[8].token==8);
+    c.token=10;command(&c);assert(last.token==10 && last.code==CORDIAL_BLE_CAPACITY);
+    links[6].closing=true;last.token=0;command(&c);assert(last.token==10);
+    memset(&links[6],0,sizeof links[6]);
+    // Adoption keeps the reserve while the saved non-resident link closes.
+    c.token=9;c.kind=CORDIAL_BLE_ADOPT;command(&c);assert(links[7].pairing && links[7].adopted);
+    links[7].closing=true;
+    c.token=10;c.kind=CORDIAL_BLE_CONNECT;command(&c);assert(links[6].token==10);
+    c.token=11;command(&c);assert(last.token==11 && last.code==CORDIAL_BLE_CAPACITY);
+    memset(&links[7],0,sizeof links[7]);
+    // Automatic admission has the same independent normal allowance.
+    c.token=9;c.pairing=1;command(&c);assert(links[7].pairing);
+    memset(&links[8],0,sizeof links[8]);
+    incoming.attempt=2;incoming.handle=42;
+    c=(cordial_ble_command){.kind=CORDIAL_BLE_ACCEPT,.token=11,.number=2};
+    command(&c);assert(accepted==1 && !rejected && links[8].token==11);
+    incoming.attempt=3;c.token=12;c.number=3;command(&c);
+    assert(rejected==1 && last.code==CORDIAL_BLE_CAPACITY);
+    links[6].closing=true;incoming.attempt=4;c.number=4;command(&c);assert(rejected==2);
+    memset(&links[6],0,sizeof links[6]);
+    incoming.attempt=5;c.number=5;incoming.handle=42;command(&c);
+    assert(accepted==2 && links[6].token==12);
+    memset(&links[6],0,sizeof links[6]);
+    c=(cordial_ble_command){.kind=CORDIAL_BLE_ADOPT,.token=9};command(&c);
+    assert(links[7].adopted && links[7].pairing);
+    // Queue pressure cannot lose promotion after a committed bond.
+    for(unsigned i=0;i<8;i++)assert(xQueueSend(commands,&c,0));
+    cordial_ble_promote(9);
+    assert(waits==1 && wakes==1 && queued_count==8 && links[7].pairing);
+    // A native disconnect can start before the application sees its callback.
+    links[7].closing=true;
+    while(queued_count)drain_one();
+    assert(!links[7].pairing);
+    c=(cordial_ble_command){.kind=CORDIAL_BLE_CONNECT,.token=13};command(&c);
+    assert(!links[6].token && last.token==13 && last.code==CORDIAL_BLE_CAPACITY);
+    memset(&links[7],0,sizeof links[7]);command(&c);assert(links[6].token==13);
+}
+''')
+
     def test_preempted_discovery_resumes_without_restarting_cancelled_scans(self):
         native = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
         stop = native[native.index("static int stop_scan(void)"):native.index("// Call only after")]
@@ -38,7 +135,7 @@ static uint64_t scan_id;
 static bool scan_unresolved, active, preempted, auto_active;
 static void schedule_radio(void) {}
 static int starts, failures, resolution=1, start_error;
-static struct {uint32_t token;uint16_t connection;} links[4];
+static struct {uint32_t token;uint16_t connection;} links[MYNEWT_VAL(BLE_MAX_CONNECTIONS)];
 struct ble_gap_disc_params {int itvl,window,filter_duplicates;};
 struct ble_gap_event {int type;struct {int reason;} disc_complete;};
 static int gap(struct ble_gap_event *,void *);
@@ -99,11 +196,11 @@ int main(void) {
 #define BLE_HS_EPREEMPTED 2
 #define BLE_ERR_REM_USER_CONN_TERM 0x13
 typedef struct {uint8_t type,val[6];} ble_addr_t;
-typedef struct {uint32_t token;uint16_t connection;cordial_ble_peer peer;bool started;} link;
-static link links[4];
+typedef struct {uint32_t token;uint16_t connection;cordial_ble_peer peer;bool started,pairing;} link;
+static link links[MYNEWT_VAL(BLE_MAX_CONNECTIONS)];
 static bool is_synced=true,auto_active,auto_cancel,auto_dirty,auto_consumed;
 static unsigned reconnect_count;
-static ble_addr_t reconnect_peers[8];
+static ble_addr_t reconnect_peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
 static uint64_t scan_id;
 static struct {uint32_t attempt;uint16_t handle;} incoming={.handle=BLE_HS_CONN_HANDLE_NONE};
 static uint32_t next_attempt,auto_attempt;
@@ -191,6 +288,12 @@ int main(void){
     auto_gap(&e,(void *)(uintptr_t)(auto_attempt-1));assert(auto_active);
     auto_gap(&e,(void *)(uintptr_t)auto_attempt);assert(!auto_active);
     resume_radio();assert(auto_active && connects==8);
+    // Seven normal links and pairing still leave one normal auto connection.
+    auto_active=false;
+    for(unsigned i=0;i<8;i++) links[i]=(link){.token=20+i,.connection=20+i,.pairing=i==7};
+    resume_radio();assert(auto_active && connects==9);
+    auto_active=false;links[8]=(link){.token=28,.connection=28};
+    resume_radio();assert(!auto_active && connects==9);
     assert(!failures);
 }
 ''')
@@ -239,7 +342,7 @@ int main(void){
 #include <stddef.h>
 typedef int irk_lookup_state_t;
 enum {IRK_LOOKUP_SUCCEEDED=1,IRK_LOOKUP_FAILED=2,CORDIAL_AUTHENTICATION=3};
-typedef struct {bool closing,security_requested,pairing,authenticated;int handle;} cordial_connection;
+typedef struct {bool closing,security_requested,pairing,adopted,authenticated;int handle;} cordial_connection;
 typedef struct {int unused;} cordial_peer;
 static int state=IRK_LOOKUP_SUCCEEDED,key_size=16,started,failed;
 static bool bonded=true;
@@ -259,7 +362,9 @@ int main(void){
     security_ready(&l);assert(l.authenticated && started==1 && !failed);
     l.authenticated=false;key_size=0;security_ready(&l);assert(!l.authenticated && started==1);
     key_size=16;bonded=false;security_ready(&l);assert(!l.authenticated && started==1);
-    bonded=true;state=IRK_LOOKUP_FAILED;security_ready(&l);assert(failed==1 && !l.authenticated);
+    bonded=true;l.pairing=true;l.adopted=true;
+    security_ready(&l);assert(l.authenticated && started==2 && !failed);
+    l.authenticated=false;state=IRK_LOOKUP_FAILED;security_ready(&l);assert(failed==1 && !l.authenticated);
 }
 ''')
 
@@ -325,8 +430,8 @@ int main(void) {
     r[109]++; assert(!cordial_bonds_same_privacy(r,145)); r[109]--;
     uint8_t raw[6]={0,0,0,0,0,0x40},resolved[6],type;
     assert(cordial_bonds_resolve_rpa(raw,resolved,&type) && type==1 && resolved[0]==0xc5);
-    ble_addr_t peers[8];int count;
-    assert(!cordial_bonds_peers(peers,&count,8) && count==1);
+    ble_addr_t peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];int count;
+    assert(!cordial_bonds_peers(peers,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) && count==1);
     assert(peers[0].type==1 && peers[0].val[0]==0xc5);
     union ble_store_key k={.sec={.peer_addr=peers[0]}};union ble_store_value v;
     assert(cordial_bonds_read(BLE_STORE_OBJ_TYPE_OUR_SEC,&k,&v)==BLE_HS_ENOENT);
@@ -340,7 +445,7 @@ int main(void) {
     assert(!cordial_bonds_delete(BLE_STORE_OBJ_TYPE_PEER_SEC,&k));
     assert(cordial_bonds_dirty(&peers[0]));
     assert(cordial_bonds_delete(BLE_STORE_OBJ_TYPE_PEER_SEC,&k)==BLE_HS_ENOENT);
-    assert(!cordial_bonds_peers(peers,&count,8) && count==0);
+    assert(!cordial_bonds_peers(peers,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) && count==0);
     assert(!cordial_bonds_prepare_unpair(&k.sec.peer_addr));
     assert(!cordial_bonds_read(BLE_STORE_OBJ_TYPE_PEER_SEC,&k,&v) && v.sec.irk_present);
     assert(!cordial_bonds_delete(BLE_STORE_OBJ_TYPE_PEER_SEC,&k));
@@ -350,10 +455,10 @@ int main(void) {
     assert(!cordial_bonds_delete(BLE_STORE_OBJ_TYPE_OUR_SEC,&k));
     assert(cordial_bonds_delete(BLE_STORE_OBJ_TYPE_OUR_SEC,&k)==BLE_HS_ENOENT);
     assert(!cordial_bonds_delete(BLE_STORE_OBJ_TYPE_PEER_SEC,&k));
-    for(int i=0;i<8;i++) {r[15]=i;assert(!cordial_bonds_import(r,145));}
-    r[15]=8;assert(cordial_bonds_import(r,145)==BLE_HS_ENOMEM);
-    assert(!cordial_bonds_peers(peers,&count,8) && count==8);
-    cordial_bonds_clear();assert(!cordial_bonds_peers(peers,&count,8) && count==0);
+    for(int i=0;i<MYNEWT_VAL(BLE_STORE_MAX_BONDS);i++) {r[15]=i;assert(!cordial_bonds_import(r,145));}
+    r[15]=MYNEWT_VAL(BLE_STORE_MAX_BONDS);assert(cordial_bonds_import(r,145)==BLE_HS_ENOMEM);
+    assert(!cordial_bonds_peers(peers,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) && count==MYNEWT_VAL(BLE_STORE_MAX_BONDS));
+    cordial_bonds_clear();assert(!cordial_bonds_peers(peers,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) && count==0);
     assert(!cordial_bonds_same_privacy(r,145));
     cordial_ble_command c={.kind=CORDIAL_BLE_IMPORT,.length=145};memcpy(c.data,r,145);
     command(&c);assert(!last.code && removes==1 && adds==1 && scans==2);
@@ -398,7 +503,7 @@ struct ble_hs_adv_fields { uint8_t *name; uint8_t name_len; uint16_t appearance;
 static uint16_t appearance;
 struct ble_gap_event { struct { ble_addr_t addr; uint8_t *data;
     int length_data, rssi, event_type; } disc; };
-static struct { unsigned token, connection; } links[4];
+static struct { unsigned token, connection; } links[MYNEWT_VAL(BLE_MAX_CONNECTIONS)];
 static uint64_t scan_id;
 static bool scan_unresolved, active, auto_active, resolution=true;
 static unsigned cancels, starts, queries, emitted;
@@ -406,10 +511,10 @@ static int scan_error, resolve_error;
 static bool resolved;
 static ble_addr_t identity;
 static cordial_ble_event last;
-static ble_addr_t stored[8];
+static ble_addr_t stored[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
 static int count, store_error;
 static int cordial_bonds_peers(ble_addr_t *out,int *n,int capacity) {
-    assert(capacity==8);memcpy(out,stored,sizeof stored);*n=count;return store_error;
+    assert(capacity==MYNEWT_VAL(BLE_STORE_MAX_BONDS));memcpy(out,stored,sizeof stored);*n=count;return store_error;
 }
 static void emit(const cordial_ble_event *e) { last=*e;emitted++; }
 static int ble_gap_disc_active(void) { return active; }
@@ -469,6 +574,43 @@ int main(void) {
 
 
 
+
+    def test_adopted_reserve_rejects_repeat_pairing_without_deleting_bond(self):
+        source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
+        repeat = source[source.index("    case BLE_GAP_EVENT_REPEAT_PAIRING: {"):
+                        source.index("    case BLE_GAP_EVENT_NOTIFY_RX: {")]
+        repeat = repeat[repeat.index("{")+1:repeat.rindex("}")]
+        run_c(r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include "ble.h"
+enum {BLE_GAP_REPEAT_PAIRING_IGNORE, BLE_GAP_REPEAT_PAIRING_RETRY};
+typedef struct {bool pairing,adopted,closing;uint16_t connection;} link;
+static link current={.pairing=true,.connection=1};
+struct ble_gap_conn_desc {int peer_id_addr;};
+struct ble_store_key_sec {int peer_addr;};
+struct ble_store_value_sec {bool irk_present;};
+struct ble_gap_event {struct {uint16_t conn_handle;} repeat_pairing;};
+static unsigned failures,deletes;
+static link *by_handle(uint16_t handle) {assert(handle==1);return &current;}
+static void fail(link *l,int code) {assert(l==&current && code==CORDIAL_BLE_AUTH);failures++;l->closing=true;}
+static int ble_gap_conn_find(uint16_t handle,struct ble_gap_conn_desc *desc) {assert(handle==1);desc->peer_id_addr=2;return 0;}
+static int ble_store_read_peer_sec(const struct ble_store_key_sec *key,struct ble_store_value_sec *value) {assert(key->peer_addr==2);value->irk_present=true;return 0;}
+static int cordial_bonds_mark_dirty(const int *peer) {assert(*peer==2);return 0;}
+static int ble_store_util_delete_peer(const int *peer) {assert(*peer==2);deletes++;return 0;}
+static int repeat_pairing(struct ble_gap_event *event) {link *l;
+''' + repeat + r'''
+}
+int main(void) {
+    struct ble_gap_event event={.repeat_pairing={.conn_handle=1}};
+    assert(repeat_pairing(&event)==BLE_GAP_REPEAT_PAIRING_RETRY && deletes==1 && !failures);
+    current.adopted=true;
+    assert(repeat_pairing(&event)==BLE_GAP_REPEAT_PAIRING_IGNORE && deletes==1 && failures==1);
+    assert(current.pairing && current.closing);
+    assert(repeat_pairing(&event)==BLE_GAP_REPEAT_PAIRING_IGNORE && deletes==1 && failures==1);
+}
+''')
 
     def test_native_authentication_failure_keeps_link_insecure(self):
         source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()

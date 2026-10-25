@@ -1,6 +1,5 @@
 //! The Cordial serial API: protobuf messages generated from `proto/cordial.proto`, the frame
-//! encoding used on the USB serial port, and the information and setting keys from
-//! `proto/keys.toml`; and the Dongle's saved records in [`storage`].
+//! encoding used on the USB serial port, and the Dongle's saved records in [`storage`].
 //!
 //! A client sends [`Request`] frames and receives [`Message`] frames, each holding a
 //! [`Response`] or an [`Event`]. [`frame`] turns messages into frames and back.
@@ -26,7 +25,6 @@ pub mod storage {
 }
 
 pub mod frame;
-pub mod keys;
 
 /// USB vendor ID of every Dongle (pid.codes).
 pub const USB_VENDOR_ID: u16 = 0x1209;

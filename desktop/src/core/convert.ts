@@ -1,51 +1,65 @@
 // Converts protocol messages into the app's plain state, and app values back
 // into protocol values. Unknown enum values read as the enum's zero value,
-// unknown oneof cases as unset, and settings of a type this app doesn't know
-// are left out.
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+// unknown oneof cases as unset, and settings of a group or field this app
+// doesn't know are left out.
+import type { MessageInitShape } from "@bufbuild/protobuf";
 import {
+  BacklightEffect,
+  BacklightMode,
+  BacklightStatus,
   CapacityReason,
   CodeKind,
   DeviceState,
   ErrorCode,
+  FunctionRowMode,
   InactiveReason,
   IntegrationKind,
   IntegrationState,
+  KeyboardPlatform,
   Kind,
   OutputMode,
   OutputState,
   Platform,
-  ReportType,
+  ResourceType,
   Role,
   SettingState,
+  SettingsGroup,
   Transport,
-  ValueSchema,
-  WarningCode,
+  VendorRegistry,
+  WheelMode,
   type Candidate as WireCandidate,
   type Device,
-  type DeviceWarning as WireWarning,
-  type Info,
+  type DeviceInformation as WireDeviceInformation,
   type Pairing,
   type Profile as WireProfile,
-  type Setting as WireSetting,
+  type ResourceCapacity,
+  type SettingsObject,
+  type SettingsRef,
+  type SettingsUpdate,
+  type SettingsUpdateSchema,
   type Status,
-  type Value,
 } from "@cordial/protocol";
 import type { CordialError } from "@cordial/client";
 import type {
   AdapterStatus,
   Candidate,
+  Code,
+  DeviceInformation,
   DeviceRecord,
-  DeviceWarning,
-  InfoEntry,
   Integration,
   KindName,
   OutputModeName,
   PairingPrompt,
   Profile,
+  Resource,
+  ResourceTypeName,
   RoleName,
   Scalar,
   Setting,
+  SettingField,
+  SettingFields,
+  SettingsChange,
+  SettingsGroupName,
   ValueType,
   WireError,
 } from "../shared/state.ts";
@@ -76,31 +90,18 @@ export function wireError(error: CordialError): WireError {
   };
 }
 
-function scalar(value: Value | undefined): { type: InfoEntry["type"]; value: Scalar } | null {
-  const v = value?.value;
-  switch (v?.case) {
-    case "bool":
-      return { type: "bool", value: v.value };
-    case "integer":
-      return { type: "integer", value: number(v.value) };
-    case "text":
-      return { type: "text", value: v.value };
-    case "color":
-      return { type: "color", value: v.value };
-    default:
-      return null;
-  }
-}
-
-export function info(list: Info[]): InfoEntry[] {
-  const seen = new Set<string>();
-  return list.flatMap((i) => {
-    const v = scalar(i.value);
-    if (!v || seen.has(i.key)) return [];
-    seen.add(i.key);
-    return [{ key: i.key, ...v }];
+/** Resource entries of known types, the first of each type. */
+export function resources(list: ResourceCapacity[]): Resource[] {
+  const seen = new Set<number>();
+  return list.flatMap((r) => {
+    if (!(r.type in ResourceType) || r.type === ResourceType.UNKNOWN || seen.has(r.type)) return [];
+    seen.add(r.type);
+    return [{ type: name(ResourceType, r.type) as ResourceTypeName, count: optional(r.count), limit: optional(r.limit) }];
   });
 }
+
+/** Distinct error codes; ones this app doesn't know read as `unknown`. */
+export const errors = (list: ErrorCode[]): Code[] => [...new Set(list.map(errorCode))];
 
 export function status(s: Status): AdapterStatus {
   const p = s.profileSupport;
@@ -109,23 +110,29 @@ export function status(s: Status): AdapterStatus {
     name: s.name,
     platform: name(Platform, s.platform),
     ready: s.ready,
+    errors: errors(s.errors),
+    resources: resources(s.resources),
     transports: s.transports.flatMap((t) => {
       const kind = transport(t.transport);
       // Missing means enabled.
-      return kind ? [{ transport: kind, maxEnabled: optional(t.maxEnabled), enabled: t.enabled !== false }] : [];
+      return kind ? [{ transport: kind, enabled: t.enabled !== false, resources: resources(t.resources) }] : [];
     }),
-    info: info(s.info),
-    profileSupport: p ? { memoryBudget: p.memoryBudget, memoryUsed: p.memoryUsed, maxLayers: p.maxLayers } : null,
+    information: {
+      firmwareVersion: optional(s.information?.firmwareVersion),
+      boardName: optional(s.information?.boardName),
+      developmentBuild: optional(s.information?.developmentBuild),
+    },
+    profileSupport: p ? { resources: resources(p.resources) } : null,
     // Without profile support there are no interfaces, whatever the message carries.
     interfaces: p
       ? s.configurationInterfaces.flatMap((i) =>
-          i.interface ? [{ interface: i.interface, enabled: i.enabled, profile: i.profile, conflicts: [...i.conflicts] }] : [])
+          i.interface ? [{ interface: i.interface, enabled: i.enabled, active: i.active, profile: i.profile, conflicts: [...i.conflicts] }] : [])
       : [],
     outputSupport: s.outputSupport.flatMap((o) => {
       const r = role(o.role);
       const modes = o.modes.flatMap((m) => {
         const n = outputMode(m.mode);
-        return n ? [{ mode: n, maxSlots: m.maxSlots, slots: optional(m.slots) }] : [];
+        return n ? [{ mode: n, resources: resources(m.resources) }] : [];
       });
       return r ? [{ role: r, modes }] : [];
     }),
@@ -173,7 +180,7 @@ export function device(d: Device): DeviceRecord {
     blocked: d.blocked,
     paused: d.paused,
     inactive: d.inactive === undefined ? null : name(InactiveReason, d.inactive),
-    error: d.error === undefined ? null : errorCode(d.error),
+    errors: errors(d.errors),
     security: d.security
       ? {
           encrypted: optional(d.security.encrypted),
@@ -183,10 +190,9 @@ export function device(d: Device): DeviceRecord {
         }
       : null,
     hidpp: hidpp(d),
-    info: info(d.info),
+    information: information(d.information),
     roles: roles(d.roles),
     profiles: d.profiles ? [...d.profiles.profiles] : null,
-    profileError: d.profileError === undefined ? null : errorCode(d.profileError),
     outputPreferences: d.outputPreferences.flatMap((p) => {
       const r = role(p.role);
       return r ? [{ role: r, mode: outputMode(p.mode) }] : [];
@@ -198,58 +204,202 @@ export function device(d: Device): DeviceRecord {
   };
 }
 
-export function warning(w: WireWarning): DeviceWarning {
+/** A reported enum value by lower-case name, or null while unknown; a value this app doesn't know
+ * reads as the enum's zero value. */
+const optionalName = <E extends Record<string, string | number>>(e: E, v: number | undefined) => (v === undefined ? null : name(e, v));
+
+/** The device's information, each field null while unknown. */
+export function information(i: WireDeviceInformation | undefined): DeviceInformation {
+  const id = i?.identity;
+  const b = i?.backlight;
+  const w = i?.wheel;
+  // At most one sensor per index, in index order.
+  const sensors = new Map((i?.pointerSensors ?? []).map((s) => [s.index, optional(s.dpi)]));
   return {
-    code: name(WarningCode, w.code),
-    service: w.service,
-    reportType: w.reportType === ReportType.UNKNOWN || !(w.reportType in ReportType) ? null : (name(ReportType, w.reportType) as DeviceWarning["reportType"]),
-    reportId: optional(w.reportId),
-    bitOffset: optional(w.bitOffset),
-    usagePage: optional(w.usagePage),
-    usage: optional(w.usage),
+    identity: {
+      manufacturer: optional(id?.manufacturer),
+      model: optional(id?.model),
+      serial: optional(id?.serial),
+      firmwareVersion: optional(id?.firmwareVersion),
+      bootloaderVersion: optional(id?.bootloaderVersion),
+      hardwareRevision: optional(id?.hardwareRevision),
+      softwareRevision: optional(id?.softwareRevision),
+      vendor: { registry: optionalName(VendorRegistry, id?.vendor?.registry), id: optional(id?.vendor?.id) },
+      product: { id: optional(id?.product?.id), version: optional(id?.product?.version) },
+    },
+    battery: { level: optional(i?.battery?.level), charging: optional(i?.battery?.charging) },
+    keyboard: { platform: optionalName(KeyboardPlatform, i?.keyboard?.platform), functionRow: optionalName(FunctionRowMode, i?.keyboard?.functionRow) },
+    power: { autoOff: optional(i?.power?.autoOff) },
+    backlight: {
+      currentBrightness: optional(b?.currentBrightness),
+      status: optionalName(BacklightStatus, b?.status),
+      enabled: optional(b?.enabled),
+      mode: optionalName(BacklightMode, b?.mode),
+      brightness: optional(b?.brightness),
+      delay: { handsAway: optional(b?.delay?.handsAway), handsNearby: optional(b?.delay?.handsNearby), externalPower: optional(b?.delay?.externalPower) },
+      startupEffect: optional(b?.startupEffect),
+      dialEffect: optional(b?.dialEffect),
+      powerSave: optional(b?.powerSave),
+      effect: optionalName(BacklightEffect, b?.effect),
+    },
+    pointerSensors: [...sensors].sort(([a], [b]) => a - b).map(([index, dpi]) => ({ index, dpi })),
+    wheel: {
+      resolutionMultiplier: optional(w?.resolutionMultiplier),
+      ratchetsPerRotation: optional(w?.ratchetsPerRotation),
+      diameter: optional(w?.diameter),
+      mode: optionalName(WheelMode, w?.mode),
+      freeSpinThreshold: optional(w?.freeSpinThreshold),
+      invert: optional(w?.invert),
+    },
+    thumbwheel: { invert: optional(i?.thumbwheel?.invert) },
   };
 }
 
-export function setting(s: WireSetting): Setting | null {
-  const status = s.status;
-  const base = {
-    integration: s.integration,
-    key: s.key,
-    state: status.case === "state" ? name(SettingState, status.value) : null,
-    error: status.case === "error" ? errorCode(status.value) : null,
-    choices: [] as Scalar[],
-    min: null,
-    max: null,
-    step: null,
-    maxBytes: null,
-  };
-  const t = s.type;
-  const of = (type: ValueType, value: Scalar | undefined, saved: Scalar | undefined) => ({ ...base, type, value: optional(value), saved: optional(saved) });
-  switch (t.case) {
-    case "bool":
-      return of("bool", t.value.value, t.value.saved);
-    case "integer": {
-      const v = t.value;
-      const row: Setting = of("integer", v.value === undefined ? undefined : number(v.value), v.saved === undefined ? undefined : number(v.saved));
-      if (v.limits.case === "range") {
-        row.min = number(v.limits.value.min);
-        row.max = number(v.limits.value.max);
-        row.step = Math.max(1, number(v.limits.value.step));
-      } else if (v.limits.case === "choices") row.choices = v.limits.value.values.map(number);
-      return row;
-    }
-    case "enum":
-      return { ...of("enum", t.value.value, t.value.saved), choices: [...t.value.choices] };
-    case "text":
-      return { ...of("text", t.value.value, t.value.saved), maxBytes: optional(t.value.maxBytes) };
-    case "color":
-      return of("color", t.value.value, t.value.saved);
-    default:
-      return null;
-  }
+type Enum = Record<string, string | number>;
+/** Where a setting field sits in its group's settings and update messages, and its value type. */
+interface FieldSpec {
+  type: ValueType;
+  path: string[];
+  enum?: Enum;
+}
+const bool = (...path: string[]): FieldSpec => ({ type: "bool", path });
+const integer = (...path: string[]): FieldSpec => ({ type: "integer", path });
+const enumOf = (e: Enum, ...path: string[]): FieldSpec => ({ type: "enum", path, enum: e });
+
+/** Every setting field this app knows, by group, in the protocol's field order. */
+export const FIELDS: { [G in SettingsGroupName]: Record<SettingFields[G], FieldSpec> } = {
+  keyboard: { platform: enumOf(KeyboardPlatform, "platform"), function_row: enumOf(FunctionRowMode, "functionRow") },
+  power: { auto_off: integer("autoOff") },
+  backlight: {
+    enabled: bool("enabled"),
+    mode: enumOf(BacklightMode, "mode"),
+    brightness: integer("brightness"),
+    hands_away: integer("delay", "handsAway"),
+    hands_nearby: integer("delay", "handsNearby"),
+    external_power: integer("delay", "externalPower"),
+    startup_effect: bool("startupEffect"),
+    dial_effect: bool("dialEffect"),
+    power_save: bool("powerSave"),
+    effect: enumOf(BacklightEffect, "effect"),
+  },
+  pointer_sensor: { dpi: integer("dpi") },
+  wheel: { mode: enumOf(WheelMode, "mode"), free_spin_threshold: integer("freeSpinThreshold"), invert: bool("invert") },
+  thumbwheel: { invert: bool("invert") },
+};
+
+type GroupCase = NonNullable<SettingsObject["group"]["case"]>;
+/** The oneof case of each group in settings objects and updates. */
+export const CASES: Record<SettingsGroupName, GroupCase> = {
+  keyboard: "keyboard",
+  power: "power",
+  backlight: "backlight",
+  pointer_sensor: "pointerSensor",
+  wheel: "wheel",
+  thumbwheel: "thumbwheel",
+};
+const GROUPS = Object.fromEntries(Object.entries(CASES).map(([g, c]) => [c, g])) as Record<GroupCase, SettingsGroupName>;
+
+const spec = (f: SettingField): FieldSpec => (FIELDS[f.group] as Record<string, FieldSpec>)[f.field]!;
+const fieldsOf = (group: SettingsGroupName) => Object.entries(FIELDS[group]) as [SettingField["field"], FieldSpec][];
+const at = (message: any, path: string[]): any => path.reduce((m, k) => m?.[k], message);
+
+/** A setting value as the app keeps it: enum values by lower-case name. */
+function scalar(s: FieldSpec, v: boolean | bigint | number | undefined): Scalar | null {
+  if (v === undefined) return null;
+  if (s.type === "integer") return number(v as bigint);
+  return s.enum ? name(s.enum, v as number) : (v as boolean);
 }
 
-export const settings = (list: WireSetting[]) => list.flatMap((s) => setting(s) ?? []);
+/** A setting value as the protocol carries it. */
+function wireScalar(s: FieldSpec, v: Scalar): boolean | bigint | number {
+  if (s.type === "integer") return BigInt(v as number);
+  return s.enum ? (s.enum[(v as string).toUpperCase()] as number) : (v as boolean);
+}
+
+/** The settings of one object, one per field present; none for a group this app doesn't know. */
+export function objectSettings(o: SettingsObject): Setting[] {
+  const g = o.group;
+  if (!g.case) return [];
+  const group = GROUPS[g.case];
+  const index = g.case === "pointerSensor" ? g.value.index : null;
+  return fieldsOf(group).flatMap(([field, s]) => {
+    const w = at(g.value, s.path);
+    if (!w) return [];
+    const status = w.status?.result;
+    const row = {
+      integration: o.integration,
+      group,
+      index,
+      field,
+      type: s.type,
+      value: scalar(s, w.value),
+      saved: scalar(s, w.saved),
+      state: status?.case === "state" ? name(SettingState, status.value) : null,
+      error: status?.case === "error" ? errorCode(status.value) : null,
+      choices: [] as Scalar[],
+      min: null as number | null,
+      max: null as number | null,
+      step: null as number | null,
+    } as Setting;
+    if (s.enum) row.choices = known(s.enum, w.choices);
+    else if (w.limits?.case === "range") {
+      row.min = number(w.limits.value.min);
+      row.max = number(w.limits.value.max);
+      row.step = Math.max(1, number(w.limits.value.step));
+    } else if (w.limits?.case === "choices") row.choices = [...new Set((w.limits.value.values as bigint[]).map(number))];
+    return [row];
+  });
+}
+
+export const settings = (list: SettingsObject[]) => list.flatMap(objectSettings);
+
+/** The identity of the object holding a setting, as the protocol orders and names it. */
+export const objectRef = (f: SettingField) => ({
+  integration: f.integration,
+  group: wire(SettingsGroup, f.group),
+  index: f.group === "pointer_sensor" ? (f.index ?? 0) : undefined,
+});
+
+/** Whether a setting belongs to the object `ref` names; a group this app doesn't know names none. */
+export function inObject(f: SettingField, ref: Pick<SettingsRef, "integration" | "group" | "index">): boolean {
+  if (!(ref.group in SettingsGroup) || ref.group === SettingsGroup.UNKNOWN) return false;
+  const group = name(SettingsGroup, ref.group);
+  return f.integration === ref.integration && f.group === group && (group !== "pointer_sensor" || f.index === (ref.index ?? 0));
+}
+
+/** The listing order: by object, then field in protocol order. */
+export function compareSettings(a: Setting, b: Setting): number {
+  const x = objectRef(a);
+  const y = objectRef(b);
+  return x.integration - y.integration || x.group - y.group || (x.index ?? -1) - (y.index ?? -1)
+    || Object.keys(FIELDS[a.group]).indexOf(a.field) - Object.keys(FIELDS[b.group]).indexOf(b.field);
+}
+
+/** The update that saves or forgets one field. */
+export function settingsUpdate(change: SettingsChange): MessageInitShape<typeof SettingsUpdateSchema> {
+  const f = change.setting;
+  const s = spec(f);
+  const value: Record<string, unknown> = f.group === "pointer_sensor" ? { index: f.index ?? 0 } : {};
+  let node = value;
+  for (const k of s.path.slice(0, -1)) node = (node[k] = {}) as Record<string, unknown>;
+  node[s.path.at(-1)!] = { change: change.type === "set" ? { case: "value", value: wireScalar(s, change.value) } : { case: "forget", value: {} } };
+  return { integration: f.integration, group: { case: CASES[f.group], value } } as MessageInitShape<typeof SettingsUpdateSchema>;
+}
+
+/** The changes an update carries, field by field; none for a group this app doesn't know. */
+export function updateChanges(u: SettingsUpdate): SettingsChange[] {
+  const g = u.group;
+  if (!g.case) return [];
+  const group = GROUPS[g.case];
+  const index = g.case === "pointerSensor" ? g.value.index : null;
+  return fieldsOf(group).flatMap(([field, s]): SettingsChange[] => {
+    const c = at(g.value, s.path)?.change;
+    const setting = { integration: u.integration, group, index, field } as SettingField;
+    if (c?.case === "forget") return [{ type: "forget", setting }];
+    if (c?.case === "value") return [{ type: "set", setting, value: scalar(s, c.value)! }];
+    return [];
+  });
+}
 
 export function candidate(c: WireCandidate): Candidate {
   return { id: c.id, transport: transport(c.transport), name: c.name, kinds: kinds(c.kinds), rssi: optional(c.rssi) };
@@ -278,19 +428,5 @@ export function pairingStep(p: Pairing): PairingStep {
     default:
       // Connecting, or a step this app doesn't know: still in progress.
       return { kind: "progress" };
-  }
-}
-
-/** A setting value as the protocol carries it for a setting of `type`. */
-export function value(type: ValueType, v: Scalar) {
-  switch (type) {
-    case "bool":
-      return create(ValueSchema, { value: { case: "bool", value: v as boolean } });
-    case "integer":
-      return create(ValueSchema, { value: { case: "integer", value: BigInt(v as number) } });
-    case "color":
-      return create(ValueSchema, { value: { case: "color", value: v as number } });
-    default:
-      return create(ValueSchema, { value: { case: "text", value: String(v) } });
   }
 }

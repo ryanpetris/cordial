@@ -2,8 +2,7 @@
 
 [Protocol index](README.md)
 
-Development firmware, built with the `debug` or `development` profile, reports `build.development`
-in `Status.info` and accepts three more commands, plus `EnterBootloader`. Production firmware
+Development firmware, built with the `debug` or `development` profile, reports `Status.information.development_build = true` and accepts three more commands, plus `EnterBootloader`. Production firmware
 compiles their handlers out and answers all four with `ERROR_CODE_UNKNOWN_COMMAND`. Nothing at
 runtime, and no serial or DTR sequence, can enable them on production firmware.
 

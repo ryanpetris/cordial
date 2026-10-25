@@ -56,8 +56,8 @@ its identity alone is not a fresh candidate.
 
 `StartPairing` refuses a blocked saved device, a transport the firmware cannot pair or has
 disabled, a full flash (`ERROR_CODE_NO_CAPACITY` with `CAPACITY_REASON_STORAGE`, also reported as
-`storage.full`) and a full connection table (`CAPACITY_REASON_CONNECTIONS`). A saved device is
-recognized from the candidate's address when the address is its identity or the stack can resolve
+`ERROR_CODE_STORAGE_FULL` in `Status.errors`) and a full connection table
+(`CAPACITY_REASON_CONNECTIONS`). A saved device is recognized from the candidate's address when the address is its identity or the stack can resolve
 it; a disabled device advertising a private address is recognized only once pairing reveals its
 identity, and a blocked one then fails with `ERROR_CODE_BLOCKED` without changing its bond. It
 closes the selected device's own link and any setup link first, and never an unrelated working
@@ -74,8 +74,8 @@ renews its bond in place, keeping its ID, name and preferences, including whethe
 disabled device connects once it is enabled.
 
 A newly paired device is saved trusted and unblocked, with no integration enabled; its first
-connection turns on each integration it detects. It is saved enabled when fewer than `max_enabled`
-devices of its transport are enabled, and disabled otherwise. An enabled device then connects on
+connection turns on each integration it detects. It is saved enabled when the number enabled for
+its transport is below the advertised `DEVICES.limit`, and disabled otherwise. An enabled device then connects on
 its own; there is no separate connect step.
 
 ## Devices
@@ -89,18 +89,19 @@ its own; there is no separate connect step.
 | `DisconnectDevice` | `Device` | Closes the link and pauses automatic reconnection until `ConnectDevice` or a restart. |
 | `UnpairDevice` | none | Pauses and disconnects the device, then deletes its bond and settings once the link is gone; `device_removed` follows. |
 | `RefreshDevice` | none | Re-reads device information and settings from a connected device. |
-| `ListWarnings` | `DeviceWarnings` | One page of the device's current HID warnings. |
 
-`device`, `settings_changed` and `warnings_changed` events report every change. Connection progress
-and failure show up in `Device.state` and `Device.error`; a connection attempt times out after 30
+`device` and `settings_changed` events report changes. Immediate `ConnectDevice` refusals return
+response `Error`. After acceptance, connection progress and failure arrive in `Event.device`, in
+`Device.state` and `Device.errors`; a connection attempt times out after 30
 seconds and records `ERROR_CODE_TIMEOUT` without pausing automatic reconnection.
 
 ### Enabled, trusted and blocked
 
-Enabled means the device is loaded into the Bluetooth stack's bond table, which lets it reconnect,
-be recognized when it connects in, and encrypt its link; a disabled device stays saved but cannot
-connect. The table has a fixed size per transport, reported as `TransportSupport.max_enabled` (the
-stack's bond table less one entry kept free for pairing). The table holds every enabled, unblocked
+Enabled is the saved preference that lets a device connect. Eligible devices are loaded into the
+Bluetooth stack's bond table to reconnect, recognize incoming connections and encrypt their links;
+a disabled device stays saved but cannot connect. Each transport reports its allowance as
+`DEVICES.limit` in `TransportSupport.resources`, with one additional native bond entry kept free
+for pairing. The table holds every enabled, unblocked
 device whose transport the firmware supports and has enabled. A `SetDevice` that changes anything
 about a device without an entry, and leaves it enabled and unblocked on such a transport, is refused
 with `ERROR_CODE_NO_CAPACITY` and `CAPACITY_REASON_ENABLED` while that transport's table is full. A
@@ -110,8 +111,11 @@ smaller table starts
 with more devices enabled, nothing is disabled or deleted: the lowest device IDs are loaded and the
 rest report `INACTIVE_REASON_CAPACITY` until the user disables enough of them.
 
-Separately, the Dongle holds a fixed number of live connections, shared across transports, and
-keeps one free for pairing. Any enabled device connects whenever one is free.
+The same allowance is reported as `CONNECTIONS.limit` and governs normal connection admission for
+that transport. Classic and BLE have independent allowances; enabling Classic does not reduce BLE
+capacity. Connecting and closing links occupy normal slots until freed. The Dongle reserves one
+additional pairing connection overall, outside both normal allowances. An eligible device can
+connect while its transport has room, regardless of the other transport's normal connection count.
 
 Automatic reconnection and incoming connections need an enabled, trusted, unblocked device without
 a disconnect pause. While eligible BLE devices are disconnected, the Dongle uses the controller's
@@ -151,12 +155,12 @@ returns `ERROR_CODE_UNSUPPORTED`. Unknown numeric roles or modes and an unspecif
 failed saves leave the previous policy and desired pools unchanged. An empty list changes nothing.
 Clients gate these writes on advertised support because older firmware ignores unknown fields.
 
-A missing Gamepad preference means Disabled. Saving HID or XInput contributes to
-that mode's desired USB pool even while the device is disconnected, disabled or
-blocked. Each pool is independently capped at four; `max_slots` is not a limit
-on how many paired devices may save the choice. Pairing, unpairing or a saved
-mode change reconnects USB after the response when a pool count changes.
-Connecting and disconnecting devices only assigns or releases existing slots.
+A missing Gamepad preference means Disabled. Saving HID or XInput contributes configured candidates
+for that mode even while the device is disconnected, disabled or blocked. The `SLOTS.limit` in
+`OutputModeSupport.resources` limits USB allocation, not how many paired devices may save the
+choice. Valid preferences save even when their requested interfaces cannot fit. Pairing, unpairing,
+connection and profile changes all use the same allocator; USB reconnects only when its actual
+allocation changes. Connected-device requirements can preempt lower-priority interfaces.
 See [live output states and pool rules](records.md#devices) and
 [USB gamepad behavior](hid-forwarding.md#usb-gamepad-outputs). Client controls,
 CLI commands and human-readable slot numbering are described in
@@ -166,12 +170,14 @@ CLI commands and human-readable slot numbering are described in
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListSettings` | `DeviceSettings` | One page of every setting the Dongle knows for the device, across integrations: those read on the current connection plus every saved value. Sends nothing to the device. |
+| `ListSettings` | `DeviceSettings` | One page of complete typed settings domains, across integrations: configurable fields discovered on this connection plus every saved preference. Sends nothing to the device. |
 | `SetSettings` | none | Saves and forgets values in one storage write. Each change either saves a value or, with `forget`, removes the saved value. A `settings_changed` event follows. |
 
 A valid value is always saved, whatever the device's current state: disconnected, busy, its
 integration off, or in a mode where the value does not apply. It stays pending until an apply writes
-it. Changes apply in order, so a later change to the same setting replaces an earlier one. If any
+and confirms it. Changes are typed partial domain updates, so missing nested fields stay unchanged.
+Each present field selects a value or an empty `SettingForget` marker. Changes apply in order,
+so a later change to the same field replaces an earlier one. If any
 change in a request is invalid, nothing is saved. A forgotten setting is never written to the device
 again; the device keeps whatever value it has.
 
@@ -216,12 +222,12 @@ collection, so the same usage in Mouse and Game Pad collections identifies diffe
 A rule is refused with `ERROR_CODE_BAD_ARGS`, and nothing is saved, when its input and collection
 are outside `ProfileSupport.ranges` of kind `KIND_REMAP_INPUT` for a remap, `KIND_SCALE_INPUT`
 for a scale or `KIND_AXIS_INPUT` for an axis rule, when a remap has an output outside ranges of
-kind `KIND_REMAP_OUTPUT` or more than `max_remap_outputs` outputs, or when a scale has a zero
-numerator or denominator. An axis rule's `destination` must be within ranges of kind
+kind `KIND_REMAP_OUTPUT` or more outputs than `OUTPUTS.limit` in `ProfileSupport.resources`, or
+when a scale has a zero numerator or denominator. An axis rule's `destination` must be within ranges of kind
 `KIND_AXIS_OUTPUT` in the input's Game Pad collection. Unknown and unspecified kinds grant no
 capability. Axis rules apply only to absolute Game Pad axes; `invert` reverses the normalized
 axis range. They add no deadzones, curves or sensitivity settings. A save that would make the
-profile larger than `memory_budget` returns `ERROR_CODE_NO_CAPACITY` with
+profile larger than `MEMORY.limit` in `ProfileSupport.resources` returns `ERROR_CODE_NO_CAPACITY` with
 `CAPACITY_REASON_PROFILE_MEMORY`, since it could never be loaded. The Dongle applies every rule it accepts to every device that uses the profile, whatever
 kind of device it is. The number of saved profiles is limited only by flash; creating or copying one
 that does not fit returns `ERROR_CODE_NO_CAPACITY` with `CAPACITY_REASON_STORAGE`.
@@ -244,13 +250,13 @@ Game Pad (`01:05`), independently of Mouse (`01:02`), Keyboard (`01:06`), Consum
 (`0c:01`) and System Control (`01:80`) inputs with the same usage.
 
 These limits apply to saves. A saved profile that a later firmware's limits no longer allow is kept
-as saved: a rule whose input or output the firmware does not support has no effect, only the first
-`max_layers` profiles of a longer saved layer list apply, and a save that would leave the profile or
-list over the limits is refused.
+as saved. A rule whose input or output the firmware does not support has no effect. Only the first
+profiles up to `LAYERS.limit` in `ProfileSupport.resources` apply. A save that would leave the
+profile or layer list over the limits is refused.
 
-`SetDevice.profiles` sets a device's layers: up to `max_layers` profiles in the order they apply,
-or an empty list to pass everything through. A newly paired device has no layers; each device's
-layers are set on their own.
+`SetDevice.profiles` sets a device's layers, up to the `LAYERS.limit` in `ProfileSupport.resources`,
+in the order they apply, or an empty list to pass everything through. A newly paired device has no
+layers; each device's layers are set on their own.
 
 `SetAdapter.configuration_interfaces` changes the preferences of each configuration interface it
 lists, such as VIA or Vial, applying the updates in order. Each interface has its own enabled flag
@@ -258,9 +264,14 @@ and profile, independent of any device's layers; 0 clears the profile. Every int
 disabled. An enabled interface needs a profile in the resulting configuration, and several
 interfaces can be enabled at once unless `conflicts` lists one of the others; a resulting
 configuration that enables conflicting interfaces returns `ERROR_CODE_UNSUPPORTED` and changes
-nothing. A disabled interface keeps its profile. Enabling or disabling an interface, or changing an
-enabled interface's profile, reconnects USB after the response has been written; Bluetooth
-connections and held input carry on.
+nothing. A disabled interface keeps its profile. Saved `enabled` requests an interface; `active`
+reports whether it fits in the actual USB allocation. Valid preferences save even when capacity
+omits the interface. USB reconnects only when the actual allocation changes. The plan is computed
+before durable save/apply and detach, and later failures do not roll back persisted preferences.
+The response normally finishes transmitting before detach, subject to the short response-drain
+deadline described under [sessions](transport.md#sessions). Bluetooth connections and held input
+carry on. Clients reopen the serial session and read fresh status without a reconnect confirmation
+dialog.
 
 `DeleteProfile` refuses with `ERROR_CODE_IN_USE` while the profile is the profile of any
 configuration interface, enabled or not, or in any saved device's layers, whether or not the device
@@ -279,14 +290,15 @@ profiles waits for at most one such step already in progress. A command that
 reads many records, such as a listing or a reference check, therefore answers after reading them
 one at a time.
 
-Loaded profiles share `ProfileSupport.memory_budget`, set by the board configuration so that every
-connected device can load two profiles that remap every key the VIA editor shows. A board configured
-without profile support, such as the Pico W, reports no `ProfileSupport` and no configuration
-interfaces, answers profile commands with `ERROR_CODE_UNKNOWN_COMMAND`, and refuses
-`SetDevice.profiles` with `ERROR_CODE_UNSUPPORTED`. `memory_used` reports what is loaded. A device
+Loaded profiles share the `MEMORY.limit` in `ProfileSupport.resources`, set by the board
+configuration. A board configured without profile support, such as the Pico W, reports no
+`ProfileSupport` and no configuration interfaces, answers profile commands with
+`ERROR_CODE_UNKNOWN_COMMAND`, and refuses `SetDevice.profiles` with `ERROR_CODE_UNSUPPORTED`.
+`MEMORY.count` reports loaded bytes. A device
 loads all of its layers or none: when the profiles it would add do not fit in what is left of the
 budget, or one of them cannot be read or decoded, none is loaded, its input passes through
-unchanged, and `Device.profile_error` says why. The connection itself carries on. When a connected
+unchanged, and `Device.errors` includes `ERROR_CODE_PROFILE_MEMORY_EXCEEDED` or
+`ERROR_CODE_PROFILE_LOAD_FAILED`. The connection itself carries on. When a connected
 device's layers change, the profiles it no longer uses count as released before the new ones are
 checked. The Dongle tries again when memory is released, when the device's layers change, or when a
 profile in its layers is edited, and after a failed read it also retries with the connection
@@ -301,7 +313,7 @@ editor's requests fail and no device's profiles are unloaded to make room.
 Each input goes through the layers in order, one rule lookup per layer. A remap's outputs are each
 looked up in the next layer by their usage, and their results are held together in order, each
 output's results taking its place, each output at most once. After each layer, only the first
-`max_remap_outputs` outputs are kept. A remap applies only while the device reports the input as a
+outputs up to the advertised `OUTPUTS.limit` are kept. A remap applies only while the device reports the input as a
 held control; other forms of the same usage keep their usual behavior. A remap output never reaches a scale rule, because no usage is both a remap output and a
 scale input. Scales from every layer multiply into one ratio, kept in lowest terms and applied once
 with one fractional remainder per connection and input, which resets when the ratio changes; a
@@ -321,14 +333,14 @@ A profile whose `profile.pb` turns out to be missing or undecodable when the Don
 deleted with its rules, and `profile_removed` follows. Its references are removed first, so no
 device applies its rules once deletion begins. An undecodable rules file is removed, leaving the
 profile empty. Neither cleanup runs between a connection starting and its first forwarded input;
-the connection loads no profiles, its `profile_error` is `ERROR_CODE_STORAGE_FAILED`, and the
+the connection loads no profiles, its `errors` includes `ERROR_CODE_PROFILE_LOAD_FAILED`, and the
 cleanup follows.
 
 A saved reference to a profile that no longer exists is skipped until it is changed. Startup checks
 which profile directories exist without reading them. Before USB starts, it clears and disables a
 configuration interface whose profile does not exist, so the adapter still enumerates once. While
 reading device policies, it removes such references from device layers. Deleting a lost profile
-removes its references the same way, and disabling an enabled interface then reconnects USB.
+removes its references the same way, and USB reconnects if the actual allocation changes.
 `device` and `adapter` events follow. A listing leaves out a lost record it removes; an `unreadable`
 entry names only a record whose flash read failed. As for devices, a failed read is never proof that
 data is missing and deletes nothing.

@@ -3,9 +3,9 @@ import { ErrorCode, ProfileRuleSchema, UsageRange_Kind } from "@cordial/protocol
 import { describe, expect, it } from "vitest";
 import { isAction } from "../src/core/actions.ts";
 import { FakeAdapter, axis, device, profile, remap, scale } from "../src/fake/adapter.ts";
-import { canEnable, copyName, interfaceProblem, profileInUse, reconnectsUsb, stagedInterfaces } from "../src/shared/profiles.ts";
+import { canEnable, copyName, interfaceProblem, profileInUse, stagedInterfaces } from "../src/shared/profiles.ts";
 import type { AdapterStatus, AppState, DeviceEntry } from "../src/shared/state.ts";
-import { profileAlertText } from "../src/shared/text.ts";
+import { memoryPercent, profileAlertText } from "../src/shared/text.ts";
 import { controller, record, until } from "./helpers.ts";
 
 const ID = "0123456789ABCDEF";
@@ -329,9 +329,17 @@ describe("Profiles", () => {
     await c.manager.rescan();
     await until(() => adapter(state).connection === "connected" && adapter(state).readiness === "ready");
     expect(adapter(state).status!.interfaces).toEqual([
-      { interface: 1, enabled: false, profile: 0, conflicts: [2] },
-      { interface: 2, enabled: true, profile: 1, conflicts: [1] },
+      { interface: 1, enabled: false, active: false, profile: 0, conflicts: [2] },
+      { interface: 2, enabled: true, active: true, profile: 1, conflicts: [1] },
     ]);
+    // Another profile for the enabled interface leaves the USB interfaces as they are.
+    expect(await c.act({ type: "adapter.settings", adapterId: ID, interfaces: { 2: { profile: 2 } } })).toMatchObject({ ok: false });
+    await c.act({ type: "profile.create", adapterId: ID, name: "B" });
+    await until(() => !!adapter(state).profileNames[2]);
+    expect(await c.act({ type: "adapter.settings", adapterId: ID, interfaces: { 2: { profile: 2 } } })).toEqual({ ok: true });
+    await until(() => adapter(state).status!.interfaces[1]!.profile === 2);
+    expect(fake.usbReconnects).toBe(1);
+    expect(adapter(state).connection).toBe("connected");
     // A user-disconnected adapter is recognized by the start of its USB serial number.
     await c.act({ type: "adapter.disconnect", adapterId: ID });
     const opened = ports.opened;
@@ -345,30 +353,31 @@ describe("Profiles", () => {
     const { fake, c, deps, state } = await start({ profiles: [profile(1, "Big", [], 900), profile(2, "Small", [], 200)], memoryBudget: 1000 });
     const alerts = () => deps.profileAlert.mock.calls.map(([a]) => a);
     await c.act({ type: "device.update", key: KEY, profiles: [1] });
-    await until(() => adapter(state).status!.profileSupport!.memoryUsed === 900);
+    await until(() => adapter(state).status!.errors.includes("profile_memory_low"));
     await until(() => alerts().length === 1);
-    expect(alerts()[0]).toEqual({ kind: "memory", adapterId: ID, name: "Pico 2 W", percent: 90 });
+    expect(alerts()[0]).toEqual({ kind: "memory", adapterId: ID, name: "Pico 2 W" });
     expect(profileAlertText(alerts()[0]!)).toEqual({ title: "Pico 2 W is almost out of profile memory.", body: null });
     await c.act({ type: "device.update", key: `${ID}/2`, profiles: [2] });
     await until(() => alerts().length === 2);
-    expect(alerts()[1]).toEqual({ kind: "device", key: `${ID}/2`, name: "Keyboard", code: "no_capacity" });
-    expect(state().devices[1]!.device.profileError).toBe("no_capacity");
+    expect(alerts()[1]).toEqual({ kind: "device", key: `${ID}/2`, name: "Keyboard", code: "profile_memory_exceeded" });
+    expect(state().devices[1]!.device.errors).toEqual(["profile_memory_exceeded"]);
     expect(profileAlertText(alerts()[1]!)).toEqual({
       title: "Keyboard connected without its profiles.",
       body: "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.",
     });
     // Releasing memory loads the waiting device's profiles and clears both conditions.
     await c.act({ type: "device.update", key: KEY, profiles: [] });
-    await until(() => state().devices[1]!.device.profileError === null && adapter(state).status!.profileSupport!.memoryUsed === 200);
+    await until(() => state().devices[1]!.device.errors.length === 0 && adapter(state).status!.errors.length === 0);
+    expect(memoryPercent(adapter(state).status)).toBe(20);
     expect(alerts()).toHaveLength(2);
     // Each notifies again once the condition returns.
     await c.act({ type: "device.update", key: KEY, profiles: [1] });
-    await until(() => state().devices[0]!.device.profileError === "no_capacity");
+    await until(() => state().devices[0]!.device.errors.includes("profile_memory_exceeded"));
     await until(() => alerts().length === 3);
     expect(alerts()[2]).toMatchObject({ kind: "device", key: KEY });
     fake.changeAdapter({ memoryBudget: 1100 });
     await until(() => alerts().length === 4);
-    expect(alerts()[3]).toMatchObject({ kind: "memory", percent: 100 });
+    expect(alerts()[3]).toEqual({ kind: "memory", adapterId: ID, name: "Pico 2 W" });
     await c.stop();
   });
 
@@ -399,23 +408,15 @@ describe("Configuration interface checks", () => {
     platform: "linux",
     ready: true,
     transports: [],
-    info: [],
-    profileSupport: { memoryBudget: 100, memoryUsed: 0, maxLayers: 4 },
+    information: { firmwareVersion: null, boardName: null, developmentBuild: null },
+    errors: [],
+    resources: [],
+    profileSupport: { resources: [{ type: "memory", count: 0, limit: 100 }, { type: "layers", count: null, limit: 4 }] },
     interfaces,
     outputSupport: [],
   });
-  const via = { interface: 1, enabled: false, profile: 0, conflicts: [2] };
-  const vial = { interface: 2, enabled: false, profile: 0, conflicts: [1] };
-
-  it("reconnects USB when an interface turns on or off, or an enabled one changes profile", () => {
-    const off = status([via, vial]);
-    expect(reconnectsUsb(off, { interfaces: { 1: { profile: 3 } } })).toBe(false);
-    expect(reconnectsUsb(off, { interfaces: { 1: { enabled: true, profile: 3 } } })).toBe(true);
-    const on = status([{ ...via, enabled: true, profile: 3 }, vial]);
-    expect(reconnectsUsb(on, { interfaces: { 1: { profile: 4 } } })).toBe(true);
-    expect(reconnectsUsb(on, { interfaces: { 1: { profile: 3 } } })).toBe(false);
-    expect(reconnectsUsb(on, { platform: "mac" })).toBe(false);
-  });
+  const via = { interface: 1, enabled: false, active: false, profile: 0, conflicts: [2] };
+  const vial = { interface: 2, enabled: false, active: false, profile: 0, conflicts: [1] };
 
   it("offers turning an interface on only with a profile and without a conflicting one on", () => {
     const s = status([{ ...via, enabled: true, profile: 1 }, { ...vial, profile: 1 }]);

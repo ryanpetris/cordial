@@ -381,36 +381,17 @@ impl Connection {
         self.done(Command::RefreshDevice(p::RefreshDevice { device }))
     }
 
-    /// One page of a device's warnings after `after`; `None` starts the listing.
-    pub fn list_warnings(
-        &self,
-        device: u32,
-        after: Option<p::DeviceWarning>,
-    ) -> Result<p::DeviceWarnings> {
-        self.page(Command::ListWarnings(p::ListWarnings { device, after }))
-    }
-
-    /// Every warning of a device, read page by page.
-    pub fn all_warnings(&self, device: u32) -> Result<Vec<p::DeviceWarning>> {
-        self.pages::<p::DeviceWarnings>(|after| {
-            Command::ListWarnings(p::ListWarnings {
-                device,
-                after: after.copied(),
-            })
-        })
-    }
-
     /// One page of a device's settings after `after`; `None` starts the listing.
     pub fn list_settings(
         &self,
         device: u32,
-        after: Option<p::SettingRef>,
+        after: Option<p::SettingsRef>,
     ) -> Result<p::DeviceSettings> {
         self.page(Command::ListSettings(p::ListSettings { device, after }))
     }
 
-    /// Every setting of a device, read page by page.
-    pub fn all_settings(&self, device: u32) -> Result<Vec<p::Setting>> {
+    /// Every settings object of a device, read page by page.
+    pub fn all_settings(&self, device: u32) -> Result<Vec<p::SettingsObject>> {
         self.pages::<p::DeviceSettings>(|after| {
             Command::ListSettings(p::ListSettings {
                 device,
@@ -421,7 +402,7 @@ impl Connection {
 
     /// Saves and forgets settings in one request; the changes apply in order. Success carries no
     /// result: the Dongle holds what was sent, and a settings_changed event follows.
-    pub fn set_settings(&self, device: u32, changes: Vec<p::SettingChange>) -> Result<()> {
+    pub fn set_settings(&self, device: u32, changes: Vec<p::SettingsUpdate>) -> Result<()> {
         self.done(Command::SetSettings(p::SetSettings { device, changes }))
     }
 

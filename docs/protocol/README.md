@@ -14,8 +14,7 @@ reports what it says, such as battery levels.
 - [USB discovery, framing and sessions](transport.md)
 - [Compatibility rules](compatibility.md)
 - [Commands](commands.md)
-- [Records: status, profiles, devices, integrations, information, settings and warnings](records.md)
-- [Information and settings keys](keys.md)
+- [Records: status, profiles, devices, integrations, information and settings](records.md)
 - [Limits and errors](limits-and-errors.md)
 - [CLI, TUI and desktop behavior](clients.md)
 - [Development commands](development.md)
@@ -25,12 +24,11 @@ reports what it says, such as battery levels.
 
 - [`proto/cordial.proto`](../../proto/cordial.proto) defines every message. Its comments say what
   each field means, which fields are required, and what a missing field means.
-- [`proto/keys.toml`](../../proto/keys.toml) lists every information and setting key, with its type,
-  unit and enum values.
+- [`proto/storage.proto`](../../proto/storage.proto) defines the saved records independently of
+  the serial representation. See [storage format](../storage-format.md).
 
-Both are checked: `tools/check_keys.py` validates the key catalog and compares it with an earlier
-version, and `buf breaking` compares the schema with the last release (see
-[Compatibility rules](compatibility.md)).
+`buf lint` checks both schemas, and `buf breaking` compares them with the newest earlier release
+in the same series. See [Compatibility rules](compatibility.md).
 
 ## Libraries
 
@@ -39,7 +37,7 @@ them too:
 
 | | Rust | TypeScript |
 | --- | --- | --- |
-| Messages, framing, key constants | `cordial-protocol` | `@cordial/protocol` |
+| Messages and framing | `cordial-protocol` | `@cordial/protocol` |
 | Port discovery and connection | `cordial-client` | `@cordial/client` (`/node`, `/web`) |
 
 The protocol libraries do no I/O; the Rust one is `no_std` and shared with the firmware. The client

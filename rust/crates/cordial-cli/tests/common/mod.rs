@@ -4,12 +4,12 @@
 use cordial_client::{Connection, Received, paging};
 use cordial_protocol::{
     self as p, CodeKind, ConfigurationInterface, DeviceState, ErrorCode, IntegrationKind,
-    MAX_REQUEST_BYTES, Role, SettingState, Transport, device_list_entry,
+    MAX_REQUEST_BYTES, ResourceType, Role, SettingState, Transport, device_list_entry,
     frame::{self, Decoder},
-    keys, message, pairing, profile_list_entry, profile_rule, profile_rule_change,
+    integer_setting_update, message, pairing, profile_list_entry, profile_rule,
+    profile_rule_change,
     request::Command,
-    response, setting, setting_change,
-    value::Value,
+    response, settings_object, settings_update,
 };
 use prost::Message as _;
 use std::{
@@ -88,8 +88,7 @@ pub struct Sim {
     pub devices: Vec<p::Device>,
     /// Saved devices whose records can't be read.
     pub unreadable: Vec<u32>,
-    pub settings: BTreeMap<u32, Vec<p::Setting>>,
-    pub warnings: BTreeMap<u32, Vec<p::DeviceWarning>>,
+    pub settings: BTreeMap<u32, Vec<p::SettingsObject>>,
     pub candidates: Vec<p::Candidate>,
     /// A scan ends at once with scan_done.
     pub scan_ends: bool,
@@ -102,6 +101,8 @@ pub struct Sim {
     pub log: Vec<Command>,
     /// Commands answered with this error instead.
     pub refuse: BTreeMap<&'static str, ErrorCode>,
+    /// Commands that take effect at once but whose replies leave only after this delay.
+    pub slow: BTreeMap<&'static str, Duration>,
     /// Saved profiles and their rules; used only when the status has profile support.
     pub profiles: Vec<p::Profile>,
     pub rules: BTreeMap<u32, Vec<p::ProfileRule>>,
@@ -114,10 +115,11 @@ pub struct Sim {
     session: u64,
 }
 
-pub fn info(key: &str, value: Value) -> p::Info {
-    p::Info {
-        key: key.into(),
-        value: Some(p::Value { value: Some(value) }),
+pub fn resource(kind: ResourceType, count: Option<u32>, limit: Option<u32>) -> p::ResourceCapacity {
+    p::ResourceCapacity {
+        r#type: kind as i32,
+        count,
+        limit,
     }
 }
 
@@ -130,31 +132,29 @@ pub fn status(ready: bool) -> p::Status {
         transports: vec![
             p::TransportSupport {
                 transport: Transport::Classic as i32,
-                max_enabled: Some(1),
                 enabled: Some(true),
+                resources: vec![resource(ResourceType::Devices, None, Some(1))],
             },
             p::TransportSupport {
                 transport: Transport::Ble as i32,
-                max_enabled: Some(7),
                 enabled: Some(true),
+                resources: vec![resource(ResourceType::Devices, None, Some(7))],
             },
         ],
-        info: vec![
-            info(keys::FIRMWARE_VERSION, Value::Text("1.2.3-dev".into())),
-            info(keys::BUILD_DEVELOPMENT, Value::Bool(true)),
-        ],
-        profile_support: None,
-        configuration_interfaces: Vec::new(),
-        output_support: Vec::new(),
+        information: Some(p::AdapterInformation {
+            firmware_version: Some("1.2.3-dev".into()),
+            board_name: None,
+            development_build: Some(true),
+        }),
+        ..Default::default()
     }
 }
 
 /// Advertises HID and XInput gamepad output, four slots each.
 pub fn enable_gamepads(status: &mut p::Status) {
-    let mode = |mode: p::OutputMode, max_slots: u32| p::OutputModeSupport {
+    let mode = |mode: p::OutputMode, slots: u32| p::OutputModeSupport {
         mode: mode as i32,
-        max_slots,
-        slots: None,
+        resources: vec![resource(ResourceType::Slots, None, Some(slots))],
     };
     status.output_support = vec![p::OutputSupport {
         role: Role::Gamepad as i32,
@@ -227,10 +227,11 @@ pub fn enable_profiles(status: &mut p::Status) {
             range(p::usage_range::Kind::AxisInput, 0x01, 0x30, 0x35, GAMEPAD),
             range(p::usage_range::Kind::AxisOutput, 0x01, 0x30, 0x35, GAMEPAD),
         ],
-        memory_budget: 8192,
-        max_remap_outputs: 4,
-        max_layers: 3,
-        memory_used: 1024,
+        resources: vec![
+            resource(ResourceType::Memory, Some(1024), Some(8192)),
+            resource(ResourceType::Outputs, None, Some(4)),
+            resource(ResourceType::Layers, None, Some(3)),
+        ],
     });
     status.configuration_interfaces = [
         (ConfigurationInterface::Via, ConfigurationInterface::Vial),
@@ -240,6 +241,7 @@ pub fn enable_profiles(status: &mut p::Status) {
     .map(|(i, other)| p::ConfigurationInterfaceSupport {
         interface: i as i32,
         enabled: false,
+        active: false,
         profile: 0,
         conflicts: vec![other as i32],
     })
@@ -285,21 +287,33 @@ pub fn candidate(id: u32, name: &str) -> p::Candidate {
     }
 }
 
-/// A HID++ integer setting with a range.
-pub fn dpi(value: i64, saved: Option<i64>) -> p::Setting {
-    p::Setting {
+fn applied() -> Option<p::SettingStatus> {
+    Some(p::SettingStatus {
+        result: Some(p::setting_status::Result::State(
+            SettingState::Applied as i32,
+        )),
+    })
+}
+
+/// A HID++ pointer sensor with a sensitivity range.
+pub fn dpi(index: u32, value: i64, saved: Option<i64>) -> p::SettingsObject {
+    p::SettingsObject {
         integration: IntegrationKind::Hidpp as i32,
-        key: "pointer.sensor.0.dpi".into(),
-        status: saved.map(|_| setting::Status::State(SettingState::Applied as i32)),
-        r#type: Some(setting::Type::Integer(p::IntegerSetting {
-            value: Some(value),
-            saved,
-            limits: Some(p::integer_setting::Limits::Range(p::IntegerRange {
-                min: 400,
-                max: 4000,
-                step: 50,
-            })),
-        })),
+        group: Some(settings_object::Group::PointerSensor(
+            p::PointerSensorSettings {
+                index,
+                dpi: Some(p::IntegerSetting {
+                    value: Some(value),
+                    saved,
+                    status: saved.and_then(|_| applied()),
+                    limits: Some(p::integer_setting::Limits::Range(p::IntegerRange {
+                        min: 400,
+                        max: 4000,
+                        step: 50,
+                    })),
+                }),
+            },
+        )),
     }
 }
 
@@ -317,7 +331,6 @@ impl Default for Sim {
             ],
             unreadable: Vec::new(),
             settings: BTreeMap::new(),
-            warnings: BTreeMap::new(),
             candidates: vec![candidate(1, "New Keyboard")],
             scan_ends: true,
             plan: Plan::Done,
@@ -326,6 +339,7 @@ impl Default for Sim {
             data: BTreeMap::new(),
             log: Vec::new(),
             refuse: BTreeMap::new(),
+            slow: BTreeMap::new(),
             profiles: Vec::new(),
             rules: BTreeMap::new(),
             page_size: 2,
@@ -355,7 +369,6 @@ fn kind_name(command: &Command) -> &'static str {
         Command::DisconnectDevice(_) => "disconnect_device",
         Command::UnpairDevice(_) => "unpair_device",
         Command::RefreshDevice(_) => "refresh_device",
-        Command::ListWarnings(_) => "list_warnings",
         Command::ListSettings(_) => "list_settings",
         Command::SetSettings(_) => "set_settings",
         Command::ListFeatures(_) => "list_features",
@@ -401,20 +414,17 @@ fn id_after(after: u32) -> Option<u32> {
     (after != 0).then_some(after)
 }
 
-fn setting_key(s: &p::Setting) -> (i32, String) {
-    (s.integration, s.key.clone())
+fn settings_key(r: &p::SettingsRef) -> (i32, i32, Option<u32>) {
+    (r.integration, r.group, r.index)
 }
 
-fn warning_key(w: &p::DeviceWarning) -> impl Ord + use<> {
-    (
-        w.service,
-        w.report_type,
-        w.report_id,
-        w.bit_offset,
-        w.usage_page,
-        w.usage,
-        w.code,
-    )
+/// A resource's limit; a missing one allows anything.
+fn limit(resources: &[p::ResourceCapacity], kind: ResourceType) -> u32 {
+    resources
+        .iter()
+        .find(|r| r.r#type == kind as i32)
+        .and_then(|r| r.limit)
+        .unwrap_or(u32::MAX)
 }
 
 /// Rules in order of input, then collection.
@@ -570,8 +580,10 @@ impl Sim {
             let Some(s) = next.iter_mut().find(|s| s.interface == u.interface) else {
                 return Some(ErrorCode::Unsupported);
             };
+            // Every enabled interface fits.
             if let Some(on) = u.enabled {
                 s.enabled = on;
+                s.active = on;
             }
             if let Some(profile) = u.profile {
                 if profile != 0 && !self.profiles.iter().any(|p| p.id == profile) {
@@ -607,7 +619,8 @@ impl Sim {
                 Some(profile_rule_change::Change::Rule(rule)) => {
                     let mut rule = rule.clone();
                     if let Some(profile_rule::Effect::Remap(remap)) = &mut rule.effect {
-                        if remap.outputs.len() > support.max_remap_outputs as usize {
+                        let max = limit(&support.resources, ResourceType::Outputs);
+                        if remap.outputs.len() > max as usize {
                             return Some(ErrorCode::BadArgs);
                         }
                         for o in &mut remap.outputs {
@@ -810,7 +823,9 @@ impl Sim {
                     let Some(support) = &self.status.profile_support else {
                         return self.respond(error(ErrorCode::Unsupported));
                     };
-                    if layers.profiles.len() > support.max_layers as usize {
+                    if layers.profiles.len()
+                        > limit(&support.resources, ResourceType::Layers) as usize
+                    {
                         return self.respond(error(ErrorCode::BadArgs));
                     }
                     if !layers.profiles.iter().all(|id| self.has_profile(*id)) {
@@ -1006,65 +1021,49 @@ impl Sim {
                     self.event(p::event::Kind::Profile(profile));
                 }
             }
-            Command::ListWarnings(l) => {
-                let all = self.warnings.get(&l.device).cloned().unwrap_or_default();
-                let after = l.after.as_ref().map(warning_key);
-                let (warnings, end) = page(&all, warning_key, after, self.page_size);
-                self.respond(Some(response::Result::Warnings(p::DeviceWarnings {
-                    device: l.device,
-                    warnings,
-                    end,
-                })));
-            }
             Command::ListSettings(l) => {
                 let all = self.settings.get(&l.device).cloned().unwrap_or_default();
-                let after = l.after.map(|r| (r.integration, r.key));
-                let (settings, end) = page(&all, setting_key, after, self.page_size);
+                let after = l.after.as_ref().map(settings_key);
+                let key = |o: &p::SettingsObject| settings_key(&paging::settings_ref(o));
+                let (objects, end) = page(&all, key, after, self.page_size);
                 self.respond(Some(response::Result::Settings(p::DeviceSettings {
                     device: l.device,
-                    settings,
+                    objects,
                     end,
                 })));
             }
             Command::SetSettings(set) => {
+                // Saves and applies pointer sensor sensitivities, the only settings it has.
                 let list = self.settings.entry(set.device).or_default();
+                let mut changed = Vec::new();
                 for change in &set.changes {
-                    let Some(s) = list.iter_mut().find(|s| s.key == change.key) else {
+                    let Some(settings_update::Group::PointerSensor(u)) = &change.group else {
                         continue;
                     };
-                    match &change.change {
-                        Some(setting_change::Change::Value(p::Value {
-                            value: Some(Value::Integer(n)),
-                        })) => {
-                            if let Some(setting::Type::Integer(t)) = &mut s.r#type {
-                                t.saved = Some(*n);
-                            }
-                            s.status = Some(setting::Status::State(SettingState::Pending as i32));
+                    let Some(o) = list.iter_mut().find(|o| {
+                        matches!(&o.group, Some(settings_object::Group::PointerSensor(s)) if s.index == u.index)
+                    }) else {
+                        continue;
+                    };
+                    let Some(settings_object::Group::PointerSensor(s)) = &mut o.group else {
+                        continue;
+                    };
+                    let Some(dpi) = &mut s.dpi else { continue };
+                    match u.dpi.as_ref().and_then(|c| c.change.as_ref()) {
+                        Some(integer_setting_update::Change::Value(n)) => {
+                            dpi.saved = Some(*n);
+                            dpi.value = Some(*n);
+                            dpi.status = applied();
                         }
-                        Some(setting_change::Change::Forget(_)) => {
-                            if let Some(setting::Type::Integer(t)) = &mut s.r#type {
-                                t.saved = None;
-                            }
-                            s.status = None;
+                        Some(integer_setting_update::Change::Forget(_)) => {
+                            dpi.saved = None;
+                            dpi.status = None;
                         }
-                        _ => {}
+                        None => continue,
                     }
+                    changed.push(o.clone());
                 }
                 self.respond(None);
-                let list = self.settings.get_mut(&set.device).unwrap();
-                for s in list.iter_mut() {
-                    if let Some(setting::Type::Integer(t)) = &mut s.r#type
-                        && t.saved.is_some()
-                    {
-                        t.value = t.saved;
-                        s.status = Some(setting::Status::State(SettingState::Applied as i32));
-                    }
-                }
-                let changed = list
-                    .iter()
-                    .filter(|s| set.changes.iter().any(|c| c.key == s.key))
-                    .cloned()
-                    .collect();
                 self.event(p::event::Kind::SettingsChanged(p::SettingsChanged {
                     device: set.device,
                     changed,
@@ -1148,7 +1147,23 @@ impl Dongle {
                         && let Ok(request) = p::Request::decode(frame)
                         && let Some(command) = request.command
                     {
-                        sim.lock().unwrap().answer(command);
+                        let mut sim = sim.lock().unwrap();
+                        let Some(delay) = sim.slow.get(kind_name(&command)).copied() else {
+                            sim.answer(command);
+                            continue;
+                        };
+                        let (held, replies) = mpsc::channel();
+                        let out = sim.out.replace(PipeWriter(held));
+                        sim.answer(command);
+                        sim.out = out.clone();
+                        if let Some(mut out) = out {
+                            thread::spawn(move || {
+                                thread::sleep(delay);
+                                for bytes in replies.try_iter() {
+                                    let _ = out.write_all(&bytes);
+                                }
+                            });
+                        }
                     }
                 }
             }

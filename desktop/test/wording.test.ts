@@ -20,7 +20,7 @@ describe("error wording", () => {
     expect(failure(storage, true)).toBe(READ_FAILED);
     expect(failure(storage)).toBe("The adapter couldn't save the change. Your saved data hasn't changed.");
     expect(failure(new ConnectionClosedError(), true)).toBe("The adapter disconnected before it answered.");
-    expect(failure(new ConnectionClosedError())).toBe("The adapter disconnected before the change finished.");
+    expect(failure(new ConnectionClosedError())).toBe("The adapter couldn't confirm whether the change was saved.");
   });
 
   it("names gamepads by kind, or by role without a kind", () => {

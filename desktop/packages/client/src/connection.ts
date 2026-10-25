@@ -16,8 +16,6 @@ import {
   type DeviceList,
   type DeviceListEntry,
   type DeviceSettings,
-  type DeviceWarning,
-  type DeviceWarnings,
   type Event,
   type Feature,
   type FeatureList,
@@ -35,12 +33,12 @@ import {
   type SetDeviceSchema,
   type SetProfileRulesSchema,
   type SetSettingsSchema,
-  type Setting,
-  type SettingRefSchema,
+  type SettingsObject,
+  type SettingsRefSchema,
   type Status,
   type Transport,
 } from "@cordial/protocol";
-import { featureRef, ruleRef, settingRef } from "./order.ts";
+import { featureRef, ruleRef, settingsRef } from "./order.ts";
 import type { ByteStream } from "./stream.ts";
 
 /** A request, as the command it carries. */
@@ -300,25 +298,16 @@ export class Connection {
   refreshDevice(device: number): Promise<void> {
     return this.#void({ case: "refreshDevice", value: { device } });
   }
-  /** One page of a device's warnings following `after`, the last warning received. */
-  listWarnings(device: number, after?: DeviceWarning): Promise<DeviceWarnings> {
-    return this.#call({ case: "listWarnings", value: { device, after } }, "warnings");
-  }
-  listAllWarnings(device: number): Promise<DeviceWarning[]> {
-    return readAll("listWarnings", async (after: DeviceWarning | undefined) => {
-      const page = await this.listWarnings(device, after);
-      return { entries: page.warnings, end: page.end };
-    }, (w) => w);
-  }
-  /** One page of a device's settings following `after`, the last setting received. */
-  listSettings(device: number, after?: MessageInitShape<typeof SettingRefSchema>): Promise<DeviceSettings> {
+  /** One page of a device's settings objects following `after`, the identity of the last object
+   * received. */
+  listSettings(device: number, after?: MessageInitShape<typeof SettingsRefSchema>): Promise<DeviceSettings> {
     return this.#call({ case: "listSettings", value: { device, after } }, "settings");
   }
-  listAllSettings(device: number): Promise<Setting[]> {
-    return readAll("listSettings", async (after: MessageInitShape<typeof SettingRefSchema> | undefined) => {
+  listAllSettings(device: number): Promise<SettingsObject[]> {
+    return readAll("listSettings", async (after: MessageInitShape<typeof SettingsRefSchema> | undefined) => {
       const page = await this.listSettings(device, after);
-      return { entries: page.settings, end: page.end };
-    }, settingRef);
+      return { entries: page.objects, end: page.end };
+    }, settingsRef);
   }
   /** Saves and forgets settings in one write, applied in order. Success means the Dongle saved
    * exactly what was sent; a settings_changed event follows. */

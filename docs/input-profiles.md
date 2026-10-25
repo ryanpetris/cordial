@@ -66,13 +66,12 @@ itself without inversion forgets its rule, as does remapping an input only to it
 collection or scaling it by a ratio equal to 1.
 
 A profile occupies memory only while a connected device or a configuration interface uses it. Loaded
-profiles share a memory budget set by the board configuration and reported to clients, sized so that
-every connected device can load two fully remapped VIA profiles. The Pico W has no profile support,
-to keep its limited RAM for connections; the Pico 2 W and the other boards have it. A device whose
-profiles do not fit in what is left loads none of them and passes its input through unchanged, and
-Cordial notifies the user; it also warns when the budget is nearly full. When a device connects, the
-adapter reads the profiles in its layers from flash before forwarding its first input, and shares a
-profile that another connected device already uses. Edits and layer changes apply to connected
+profiles share a memory budget set by the board configuration and reported to clients. The Pico W
+has no profile support, to keep its limited RAM for connections; the other presets support profiles.
+A device whose profiles do not fit in what is left loads none of them and passes its input through
+unchanged. Cordial notifies the user and also warns when the budget is nearly full. When a device
+connects, the adapter reads the profiles in its layers from flash before forwarding its first input,
+and shares a profile that another connected device already uses. Edits and layer changes apply to connected
 devices from their next input; a held input keeps the outputs it was pressed with until it is
 released.
 
@@ -83,8 +82,11 @@ each to an external editor over USB, each with its own switch and profile. The p
 several interfaces to be enabled at once, and the adapter reports which ones it cannot run together:
 VIA and Vial share a Raw HID usage, so this firmware lists them as conflicting. With every interface
 disabled, no editor interface or its endpoints are allocated and every profile keeps translating input.
-Changing the enabled interface rebuilds USB and reconnects the adapter on every board. The adapter
-starts USB with its saved interfaces, so an enabled interface adds no reconnect at startup.
+Saved enablement requests an editor interface; active exposure depends on
+[USB allocation](protocol/hid-forwarding.md#usb-allocation). Valid preferences save even when the
+interface cannot fit. USB reconnects only when the actual allocation changes. It computes that
+allocation before startup and saves, then exposes what fits. After a reconnect, clients read fresh
+status in a new serial session.
 Selecting a profile for an interface does not apply it to any device, and deleting a profile is
 refused while it is in a device's layers or selected by an interface.
 
@@ -94,7 +96,7 @@ refused while it is in a device's layers or selected by an interface.
   [`cordial-via.json`](../configs/keyboards/cordial-via.json) as a VIA v2 definition through the
   editor's Design tab. Remap uses the same VIA interface and definition, subject to its device
   registration/import workflow.
-- Vial uses protocol 6. Enabling Vial appends `-vial:f64c2b3c` to the adapter's USB serial, allowing
+- Vial uses protocol 6. Active Vial exposure appends `-vial:f64c2b3c` to the adapter's USB serial, allowing
   Vial desktop to discover it and download its embedded definition automatically. The definition
   comes from [`cordial-vial.json`](../configs/keyboards/cordial-vial.json). Regenerate its
   compressed bytes with `python3 tools/generate_vial_definition.py` after editing that definition.
@@ -182,7 +184,8 @@ VIA, Vial and Remap sessions still require hardware verification.
 8. Change an enabled interface's profile with the editor closed, reopen it, and confirm it reads the
    new profile. Disable the interface and verify it disappears while rules keep working. Confirm
    enabling VIA and Vial together is refused as conflicting.
-9. Power up with VIA or Vial enabled. Verify the adapter enumerates once with the enabled interface,
+9. Power up with VIA or Vial enabled and enough USB resources. Verify the adapter enumerates once
+   with the active interface,
    and that input and serial access work, including in firmware setup, boot menus, and pre-boot
    unlock screens used with the adapter.
 10. Measure the time from a keyboard's reconnection to its first key reaching the Host with and

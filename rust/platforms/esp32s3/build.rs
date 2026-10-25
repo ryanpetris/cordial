@@ -51,6 +51,10 @@ fn main() {
             "cargo:rerun-if-changed={}",
             root.join("tools/esp_config.py").display()
         );
+        println!(
+            "cargo:rerun-if-changed={}",
+            root.join("tools/bluetooth_config.py").display()
+        );
         assert!(
             Command::new("python3")
                 .arg(generator)

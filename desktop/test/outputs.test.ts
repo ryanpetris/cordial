@@ -1,11 +1,13 @@
 import { create } from "@bufbuild/protobuf";
-import { DeviceSchema, ErrorCode, OutputMode, OutputState, Role, StatusSchema } from "@cordial/protocol";
+import { DeviceSchema, ErrorCode, OutputMode, OutputState, ResourceType, Role, StatusSchema } from "@cordial/protocol";
 import { describe, expect, it } from "vitest";
 import { isAction } from "../src/core/actions.ts";
 import * as convert from "../src/core/convert.ts";
 import { FakeAdapter, device } from "../src/fake/adapter.ts";
-import { gamepadModes, gamepadOutput, offersGamepadOutput, reconnectsGamepadUsb } from "../src/shared/outputs.ts";
-import type { AdapterStatus, AppState, DeviceRecord } from "../src/shared/state.ts";
+import { trayModel } from "../src/main/tray-model.ts";
+import { resource } from "../src/shared/capacity.ts";
+import { gamepadModes, gamepadOutput, offersGamepadOutput } from "../src/shared/outputs.ts";
+import type { AdapterStatus, AppState } from "../src/shared/state.ts";
 import { codeText } from "../src/shared/text.ts";
 import { controller, record, until } from "./helpers.ts";
 
@@ -16,16 +18,19 @@ const support = (modes: AdapterStatus["outputSupport"][number]["modes"]): Adapte
   name: "A",
   platform: "linux",
   ready: true,
+  errors: [],
+  resources: [],
   transports: [],
-  info: [],
+  information: { firmwareVersion: null, boardName: null, developmentBuild: null },
   profileSupport: null,
   interfaces: [],
   outputSupport: [{ role: "gamepad", modes }],
 });
+const slots = (count: number | null, limit: number | null) => [{ type: "slots" as const, count, limit }];
 const BOTH = support([
-  { mode: "disabled", maxSlots: 0, slots: null },
-  { mode: "hid", maxSlots: 4, slots: 1 },
-  { mode: "xinput", maxSlots: 4, slots: 0 },
+  { mode: "disabled", resources: slots(0, 0) },
+  { mode: "hid", resources: slots(1, 4) },
+  { mode: "xinput", resources: slots(0, 4) },
 ]);
 const NONE: AdapterStatus = { ...BOTH, outputSupport: [] };
 
@@ -35,11 +40,19 @@ describe("Output conversion", () => {
   it("keeps known output support and skips roles and modes this app doesn't know", () => {
     const s = convert.status(create(StatusSchema, {
       outputSupport: [
-        { role: Role.GAMEPAD, modes: [{ mode: OutputMode.DISABLED }, { mode: OutputMode.XINPUT, maxSlots: 4, slots: 2 }, { mode: 9 as OutputMode, maxSlots: 4 }] },
-        { role: 42 as Role, modes: [{ mode: OutputMode.HID, maxSlots: 4 }] },
+        {
+          role: Role.GAMEPAD,
+          modes: [
+            { mode: OutputMode.DISABLED, resources: [{ type: ResourceType.SLOTS, count: 0, limit: 0 }] },
+            // A count not yet known stays unknown; an unknown type and a repeated one are skipped.
+            { mode: OutputMode.XINPUT, resources: [{ type: 42 as ResourceType, count: 1 }, { type: ResourceType.SLOTS, limit: 4 }, { type: ResourceType.SLOTS, count: 3, limit: 4 }] },
+            { mode: 9 as OutputMode, resources: [{ type: ResourceType.SLOTS, limit: 4 }] },
+          ],
+        },
+        { role: 42 as Role, modes: [{ mode: OutputMode.HID }] },
       ],
     }));
-    expect(s.outputSupport).toEqual([{ role: "gamepad", modes: [{ mode: "disabled", maxSlots: 0, slots: null }, { mode: "xinput", maxSlots: 4, slots: 2 }] }]);
+    expect(s.outputSupport).toEqual([{ role: "gamepad", modes: [{ mode: "disabled", resources: slots(0, 0) }, { mode: "xinput", resources: slots(null, 4) }] }]);
   });
 
   it("reads output preferences and states, with unknown modes as null and unknown states as unknown", () => {
@@ -72,7 +85,7 @@ describe("Output conversion", () => {
 describe("Gamepad Output choices", () => {
   it("offers the advertised modes after Disabled, and none without support", () => {
     expect(gamepadModes(BOTH)).toEqual(["disabled", "hid", "xinput"]);
-    expect(gamepadModes(support([{ mode: "xinput", maxSlots: 4, slots: null }]))).toEqual(["disabled", "xinput"]);
+    expect(gamepadModes(support([{ mode: "xinput", resources: [] }]))).toEqual(["disabled", "xinput"]);
     expect(gamepadModes(NONE)).toEqual(["disabled"]);
     expect(gamepadModes(null)).toEqual(["disabled"]);
   });
@@ -88,69 +101,6 @@ describe("Gamepad Output choices", () => {
   });
 });
 
-describe("Gamepad Output pools", () => {
-  const choosing = (id: number, mode: "hid" | "xinput" | null, patch: Partial<DeviceRecord> = {}) =>
-    record(id, { outputPreferences: [{ role: "gamepad", mode }], ...patch });
-
-  it("reconnects USB when either pool's size changes", () => {
-    const one = pad(1);
-    expect(reconnectsGamepadUsb([one], one, "hid", BOTH)).toBe(true);
-    expect(reconnectsGamepadUsb([one], one, "xinput", BOTH)).toBe(true);
-    const hid = choosing(1, "hid");
-    expect(reconnectsGamepadUsb([hid], hid, "disabled", BOTH)).toBe(true);
-    expect(reconnectsGamepadUsb([hid], hid, "xinput", BOTH)).toBe(true);
-    // The device itself counts even when the list doesn't include it.
-    expect(reconnectsGamepadUsb([], hid, "disabled", BOTH)).toBe(true);
-  });
-
-  it("keeps USB connected when the pools keep their sizes", () => {
-    const one = pad(1);
-    expect(reconnectsGamepadUsb([one], one, "disabled", BOTH)).toBe(false);
-    const hid = choosing(1, "hid");
-    expect(reconnectsGamepadUsb([hid], hid, "hid", BOTH)).toBe(false);
-  });
-
-  it("counts every paired device choosing a mode, connected or not, up to four", () => {
-    const others = [
-      choosing(2, "hid", { state: "connected" }),
-      choosing(3, "hid", { enabled: false }),
-      choosing(4, "hid", { blocked: true, inactive: "transport_disabled" }),
-      choosing(5, "hid", { inactive: "capacity" }),
-    ];
-    const one = pad(1);
-    // HID is full with four other devices, so a fifth leaves its size alone, but leaving
-    // XInput for it still shrinks XInput.
-    expect(reconnectsGamepadUsb([one, ...others], one, "hid", BOTH)).toBe(false);
-    const x = choosing(1, "xinput");
-    expect(reconnectsGamepadUsb([x, ...others], x, "hid", BOTH)).toBe(true);
-    // With three others, a fourth grows HID.
-    expect(reconnectsGamepadUsb([one, ...others.slice(1)], one, "hid", BOTH)).toBe(true);
-    // Both pools full before and after.
-    const xs = [6, 7, 8, 9].map((id) => choosing(id, "xinput"));
-    const five = choosing(1, "xinput");
-    expect(reconnectsGamepadUsb([five, ...others, ...xs], five, "hid", BOTH)).toBe(false);
-  });
-
-  it("counts a mode this app doesn't know in neither pool", () => {
-    const unknown = choosing(1, null);
-    expect(reconnectsGamepadUsb([unknown], unknown, "disabled", BOTH)).toBe(false);
-    expect(reconnectsGamepadUsb([unknown, choosing(2, null)], unknown, "hid", BOTH)).toBe(true);
-  });
-
-  it("counts only the modes the adapter offers", () => {
-    // Clearing a choice the adapter can't use changes no pool.
-    const hid = choosing(1, "hid");
-    const xinput = choosing(2, "xinput");
-    expect(reconnectsGamepadUsb([hid, xinput], hid, "disabled", NONE)).toBe(false);
-    expect(reconnectsGamepadUsb([hid, xinput], xinput, "disabled", null)).toBe(false);
-    const xOnly = support([{ mode: "disabled", maxSlots: 0, slots: null }, { mode: "xinput", maxSlots: 4, slots: 1 }]);
-    expect(reconnectsGamepadUsb([hid, xinput], hid, "disabled", xOnly)).toBe(false);
-    // An offered pool still changes size.
-    expect(reconnectsGamepadUsb([hid, xinput], xinput, "disabled", xOnly)).toBe(true);
-    expect(reconnectsGamepadUsb([hid, xinput], hid, "xinput", xOnly)).toBe(true);
-  });
-});
-
 /** Every adapter is ready and `devices` devices are listed. */
 const loaded = (s: AppState | null, devices: number) =>
   !!s && s.adapters.length > 0 && s.adapters.every((a) => a.readiness === "ready") && s.devices.length === devices && s.devices.every((d) => d.settings !== null);
@@ -162,23 +112,25 @@ describe("Gamepad Output changes", () => {
     device(3, { name: "Keys" }),
   ];
 
-  it("saves a mode, follows the reported state, and reconnects USB when a pool's size changes", async () => {
-    const fake = new FakeAdapter({ adapterId: ID, devices: controllers() });
+  it("saves a mode, follows the reported state, and reconnects USB when the allocation changes", async () => {
+    // Serial and three gamepad slots fit: Pad Two's configured HID slot first, then unconfigured ones.
+    const fake = new FakeAdapter({ adapterId: ID, devices: controllers(), usbInterfaces: 5 });
     const { c, state } = controller({ "/a": fake });
     await c.manager.rescan();
     await until(() => loaded(state(), 3));
     const entry = (id: number) => state()!.devices.find((d) => d.key === `${ID}/${id}`)!.device;
     const adapter = () => state()!.adapters[0]!;
-    expect(adapter().status!.outputSupport[0]!.modes.map((m) => [m.mode, m.slots])).toEqual([["disabled", null], ["hid", 1], ["xinput", 0]]);
+    const pools = () => adapter().status!.outputSupport[0]!.modes.map((m) => [m.mode, resource(m.resources, "slots")?.count]);
+    expect(pools()).toEqual([["disabled", 0], ["hid", 3], ["xinput", 0]]);
     expect(entry(1).outputs).toEqual([{ role: "gamepad", mode: "disabled", state: "disabled", slot: null }]);
     expect(entry(2).outputs).toEqual([{ role: "gamepad", mode: "hid", state: "disconnected", slot: null }]);
     expect(entry(3).outputs).toEqual([]);
 
-    // A second HID controller grows the HID pool from one slot to two.
-    expect(await c.act({ type: "device.update", key: `${ID}/1`, gamepadOutput: "hid" })).toEqual({ ok: true });
+    // A connected XInput controller takes a slot ahead of the unconfigured HID ones.
+    expect(await c.act({ type: "device.update", key: `${ID}/1`, gamepadOutput: "xinput" })).toEqual({ ok: true });
     expect(fake.received.filter((r) => r.command.case === "setDevice").at(-1)!.command.value).toMatchObject({
       device: 1,
-      outputPreferences: [{ role: Role.GAMEPAD, mode: OutputMode.HID }],
+      outputPreferences: [{ role: Role.GAMEPAD, mode: OutputMode.XINPUT }],
       integrations: [],
     });
     await until(() => adapter().connection === "connecting");
@@ -186,15 +138,37 @@ describe("Gamepad Output changes", () => {
     await until(() => fake.present);
     await c.manager.rescan();
     await until(() => adapter().connection === "connected" && loaded(state(), 3));
-    expect(entry(1).outputPreferences).toEqual([{ role: "gamepad", mode: "hid" }]);
-    expect(entry(1).outputs).toEqual([{ role: "gamepad", mode: "hid", state: "active", slot: 0 }]);
-    expect(adapter().status!.outputSupport[0]!.modes.find((m) => m.mode === "hid")!.slots).toBe(2);
+    expect(entry(1).outputPreferences).toEqual([{ role: "gamepad", mode: "xinput" }]);
+    expect(entry(1).outputs).toEqual([{ role: "gamepad", mode: "xinput", state: "active", slot: 0 }]);
+    expect(pools()).toEqual([["disabled", 0], ["hid", 2], ["xinput", 1]]);
+    expect(adapter().status!.errors).toEqual([]);
 
     // Disconnecting releases the slot without reconnecting USB.
     expect(await c.act({ type: "device.disconnect", key: `${ID}/1` })).toEqual({ ok: true });
     await until(() => entry(1).outputs[0]!.state === "disconnected");
     expect(entry(1).outputs[0]!.slot).toBeNull();
     expect(fake.usbReconnects).toBe(1);
+    await c.stop();
+  });
+
+  it("reports a save whose answer USB cut off as unknown, and shows what was saved once reconnected", async () => {
+    const fake = new FakeAdapter({ adapterId: ID, devices: controllers(), usbInterfaces: 5 });
+    const { c, state } = controller({ "/a": fake });
+    await c.manager.rescan();
+    await until(() => loaded(state(), 3));
+    const release = fake.hold();
+    const pending = c.act({ type: "device.update", key: `${ID}/1`, gamepadOutput: "xinput" });
+    await until(() => fake.received.some((r) => r.command.case === "setDevice"));
+    // The adapter detaches before the response leaves it.
+    fake.unplug();
+    release();
+    expect(await pending).toEqual({ ok: false, message: "The adapter couldn't confirm whether the change was saved." });
+    // USB still reconnects for the new allocation.
+    await until(() => state()!.adapters[0]!.connection === "connecting" && fake.usbReconnects === 1);
+    await until(() => fake.present);
+    await c.manager.rescan();
+    await until(() => state()!.adapters[0]!.connection === "connected" && loaded(state(), 3));
+    expect(state()!.devices.find((d) => d.key === `${ID}/1`)!.device.outputPreferences).toEqual([{ role: "gamepad", mode: "xinput" }]);
     await c.stop();
   });
 
@@ -234,5 +208,34 @@ describe("Gamepad Output changes", () => {
     fake.failures.setDevice = [ErrorCode.STORAGE_FAILED];
     expect(await c.act({ type: "device.update", key: `${ID}/1`, gamepadOutput: "disabled" })).toMatchObject({ ok: false });
     await c.stop();
+  });
+
+  it("reports omitted required and reserved interfaces independently, and unconfigured ones not at all", async () => {
+    const devices = [
+      device(1, { name: "Live", kinds: ["gamepad"], roles: ["gamepad"], state: "connected", gamepadOutput: "hid" }),
+      device(2, { name: "Second", kinds: ["gamepad"], roles: ["gamepad"], gamepadOutput: "hid" }),
+      device(3, { name: "Other", kinds: ["gamepad"], roles: ["gamepad"], gamepadOutput: "xinput" }),
+    ];
+    // Serial takes two interfaces, the connected HID controller one, the first XInput slot one and
+    // the second HID slot one.
+    const cases: [number, string[]][] = [
+      [3, ["usb_required_capacity_exceeded", "usb_reserved_capacity_exceeded"]],
+      [4, ["usb_reserved_capacity_exceeded"]],
+      [5, []],
+    ];
+    for (const [usbInterfaces, errors] of cases) {
+      const fake = new FakeAdapter({ adapterId: ID, devices: structuredClone(devices), usbInterfaces });
+      const { c, state } = controller({ "/a": fake });
+      await c.manager.rescan();
+      await until(() => loaded(state(), 3));
+      const adapter = state()!.adapters[0]!;
+      expect(adapter.status!.errors).toEqual(errors);
+      expect(resource(adapter.status!.resources, "interfaces")).toEqual({ type: "interfaces", count: usbInterfaces, limit: usbInterfaces });
+      // Only the required capacity needs attention, on the adapter and in the tray.
+      const required = errors.includes("usb_required_capacity_exceeded");
+      expect(adapter.attention).toEqual(required ? [codeText("usb_required_capacity_exceeded")] : []);
+      expect(trayModel(state()!).badge).toBe(required ? "attention" : "none");
+      await c.stop();
+    }
   });
 });

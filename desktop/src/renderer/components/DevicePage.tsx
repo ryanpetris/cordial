@@ -2,15 +2,14 @@ import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } fr
 import { createPortal } from "react-dom";
 import { isLow } from "../../shared/battery.ts";
 import { enabledFull } from "../../shared/capacity.ts";
-import { gamepadModes, gamepadOutput, offersGamepadOutput, reconnectsGamepadUsb } from "../../shared/outputs.ts";
-import { settingsBusy, settingsCurrent } from "../../shared/settings.ts";
+import { gamepadModes, gamepadOutput, offersGamepadOutput } from "../../shared/outputs.ts";
+import { fieldOf, settingId, settingsBusy, settingsCurrent } from "../../shared/settings.ts";
 import type {
   AdapterEntry,
   AppState,
   DeviceChanges,
   DeviceEntry,
   DeviceRecord,
-  InfoEntry,
   OutputModeName,
   Scalar,
   Setting,
@@ -19,35 +18,40 @@ import type {
 } from "../../shared/state.ts";
 import {
   inactiveText,
-  INFO_LABELS,
   OUTPUT_MODES,
   OUTPUT_STATES,
   READ_FAILED,
   ROLES,
   SETTING_STATES,
   TRANSPORTS,
-  WARNINGS_READ_FAILED,
   batteryStale,
   batteryText,
   choiceText,
   codeText,
+  connectionError,
   deviceStatus,
   displayUnit,
-  infoValue,
+  fieldName,
+  identifierFacts,
+  identityFacts,
   integrationText,
   kindText,
   neverValue,
+  profileError,
   profileErrorText,
+  readings as readingsOf,
   reasonText,
   securityFacts,
   settingInfo,
   settingOrder,
   versionText,
-  warningFact,
   wheelFigures,
+  type FieldName,
+  type FieldRef,
+  type Reading,
 } from "../../shared/text.ts";
 import { useAction } from "../api.ts";
-import { DeviceLayers, RECONNECT_TEXT, RECONNECT_TITLE } from "./Profiles.tsx";
+import { DeviceLayers } from "./Profiles.tsx";
 import { Banner, Card, Dialog, Fact, Facts, Menu, Page, Pill, Row, Segmented, Spinner, Staged, Switch, SwitchRow, TabBar, TabPanel, type MenuOption } from "./common.tsx";
 import {
   BatteryGlyph,
@@ -70,23 +74,20 @@ const DEVICE_TABS: [DeviceTab, string][] = [
   ["profiles", "Profiles"],
   ["diagnostics", "Diagnostics"],
 ];
-/** Information keys shown on Details, in order. */
-const DETAILS_INFO = ["device.manufacturer", "device.model", "device.serial", "firmware.version", "hardware.revision", "software.revision"];
-/** Information keys shown under Identifiers on Diagnostics, in order. */
-const IDENTIFIERS = ["vendor.registry", "vendor.id", "product.id", "product.version", "bootloader.version"];
+/** A setting's field, as the settings tables name it. */
+const ref = (s: Setting): FieldRef => ({ name: fieldName(s), index: s.index });
 
-/** The label of a setting this page shows; only known keys are listed. */
-const label = (key: string) => settingInfo(key)!.label;
+const label = (s: Setting) => settingInfo(ref(s)).label;
 
-function valueText(key: string, v: Scalar | null): string {
+function valueText(name: FieldName, v: Scalar | null): string {
   if (v === null) return "Unknown";
   if (typeof v === "boolean") return v ? "On" : "Off";
-  if (typeof v === "string") return choiceText(key, v);
-  if (neverValue(key, v)) return "Never";
+  if (typeof v === "string") return choiceText(name, v);
+  if (neverValue(name, v)) return "Never";
   return String(v);
 }
 
-const choiceLabel = (s: Setting, c: Scalar) => (typeof c === "string" ? choiceText(s.key, c) : String(c));
+const choiceLabel = (s: Setting, c: Scalar) => (typeof c === "string" ? choiceText(fieldName(s), c) : String(c));
 
 /** Whether a setting's choices fit side by side as joined buttons. */
 const short = (s: Setting) => s.choices.length <= 3 && s.choices.reduce<number>((n, c) => n + choiceLabel(s, c).length, 0) <= 24;
@@ -103,11 +104,10 @@ export interface Drafts {
 }
 
 const freeform = (s: Setting) => s.type === "integer" && !s.choices.length;
-/** Text and color settings show their value without an editor. */
-const editable = (s: Setting) => s.type === "bool" || s.type === "integer" || s.type === "enum";
 
-/** Whether the row shows the reading as text instead of a control. */
-const textOnly = (s: Setting) => !editable(s) || (s.type === "enum" && !s.choices.length);
+/** Whether the row shows the reading as text instead of a control: an enum without choices takes
+ * no value. */
+const textOnly = (s: Setting) => s.type === "enum" && !s.choices.length;
 
 /** Whether the setting takes `v`. */
 function accepts(s: Setting, v: Scalar | null): v is Scalar {
@@ -119,9 +119,11 @@ function accepts(s: Setting, v: Scalar | null): v is Scalar {
     && (v - (s.min ?? 0)) % (s.step ?? 1) === 0;
 }
 
-/** The range typed text must be in: a SmartShift threshold is 1-254, since
- * only its toggle turns it Off with 255. */
-const typedRange = (s: Setting): Setting => (s.key === "wheel.threshold" ? { ...s, max: Math.min(s.max ?? 254, 254) } : s);
+const freeSpin = (s: Setting) => s.group === "wheel" && s.field === "free_spin_threshold";
+
+/** The range typed text must be in: an automatic free spin threshold is 1-254, since only its
+ * toggle turns it off with 255. */
+const typedRange = (s: Setting): Setting => (freeSpin(s) ? { ...s, max: Math.min(s.max ?? 254, 254) } : s);
 
 /** The value a set draft saves, or null when it isn't one the setting takes. */
 function draftValue(s: Setting, value: Scalar): Scalar | null {
@@ -138,11 +140,11 @@ const baseValue = (s: Setting) => (saved(s) ? s.saved : s.value);
 /** A draft's change to submit; null when it matches what is saved or it is invalid. */
 function pendingChange(s: Setting, draft: Draft | undefined): { change: SettingsChange | null; invalid: boolean } {
   if (!draft) return { change: null, invalid: false };
-  if (draft.type === "forget") return { change: saved(s) ? { type: "forget", setting: s.key } : null, invalid: false };
+  if (draft.type === "forget") return { change: saved(s) ? { type: "forget", setting: fieldOf(s) } : null, invalid: false };
   const value = draftValue(s, draft.value);
   if (value === null) return { change: null, invalid: true };
   if (!draft.policy && value === baseValue(s)) return { change: null, invalid: false };
-  return { change: { type: "set", setting: s.key, value }, invalid: false };
+  return { change: { type: "set", setting: fieldOf(s), value }, invalid: false };
 }
 
 /** Whether a row shows a current reading rather than the last one. */
@@ -210,22 +212,23 @@ function Marker({ label, state, shape, options, sending, disabled }: {
 /** Stages `v` from a value control. Choosing or typing what the device keeps
  * anyway drops the draft, except that a staged save of an unsaved value stays one. */
 function edit(s: Setting, drafts: Drafts, v: Scalar) {
-  const current = drafts.get(s.key);
+  const id = settingId(s);
+  const current = drafts.get(id);
   const policy = !saved(s) && current?.type === "set" && !!current.policy;
   const next = draftValue(s, v);
-  if (!policy && next !== null && next === baseValue(s)) drafts.set(s.key, undefined);
-  else drafts.set(s.key, { type: "set", value: v, ...(policy ? { policy } : {}) });
+  if (!policy && next !== null && next === baseValue(s)) drafts.set(id, undefined);
+  else drafts.set(id, { type: "set", value: v, ...(policy ? { policy } : {}) });
 }
 
 /** The row's value control, showing the draft, else the saved value, else the reading. */
 function Control({ s, draft, guards, drafts, invalid }: { s: Setting; draft: Draft | undefined; guards: FormGuards; drafts: Drafts; invalid: boolean }) {
-  const name = label(s.key);
+  const name = label(s);
   const value: Scalar | null = draft?.type === "set" ? draft.value : draft?.type === "forget" ? s.value : baseValue(s);
   const change = (v: Scalar) => edit(s, drafts, v);
-  if (textOnly(s)) return <span className="value">{valueText(s.key, s.value)}</span>;
+  if (textOnly(s)) return <span className="value">{valueText(fieldName(s), s.value)}</span>;
   if (s.type === "bool")
     return <Switch label={name} checked={typeof value === "boolean" ? value : null} disabled={guards.locked} onChange={change} />;
-  if (s.key === "wheel.threshold" && freeform(s)) return <SmartShift s={s} value={value} guards={guards} drafts={drafts} invalid={invalid} />;
+  if (freeSpin(s) && freeform(s)) return <FreeSpin s={s} value={value} guards={guards} drafts={drafts} invalid={invalid} />;
   if (s.choices.length && value !== null && s.choices.includes(value) && short(s))
     return (
       <Segmented
@@ -249,7 +252,7 @@ function Control({ s, draft, guards, drafts, invalid }: { s: Setting; draft: Dra
       >
         {value === null || !s.choices.includes(value) ? (
           <option value={value === null ? "" : String(value)} disabled>
-            {valueText(s.key, value)}
+            {valueText(fieldName(s), value)}
           </option>
         ) : null}
         {s.choices.map((c) => (
@@ -267,28 +270,28 @@ function Control({ s, draft, guards, drafts, invalid }: { s: Setting; draft: Dra
       disabled={guards.locked}
       label={name}
       onEdit={change}
-      onRevert={draft ? () => drafts.set(s.key, undefined) : null}
+      onRevert={draft ? () => drafts.set(settingId(s), undefined) : null}
     />
   );
 }
 
-/** SmartShift: On with a threshold of 1-254, or Off, which the device takes as 255. */
-function SmartShift({ s, value, guards, drafts, invalid }: { s: Setting; value: Scalar | null; guards: FormGuards; drafts: Drafts; invalid: boolean }) {
+/** Automatic free spin: on with a threshold of 1-254, or off, which the device takes as 255. */
+function FreeSpin({ s, value, guards, drafts, invalid }: { s: Setting; value: Scalar | null; guards: FormGuards; drafts: Drafts; invalid: boolean }) {
   // Text typed into the threshold keeps it On, even while empty or invalid.
   const on = typeof value === "string" ? true : typeof value === "number" ? value !== 255 : null;
   const threshold = [s.saved, s.value].find((v): v is number => typeof v === "number" && v >= 1 && v <= 254) ?? 254;
   return (
     <>
-      <Switch label={label(s.key)} checked={on} disabled={guards.locked} onChange={(v) => edit(s, drafts, v ? threshold : 255)} />
+      <Switch label="Automatic Free Spin" checked={on} disabled={guards.locked} onChange={(v) => edit(s, drafts, v ? threshold : 255)} />
       {on ? (
         <IntegerControl
           s={typedRange(s)}
           text={String(value)}
           invalid={invalid}
           disabled={guards.locked}
-          label={`${label(s.key)} Threshold`}
+          label={label(s)}
           onEdit={(v) => edit(s, drafts, v)}
-          onRevert={drafts.get(s.key) ? () => drafts.set(s.key, undefined) : null}
+          onRevert={drafts.get(settingId(s)) ? () => drafts.set(settingId(s), undefined) : null}
         />
       ) : null}
     </>
@@ -361,20 +364,21 @@ function SettingRow({ entry, s, drafts, guards, item }: {
   item: SettingsSaveItem | undefined;
 }) {
   const fresh = settingFresh(entry, s);
-  const info = settingInfo(s.key)!;
+  const id = settingId(s);
+  const info = settingInfo(ref(s));
   // Text readings follow their value; editors keep the unit beside the number.
-  const unit = textOnly(s) ? displayUnit(s.key, s.value) : info.unit;
-  const draft = drafts.get(s.key);
+  const unit = textOnly(s) ? displayUnit(fieldName(s), s.value) : info.unit;
+  const draft = drafts.get(id);
   const { change, invalid } = pendingChange(s, draft);
   const staged = change !== null || invalid;
   const settable = fresh && accepts(s, s.value);
-  const forget: MenuOption = ["Forget Saved Value", () => drafts.set(s.key, { type: "forget" })];
-  const keep = (text: string): MenuOption => [text, settable ? () => drafts.set(s.key, { type: "set", value: s.value!, policy: true }) : null];
+  const forget: MenuOption = ["Forget Saved Value", () => drafts.set(id, { type: "forget" })];
+  const keep = (text: string): MenuOption => [text, settable ? () => drafts.set(id, { type: "set", value: s.value!, policy: true }) : null];
   let shape: MarkShape;
   let state: string;
   let options: MenuOption[];
   if (staged) {
-    [shape, state, options] = ["draft", "Changed", [["Undo Change", () => drafts.set(s.key, undefined)]]];
+    [shape, state, options] = ["draft", "Changed", [["Undo Change", () => drafts.set(id, undefined)]]];
   } else if (!saved(s)) {
     [shape, state, options] = ["outline", SETTING_STATES.unmanaged, [keep("Save Current Value")]];
   } else if (s.state === "changed_on_device") {
@@ -389,10 +393,10 @@ function SettingRow({ entry, s, drafts, guards, item }: {
   if (item?.status === "not_saved") notes.push(<span key="save" className="error-text">Couldn't Save{item.error ? `: ${reasonText(item.error)}` : ""}</span>);
   else if (item?.status === "unknown" && item.error) notes.push(<span key="save" className="error-text">{reasonText(item.error)}</span>);
   if (invalid) notes.push(<span key="range" className="error-text">{rangeText(typedRange(s))}</span>);
-  if (saved(s) && s.state === "changed_on_device" && fresh) notes.push(<span key="device">Device: {valueText(s.key, s.value)}</span>);
+  if (saved(s) && s.state === "changed_on_device" && fresh) notes.push(<span key="device">Device: {valueText(fieldName(s), s.value)}</span>);
   if (s.error) notes.push(<span key="error">{reasonText(codeText(s.error))}</span>);
 
-  const labelId = `setting-${s.key}`;
+  const labelId = `setting-${id}`;
   return (
     <div className={fresh ? "setting-row" : "setting-row stale"} role="group" aria-labelledby={labelId}>
       <div className="setting-label">
@@ -413,16 +417,16 @@ function SettingRow({ entry, s, drafts, guards, item }: {
 }
 
 /** A value the device only reports, shown with the settings it belongs to. */
-function ReadingRow({ f, dim }: { f: InfoEntry; dim: boolean }) {
-  const info = settingInfo(f.key)!;
-  const unit = displayUnit(f.key, f.value);
+function ReadingRow({ f, dim }: { f: Reading; dim: boolean }) {
+  const info = settingInfo(f);
+  const unit = displayUnit(f.name, f.value);
   return (
     <div className={dim ? "setting-row stale" : "setting-row"} role="group" aria-label={info.label}>
       <div className="setting-label">
         <div className="row-title">{info.label}</div>
       </div>
       <div className="setting-control">
-        <span className="value">{typeof f.value === "string" ? choiceText(f.key, f.value) : valueText(f.key, f.value)}</span>
+        <span className="value">{valueText(f.name, f.value)}</span>
         {unit ? <span className="unit">{unit}</span> : null}
       </div>
       <div className="setting-marker" />
@@ -432,10 +436,11 @@ function ReadingRow({ f, dim }: { f: InfoEntry; dim: boolean }) {
 
 /** The settings tab's contents: settings the page knows, readings shown with them, and the wheel's figures. */
 function settingsView(entry: DeviceEntry) {
-  const rows = (entry.settings ?? []).filter((s) => settingInfo(s.key)).sort((a, b) => settingOrder(a.key) - settingOrder(b.key));
-  const keys = new Set(rows.map((s) => s.key));
-  const readings = entry.device.info.filter((f) => settingInfo(f.key) && !keys.has(f.key)).sort((a, b) => settingOrder(a.key) - settingOrder(b.key));
-  const figures = wheelFigures(entry.device.info);
+  const rows = [...(entry.settings ?? [])].sort((a, b) => settingOrder(ref(a)) - settingOrder(ref(b)));
+  // A field the device takes writes for shows as a setting rather than a reading.
+  const fields = new Set(rows.map((s) => `${fieldName(s)}/${s.index}`));
+  const readings = readingsOf(entry.device.information).filter((f) => !fields.has(`${f.name}/${f.index}`)).sort((a, b) => settingOrder(a) - settingOrder(b));
+  const figures = wheelFigures(entry.device.information);
   return { rows, readings, figures };
 }
 
@@ -451,13 +456,11 @@ const starting = (entry: DeviceEntry) => entry.device.state === "connected" && e
 
 /** The settings form: every staged change goes to the device together with
  * Save. Its buttons go in the page bar, `bar`, outside the form. */
-function Settings({ entry, live, adapter, peers, drafts, details, onDetails, bar }: {
+function Settings({ entry, live, adapter, drafts, details, onDetails, bar }: {
   entry: DeviceEntry;
   /** False while the page shows the device's last state as its adapter reconnects. */
   live: boolean;
   adapter: AdapterEntry | undefined;
-  /** The adapter's paired devices. */
-  peers: DeviceRecord[];
   drafts: Drafts;
   details: DeviceChanges;
   onDetails: (update: (draft: DeviceChanges) => DeviceChanges) => void;
@@ -468,7 +471,6 @@ function Settings({ entry, live, adapter, peers, drafts, details, onDetails, bar
   const [saving, runSave] = useAction(true);
   const [reloading, runReload] = useAction(true);
   const [problem, setProblem] = useState<string | null>(null);
-  const [confirming, setConfirming] = useState(false);
   const form = useRef<HTMLFormElement>(null);
   const d = entry.device;
   const status = adapter?.status ?? null;
@@ -480,7 +482,7 @@ function Settings({ entry, live, adapter, peers, drafts, details, onDetails, bar
   const outputChange = gamepad ? pendingDetails(details, d).gamepadOutput : undefined;
   const stageOutput = (mode: OutputModeName | undefined) => onDetails((x) => pendingDetails({ ...x, gamepadOutput: mode }, d));
   const { rows: settings, readings, figures } = settingsView(entry);
-  const categories = [...new Set([...settings.map((s) => s.key), ...readings.map((f) => f.key)].sort((a, b) => settingOrder(a) - settingOrder(b)).map((k) => settingInfo(k)!.category))];
+  const categories = [...new Set([...settings.map(ref), ...readings].sort((a, b) => settingOrder(a) - settingOrder(b)).map((f) => settingInfo(f).category))];
   if (figures.length && !categories.includes("Wheel")) categories.push("Wheel");
   const connected = d.state === "connected";
   const reachable = live && adapter?.connection === "connected";
@@ -490,8 +492,8 @@ function Settings({ entry, live, adapter, peers, drafts, details, onDetails, bar
   const guards: FormGuards = { locked: busy, busy };
   const submission = entry.settingsSave;
   const items = submission?.items ?? [];
-  const itemFor = (key: string) => items.find((i) => i.change.setting === key);
-  const staged = settings.map((s) => ({ s, draft: drafts.get(s.key), ...pendingChange(s, drafts.get(s.key)) }));
+  const itemFor = (id: string) => items.find((i) => settingId(i.change.setting) === id);
+  const staged = settings.map((s) => ({ s, draft: drafts.get(settingId(s)), ...pendingChange(s, drafts.get(settingId(s))) }));
   const changes = staged.filter((r) => r.change !== null);
   const dirty = staged.some((r) => r.change !== null || r.invalid) || outputChange !== undefined;
   const invalid = staged.some((r) => r.invalid);
@@ -506,8 +508,9 @@ function Settings({ entry, live, adapter, peers, drafts, details, onDetails, bar
     setProblem(null);
     const result = await runSave({ type: "settings.save", key: entry.key, changes: list });
     for (const item of result.settingsSave?.items ?? []) {
-      const draft = cohort.find(([key]) => key === item.change.setting)?.[1];
-      if (draft && item.status === "saved") drafts.set(item.change.setting, undefined, draft);
+      const id = settingId(item.change.setting);
+      const draft = cohort.find(([key]) => key === id)?.[1];
+      if (draft && item.status === "saved") drafts.set(id, undefined, draft);
     }
     if (!result.ok && !result.inline) setProblem(result.message);
     return result.ok;
@@ -515,22 +518,16 @@ function Settings({ entry, live, adapter, peers, drafts, details, onDetails, bar
   // Settings go first, since a Gamepad Output change can reconnect USB. A setting that wasn't
   // saved, or may not have been, keeps the output change staged.
   const save = async () => {
-    setConfirming(false);
     if (!canSave) return;
     setProblem(null);
-    if (changes.length && !(await submit(changes.map((r) => r.change!), changes.map((r) => [r.s.key, r.draft])))) return;
+    if (changes.length && !(await submit(changes.map((r) => r.change!), changes.map((r) => [settingId(r.s), r.draft])))) return;
     const sent = outputChange;
     if (sent === undefined) return;
     const result = await runSave({ type: "device.update", key: entry.key, gamepadOutput: sent });
     if (result.ok) onDetails((x) => settleDetails(x, { gamepadOutput: sent }));
     else setProblem(result.message);
   };
-  // Saving a Gamepad Output change that reconnects USB asks first.
-  const requestSave = () => {
-    if (!canSave) return;
-    if (outputChange !== undefined && reconnectsGamepadUsb(peers, d, outputChange, status)) setConfirming(true);
-    else void save();
-  };
+  const requestSave = () => { void save(); };
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
     requestSave();
@@ -596,7 +593,7 @@ function Settings({ entry, live, adapter, peers, drafts, details, onDetails, bar
         <RefreshIcon /> Refresh
       </button>
       {retryable.length ? (
-        <button type="button" {...guard(canRetry, () => void submit(retry.map((r) => ({ type: "set", setting: r.s.key, value: r.s.saved! })), []))}>
+        <button type="button" {...guard(canRetry, () => void submit(retry.map((r) => ({ type: "set", setting: fieldOf(r.s), value: r.s.saved! })), []))}>
           <RefreshIcon /> Retry
         </button>
       ) : null}
@@ -664,14 +661,14 @@ function Settings({ entry, live, adapter, peers, drafts, details, onDetails, bar
           {categories.map((category) => (
             <Card key={category} title={category}>
               {settings
-                .filter((s) => settingInfo(s.key)!.category === category)
+                .filter((s) => settingInfo(ref(s)).category === category)
                 .map((s) => (
-                  <SettingRow key={s.key} entry={entry} s={s} drafts={drafts} guards={guards} item={itemFor(s.key)} />
+                  <SettingRow key={settingId(s)} entry={entry} s={s} drafts={drafts} guards={guards} item={itemFor(settingId(s))} />
                 ))}
               {readings
-                .filter((f) => settingInfo(f.key)!.category === category)
+                .filter((f) => settingInfo(f).category === category)
                 .map((f) => (
-                  <ReadingRow key={f.key} f={f} dim={!connected} />
+                  <ReadingRow key={`${f.name}/${f.index}`} f={f} dim={!connected} />
                 ))}
               {category === "Wheel" && figures.length ? (
                 <div className={connected ? "figures" : "figures dim"}>
@@ -688,17 +685,6 @@ function Settings({ entry, live, adapter, peers, drafts, details, onDetails, bar
         </div>
       </form>
       {bar ? createPortal(footer, bar) : null}
-      <Dialog open={confirming} title={RECONNECT_TITLE} onClose={() => setConfirming(false)}>
-        <p className="dialog-body">{RECONNECT_TEXT}</p>
-        <footer className="dialog-footer">
-          <button onClick={() => setConfirming(false)}>
-            <CloseIcon /> Cancel
-          </button>
-          <button className="suggested" disabled={!canSave} onClick={() => void save()}>
-            <CheckIcon /> Save
-          </button>
-        </footer>
-      </Dialog>
     </>
   );
 }
@@ -770,9 +756,8 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
   const ready = live && adapter?.connection === "connected" && !!adapter.status?.ready;
   const canConnect = ready && d.inactive === null && d.state === "disconnected";
   const peers = state.devices.filter((x) => x.adapterId === entry.adapterId).map((x) => x.device);
-  const facts = (keys: string[]) => keys.flatMap((key) => d.info.filter((f) => f.key === key));
-  const info = facts(DETAILS_INFO);
-  const identifiers = facts(IDENTIFIERS);
+  const info = identityFacts(d.information);
+  const identifiers = identifierFacts(d.information);
   // Details, Profiles and Gamepad Output edits stage in `details`; each tab's Save sends only its
   // own changes.
   const changes = pendingDetails(details, d);
@@ -825,10 +810,11 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
     document.addEventListener("keydown", key);
     return () => document.removeEventListener("keydown", key);
   }, []);
-  const warningsFailed = !!entry.warningsError;
   const gamepadStatus = d.outputs.find((o) => o.role === "gamepad");
-  // A failed list read is retried by reading the lists again rather than asking the device.
-  const listsFailed = warningsFailed || !!entry.settingsError;
+  // A failed list read is retried by reading the list again rather than asking the device.
+  const listsFailed = !!entry.settingsError;
+  const lastError = connectionError(d);
+  const unloaded = profileError(d);
 
   return (
     <Page
@@ -925,7 +911,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
 
       <TabPanel id={tabs} value={tab}>
         {tab === "settings" ? (
-          <Settings entry={entry} live={live} adapter={adapter} peers={peers} drafts={drafts} details={details} onDetails={onDetails} bar={settingsBar} />
+          <Settings entry={entry} live={live} adapter={adapter} drafts={drafts} details={details} onDetails={onDetails} bar={settingsBar} />
         ) : tab === "profiles" ? (
           <DeviceLayers
             entry={entry}
@@ -937,40 +923,20 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
           />
         ) : tab === "diagnostics" ? (
           <>
-            {warningsFailed || entry.warnings?.length ? (
-              <Card title="Device Warnings">
-                {warningsFailed ? (
-                  <Row title={WARNINGS_READ_FAILED} />
-                ) : (
-                  <Facts>
-                    {(entry.warnings ?? []).map((w, i) => {
-                      const fact = warningFact(w);
-                      return (
-                        <Fact key={i} label={fact.label} dim={!connected}>
-                          {fact.text}
-                          <span className="fact-detail">{fact.context}</span>
-                        </Fact>
-                      );
-                    })}
-                  </Facts>
-                )}
-              </Card>
-            ) : null}
-
-            {d.error ? (
+            {lastError ? (
               <Card title="Connection">
                 <Facts>
-                  <Fact label="Last Error">{codeText(d.error)}</Fact>
+                  <Fact label="Last Error">{codeText(lastError)}</Fact>
                 </Facts>
               </Card>
             ) : null}
 
-            {connected && d.profileError ? (
+            {unloaded ? (
               <Card title="Profiles">
                 <Facts>
                   <Fact label="Status">
                     Not Loaded
-                    <span className="fact-detail">{profileErrorText(d.profileError)}</span>
+                    <span className="fact-detail">{profileErrorText(unloaded)}</span>
                   </Fact>
                 </Facts>
               </Card>
@@ -1020,9 +986,9 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
 
             <Card title="Identifiers">
               <Facts>
-                {identifiers.map((f) => (
-                  <Fact key={f.key} label={INFO_LABELS[f.key]} dim={!connected}>
-                    {infoValue(f)}
+                {identifiers.map(([label, value]) => (
+                  <Fact key={label} label={label} dim={!connected}>
+                    {value}
                   </Fact>
                 ))}
                 <Fact label="Device ID">{d.id}</Fact>
@@ -1065,9 +1031,9 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
             <Card title="Information">
               <Facts>
                 {d.kinds.length ? <Fact label="Device Type">{kindText(entry.kind)}</Fact> : null}
-                {info.map((f) => (
-                  <Fact key={f.key} label={INFO_LABELS[f.key]} dim={!connected}>
-                    {infoValue(f)}
+                {info.map(([label, value]) => (
+                  <Fact key={label} label={label} dim={!connected}>
+                    {value}
                   </Fact>
                 ))}
                 {adapter ? <Fact label="Adapter">{adapter.name}</Fact> : null}

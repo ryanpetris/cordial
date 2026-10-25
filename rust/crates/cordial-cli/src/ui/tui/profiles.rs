@@ -375,7 +375,7 @@ impl<F: Fleet> Model<F> {
         };
         if let Some(percent) = words::memory_percent(view) {
             b.section("Profile Memory");
-            let look = if percent >= words::MEMORY_ALERT_PERCENT as u32 {
+            let look = if words::memory_alert(view) {
                 err()
             } else {
                 Style::new()
@@ -448,7 +448,11 @@ impl<F: Fleet> Model<F> {
                     !locked && (s.enabled || can_enable),
                 );
                 controls.append(sw);
-                b.labelled(staged_label(profiles::interface_label(i), staged), controls);
+                let mut label = staged_label(profiles::interface_label(i), staged);
+                if !staged && s.enabled && !s.active {
+                    label.spans.push(layout::span(" Inactive", dim()));
+                }
+                b.labelled(label, controls);
             }
         }
 

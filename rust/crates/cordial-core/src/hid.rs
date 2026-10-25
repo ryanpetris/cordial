@@ -5,7 +5,7 @@ pub const REPORT_BYTES: usize = 512;
 pub const REPORTS: usize = 16;
 pub const FIELDS: usize = 96;
 pub const USAGE_SPANS: usize = 128;
-pub const SOURCES: usize = 4;
+pub const SOURCES: usize = crate::devices::ACTIVE_CONNECTIONS;
 pub const QUEUE: usize = 64;
 pub const CONSUMERS: usize = 8;
 pub const MAX_WARNINGS: usize = 3 * (FIELDS + 2 * REPORTS * (REPORT_BYTES * 8 + 1));
@@ -410,7 +410,7 @@ pub struct Map {
     // One aligned allocation holds the immutable compiled sections. Releasing
     // a service returns one contiguous block for its next descriptor/map.
     storage: Box<[core::mem::MaybeUninit<u64>]>,
-    sections: [Section; 7],
+    sections: [Section; 6],
     pub roles: u8,
     pub hidpp_reports: u8,
     pub numbered: bool,
@@ -423,23 +423,12 @@ pub struct Map {
     retained_values: usize,
     numeric_values: usize,
 }
-#[derive(Clone, Copy, Debug)]
-pub struct InputLimitation {
-    pub code: crate::model::errors::WarningCode,
-    /// The report type: 0 input, 1 output, 2 feature.
-    pub kind: u8,
-    pub report_id: u8,
-    pub bit_offset: u16,
-    pub usage_page: u16,
-    pub usage: u16,
-}
 const _: () = {
     assert!(core::mem::align_of::<Field>() <= 8);
     assert!(core::mem::align_of::<OutputField>() <= 8);
     assert!(core::mem::align_of::<BatteryField>() <= 8);
     assert!(core::mem::align_of::<Span>() <= 8);
     assert!(core::mem::align_of::<Layout>() <= 8);
-    assert!(core::mem::align_of::<InputLimitation>() <= 8);
     assert!(core::mem::align_of::<IndicatorScale>() <= 8);
 };
 #[derive(Clone, Copy, Default)]
@@ -604,7 +593,6 @@ struct Compiler {
     roles: u8,
     hidpp_reports: u8,
     numbered: bool,
-    limitations: heapless::Vec<InputLimitation, FIELDS>,
     scales: heapless::Vec<IndicatorScale, FIELDS>,
     state_bits: usize,
     array_fields: usize,
@@ -646,9 +634,6 @@ impl Map {
     fn output_fields(&self) -> &[OutputField] {
         self.section(1)
     }
-    pub(crate) fn indicator_field_count(&self) -> usize {
-        self.output_fields().len()
-    }
     fn battery_fields(&self) -> &[BatteryField] {
         self.section(2)
     }
@@ -658,11 +643,8 @@ impl Map {
     pub fn reports(&self) -> &[Layout] {
         self.section(4)
     }
-    pub fn limitations(&self) -> &[InputLimitation] {
-        self.section(5)
-    }
     fn scales(&self) -> &[IndicatorScale] {
-        self.section(6)
+        self.section(5)
     }
 
     /// Allocate once at admission; decoding and clearing never allocate.
@@ -1164,7 +1146,6 @@ impl Compiler {
                 core::mem::size_of_val(map.battery.as_slice()),
                 core::mem::size_of_val(map.usages.as_slice()),
                 core::mem::size_of_val(map.reports.as_slice()),
-                core::mem::size_of_val(map.limitations.as_slice()),
                 core::mem::size_of_val(map.scales.as_slice()),
             ];
             let mut storage = Vec::new();
@@ -1173,7 +1154,7 @@ impl Compiler {
                 .try_reserve_exact(words)
                 .map_err(|_| Error::Capacity)?;
             storage.resize(words, core::mem::MaybeUninit::<u64>::zeroed());
-            let mut sections = [Section::default(); 7];
+            let mut sections = [Section::default(); 6];
             let mut offset = 0usize;
             let mut retain =
                 |index: usize, source: *const u8, length: usize| -> Result<(), Error> {
@@ -1203,8 +1184,7 @@ impl Compiler {
             retain(2, map.battery.as_ptr().cast(), map.battery.len())?;
             retain(3, map.usages.as_ptr().cast(), map.usages.len())?;
             retain(4, map.reports.as_ptr().cast(), map.reports.len())?;
-            retain(5, map.limitations.as_ptr().cast(), map.limitations.len())?;
-            retain(6, map.scales.as_ptr().cast(), map.scales.len())?;
+            retain(5, map.scales.as_ptr().cast(), map.scales.len())?;
             let mut compiled = Map {
                 storage: storage.into_boxed_slice(),
                 sections,
@@ -1383,18 +1363,7 @@ impl Compiler {
                 } else {
                     self.reports[ri].unwritable |= 1 << kind;
                 }
-                let usage = usage_at(local, 0, true);
-                return push(
-                    &mut self.limitations,
-                    InputLimitation {
-                        code: crate::model::errors::WarningCode::IndicatorRangeUnsupported,
-                        kind: kind as u8,
-                        report_id: g.id,
-                        bit_offset: offset,
-                        usage_page: (usage >> 16) as u16,
-                        usage: usage as u16,
-                    },
-                );
+                return Ok(());
             }
             report.leds |= kind == 1 && (has_leds || context.indicator != 0 || context.mode == 4);
             let span = self.store_usages(local)?;
@@ -1493,7 +1462,6 @@ impl Compiler {
         let variable = flags & 2 != 0;
         let relative = flags & 4 != 0;
         let mut roles = 0;
-        let mut unsupported = None;
         for span in local {
             let page = span.first() >> 16;
             let cap = match page {
@@ -1511,30 +1479,6 @@ impl Compiler {
                 for usage in span.first()..=end {
                     let role = usage_kind(usage, app, kind == 1, relative);
                     roles |= role;
-                    if role != 0 && kind == 0 {
-                        let desktop = app == MOUSE && matches!(usage, 0x10030 | 0x10031 | 0x10038);
-                        if desktop && !variable {
-                            unsupported = Some((
-                                crate::model::errors::WarningCode::PointerSelectorUnsupported,
-                                usage,
-                            ));
-                        }
-                        let axis = desktop || (usage == 0xc0238 && variable && relative);
-                        // A usage range that only spans a numeric control, as a keyboard's
-                        // Consumer array often does, describes a block of codes; only a numeric
-                        // usage the device lists by itself is one it means to select.
-                        if !axis
-                            && !variable
-                            && page == 12
-                            && span.first() == span.last()
-                            && CONSUMER_AXES.contains(&(usage as u16))
-                        {
-                            unsupported = Some((
-                                crate::model::errors::WarningCode::NumericSelectorUnsupported,
-                                usage,
-                            ));
-                        }
-                    }
                 }
             }
         }
@@ -1544,26 +1488,7 @@ impl Compiler {
         self.roles |= roles;
         self.reports[ri].held_roles |= roles;
         if variable && flags & 0x100 != 0 {
-            unsupported = Some((
-                crate::model::errors::WarningCode::BufferedInputUnsupported,
-                usage_at(local, 0, true),
-            ));
-        }
-        if let Some((code, usage)) = unsupported {
-            push(
-                &mut self.limitations,
-                InputLimitation {
-                    code,
-                    kind: 0,
-                    report_id: g.id,
-                    bit_offset: offset,
-                    usage_page: (usage >> 16) as u16,
-                    usage: usage as u16,
-                },
-            )?;
-            if variable {
-                return Ok(());
-            }
+            return Ok(());
         }
         validate_scalar(g)?;
         self.roles |= roles;
@@ -3727,41 +3652,6 @@ impl Map {
                     let raw = self.indicator_usage(f, j);
                     let usage = lock_usage(f, raw)?;
                     if mask & (1 << (usage - 0x80001)) == 0 || !self.contains_usage(f, raw) {
-                        return None;
-                    }
-                    Some((
-                        f.bit
-                            + if variable {
-                                (j * usize::from(f.size)) as u16
-                            } else {
-                                0
-                            },
-                        raw,
-                    ))
-                })
-            })
-    }
-    pub(crate) fn unknown_indicator_locations<'a>(
-        &'a self,
-        ri: usize,
-        kind: crate::bluetooth::ReportType,
-        mask: u8,
-        cache: &'a IndicatorCache,
-    ) -> impl Iterator<Item = (u16, u32)> + 'a {
-        self.output_fields()
-            .iter()
-            .filter(move |f| {
-                usize::from(f.report) == ri && f.kind == report_kind(kind) && f.flags & 0x8000 != 0
-            })
-            .flat_map(move |f| {
-                let variable = f.flags & 2 != 0;
-                (0..Self::indicator_elements(f)).filter_map(move |j| {
-                    let raw = self.indicator_usage(f, j);
-                    let usage = lock_usage(f, raw)?;
-                    if mask & (1 << (usage - 0x80001)) == 0
-                        || !self.contains_usage(f, raw)
-                        || cache.get(usize::from(f.state) + j) & 1 != 0
-                    {
                         return None;
                     }
                     Some((

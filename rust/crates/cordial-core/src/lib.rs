@@ -30,3 +30,5 @@ pub mod wire;
 pub mod identity;
 
 pub mod battery;
+
+pub mod usb;

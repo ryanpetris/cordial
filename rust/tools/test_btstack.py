@@ -15,7 +15,7 @@ def main():
     output = next(Path(msg["out_dir"]) for msg in messages
                   if msg["reason"] == "build-script-executed" and "cordial-btstack" in msg["package_id"])
     source = Path(os.environ.get("CORDIAL_BTSTACK_SOURCE", ROOT.parent / ".cache/dependencies/btstack"))
-    for name in ("profiles", "gatt", "information", "layout"):
+    for name in ("profiles", "gatt", "information", "layout", "capacity"):
         executable = output / f"{name}-callback-tests"
         subprocess.run(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-DENABLE_BLE", "-DENABLE_CLASSIC",
                         "-I", str(ROOT / "adapters/btstack/c"), "-I", str(source / "src"), "-I", str(output),
@@ -25,7 +25,7 @@ def main():
     security = output / "saved-security-tests"
     subprocess.run(["cc", "-std=c11", "-DENABLE_BLE=1", "-ffunction-sections", "-fdata-sections",
                     "-Wl,--gc-sections", "-I", str(ROOT / "adapters/btstack/c"), "-I", str(source / "src"),
-                    "-I", str(source / "platform/embedded"), str(ROOT / "adapters/btstack/tests/security.c"),
+                    "-I", str(output), "-I", str(source / "platform/embedded"), str(ROOT / "adapters/btstack/tests/security.c"),
                     *[str(source / f"src/{name}.c") for name in ("btstack_linked_list", "hci_event", "btstack_util")],
                     "-o", str(security)], check=True, cwd=ROOT)
     subprocess.run([str(security)], check=True, cwd=ROOT)

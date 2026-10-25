@@ -19,13 +19,3 @@ export function offersGamepadOutput(d: DeviceRecord, status: AdapterStatus | nul
   const gamepad = d.kinds.includes("gamepad") || d.roles.includes("gamepad");
   return gamepadOutput(d) !== "disabled" || (gamepad && gamepadModes(status).length > 1);
 }
-
-/** Whether saving `mode` as `device`'s Gamepad Output changes the size of a pool the adapter
- * offers, which reconnects its USB. A pool holds the devices choosing its mode, up to the mode's
- * advertised capacity. `devices` are the adapter's paired devices, connected or not. */
-export function reconnectsGamepadUsb(devices: DeviceRecord[], device: DeviceRecord, mode: OutputModeName, status: AdapterStatus | null): boolean {
-  const offered = status?.outputSupport.find((s) => s.role === "gamepad")?.modes.filter((m) => m.mode === "hid" || m.mode === "xinput") ?? [];
-  const pools = (modes: (OutputModeName | null)[]) => offered.map((m) => Math.min(m.maxSlots, modes.filter((x) => x === m.mode).length)).join();
-  const others = devices.filter((d) => d.id !== device.id).map(gamepadOutput);
-  return pools([...others, gamepadOutput(device)]) !== pools([...others, mode]);
-}

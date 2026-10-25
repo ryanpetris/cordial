@@ -83,12 +83,11 @@ describe("Controller", () => {
     ]);
     const mouse = s.devices.find((d) => d.key === "AAAA0001/2")!;
     expect(mouse).toMatchObject({ name: "Example Mouse", kind: "mouse" });
-    expect(mouse.warnings!.map((w) => w.code)).toEqual(["pointer_selector_unsupported"]);
     expect(mouse.battery).toEqual({ percent: 12, charging: false, percentFresh: true, chargingFresh: true });
     expect(mouse.device.hidpp).toEqual({ kind: 1, enabled: true, version: { major: 4, minor: 5 }, state: "active", error: null });
     // Only setting values the device accepts writes for are settings; readings are information.
-    expect(mouse.settings!.map((x) => x.key)).toEqual(["pointer.sensor.0.dpi", "wheel.invert", "wheel.mode"]);
-    expect(mouse.device.info.find((f) => f.key === "wheel.diameter")).toEqual({ key: "wheel.diameter", type: "integer", value: 50 });
+    expect(mouse.settings!.map((x) => `${x.group}.${x.field}`)).toEqual(["pointer_sensor.dpi", "wheel.mode", "wheel.invert"]);
+    expect(mouse.device.information.wheel).toMatchObject({ diameter: 50, mode: null });
     await c.stop();
   });
 
@@ -231,20 +230,20 @@ describe("Controller", () => {
     await until(() => deps.lowBattery.mock.calls.length === 1);
     expect(deps.lowBattery.mock.calls[0]![0]).toMatchObject({ key: "AAAA0001/2", level: "low", percent: 12 });
     const battery = () => state()!.devices.find((d) => d.key === "AAAA0001/2")!.battery;
-    a.changeInfo(2, { "battery.level": 11 });
+    a.changeInfo(2, { battery: { level: 11 } });
     await until(() => battery()?.percent === 11);
-    a.changeInfo(2, { "battery.level": 4 });
+    a.changeInfo(2, { battery: { level: 4 } });
     await until(() => deps.lowBattery.mock.calls.length === 2);
     expect(deps.lowBattery.mock.calls[1]![0]).toMatchObject({ level: "critical" });
     // Unknown doesn't reset; charging does.
-    a.changeInfo(2, { "battery.level": null, "battery.charging": null });
+    a.changeInfo(2, {});
     await until(() => battery() === null);
-    a.changeInfo(2, { "battery.level": 4, "battery.charging": false });
+    a.changeInfo(2, { battery: { level: 4, charging: false } });
     await until(() => battery()?.percent === 4);
-    a.changeInfo(2, { "battery.charging": true });
+    a.changeInfo(2, { battery: { level: 4, charging: true } });
     await until(() => battery()?.charging === true);
     expect(deps.lowBattery).toHaveBeenCalledTimes(2);
-    a.changeInfo(2, { "battery.charging": false });
+    a.changeInfo(2, { battery: { level: 4, charging: false } });
     await until(() => deps.lowBattery.mock.calls.length === 3);
     await c.stop();
   });
@@ -514,9 +513,9 @@ it("enables and disables each transport and explains a disabled transport's devi
   const status = () => state()!.adapters[0]!.status!;
   const CLASSIC_DISABLED = transportDisabledText("classic");
   // The firmware starts with Classic disabled and BLE enabled.
-  expect(status().transports).toEqual([
-    { transport: "classic", maxEnabled: 7, enabled: false },
-    { transport: "ble", maxEnabled: 7, enabled: true },
+  expect(status().transports).toMatchObject([
+    { transport: "classic", enabled: false },
+    { transport: "ble", enabled: true },
   ]);
   expect(entry("3").device.inactive).toBe("transport_disabled");
   expect(inactiveText(entry("3").device)).toBe("Bluetooth Classic is disabled. Enable it in the adapter settings.");
@@ -605,7 +604,7 @@ it("refuses changing a transport the adapter doesn't support", async () => {
   const { c, state } = controller({ "/a": a });
   await c.manager.rescan();
   await until(() => loaded(state(), 4));
-  expect(state()!.adapters[0]!.status!.transports).toEqual([{ transport: "ble", maxEnabled: 7, enabled: true }]);
+  expect(state()!.adapters[0]!.status!.transports).toMatchObject([{ transport: "ble", enabled: true }]);
   const sent = a.received.length;
   expect(await c.act({ type: "adapter.settings", adapterId: "AAAA0001", transports: { classic: true } })).toEqual({
     ok: false,
@@ -626,9 +625,9 @@ it("treats a transport whose enabled flag is missing as enabled", async () => {
   const { c, state } = controller({ "/a": a });
   await c.manager.rescan();
   await until(() => loaded(state(), 4));
-  expect(state()!.adapters[0]!.status!.transports).toEqual([
-    { transport: "classic", maxEnabled: 7, enabled: true },
-    { transport: "ble", maxEnabled: 7, enabled: true },
+  expect(state()!.adapters[0]!.status!.transports).toMatchObject([
+    { transport: "classic", enabled: true },
+    { transport: "ble", enabled: true },
   ]);
   await c.act({ type: "scan.start", adapterId: "AAAA0001" });
   expect(a.received.at(-1)!.command.value).toMatchObject({ transports: [Transport.CLASSIC, Transport.BLE] });

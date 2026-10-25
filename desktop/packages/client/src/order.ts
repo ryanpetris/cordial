@@ -1,6 +1,6 @@
 // The orders the Dongle lists entries in, so a client can merge pages and changes into what it has
 // listed and keep it in the same order.
-import type { DeviceWarning, Feature, FeatureRef, ProfileRule, Setting, SettingRef, Usage } from "@cordial/protocol";
+import { SettingsGroup, type Feature, type FeatureRef, type ProfileRule, type SettingsObject, type SettingsRef, type Usage } from "@cordial/protocol";
 
 const encoder = new TextEncoder();
 
@@ -15,28 +15,32 @@ export function compareBytes(a: string, b: string): number {
 }
 
 const compareNumbers = (a: number, b: number) => (a < b ? -1 : a > b ? 1 : 0);
+/** The group each settings object case belongs to. */
+const GROUPS: Record<NonNullable<SettingsObject["group"]["case"]>, SettingsGroup> = {
+  keyboard: SettingsGroup.KEYBOARD,
+  power: SettingsGroup.POWER,
+  backlight: SettingsGroup.BACKLIGHT,
+  pointerSensor: SettingsGroup.POINTER_SENSOR,
+  wheel: SettingsGroup.WHEEL,
+  thumbwheel: SettingsGroup.THUMBWHEEL,
+};
+
+export type SettingsKey = Pick<SettingsRef, "integration" | "group" | "index">;
+
+/** The identity a settings object is listed by; undefined for a group this client doesn't know. */
+export function settingsRef(o: SettingsObject): SettingsKey | undefined {
+  const g = o.group;
+  if (!g.case) return undefined;
+  return { integration: o.integration, group: GROUPS[g.case], index: g.case === "pointerSensor" ? g.value.index : undefined };
+}
+
 /** A missing value orders before any value. */
 const compareOptional = (a: number | undefined, b: number | undefined) =>
   a === undefined ? (b === undefined ? 0 : -1) : b === undefined ? 1 : compareNumbers(a, b);
 
-/** The key a setting is listed by. */
-export const settingRef = (s: Pick<Setting, "integration" | "key">): Pick<SettingRef, "integration" | "key"> => ({ integration: s.integration, key: s.key });
-
-/** Settings order: integration, then key compared bytewise. */
-export const compareSettingRefs = (a: Pick<SettingRef, "integration" | "key">, b: Pick<SettingRef, "integration" | "key">) =>
-  compareNumbers(a.integration, b.integration) || compareBytes(a.key, b.key);
-
-type WarningKey = Pick<DeviceWarning, "code" | "service" | "reportType" | "reportId" | "bitOffset" | "usagePage" | "usage">;
-
-/** Warnings order: service, report type, report ID, bit offset, usage page, usage, then code. */
-export const compareWarnings = (a: WarningKey, b: WarningKey) =>
-  compareNumbers(a.service, b.service)
-  || compareNumbers(a.reportType, b.reportType)
-  || compareOptional(a.reportId, b.reportId)
-  || compareOptional(a.bitOffset, b.bitOffset)
-  || compareOptional(a.usagePage, b.usagePage)
-  || compareOptional(a.usage, b.usage)
-  || compareNumbers(a.code, b.code);
+/** Settings order: integration, then group, then component index. */
+export const compareSettingsRefs = (a: SettingsKey, b: SettingsKey) =>
+  compareNumbers(a.integration, b.integration) || compareNumbers(a.group, b.group) || compareOptional(a.index, b.index);
 
 type UsageKey = Pick<Usage, "usagePage" | "usage">;
 

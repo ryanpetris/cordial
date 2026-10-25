@@ -435,7 +435,7 @@ fn file_get_saves_records_as_json_unless_raw() {
 
 #[test]
 fn production_firmware_refuses_development_commands_locally() {
-    let dongle = Dongle::with(|sim| sim.status.info.clear());
+    let dongle = Dongle::with(|sim| sim.status.information = None);
     let (result, _, _) = script(&dongle, &["file", "list", "/"], false, b"");
     assert_eq!(
         result.unwrap_err().message,
@@ -492,6 +492,42 @@ fn transports_are_shown_and_set_per_transport() {
         "unsupported: the adapter or device doesn't support this"
     );
     assert!(!dongle.sent().contains(&"set_adapter"));
+}
+
+#[test]
+fn a_one_shot_timeout_leaves_a_sent_save_unconfirmed() {
+    let dongle = Dongle::with(|sim| {
+        sim.slow.insert("set_adapter", Duration::from_secs(3));
+        sim.slow.insert("list_files", Duration::from_secs(3));
+    });
+    let timeout = Duration::from_millis(500);
+    for json in [false, true] {
+        let started = Instant::now();
+        let (result, out, _) = run(
+            &dongle,
+            &["adapter", "set", "name", "Office"],
+            json,
+            timeout,
+            Cursor::new(b""),
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            result.unwrap_err().message,
+            "the adapter couldn't confirm whether the change was saved"
+        );
+        assert!(!out.contains("renamed"), "{out}");
+    }
+    assert_eq!(dongle.0.lock().unwrap().status.name, "Office");
+    let sent = dongle.sent();
+    assert_eq!(sent.iter().filter(|c| **c == "set_adapter").count(), 2);
+    let (result, _, _) = run(
+        &dongle,
+        &["file", "list", "/"],
+        false,
+        timeout,
+        Cursor::new(b""),
+    );
+    assert_eq!(result.unwrap_err().message, "operation timed out");
 }
 
 #[test]

@@ -260,7 +260,10 @@ fn boot_keyboard_switches_formats_and_preserves_leds_and_idle_reports() {
         MockDriver::new(&host),
         "0000000000000000",
         "Test adapter",
-        Default::default(),
+        crate::Topology {
+            desktop: true,
+            ..Default::default()
+        },
         &io,
         &mut buffers,
     );
@@ -369,7 +372,10 @@ fn overdue_idle_reports_allow_queued_key_presses_and_releases() {
         MockDriver::new(&host),
         "0000000000000000",
         "Test adapter",
-        Default::default(),
+        crate::Topology {
+            desktop: true,
+            ..Default::default()
+        },
         &io,
         &mut buffers,
     );
@@ -416,6 +422,7 @@ fn composite_pools_use_allocated_endpoints_and_one_receiver_function() {
                     "0000000000000000",
                     "Test adapter",
                     crate::Topology {
+                        desktop: true,
                         interfaces: set,
                         gamepads: cordial_core::outputs::Plan {
                             hid_gamepads: hid_count as u8,
@@ -438,6 +445,7 @@ fn composite_pools_use_allocated_endpoints_and_one_receiver_function() {
                     let length = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
                     assert_eq!(length, bytes.len());
                     assert!(length <= 512);
+                    assert_eq!(length, usize::from(io.topology().cost().config_bytes));
                     assert_eq!(
                         bytes[4] as usize,
                         3 + hid_count + xinput_count + usize::from(set != 0)
@@ -1041,6 +1049,7 @@ fn hid_workers_and_control_reads_encode_mapped_directions() {
         "0000000000000000",
         "Test adapter",
         crate::Topology {
+            desktop: true,
             interfaces: 0,
             gamepads: cordial_core::outputs::Plan {
                 hid_gamepads: 1,
@@ -1101,6 +1110,7 @@ fn workers_settle_reassignment_keep_control_truth_and_leave_cdc_and_keyboard_run
     let host = Host::default();
     let io = crate::Io::new();
     let topology = crate::Topology {
+        desktop: true,
         interfaces: 0,
         gamepads: cordial_core::outputs::Plan {
             hid_gamepads: 1,
@@ -1245,6 +1255,7 @@ fn rebuild_drops_every_endpoint_and_receiver_before_allocating_the_next_pools() 
         {
             let mut buffers = crate::Buffers::new(&io);
             let topology = crate::Topology {
+                desktop: true,
                 interfaces,
                 gamepads: cordial_core::outputs::Plan {
                     hid_gamepads: count,
@@ -1378,6 +1389,7 @@ fn remapped_and_disabled_hat_directions_reach_usb_without_raw_hat_passthrough() 
         "0000000000000000",
         "Test adapter",
         crate::Topology {
+            desktop: true,
             interfaces: 0,
             gamepads: shared.app.manager.outputs.plan(),
         },
@@ -1468,6 +1480,7 @@ fn priority_batches_and_busy_workers_preserve_digital_transitions_for_both_modes
             "0000000000000000",
             "Test adapter",
             crate::Topology {
+                desktop: true,
                 interfaces: 0,
                 gamepads: shared.app.manager.outputs.plan(),
             },
@@ -1621,6 +1634,7 @@ fn xinput_status_and_ack_do_not_block_out_and_keep_handshake_order() {
         "0000000000000000",
         "Test adapter",
         crate::Topology {
+            desktop: true,
             interfaces: 0,
             gamepads: cordial_core::outputs::Plan {
                 hid_gamepads: 0,
@@ -1860,4 +1874,86 @@ fn raw_axis_reports_preserve_declarations_when_samples_are_null() {
             assert_eq!(pad.axes_valid.count_ones() as usize, i);
         }
     }
+}
+
+#[test]
+fn platform_allocations_and_serial_recovery_match_actual_builder_costs() {
+    use cordial_core::usb::{Demand, allocate};
+    for budget in [crate::Budget::PICO, crate::Budget::ESP] {
+        for desktop in [false, true] {
+            for interfaces in [0, 1, 2] {
+                let host = Host::default();
+                let io = crate::Io::with_budget(budget);
+                let topology = allocate(
+                    Demand {
+                        desktop: if desktop { 0x41 } else { 0xff },
+                        editor: if interfaces != 0 { 0x44 } else { 0xff },
+                        interfaces,
+                        ..Default::default()
+                    },
+                    io.budget,
+                )
+                .topology;
+                assert!(topology.fits(io.budget));
+                let mut buffers = crate::Buffers::new(&io);
+                let mut usb = crate::Usb::new(
+                    MockDriver::new(&host),
+                    "0000000000000000",
+                    "Test adapter",
+                    topology,
+                    &io,
+                    &mut buffers,
+                );
+                let mut running = pin!(usb.device.run());
+                let bytes = exchange(&host, running.as_mut(), [0x80, 6, 0, 2, 0, 0, 0xff, 0xff]);
+                let cost = topology.cost();
+                assert_eq!(bytes.len(), usize::from(cost.config_bytes));
+                assert_eq!(bytes[4], cost.interfaces);
+                let allocations = &host.0.borrow().allocations;
+                assert_eq!(
+                    allocations.iter().filter(|a| a.addr.is_in()).count(),
+                    usize::from(cost.in_endpoints)
+                );
+                assert_eq!(
+                    allocations.iter().filter(|a| a.addr.is_out()).count(),
+                    usize::from(cost.out_endpoints)
+                );
+                assert_eq!(
+                    allocations
+                        .iter()
+                        .filter(|a| a.addr.is_out())
+                        .map(|a| a.max_packet_size)
+                        .sum::<u16>(),
+                    cost.out_packet_bytes
+                );
+            }
+        }
+    }
+    let host = Host::default();
+    let io = crate::Io::with_budget(crate::Budget::ESP);
+    let mut buffers = crate::Buffers::new(&io);
+    let invalid = crate::Topology {
+        desktop: true,
+        interfaces: 3,
+        gamepads: cordial_core::outputs::Plan {
+            hid_gamepads: 4,
+            xinput_gamepads: 4,
+        },
+    };
+    let mut usb = crate::Usb::new(
+        MockDriver::new(&host),
+        "0000000000000000",
+        "Test adapter",
+        invalid,
+        &io,
+        &mut buffers,
+    );
+    let mut running = pin!(usb.device.run());
+    let bytes = exchange(&host, running.as_mut(), [0x80, 6, 0, 2, 0, 0, 0xff, 0xff]);
+    assert_eq!(io.topology(), crate::Topology::default());
+    assert_eq!(bytes[4], 2);
+    assert_eq!(
+        bytes.len(),
+        usize::from(crate::Topology::default().cost().config_bytes)
+    );
 }

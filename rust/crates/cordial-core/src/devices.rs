@@ -60,8 +60,19 @@ pub const RAPID_DROPS_ADMITTED: u32 = 2;
 /// further rapid drop up to `RAPID_DROP_DELAY_MAX_MS`.
 pub const RAPID_DROP_DELAY_MS: u64 = 1000;
 pub const RAPID_DROP_DELAY_MAX_MS: u64 = 5000;
-/// Live Bluetooth connections, shared across transports. Records are allocated on demand.
-pub const ACTIVE_CONNECTIONS: usize = 4;
+/// Board connection allowances, plus one shared pairing slot.
+mod capacity {
+    include!(concat!(env!("OUT_DIR"), "/bluetooth.rs"));
+}
+pub use capacity::{ACTIVE_CONNECTIONS, BLE_CONNECTIONS, CLASSIC_CONNECTIONS};
+
+/// Normal connections admitted independently for each transport.
+pub const fn connection_limit(transport: Transport) -> usize {
+    match transport {
+        Transport::Classic => CLASSIC_CONNECTIONS,
+        Transport::Ble => BLE_CONNECTIONS,
+    }
+}
 pub const SCAN_CANDIDATES: usize = 32;
 /// Saved devices returned by one listing page.
 pub const PAGE_SIZE: usize = 8;
@@ -329,8 +340,6 @@ pub struct Live {
     pub policy: Option<Policy>,
     pub catalog: Catalog,
     pub roles: u8,
-    pub warnings: Vec<crate::model::errors::DeviceWarning>,
-    pub warnings_changed: bool,
     pub setup: Setup,
     /// Why the device's profiles are not loaded, while they are not.
     pub profile_error: Option<ErrorCode>,
@@ -348,28 +357,11 @@ impl Live {
             policy: None,
             catalog,
             roles: 0,
-            warnings: Vec::new(),
-            warnings_changed: false,
             setup: Setup::default(),
             profile_error: None,
             profile_retry: None,
             hydrate_retry: Backoff::default(),
         }
-    }
-    pub fn update_warnings(
-        &mut self,
-        warnings: &[crate::model::errors::DeviceWarning],
-    ) -> Result<bool, ErrorCode> {
-        if self.warnings == warnings {
-            return Ok(false);
-        }
-        self.warnings
-            .try_reserve_exact(warnings.len().saturating_sub(self.warnings.len()))
-            .map_err(|_| ErrorCode::Capacity)?;
-        self.warnings.clear();
-        self.warnings.extend_from_slice(warnings);
-        self.warnings_changed = true;
-        Ok(true)
     }
 }
 

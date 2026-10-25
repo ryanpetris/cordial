@@ -731,12 +731,7 @@ fn custom_input_bytes_leave_standard_keys_available_with_a_field_diagnostic() {
         5, 7, 9, 4, 0x15, 0, 0x25, 1, 0x75, 8, 0x95, 1, 0x82, 2, 1, 0xc0,
     ]);
     let map = Map::compile(&descriptor).unwrap();
-    assert_eq!(map.limitations().len(), 1);
-    assert_eq!(
-        map.limitations()[0].code,
-        cordial_core::model::errors::WarningCode::BufferedInputUnsupported
-    );
-    assert_eq!(map.limitations()[0].usage_page, 7);
+
     let mut bytes = [0; 9];
     bytes[2] = 5;
     assert!(key(
@@ -807,7 +802,7 @@ fn input_array_high_flags_do_not_change_selector_semantics() {
         0x82, 0, 1, 0xc0,
     ];
     let map = Map::compile(&descriptor).unwrap();
-    assert!(map.limitations().is_empty());
+
     assert!(key(
         &map.decode(&mut map.state().unwrap(), 0, &[4]).unwrap().held,
         4
@@ -823,7 +818,7 @@ fn relative_selector_items_emit_independent_pulses_and_rearm_when_cleared() {
         0x81, 1, 0x75, 8, 9, 0, 9, 4, 0x81, 4, 9, 0, 9, 4, 0x81, 4, 0xc0,
     ];
     let map = Map::compile(&descriptor).unwrap();
-    assert!(map.limitations().is_empty());
+
     let mut state = map.state().unwrap();
     let first = map.decode(&mut state, 0, &[1, 1, 0]).unwrap();
     assert!(key(&first.held, 4) && key(&first.pulses, 4));
@@ -882,11 +877,7 @@ fn absolute_numeric_selectors_are_diagnosed_without_losing_ordinary_controls() {
         0xc0,
     ];
     let map = Map::compile(&bytes).unwrap();
-    assert_eq!(
-        map.limitations()[0].code,
-        cordial_core::model::errors::WarningCode::NumericSelectorUnsupported
-    );
-    assert_eq!(map.limitations()[0].usage, 0xe0);
+
     let input = map.decode(&mut map.state().unwrap(), 0, &[1, 2]).unwrap();
     assert_eq!(input.held.consumers[0], 0xcd);
 }
@@ -1060,7 +1051,7 @@ fn a_consumer_range_spanning_a_numeric_control_is_not_diagnosed() {
         0x81, 0, 0xc0,
     ];
     let map = Map::compile(&bytes).unwrap();
-    assert!(map.limitations().is_empty());
+
     let input = map
         .decode(&mut map.state().unwrap(), 0, &[0xcd, 0])
         .unwrap();

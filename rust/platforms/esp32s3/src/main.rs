@@ -14,7 +14,7 @@ use esp_idf_sys as sys;
 
 type Store = Result<storage::Storage, cordial_core::storage::Error>;
 type App = Owner<'static, radio::Records, radio::Radio>;
-static USB_IO: cordial_usb::Io = cordial_usb::Io::new();
+static USB_IO: cordial_usb::Io = cordial_usb::Io::with_budget(cordial_usb::Budget::ESP);
 #[cfg(feature = "btstack")]
 #[path = "radio/btstack.rs"]
 mod radio;
@@ -38,13 +38,9 @@ fn bootloader() -> ! {
 }
 
 #[embassy_executor::task]
-async fn usb_task(serial: &'static str, interfaces: u8) {
+async fn usb_task(serial: &'static str, mut topology: cordial_usb::Topology) {
     let mut peripheral = usb::Peripheral::new().expect("USB peripheral");
     let mut out = [0; 256];
-    let mut topology = cordial_usb::Topology {
-        interfaces,
-        ..Default::default()
-    };
     loop {
         topology = {
             let mut buffers = Buffers::new(&USB_IO);
@@ -129,12 +125,13 @@ fn start(spawner: embassy_executor::Spawner) {
         board::STORAGE_IDENTITY,
         board::STORAGE_START..board::STORAGE_END,
     );
-    // USB enumerates once, with the saved configuration interfaces. Flash reads complete
-    // synchronously, so no executor is needed yet.
-    let interfaces = embassy_futures::block_on(cordial_usb::saved_interfaces(
+    let topology = embassy_futures::block_on(cordial_usb::saved_topology(
         &mut store,
         board::PROFILE_MEMORY_BUDGET.is_some(),
+        cordial_usb::Budget::ESP,
     ));
+    USB_IO.set_topology(topology);
+    let interfaces = topology.interfaces;
     let available = store.is_ok();
     let (radio, handle, wake) = radio::new(store);
     let app = Application::new(Build {
@@ -150,7 +147,7 @@ fn start(spawner: embassy_executor::Spawner) {
         bootloader: None,
     });
     let owner: &'static App = Box::leak(Box::new(Owner::new(&USB_IO, app, handle, radio)));
-    spawner.spawn(usb_task(serial, interfaces).unwrap());
+    spawner.spawn(usb_task(serial, topology).unwrap());
     radio::spawn(spawner);
     spawner.spawn(priority_task(owner, wake, available).unwrap());
     spawner.spawn(secondary_task(owner, interfaces).unwrap());

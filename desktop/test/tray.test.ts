@@ -27,8 +27,6 @@ const entry = (adapterId: string, id: string, patch: Partial<DeviceEntry> = {}, 
   kind: "keyboard",
   battery: null,
   pending: [],
-  warnings: null,
-  warningsError: null,
   settings: null,
   settingsError: null,
   settingsSave: null,
@@ -52,15 +50,13 @@ describe("trayModel", () => {
     expect(trayModel(app([], [], true)).visible).toBe(true);
   });
 
-  it("fills when a device is connected and badges low battery first", () => {
+  it("fills when a device is connected and badges attention before low battery", () => {
     const idle = trayModel(app([adapter("A")], [entry("A", "1")]));
     expect([idle.visible, idle.base, idle.badge]).toEqual([true, "idle", "none"]);
-    const low = trayModel(
-      app(
-        [adapter("A", { attention: ["1 device needs pairing again"] })],
-        [entry("A", "1", { battery: { percent: 20, charging: false, percentFresh: true, chargingFresh: true } }, "connected")],
-      ),
-    );
+    const lowEntry = entry("A", "1", { battery: { percent: 20, charging: false, percentFresh: true, chargingFresh: true } }, "connected");
+    const attention = trayModel(app([adapter("A", { attention: ["1 device needs pairing again"] })], [lowEntry]));
+    expect([attention.base, attention.badge]).toEqual(["connected", "attention"]);
+    const low = trayModel(app([adapter("A")], [lowEntry]));
     expect([low.base, low.badge]).toEqual(["connected", "low"]);
     expect(low.groups[0]!.devices[0]!.label).toBe("1 — Connected · 20% (low)");
     expect(low.tooltip).toContain("1 device connected");

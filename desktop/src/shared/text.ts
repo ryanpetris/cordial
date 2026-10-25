@@ -1,17 +1,16 @@
 // The host's words for adapter codes and records. The adapter sends machine
-// codes and catalog keys only. Records keyed by the protocol's enums are
-// exhaustive, so a protocol change fails type checking until its wording is
-// added here; keys missing from the catalog tables here are not shown.
+// codes and typed fields only. Records keyed by the protocol's enums and
+// setting fields are exhaustive, so a protocol change fails type checking until
+// its wording is added here.
 import type {
   AdapterEntry,
   AdapterStatus,
   Battery,
   Code,
   DeviceKind,
+  DeviceInformation,
   DeviceRecord,
-  DeviceWarning,
   HostPlatform,
-  InfoEntry,
   Inactive,
   IntegrationStateName,
   Integration,
@@ -19,13 +18,15 @@ import type {
   OutputModeName,
   OutputStateName,
   ProfileAlert,
-  ReportTypeName,
+  Resource,
   RoleName,
   Scalar,
   Security,
+  SettingField,
+  SettingFields,
   SettingStateName,
+  SettingsGroupName,
   TransportName,
-  WarningName,
   WireError,
 } from "./state.ts";
 
@@ -67,6 +68,12 @@ const ERRORS: Record<Code, string> = {
   device_error: "this device reported an error",
   invalid_response: "the adapter couldn't understand this device's reply",
   readback_mismatch: "the device reported a different value from the one requested",
+  storage_full: "the adapter's storage is full",
+  profile_memory_low: "the adapter is almost out of profile memory",
+  usb_required_capacity_exceeded: "the adapter doesn't have enough USB capacity for every required interface",
+  usb_reserved_capacity_exceeded: "the adapter doesn't have enough USB capacity for every reserved interface",
+  profile_memory_exceeded: "the adapter doesn't have room for this device's profiles",
+  profile_load_failed: "the adapter couldn't read one of this device's profiles",
 };
 
 const CAPACITY: Record<NonNullable<WireError["reason"]>, string> = {
@@ -119,54 +126,6 @@ export function inactiveText(d: DeviceRecord): string {
   return INACTIVE[d.inactive ?? "unknown"];
 }
 
-export const WARNINGS: Record<WarningName, string> = {
-  unknown: "The adapter can't use part of this device.",
-  numeric_selector_unsupported: "The adapter can't derive a value from this numeric selector field.",
-  pointer_selector_unsupported: "The adapter can't forward pointer coordinates from a selector field.",
-  buffered_input_unsupported: "The adapter can't interpret this input field's custom byte format.",
-  indicator_report_too_large: "The indicator report is larger than the Bluetooth connection allows.",
-  indicator_read_unsupported: "The device doesn't support reading this indicator report.",
-  indicator_write_unsupported: "The device doesn't support writing this indicator report.",
-  buffered_indicator_unsupported: "The adapter can't interpret this indicator field's custom byte format.",
-  indicator_state_unknown: "The device doesn't report the indicator state needed for this update.",
-  indicator_read_failed: "The adapter couldn't read the indicator report.",
-  indicator_write_failed: "The adapter couldn't update the indicator lights.",
-  indicator_array_full: "The indicator report has no room for all active lights.",
-  indicator_relative_selector_unsupported: "The adapter can't forward this relative indicator selector.",
-  indicator_mode_unsupported: "The indicator doesn't provide a usable on/off control.",
-  indicator_nonlinear_unsupported: "The adapter can't convert this indicator's nonlinear values.",
-  indicator_scale_unsupported: "The indicator's units don't provide a usable value conversion.",
-  indicator_range_unsupported: "The indicator's value range can't represent both states.",
-};
-
-const REPORT_TYPES: Record<ReportTypeName, string> = {
-  input: "Input Report",
-  output: "Output Report",
-  feature: "Feature Report",
-};
-
-const hex = (n: number) => n.toString(16).toUpperCase().padStart(4, "0");
-
-export const WARNINGS_READ_FAILED = "The adapter couldn't read the device's warnings.";
-
-const INPUT_WARNINGS: WarningName[] = ["numeric_selector_unsupported", "pointer_selector_unsupported", "buffered_input_unsupported"];
-
-/** A device warning as an Information fact: what it concerns, the problem,
- * and the HID service, report and field it was found in. */
-export function warningFact(w: DeviceWarning): { label: string; text: string; context: string } {
-  const context = [`Service ${w.service}`];
-  const kind = w.reportType ? REPORT_TYPES[w.reportType] : null;
-  if (kind) context.push(w.reportId !== null ? `${kind} ${w.reportId}` : kind);
-  else if (w.reportId !== null) context.push(`Report ${w.reportId}`);
-  if (w.bitOffset !== null) context.push(`Bit ${w.bitOffset}`);
-  if (w.usagePage !== null) context.push(`Usage ${hex(w.usagePage)}${w.usage !== null ? `:${hex(w.usage)}` : ""}`);
-  return {
-    label: INPUT_WARNINGS.includes(w.code) ? "Input Field" : w.code === "unknown" ? "Device Warning" : "Lock Indicators",
-    text: WARNINGS[w.code],
-    context: context.join(", "),
-  };
-}
-
 /** Whether HID++ is up on the device, in a few words. */
 export const INTEGRATION_STATES: Record<IntegrationStateName, string> = {
   off: "Off",
@@ -186,6 +145,7 @@ export const versionText = (i: Integration) => (i.version ? `${i.version.major}.
 /** A saved setting's state as its marker names it; `unmanaged` is a setting with no saved value. */
 export const SETTING_STATES: Record<SettingStateName | "unmanaged" | "error", string> = {
   unmanaged: "Not Saved",
+  unknown: "Saved",
   pending: "Saved",
   applied: "Saved",
   changed_on_device: "Changed on Device",
@@ -207,20 +167,36 @@ export const PLATFORMS: Record<HostPlatform, string> = { linux: "Linux", windows
 export const TRANSPORTS: Record<TransportName, string> = { ble: "Bluetooth LE", classic: "Bluetooth Classic" };
 export const ROLES: Record<RoleName, string> = { keyboard: "Keyboard", mouse: "Mouse", consumer_control: "Media Keys", system_control: "System Keys", gamepad: "Gamepad" };
 
-/** Labels of the information keys the Information card shows, in display order. */
-export const INFO_LABELS: Record<string, string> = {
-  "device.manufacturer": "Manufacturer",
-  "device.model": "Model",
-  "device.serial": "Serial Number",
-  "firmware.version": "Firmware",
-  "bootloader.version": "Bootloader",
-  "hardware.revision": "Hardware",
-  "software.revision": "Software",
-  "vendor.registry": "Vendor ID Namespace",
-  "vendor.id": "Vendor ID",
-  "product.id": "Product ID",
-  "product.version": "Product Version",
-};
+const hex = (n: number) => `0x${n.toString(16).toUpperCase().padStart(4, "0")}`;
+const known = (facts: [string, string | null][]) => facts.filter((f): f is [string, string] => f[1] !== null);
+
+/** The device's identity facts the Information card shows, in display order; unknown ones are left
+ * out. */
+export function identityFacts(i: DeviceInformation): [string, string][] {
+  const id = i.identity;
+  return known([
+    ["Manufacturer", id.manufacturer],
+    ["Model", id.model],
+    ["Serial Number", id.serial],
+    ["Firmware", id.firmwareVersion],
+    ["Hardware", id.hardwareRevision],
+    ["Software", id.softwareRevision],
+  ]);
+}
+
+const REGISTRIES = { unknown: "Unknown", usb: "USB", bluetooth: "Bluetooth" } as const;
+
+/** The device's identifiers Diagnostics shows, in display order; unknown ones are left out. */
+export function identifierFacts(i: DeviceInformation): [string, string][] {
+  const id = i.identity;
+  return known([
+    ["Vendor ID Namespace", id.vendor.registry && REGISTRIES[id.vendor.registry]],
+    ["Vendor ID", id.vendor.id === null ? null : hex(id.vendor.id)],
+    ["Product ID", id.product.id === null ? null : hex(id.product.id)],
+    ["Product Version", id.product.version === null ? null : hex(id.product.version)],
+    ["Bootloader", id.bootloaderVersion],
+  ]);
+}
 
 const KINDS: Record<DeviceKind, string> = {
   keyboard: "Keyboard",
@@ -241,10 +217,19 @@ export function displayKind(kinds: KindName[], roles: RoleName[] = []): DeviceKi
   return keyboard && mouse ? "keyboard_mouse" : keyboard ? "keyboard" : mouse ? "mouse" : gamepad ? "gamepad" : "other";
 }
 
+/** Device errors that say why a connected device's profiles aren't loaded. */
+const PROFILE_ERRORS: Code[] = ["profile_memory_exceeded", "profile_load_failed"];
+
+/** Why a connected device's profiles aren't loaded, if they aren't. */
+export const profileError = (d: DeviceRecord): Code | null =>
+  d.state === "connected" ? (d.errors.find((e) => PROFILE_ERRORS.includes(e)) ?? null) : null;
+
+/** The device's last failed connection attempt. */
+export const connectionError = (d: DeviceRecord): Code | null => d.errors.find((e) => !PROFILE_ERRORS.includes(e)) ?? null;
+
 /** Why a connected device's profiles aren't loaded. */
 export function profileErrorText(code: Code): string {
-  if (code === "no_capacity") return "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.";
-  if (code === "storage_failed") return "The adapter couldn't read one of this device's profiles.";
+  if (code === "profile_memory_exceeded") return "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.";
   return codeText(code);
 }
 
@@ -255,33 +240,30 @@ export function profileAlertText(alert: ProfileAlert): { title: string; body: st
     : { title: `${alert.name} connected without its profiles.`, body: profileErrorText(alert.code) };
 }
 
-/** How full the adapter's profile memory is, as a whole percentage; null without a budget. */
-export const memoryPercent = (s: AdapterStatus | null) =>
-  s?.profileSupport?.memoryBudget ? Math.round((s.profileSupport.memoryUsed / s.profileSupport.memoryBudget) * 100) : null;
-
-export function infoValue(f: InfoEntry): string {
-  const v = f.value;
-  switch (f.key) {
-    case "vendor.id":
-    case "product.id":
-    case "product.version":
-      return typeof v === "number" ? `0x${v.toString(16).toUpperCase().padStart(4, "0")}` : String(v);
-    case "vendor.registry":
-      return v === "usb" ? "USB" : "Bluetooth";
-    default:
-      if (f.type === "bool") return v ? "Yes" : "No";
-      if (f.type === "color") return `#${(v as number).toString(16).padStart(6, "0").toUpperCase()}`;
-      return String(v);
-  }
+/** How full the adapter's profile memory is, as a whole percentage; null while either value is
+ * unknown or without a budget. */
+export function memoryPercent(s: AdapterStatus | null): number | null {
+  const m = s?.profileSupport?.resources.find((r) => r.type === "memory");
+  return m?.count != null && m.limit ? Math.round((m.count / m.limit) * 100) : null;
 }
 
-/** The text an information entry or the adapter status carries for `key`, if any. */
-export const infoOf = (list: InfoEntry[], key: string) => list.find((f) => f.key === key)?.value;
+/** A resource's usage in a few words: "3 of 7", or what is known of it. */
+export function capacityText(r: Resource): string {
+  if (r.count !== null && r.limit !== null) return `${r.count} of ${r.limit}`;
+  if (r.count !== null) return String(r.count);
+  return r.limit !== null ? `Up to ${r.limit}` : "Unknown";
+}
+
+/** Status labels for the adapter's USB capacity errors, in the order shown. */
+export const USB_CAPACITY: [Code, string][] = [
+  ["usb_required_capacity_exceeded", "Required Capacity Exceeded"],
+  ["usb_reserved_capacity_exceeded", "Reserved Capacity Exceeded"],
+];
 
 /** Why a nearby device can't be added: the adapter has no room to save it. */
 export const STORAGE_FULL = "Storage Full";
 
-export const storageFull = (s: AdapterStatus | null) => infoOf(s?.info ?? [], "storage.full") === true;
+export const storageFull = (s: AdapterStatus | null) => !!s?.errors.includes("storage_full");
 
 export interface SettingInfo {
   label: string;
@@ -290,9 +272,18 @@ export interface SettingInfo {
   choices?: Record<string, string>;
 }
 
-/** Recognized settings and setting-like readings in display order; categories follow first use. */
-const SETTINGS: Record<string, SettingInfo> = {
-  "keyboard.fn_row": {
+/** A setting field or a reading shown with the settings, by group and protocol field name. */
+export type FieldName =
+  | { [G in SettingsGroupName]: `${G}.${SettingFields[G]}` }[SettingsGroupName]
+  | "backlight.current_brightness"
+  | "backlight.status";
+
+/** A field's name as the settings tables list it. */
+export const fieldName = (f: Pick<SettingField, "group" | "field">) => `${f.group}.${f.field}` as FieldName;
+
+/** Settings and setting-like readings in display order; categories follow first use. */
+const SETTINGS: Record<FieldName, SettingInfo> = {
+  "keyboard.function_row": {
     label: "Function Row",
     category: "Keyboard",
     choices: { function_keys: "F1-F12", special_actions: "Shortcuts" },
@@ -314,68 +305,96 @@ const SETTINGS: Record<string, SettingInfo> = {
   },
   "backlight.enabled": { label: "Backlight", category: "Backlight" },
   "backlight.mode": { label: "Backlight Mode", category: "Backlight" },
-  "backlight.level": { label: "Manual Backlight Level", category: "Backlight" },
-  "backlight.current_level": { label: "Current Backlight Level", category: "Backlight" },
+  "backlight.brightness": { label: "Brightness", category: "Backlight" },
+  "backlight.current_brightness": { label: "Current Brightness", category: "Backlight" },
   "backlight.status": {
     label: "Backlight Status",
     category: "Backlight",
     choices: { battery: "Off (Battery)", saturated: "Automatic (Saturated)" },
   },
   "backlight.effect": { label: "Backlight Effect", category: "Backlight" },
-  "backlight.delay.hands_out": { label: "Timeout With Hands Away", category: "Backlight", unit: "s" },
-  "backlight.delay.hands_in": { label: "Timeout With Hands Nearby", category: "Backlight", unit: "s" },
-  "backlight.delay.powered": { label: "Timeout While Plugged In", category: "Backlight", unit: "s" },
-  "backlight.power_on": { label: "Backlight at Power-On", category: "Backlight" },
-  "backlight.crown": { label: "Crown Backlight", category: "Backlight" },
+  "backlight.hands_away": { label: "Hands Away Timeout", category: "Backlight", unit: "s" },
+  "backlight.hands_nearby": { label: "Hands Nearby Timeout", category: "Backlight", unit: "s" },
+  "backlight.external_power": { label: "External Power Timeout", category: "Backlight", unit: "s" },
+  "backlight.startup_effect": { label: "Startup Effect", category: "Backlight" },
+  "backlight.dial_effect": { label: "Dial Lighting Effect", category: "Backlight" },
   "backlight.power_save": { label: "Backlight Power Saving", category: "Backlight" },
-  "pointer.sensor.{n}.dpi": { label: "Pointer Speed", category: "Pointer", unit: "DPI" },
-  "wheel.mode": { label: "Wheel Mode", category: "Wheel" },
-  "wheel.threshold": { label: "SmartShift", category: "Wheel" },
+  "pointer_sensor.dpi": { label: "Pointer Sensitivity", category: "Pointer", unit: "DPI" },
+  "wheel.mode": { label: "Wheel Mode", category: "Wheel", choices: { free_spin: "Free Spin", stepped: "Stepped" } },
+  "wheel.free_spin_threshold": { label: "Automatic Free Spin Threshold", category: "Wheel" },
   "wheel.invert": { label: "Reverse Vertical Scrolling", category: "Wheel" },
   "thumbwheel.invert": { label: "Reverse Horizontal Scrolling", category: "Wheel" },
   "power.auto_off": { label: "Automatic Power-Off", category: "Power", unit: "s" },
 };
 
-const SENSOR = /^pointer\.sensor\.([0-9]+)\.dpi$/;
-const template = (key: string) => (SENSOR.test(key) ? "pointer.sensor.{n}.dpi" : key);
+/** A field with the component it belongs to: the pointer sensor's index, else null. */
+export type FieldRef = { name: FieldName; index: number | null };
 
-/** How the settings form shows `key`; null for keys this app doesn't know. */
-export function settingInfo(key: string): SettingInfo | null {
-  const info = SETTINGS[template(key)];
-  if (!info) return null;
-  const sensor = Number(SENSOR.exec(key)?.[1] ?? 0);
-  return sensor === 0 ? info : { ...info, label: `Pointer Speed ${sensor + 1}` };
+/** How the settings form shows a field; a second pointer sensor is numbered. */
+export function settingInfo({ name, index }: FieldRef): SettingInfo {
+  const info = SETTINGS[name];
+  return index ? { ...info, label: `${info.label} ${index + 1}` } : info;
 }
 
 /** Whether a displayed value reads "Never", which takes no unit. */
-export const neverValue = (key: string, v: Scalar | null) => key === "power.auto_off" && v === 0;
+export const neverValue = (name: FieldName, v: Scalar | null) => name === "power.auto_off" && v === 0;
 
 /** The unit beside a displayed value; none when the value reads "Never". */
-export const displayUnit = (key: string, v: Scalar | null) => (neverValue(key, v) ? undefined : settingInfo(key)?.unit);
+export const displayUnit = (name: FieldName, v: Scalar | null) => (neverValue(name, v) ? undefined : SETTINGS[name].unit);
 
 const ORDER = Object.keys(SETTINGS);
 /** Display order; a second sensor follows the first. */
-export const settingOrder = (key: string) => ORDER.indexOf(template(key)) + Number(SENSOR.exec(key)?.[1] ?? 0) / 100;
+export const settingOrder = ({ name, index }: FieldRef) => ORDER.indexOf(name) + (index ?? 0) / 100;
 
 /** Capitalizes each word: "permanent manual" becomes "Permanent Manual". */
 const titleCase = (s: string) => s.replace(/(^|\s)(\p{Ll})/gu, (_, space: string, c: string) => space + c.toUpperCase());
 
-/** An enum token in words: the catalog's wording, else the token in title case. */
-export function choiceText(key: string, token: string): string {
-  return settingInfo(key)?.choices?.[token] ?? titleCase(token.replace(/[_-]/g, " "));
+/** An enum value in words: the table's wording, else the protocol name in title case. */
+export function choiceText(name: FieldName, token: string): string {
+  return SETTINGS[name].choices?.[token] ?? titleCase(token.replace(/[_-]/g, " "));
+}
+
+/** A reading the device reports for a field, shown with the settings. */
+export type Reading = FieldRef & { value: Scalar };
+
+/** The device's setting-like readings, each one it reports. */
+export function readings(i: DeviceInformation): Reading[] {
+  const b = i.backlight;
+  const list: [FieldName, Scalar | null][] = [
+    ["keyboard.platform", i.keyboard.platform],
+    ["keyboard.function_row", i.keyboard.functionRow],
+    ["power.auto_off", i.power.autoOff],
+    ["backlight.current_brightness", b.currentBrightness],
+    ["backlight.status", b.status],
+    ["backlight.enabled", b.enabled],
+    ["backlight.mode", b.mode],
+    ["backlight.brightness", b.brightness],
+    ["backlight.hands_away", b.delay.handsAway],
+    ["backlight.hands_nearby", b.delay.handsNearby],
+    ["backlight.external_power", b.delay.externalPower],
+    ["backlight.startup_effect", b.startupEffect],
+    ["backlight.dial_effect", b.dialEffect],
+    ["backlight.power_save", b.powerSave],
+    ["backlight.effect", b.effect],
+    ["wheel.mode", i.wheel.mode],
+    ["wheel.free_spin_threshold", i.wheel.freeSpinThreshold],
+    ["wheel.invert", i.wheel.invert],
+    ["thumbwheel.invert", i.thumbwheel.invert],
+  ];
+  return [
+    ...list.flatMap(([name, value]) => (value === null ? [] : [{ name, index: null, value }])),
+    ...i.pointerSensors.flatMap((p) => (p.dpi === null ? [] : [{ name: "pointer_sensor.dpi" as const, index: p.index, value: p.dpi }])),
+  ];
 }
 
 /** The wheel's capability readings as labelled figures. */
-export function wheelFigures(info: InfoEntry[]): [string, string][] {
-  const figures: [string, string, (v: Scalar) => string][] = [
-    ["wheel.resolution_multiplier", "Resolution Multiplier", String],
-    ["wheel.ratchets_per_rotation", "Ratchets per Rotation", String],
-    ["wheel.diameter", "Wheel Diameter", (v) => `${String(v)} mm`],
-  ];
-  return figures.flatMap(([key, label, text]) => {
-    const v = infoOf(info, key);
-    return v === undefined ? [] : [[label, text(v)] as [string, string]];
-  });
+export function wheelFigures(i: DeviceInformation): [string, string][] {
+  const w = i.wheel;
+  return known([
+    ["Resolution Multiplier", w.resolutionMultiplier === null ? null : String(w.resolutionMultiplier)],
+    ["Ratchets per Rotation", w.ratchetsPerRotation === null ? null : String(w.ratchetsPerRotation)],
+    ["Wheel Diameter", w.diameter === null ? null : `${w.diameter} mm`],
+  ]);
 }
 
 export function securityFacts(s: Security): [string, string][] {

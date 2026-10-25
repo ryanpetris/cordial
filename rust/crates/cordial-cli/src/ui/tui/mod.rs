@@ -23,6 +23,7 @@ mod world;
 
 pub(crate) use fleet::Live;
 
+use crate::settings::{Field as SettingField, Value};
 use crate::{
     controller::{AdapterUpdate, Command, DeviceUpdate, Event, Notice, Outcome, Phase, Ticket},
     error::Error,
@@ -31,9 +32,7 @@ use crate::{
 };
 use add::AddDevice;
 use cordial_client::serial::PortInfo;
-use cordial_protocol::{
-    self as p, ConfigurationInterface, OutputMode, Platform, Transport, value::Value,
-};
+use cordial_protocol::{self as p, ConfigurationInterface, OutputMode, Platform, Transport};
 use fleet::{Fleet, Slot};
 use layout::Hit;
 use profiles::{ProfilePage, Step};
@@ -50,7 +49,7 @@ pub const MIN_HEIGHT: usize = 16;
 /// How often the attached adapters are listed.
 const LIST_EVERY: Duration = Duration::from_secs(1);
 /// How long an adapter that went away keeps its page while it may return, as across the USB
-/// reconnect a configuration interface change causes.
+/// reconnect an interface allocation change causes.
 const RECONNECT_HOLD: Duration = Duration::from_secs(15);
 /// A session that ends this soon after opening counts as a failure of its port.
 const UNSTABLE: Duration = Duration::from_secs(10);
@@ -154,20 +153,21 @@ pub enum Action {
     LayersDiscard,
     DiagnosticsRefresh,
 
-    SettingBool(String, bool),
-    SettingChoice(String, Value),
+    SettingBool(SettingField, bool),
+    SettingChoice(SettingField, Value),
     /// Opens the choices of a setting with many.
-    SettingSelect(String),
-    SettingStep(String, i64),
+    SettingSelect(SettingField),
+    SettingStep(SettingField, i64),
     /// Types a number for an integer setting.
-    SettingEdit(String),
-    SmartShift(String, bool),
+    SettingEdit(SettingField),
+    /// Turns automatic free spin on or off.
+    FreeSpin(SettingField, bool),
     /// Opens a setting's state menu.
-    Marker(String),
-    Undo(String),
+    Marker(SettingField),
+    Undo(SettingField),
     /// Stages saving the value the device reports.
-    Keep(String),
-    ForgetSetting(String),
+    Keep(SettingField),
+    ForgetSetting(SettingField),
     SettingsRefresh,
     SettingsReapply,
     SettingsReload,
@@ -227,10 +227,6 @@ pub enum Dialog {
         purpose: PickFor,
         chosen: u32,
     },
-    /// Confirming an adapter save that reconnects USB.
-    SaveAdapter(String),
-    /// Confirming a device's Settings save whose Gamepad Output change reconnects USB.
-    SaveSettings(String, u32),
     AddDevice,
     Bootloader(String),
     Files(String),
@@ -296,7 +292,7 @@ pub(super) enum Kind {
     },
     SettingsSave {
         device: u32,
-        sent: Vec<(String, Draft)>,
+        sent: Vec<(SettingField, Draft)>,
         /// The staged gamepad output is saved once this finishes.
         gamepad: bool,
     },
@@ -360,8 +356,8 @@ pub(super) struct Off {
 #[derive(Clone, Debug, Default)]
 pub(super) struct Submission {
     pub running: bool,
-    /// The keys it sent.
-    pub keys: Vec<String>,
+    /// The fields it sent.
+    pub fields: Vec<SettingField>,
     /// Why it failed; None while running or after it succeeded.
     pub error: Option<String>,
     /// Its outcome is unknown, so its keys are neither saved nor failed.
@@ -425,12 +421,10 @@ pub(crate) struct Model<F: Fleet> {
 
     adapter_drafts: HashMap<String, AdapterUpdate>,
     device_drafts: HashMap<(String, u32), DeviceUpdate>,
-    setting_drafts: HashMap<(String, u32), BTreeMap<String, Draft>>,
+    setting_drafts: HashMap<(String, u32), BTreeMap<SettingField, Draft>>,
     submissions: HashMap<(String, u32), Submission>,
     /// Why each device's settings couldn't be listed.
     settings_errors: HashMap<(String, u32), String>,
-    /// Devices whose warnings couldn't be listed.
-    warnings_failed: HashSet<(String, u32)>,
     notes: HashMap<Spot, String>,
     /// Each device's last connection state, to drop errors that belonged to an earlier one.
     device_states: HashMap<(String, u32), i32>,
@@ -442,7 +436,7 @@ pub(crate) struct Model<F: Fleet> {
     /// The dialog's text field has the keyboard.
     form_focused: bool,
     /// The integer setting being typed, which holds the form.
-    editing: Option<String>,
+    editing: Option<SettingField>,
     add: Option<AddDevice>,
     /// Adapters whose scan from a closed Add Device stops once its start is answered.
     scan_stops: HashSet<(Slot, Ticket)>,
@@ -493,7 +487,6 @@ impl<F: Fleet> Model<F> {
             setting_drafts: HashMap::new(),
             submissions: HashMap::new(),
             settings_errors: HashMap::new(),
-            warnings_failed: HashSet::new(),
             notes: HashMap::new(),
             device_states: HashMap::new(),
             jobs: HashMap::new(),
@@ -953,8 +946,6 @@ impl<F: Fleet> Model<F> {
                 | Dialog::Forget(a, _)
                 | Dialog::ProfileName(a, _)
                 | Dialog::ProfileDelete(a, _)
-                | Dialog::SaveAdapter(a)
-                | Dialog::SaveSettings(a, _)
                 | Dialog::Pick { adapter: a, .. },
             ) => a == id,
             _ => false,

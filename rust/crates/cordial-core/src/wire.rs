@@ -5,21 +5,23 @@ use alloc::{
     vec::Vec,
 };
 
-use cordial_protocol::{self as p, keys};
+use cordial_protocol as p;
+
+mod settings;
+pub use settings::*;
 
 use crate::{
-    compact::{Observed, Record, scalar},
+    compact::{Observed, Record},
     devices::{Device, Policy},
     manager::{Connection, Manager},
     model::{
-        errors::{DeviceWarning, ErrorCode as E, HidReportType, WarningCode},
+        errors::ErrorCode as E,
         hidpp::ProtocolState,
         identifiers::{ConnectionState, HostPlatform, SettingsState, Transport},
         info::{InfoField, InfoKey},
         link::{ConnectionSecurity, DeviceKind},
-        settings::{SettingKey, SettingState, SettingType, SettingValue},
+        settings::{SettingKey, SettingValue},
     },
-    settings::Catalog,
 };
 
 /// The wire code for an internal error.
@@ -29,7 +31,8 @@ pub fn error_code(code: E) -> p::ErrorCode {
         E::UnknownCommand => W::UnknownCommand,
         E::InvalidArgs => W::BadArgs,
         E::Busy => W::Busy,
-        E::NotFound | E::NotPending | E::ReadOnly => W::NotFound,
+        E::NotFound | E::NotPending => W::NotFound,
+        E::ReadOnly => W::Unsupported,
         E::Blocked => W::Blocked,
         E::Disabled => W::Disabled,
         E::CandidateExpired => W::CandidateExpired,
@@ -178,118 +181,152 @@ fn security(security: ConnectionSecurity) -> p::Security {
     }
 }
 
-/// The wire key of a setting record. Repeated parts carry their index in the key.
-pub fn setting_key(key: SettingKey) -> String {
-    use SettingKey::*;
-    match key {
-        KeyboardPlatform => keys::KEYBOARD_PLATFORM.into(),
-        PowerAutoOff => keys::POWER_AUTO_OFF.into(),
-        FnRowDefault => keys::KEYBOARD_FN_ROW.into(),
-        PointerDpi0 => keys::indexed(keys::POINTER_SENSOR_N_DPI, 0),
-        PointerDpi1 => keys::indexed(keys::POINTER_SENSOR_N_DPI, 1),
-        BacklightEnabled => keys::BACKLIGHT_ENABLED.into(),
-        BacklightMode => keys::BACKLIGHT_MODE.into(),
-        BacklightLevel => keys::BACKLIGHT_LEVEL.into(),
-        BacklightDelayHandsOut => keys::BACKLIGHT_DELAY_HANDS_OUT.into(),
-        BacklightDelayHandsIn => keys::BACKLIGHT_DELAY_HANDS_IN.into(),
-        BacklightDelayPowered => keys::BACKLIGHT_DELAY_POWERED.into(),
-        BacklightPowerOn => keys::BACKLIGHT_POWER_ON.into(),
-        BacklightCrown => keys::BACKLIGHT_CROWN.into(),
-        BacklightPowerSave => keys::BACKLIGHT_POWER_SAVE.into(),
-        BacklightEffect => keys::BACKLIGHT_EFFECT.into(),
-        BacklightCurrentLevel => keys::BACKLIGHT_CURRENT_LEVEL.into(),
-        BacklightStatus => keys::BACKLIGHT_STATUS.into(),
-        WheelMode => keys::WHEEL_MODE.into(),
-        WheelThreshold => keys::WHEEL_THRESHOLD.into(),
-        WheelInvert => keys::WHEEL_INVERT.into(),
-        ThumbwheelInvert => keys::THUMBWHEEL_INVERT.into(),
-        // Decoded into its own information keys; never sent under this name.
-        WheelInfo => String::new(),
+fn text(value: &SettingValue) -> Option<String> {
+    match value {
+        SettingValue::Text(v) => Some(v.clone()),
+        _ => None,
     }
 }
-
-/// The setting record for a wire key, if the firmware has one.
-pub fn parse_setting_key(key: &str) -> Option<SettingKey> {
-    SettingKey::ALL
-        .into_iter()
-        .filter(|k| *k != SettingKey::WheelInfo)
-        .find(|k| setting_key(*k) == key)
+fn integer(value: &SettingValue) -> Option<u32> {
+    match value {
+        SettingValue::Integer(v) => (*v).try_into().ok(),
+        _ => None,
+    }
 }
-
-fn value(value: SettingValue) -> Option<p::Value> {
-    use p::value::Value as V;
-    Some(p::Value {
-        value: Some(match value {
-            SettingValue::Null => return None,
-            SettingValue::Bool(b) => V::Bool(b),
-            SettingValue::Integer(n) => V::Integer(n),
-            SettingValue::Text(t) => V::Text(t),
-        }),
-    })
-}
-
-/// The internal value of a wire value, for a setting of type `kind`.
-pub fn setting_value(kind: SettingType, value: &p::Value) -> Option<SettingValue> {
-    use p::value::Value as V;
-    match (kind, value.value.as_ref()?) {
-        (SettingType::Bool, V::Bool(b)) => Some(SettingValue::Bool(*b)),
-        (SettingType::Integer, V::Integer(n)) => Some(SettingValue::Integer(*n)),
-        (SettingType::Enum | SettingType::Text, V::Text(t)) => Some(SettingValue::Text(t.clone())),
+fn boolean(value: &SettingValue) -> Option<bool> {
+    match value {
+        SettingValue::Bool(v) => Some(*v),
         _ => None,
     }
 }
 
-fn info(key: impl Into<String>, value: SettingValue) -> Option<p::Info> {
-    Some(p::Info {
-        key: key.into(),
-        value: self::value(value),
-    })
-    .filter(|i| i.value.is_some())
-}
-
-/// A device's information list: identity and battery from any source, the values its
-/// integrations only report, and the read-only settings of this device.
-fn device_info(fields: &[InfoField], records: &[Record]) -> Vec<p::Info> {
-    let mut list = Vec::new();
+/// Current connection facts, including behavior the device only permits reading.
+fn device_info(fields: &[InfoField], records: &[Record]) -> p::DeviceInformation {
+    let mut info = p::DeviceInformation::default();
+    let mut identity = p::DeviceIdentity::default();
+    let mut battery = p::BatteryInformation::default();
     for field in fields.iter().filter(|f| f.available) {
-        let key = match (field.key, field.instance) {
-            (InfoKey::Manufacturer, _) => keys::DEVICE_MANUFACTURER,
-            (InfoKey::Model, _) => keys::DEVICE_MODEL,
-            (InfoKey::Serial, _) => keys::DEVICE_SERIAL,
-            (InfoKey::Firmware, 0) => keys::FIRMWARE_VERSION,
-            (InfoKey::Firmware, 1) => keys::BOOTLOADER_VERSION,
-            (InfoKey::Hardware, _) => keys::HARDWARE_REVISION,
-            (InfoKey::Software, _) => keys::SOFTWARE_REVISION,
-            (InfoKey::VendorIdNamespace, _) => keys::VENDOR_REGISTRY,
-            (InfoKey::VendorId, _) => keys::VENDOR_ID,
-            (InfoKey::ProductId, _) => keys::PRODUCT_ID,
-            (InfoKey::ProductVersion, _) => keys::PRODUCT_VERSION,
-            (InfoKey::BatteryPercent, _) => keys::BATTERY_LEVEL,
-            (InfoKey::BatteryCharging, _) => keys::BATTERY_CHARGING,
-            // Name and kind are fields of the device record.
-            (InfoKey::Name | InfoKey::Kind | InfoKey::Firmware, _) => continue,
-        };
-        list.extend(info(key, field.value.clone()));
-    }
-    for record in records.iter().filter(|r| !r.writable) {
-        if record.metadata.key == SettingKey::WheelInfo {
-            list.extend(wheel_info(record));
-        } else if let Some(value) = observed(record) {
-            list.extend(info(setting_key(record.metadata.key), value));
+        let value = &field.value;
+        match (field.key, field.instance) {
+            (InfoKey::Manufacturer, _) => identity.manufacturer = text(value),
+            (InfoKey::Model, _) => identity.model = text(value),
+            (InfoKey::Serial, _) => identity.serial = text(value),
+            (InfoKey::Firmware, 0) => identity.firmware_version = text(value),
+            (InfoKey::Firmware, 1) => identity.bootloader_version = text(value),
+            (InfoKey::Hardware, _) => identity.hardware_revision = text(value),
+            (InfoKey::Software, _) => identity.software_revision = text(value),
+            (InfoKey::VendorIdNamespace, _) => {
+                if let Some(value) = text(value) {
+                    identity.vendor.get_or_insert_default().registry = Some(match value.as_str() {
+                        "usb" => p::VendorRegistry::Usb,
+                        "bluetooth" => p::VendorRegistry::Bluetooth,
+                        _ => p::VendorRegistry::Unknown,
+                    }
+                        as i32);
+                }
+            }
+            (InfoKey::VendorId, _) => {
+                if let Some(v) = integer(value) {
+                    identity.vendor.get_or_insert_default().id = Some(v);
+                }
+            }
+            (InfoKey::ProductId, _) => {
+                if let Some(v) = integer(value) {
+                    identity.product.get_or_insert_default().id = Some(v);
+                }
+            }
+            (InfoKey::ProductVersion, _) => {
+                if let Some(v) = integer(value) {
+                    identity.product.get_or_insert_default().version = Some(v);
+                }
+            }
+            (InfoKey::BatteryPercent, _) => battery.level = integer(value),
+            (InfoKey::BatteryCharging, _) => battery.charging = boolean(value),
+            _ => {}
         }
     }
-    list
+    if identity != p::DeviceIdentity::default() {
+        info.identity = Some(identity);
+    }
+    if battery != p::BatteryInformation::default() {
+        info.battery = Some(battery);
+    }
+    for record in records.iter().filter(|r| !r.writable && r.available) {
+        let key = record.metadata.key;
+        let value = record.observed.wire(key);
+        if matches!(record.observed, Observed::Missing) {
+            continue;
+        }
+        use SettingKey::*;
+        match key {
+            KeyboardPlatform => {
+                info.keyboard.get_or_insert_default().platform = enum_observed(record)
+            }
+            FnRowDefault => {
+                info.keyboard.get_or_insert_default().function_row = enum_observed(record)
+            }
+            PowerAutoOff => info.power.get_or_insert_default().auto_off = integer(&value),
+            BacklightCurrentLevel => {
+                info.backlight.get_or_insert_default().current_brightness = integer(&value)
+            }
+            BacklightStatus => {
+                info.backlight.get_or_insert_default().status = enum_observed(record)
+            }
+            BacklightEnabled => info.backlight.get_or_insert_default().enabled = boolean(&value),
+            BacklightMode => info.backlight.get_or_insert_default().mode = enum_observed(record),
+            BacklightLevel => info.backlight.get_or_insert_default().brightness = integer(&value),
+            BacklightDelayHandsOut => {
+                info.backlight
+                    .get_or_insert_default()
+                    .delay
+                    .get_or_insert_default()
+                    .hands_away = integer(&value)
+            }
+            BacklightDelayHandsIn => {
+                info.backlight
+                    .get_or_insert_default()
+                    .delay
+                    .get_or_insert_default()
+                    .hands_nearby = integer(&value)
+            }
+            BacklightDelayPowered => {
+                info.backlight
+                    .get_or_insert_default()
+                    .delay
+                    .get_or_insert_default()
+                    .external_power = integer(&value)
+            }
+            BacklightPowerOn => {
+                info.backlight.get_or_insert_default().startup_effect = boolean(&value)
+            }
+            BacklightCrown => info.backlight.get_or_insert_default().dial_effect = boolean(&value),
+            BacklightPowerSave => {
+                info.backlight.get_or_insert_default().power_save = boolean(&value)
+            }
+            BacklightEffect => {
+                info.backlight.get_or_insert_default().effect = enum_observed(record)
+            }
+            PointerDpi0 | PointerDpi1 => info.pointer_sensors.push(p::PointerSensorInformation {
+                index: u32::from(key == PointerDpi1),
+                dpi: integer(&value),
+            }),
+            WheelMode => info.wheel.get_or_insert_default().mode = enum_observed(record),
+            WheelThreshold => {
+                info.wheel.get_or_insert_default().free_spin_threshold = integer(&value)
+            }
+            WheelInvert => info.wheel.get_or_insert_default().invert = boolean(&value),
+            ThumbwheelInvert => info.thumbwheel.get_or_insert_default().invert = boolean(&value),
+            WheelInfo => wheel_info(record, &mut info),
+        }
+    }
+    info.pointer_sensors.sort_by_key(|s| s.index);
+    info
 }
 
-fn observed(record: &Record) -> Option<SettingValue> {
-    Some(record.observed.wire(record.metadata.key)).filter(|v| *v != SettingValue::Null)
-}
-
-/// Decodes the HiResWheel capability response: resolution multiplier, capability flags, and from
-/// revision 1 ratchets per rotation and wheel diameter in millimetres.
-fn wheel_info(record: &Record) -> Vec<p::Info> {
+/// Decodes the HiResWheel capability response, including revision-one geometry.
+fn wheel_info(record: &Record, info: &mut p::DeviceInformation) {
     let Observed::Text(hex) = &record.observed else {
-        return Vec::new();
+        return;
     };
     let bytes: Vec<u8> = hex
         .as_bytes()
@@ -297,24 +334,14 @@ fn wheel_info(record: &Record) -> Vec<p::Info> {
         .filter_map(|pair| u8::from_str_radix(core::str::from_utf8(pair).ok()?, 16).ok())
         .collect();
     if bytes.len() * 2 != hex.len() || !matches!(bytes.len(), 2 | 4) {
-        return Vec::new();
+        return;
     }
-    let mut list = Vec::new();
-    list.extend(info(
-        keys::WHEEL_RESOLUTION_MULTIPLIER,
-        SettingValue::Integer(bytes[0].into()),
-    ));
+    let wheel = info.wheel.get_or_insert_default();
+    wheel.resolution_multiplier = Some(bytes[0].into());
     if bytes.len() == 4 {
-        list.extend(info(
-            keys::WHEEL_RATCHETS_PER_ROTATION,
-            SettingValue::Integer(bytes[2].into()),
-        ));
-        list.extend(info(
-            keys::WHEEL_DIAMETER,
-            SettingValue::Integer(bytes[3].into()),
-        ));
+        wheel.ratchets_per_rotation = Some(bytes[2].into());
+        wheel.diameter = Some(bytes[3].into());
     }
-    list
 }
 
 fn hidpp(
@@ -435,15 +462,30 @@ pub fn device(manager: &Manager, policy: &Policy, slot: Option<usize>) -> p::Dev
         blocked: policy.blocked,
         paused: d.is_some_and(|d| d.paused),
         inactive: inactive.map(|r| r as i32),
-        error: d.and_then(|d| d.error).map(|e| error_code(e) as i32),
+        errors: {
+            let mut errors: Vec<i32> = d
+                .and_then(|d| d.error)
+                .map(|e| error_code(e) as i32)
+                .into_iter()
+                .collect();
+            if let Some(error) = live.and_then(|l| l.profile_error) {
+                errors.push(match error {
+                    E::Capacity => p::ErrorCode::ProfileMemoryExceeded,
+                    _ => p::ErrorCode::ProfileLoadFailed,
+                } as i32);
+            }
+            errors.sort_unstable();
+            errors.dedup();
+            errors
+        },
         security: connection
             .filter(|_| d.is_some_and(|d| d.state == ConnectionState::Connected))
             .and_then(|c| c.security)
             .map(security),
         integrations: hidpp(policy, d, connection).into_iter().collect(),
-        info: live
-            .map(|l| device_info(&fields, l.catalog.records()))
-            .unwrap_or_default(),
+        information: live
+            .filter(|_| d.is_some_and(|d| d.state == ConnectionState::Connected))
+            .map(|l| device_info(&fields, l.catalog.records())),
         roles: roles(role_bits),
         output_preferences: policy
             .output_preferences
@@ -461,191 +503,18 @@ pub fn device(manager: &Manager, policy: &Policy, slot: Option<usize>) -> p::Dev
         profiles: manager.profiles_supported().then(|| p::ProfileLayers {
             profiles: policy.profiles.iter().map(|&id| id as u32).collect(),
         }),
-        profile_error: live
-            .and_then(|l| l.profile_error)
-            .map(|e| error_code(e) as i32),
     }
 }
 
-/// A setting record as a wire setting. `None` for read-only records, which are information.
-pub fn setting(record: &Record) -> Option<p::Setting> {
-    if !record.writable {
-        return None;
+/// A resource whose count and allowance can each be unknown.
+pub fn resource(
+    kind: p::ResourceType,
+    count: Option<u32>,
+    limit: Option<u32>,
+) -> p::ResourceCapacity {
+    p::ResourceCapacity {
+        r#type: kind as i32,
+        count,
+        limit,
     }
-    let key = record.metadata.key;
-    let saved = record.preference.as_ref().map(|p| scalar(key, p.value));
-    let observed = observed(record);
-    let metadata = record.metadata.wire();
-    use p::setting::{Status, Type};
-    let status = record.preference.as_ref().map(|_| match record.state {
-        SettingState::Unmanaged | SettingState::Pending | SettingState::Applying => {
-            Status::State(p::SettingState::Pending as i32)
-        }
-        SettingState::Applied => Status::State(p::SettingState::Applied as i32),
-        SettingState::ChangedOnDevice => Status::State(p::SettingState::ChangedOnDevice as i32),
-        SettingState::Unsupported => Status::State(p::SettingState::Unsupported as i32),
-        SettingState::Uncertain => Status::Error(p::ErrorCode::Timeout as i32),
-        SettingState::Error => {
-            Status::Error(error_code(record.error.unwrap_or(E::InternalError)) as i32)
-        }
-    });
-    let integer = |v: Option<SettingValue>| match v {
-        Some(SettingValue::Integer(n)) => Some(n),
-        _ => None,
-    };
-    let text = |v: Option<SettingValue>| match v {
-        Some(SettingValue::Text(t)) => Some(t),
-        _ => None,
-    };
-    let kind = match metadata.kind {
-        SettingType::Bool => Type::Bool(p::BoolSetting {
-            value: match observed {
-                Some(SettingValue::Bool(b)) => Some(b),
-                _ => None,
-            },
-            saved: match saved {
-                Some(SettingValue::Bool(b)) => Some(b),
-                _ => None,
-            },
-        }),
-        SettingType::Integer => Type::Integer(p::IntegerSetting {
-            value: integer(observed),
-            saved: integer(saved),
-            limits: if !metadata.choices.is_empty() {
-                Some(p::integer_setting::Limits::Choices(p::IntegerChoices {
-                    values: metadata
-                        .choices
-                        .iter()
-                        .filter_map(|c| match c {
-                            SettingValue::Integer(n) => Some(*n),
-                            _ => None,
-                        })
-                        .collect(),
-                }))
-            } else if let (Some(min), Some(max)) = (metadata.min, metadata.max) {
-                Some(p::integer_setting::Limits::Range(p::IntegerRange {
-                    min,
-                    max,
-                    step: metadata.step.map_or(0, |s| s.max(0) as u64),
-                }))
-            } else {
-                None
-            },
-        }),
-        SettingType::Enum => Type::Enum(p::EnumSetting {
-            value: text(observed),
-            saved: text(saved),
-            choices: metadata
-                .choices
-                .iter()
-                .filter_map(|c| match c {
-                    SettingValue::Text(t) => Some(t.clone()),
-                    _ => None,
-                })
-                .collect(),
-        }),
-        SettingType::Text => Type::Text(p::TextSetting {
-            value: text(observed),
-            saved: text(saved),
-            max_bytes: Some(crate::settings::MAX_TEXT_BYTES as u32),
-        }),
-    };
-    Some(p::Setting {
-        integration: p::IntegrationKind::Hidpp as i32,
-        key: setting_key(key),
-        status,
-        r#type: Some(kind),
-    })
-}
-
-/// Every setting `catalog` holds, in listing order: by integration, then key compared bytewise.
-pub fn settings(catalog: &Catalog) -> Vec<p::Setting> {
-    let mut settings: Vec<p::Setting> = catalog.records().iter().filter_map(setting).collect();
-    settings.sort_by(|a, b| setting_order(a).cmp(&setting_order(b)));
-    settings
-}
-
-/// Where a setting comes in a listing.
-pub fn setting_order(setting: &p::Setting) -> (i32, &[u8]) {
-    (setting.integration, setting.key.as_bytes())
-}
-
-fn warning_code(code: WarningCode) -> p::WarningCode {
-    use WarningCode as C;
-    use p::WarningCode as W;
-    match code {
-        C::NumericSelectorUnsupported => W::NumericSelectorUnsupported,
-        C::PointerSelectorUnsupported => W::PointerSelectorUnsupported,
-        C::BufferedInputUnsupported => W::BufferedInputUnsupported,
-        C::IndicatorReadUnsupported => W::IndicatorReadUnsupported,
-        C::IndicatorWriteUnsupported => W::IndicatorWriteUnsupported,
-        C::IndicatorReportTooLarge => W::IndicatorReportTooLarge,
-        C::BufferedIndicatorUnsupported => W::BufferedIndicatorUnsupported,
-        C::IndicatorArrayFull => W::IndicatorArrayFull,
-        C::IndicatorRelativeSelectorUnsupported => W::IndicatorRelativeSelectorUnsupported,
-        C::IndicatorRangeUnsupported => W::IndicatorRangeUnsupported,
-        C::IndicatorModeUnsupported => W::IndicatorModeUnsupported,
-        C::IndicatorNonlinearUnsupported => W::IndicatorNonlinearUnsupported,
-        C::IndicatorScaleUnsupported => W::IndicatorScaleUnsupported,
-        C::IndicatorStateUnknown => W::IndicatorStateUnknown,
-        C::IndicatorReadFailed => W::IndicatorReadFailed,
-        C::IndicatorWriteFailed => W::IndicatorWriteFailed,
-    }
-}
-
-pub fn warning(w: &DeviceWarning) -> p::DeviceWarning {
-    p::DeviceWarning {
-        code: warning_code(w.code) as i32,
-        service: w.service.into(),
-        report_type: match w.report_type {
-            None => p::ReportType::Unknown,
-            Some(HidReportType::Input) => p::ReportType::Input,
-            Some(HidReportType::Output) => p::ReportType::Output,
-            Some(HidReportType::Feature) => p::ReportType::Feature,
-        } as i32,
-        report_id: w.report_id.map(u32::from),
-        bit_offset: w.bit_offset.map(u32::from),
-        usage_page: w.usage_page.map(u32::from),
-        usage: w.usage.map(u32::from),
-    }
-}
-
-/// One page of device `id`'s warnings; `end` is left for the caller.
-pub fn warnings(id: u64, warnings: &[DeviceWarning]) -> p::DeviceWarnings {
-    p::DeviceWarnings {
-        device: id as u32,
-        warnings: warnings.iter().map(warning).collect(),
-        end: false,
-    }
-}
-
-/// Where a warning comes in a listing: by service, report type, report ID, bit offset, usage page,
-/// usage and code, a missing field before any value.
-pub type WarningOrder = (
-    u32,
-    i32,
-    Option<u32>,
-    Option<u32>,
-    Option<u32>,
-    Option<u32>,
-    i32,
-);
-pub fn warning_order(w: &p::DeviceWarning) -> WarningOrder {
-    (
-        w.service,
-        w.report_type,
-        w.report_id,
-        w.bit_offset,
-        w.usage_page,
-        w.usage,
-        w.code,
-    )
-}
-
-/// `warnings` in listing order, each listed once.
-pub fn sorted_warnings(warnings: &[DeviceWarning]) -> Vec<DeviceWarning> {
-    let mut sorted = warnings.to_vec();
-    sorted.sort_by_cached_key(|w| warning_order(&warning(w)));
-    sorted.dedup();
-    sorted
 }

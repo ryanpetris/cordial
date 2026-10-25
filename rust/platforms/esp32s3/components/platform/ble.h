@@ -26,7 +26,7 @@ typedef void (*cordial_ble_emit)(const cordial_ble_event *);
 enum cordial_ble_command_kind { CORDIAL_BLE_SCAN=1, CORDIAL_BLE_CONNECT, CORDIAL_BLE_DISCONNECT,
     CORDIAL_BLE_REPLY, CORDIAL_BLE_SERVICES, CORDIAL_BLE_CHARACTERISTICS, CORDIAL_BLE_DESCRIPTORS,
     CORDIAL_BLE_READ, CORDIAL_BLE_WRITE, CORDIAL_BLE_FORGET, CORDIAL_BLE_ADOPT, CORDIAL_BLE_SUBSCRIBE, CORDIAL_BLE_IMPORT, CORDIAL_BLE_EXPORT, CORDIAL_BLE_RECONNECT, CORDIAL_BLE_ACCEPT,
-    CORDIAL_BLE_READ_UUID };
+    CORDIAL_BLE_READ_UUID, CORDIAL_BLE_PROMOTE };
 typedef struct {
     uint64_t scan;
     uint32_t token, request, number;
@@ -37,6 +37,7 @@ typedef struct {
 } cordial_ble_command;
 int cordial_ble_start(cordial_ble_emit);
 int cordial_ble_submit(const cordial_ble_command *);
+void cordial_ble_promote(uint32_t token);
 
 void cordial_ble_identity(const uint8_t *irk);
 

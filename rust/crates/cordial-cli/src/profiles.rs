@@ -2,7 +2,8 @@
 //! rules in words, and the checks made before asking the adapter to change any of them.
 use crate::{error::Error, model, view::State};
 use cordial_protocol::{
-    self as p, ConfigurationInterface, ErrorCode, Role, profile_rule, profile_rule_change,
+    self as p, ConfigurationInterface, ErrorCode, ResourceType, Role, profile_rule,
+    profile_rule_change,
 };
 
 /// The longest profile name, in UTF-8 bytes.
@@ -18,9 +19,19 @@ pub fn available(status: &p::Status) -> bool {
     support(status).is_some()
 }
 
-/// The most profiles one device's layers can list, when the adapter has profiles.
+/// A profile resource the adapter reports.
+pub fn resource(status: &p::Status, kind: ResourceType) -> Option<&p::ResourceCapacity> {
+    model::resource(&support(status)?.resources, kind)
+}
+
+/// The most profiles one device's layers can list, when the adapter reports it.
 pub fn max_layers(status: &p::Status) -> Option<u32> {
-    support(status).map(|s| s.max_layers)
+    resource(status, ResourceType::Layers)?.limit
+}
+
+/// The most outputs one remap can hold, when the adapter reports it.
+fn max_outputs(support: &p::ProfileSupport) -> Option<u32> {
+    model::resource(&support.resources, ResourceType::Outputs)?.limit
 }
 
 /// The kinds of input a profile's rules change that this build knows.
@@ -166,30 +177,6 @@ pub fn interface_refusal(status: &p::Status, updates: &[InterfaceUpdate]) -> Opt
         }
     }
     None
-}
-
-/// Whether saving `updates` reconnects USB: an interface is enabled or disabled, or an enabled
-/// interface changes its profile.
-pub fn reconnects(status: &p::Status, updates: &[InterfaceUpdate]) -> bool {
-    reconnected(
-        &status.configuration_interfaces,
-        &configured(status, updates),
-    )
-}
-
-/// Whether going from the `before` interfaces to the `after` ones reconnects USB.
-pub fn reconnected(
-    before: &[p::ConfigurationInterfaceSupport],
-    after: &[p::ConfigurationInterfaceSupport],
-) -> bool {
-    before.iter().any(|old| {
-        after
-            .iter()
-            .find(|new| new.interface == old.interface)
-            .is_some_and(|new| {
-                old.enabled != new.enabled || new.enabled && old.profile != new.profile
-            })
-    })
 }
 
 /// Why the adapter would refuse to delete a profile, or `None` when nothing uses it.
@@ -495,12 +482,8 @@ pub fn rule_refusal(support: &p::ProfileSupport, rule: &p::ProfileRule) -> Optio
                     seen.push(resolved);
                 }
             }
-            (seen.len() > support.max_remap_outputs as usize).then(|| {
-                format!(
-                    "a remap holds at most {} outputs",
-                    support.max_remap_outputs
-                )
-            })
+            let max = max_outputs(support)?;
+            (seen.len() > max as usize).then(|| format!("a remap holds at most {max} outputs"))
         }
         Some(profile_rule::Effect::Scale(scale)) => {
             if !accepts(
@@ -597,10 +580,23 @@ mod tests {
                 range(p::usage_range::Kind::AxisInput, 0x01, 0x30, 0x35, GAMEPAD),
                 range(p::usage_range::Kind::AxisOutput, 0x01, 0x30, 0x35, GAMEPAD),
             ],
-            memory_budget: 4096,
-            max_remap_outputs: 2,
-            max_layers: 4,
-            memory_used: 0,
+            resources: vec![
+                p::ResourceCapacity {
+                    r#type: ResourceType::Memory as i32,
+                    count: Some(0),
+                    limit: Some(4096),
+                },
+                p::ResourceCapacity {
+                    r#type: ResourceType::Outputs as i32,
+                    count: None,
+                    limit: Some(2),
+                },
+                p::ResourceCapacity {
+                    r#type: ResourceType::Layers as i32,
+                    count: None,
+                    limit: Some(4),
+                },
+            ],
         }
     }
 
@@ -799,6 +795,7 @@ mod tests {
         p::ConfigurationInterfaceSupport {
             interface: i as i32,
             enabled,
+            active: enabled,
             profile,
             conflicts: conflicts.iter().map(|c| *c as i32).collect(),
         }
@@ -856,12 +853,6 @@ mod tests {
         via_only.configuration_interfaces.remove(1);
         let error = interface_refusal(&via_only, &[update(Vial, Some(false), None)]).unwrap();
         assert_eq!(error.code_of(), Some(ErrorCode::Unsupported));
-        assert!(reconnects(&status, &[update(Via, Some(true), Some(2))]));
-        // A disabled interface's profile changes without reconnecting.
-        assert!(!reconnects(&status, &[update(Vial, None, Some(4))]));
-        let mut enabled = status.clone();
-        enabled.configuration_interfaces[1].enabled = true;
-        assert!(reconnects(&enabled, &[update(Vial, None, Some(4))]));
     }
 
     #[test]

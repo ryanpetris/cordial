@@ -1,13 +1,14 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { isLow } from "../../shared/battery.ts";
 import { adapterName } from "../../shared/adapter-name.ts";
-import { reconnectsUsb, stagedInterfaces } from "../../shared/profiles.ts";
+import { resource } from "../../shared/capacity.ts";
+import { stagedInterfaces } from "../../shared/profiles.ts";
 import type { AdapterChanges, AdapterEntry, AdapterStatus, AppState, HostPlatform, InterfaceChange, TransportName } from "../../shared/state.ts";
-import { PLATFORMS, STORAGE_FULL, TRANSPORTS, adapterStatus, batteryStale, deviceStatus, infoOf, storageFull } from "../../shared/text.ts";
+import { PLATFORMS, STORAGE_FULL, TRANSPORTS, USB_CAPACITY, adapterStatus, batteryStale, capacityText, deviceStatus, storageFull } from "../../shared/text.ts";
 import { useAction } from "../api.ts";
 import type { Selection } from "../App.tsx";
 import { Banner, Card, Dialog, Fact, Facts, Meter, Page, Pill, Segmented, Spinner, Staged, SwitchRow, TabBar, TabPanel } from "./common.tsx";
-import { AdapterProfiles, ConfigurationInterfaces, ProfileMemory, RECONNECT_TEXT, RECONNECT_TITLE } from "./Profiles.tsx";
+import { AdapterProfiles, ConfigurationInterfaces, ProfileMemory } from "./Profiles.tsx";
 import { AdapterIcon, CheckIcon, ChevronIcon, CloseIcon, DeviceIcon, PencilIcon, PlugIcon, SwapIcon, UndoIcon, UnplugIcon } from "./icons.tsx";
 
 /** The rename dialog's contents; mounted each time it opens, so it starts from the current name. */
@@ -115,7 +116,6 @@ export function AdapterPage({
   const [saving, runSave] = useAction(true);
   const [renameError, setRenameError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [confirming, setConfirming] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
   const [editing, setEditing] = useState(renaming);
   useEffect(() => setEditing(renaming), [renaming]);
@@ -157,7 +157,6 @@ export function AdapterPage({
   };
   const platform = draft.platform ?? view?.platform;
   const save = async () => {
-    setConfirming(false);
     if (!canSave) return;
     setSaveError(null);
     const sent = changes;
@@ -165,12 +164,11 @@ export function AdapterPage({
     if (result.ok) onDraft((d) => settle(d, sent));
     else setSaveError(result.message);
   };
-  // Saving a change that reconnects USB asks first.
-  const requestSave = () => {
-    if (!canSave) return;
-    if (view && reconnectsUsb(view, changes)) setConfirming(true);
-    else void save();
-  };
+  const requestSave = () => { void save(); };
+  // A save whose outcome was unknown no longer is once the adapter reports the staged values.
+  useEffect(() => {
+    if (view && !dirty) setSaveError(null);
+  }, [view, dirty]);
   const discard = () => {
     setSaveError(null);
     onDraft(() => ({}));
@@ -201,6 +199,12 @@ export function AdapterPage({
   const transports = view?.transports ?? [];
   // Details reports the adapter's live state, so it shows only while connected.
   const live = connected ? view : null;
+  const usbInterfaces = resource(live?.resources, "interfaces");
+  const usbErrors = USB_CAPACITY.filter(([code]) => live?.errors.includes(code));
+  const enabledDevices = live?.transports.flatMap((t) => {
+    const r = resource(t.resources, "devices");
+    return t.enabled && r && (r.count !== null || r.limit !== null) ? [{ transport: t.transport, r }] : [];
+  }) ?? [];
   const empty = (
     <div className="page-empty">
       <AdapterIcon size={64} />
@@ -268,17 +272,6 @@ export function AdapterPage({
           if (result.ok) closeRename();
           else setRenameError(result.message);
         }} />
-      </Dialog>
-      <Dialog open={confirming} title={RECONNECT_TITLE} onClose={() => setConfirming(false)}>
-        <p className="dialog-body">{RECONNECT_TEXT}</p>
-        <footer className="dialog-footer">
-          <button onClick={() => setConfirming(false)}>
-            <CloseIcon /> Cancel
-          </button>
-          <button className="suggested" disabled={!canSave} onClick={() => void save()}>
-            <CheckIcon /> Save
-          </button>
-        </footer>
       </Dialog>
       {adapter.attention.map((a) => (
         <Banner key={a} kind="warning">
@@ -376,23 +369,32 @@ export function AdapterPage({
               </Card>
             ) : null}
 
-            {live && live.transports.some((t) => t.enabled && t.maxEnabled !== null) ? (
+            {enabledDevices.length ? (
               <Card title="Active Devices">
-                {live.transports.map(({ transport, maxEnabled, enabled }) => {
-                  if (!enabled || maxEnabled === null) return null;
-                  const used = devices.filter((d) => d.device.transport === transport && d.device.inactive === null).length;
-                  return (
-                    <div key={transport} className="row meter-row">
-                      <div className="meter-line">
-                        <span>{TRANSPORTS[transport]}</span>
-                        <span className="value">
-                          {used} of {maxEnabled}
-                        </span>
-                      </div>
-                      <Meter fraction={maxEnabled ? used / maxEnabled : 0} />
+                {enabledDevices.map(({ transport, r }) => (
+                  <div key={transport} className="row meter-row">
+                    <div className="meter-line">
+                      <span>{TRANSPORTS[transport]}</span>
+                      <span className="value">{capacityText(r)}</span>
                     </div>
-                  );
-                })}
+                    {r.count !== null && r.limit !== null ? <Meter fraction={r.limit ? Math.min(1, r.count / r.limit) : 0} /> : null}
+                  </div>
+                ))}
+              </Card>
+            ) : null}
+
+            {usbInterfaces || usbErrors.length ? (
+              <Card title="USB">
+                <Facts>
+                  <Fact label="Interfaces">
+                    {usbInterfaces ? capacityText(usbInterfaces) : "Unknown"}
+                    {usbErrors.map(([code, label]) => (
+                      <span key={code} className="fact-detail">
+                        {label}
+                      </span>
+                    ))}
+                  </Fact>
+                </Facts>
               </Card>
             ) : null}
 
@@ -411,8 +413,8 @@ export function AdapterPage({
             {live ? (
               <Card title="Information">
                 <Facts>
-                  <Fact label="Firmware">{String(infoOf(live.info, "firmware.version") ?? "Unknown")}</Fact>
-                  {infoOf(live.info, "board.name") !== undefined ? <Fact label="Board">{String(infoOf(live.info, "board.name"))}</Fact> : null}
+                  <Fact label="Firmware">{live.information.firmwareVersion ?? "Unknown"}</Fact>
+                  {live.information.boardName !== null ? <Fact label="Board">{live.information.boardName}</Fact> : null}
                 </Facts>
               </Card>
             ) : null}

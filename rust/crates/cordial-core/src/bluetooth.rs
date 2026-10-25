@@ -24,7 +24,13 @@ impl Capabilities {
         }
     }
 }
-pub use crate::model::errors::HidReportType as ReportType;
+/// The report types used by the Bluetooth HID transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReportType {
+    Input,
+    Output,
+    Feature,
+}
 /// A service's parsed report map, owned from discovery through admission.
 pub struct Descriptor {
     pub service: ServiceId,
@@ -286,7 +292,11 @@ pub trait Bluetooth {
     /// finish native cleanup for a pairing that has not been adopted. Do not
     /// publish later callbacks under a reused slot or remove another live bond.
     fn disconnect(&mut self, link: LinkId);
+    /// Accept the bond without releasing the pairing connection reserve.
     fn adopt(&mut self, link: LinkId) -> Result<(), Error>;
+    /// Charge an adopted, resident link to its normal transport allowance.
+    /// This synchronous handoff cannot fail after the bond has been committed.
+    fn promote(&mut self, link: LinkId);
     fn pair_reply(
         &mut self,
         link: LinkId,

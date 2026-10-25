@@ -11,7 +11,6 @@ PROFILE ?= development
 PROTOCOL_BASE ?= $(shell $(PYTHON) tools/version.py --protocol-base 2>/dev/null)
 BOARDS := pico_w pico2_w waveshare_rp2350b_plus_w xiao_esp32s3
 ESP_BOARDS := xiao_esp32s3
-PICO_BOARDS := $(filter-out $(ESP_BOARDS),$(BOARDS))
 DOCKER ?= docker
 DEB_DISTRIBUTION ?= trixie
 DEB_BASE_trixie := debian:13
@@ -25,9 +24,9 @@ FIRMWARE_PLATFORM = $(if $(filter $(ESP_BOARDS),$(BOARD)),esp32s3,pico)
 	package-cli package-cli-tar package-cli-arch package-cli-deb package-firmware \
 	local-package-desktop local-package-desktop-tar local-package-web local-package-cli \
 	image-app image-pico image-esp32s3 image-arch image-deb \
-	check check-memory check-firmware check-firmware-all check-rust check-desktop check-protocol check-tools version clean
+	check check-firmware check-firmware-all check-rust check-desktop check-protocol check-tools version clean
 help:
-	@echo 'Cordial: all desktop web cli firmware firmware-all check check-memory check-firmware check-firmware-all version clean'
+	@echo 'Cordial: all desktop web cli firmware firmware-all check check-firmware check-firmware-all version clean'
 	@echo 'Without Docker: local-desktop local-web local-cli'
 	@echo 'Release packages: package-desktop package-web package-cli package-firmware (CORDIAL_VERSION, default 0.0.0)'
 	@echo 'Distribution packages: package-desktop-arch package-desktop-deb package-cli-arch package-cli-deb (DEB_DISTRIBUTION=$(DEB_DISTRIBUTION))'
@@ -155,10 +154,6 @@ check-firmware: image-$(FIRMWARE_PLATFORM)
 	$(call build,$(FIRMWARE_PLATFORM),python3 rust/tools/build_firmware.py rust/boards/$(BOARD).json --profile $(PROFILE) --clippy)
 check-firmware-all:
 	@set -e; for board in $(BOARDS); do for profile in production debug; do $(MAKE) check-firmware BOARD=$$board PROFILE=$$profile; done; done
-# The allocation check builds each Pico board's development firmware and runs the workloads with
-# that board's configuration and heap under QEMU in the Pico image.
-check-memory: image-pico
-	$(call build,pico,for board in $(PICO_BOARDS); do python3 rust/tools/build_firmware.py rust/boards/$$board.json --profile development; python3 rust/tools/check_memory.py build/firmware/$$CORDIAL_VERSION-dev/$$board-btstack-pico-sdk-cyw43/cordial-$$board-btstack-pico-sdk-cyw43.elf; done)
 check-rust:
 	$(PYTHON) rust/tools/firmware_dependencies.py --btstack
 	cd rust
@@ -173,7 +168,6 @@ check-tools:
 # Lint and breaking checks cover every schema in proto/. A schema the base release lacks, such as
 # storage.proto before its first release, is new to buf breaking and has nothing to break.
 check-protocol: desktop/node_modules/.package-lock.json
-	$(PYTHON) tools/check_keys.py $(if $(PROTOCOL_BASE),--against $(PROTOCOL_BASE))
 	npm --prefix desktop/packages/protocol run lint
 	if [ -n "$(PROTOCOL_BASE)" ] && git cat-file -e "$(PROTOCOL_BASE):proto/cordial.proto" 2>/dev/null; then
 	  npm --prefix desktop/packages/protocol run breaking -- "../../../.git#ref=$(PROTOCOL_BASE),subdir=proto"
@@ -181,4 +175,4 @@ check-protocol: desktop/node_modules/.package-lock.json
 version:
 	@$(PYTHON) tools/version.py
 clean:
-	rm -rf rust/target rust/platforms/pico/target rust/platforms/esp32s3/target rust/tests/memory-arm/target desktop/out desktop/dist build/packages build/firmware build/release target/firmware target/memory-arm target/tmp
+	rm -rf rust/target rust/platforms/pico/target rust/platforms/esp32s3/target desktop/out desktop/dist build/packages build/firmware build/release target/firmware target/tmp

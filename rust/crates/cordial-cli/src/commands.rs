@@ -8,14 +8,16 @@ use crate::{
     error::Error,
     model::{self, Prompt},
     profiles::{self, InterfaceUpdate},
-    records, storage,
+    records,
+    settings::{self, Field, Setting},
+    storage,
     ui::{catalog, text},
     view::State,
 };
 use cordial_client::paging::{self as paging, Page};
 use cordial_protocol::{
-    self as p, CapacityReason, CodeKind, ErrorCode, IntegrationKind, keys, pairing,
-    profile_list_entry, profile_rule_change, request::Command as C, response,
+    self as p, CapacityReason, CodeKind, ErrorCode, IntegrationKind, pairing, profile_list_entry,
+    profile_rule_change, request::Command as C, response,
 };
 use std::time::Duration;
 
@@ -476,7 +478,6 @@ pub(crate) fn execute(
         | Command::Set(target, ..)
         | Command::GamepadOutput(target, _)
         | Command::Layers(target, _)
-        | Command::Warnings(target)
         | Command::Settings(target)
         | Command::SettingGet(target, _)
         | Command::SettingSet(target, ..)
@@ -943,10 +944,6 @@ fn device_command(
                 "device get",
                 true,
             )?)?;
-            // A device has warnings only while it has a link.
-            if device.state() != p::DeviceState::Disconnected {
-                list_warnings(session, id, false)?;
-            }
             Ok(Outcome::Device { subject, device })
         }
         Command::Connect(_) => {
@@ -1057,48 +1054,39 @@ fn device_command(
             };
             save_device(session, st, &d, subject, update, name)
         }
-        Command::Warnings(_) => Ok(Outcome::Warnings {
-            subject,
-            warnings: list_warnings(session, id, true)?,
-        }),
         Command::Settings(_) => {
             let _pending = session.pending("setting list", id);
             list_settings(session, id, true)?;
             Ok(Outcome::Settings(subject))
         }
-        Command::SettingGet(_, key) => {
+        Command::SettingGet(_, field) => {
             let settings = list_settings(session, id, true)?;
-            let setting = find(&settings, key, "setting get")?;
+            let setting = find(&settings, field, "setting get")?;
             Ok(Outcome::Setting { subject, setting })
         }
-        Command::SettingSet(_, key, input) => {
+        Command::SettingSet(_, field, input) => {
             let settings = list_settings(session, id, false)?;
-            let setting = find(&settings, key, "setting set")?;
+            let setting = find(&settings, field, "setting set")?;
             let value = catalog::setting_value(&setting, input).map_err(Error::new)?;
-            save(session, &subject, vec![(setting, value)], Vec::new())
+            save(session, &subject, vec![(setting.field, value)], Vec::new())
         }
-        Command::SettingForget(_, key) => {
+        Command::SettingForget(_, field) => {
             let settings = list_settings(session, id, false)?;
-            let setting = find(&settings, key, "setting forget")?;
-            save(session, &subject, Vec::new(), vec![setting])
+            let setting = find(&settings, field, "setting forget")?;
+            save(session, &subject, Vec::new(), vec![setting.field])
         }
         Command::SettingsSave { set, forget, .. } => {
             let known = st.settings_of(id);
-            let set = set
-                .iter()
-                .map(|(key, value)| {
-                    let setting = find(known, key, "setting set")?;
-                    if !model::accepts(&setting, value) {
-                        return Err(refused(ErrorCode::BadArgs, "setting set"));
-                    }
-                    Ok((setting, value.clone()))
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            let forget = forget
-                .iter()
-                .map(|key| find(known, key, "setting forget"))
-                .collect::<Result<Vec<_>, Error>>()?;
-            save(session, &subject, set, forget)
+            for (field, value) in set {
+                let setting = find(&known, field, "setting set")?;
+                if !settings::accepts(&setting, value) {
+                    return Err(refused(ErrorCode::BadArgs, "setting set"));
+                }
+            }
+            for field in forget {
+                find(&known, field, "setting forget")?;
+            }
+            save(session, &subject, set.clone(), forget.clone())
         }
         Command::Features(_) => {
             let features = read_pages::<p::FeatureList>(session, "feature list", true, |after| {
@@ -1140,10 +1128,12 @@ fn save_device(
         return Err(no_capacity(CapacityReason::Enabled, "device set"));
     }
     if let Some(layers) = &update.layers {
-        let Some(max) = profiles::max_layers(&st.status) else {
+        if !profiles::available(&st.status) {
             return Err(Error::new(NO_PROFILES));
-        };
-        if layers.len() > max as usize {
+        }
+        if let Some(max) = profiles::max_layers(&st.status)
+            && layers.len() > max as usize
+        {
             return Err(Error::new(format!(
                 "a device can use at most {max} profiles"
             )));
@@ -1218,7 +1208,7 @@ pub fn enabled_full(st: &State, d: &p::Device) -> bool {
     let Some(transport) = model::transport(d.transport) else {
         return false;
     };
-    let Some(max) = model::max_enabled(&st.status, transport) else {
+    let Some(max) = model::enabled_devices(&st.status, transport).and_then(|r| r.limit) else {
         return false;
     };
     let enabled = st
@@ -1229,33 +1219,22 @@ pub fn enabled_full(st: &State, d: &p::Device) -> bool {
     enabled >= max as usize
 }
 
-fn list_settings(session: &Session, id: u32, reported: bool) -> Result<Vec<p::Setting>, Error> {
-    read_pages::<p::DeviceSettings>(session, "setting list", reported, |after| {
+/// Every setting of a device, read page by page.
+fn list_settings(session: &Session, id: u32, reported: bool) -> Result<Vec<Setting>, Error> {
+    let objects = read_pages::<p::DeviceSettings>(session, "setting list", reported, |after| {
         C::ListSettings(p::ListSettings {
             device: id,
             after: after.cloned(),
         })
-    })
+    })?;
+    Ok(settings::settings(&objects))
 }
 
-fn list_warnings(
-    session: &Session,
-    id: u32,
-    reported: bool,
-) -> Result<Vec<p::DeviceWarning>, Error> {
-    read_pages::<p::DeviceWarnings>(session, "warning list", reported, |after| {
-        C::ListWarnings(p::ListWarnings {
-            device: id,
-            after: after.copied(),
-        })
-    })
-}
-
-/// The setting with `key`. A key the catalog doesn't know is never shown, so it isn't found.
-fn find(settings: &[p::Setting], key: &str, command: &'static str) -> Result<p::Setting, Error> {
+/// The setting of `field`.
+fn find(settings: &[Setting], field: &Field, command: &'static str) -> Result<Setting, Error> {
     settings
         .iter()
-        .find(|s| s.key == key && keys::lookup(&s.key).is_some())
+        .find(|s| s.field == *field)
         .cloned()
         .ok_or_else(|| refused(ErrorCode::NotFound, command))
 }
@@ -1264,21 +1243,19 @@ fn find(settings: &[p::Setting], key: &str, command: &'static str) -> Result<p::
 fn save(
     session: &Session,
     subject: &Subject,
-    set: Vec<(p::Setting, p::value::Value)>,
-    forget: Vec<p::Setting>,
+    set: Vec<(Field, settings::Value)>,
+    forget: Vec<Field>,
 ) -> Result<Outcome, Error> {
     let _pending = session.pending("setting set", subject.id);
-    let set_keys: Vec<String> = set.iter().map(|(s, _)| s.key.clone()).collect();
-    let forget_keys: Vec<String> = forget.iter().map(|s| s.key.clone()).collect();
     let name = if set.is_empty() {
         "setting forget"
     } else {
         "setting set"
     };
     let changes = set
-        .into_iter()
-        .map(|(s, value)| model::save_change(&s, value))
-        .chain(forget.iter().map(model::forget_change))
+        .iter()
+        .map(|(field, value)| settings::update(*field, Some(*value)))
+        .chain(forget.iter().map(|field| settings::update(*field, None)))
         .collect();
     session.call(
         C::SetSettings(p::SetSettings {
@@ -1289,11 +1266,10 @@ fn save(
         true,
     )?;
     // The view took the values sent once the adapter accepted them.
-    let settings = session.state().settings_of(subject.id).to_vec();
     Ok(Outcome::Saved {
         subject: subject.clone(),
-        set: set_keys,
-        forget: forget_keys,
-        settings,
+        set: set.into_iter().map(|(field, _)| field).collect(),
+        forget,
+        settings: session.state().settings_of(subject.id),
     })
 }

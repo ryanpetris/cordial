@@ -458,11 +458,11 @@ impl Engine {
             let outcome = if !r.available
                 || (self.apply
                     && (!r.writable
-                        || !r
-                            .preference
-                            .as_ref()
-                            .is_some_and(|p| r.metadata.accepts(p.value))))
-            {
+                        || !r.preference.as_ref().is_some_and(|p| {
+                            r.metadata.feature == p.metadata.feature
+                                && r.metadata.scope == p.metadata.scope
+                                && r.metadata.accepts(p.value)
+                        }))) {
                 Outcome::Unsupported
             } else if !self.apply && r.error.is_none() {
                 Outcome::Read
@@ -969,17 +969,6 @@ fn publish(
         catalog.catalog_changed = true;
     }
     r.changed.set(true);
-    if let Some(p) = &r.preference
-        && (!writable
-            || metadata.feature != p.metadata.feature
-            || metadata.scope != p.metadata.scope)
-    {
-        r.metadata = p.metadata.clone();
-        r.writable = true;
-        r.available = false;
-        failed(r, Error::UnsupportedSetting, false);
-        return Ok(());
-    }
     if r.metadata != metadata {
         r.metadata = metadata;
     }
@@ -989,7 +978,10 @@ fn publish(
         observation(r, value, now, source);
     }
     if let Some(p) = &r.preference
-        && !r.metadata.accepts(p.value)
+        && (!r.writable
+            || r.metadata.feature != p.metadata.feature
+            || r.metadata.scope != p.metadata.scope
+            || !r.metadata.accepts(p.value))
     {
         r.state = SettingState::Unsupported;
         r.error = Some(Error::UnsupportedSetting);

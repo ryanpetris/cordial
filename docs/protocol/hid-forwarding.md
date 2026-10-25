@@ -8,11 +8,13 @@ relative key/button events, absolute and relative pointer axes, 16 mouse buttons
 both wheels, and Consumer-page keys, switches, and linear controls. Relative
 selector items containing ordinary keys or buttons produce press/release events;
 selectors for numeric pointer or Consumer axes require an application-defined
-conversion and produce a field warning.
+conversion and are not forwarded.
 
 Each map is limited to 2,048 descriptor bytes, 512 report bytes, 16 report IDs,
-96 fields, and 128 compressed usage spans. The shared forwarder has four source
-slots, eight simultaneously held Consumer keys, and 64 queued transitions.
+96 fields, and 128 compressed usage spans. The shared forwarder has one source
+slot per compiled runtime connection slot, eight simultaneously held Consumer keys, and 64 queued
+transitions. Runtime slots cover both normal transport allowances and the shared pairing reserve;
+see [Bluetooth capacity](limits-and-errors.md#bluetooth-capacity).
 Keyboard state covers usages 1 through 255. Held Consumer controls cover usages
 1 through 65,535. Exceeding an active input limit
 returns an error rather than silently dropping keys.
@@ -58,9 +60,9 @@ when a cross-report Consumer-key union temporarily exceeds its capacity.
 ## USB interfaces and boot keyboard
 
 The adapter presents one composite USB device. Its serial port uses two interfaces. A shared
-HID interface carries keyboard, mouse, Consumer, system and radio reports. Each HID gamepad
-slot uses a separate interface and IN endpoint with a 22-byte input report. XInput uses
-separate receiver channels.
+HID interface carries keyboard, mouse, Consumer, system and radio reports when configured devices
+need it. Each HID gamepad slot uses a separate interface and IN endpoint with a 22-byte input
+report. XInput uses separate receiver channels.
 
 The desktop HID interface advertises the boot keyboard subclass and protocol. In normal report
 protocol, it sends the full keyboard bitmap and the other desktop reports. When the Host selects
@@ -71,14 +73,74 @@ bitmap remains intact. Switching protocols reconciles current input, and USB res
 report protocol. Lock LEDs and host-requested idle reporting work in both modes. Boot mouse
 protocol is not provided.
 
-VIA or Vial adds one interface with an IN and an OUT endpoint only while enabled. Disabling the
-editor reconnects USB and releases that allocation. Bluetooth connection counts and whether an
-editor application is open do not control this interface.
+VIA or Vial requests one interface with an IN and an OUT endpoint while enabled. Saved enablement
+is separate from active USB exposure. Connected-device requirements can take priority over an
+editor, and whether an editor application is open does not change its priority.
 
 USB fixtures exercise descriptor and endpoint counts, independent controller reports and
 transitions, boot/report switching, rollover, lock LEDs, and idle reports. Hardware verification
 must also cover pre-OS keyboard input, separate gamepad recognition in host applications, and
-repeated editor enable/disable cycles on both Pico and ESP32-S3 boards.
+repeated editor enable/disable cycles on both Pico and ESP32-S3 boards. Allocation pressure,
+connected-device preemption, a host that stops reading serial, and reconnecting with held controls
+also need hardware validation.
+
+## USB allocation
+
+One allocator selects interfaces for startup, configuration changes, device
+connections and profile changes. It accounts for compiled interface and endpoint limits,
+descriptor buffers, handlers and platform restrictions. Serial always fits and remains available.
+HID gamepads keep separate interfaces, as does each XInput channel.
+
+Lower numeric priorities win. When several conditions apply to a slot, it uses the lowest value.
+Equal priorities keep stable slot order.
+
+| Priority | Candidate |
+| --- | --- |
+| `0x00` | Serial, including both CDC interfaces |
+| `0x41` | Shared keyboard/mouse interface required by a connected device |
+| `0x42` | HID gamepad slot selected by a connected device |
+| `0x43` | XInput channel selected by a connected device |
+| `0x44` | Enabled editor whose selected profile is used by a connected device |
+| `0x81` | Shared keyboard/mouse interface required only by disconnected configured devices |
+| `0x82` | Configured HID slot zero, only when no HID users are connected |
+| `0x83` | Configured XInput channel zero, only when no XInput users are connected |
+| `0xC2` | Further configured HID slots with no connected user |
+| `0xC3` | Further configured XInput channels with no connected user |
+| `0xC4` | Enabled editor with no connected device using its selected profile |
+| `0xE2` | Unconfigured extra HID slots, up to the compiled maximum |
+| `0xE3` | Unconfigured extra XInput channels, up to the compiled maximum |
+| `0xFF` | Disabled editor, excluded from candidates |
+
+Configured users are saved devices whose roles, output preferences or profile outputs need the
+interface, regardless of whether those devices are enabled or connected. A keyboard/mouse
+interface with no configured users is absent. Each gamepad mode has
+at most four slots where supported. Spare slots yield to higher priorities. A connected device can
+preempt a lower-priority editor or an unused slot.
+
+Connected users occupy the first slots in each mode. Slot zero uses the connected priority when
+occupied; further configured disconnected slots keep their reserved priority of `0xC2` or `0xC3`.
+
+The allocator computes the resulting plan before detach. Capacity does not reject valid
+preferences: the adapter saves them and exposes what fits. Malformed values,
+unsupported choices and profile conflicts still fail validation. Startup also selects a fitting
+plan when saved preferences request more than the hardware can expose. Later reconfiguration
+failures do not roll back persisted preferences.
+
+USB rebuilds only when the actual allocation changes. A different priority or an omitted candidate
+alone does not trigger another rebuild. This prevents repeated reconnects for an interface that
+cannot fit. Bluetooth connections and current held input survive the rebuild; boot/report protocol
+switching still reconciles held input and completes in-flight reports.
+
+`Status.errors` independently reports `ERROR_CODE_USB_REQUIRED_CAPACITY_EXCEEDED` when any omitted
+candidate has priority below `0xC0`, and `ERROR_CODE_USB_RESERVED_CAPACITY_EXCEEDED` when any omitted
+candidate is in `0xC0..0xDF`. Both can be present together. Clients show the required error
+prominently and mark tray attention; the reserved error has a subtle indicator. Omitted extras in
+`0xE0..0xFE` produce neither error. Disabled interfaces at `0xFF` are not candidates.
+
+The pending command completes before the serial response drain deadline starts. The response
+normally drains before detach, with a short fixed deadline that host traffic cannot extend.
+Detach closes the session, and clients read fresh status after reconnecting. See
+[serial sessions](transport.md#sessions).
 
 ## Gamepad output preferences
 
@@ -89,7 +151,7 @@ completed setup never enables output retroactively. The choice takes effect afte
 and a failed save retries on a later connection. Gamepad selection and HID++ detection settle
 independently; both must finish before setup completes.
 
-The generic output API defines HID and XInput choices, independent desired pools and runtime states.
+The generic output API defines HID and XInput choices, independent slot pools and runtime states.
 Pico W, Pico 2 W and Waveshare RP2350B-Plus-W provide both USB backends. ESP32 leaves gamepad output
 disabled. These preferences do not alter keyboard, mouse, Consumer or
 system input forwarding, profile usage ranges, Bluetooth connection limits, or VIA/Vial behavior.
@@ -178,8 +240,8 @@ vendor features.
 
 A fresh report read preserves unrelated nonvolatile fields. Relative companions
 use neutral values. Absolute volatile fields use an encodable out-of-range
-no-change value. Selector arrays retain unrelated selections and report a
-capacity warning when there is no room for all required active indicators.
+no-change value. Selector arrays retain unrelated selections and reject an update
+when there is no room for all required active indicators.
 Color and brightness snapshots cover the complete indicator tuple across report
 IDs and Output/Feature types. Turning a lock off preserves a color through its
 mode or intensity control where available; turning it on restores a visible
@@ -194,7 +256,7 @@ steps and recorded only after a successful write. Nonzero writes with feedback
 arriving before acknowledgement require a fresh read before another delta.
 GET_REPORT on a relative field never establishes absolute state.
 
-The following cases remain unavailable and produce specific diagnostics:
+The following cases remain unavailable:
 
 - Buffered Bytes fields whose content is defined by the application.
 - Relative numeric pointer or Consumer selector formats without a standard
@@ -216,15 +278,6 @@ Malformed descriptors, descriptor limits, or exhausted admission memory fail
 profile setup explicitly. BLE profiles retain separate maps for up to three HID
 services. Native service and characteristic limits also apply.
 
-## Warnings
-
-Each limitation above is reported as a `DeviceWarning`, listed by `ListWarnings`, and added or
-removed by a `warnings_changed` event when it appears or clears. A warning identifies its code, the
-HID service, the report type and optional report ID, the field's bit offset and its usage. Input and
-indicator capability limitations are separate from retryable indicator read and write failures; a
-successful indicator update clears its failures. A reconnect replaces the earlier connection's
-warnings.
-
 ## Output reports
 
 BLE output reports prefer the HID Data Output procedure, GATT Write Without Response, when the
@@ -242,17 +295,14 @@ LED collections, Ordinal instances, and Consumer controls.
 
 On Pico W, Pico 2 W and Waveshare RP2350B-Plus-W, each paired device may select
 Disabled, HID or XInput for its gamepad role. A missing selection means Disabled.
-Each USB pool contains the number of valid paired records selecting that mode,
-capped independently at four. Saved devices count even when disconnected or not
-resident in the Bluetooth stack. Invalid bonds and duplicate peers follow the
-core's saved-record validation rules. ESP32-S3 advertises no gamepad output modes.
+Saved devices contribute configured candidates even when disconnected or not resident in the
+Bluetooth stack. Invalid bonds and duplicate peers follow the core's saved-record validation rules.
+ESP32-S3 advertises no gamepad output modes.
 
-USB allocates these pools before the initial enumeration. Pairing, unpairing or a
-saved output change rebuilds USB only when a pool count changes. The owner waits
-for persistence and physical completion of the command response, cancels the USB
-workers, disables the device, drops the allocation, and waits 250 ms before
-reborrowing the peripheral. Bluetooth connection changes assign or release slots
-without USB enumeration. A vacant HID slot reports neutral controls; a vacant
+The [shared allocator](#usb-allocation) selects the actual pools before initial enumeration and
+whenever requirements change. A connection can use an already exposed vacant slot without a
+rebuild, or preempt lower-priority interfaces when its required output does not fit. USB rebuilds
+only when the selected interfaces change. A vacant HID slot reports neutral controls; a vacant
 XInput channel reports absence.
 
 The 22-byte HID gamepad report retains 32 numbered buttons, X/Y/Z/Rx/Ry/Rz axes,
@@ -360,6 +410,5 @@ X-to-L1, L1-to-Back and R1-to-Start labels. Those labels do not establish a firm
 Browser XInput visibility and right-stick visualization remain unresolved. Full HID axis and trigger
 behavior and multiple simultaneous channels have not been manually verified.
 
-When VIA or Vial is enabled, its Raw HID configuration interface follows the gamepad
-functions. Disabling the editor rebuilds the USB device without that interface or its
-endpoints. Vial's serial suffix follows the selected editor.
+An active VIA or Vial Raw HID interface follows the gamepad functions. Disabling an active editor
+rebuilds USB without its interface and endpoints. Vial's serial suffix follows its active exposure.

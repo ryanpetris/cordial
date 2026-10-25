@@ -1,11 +1,11 @@
 // A simulated adapter speaking the serial API over an in-memory ByteStream,
 // following the firmware's behavior: every command answers at once, and
 // changes follow as events after the response. Listings come in pages of
-// `pageSize` entries, and settings and warnings events carry only what changed
-// since the client last listed or heard of them. Tests and the demo
+// `pageSize` entries, and settings events carry only what changed since the
+// client last listed or heard of them. Tests and the demo
 // mode use it; all data is synthetic.
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
-import { compareRuleRefs, compareSettingRefs, compareWarnings, ruleRef, settingRef, type ByteStream } from "@cordial/client";
+import { compareRuleRefs, compareSettingsRefs, ruleRef, settingsRef, type ByteStream } from "@cordial/client";
 import {
   CapacityReason,
   CodeKind,
@@ -13,7 +13,6 @@ import {
   DELIMITER,
   DeviceSchema,
   DeviceState,
-  DeviceWarningSchema,
   ErrorCode,
   FrameDecoder,
   InactiveReason,
@@ -25,48 +24,50 @@ import {
   OutputState,
   Platform,
   ProfileRuleSchema,
-  ReportType,
   RequestSchema,
+  ResourceType,
   Role,
-  SettingSchema,
   SettingState,
+  SettingsGroup,
+  SettingsObjectSchema,
   StatusSchema,
   Transport,
-  WarningCode,
   encodeFrame,
-  type DeviceWarning as WireWarning,
+  type DeviceInformationSchema,
   type EventSchema,
   type PairingSchema,
   type ProfileRule,
   type Request,
-  type Setting,
   type ResponseSchema,
+  type SettingsObject,
   type Usage,
   UsageSchema,
   UsageRange_Kind,
-  type Value,
-  type ValueSchema,
+  VendorRegistry,
 } from "@cordial/protocol";
+import { CASES, FIELDS, updateChanges } from "../core/convert.ts";
 import { adapterName } from "../shared/adapter-name.ts";
-import type { Candidate, DeviceWarning, KindName, OutputModeName, RoleName, Scalar, ValueType } from "../shared/state.ts";
+import type { Candidate, KindName, OutputModeName, RoleName, Scalar, SettingField, SettingFields, SettingsGroupName, ValueType } from "../shared/state.ts";
 
 type MessageInit = MessageInitShape<typeof MessageSchema>;
-type ValueInit = MessageInitShape<typeof ValueSchema>;
 type Command<C extends Request["command"]["case"]> = Extract<Request["command"], { case: C }>["value"];
 
-export interface FakeSetting {
-  key: string;
+/** A HID++ setting field: its group, component index (pointer sensors only) and field. Enum
+ * values are the protocol's names in lower case. */
+export type FakeSetting = Omit<SettingField, "integration"> & {
   type: ValueType;
   value: Scalar | null;
   saved: Scalar | null;
-  state: "pending" | "applied" | "changed_on_device" | "unsupported";
+  state: "unknown" | "pending" | "applied" | "changed_on_device" | "unsupported";
   /** The last apply's failure, replacing the state. */
   error: ErrorCode | null;
   choices: Scalar[];
   min: number | null;
   max: number | null;
   step: number | null;
-}
+  /** Applying the saved value fails with this, though it stays saved. */
+  fails: ErrorCode | null;
+};
 
 export interface FakeDevice {
   id: number;
@@ -78,6 +79,7 @@ export interface FakeDevice {
   trusted: boolean;
   blocked: boolean;
   paused: boolean;
+  /** The last failed connection attempt. */
   error: ErrorCode | null;
   hidppEnabled: boolean;
   /** The HID++ version the device reports when connected; null for a device without HID++. */
@@ -87,12 +89,10 @@ export interface FakeDevice {
   /** HID++ failed to start on the connected device. */
   hidppError: ErrorCode | null;
   roles: RoleName[];
-  /** What the device reports while connected, by catalog key. */
-  info: Record<string, Scalar>;
+  /** What the device reports while connected. */
+  info: MessageInitShape<typeof DeviceInformationSchema>;
   /** Settings as read on the current connection, with the saved values. */
   settings: FakeSetting[];
-  /** Warnings on the current connection. */
-  warnings: DeviceWarning[];
   /** The device's layers: profile IDs in the order they apply. */
   profiles: number[];
   /** Why the connected device's profiles aren't loaded; the fake works it out. */
@@ -143,6 +143,8 @@ export interface FakeOptions {
   maxLayers?: number;
   /** Entries per listed page. */
   pageSize?: number;
+  /** USB interfaces the board can expose. */
+  usbInterfaces?: number;
   /** Whether the board has HID and XInput gamepad outputs; every board but the ESP32-S3 does. */
   gamepadOutputs?: boolean;
 }
@@ -274,7 +276,6 @@ export function device(id: number, patch: Partial<FakeDevice> = {}): FakeDevice 
     roles: [],
     info: {},
     settings: [],
-    warnings: [],
     profiles: [],
     profileError: null,
     gamepadOutput: "disabled",
@@ -282,8 +283,9 @@ export function device(id: number, patch: Partial<FakeDevice> = {}): FakeDevice 
   };
 }
 
-export function setting(key: string, patch: Partial<FakeSetting> = {}): FakeSetting {
-  return { key, type: "bool", value: null, saved: null, state: "pending", error: null, choices: [], min: null, max: null, step: null, ...patch };
+export function setting<G extends SettingsGroupName>(group: G, field: SettingFields[G], patch: Partial<FakeSetting> = {}): FakeSetting {
+  const type = (FIELDS[group] as Record<string, { type: ValueType }>)[field]!.type;
+  return { group, field, index: group === "pointer_sensor" ? 0 : null, type, value: null, saved: null, state: "pending", error: null, choices: [], min: null, max: null, step: null, fails: null, ...patch } as FakeSetting;
 }
 
 /** A few synthetic devices showing the main states. */
@@ -296,27 +298,26 @@ export function demoDevices(): FakeDevice[] {
       hidppEnabled: true,
       hidpp: [4, 5],
       info: {
-        "device.manufacturer": "Example Co",
-        "device.model": "Example Keys",
-        "device.serial": "0000EXAMPLE1",
-        "firmware.version": "EK 1.02.0003",
-        "bootloader.version": "BL 1.00.0001",
-        "vendor.registry": "usb",
-        "vendor.id": 0x1234,
-        "product.id": 0x5678,
-        "product.version": 1,
-        "battery.level": 72,
-        "battery.charging": false,
-        "backlight.current_level": 3,
+        identity: {
+          manufacturer: "Example Co",
+          model: "Example Keys",
+          serial: "0000EXAMPLE1",
+          firmwareVersion: "EK 1.02.0003",
+          bootloaderVersion: "BL 1.00.0001",
+          vendor: { registry: VendorRegistry.USB, id: 0x1234 },
+          product: { id: 0x5678, version: 1 },
+        },
+        battery: { level: 72, charging: false },
+        backlight: { currentBrightness: 3 },
       },
       settings: [
-        setting("keyboard.fn_row", { type: "enum", choices: ["function_keys", "special_actions"], value: "special_actions" }),
-        setting("keyboard.platform", { type: "enum", choices: ["windows", "linux", "chrome_os", "android", "mac", "ios"], value: "linux" }),
-        setting("backlight.enabled", { value: true, saved: true, state: "applied" }),
-        setting("backlight.mode", { type: "enum", choices: ["automatic", "permanent_manual"], value: "automatic" }),
-        setting("backlight.level", { type: "integer", min: 0, max: 7, step: 1, value: 3 }),
-        setting("backlight.delay.hands_out", { type: "integer", min: 5, max: 7200, step: 5, value: 60, saved: 30, state: "changed_on_device" }),
-        setting("power.auto_off", { type: "integer", min: 0, max: 15300, step: 60, value: 1800 }),
+        setting("keyboard", "function_row", { choices: ["function_keys", "special_actions"], value: "special_actions" }),
+        setting("keyboard", "platform", { choices: ["windows", "linux", "chrome_os", "android", "mac", "ios"], value: "linux" }),
+        setting("backlight", "enabled", { value: true, saved: true, state: "applied" }),
+        setting("backlight", "mode", { choices: ["automatic", "permanent_manual"], value: "automatic" }),
+        setting("backlight", "brightness", { min: 0, max: 7, step: 1, value: 3 }),
+        setting("backlight", "hands_away", { min: 5, max: 7200, step: 5, value: 60, saved: 30, state: "changed_on_device" }),
+        setting("power", "auto_off", { min: 0, max: 15300, step: 60, value: 1800 }),
       ],
     }),
     device(2, {
@@ -327,23 +328,17 @@ export function demoDevices(): FakeDevice[] {
       hidppEnabled: true,
       hidpp: [4, 5],
       info: {
-        "device.manufacturer": "Example Co",
-        "battery.level": 12,
-        "battery.charging": false,
-        "wheel.resolution_multiplier": 8,
-        "wheel.ratchets_per_rotation": 24,
-        "wheel.diameter": 50,
+        identity: { manufacturer: "Example Co" },
+        battery: { level: 12, charging: false },
+        wheel: { resolutionMultiplier: 8, ratchetsPerRotation: 24, diameter: 50 },
       },
-      warnings: [
-        { code: "pointer_selector_unsupported", service: 1, reportId: 2, reportType: "input", bitOffset: 24, usagePage: 1, usage: 0x38 },
-      ],
       settings: [
-        setting("pointer.sensor.0.dpi", { type: "integer", min: 200, max: 8000, step: 50, value: 1000 }),
-        setting("wheel.mode", { type: "enum", choices: ["freespin", "ratchet"], value: "ratchet" }),
-        setting("wheel.invert", { value: false }),
+        setting("pointer_sensor", "dpi", { min: 200, max: 8000, step: 50, value: 1000 }),
+        setting("wheel", "mode", { choices: ["free_spin", "stepped"], value: "stepped" }),
+        setting("wheel", "invert", { value: false }),
       ],
     }),
-    device(3, { name: "Travel Keyboard", transport: "classic", info: { "firmware.version": "2.1" } }),
+    device(3, { name: "Travel Keyboard", transport: "classic", info: { identity: { firmwareVersion: "2.1" } } }),
     device(4, { name: "Old Mouse", kinds: ["mouse"], enabled: false }),
   ];
 }
@@ -361,7 +356,7 @@ export function demoDevicesBle(): FakeDevice[] {
       name: "Example Compact Keyboard",
       state: "connected",
       roles: ["keyboard", "consumer_control"],
-      info: { "device.manufacturer": "Example Co", "battery.level": 54, "battery.charging": true },
+      info: { identity: { manufacturer: "Example Co" }, battery: { level: 54, charging: true } },
     }),
     device(2, { name: "Example Trackball", kinds: ["mouse"], roles: ["mouse"] }),
   ];
@@ -393,26 +388,22 @@ const MAX_SLOTS = 4;
 const VIAL_SERIAL = "-vial:f64c2b3c";
 const upper = <E>(e: E, name: string) => (e as Record<string, number>)[name.toUpperCase()]!;
 
-function wireValue(type: ValueType, v: Scalar): ValueInit {
-  if (type === "bool") return { value: { case: "bool", value: v as boolean } };
-  if (type === "integer") return { value: { case: "integer", value: BigInt(v as number) } };
-  if (type === "color") return { value: { case: "color", value: v as number } };
-  return { value: { case: "text", value: String(v) } };
+/** The protocol value of a fake setting's value, by its field's type. */
+function wireOf(s: FakeSetting, v: Scalar): boolean | bigint | number {
+  if (s.type === "integer") return BigInt(v as number);
+  if (s.type === "bool") return v as boolean;
+  return upper((FIELDS[s.group] as Record<string, { enum?: object }>)[s.field]!.enum, v as string);
 }
 
-/** A wire value as the setting takes it, or undefined when its type or limits don't allow it. */
-function fromWire(s: FakeSetting, v: Value | undefined): Scalar | undefined {
-  const value = v?.value;
-  let out: Scalar | undefined;
-  if (s.type === "bool" && value?.case === "bool") out = value.value;
-  else if (s.type === "integer" && value?.case === "integer") out = Number(value.value);
-  else if (s.type === "color" && value?.case === "color") out = value.value;
-  else if ((s.type === "enum" || s.type === "text") && value?.case === "text") out = value.value;
-  if (out === undefined) return undefined;
-  if (s.choices.length && !s.choices.includes(out)) return undefined;
-  if (typeof out === "number" && ((s.min !== null && out < s.min) || (s.max !== null && out > s.max))) return undefined;
-  return out;
+/** Whether the setting takes `v`, a value read from the protocol. */
+function takes(s: FakeSetting, v: Scalar): boolean {
+  if (s.type === "bool") return typeof v === "boolean";
+  if (s.choices.length || s.type === "enum") return s.choices.includes(v);
+  const n = v as number;
+  return (s.min === null || n >= s.min) && (s.max === null || n <= s.max) && (s.step === null || (n - (s.min ?? 0)) % s.step === 0);
 }
+
+const sameObject = (s: FakeSetting, group: string, index: number | null) => s.group === group && s.index === index;
 
 class Refusal extends Error {
   constructor(readonly code: ErrorCode, readonly reason = CapacityReason.UNKNOWN) {
@@ -433,6 +424,7 @@ export class FakeAdapter implements ByteStream {
   readonly defaultName: string;
   ready: boolean;
   storageFull = false;
+  readonly usbInterfaces: number;
   maxEnabled: number;
   /** Requests received in this session, for assertions. */
   received: Request[] = [];
@@ -442,8 +434,6 @@ export class FakeAdapter implements ByteStream {
   failures: Record<string, ErrorCode[]> = {};
   /** Whether a STORAGE_FAILED failure leaves the outcome of its write unknown. */
   uncertainWrites = false;
-  /** Apply failures for settings that are saved anyway. */
-  settingFailures: Record<string, ErrorCode> = {};
   readonly profileSupport: boolean;
   readonly gamepadOutputs: boolean;
   profiles: FakeProfile[];
@@ -458,7 +448,7 @@ export class FakeAdapter implements ByteStream {
   /** Records listed as entries of a kind newer than the client, which it reads as unset. */
   newerDevices = new Set<number>();
   newerProfiles = new Set<number>();
-  /** How often USB reconnected for a configuration interface or gamepad pool change. */
+  /** How often USB reconnected for a change to its interfaces. */
   usbReconnects = 0;
   /** Whether the USB device is attached; false briefly while it reconnects. */
   present = true;
@@ -470,6 +460,8 @@ export class FakeAdapter implements ByteStream {
   readonly #loaded = new Map<number, number[]>();
   /** The gamepad slot each connected device holds in its mode's pool, by device ID. */
   readonly #slots = new Map<number, { mode: OutputModeName; slot: number }>();
+  /** The USB interfaces exposed since USB last connected, and the priorities of those left out. */
+  #usb: { exposed: string[]; omitted: number[] };
   #nextProfile: number;
   readonly #latency: number;
   readonly #settingJobMs: number;
@@ -487,10 +479,9 @@ export class FakeAdapter implements ByteStream {
   /** Replies and events waiting for the reply delay, in order. */
   #outbox: Promise<void> = Promise.resolve();
   #gate: Promise<void> | null = null;
-  /** The settings and warnings of each device this session's client has listed or heard of, by
-   * their encoding, so events carry only what changed since. */
+  /** The settings objects of each device this session's client has listed or heard of, by their
+   * identity, with their encoding, so events carry only what changed since. */
   readonly #seenSettings = new Map<number, Map<string, string>>();
-  readonly #seenWarnings = new Map<number, Map<string, WireWarning>>();
 
   constructor(options: FakeOptions = {}) {
     this.id = options.adapterId ?? "0000000000000F01";
@@ -517,9 +508,11 @@ export class FakeAdapter implements ByteStream {
     this.memoryBudget = options.memoryBudget ?? 4096;
     this.maxLayers = options.maxLayers ?? 4;
     this.pageSize = options.pageSize ?? 8;
+    this.usbInterfaces = options.usbInterfaces ?? 16;
     this.#nextProfile = Math.max(0, ...this.profiles.map((p) => p.id)) + 1;
     this.#nextDevice = Math.max(9, ...this.devices.map((d) => d.id)) + 1;
     this.#load(null);
+    this.#usb = this.#allocate();
   }
 
   // ---- ByteStream -----------------------------------------------------------
@@ -571,7 +564,6 @@ export class FakeAdapter implements ByteStream {
     this.received = [];
     this.events = [];
     this.#seenSettings.clear();
-    this.#seenWarnings.clear();
     this.#starting = true;
     return this;
   }
@@ -675,39 +667,94 @@ export class FakeAdapter implements ByteStream {
     return this.profiles.filter((p) => ids.has(p.id)).reduce((n, p) => n + sizeOf(p), 0);
   }
 
-  status() {
-    const info: { key: string; value: ValueInit }[] = [
-      { key: "firmware.version", value: wireValue("text", "0.0.0-dev") },
-      { key: "board.name", value: wireValue("text", this.board) },
-      { key: "build.development", value: wireValue("bool", true) },
+  /** The adapter's problems, in numeric order. */
+  errors(): ErrorCode[] {
+    const omitted = this.#usb.omitted;
+    const errors = [
+      ...(omitted.some((p) => p < 0xc0) ? [ErrorCode.USB_REQUIRED_CAPACITY_EXCEEDED] : []),
+      ...(omitted.some((p) => p >= 0xc0 && p < 0xe0) ? [ErrorCode.USB_RESERVED_CAPACITY_EXCEEDED] : []),
     ];
-    if (this.storageFull) info.push({ key: "storage.full", value: wireValue("bool", true) });
+    if (this.ready && this.storageFull) errors.push(ErrorCode.STORAGE_FULL);
+    if (this.profileSupport && this.memoryBudget > 0 && this.memoryUsed() * 100 >= this.memoryBudget * 85) errors.push(ErrorCode.PROFILE_MEMORY_LOW);
+    return [...new Set(errors)].sort((a, b) => a - b);
+  }
+
+  /** The USB interfaces the firmware would expose, with their priorities, lower first: serial
+   * (two), keyboard and mouse while a saved device uses them, the slots of each gamepad mode up to
+   * its maximum, and each enabled configuration interface. */
+  #wanted(): { name: string; priority: number }[] {
+    const live = (d: FakeDevice) => d.state === "connected" && this.inactive(d) === undefined;
+    const desktop = this.devices.filter((d) => d.roles.some((r) => r !== "gamepad"));
+    const want = [{ name: "serial", priority: 0x00 }, { name: "serial", priority: 0x00 }];
+    if (desktop.length) want.push({ name: "keyboard", priority: desktop.some(live) ? 0x41 : 0x81 });
+    if (this.gamepadOutputs)
+      for (const [mode, offset] of [["hid", 2], ["xinput", 3]] as const) {
+        const users = this.devices.filter((d) => d.gamepadOutput === mode);
+        const connected = users.filter(live).length;
+        for (let slot = 0; slot < MAX_SLOTS; slot++)
+          want.push({ name: mode, priority: offset + (slot < connected ? 0x40 : slot >= users.length ? 0xe0 : slot === 0 ? 0x80 : 0xc0) });
+      }
+    for (const i of ["via", "vial"] as const) {
+      const { enabled, profile } = this.interfaces[i];
+      if (enabled) want.push({ name: i, priority: this.devices.some((d) => live(d) && d.profiles.includes(profile)) ? 0x44 : 0xc4 });
+    }
+    return want;
+  }
+
+  /** What fits the board's interfaces, lowest priority first. */
+  #allocate() {
+    const want = this.#wanted().sort((a, b) => a.priority - b.priority);
+    return { exposed: want.slice(0, this.usbInterfaces).map((w) => w.name), omitted: want.slice(this.usbInterfaces).map((w) => w.priority) };
+  }
+
+  /** Allocates USB again after a save, reconnecting it once the response has gone out when the
+   * exposed interfaces change. */
+  #reallocate() {
+    const before = this.#usb.exposed.join();
+    this.#usb = this.#allocate();
+    if (this.#usb.exposed.join() !== before) this.#reconnectUsb();
+  }
+
+  status() {
     return create(StatusSchema, {
       id: this.id,
       name: this.name,
       platform: upper(Platform, this.platform),
       ready: this.ready,
-      transports: this.transports.map((t) => ({ transport: TRANSPORT[t], maxEnabled: this.maxEnabled, enabled: this.enabled[t] })),
-      info,
+      errors: this.errors(),
+      resources: [{ type: ResourceType.INTERFACES, count: this.#usb.exposed.length, limit: this.usbInterfaces }],
+      transports: this.transports.map((t) => ({
+        transport: TRANSPORT[t],
+        enabled: this.enabled[t],
+        resources: [
+          { type: ResourceType.DEVICES, count: this.devices.filter((d) => d.transport === t && d.enabled).length, limit: this.maxEnabled },
+          { type: ResourceType.CONNECTIONS, count: this.devices.filter((d) => d.transport === t && d.state === "connected").length, limit: this.maxEnabled },
+        ],
+      })),
+      information: { firmwareVersion: "0.0.0-dev", boardName: this.board, developmentBuild: true },
       outputSupport: this.gamepadOutputs
         ? [{
             role: Role.GAMEPAD,
-            modes: (["disabled", "hid", "xinput"] as const).map((m) =>
-              m === "disabled" ? { mode: OUTPUT[m] } : { mode: OUTPUT[m], maxSlots: MAX_SLOTS, slots: this.pool(m) }),
+            modes: (["disabled", "hid", "xinput"] as const).map((m) => ({
+              mode: OUTPUT[m],
+              resources: [m === "disabled" ? { type: ResourceType.SLOTS, count: 0, limit: 0 } : { type: ResourceType.SLOTS, count: this.pool(m), limit: MAX_SLOTS }],
+            })),
           }]
         : [],
       ...(this.profileSupport
         ? {
             profileSupport: {
               ranges: this.#ranges(),
-              memoryBudget: this.memoryBudget,
-              maxRemapOutputs: 8,
-              maxLayers: this.maxLayers,
-              memoryUsed: this.memoryUsed(),
+              resources: [
+                { type: ResourceType.MEMORY, count: this.memoryUsed(), limit: this.memoryBudget },
+                { type: ResourceType.OUTPUTS, limit: 8 },
+                { type: ResourceType.LAYERS, limit: this.maxLayers },
+              ],
             },
             configurationInterfaces: (["via", "vial"] as const).map((i) => ({
               interface: INTERFACE[i],
               enabled: this.interfaces[i].enabled,
+              active: this.#usb.exposed.includes(i),
               profile: this.interfaces[i].profile,
               conflicts: [INTERFACE[i === "via" ? "vial" : "via"]],
             })),
@@ -726,9 +773,9 @@ export class FakeAdapter implements ByteStream {
     return before.indexOf(d) >= this.maxEnabled ? InactiveReason.CAPACITY : undefined;
   }
 
-  /** The size of a gamepad mode's pool: the paired devices selecting it, up to four. */
+  /** The size of a gamepad mode's pool: its slots in the USB allocation. */
   pool(mode: OutputModeName) {
-    return Math.min(MAX_SLOTS, this.devices.filter((d) => d.gamepadOutput === mode).length);
+    return this.#usb.exposed.filter((n) => n === mode).length;
   }
 
   /** The gamepad output's state, as the firmware works it out: a connected device with a gamepad
@@ -772,10 +819,6 @@ export class FakeAdapter implements ByteStream {
 
   record(d: FakeDevice) {
     const connected = d.state === "connected";
-    // Information belongs to the current connection.
-    const info = connected
-      ? Object.entries(d.info).map(([key, value]) => ({ key, value: wireValue(typeof value === "boolean" ? "bool" : typeof value === "number" ? "integer" : "text", value) }))
-      : [];
     return create(DeviceSchema, {
       id: d.id,
       transport: TRANSPORT[d.transport],
@@ -787,84 +830,64 @@ export class FakeAdapter implements ByteStream {
       blocked: d.blocked,
       paused: d.paused,
       inactive: this.inactive(d),
-      error: d.error ?? undefined,
+      errors: [...new Set([d.error, connected ? d.profileError : null].filter((e) => e !== null))].sort((a, b) => a - b),
       security: connected ? { encrypted: true, authenticated: false, secureConnections: true, keySize: 16 } : undefined,
       integrations: this.#hidpp(d),
-      info,
+      // Information belongs to the current connection.
+      information: connected ? d.info : undefined,
       roles: d.roles.map((r) => upper(Role, r)),
       profiles: this.profileSupport ? { profiles: d.profiles } : undefined,
-      profileError: connected ? (d.profileError ?? undefined) : undefined,
       // The adapter keeps no entry for Disabled, and reports a gamepad's output state.
       outputPreferences: d.gamepadOutput === "disabled" ? [] : [{ role: Role.GAMEPAD, mode: OUTPUT[d.gamepadOutput] }],
       outputs: d.roles.includes("gamepad") || d.gamepadOutput !== "disabled" ? [this.#gamepad(d)] : [],
     });
   }
 
-  #setting(s: FakeSetting, connected: boolean) {
-    const status = s.saved === null ? undefined : s.error !== null ? { case: "error" as const, value: s.error } : { case: "state" as const, value: upper(SettingState, s.state) };
+  #wrapper(s: FakeSetting, connected: boolean) {
+    const status = s.saved === null ? undefined : { result: s.error !== null ? { case: "error" as const, value: s.error } : { case: "state" as const, value: upper(SettingState, s.state) } };
     // A disconnected device's values haven't been read on this connection.
-    const value = connected ? (s.value ?? undefined) : undefined;
-    const saved = s.saved ?? undefined;
-    const big = (v: Scalar | undefined) => (v === undefined ? undefined : BigInt(v as number));
-    const type =
-      s.type === "bool" ? { case: "bool" as const, value: { value: value as boolean | undefined, saved: saved as boolean | undefined } }
-        : s.type === "integer" ? {
-            case: "integer" as const,
-            value: {
-              value: big(value),
-              saved: big(saved),
-              limits: s.choices.length
-                ? { case: "choices" as const, value: { values: s.choices.map((c) => BigInt(c as number)) } }
-                : s.min !== null && s.max !== null ? { case: "range" as const, value: { min: BigInt(s.min), max: BigInt(s.max), step: BigInt(s.step ?? 0) } } : undefined,
-            },
-          }
-          : s.type === "enum" ? { case: "enum" as const, value: { value: value as string | undefined, saved: saved as string | undefined, choices: s.choices as string[] } }
-            : s.type === "color" ? { case: "color" as const, value: { value: value as number | undefined, saved: saved as number | undefined } }
-              : { case: "text" as const, value: { value: value as string | undefined, saved: saved as string | undefined, maxBytes: 64 } };
-    return create(SettingSchema, { integration: IntegrationKind.HIDPP, key: s.key, status, type });
+    const value = connected && s.value !== null ? wireOf(s, s.value) : undefined;
+    const saved = s.saved === null ? undefined : wireOf(s, s.saved);
+    if (s.type === "enum") return { value, saved, status, choices: s.choices.map((c) => wireOf(s, c)) };
+    if (s.type === "bool") return { value, saved, status };
+    const limits = s.choices.length
+      ? { case: "choices" as const, value: { values: s.choices.map((c) => BigInt(c as number)) } }
+      : s.min !== null && s.max !== null ? { case: "range" as const, value: { min: BigInt(s.min), max: BigInt(s.max), step: BigInt(s.step ?? 0) } } : undefined;
+    return { value, saved, status, limits };
   }
 
-  /** The settings the adapter knows, in listing order: those read on the current connection and
-   * every saved value. */
-  settingsOf(d: FakeDevice): Setting[] {
+  /** The settings objects the adapter knows, in listing order: the fields read on the current
+   * connection and every saved one. */
+  settingsOf(d: FakeDevice): SettingsObject[] {
     const connected = d.state === "connected";
     const known = connected ? d.settings : d.settings.filter((s) => s.saved !== null);
-    return known.map((s) => this.#setting(s, connected)).sort((a, b) => compareSettingRefs(settingRef(a), settingRef(b)));
+    const objects = new Map<string, Record<string, unknown>>();
+    for (const s of known) {
+      const id = `${s.group}/${s.index}`;
+      const value = objects.get(id) ?? (s.group === "pointer_sensor" ? { index: s.index } : {});
+      objects.set(id, value);
+      const path = (FIELDS[s.group] as Record<string, { path: string[] }>)[s.field]!.path;
+      let node = value;
+      for (const k of path.slice(0, -1)) node = (node[k] ??= {}) as Record<string, unknown>;
+      node[path.at(-1)!] = this.#wrapper(s, connected);
+    }
+    return [...objects].map(([id, value]) => create(SettingsObjectSchema, {
+      integration: IntegrationKind.HIDPP,
+      group: { case: CASES[id.split("/")[0] as SettingsGroupName], value },
+    } as MessageInitShape<typeof SettingsObjectSchema>)).sort((a, b) => compareSettingsRefs(settingsRef(a)!, settingsRef(b)!));
   }
 
-  /** The current connection's warnings in listing order; none while disconnected. */
-  warningsOf(d: FakeDevice): WireWarning[] {
-    return (d.state === "connected" ? d.warnings : []).map((w) => create(DeviceWarningSchema, {
-      code: upper(WarningCode, w.code),
-      service: w.service,
-      reportType: w.reportType ? upper(ReportType, w.reportType) : ReportType.UNKNOWN,
-      reportId: w.reportId ?? undefined,
-      bitOffset: w.bitOffset ?? undefined,
-      usagePage: w.usagePage ?? undefined,
-      usage: w.usage ?? undefined,
-    })).sort(compareWarnings);
-  }
-
-  /** Reports the settings of `d` that changed, appeared or went away since the client last
-   * listed or heard of them. */
+  /** Reports the settings objects of `d` that changed, appeared or went away since the client
+   * last listed or heard of them. */
   #settingsChanged(d: FakeDevice) {
     const seen = this.#seenSettings.get(d.id) ?? new Map<string, string>();
     const current = this.settingsOf(d);
-    const now = new Map(current.map((s) => [s.key, hex(toBinary(SettingSchema, s))]));
-    const changed = current.filter((s) => seen.get(s.key) !== now.get(s.key));
-    const removed = [...seen.keys()].filter((k) => !now.has(k)).map((key) => ({ integration: IntegrationKind.HIDPP, key }));
+    const id = (o: SettingsObject) => JSON.stringify(settingsRef(o));
+    const now = new Map(current.map((o) => [id(o), hex(toBinary(SettingsObjectSchema, o))]));
+    const changed = current.filter((o) => seen.get(id(o)) !== now.get(id(o)));
+    const removed = [...seen.keys()].filter((k) => !now.has(k)).map((k) => JSON.parse(k) as { integration: number; group: SettingsGroup; index?: number });
     this.#seenSettings.set(d.id, now);
     if (changed.length || removed.length) this.#event({ case: "settingsChanged", value: { device: d.id, changed, removed } });
-  }
-
-  /** Reports the warnings of `d` added or removed since the client last listed or heard of them. */
-  #warningsChanged(d: FakeDevice) {
-    const seen = this.#seenWarnings.get(d.id) ?? new Map<string, WireWarning>();
-    const now = new Map(this.warningsOf(d).map((w) => [hex(toBinary(DeviceWarningSchema, w)), w]));
-    const added = [...now].filter(([k]) => !seen.has(k)).map(([, w]) => w);
-    const removed = [...seen].filter(([k]) => !now.has(k)).map(([, w]) => w);
-    this.#seenWarnings.set(d.id, now);
-    if (added.length || removed.length) this.#event({ case: "warningsChanged", value: { device: d.id, added, removed } });
   }
 
   /** Capabilities advertised by this board, qualified by rule kind and collection. */
@@ -894,20 +917,11 @@ export class FakeAdapter implements ByteStream {
     this.#changed(d, before);
   }
 
-  /** Changes what a device reports; the device event carries it. */
-  changeInfo(id: number, values: Record<string, Scalar | null>) {
+  /** Replaces what a device reports; the device event carries it. */
+  changeInfo(id: number, info: FakeDevice["info"]) {
     const d = this.find(id);
-    for (const [key, value] of Object.entries(values)) {
-      if (value === null) delete d.info[key];
-      else d.info[key] = value;
-    }
+    d.info = info;
     this.#event({ case: "device", value: this.record(d) });
-  }
-
-  changeWarnings(id: number, warnings: DeviceWarning[]) {
-    const d = this.find(id);
-    d.warnings = warnings;
-    this.#warningsChanged(d);
   }
 
   changeAdapter(patch: { ready?: boolean; storageFull?: boolean; memoryBudget?: number }) {
@@ -924,13 +938,12 @@ export class FakeAdapter implements ByteStream {
     return { active: this.#active(d), connected: d.state === "connected" };
   }
 
-  /** Reports a changed device, its profiles loading or unloading, and its settings and warnings
-   * when its connection or HID++ came up or went down. `loads` is what was loaded before the change. */
+  /** Reports a changed device, its profiles loading or unloading, and its settings when its
+   * connection or HID++ came up or went down. `loads` is what was loaded before the change. */
   #changed(d: FakeDevice, before: { active: boolean; connected: boolean }, loads = this.#loads()) {
     this.#load(loads, d);
     this.#event({ case: "device", value: this.record(d) });
     const connected = d.state === "connected";
-    if (before.connected !== connected) this.#warningsChanged(d);
     // Values become current, or possibly stale, as HID++ comes up or goes down.
     if (this.#active(d) && !before.active) this.#apply(d);
     else if (before.active !== this.#active(d) || before.connected !== connected) this.#settingsChanged(d);
@@ -959,11 +972,11 @@ export class FakeAdapter implements ByteStream {
       if (have && have.join() === want.join()) continue;
       this.#loaded.delete(d.id);
       if (want.some((id) => this.unreadableProfiles.has(id))) {
-        d.profileError = ErrorCode.STORAGE_FAILED;
+        d.profileError = ErrorCode.PROFILE_LOAD_FAILED;
         continue;
       }
       const next = new Map(this.#loaded).set(d.id, want);
-      if (this.memoryUsed(next) > this.memoryBudget) d.profileError = ErrorCode.NO_CAPACITY;
+      if (this.memoryUsed(next) > this.memoryBudget) d.profileError = ErrorCode.PROFILE_MEMORY_EXCEEDED;
       else {
         this.#loaded.set(d.id, want);
         d.profileError = null;
@@ -989,8 +1002,7 @@ export class FakeAdapter implements ByteStream {
       if (this.#session !== session || !this.#active(d)) return;
       for (const s of d.settings) {
         if (s.saved === null) continue;
-        const error = this.settingFailures[s.key];
-        if (error !== undefined) s.error = error;
+        if (s.fails !== null) s.error = s.fails;
         else Object.assign(s, { value: s.saved, state: "applied", error: null });
       }
       this.#settingsChanged(d);
@@ -1144,13 +1156,12 @@ export class FakeAdapter implements ByteStream {
       case "unpairDevice": {
         const d = this.find(command.value.device);
         this.#needReady();
-        const pools = this.#pools();
         this.devices = this.devices.filter((x) => x !== d);
         this.#slots.delete(d.id);
         this.#reply({});
         this.#event({ case: "deviceRemoved", value: { id: d.id } });
         this.#load();
-        if (this.#pools() !== pools) this.#reconnectUsb();
+        this.#reallocate();
         return;
       }
       case "refreshDevice": {
@@ -1161,21 +1172,14 @@ export class FakeAdapter implements ByteStream {
         this.#settingsChanged(d);
         return;
       }
-      case "listWarnings": {
-        const d = this.find(command.value.device);
-        const { entries, end } = page(this.warningsOf(d), command.value.after, this.pageSize, (w) => w, compareWarnings);
-        const seen = this.#seenWarnings.get(d.id) ?? new Map<string, WireWarning>();
-        for (const w of entries) seen.set(hex(toBinary(DeviceWarningSchema, w)), w);
-        this.#seenWarnings.set(d.id, seen);
-        return this.#reply({ result: { case: "warnings", value: { device: d.id, warnings: entries, end } } });
-      }
       case "listSettings": {
         const d = this.find(command.value.device);
-        const { entries, end } = page(this.settingsOf(d), command.value.after, this.pageSize, settingRef, compareSettingRefs);
+        const after = command.value.after;
+        const { entries, end } = page(this.settingsOf(d), after && { integration: after.integration, group: after.group, index: after.index }, this.pageSize, (o) => settingsRef(o)!, compareSettingsRefs);
         const seen = this.#seenSettings.get(d.id) ?? new Map<string, string>();
-        for (const s of entries) seen.set(s.key, hex(toBinary(SettingSchema, s)));
+        for (const o of entries) seen.set(JSON.stringify(settingsRef(o)), hex(toBinary(SettingsObjectSchema, o)));
         this.#seenSettings.set(d.id, seen);
-        return this.#reply({ result: { case: "settings", value: { device: d.id, settings: entries, end } } });
+        return this.#reply({ result: { case: "settings", value: { device: d.id, objects: entries, end } } });
       }
       case "setSettings":
         return this.#setSettings(command.value);
@@ -1224,10 +1228,6 @@ export class FakeAdapter implements ByteStream {
       this.enabled[transport!] = enabled;
       if (!toggled.includes(transport!)) toggled.push(transport!);
     }
-    const reconnect = (Object.keys(interfaces) as InterfaceName[]).some((i) => {
-      const [was, now] = [this.interfaces[i], interfaces[i]];
-      return was.enabled !== now.enabled || (now.enabled && was.profile !== now.profile);
-    });
     const interfacesChanged = JSON.stringify(interfaces) !== JSON.stringify(this.interfaces);
     const changed = next !== this.name || (platform !== undefined && Platform[platform]!.toLowerCase() !== this.platform) || toggled.length > 0 || interfacesChanged;
     this.interfaces = interfaces;
@@ -1236,7 +1236,7 @@ export class FakeAdapter implements ByteStream {
     this.#reply({});
     if (changed) this.#event({ case: "adapter", value: this.status() });
     for (const t of toggled) this.#applyTransport(t);
-    if (reconnect) this.#reconnectUsb();
+    this.#reallocate();
   }
 
   #setDevice(update: Command<"setDevice">) {
@@ -1282,33 +1282,31 @@ export class FakeAdapter implements ByteStream {
     if ((patch.blocked || patch.enabled === false) && d.state !== "disconnected") patch.state = "disconnected";
     const before = this.#snapshot(d);
     const loads = this.#loads();
-    const pools = this.#pools();
     Object.assign(d, patch);
     // Loading follows the new layers before the response, as the firmware's does.
     this.#load(null);
     this.#reply({});
     this.#changed(d, before, loads);
-    // USB is rebuilt with the new gamepad pools once the response has gone out.
-    if (this.#pools() !== pools) this.#reconnectUsb();
-  }
-
-  /** The gamepad pool sizes, compared to see whether a change rebuilds USB; a board without
-   * gamepad outputs has no pools. */
-  #pools() {
-    return this.gamepadOutputs ? `${this.pool("hid")} ${this.pool("xinput")}` : "";
+    this.#reallocate();
   }
 
   #setSettings({ device: id, changes }: Command<"setSettings">) {
     const d = this.find(id);
     if (!changes.length) throw new Refusal(ErrorCode.BAD_ARGS);
-    // Every change is checked before any is saved.
-    const checked = changes.map((c) => {
-      const s = d.settings.find((x) => x.key === c.key);
-      if (!s || c.integration !== IntegrationKind.HIDPP) throw new Refusal(ErrorCode.NOT_FOUND);
-      if (c.change.case === "forget") return { s, value: null };
-      const value = fromWire(s, c.change.value);
-      if (value === undefined) throw new Refusal(ErrorCode.BAD_ARGS);
-      return { s, value };
+    // Every change is checked before any is saved. Saved fields are known while disconnected.
+    const known = d.state === "connected" ? d.settings : d.settings.filter((s) => s.saved !== null);
+    const checked = changes.flatMap((u) => {
+      if (u.integration !== IntegrationKind.HIDPP) throw new Refusal(ErrorCode.NOT_FOUND);
+      const fields = updateChanges(u);
+      if (!fields.length) throw new Refusal(ErrorCode.BAD_ARGS);
+      return fields.map((c) => {
+        const f = c.setting;
+        const s = known.find((x) => sameObject(x, f.group, f.index) && x.field === f.field);
+        if (!s) throw new Refusal(ErrorCode.NOT_FOUND);
+        if (c.type === "forget") return { s, value: null };
+        if (!takes(s, c.value)) throw new Refusal(ErrorCode.BAD_ARGS);
+        return { s, value: c.value };
+      });
     });
     this.#needReady();
     // In order, so a later change to the same setting replaces an earlier one.
@@ -1466,7 +1464,7 @@ export class FakeAdapter implements ByteStream {
       kinds: p.candidate.kinds,
       transport: p.candidate.transport ?? "ble",
       state: "connecting",
-      info: { "battery.level": 90 },
+      info: { battery: { level: 90 } },
     });
     this.devices.push(created);
     this.#event({ case: "device", value: this.record(created) });

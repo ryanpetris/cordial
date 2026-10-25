@@ -15,8 +15,9 @@ use crate::{
     error::Error,
     model,
     profiles::{self, InterfaceUpdate},
+    ui::text,
 };
-use cordial_protocol::{self as p, ConfigurationInterface, Platform};
+use cordial_protocol::{self as p, ConfigurationInterface, ErrorCode, Platform, ResourceType};
 use ratatui::text::Line;
 
 pub const PLATFORMS: [Platform; 3] = [Platform::Linux, Platform::Windows, Platform::Mac];
@@ -117,8 +118,8 @@ impl<F: Fleet> Model<F> {
         });
     }
 
-    /// Saves the adapter's staged changes, asking first when the save reconnects USB.
-    pub(super) fn save_adapter(&mut self, id: &str, confirmed: bool) {
+    /// Saves the adapter's staged changes.
+    pub(super) fn save_adapter(&mut self, id: &str) {
         let Some(a) = self.adapter(id).cloned() else {
             return;
         };
@@ -130,10 +131,6 @@ impl<F: Fleet> Model<F> {
         if let Some(e) = profiles::interface_refusal(status, &changes.interfaces) {
             self.notes
                 .insert(Spot::AdapterSave(id.to_owned()), words::failure(&e));
-            return;
-        }
-        if !confirmed && profiles::reconnects(status, &changes.interfaces) {
-            self.dialog = Some(Dialog::SaveAdapter(id.to_owned()));
             return;
         }
         self.notes.remove(&Spot::AdapterSave(id.to_owned()));
@@ -213,7 +210,7 @@ impl<F: Fleet> Model<F> {
                 self.notes.remove(&Spot::Dialog);
                 self.open_picker(id);
             }
-            Action::AdapterSave => self.save_adapter(id, false),
+            Action::AdapterSave => self.save_adapter(id),
             Action::AdapterDiscard if !self.adapter_saving(id) => {
                 self.adapter_drafts.remove(id);
                 self.notes.remove(&Spot::AdapterSave(id.to_owned()));
@@ -300,22 +297,6 @@ impl<F: Fleet> Model<F> {
         buttons.align_right(right);
         DialogView {
             title: "Rename Adapter".into(),
-            body,
-            buttons,
-        }
-    }
-
-    /// The USB Reconnect Required confirmation, with Save enabled when `can_save`.
-    pub(super) fn reconnect_dialog(&self, can_save: bool, w: usize) -> DialogView {
-        let mut body = Layout::new(w);
-        body.para(words::RECONNECT_TEXT, layout::plain());
-        let mut buttons = Layout::new(w);
-        let mut right = Layout::new(w);
-        right.button("Cancel", Action::Cancel, Tone::Normal);
-        button_if(&mut right, "Save", Action::Confirm, Tone::Primary, can_save);
-        buttons.align_right(right);
-        DialogView {
-            title: words::RECONNECT_TITLE.into(),
             body,
             buttons,
         }
@@ -478,32 +459,36 @@ impl<F: Fleet> Model<F> {
                 b.control2(first, second, Action::Show(d.page()));
             }
         }
-        let limited: Vec<_> = live
-            .transports
-            .iter()
-            .filter(|t| t.enabled() && t.max_enabled.is_some())
+        let limited: Vec<_> = model::enabled_transports(live)
+            .into_iter()
+            .filter_map(|t| {
+                let r = model::enabled_devices(live, t)?;
+                (r.count.is_some() || r.limit.is_some()).then_some((t, r))
+            })
             .collect();
         if !limited.is_empty() {
             b.section("Active Devices");
-            for t in limited {
-                let Some(transport) = model::transport(t.transport) else {
-                    continue;
-                };
-                let max = t.max_enabled.unwrap_or(0);
-                let used = self
-                    .devices
-                    .iter()
-                    .filter(|d| {
-                        d.adapter == a.id
-                            && d.d.transport == t.transport
-                            && model::inactive(&d.d).is_none()
-                    })
-                    .count();
+            for (t, r) in limited {
                 b.fact(
-                    words::transport_name(transport),
-                    &format!("{used} of {max}"),
+                    words::transport_name(t),
+                    &text::capacity_text(r),
                     layout::plain(),
                 );
+            }
+        }
+        let interfaces = model::resource(&live.resources, ResourceType::Interfaces);
+        let usb = text::usb_capacity(live);
+        if interfaces.is_some() || !usb.is_empty() {
+            b.section("USB");
+            let count = interfaces.map_or_else(|| "Unknown".into(), text::capacity_text);
+            b.fact("Interfaces", &count, layout::plain());
+            for (code, label) in usb {
+                let look = if code == ErrorCode::UsbRequiredCapacityExceeded {
+                    warn()
+                } else {
+                    dim()
+                };
+                b.fact("", label, look);
             }
         }
         let enabled = model::enabled_transports(live);
@@ -520,8 +505,7 @@ impl<F: Fleet> Model<F> {
             }
         }
         b.section("Information");
-        let firmware = Self::info_text(live, cordial_protocol::keys::FIRMWARE_VERSION)
-            .unwrap_or_else(|| "Unknown".into());
+        let firmware = Self::firmware(live).unwrap_or_else(|| "Unknown".into());
         b.fact("Firmware", &firmware, layout::plain());
         if let Some(board) = Self::board(live) {
             b.fact("Board", &board, layout::plain());
@@ -603,17 +587,5 @@ impl<F: Fleet> Model<F> {
         profiles::configured(view, &draft)
             .into_iter()
             .find(|s| s.interface == i as i32)
-    }
-
-    /// Answers the reconnect confirmation by saving; false when the
-    /// dialog isn't the confirmation.
-    pub(super) fn adapter_confirm(&mut self, dialog: &Dialog) -> bool {
-        let Dialog::SaveAdapter(id) = dialog else {
-            return false;
-        };
-        let id = id.clone();
-        self.dialog = None;
-        self.save_adapter(&id, true);
-        true
     }
 }

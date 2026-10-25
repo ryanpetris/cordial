@@ -1,15 +1,39 @@
 import copy
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import firmware_config as config
 
 
 class BoardConfigTests(unittest.TestCase):
+    def test_bluetooth_limits_and_esp_controller_activities(self):
+        from bluetooth_config import generate, limits
+        for name, expected in (("pico_w", (2, 8)), ("pico2_w", (6, 14)),
+                               ("waveshare_rp2350b_plus_w", (6, 14)), ("xiao_esp32s3", (0, 8))):
+            path = config.ROOT / "boards" / f"{name}.json"
+            board = config.load(path, "development")
+            self.assertEqual(limits(board), expected)
+            with tempfile.TemporaryDirectory() as out, patch.dict(os.environ, CORDIAL_CONFIG=str(path)):
+                generate(out)
+                for key, value in zip(("CLASSIC", "BLE", "ACTIVE"), (*expected, sum(expected) + 1)):
+                    self.assertIn(f"pub const {key}_CONNECTIONS: usize = {value};\n",
+                                  Path(out, "bluetooth.rs").read_text())
+                    self.assertIn(f"#define CORDIAL_{key}_CONNECTIONS {value}\n",
+                                  Path(out, "cordial_bluetooth.h").read_text())
+            if board["chip"] == "esp32s3":
+                with tempfile.TemporaryDirectory() as out:
+                    config.generate(board, out)
+                    sdk = Path(out, "sdkconfig.defaults").read_text()
+                    for setting in ("BT_CTRL_BLE_MAX_ACT=10", "BT_NIMBLE_MAX_CONNECTIONS=9",
+                                    "BT_NIMBLE_MAX_BONDS=9"):
+                        self.assertIn("CONFIG_" + setting + "\n", sdk)
+
     def test_adapter_defaults_are_baked_without_changing_identity(self):
         for board in config.ROOT.joinpath("boards").glob("*.json"):
             baseline = config.load(board, "production")

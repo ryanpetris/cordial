@@ -12,7 +12,7 @@
 #include "ble/gatt_client.h"
 #include "ble/att_server.h"
 #include "ble/sm.h"
-#define CORDIAL_LINKS 4
+#define CORDIAL_LINKS CORDIAL_ACTIVE_CONNECTIONS
 #define CORDIAL_REPORT_BYTES 512
 #define CORDIAL_DESCRIPTOR_BYTES 2048
 #define CORDIAL_SERVICES 3

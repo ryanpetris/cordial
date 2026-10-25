@@ -70,7 +70,7 @@ export function trayModel(state: AppState): TrayModel {
   return {
     visible: adapters.length > 0 || state.preferences.alwaysShowTray,
     base: connected.length ? "connected" : "idle",
-    badge: low.length ? "low" : attention.length ? "attention" : "none",
+    badge: attention.length ? "attention" : low.length ? "low" : "none",
     tooltip: `Cordial — ${tooltip}`,
     groups,
     empty: devices.length ? null : adapters.length ? "No Saved Devices" : "No Adapter Connected",

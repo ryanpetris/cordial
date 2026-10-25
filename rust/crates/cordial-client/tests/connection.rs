@@ -188,6 +188,55 @@ fn responses_match_requests_in_order_with_events_between() {
 }
 
 #[test]
+fn status_and_device_events_preserve_scoped_errors_and_resources() {
+    let mut adapter = status("Desk");
+    adapter.errors = vec![
+        p::ErrorCode::UsbRequiredCapacityExceeded as i32,
+        p::ErrorCode::UsbReservedCapacityExceeded as i32,
+    ];
+    adapter.resources = vec![p::ResourceCapacity {
+        r#type: p::ResourceType::Interfaces as i32,
+        count: Some(5),
+        limit: None,
+    }];
+    adapter.configuration_interfaces = vec![p::ConfigurationInterfaceSupport {
+        interface: p::ConfigurationInterface::Via as i32,
+        enabled: true,
+        active: false,
+        profile: 3,
+        ..Default::default()
+    }];
+    let mut saved_device = device(2);
+    saved_device.errors = vec![p::ErrorCode::ProfileMemoryExceeded as i32];
+    saved_device.integrations = vec![p::Integration {
+        kind: p::IntegrationKind::Hidpp as i32,
+        enabled: true,
+        status: Some(p::integration::Status::Error(p::ErrorCode::Timeout as i32)),
+        ..Default::default()
+    }];
+    let reply = adapter.clone();
+    let changed = saved_device.clone();
+    let (reader, writer, _, _out) = dongle(
+        |_| {},
+        move |command, out| match command {
+            Command::GetStatus(_) => out.respond(Some(response::Result::Status(reply.clone()))),
+            Command::GetDevice(_) => {
+                out.respond(Some(response::Result::Device(changed.clone())));
+                out.event(p::event::Kind::Device(changed.clone()));
+            }
+            other => panic!("{other:?}"),
+        },
+    );
+    let (connection, events) = Connection::new(reader, writer);
+    assert_eq!(connection.status().unwrap(), adapter);
+    assert_eq!(connection.get_device(2).unwrap(), saved_device);
+    assert_eq!(
+        events.recv_timeout(Duration::from_secs(1)).unwrap().kind,
+        Some(p::event::Kind::Device(saved_device))
+    );
+}
+
+#[test]
 fn the_first_request_follows_a_delimiter_and_leftovers_are_ignored() {
     let (reader, writer, received, _out) = dongle(
         |out| {
@@ -343,6 +392,97 @@ fn profile_commands_carry_their_fields_and_results() {
 }
 
 #[test]
+fn typed_settings_keep_metadata_cursors_partial_updates_and_whole_events() {
+    let object = |index| p::SettingsObject {
+        integration: p::IntegrationKind::Hidpp as i32,
+        group: Some(p::settings_object::Group::PointerSensor(
+            p::PointerSensorSettings {
+                index,
+                dpi: Some(p::IntegerSetting {
+                    value: Some(0),
+                    saved: Some(800),
+                    status: Some(p::SettingStatus {
+                        result: Some(p::setting_status::Result::State(
+                            p::SettingState::Pending as i32,
+                        )),
+                    }),
+                    limits: Some(p::integer_setting::Limits::Range(p::IntegerRange {
+                        min: 0,
+                        max: 3200,
+                        step: 100,
+                    })),
+                }),
+            },
+        )),
+    };
+    let expected = vec![object(0), object(1)];
+    let change = p::SettingsUpdate {
+        integration: p::IntegrationKind::Hidpp as i32,
+        group: Some(p::settings_update::Group::Backlight(
+            p::BacklightSettingsUpdate {
+                enabled: Some(p::BoolSettingUpdate {
+                    change: Some(p::bool_setting_update::Change::Value(false)),
+                }),
+                delay: Some(p::BacklightDelaySettingsUpdate {
+                    hands_away: Some(p::IntegerSettingUpdate {
+                        change: Some(p::integer_setting_update::Change::Value(0)),
+                    }),
+                    external_power: Some(p::IntegerSettingUpdate {
+                        change: Some(p::integer_setting_update::Change::Forget(
+                            p::SettingForget {},
+                        )),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+    };
+    let event = p::SettingsChanged {
+        device: 1,
+        changed: vec![object(1)],
+        removed: vec![cordial_client::paging::settings_ref(&object(0))],
+    };
+    let saved_change = change;
+    let saved_event = event.clone();
+    let (reader, writer, _, _out) = dongle(
+        |_| {},
+        move |command, out| match command {
+            Command::GetStatus(_) => out.respond(Some(response::Result::Status(status("Desk")))),
+            Command::ListSettings(list) => {
+                assert_eq!(list.device, 1);
+                let index = if let Some(after) = list.after {
+                    assert_eq!(after, cordial_client::paging::settings_ref(&object(0)));
+                    1
+                } else {
+                    0
+                };
+                out.respond(Some(response::Result::Settings(p::DeviceSettings {
+                    device: 1,
+                    objects: vec![object(index)],
+                    end: index == 1,
+                })));
+            }
+            Command::SetSettings(update) => {
+                assert_eq!(update.device, 1);
+                assert_eq!(update.changes, vec![saved_change]);
+                out.respond(None);
+                out.event(p::event::Kind::SettingsChanged(saved_event.clone()));
+            }
+            other => panic!("{other:?}"),
+        },
+    );
+    let (connection, events) = Connection::new(reader, writer);
+    connection.status().unwrap();
+    assert_eq!(connection.all_settings(1).unwrap(), expected);
+    connection.set_settings(1, vec![change]).unwrap();
+    assert_eq!(
+        events.recv_timeout(Duration::from_secs(1)).unwrap().kind,
+        Some(p::event::Kind::SettingsChanged(event))
+    );
+}
+
+#[test]
 fn listings_read_every_page_and_keep_unreadable_ids() {
     let afters = Arc::new(Mutex::new(Vec::new()));
     let log = afters.clone();
@@ -450,13 +590,16 @@ fn a_timed_out_request_closes_the_connection() {
 fn a_request_over_the_frame_limit_is_not_sent() {
     let (reader, writer, received, _out) = dongle(|_| {}, |_, out| out.respond(None));
     let (connection, _events) = Connection::new(reader, writer);
-    let change = p::SettingChange {
+    let change = p::SettingsUpdate {
         integration: p::IntegrationKind::Hidpp as i32,
-        key: "k".repeat(MAX_REQUEST_BYTES),
-        change: None,
+        group: Some(p::settings_update::Group::Power(p::PowerSettingsUpdate {
+            auto_off: Some(p::IntegerSettingUpdate {
+                change: Some(p::integer_setting_update::Change::Value(30)),
+            }),
+        })),
     };
     assert!(matches!(
-        connection.set_settings(1, vec![change]),
+        connection.set_settings(1, vec![change; MAX_REQUEST_BYTES]),
         Err(Error::TooLong)
     ));
     thread::sleep(Duration::from_millis(30));
@@ -526,7 +669,7 @@ fn a_handler_sees_events_and_responses_in_stream_order() {
                 }));
                 out.respond(Some(response::Result::Settings(p::DeviceSettings {
                     device: 1,
-                    settings: Vec::new(),
+                    objects: Vec::new(),
                     end: true,
                 })));
                 out.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 1 }));
@@ -643,7 +786,6 @@ impl Name for p::event::Kind {
             p::event::Kind::ScanFound(_) => "scan_found",
             p::event::Kind::ScanDone(_) => "scan_done",
             p::event::Kind::Pairing(_) => "pairing",
-            p::event::Kind::WarningsChanged(_) => "warnings_changed",
             p::event::Kind::Profile(_) => "profile",
             p::event::Kind::ProfileRemoved(_) => "profile_removed",
         }

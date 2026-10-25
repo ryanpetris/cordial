@@ -63,7 +63,7 @@ describe("development server", () => {
     };
     expect(await classic(false)).toBe(true);
     // The simulated ESP32-S3 supports only BLE, enabled.
-    expect((await state()).adapters.find((a) => a.id === "00000000000FA002")!.status!.transports).toEqual([{ transport: "ble", maxEnabled: 7, enabled: true }]);
+    expect((await state()).adapters.find((a) => a.id === "00000000000FA002")!.status!.transports).toMatchObject([{ transport: "ble", enabled: true }]);
     const set = (enabled: unknown) => act({ type: "adapter.settings", adapterId: "00000000000FA001", transports: { classic: enabled } });
     expect(await set(true)).toEqual(OK);
     expect(await classic(true)).toBe(true);

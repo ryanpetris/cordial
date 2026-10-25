@@ -233,7 +233,7 @@ fn forget_survives_capability_changes_and_keeps_cached_rows() {
         let mut read_only = setting();
         read_only.writable = false;
         catalog.replace_discovery(vec![read_only], vec![]).unwrap();
-        assert!(catalog.records()[0].writable);
+        assert!(!catalog.records()[0].writable);
         assert_eq!(catalog.records()[0].state, SettingState::Unsupported);
         catalog.connection(false, false);
         catalog

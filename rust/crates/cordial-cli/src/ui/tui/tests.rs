@@ -3,13 +3,10 @@
 use super::*;
 use crate::{
     controller::Target,
-    model,
-    ui::{
-        catalog::tests::{boolean, choice, integer},
-        command::tests as fixture,
-    },
+    settings::tests::{ranged, sensor, wheel},
+    ui::command::tests as fixture,
 };
-use cordial_protocol::{DeviceState, InactiveReason, IntegrationKind, keys};
+use cordial_protocol::{DeviceState, InactiveReason, IntegrationKind};
 use ratatui::{
     buffer::Buffer,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -71,30 +68,28 @@ fn port(name: &str, id: &str) -> PortInfo {
     }
 }
 
-fn battery(d: &mut p::Device, percent: i64) {
-    d.info.push(p::Info {
-        key: keys::BATTERY_LEVEL.into(),
-        value: Some(model::wire_value(Value::Integer(percent))),
-    });
+fn battery(d: &mut p::Device, percent: u32) {
+    d.information
+        .get_or_insert_default()
+        .battery
+        .get_or_insert_default()
+        .level = Some(percent);
 }
 
-/// A mouse with Logitech Features up and three settings.
-fn mouse_settings() -> Vec<p::Setting> {
-    let mut dpi = integer("pointer.sensor.0.dpi", 200, 4000, 50);
-    if let Some(p::setting::Type::Integer(i)) = &mut dpi.r#type {
-        i.value = Some(1000);
-        i.saved = Some(1000);
-    }
-    dpi.status = Some(p::setting::Status::State(p::SettingState::Applied as i32));
-    let mut mode = choice(keys::WHEEL_MODE, &["freespin", "ratchet"]);
-    if let Some(p::setting::Type::Enum(e)) = &mut mode.r#type {
-        e.value = Some("ratchet".into());
-    }
-    let mut invert = boolean(keys::WHEEL_INVERT);
-    if let Some(p::setting::Type::Bool(b)) = &mut invert.r#type {
-        b.value = Some(false);
-    }
-    vec![dpi, mode, invert]
+/// A mouse with Logitech Features up and three settings: a saved sensitivity, a stepped wheel
+/// and its direction.
+fn mouse_settings() -> Vec<p::SettingsObject> {
+    let mut dpi = ranged(Some(1000), 200, 4000, 50);
+    dpi.saved = Some(1000);
+    dpi.status = Some(p::SettingStatus {
+        result: Some(p::setting_status::Result::State(
+            p::SettingState::Applied as i32,
+        )),
+    });
+    vec![
+        sensor(0, dpi),
+        wheel(Some(p::WheelMode::Stepped as i32), Some(false)),
+    ]
 }
 
 fn first_adapter() -> State {
@@ -546,19 +541,21 @@ fn offer_gamepads(st: &mut State) {
             .into_iter()
             .map(|mode| p::OutputModeSupport {
                 mode: mode as i32,
-                max_slots: 4,
-                slots: Some(1),
+                resources: vec![p::ResourceCapacity {
+                    r#type: p::ResourceType::Slots as i32,
+                    count: Some(1),
+                    limit: Some(4),
+                }],
             })
             .collect(),
     }];
 }
 
 impl App {
-    /// Answers the USB Reconnect Required confirmation with Save.
-    fn confirm_reconnect(&mut self) {
-        assert!(self.shows(words::RECONNECT_TITLE), "{}", self.screen());
-        self.click("[Save]");
-        assert_eq!(self.m.dialog, None);
+    /// A save sent at once, without a confirmation.
+    fn saved_without_asking(&mut self) {
+        let screen = self.screen();
+        assert_eq!(self.m.dialog, None, "{screen}");
     }
 }
 
@@ -581,7 +578,7 @@ fn gamepad_output_is_staged_on_settings_until_save() {
     assert!(app.shows("✎ Changed"));
     assert!(!app.ran("DeviceSave"));
     app.ctrl('s');
-    app.confirm_reconnect();
+    app.saved_without_asking();
     assert!(app.ran("DeviceSave(4, DeviceUpdate { enabled: None, trusted: None, blocked: None, hidpp: None, gamepad: Some(Xinput), layers: None })"));
     app.finish(Ok(Outcome::Devices));
     assert!(!app.shows("✎ Changed"));
@@ -630,11 +627,11 @@ fn settings_save_before_a_gamepad_output_change() {
     app.attach(vec![("/dev/ttyACM0", st)]);
     app.click("Example Mouse");
     app.click("Settings");
-    app.click("[○ Freespin]");
+    app.click("[○ Free Spin]");
     app.click("[○ Disabled]");
     assert!(app.shows("[● Disabled]"));
     app.ctrl('s');
-    app.confirm_reconnect();
+    app.saved_without_asking();
     assert!(app.ran("SettingsSave { device: 2"));
     assert!(!app.ran("DeviceSave"));
     // The staged output can't change while the settings save.
@@ -646,7 +643,7 @@ fn settings_save_before_a_gamepad_output_change() {
 }
 
 #[test]
-fn a_gamepad_pool_change_asks_before_saving_anything() {
+fn a_gamepad_output_change_saves_without_asking() {
     let mut st = first_adapter();
     offer_gamepads(&mut st);
     st.devices[1].output_preferences = vec![p::OutputPreference {
@@ -657,88 +654,28 @@ fn a_gamepad_pool_change_asks_before_saving_anything() {
     app.attach(vec![("/dev/ttyACM0", st)]);
     app.click("Example Mouse");
     app.click("Settings");
-    app.click("[○ Freespin]");
+    app.click("[○ Free Spin]");
     app.click("[○ Disabled]");
-    let runs = app.calls().len();
-    // Cancel, Escape and the Save button and shortcut that open the confirmation send nothing.
+    // Save sends the settings, then Gamepad Output, whatever happens to the USB interfaces.
     app.click("[Save]");
-    assert!(app.shows(words::RECONNECT_TITLE), "{}", app.screen());
-    app.click("[Cancel]");
-    assert_eq!(app.m.dialog, None);
-    app.render();
-    app.ctrl('s');
-    assert!(app.shows(words::RECONNECT_TITLE));
-    app.key(KeyCode::Esc);
-    assert_eq!(app.m.dialog, None);
-    assert_eq!(app.calls().len(), runs);
-    let screen = app.screen();
-    assert!(
-        screen.contains("[● Disabled]") && screen.contains("[● Freespin]"),
-        "{screen}"
-    );
-    // Save sends the settings, then Gamepad Output without asking again.
-    app.render();
-    app.ctrl('s');
-    app.confirm_reconnect();
+    app.saved_without_asking();
     assert!(app.ran("SettingsSave { device: 2"));
     assert!(!app.ran("DeviceSave"));
     app.finish(Ok(Outcome::Devices));
     assert!(app.ran("gamepad: Some(Disabled)"));
     assert_eq!(app.m.dialog, None);
-}
-
-#[test]
-fn a_save_that_keeps_the_gamepad_pools_does_not_ask() {
-    // Settings alone.
-    let mut st = first_adapter();
-    offer_gamepads(&mut st);
-    st.devices[1].output_preferences = vec![p::OutputPreference {
-        role: p::Role::Gamepad as i32,
-        mode: p::OutputMode::Hid as i32,
-    }];
-    let mut app = App::new(110, 40);
-    app.attach(vec![("/dev/ttyACM0", st)]);
-    app.click("Example Mouse");
-    app.click("Settings");
-    app.click("[○ Freespin]");
-    app.render();
-    app.ctrl('s');
-    assert_eq!(app.m.dialog, None);
-    assert!(app.ran("SettingsSave { device: 2"));
-
-    // HID stays full without the gamepad: four other saved devices select it, whether disabled,
-    // blocked, not resident or on a disabled transport. The enumerated pool reports one slot.
+    // A gamepad alone also saves at once.
     let mut st = gamepad_adapter(p::OutputMode::Hid);
     offer_gamepads(&mut st);
-    let inactive = [
-        InactiveReason::Disabled,
-        InactiveReason::Blocked,
-        InactiveReason::Capacity,
-        InactiveReason::TransportDisabled,
-    ];
-    for (id, why) in (5..).zip(inactive) {
-        st.devices.push(p::Device {
-            state: DeviceState::Disconnected as i32,
-            enabled: why != InactiveReason::Disabled,
-            blocked: why == InactiveReason::Blocked,
-            inactive: Some(why as i32),
-            output_preferences: st.devices[3].output_preferences.clone(),
-            ..fixture::device(id, "Spare Gamepad")
-        });
-    }
-    let mut four = st.clone();
-    four.devices.pop();
-    for (st, asks) in [(st, false), (four, true)] {
-        let mut app = App::new(110, 40);
-        app.attach(vec![("/dev/ttyACM0", st)]);
-        app.click("Example Gamepad");
-        app.click("Settings");
-        app.click("[○ Disabled]");
-        app.render();
-        app.ctrl('s');
-        assert_eq!(app.shows(words::RECONNECT_TITLE), asks, "{}", app.screen());
-        assert_eq!(app.ran("gamepad: Some(Disabled)"), !asks);
-    }
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Example Gamepad");
+    app.click("Settings");
+    app.click("[○ Disabled]");
+    app.render();
+    app.ctrl('s');
+    app.saved_without_asking();
+    assert!(app.ran("gamepad: Some(Disabled)"));
 }
 
 #[test]
@@ -760,16 +697,16 @@ fn a_failed_settings_save_keeps_the_gamepad_output_change_staged() {
         app.attach(vec![("/dev/ttyACM0", st)]);
         app.click("Example Mouse");
         app.click("Settings");
-        app.click("[○ Freespin]");
+        app.click("[○ Free Spin]");
         app.click("[○ Disabled]");
         app.ctrl('s');
-        app.confirm_reconnect();
+        app.saved_without_asking();
         app.finish(Err(error));
         assert!(!app.ran("DeviceSave"));
         let screen = app.screen();
         assert!(screen.contains(text), "{screen}");
         assert!(
-            screen.contains("[● Disabled]") && screen.contains("[● Freespin]"),
+            screen.contains("[● Disabled]") && screen.contains("[● Free Spin]"),
             "{screen}"
         );
     }
@@ -788,10 +725,10 @@ fn details_save_waits_for_a_settings_save_that_saves_the_gamepad_output() {
     app.click("Example Mouse");
     app.m.action(Action::DeviceToggle(Toggle::Trusted, false));
     app.click("Settings");
-    app.click("[○ Freespin]");
+    app.click("[○ Free Spin]");
     app.click("[○ Disabled]");
     app.ctrl('s');
-    app.confirm_reconnect();
+    app.saved_without_asking();
     assert!(app.ran("SettingsSave { device: 2"));
     // Saving Details now would leave the gamepad output unsent once the settings save.
     app.m.action(Action::DetailsSave);
@@ -852,7 +789,7 @@ fn save_xinput(app: &mut App) {
     app.click("[○ XInput]");
     app.render();
     app.ctrl('s');
-    app.confirm_reconnect();
+    app.saved_without_asking();
     assert!(app.ran("gamepad: Some(Xinput)"));
 }
 
@@ -1024,10 +961,10 @@ fn a_settings_save_answered_after_a_reconnect_sends_nothing_to_the_new_session()
     app.attach(vec![("/dev/ttyACM0", st.clone())]);
     app.click("Example Mouse");
     app.click("Settings");
-    app.click("[○ Freespin]");
+    app.click("[○ Free Spin]");
     app.click("[○ Disabled]");
     app.ctrl('s');
-    app.confirm_reconnect();
+    app.saved_without_asking();
     let (old, ticket) = *app
         .m
         .jobs
@@ -1056,12 +993,12 @@ fn settings_save_sends_every_change_in_one_request() {
     let mut app = App::two(110, 32);
     app.click("Example Mouse");
     app.click("Settings");
-    app.click("[○ Freespin]");
+    app.click("[○ Free Spin]");
     app.click("[ ] Off");
     app.click("[Save]");
     assert!(app.ran("SettingsSave { device: 2"));
-    assert!(app.ran("wheel.mode"));
-    assert!(app.ran("wheel.invert"));
+    assert!(app.ran("WheelMode"));
+    assert!(app.ran("WheelInvert"));
 }
 
 #[test]
@@ -1085,7 +1022,7 @@ fn typed_numbers_are_checked_before_saving() {
 }
 
 #[test]
-fn a_reconnecting_save_asks_first() {
+fn an_interface_save_is_sent_without_asking() {
     let mut app = App::two(110, 32);
     app.click("Pico 2 W");
     app.click("Profiles");
@@ -1101,8 +1038,7 @@ fn a_reconnecting_save_asks_first() {
         Some(3),
     );
     app.m.action(Action::AdapterSave);
-    assert!(app.shows("USB Reconnect Required"));
-    app.click("[Save]");
+    app.saved_without_asking();
     assert!(app.ran("AdapterSave"));
 }
 
@@ -1150,7 +1086,7 @@ fn quitting_closes_every_session() {
 fn the_enabled_limit_is_predicted_as_the_adapter_applies_it() {
     let mut st = first_adapter();
     // Bluetooth LE allows one device in use, and the keyboard holds it.
-    st.status.transports[1].max_enabled = Some(1);
+    st.status.transports[1].resources[0].limit = Some(1);
     st.devices.truncate(1);
     let off = p::Device {
         id: 9,
@@ -1256,4 +1192,56 @@ fn file_downloads_save_records_as_json() {
     );
     let to = screen.lines().find(|l| l.contains(" To ")).unwrap();
     assert!(to.contains("sequence.pb") && !to.contains("json"), "{to}");
+}
+
+#[test]
+fn usb_capacity_errors_show_independently() {
+    let mut st = first_adapter();
+    st.status.resources = vec![p::ResourceCapacity {
+        r#type: p::ResourceType::Interfaces as i32,
+        count: Some(0),
+        limit: Some(8),
+    }];
+    st.status.errors = vec![p::ErrorCode::UsbReservedCapacityExceeded as i32];
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    // Reserved capacity alone is shown on the adapter's page, without needing attention.
+    assert!(!app.shows("Reserved Capacity Exceeded"));
+    app.click("Pico 2 W");
+    let screen = app.screen();
+    assert!(
+        screen.contains("0 of 8") && screen.contains("Reserved Capacity Exceeded"),
+        "{screen}"
+    );
+    assert!(!screen.contains("Needs Attention") && !screen.contains("Required Capacity"));
+    // Required capacity needs attention, and both show at once.
+    let slot = app.slot("00000000000FA001");
+    app.edit(slot, |st| {
+        st.status.errors = vec![
+            p::ErrorCode::UsbRequiredCapacityExceeded as i32,
+            p::ErrorCode::UsbReservedCapacityExceeded as i32,
+        ];
+        st.status.resources[0].count = None;
+    });
+    app.m.tick();
+    let screen = app.screen();
+    for text in [
+        "Needs Attention",
+        "! The adapter doesn't have enough USB capacity for every required",
+        "Required Capacity Exceeded",
+        "Reserved Capacity Exceeded",
+        "Up to 8",
+    ] {
+        assert!(screen.contains(text), "{text}:\n{screen}");
+    }
+    app.click("Overview");
+    assert!(app.shows("Required Capacity Exceeded"), "{}", app.screen());
+    // Required capacity alone.
+    app.edit(slot, |st| {
+        st.status.errors = vec![p::ErrorCode::UsbRequiredCapacityExceeded as i32];
+    });
+    app.click("Pico 2 W");
+    let screen = app.screen();
+    assert!(screen.contains("Required Capacity Exceeded"), "{screen}");
+    assert!(!screen.contains("Reserved Capacity Exceeded"), "{screen}");
 }

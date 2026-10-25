@@ -2,8 +2,8 @@
 //! Messages are complete sentences; labels and status words are Title Case.
 use crate::{error::Error, model, ui::text};
 use cordial_protocol::{
-    self as p, CapacityReason, DeviceState, ErrorCode, InactiveReason, Kind, Role, Transport, keys,
-    value::Value,
+    self as p, CapacityReason, DeviceState, ErrorCode, InactiveReason, Kind, ResourceType, Role,
+    Transport,
 };
 
 fn error_clause(code: ErrorCode) -> &'static str {
@@ -42,6 +42,16 @@ fn error_clause(code: ErrorCode) -> &'static str {
         DeviceError => "this device reported an error",
         InvalidResponse => "the adapter couldn't understand this device's reply",
         ReadbackMismatch => "the device reported a different value from the one requested",
+        StorageFull => "the adapter's storage is full",
+        ProfileMemoryLow => "the adapter is almost out of profile memory",
+        UsbRequiredCapacityExceeded => {
+            "the adapter doesn't have enough USB capacity for every required interface"
+        }
+        UsbReservedCapacityExceeded => {
+            "the adapter doesn't have enough USB capacity for every reserved interface"
+        }
+        ProfileMemoryExceeded => "the adapter doesn't have room for this device's profiles",
+        ProfileLoadFailed => "the adapter couldn't read one of this device's profiles",
     }
 }
 
@@ -110,13 +120,10 @@ pub fn other_adapter(adapter: &str) -> String {
 }
 
 pub const STORAGE_FULL: &str = "Storage Full";
+pub const REQUIRED_CAPACITY: &str = text::USB_CAPACITY[0].1;
 pub const STORAGE_FULL_ATTENTION: &str = "The adapter's storage is full. Remove an unused device or forget a saved setting to pair another device.";
-pub const WARNINGS_READ_FAILED: &str = "The adapter couldn't read the device's warnings.";
 pub const SETTINGS_READ_FAILED: &str = "The adapter couldn't read the device's settings.";
 pub const SETTINGS_SAVE_FAILED: &str = "The adapter couldn't save the settings.";
-pub const RECONNECT_TITLE: &str = "USB Reconnect Required";
-pub const RECONNECT_TEXT: &str =
-    "The adapter will disconnect from this computer for a moment after it saves these changes.";
 pub const FORGET_TEXT: &str =
     "Forgetting this device deletes its pairing and saved settings from the adapter.";
 pub const ADAPTER_NAME_INVALID: &str = "Enter an adapter name of up to 64 bytes.";
@@ -289,8 +296,7 @@ pub fn role_text(r: Role) -> Option<&'static str> {
 /// Why a connected device's profiles aren't loaded.
 pub fn profile_error_text(code: ErrorCode) -> String {
     match code {
-        ErrorCode::NoCapacity => "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.".into(),
-        ErrorCode::StorageFailed => "The adapter couldn't read one of this device's profiles.".into(),
+        ErrorCode::ProfileMemoryExceeded => "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.".into(),
         code => code_text(code),
     }
 }
@@ -336,43 +342,6 @@ pub fn security_facts(s: &p::Security) -> [(&'static str, String); 4] {
     ]
 }
 
-/// Labels of the information keys, in display order.
-pub const INFO_LABELS: [(&str, &str); 11] = [
-    (keys::DEVICE_MANUFACTURER, "Manufacturer"),
-    (keys::DEVICE_MODEL, "Model"),
-    (keys::DEVICE_SERIAL, "Serial Number"),
-    (keys::FIRMWARE_VERSION, "Firmware"),
-    (keys::BOOTLOADER_VERSION, "Bootloader"),
-    (keys::HARDWARE_REVISION, "Hardware"),
-    (keys::SOFTWARE_REVISION, "Software"),
-    (keys::VENDOR_REGISTRY, "Vendor ID Namespace"),
-    (keys::VENDOR_ID, "Vendor ID"),
-    (keys::PRODUCT_ID, "Product ID"),
-    (keys::PRODUCT_VERSION, "Product Version"),
-];
-
-pub fn info_label(key: &str) -> &'static str {
-    INFO_LABELS
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map_or("", |(_, l)| l)
-}
-
-/// An information value as shown.
-pub fn info_value(key: &str, v: &Value) -> String {
-    match (key, v) {
-        (keys::VENDOR_ID | keys::PRODUCT_ID | keys::PRODUCT_VERSION, Value::Integer(n)) => {
-            format!("0x{n:04X}")
-        }
-        (keys::VENDOR_REGISTRY, Value::Text(t)) if t == "usb" => "USB".into(),
-        (keys::VENDOR_REGISTRY, _) => "Bluetooth".into(),
-        (_, Value::Bool(b)) => if *b { "Yes" } else { "No" }.into(),
-        (_, Value::Color(c)) => format!("#{c:06X}"),
-        (_, Value::Integer(n)) => n.to_string(),
-        (_, Value::Text(t)) => text::display(t),
-    }
-}
-
 /// The low battery threshold, in percent, the desktop application uses by default.
 pub const LOW_BATTERY_PERCENT: i64 = 20;
 /// At most this charged is critically low.
@@ -396,7 +365,7 @@ pub enum Level {
 
 impl Battery {
     pub fn of(d: &p::Device) -> Option<Self> {
-        let b = text::battery(&d.info)?;
+        let b = text::battery(d.information.as_ref())?;
         Some(Self {
             percent: b.percent,
             charging: b.charging,
@@ -442,53 +411,32 @@ impl Battery {
     }
 }
 
-/// How full the adapter's profile memory is, as a whole percentage rounded half up.
+/// How full the adapter's profile memory is, as a whole percentage rounded half up; None while
+/// its use or a nonzero budget is unknown.
 pub fn memory_percent(status: &p::Status) -> Option<u32> {
-    let support = status
-        .profile_support
-        .as_ref()
-        .filter(|s| s.memory_budget > 0)?;
-    let used = u64::from(support.memory_used) * 100;
-    let budget = u64::from(support.memory_budget);
+    let memory = crate::profiles::resource(status, ResourceType::Memory)?;
+    let used = u64::from(memory.count?) * 100;
+    let budget = u64::from(memory.limit.filter(|b| *b > 0)?);
     Some(((used * 2 + budget) / (budget * 2)) as u32)
 }
 
-/// At or above this share of the profile memory budget, the adapter needs attention.
-pub const MEMORY_ALERT_PERCENT: u64 = 85;
-
+/// The adapter reports its profile memory almost full.
 pub fn memory_alert(status: &p::Status) -> bool {
-    status.profile_support.as_ref().is_some_and(|s| {
-        s.memory_budget > 0
-            && u64::from(s.memory_used) * 100 >= u64::from(s.memory_budget) * MEMORY_ALERT_PERCENT
-    })
+    model::has_error(status, ErrorCode::ProfileMemoryLow)
 }
 
 /// The wheel's capability readings as labelled figures.
-pub fn wheel_figures(info: &[p::Info]) -> Vec<(&'static str, String)> {
+pub fn wheel_figures(info: Option<&p::DeviceInformation>) -> Vec<(&'static str, String)> {
+    let Some(w) = info.and_then(|i| i.wheel.as_ref()) else {
+        return Vec::new();
+    };
     [
-        (
-            keys::WHEEL_RESOLUTION_MULTIPLIER,
-            "Resolution Multiplier",
-            "",
-        ),
-        (
-            keys::WHEEL_RATCHETS_PER_ROTATION,
-            "Ratchets per Rotation",
-            "",
-        ),
-        (keys::WHEEL_DIAMETER, "Wheel Diameter", " mm"),
+        ("Resolution Multiplier", w.resolution_multiplier, ""),
+        ("Ratchets per Rotation", w.ratchets_per_rotation, ""),
+        ("Wheel Diameter", w.diameter, " mm"),
     ]
     .into_iter()
-    .filter_map(|(key, label, unit)| {
-        let v = model::info(info, key)?;
-        let shown = match v {
-            Value::Integer(n) => n.to_string(),
-            Value::Text(t) => text::display(t),
-            Value::Bool(b) => if *b { "Yes" } else { "No" }.into(),
-            Value::Color(c) => format!("#{c:06X}"),
-        };
-        Some((label, format!("{shown}{unit}")))
-    })
+    .filter_map(|(label, v, unit)| Some((label, format!("{}{unit}", v?))))
     .collect()
 }
 
@@ -504,19 +452,28 @@ mod tests {
 
     #[test]
     fn memory_rounds_half_up() {
-        let status = |used, budget| p::Status {
+        let status = |count, limit| p::Status {
             profile_support: Some(p::ProfileSupport {
-                memory_used: used,
-                memory_budget: budget,
+                resources: vec![p::ResourceCapacity {
+                    r#type: ResourceType::Memory as i32,
+                    count,
+                    limit,
+                }],
                 ..Default::default()
             }),
             ..Default::default()
         };
-        assert_eq!(memory_percent(&status(1, 200)), Some(1));
-        assert_eq!(memory_percent(&status(1, 201)), Some(0));
-        assert_eq!(memory_percent(&status(0, 0)), None);
-        assert!(memory_alert(&status(85, 100)));
-        assert!(!memory_alert(&status(84, 100)));
+        assert_eq!(memory_percent(&status(Some(1), Some(200))), Some(1));
+        assert_eq!(memory_percent(&status(Some(1), Some(201))), Some(0));
+        assert_eq!(memory_percent(&status(Some(0), Some(0))), None);
+        // An unknown count isn't a count of zero.
+        assert_eq!(memory_percent(&status(None, Some(200))), None);
+        assert_eq!(memory_percent(&status(Some(0), Some(200))), Some(0));
+        // The adapter decides when memory is low.
+        let mut low = status(Some(1), Some(200));
+        assert!(!memory_alert(&low));
+        low.errors.push(ErrorCode::ProfileMemoryLow as i32);
+        assert!(memory_alert(&low));
     }
 
     #[test]

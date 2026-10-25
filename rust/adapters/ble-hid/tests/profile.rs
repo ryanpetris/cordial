@@ -98,7 +98,11 @@ impl Host for Mock {
         false
     }
     fn adopt(&mut self, _: u32) -> Result<(), Error> {
+        self.0.borrow_mut().log.push(("adopt", 0));
         Ok(())
+    }
+    fn promote(&mut self, _: u32) {
+        self.0.borrow_mut().log.push(("promote", 0));
     }
     async fn changed(&self) {}
     fn start(&mut self) -> Result<(), Error> {
@@ -458,6 +462,10 @@ fn pairing_waits_for_saved_policy_then_discovers_service_scoped_reports() {
     assert!(!b.can_write(LINK));
     assert!(state.borrow().writes.is_empty());
     b.adopt(LINK).unwrap();
+    assert!(state.borrow().log.contains(&("adopt", 0)));
+    assert!(!state.borrow().log.contains(&("promote", 0)));
+    b.promote(LINK);
+    assert!(state.borrow().log.contains(&("promote", 0)));
     connected(&mut b);
     assert_eq!(state.borrow().writes, [(17, vec![1, 0]), (57, vec![1, 0])]);
     let token = state.borrow().token;
@@ -1878,4 +1886,31 @@ fn a_disconnect_the_host_cannot_queue_is_retried() {
             ..
         })
     ));
+}
+
+#[test]
+fn adopted_reserve_accepts_encryption_but_rejects_pairing_and_keeps_bond_on_close() {
+    let (mut backend, state) = setup(false);
+    backend.connect(LINK, PEER, true, None).unwrap();
+    block_on(backend.poll());
+    while backend.next_profile_event().is_some() {}
+    backend.adopt(LINK).unwrap();
+    connected(&mut backend);
+    let token = state.borrow().token;
+    state.borrow_mut().events.push_back(Raw::Security {
+        token,
+        identity: PEER,
+        security: SECURITY,
+    });
+    block_on(backend.poll());
+    assert_eq!(
+        backend.pair_reply(LINK, PromptMethod::ConfirmPasskey, true, None),
+        Err(Error::StalePrompt)
+    );
+    assert!(backend.can_write(LINK));
+    backend.disconnect(LINK);
+    block_on(backend.poll());
+    assert!(state.borrow().forgotten.is_empty());
+    assert_eq!(state.borrow().bonds, [PEER]);
+    assert!(!state.borrow().log.contains(&("promote", 0)));
 }

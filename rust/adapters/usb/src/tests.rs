@@ -79,6 +79,7 @@ struct Loops<'a> {
 }
 impl<'a> Loops<'a> {
     fn new(io: &'a Io, interfaces: u8) -> Self {
+        io.set_interfaces(interfaces);
         Self {
             priority: owner::Priority::new(io),
             secondary: owner::Secondary::new(io, interfaces),
@@ -179,9 +180,9 @@ fn serial_waits_for_completion_and_rejects_old_session_packets() {
     loops.poll(&mut s, 3);
     let packet = io.serial_tx.try_receive().ok().unwrap();
     assert!(packet.token.is_some());
-    assert_eq!(s.app.serial.queued(), 1);
+    assert_eq!(s.app.serial.queued(), 2);
     loops.poll(&mut s, 4);
-    assert_eq!(s.app.serial.queued(), 1);
+    assert_eq!(s.app.serial.queued(), 2);
     io.dtr(false);
     io.dtr(true);
     loops.poll(&mut s, 5);
@@ -201,6 +202,10 @@ fn serial_waits_for_completion_and_rejects_old_session_packets() {
 #[test]
 fn suspend_completion_cannot_consume_resumed_input_and_leds_use_standard_report() {
     let io = Io::new();
+    io.set_topology(Topology {
+        desktop: true,
+        ..Default::default()
+    });
     let mut loops = Loops::new(&io, 0);
     let mut s = shared(application(), support::Store::default());
     BusHandler(&io).configured(true);
@@ -268,6 +273,10 @@ fn suspend_completion_cannot_consume_resumed_input_and_leds_use_standard_report(
 fn protocol_switch_replays_held_keys_and_ignores_pending_completion() {
     use hid::RequestHandler;
     let io = Io::new();
+    io.set_topology(Topology {
+        desktop: true,
+        ..Default::default()
+    });
     let mut loops = Loops::new(&io, 0);
     let mut s = shared(application(), support::Store::default());
     BusHandler(&io).configured(true);
@@ -546,7 +555,6 @@ fn raw_edit_from_previous_enumeration_cannot_change_the_new_target() {
     assert!(!io.reconnect.signaled());
     let generation = io.status().generation;
     s.app.manager.preference.configuration_interfaces = std::vec![enabled(Interface::Via, 2)];
-    s.app.usb_reconnect = true;
     io.raw[0]
         .rx
         .try_send(RawPacket {
@@ -557,13 +565,9 @@ fn raw_edit_from_previous_enumeration_cannot_change_the_new_target() {
         .ok()
         .unwrap();
     loops.poll(&mut s, 1);
-    assert_eq!(
-        io.reconnect.try_take().map(|t| t.interfaces),
-        Some(Interface::Via.bit())
-    );
-    BusHandler(&io).configured(true);
-    loops.poll(&mut s, 2);
-    assert_eq!(io.raw[0].tx.try_receive().ok().unwrap().bytes[0], 255);
+    assert!(!io.reconnect.signaled());
+    assert!(io.raw[0].rx.is_empty());
+    assert!(io.raw[0].tx.is_empty());
     for id in [1, 2] {
         assert_eq!(rules(&mut s.store, id), 0);
     }
@@ -643,12 +647,12 @@ fn edits_are_saved_before_usb_enumerates_again() {
     loops.poll(&mut s, 1);
     assert_eq!(io.raw[0].tx.try_receive().ok().unwrap().bytes[0], 5);
     assert_eq!(rules(&mut s.store, 1), 0);
-    // Enumerating again follows the save in the same step, however soon after the edit.
-    s.app.usb_reconnect = true;
+    s.app.manager.preference.configuration_interfaces = std::vec![enabled(Interface::Via, 1)];
+    // Changing the interface flushes its pending edits before detaching.
     loops.poll(&mut s, 2);
     assert_eq!(
         io.reconnect.try_take().map(|t| t.interfaces),
-        Some(Interface::Vial.bit())
+        Some(Interface::Via.bit())
     );
     assert_eq!(rules(&mut s.store, 1), 1);
 }
@@ -677,15 +681,10 @@ fn usb_reconnects_only_when_the_exposed_interfaces_must_change() {
     );
     loops.poll(&mut s, 3);
     assert!(!io.reconnect.signaled());
-    // The application requests a reconnect when an enabled interface's profile changes.
+    // Retargeting the same exposed interface changes no USB descriptors.
     s.app.manager.preference.configuration_interfaces = std::vec![enabled(Interface::Vial, 2)];
-    s.app.usb_reconnect = true;
     loops.poll(&mut s, 4);
-    assert_eq!(
-        io.reconnect.try_take().map(|t| t.interfaces),
-        Some(Interface::Vial.bit())
-    );
-    assert!(!s.app.usb_reconnect);
+    assert!(!io.reconnect.signaled());
     // Switching interfaces changes the set.
     s.app.manager.preference.configuration_interfaces = std::vec![enabled(Interface::Via, 2)];
     loops.poll(&mut s, 5);
@@ -841,6 +840,8 @@ fn running(
     ] {
         block_on(app.event(event, &mut store, &mut radio, NOW));
     }
+    app.manager.usb_budget = io.budget;
+    io.set_topology(app.manager.usb_allocation().topology);
     BusHandler(io).configured(true);
     io.dtr(true);
     (Owner::new(io, app, store, radio), io, link)
@@ -1274,9 +1275,14 @@ fn startup_pools_match_core_validation_including_nonresident_pairs() {
 fn saved_pool_change_waits_for_successful_persistence_and_physical_response_completion() {
     use cordial_protocol::{OutputMode, Role, request::Command};
     for fail in [true, false] {
-        let io = Io::new();
+        let io = Io::with_budget(Budget {
+            config_bytes: 121,
+            ..Budget::PICO
+        });
         let (mut app, mut store, radio) = profile_application();
         app.manager.output_support = outputs::SUPPORT;
+        app.manager.usb_budget = io.budget;
+        io.set_topology(app.manager.usb_allocation().topology);
         if fail {
             store.fail_save = Some((cordial_core::storage::record_key(2, 77), false));
         }
@@ -1294,7 +1300,7 @@ fn saved_pool_change_waits_for_successful_persistence_and_physical_response_comp
                 device: 77,
                 output_preferences: std::vec![cordial_protocol::OutputPreference {
                     role: Role::Gamepad as i32,
-                    mode: OutputMode::Hid as i32,
+                    mode: OutputMode::Xinput as i32,
                 }],
                 ..Default::default()
             }),
@@ -1304,7 +1310,7 @@ fn saved_pool_change_waits_for_successful_persistence_and_physical_response_comp
         }
         assert!(!io.reconnect.signaled());
         assert_eq!(
-            shared.app.manager.outputs.plan().hid_gamepads,
+            shared.app.manager.outputs.plan().xinput_gamepads,
             u8::from(!fail)
         );
         let saved = block_on(outputs::saved_plan(&mut shared.store));
@@ -1336,10 +1342,9 @@ fn saturated_saved_counts_do_not_reconnect_until_the_visible_pool_changes() {
         app.manager.outputs.prepare(id, OutputMode::Hid).unwrap();
         app.manager.outputs.set(id, OutputMode::Hid);
     }
-    io.set_topology(Topology {
-        interfaces: 0,
-        gamepads: app.manager.outputs.plan(),
-    });
+    app.manager.output_support = outputs::SUPPORT;
+    app.manager.usb_budget = io.budget;
+    io.set_topology(app.manager.usb_allocation().topology);
     let mut shared = Shared { app, store, radio };
     let mut loops = Loops::new(&io, 0);
     loops.poll(&mut shared, 0);
@@ -1349,7 +1354,7 @@ fn saturated_saved_counts_do_not_reconnect_until_the_visible_pool_changes() {
     assert!(!io.reconnect.signaled());
     shared.app.manager.outputs.remove(4);
     loops.poll(&mut shared, 2);
-    assert_eq!(io.reconnect.try_take().unwrap().gamepads.hid_gamepads, 3);
+    assert!(!io.reconnect.signaled());
 }
 
 #[cfg(feature = "gamepad")]
@@ -1357,6 +1362,7 @@ fn saturated_saved_counts_do_not_reconnect_until_the_visible_pool_changes() {
 fn bus_reset_and_suspend_preserve_the_allocation_generation() {
     let io = Io::new();
     let topology = Topology {
+        desktop: true,
         interfaces: 0,
         gamepads: cordial_core::outputs::Plan {
             hid_gamepads: 2,
@@ -1391,3 +1397,164 @@ impl embassy_time_driver::Driver for Clock {
     fn schedule_wake(&self, _: u64, _: &core::task::Waker) {}
 }
 embassy_time_driver::time_driver_impl!(static CLOCK: Clock = Clock);
+
+#[cfg(feature = "gamepad")]
+#[test]
+fn allocation_change_during_a_long_command_gives_its_response_a_fresh_drain_deadline() {
+    use cordial_core::bluetooth::Event;
+    use cordial_protocol::request::Command;
+    for stalled in [false, true] {
+        let io = Io::with_budget(Budget {
+            config_bytes: 121,
+            ..Budget::PICO
+        });
+        let (mut app, mut store, radio) = profile_application();
+        for id in 1..=3 {
+            let mut policy = cordial_core::devices::Policy::paired(
+                id,
+                support::peer(id as u8 + 10),
+                b"Controller",
+            );
+            policy.enabled = false;
+            block_on(cordial_core::bonds::commit(
+                &mut store,
+                &policy,
+                &support::bond(id, policy.peer),
+            ))
+            .unwrap();
+        }
+        app.manager.output_support = outputs::SUPPORT;
+        app.manager.usb_budget = io.budget;
+        io.set_topology(app.manager.usb_allocation().topology);
+        assert!(!io.topology().desktop);
+        let mut shared = Shared { app, store, radio };
+        let mut loops = Loops::new(&io, 0);
+        let mut host = Host::new();
+        BusHandler(&io).configured(true);
+        io.dtr(true);
+        loops.poll(&mut shared, 0);
+        host.serve(&io);
+        loops.poll(&mut shared, 1);
+        host.send(
+            &io,
+            Command::DeleteProfile(cordial_protocol::DeleteProfile { profile: 1 }),
+        );
+        loops.poll(&mut shared, 2);
+        assert!(shared.app.command_pending());
+        let slot = shared.app.manager.find(77).unwrap();
+        let link = shared
+            .app
+            .manager
+            .connect(slot, true, 30_000, None, &mut shared.radio)
+            .unwrap()
+            .unwrap();
+        shared.radio.events.push_back(Event::Connected {
+            link,
+            descriptors: support::descriptor(),
+            max_output: 255,
+            layout: None,
+        });
+        loops.poll(&mut shared, 3);
+        assert!(shared.app.command_pending());
+        assert!(shared.app.manager.usb_allocation().topology.desktop);
+        let mut completed = 3 + owner::RESPONSE_DRAIN_MS;
+        for _ in 0..20 {
+            loops.poll(&mut shared, completed);
+            assert!(!io.reconnect.signaled());
+            if !shared.app.command_pending() {
+                break;
+            }
+            completed += 1;
+        }
+        assert!(!shared.app.command_pending());
+        assert!(shared.app.serial.queued() > 0);
+        assert!(block_on(cordial_core::profiles::metadata(&mut shared.store, 1)).is_err());
+        loops.poll(&mut shared, completed + 1);
+        assert!(
+            !io.reconnect.signaled(),
+            "the durable response gets a fresh deadline"
+        );
+        if stalled {
+            loops.poll(&mut shared, completed + owner::RESPONSE_DRAIN_MS);
+            assert!(!io.reconnect.signaled());
+            loops.poll(&mut shared, completed + 1 + owner::RESPONSE_DRAIN_MS);
+        } else {
+            for now in completed + 2..completed + owner::RESPONSE_DRAIN_MS {
+                host.serve(&io);
+                loops.poll(&mut shared, now);
+                if io.reconnect.signaled() {
+                    break;
+                }
+            }
+            assert_eq!(host.response(), Some(&ok()));
+        }
+        assert!(io.reconnect.try_take().unwrap().desktop);
+        assert!(!shared.app.serial.active());
+    }
+}
+
+#[cfg(feature = "gamepad")]
+#[test]
+fn stalled_response_detaches_at_a_fixed_deadline_despite_new_host_traffic() {
+    use cordial_protocol::{OutputMode, Role, request::Command};
+    let io = Io::with_budget(Budget {
+        config_bytes: 121,
+        ..Budget::PICO
+    });
+    let (mut app, store, radio) = profile_application();
+    app.manager.output_support = outputs::SUPPORT;
+    app.manager.usb_budget = io.budget;
+    io.set_topology(app.manager.usb_allocation().topology);
+    let mut shared = Shared { app, store, radio };
+    let mut loops = Loops::new(&io, 0);
+    let mut host = Host::new();
+    BusHandler(&io).configured(true);
+    io.dtr(true);
+    loops.poll(&mut shared, 0);
+    host.serve(&io);
+    loops.poll(&mut shared, 1);
+    host.send(
+        &io,
+        Command::SetDevice(cordial_protocol::SetDevice {
+            device: 77,
+            output_preferences: std::vec![cordial_protocol::OutputPreference {
+                role: Role::Gamepad as i32,
+                mode: OutputMode::Xinput as i32
+            }],
+            ..Default::default()
+        }),
+    );
+    loops.poll(&mut shared, 2);
+    assert_eq!(shared.app.manager.outputs.plan().xinput_gamepads, 1);
+    let session = io.status().session;
+    let writes = shared.store.writes.len();
+    let mut request = std::vec::Vec::new();
+    cordial_protocol::frame::encode(
+        &cordial_protocol::Request {
+            command: Some(Command::GetStatus(cordial_protocol::GetStatus {})),
+        },
+        &mut request,
+    );
+    for now in 3..3 + owner::RESPONSE_DRAIN_MS {
+        let mut bytes = [0; 64];
+        bytes[..request.len()].copy_from_slice(&request);
+        let _ = io.serial_rx.try_send(SerialRx {
+            session,
+            bytes,
+            length: request.len(),
+        });
+        loops.poll(&mut shared, now);
+        assert!(!io.reconnect.signaled());
+    }
+    assert!(host.response().is_none());
+    loops.poll(&mut shared, 3 + owner::RESPONSE_DRAIN_MS);
+    assert_eq!(io.reconnect.try_take().unwrap().gamepads.xinput_gamepads, 1);
+    assert!(!shared.app.serial.active());
+    assert_eq!(shared.app.serial.queued(), 0);
+    assert_ne!(io.status().session, session);
+    assert_eq!(shared.store.writes.len(), writes);
+    assert_eq!(
+        block_on(outputs::saved_plan(&mut shared.store)).xinput_gamepads,
+        1
+    );
+}

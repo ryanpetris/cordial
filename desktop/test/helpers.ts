@@ -1,9 +1,11 @@
 import { vi } from "vitest";
 import type { PortInfo } from "@cordial/client";
+import { IntegrationKind } from "@cordial/protocol";
 import { FakeAdapter, type FakeOptions } from "../src/fake/adapter.ts";
 import { Controller } from "../src/core/controller.ts";
+import { information } from "../src/core/convert.ts";
 import { AdapterSession } from "../src/core/session.ts";
-import { DEFAULT_PREFERENCES, type AppState, type DeviceRecord } from "../src/shared/state.ts";
+import { DEFAULT_PREFERENCES, type AppState, type DeviceRecord, type SettingField, type SettingFields, type SettingsGroupName } from "../src/shared/state.ts";
 
 export const until = async (check: () => boolean, ms = 3000) => {
   const end = Date.now() + ms;
@@ -26,13 +28,12 @@ export function record(id: number, patch: Partial<DeviceRecord> = {}): DeviceRec
     blocked: false,
     paused: false,
     inactive: null,
-    error: null,
+    errors: [],
     security: null,
     hidpp: null,
-    info: [],
+    information: information(undefined),
     roles: [],
     profiles: [],
-    profileError: null,
     outputPreferences: [],
     outputs: [],
     ...patch,
@@ -73,3 +74,7 @@ export function controller(fakes: Record<string, FakeAdapter>) {
   const c = new Controller(deps);
   return { c, deps, ports, state: () => state };
 }
+
+/** A HID++ setting field's identity. */
+export const field = <G extends SettingsGroupName>(group: G, name: SettingFields[G], index: number | null = null) =>
+  ({ integration: IntegrationKind.HIDPP, group, index, field: name }) as SettingField;

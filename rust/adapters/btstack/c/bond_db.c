@@ -3,22 +3,22 @@
 #include "gap.h"
 #include <stdint.h>
 #include <string.h>
-// The application admits seven regular entries per transport and reserves one
-// for pairing. These tables are only the active view, never persistent storage.
-static uint8_t le[8][145];
+// Each transport reserves one bond for pairing. These tables are only the
+// active view, never persistent storage.
+static uint8_t le[NVM_NUM_DEVICE_DB_ENTRIES][145];
 #ifdef ENABLE_CLASSIC
-static uint8_t classic[8][145];
+static uint8_t classic[NVM_NUM_LINK_KEYS][145];
 #endif
-static int find(uint8_t records[8][145], unsigned random,
+static int find(uint8_t records[][145], int capacity, unsigned random,
                 const uint8_t *address) {
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < capacity; i++)
     if (records[i][8] && records[i][9] == random &&
         !memcmp(records[i] + 10, address, 6))
       return i;
   return -1;
 }
-static int empty(uint8_t records[8][145]) {
-  for (int i = 0; i < 8; i++)
+static int empty(uint8_t records[][145], int capacity) {
+  for (int i = 0; i < capacity; i++)
     if (!records[i][8])
       return i;
   return -1;
@@ -33,6 +33,7 @@ int cordial_bond_import(const uint8_t *bytes, unsigned size) {
   if (!bytes || size < 17)
     return -1;
   uint8_t (*table)[145] = le;
+  int capacity = NVM_NUM_DEVICE_DB_ENTRIES;
   if (bytes[8] == 2) {
     if (size != 145)
       return -1;
@@ -42,13 +43,14 @@ int cordial_bond_import(const uint8_t *bytes, unsigned size) {
     if (size != 34)
       return -1;
     table = classic;
+    capacity = NVM_NUM_LINK_KEYS;
   }
 #endif
   else
     return -1;
-  int i = find(table, bytes[9], bytes + 10);
+  int i = find(table, capacity, bytes[9], bytes + 10);
   if (i < 0)
-    i = empty(table);
+    i = empty(table, capacity);
   if (i < 0)
     return -1;
   int privacy_changed =
@@ -66,16 +68,18 @@ int cordial_bond_import(const uint8_t *bytes, unsigned size) {
 int cordial_bond_export(unsigned transport, unsigned random, const uint8_t *address,
                    uint8_t *bytes) {
   uint8_t (*table)[145] = le;
+  int capacity = NVM_NUM_DEVICE_DB_ENTRIES;
   int size = 145;
 #ifdef ENABLE_CLASSIC
   if (transport == 1) {
     table = classic;
+    capacity = NVM_NUM_LINK_KEYS;
     size = 34;
   } else
 #endif
       if (transport != 2)
     return -1;
-  int i = find(table, random, address);
+  int i = find(table, capacity, random, address);
   if (i < 0)
     return -1;
   memcpy(bytes, table[i], size);
@@ -86,15 +90,15 @@ void le_device_db_init(void) {}
 void le_device_db_set_local_bd_addr(bd_addr_t addr) { (void)addr; }
 int le_device_db_count(void) {
   int n = 0;
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < NVM_NUM_DEVICE_DB_ENTRIES; i++)
     n += le[i][8] != 0;
   return n;
 }
-int le_device_db_max_count(void) { return 8; }
+int le_device_db_max_count(void) { return NVM_NUM_DEVICE_DB_ENTRIES; }
 int le_device_db_add(int type, bd_addr_t addr, sm_key_t irk) {
-  int i = find(le, type, addr);
+  int i = find(le, NVM_NUM_DEVICE_DB_ENTRIES, type, addr);
   if (i < 0)
-    i = empty(le);
+    i = empty(le, NVM_NUM_DEVICE_DB_ENTRIES);
   if (i < 0)
     return -1;
   memset(le[i], 0, sizeof(le[i]));
@@ -114,7 +118,7 @@ int le_device_db_add(int type, bd_addr_t addr, sm_key_t irk) {
   return i;
 }
 void le_device_db_info(int i, int *type, bd_addr_t addr, sm_key_t irk) {
-  if (i < 0 || i >= 8 || !le[i][8]) {
+  if (i < 0 || i >= NVM_NUM_DEVICE_DB_ENTRIES || !le[i][8]) {
     if (type)
       *type = BD_ADDR_TYPE_UNKNOWN;
     if (addr)
@@ -133,7 +137,7 @@ void le_device_db_info(int i, int *type, bd_addr_t addr, sm_key_t irk) {
 void le_device_db_encryption_set(int i, uint16_t ediv, uint8_t rand[8],
                                  sm_key_t ltk, int size, int auth,
                                  int authorized, int sc) {
-  if (i < 0 || i >= 8)
+  if (i < 0 || i >= NVM_NUM_DEVICE_DB_ENTRIES)
     return;
   uint8_t *p = le[i] + 81;
   p[0] =
@@ -147,7 +151,7 @@ void le_device_db_encryption_set(int i, uint16_t ediv, uint8_t rand[8],
 void le_device_db_encryption_get(int i, uint16_t *ediv, uint8_t rand[8],
                                  sm_key_t ltk, int *size, int *auth,
                                  int *authorized, int *sc) {
-  if (i < 0 || i >= 8)
+  if (i < 0 || i >= NVM_NUM_DEVICE_DB_ENTRIES)
     return;
   const uint8_t *p = le[i] + 81;
   if (ediv)
@@ -166,7 +170,7 @@ void le_device_db_encryption_get(int i, uint16_t *ediv, uint8_t rand[8],
     *sc = !!(p[0] & 32);
 }
 void le_device_db_remove(int i) {
-  if (i >= 0 && i < 8)
+  if (i >= 0 && i < NVM_NUM_DEVICE_DB_ENTRIES)
     memset(le[i], 0, 145);
 }
 void le_device_db_dump(void) {}
@@ -174,7 +178,7 @@ void le_device_db_dump(void) {}
 static void noop(void) {}
 static void local(bd_addr_t addr) { (void)addr; }
 static int get(bd_addr_t addr, link_key_t key, link_key_type_t *type) {
-  int i = find(classic, 0, addr);
+  int i = find(classic, NVM_NUM_LINK_KEYS, 0, addr);
   if (i < 0)
     return 0;
   memcpy(key, classic[i] + 17, 16);
@@ -182,9 +186,9 @@ static int get(bd_addr_t addr, link_key_t key, link_key_type_t *type) {
   return 1;
 }
 static void put(bd_addr_t addr, link_key_t key, link_key_type_t type) {
-  int i = find(classic, 0, addr);
+  int i = find(classic, NVM_NUM_LINK_KEYS, 0, addr);
   if (i < 0)
-    i = empty(classic);
+    i = empty(classic, NVM_NUM_LINK_KEYS);
   if (i < 0)
     return;
   classic[i][8] = 1;
@@ -193,7 +197,7 @@ static void put(bd_addr_t addr, link_key_t key, link_key_type_t type) {
   classic[i][33] = type;
 }
 static void del(bd_addr_t addr) {
-  int i = find(classic, 0, addr);
+  int i = find(classic, NVM_NUM_LINK_KEYS, 0, addr);
   if (i >= 0)
     memset(classic[i], 0, 145);
 }
@@ -204,7 +208,7 @@ static int init(btstack_link_key_iterator_t *it) {
 static int next(btstack_link_key_iterator_t *it, bd_addr_t addr, link_key_t key,
                 link_key_type_t *type) {
   unsigned i = (uintptr_t)it->context;
-  while (i < 8) {
+  while (i < NVM_NUM_LINK_KEYS) {
     unsigned at = i++;
     it->context = (void *)(uintptr_t)i;
     if (!classic[at][8])

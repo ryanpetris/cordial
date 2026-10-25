@@ -173,16 +173,15 @@ Keep this catalog aligned with `Makefile`, `desktop/package.json`, and
 | --- | --- |
 | Rust workspace | `make check-rust`: unit, integration, and documentation tests for all workspace crates with all features, including the core, protocol, client, CLI/TUI, USB, BLE HID, BTstack, and record storage adapters. Includes the ESP storage fixture. |
 | Rust static checks | `make check-rust`: workspace Clippy for all targets and features, with warnings treated as errors. |
-| Native BTstack callbacks | `make check-rust`: `rust/tools/test_btstack.py` builds and runs the profiles, GATT, device information, layout, and saved-security C fixtures. |
-| Generated desktop protocol | `make check-desktop`: regenerate and compare checked-in TypeScript protocol messages and setting keys. |
+| Native BTstack callbacks | `make check-rust`: `rust/tools/test_btstack.py` builds and runs the capacity, profiles, GATT, device information, layout, and saved-security C fixtures. |
+| Generated desktop protocol | `make check-desktop`: regenerate and compare checked-in TypeScript protocol messages. |
 | Desktop type checks | `make check-desktop`: TypeScript checks for the desktop and shared packages. |
-| Desktop and shared client tests | `make check-desktop`: all Vitest fixtures in `desktop/test` and `desktop/packages/*/test`, including desktop state, settings, serial communication, notifications, tray, server, client transports, framing, and keys. |
+| Desktop and shared client tests | `make check-desktop`: all Vitest fixtures in `desktop/test` and `desktop/packages/*/test`, including desktop state, settings, serial communication, notifications, tray, server, client transports, and framing. |
 | Desktop garbage-collection fixtures | `npm --prefix desktop test -- --execArgv=--expose-gc`: enables the notification and USB watcher lifetime checks that otherwise skip when `global.gc` is unavailable. |
-| Protocol compatibility | `make check-protocol`: key catalog validation and compatibility, Buf lint, and Buf breaking checks against `PROTOCOL_BASE` (the newest earlier release in the same series as `CORDIAL_VERSION`) when that base contains the protocol. |
-| Repository tool fixtures | `make check-tools`: `tools/test_*.py`, covering versions, key catalog checks, and release archive validation. |
+| Protocol compatibility | `make check-protocol`: Buf lint and Buf breaking checks against `PROTOCOL_BASE` (the newest earlier release in the same series as `CORDIAL_VERSION`) when that base contains the protocol. |
+| Repository tool fixtures | `make check-tools`: `tools/test_*.py`, covering versions, editor-definition validation, and release archive validation. |
 | Firmware and packaging tool fixtures | `make check-tools`: `rust/tests/test_*.py`, covering board configuration, firmware artifacts, flashing, dependency notices, packaging, native BLE, HID reports, and host terminal behavior. |
 | Linux CLI/TUI terminal fixture | Build the CLI and install `pyte`, then run `CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py`. The default tool run skips this fixture without these prerequisites. |
-| ARM memory fixture | `make check-memory`: build development firmware for each Pico board and run the 32-bit allocation workloads in `rust/tests/memory-arm` under QEMU with that board's configuration, against its linked firmware's heap. |
 | Firmware static checks | `make check-firmware BOARD=pico2_w PROFILE=production` and `make check-firmware BOARD=pico2_w PROFILE=debug`: firmware Clippy for the Pico 2 W. Also run them for another board (`pico_w`, `waveshare_rp2350b_plus_w`, `xiao_esp32s3`) when a change materially affects that board specifically, such as its board definition, platform code, radio backend, configuration, or partition or storage layout. |
 | Firmware artifact validation | `make firmware BOARD=pico2_w PROFILE=production` and `make firmware BOARD=pico2_w PROFILE=debug`: link and package the Pico 2 W, including metadata, image layout, and storage-boundary checks in `rust/tools/build_firmware.py`. Also build another board under the same condition as its static checks. ESP builds check the linked Rust startup stack frames. |
 | Portable application packages | `make package-desktop package-cli package-web`; validate the desktop and CLI archives with `tools/check_release_archive.py` for the selected `CORDIAL_VERSION`. |
@@ -192,7 +191,7 @@ Keep this catalog aligned with `Makefile`, `desktop/package.json`, and
 | Release asset validation | When assembling a release, verify all expected application and board/profile archives and their checksums using the asset checklist in `.github/workflows/release.yml`. Publishing is not a check and still requires authorization. |
 
 `make check` covers the Rust, desktop, protocol, and Python tool suites. It does not enable the
-garbage-collection or terminal prerequisites, or run the memory, firmware, package
+garbage-collection or terminal prerequisites, or run the firmware, package
 installation, or installed desktop smoke checks. Run package installation fixtures only in
 disposable environments, never against the developer's installed
 applications. See [building documentation](docs/building.md) and the release workflow for setup

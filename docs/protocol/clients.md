@@ -17,9 +17,9 @@ All three keep their view of the Dongle the same way:
   `input` and `collection`; omitting it starts from the beginning. See
   [Listings](compatibility.md#listings).
 - Events: `device`, `adapter` and `profile` events replace the record they carry.
-  `settings_changed` and `warnings_changed` are applied to what the client has listed: settings are
-  upserted by integration and key, warnings are kept as a set, and removals of entries the client
-  does not hold are ignored. A client lists again from the start when it needs a fresh view, such
+  `settings_changed` is applied to what the client has listed: whole domain objects are replaced by integration, group
+  and optional component index, and removals of entries the client does not hold are ignored. Adapter and device error
+  lists replace the previous lists with the complete reported sets. A client lists again from the start when it needs a fresh view, such
   as in a new session or after it lost track of a list.
 - Successful changes: a response without an error means the Dongle now holds the values sent, in
   the saved form the command defines (see [Commands](commands.md)): a trimmed adapter name, and
@@ -56,7 +56,6 @@ Bluetooth controllers.
 | `device set DEV gamepad-output disabled\|hid\|xinput` | Save a paired device's Gamepad Output choice. |
 | `device unpair DEV` | Delete the device's bond and settings. |
 | `device refresh DEV` | Re-read a connected device's information and settings. |
-| `warning list DEV` | The device's HID warnings. |
 | `setting list DEV` / `setting get DEV KEY` | The device's settings, or one in detail. |
 | `setting set DEV KEY VALUE` / `setting forget DEV KEY` | Save or forget a setting. |
 | `feature list DEV` | Development firmware: the device's integration features. |
@@ -67,8 +66,8 @@ Bluetooth controllers.
 always taken as an ID, so a device whose name is a number is addressed by its ID. `CANDIDATE` is a
 candidate ID shown in scan output, or an unambiguous name, with the same rule for numbers. Candidate
 and device IDs are separate sequences; each command takes only one of them. The CLI never picks
-silently between duplicate names. Setting keys are the catalog keys, such as `keyboard.fn_row` or
-`pointer.sensor.0.dpi`.
+silently between duplicate names. Setting paths name typed fields, such as `keyboard.function_row` or
+`pointer_sensor.0.dpi`; these paths are CLI labels, not serial fields.
 
 - The shell keeps history and completion, and prints changes as they arrive without disturbing
   partly typed input, prefixed `[NEW]`, `[CHG]` or `[DEL]` with the device ID. It keeps accepting
@@ -78,10 +77,14 @@ silently between duplicate names. Setting keys are the catalog keys, such as `ke
   Saving the bond and the later connection result are reported separately.
 - Ctrl-C, Ctrl-D, end of input, SIGINT and SIGTERM quit the shell, which closes the port: a
   running scan stops and an unsaved pairing is cancelled.
-- After a configuration interface or gamepad pool change that reconnects USB, the shell waits up to 15
-  seconds for the same adapter, found by the adapter ID at the start of its USB serial number, and
-  reopens it on whichever port it returns to. Only an adapter that doesn't return in time is reported
-  as lost.
+- When the open adapter's connection drops, as when a save or a device connecting or disconnecting
+  changes the USB allocation, the shell waits up to 15 seconds for the same adapter, found by the
+  adapter ID at the start of its USB serial number. It reopens the adapter on whichever port it
+  returns to and reads its status and devices again. Only an adapter that doesn't return in time is
+  reported as lost. Commands cut short by the drop are not sent again. Each reports its result once,
+  even after the adapter is reopened, and a save cut off before the adapter answered reports that
+  the adapter couldn't confirm whether the change was saved. `adapter select` or quitting ends the
+  wait, and `adapter select` replaces a reopen already in progress.
 - One-shot commands and scripts run each command after the previous one's result and exit nonzero
   on failure. `--timeout SECONDS` bounds a one-shot command and sets the length of a one-shot scan.
   A one-shot `pair start` finds the candidate by name within the same invocation, since candidate
@@ -151,8 +154,7 @@ attached adapter; `--port` limits it to that one port.
   on the Overview, and the most pressing one is shown in red on the status line.
 - Staging: changes stay staged, marked as changed, until Save, as in the desktop application;
   Ctrl-S presses the Save shown on screen. Discard drops the changes the shown Save would send, and
-  a failed save keeps them. Saving adapter configuration interface changes that reconnect USB asks
-  for confirmation first.
+  a failed save keeps them. Valid USB preferences save without a reconnect confirmation dialog.
   Connect, disconnect, rename, forget and creating, copying and deleting profiles act at once.
 - Input: every action works with the mouse, and every control has a keyboard equivalent. Tab and
   Shift-Tab move between controls, Up and Down choose in the sidebar or move between controls,
@@ -179,8 +181,9 @@ The desktop application uses the same commands and session rules as the CLI.
   longer listed, or the wait expires, the application leaves the page. A selected adapter tab also
   stays selected.
   A session that ends after running normally is reopened once if its port is still present.
-- Sessions: after `GetStatus` it reads every page of devices and each device's settings and
-  warnings, then follows events, and lists the devices again when the adapter becomes ready.
+- Sessions: after `GetStatus` it reads every page of devices and each device's settings, then
+  follows events, and lists the devices again when the adapter becomes ready. A USB reconnect
+  opens a fresh session and reads status instead of expecting an event from the old session.
 - Disconnect: the user can disconnect an adapter from its context menu. The application closes the
   port and does not reopen it, recognizing it by the first 16 characters of its USB serial number,
   until the user chooses Connect or restarts the application. The web version recognizes it by its
@@ -192,19 +195,20 @@ The desktop application uses the same commands and session rules as the CLI.
 - Devices open on the Details tab, with the connection switches and the device's own facts. Settings
   follows when the device has settings to show, then Profiles when the adapter supports profiles,
   with the device's layers (an ordered list of profiles, empty for a new device), then Diagnostics:
-  the device's warnings with the HID field or report each applies to, the HID++ protocol and status,
+  the device's errors, the HID++ protocol and status,
   link security and identifiers, with Refresh. Changes on Details, Settings and Profiles stay staged
   across tabs until that tab's Save sends its own changes in one request; Connect, Disconnect and
-  Forget act at once. Warnings never appear as banners.
-- Profile memory: the application notifies once when `memory_used` reaches 85% of `memory_budget`,
-  and once when a connected device's `profile_error` shows its profiles were not loaded, and resets
-  each after the condition clears. The device's Diagnostics tab shows a `profile_error`.
+  Forget act at once. Device errors stay on Diagnostics.
+- Profile memory: the application notifies once when `Status.errors` includes
+  `ERROR_CODE_PROFILE_MEMORY_LOW`, and once when a connected device's `errors` includes
+  `ERROR_CODE_PROFILE_MEMORY_EXCEEDED` or `ERROR_CODE_PROFILE_LOAD_FAILED`. Each notification
+  resets after its condition clears. Device errors appear on Diagnostics.
 - Adapters open on Details, with Settings, Profiles when the adapter supports them, and Diagnostics.
   Profiles lists the profiles one page at a time, each with an icon for each role it changes, and
   the configuration interfaces, each with its own switch and profile. The profile picker starts at
   the first page and pages on its own. Changes on Settings and
   Profiles stay staged, across tabs and pages, until Save sends them together in one request; a
-  failed save keeps them. Saving a change that reconnects USB asks for confirmation first. Creating,
+  failed save keeps them. Saving needs no reconnect confirmation dialog. Creating,
   copying and deleting profiles take effect at once.
 - Battery: a device's battery is low when a known `battery.level` is at or below the user's
   threshold (20% by default) and `battery.charging` is not true; at most 5% is critical. It notifies
@@ -240,15 +244,15 @@ Builtins are firmware-only mappings, never stored, listed or reported as user pr
 
 Clients use `Status.output_support` to offer enabled modes, rather than checking
 board names. When a backend is unavailable, clients offer no new enabled choices;
-a saved choice can still be cleared with Disabled. `max_slots` limits USB allocation,
-not the number of paired devices that may select a mode. Each change uses
+a saved choice can still be cleared with Disabled. `SLOTS.limit` in `OutputModeSupport.resources`
+limits USB allocation, not the number of paired devices that may select a mode. Each change uses
 `SetDevice.output_preferences` for the Gamepad role and preserves unrelated preferences.
 
 The saved choice is separate from live output state. Clients use `Device.outputs`
 for the current mode, state and optional slot, never infer a slot from pairing
 order, and never treat a saved choice as proof of active input. Human-readable
 slots start at 1; raw JSON and protocol slots start at 0. A slot is temporary
-and is not a Windows XInput user index. Technical output states and warnings
+and is not a Windows XInput user index. Technical output states and device errors
 belong on Diagnostics. The CLI's `device get DEV` shows Gamepad Output and,
 when reported for an enabled choice, Gamepad Status and Gamepad Slot.
 `device list` uses `gamepad-output`, `gamepad-state` and `gamepad-slot` tokens.
@@ -256,17 +260,20 @@ when reported for an enabled choice, Gamepad Status and Gamepad Slot.
 or `at most 4` while its size is unknown. See [output states and
 pools](records.md#devices) and [controller mapping limits](hid-forwarding.md#usb-gamepad-outputs).
 
-The desktop application and TUI show the USB Reconnect Required confirmation
-before saving a Gamepad Output change that changes either pool size. Cancelling
-leaves the changes staged without sending them. Save sends other staged device
-settings before Gamepad Output, since a pool-size change may reconnect USB after
-the save response. If those settings fail to save
-or their outcome is unknown, Gamepad Output stays staged. A received success
-still means the preference was saved; USB reconnection is a separate operation.
-If the response is lost, clients report an unknown save outcome and may read the
-device again after reconnecting. The existing reconnect handling restores the
-device page. Neither mode requires a running host service or an additional USB
-configuration interface. VIA/Vial behavior stays unchanged.
+The desktop application and TUI save valid output preferences without a reconnect confirmation
+or a USB-capacity pre-check. Save sends other staged device settings before Gamepad Output,
+since its save can change USB allocation. If those settings fail to save or their outcome is
+unknown, Gamepad Output stays staged. A received success confirms the saved preference; active
+USB exposure is reported separately. If the response is lost, clients report an unknown outcome
+and may read the device after reconnecting. Automatic reconnect tracking restores the device page
+and its staged state, using a fresh status read in the new session. Neither output mode requires
+a running Host service or an additional configuration interface.
+
+Clients show both USB capacity errors when both appear in `Status.errors`. Required capacity has
+a prominent warning and tray attention. Reserved capacity has a subtle indicator and no large
+Overview banner. Resource displays use each reported optional value independently: count only,
+limit only, both, or neither. Missing values are unknown and are never formatted as zero or
+unlimited.
 
 ### Gamepad verification
 
@@ -279,9 +286,9 @@ Software checks run on Linux and do not establish physical controller compatibil
 
 For a Linux hardware check:
 
-1. Start with all saved gamepad choices Disabled. Check `cordial adapter status`
-   and `lsusb -v` for zero gamepad slots while keyboard, mouse and serial remain
-   available.
+1. Start with all saved gamepad choices Disabled. Compare `cordial adapter status` and `lsusb -v`
+   with the actual allocation. Unconfigured extra gamepad slots may be exposed when resources
+   remain. Serial remains available; keyboard/mouse appears when configured devices require it.
 2. Pair a controller and check that Gamepad Output selects HID after first-connection
    setup when supported and the saved HID pool has room. Otherwise it stays Disabled.
    Test HID and XInput separately with `device set DEV gamepad-output hid` and
@@ -289,14 +296,18 @@ For a Linux hardware check:
    `device get DEV` to inspect the saved choice and reported output state.
 3. Check driver binding with `lsusb -t` and input with `evtest`. Exercise buttons,
    sticks, triggers and directional controls against the documented mapping.
-4. Disconnect and reconnect the controller. Check that the adapter stays
-   enumerated, held controls release, vacant HID slots are neutral, and XInput
+4. Disconnect and reconnect the controller. When the actual allocation stays the same, check that
+   the adapter stays enumerated. Held controls release, vacant HID slots are neutral, and XInput
    reports absence and presence. Check keyboard, mouse and serial use alongside
    gamepad input, then close Cordial and check that input continues.
-5. Change modes or unpair a controller so a pool size changes. Check that USB
-   reconnects, the client returns to the same adapter, and the saved choices
-   survive. With multiple saved controllers, check each mode's independent pool
-   against its paired-device count, capped at four.
+5. Change modes, connect devices or unpair a controller so the actual allocation changes. Check
+   that USB reconnects, the client returns to the same adapter and reads fresh status, and saved
+   choices survive. With multiple saved controllers, check each mode's independent pool against
+   [allocation priorities](hid-forwarding.md#usb-allocation), capped at its compiled maximum.
+6. Under allocation pressure, check connected-device preemption, independent required and reserved
+   errors, and both errors together. Omitted unconfigured extras produce neither error. A
+   still-omitted candidate must not cause repeated USB reconnects. Stop reading serial during a
+   save and check that the short drain deadline still allows reconfiguration.
 
 For a manual Windows check, configure the adapter on Linux first:
 

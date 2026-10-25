@@ -3,14 +3,15 @@
 use crate::{
     commands::{self, MAX_SCAN_SECONDS},
     controller::{Command, Pick, SettingInput, State, Target, Toggle},
-    model::{self, Prompt, Type},
+    model::{self, Prompt},
     profiles,
+    settings::{self, Field, Setting, Type},
     ui::{
         catalog::{self, value_string},
         text::{self, Filter, quote, safe},
     },
 };
-use cordial_protocol::{self as p, OutputMode, Platform, Transport, profile_rule};
+use cordial_protocol::{OutputMode, Platform, Transport, profile_rule};
 use std::path::PathBuf;
 
 /// A shell command: its words, argument syntax and description, in help order.
@@ -159,11 +160,6 @@ const SPECS: &[Spec] = &[
         "Forget a rule so the input passes through unchanged",
     ),
     spec(
-        "warning list",
-        "DEV",
-        "What the adapter can't use on a device",
-    ),
-    spec(
         "setting list",
         "DEV",
         "Device settings: last observed values and saved preferences",
@@ -209,7 +205,6 @@ const NOTES: &[(&[&str], &str)] = &[
             "device unpair",
             "device refresh",
             "device set",
-            "warning",
             "setting",
             "feature",
         ],
@@ -593,7 +588,8 @@ pub enum Line {
     Run(Command),
 }
 
-fn setting_key(word: &str) -> Result<String, String> {
+/// The field a setting path names, such as `wheel.mode` or `pointer_sensor.1.dpi`.
+fn setting_field(word: &str) -> Result<Field, String> {
     let valid = !word.is_empty()
         && word.len() <= 64
         && word
@@ -605,12 +601,9 @@ fn setting_key(word: &str) -> Result<String, String> {
             quote(word)
         ));
     }
-    if catalog::info_for(word).is_none() {
-        return Err(format!(
-            "Cordial doesn't recognize the setting {word}; a newer version may support it"
-        ));
-    }
-    Ok(word.to_owned())
+    Field::parse(word).ok_or_else(|| {
+        format!("Cordial doesn't recognize the setting {word}; a newer version may support it")
+    })
 }
 
 fn on_off(word: &str) -> Option<bool> {
@@ -863,15 +856,14 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
             (Some(t), Some(on)) => Line::Run(Command::Set(target(0)?, t, on)),
             _ => return usage(),
         },
-        ("warning list", 1) => Line::Run(Command::Warnings(target(0)?)),
         ("setting list", 1) => Line::Run(Command::Settings(target(0)?)),
-        ("setting get", 2) => Line::Run(Command::SettingGet(target(0)?, setting_key(words[1])?)),
+        ("setting get", 2) => Line::Run(Command::SettingGet(target(0)?, setting_field(words[1])?)),
         ("setting forget", 2) => {
-            Line::Run(Command::SettingForget(target(0)?, setting_key(words[1])?))
+            Line::Run(Command::SettingForget(target(0)?, setting_field(words[1])?))
         }
         ("setting set", 3) => Line::Run(Command::SettingSet(
             target(0)?,
-            setting_key(words[1])?,
+            setting_field(words[1])?,
             SettingInput::Text(arg(2)),
         )),
         ("feature list", 1) => Line::Run(Command::Features(target(0)?)),
@@ -978,9 +970,9 @@ fn last_word(line: &str) -> (&str, &str) {
 
 /// A setting's fine and coarse integer increments; coarse is zero when the
 /// range is small enough for fine steps alone.
-pub fn steps(s: &p::Setting) -> (i64, i64) {
-    match model::range(s) {
-        Some((min, max, fine)) if model::step_count(min, max, fine) <= 20 => (fine, 0),
+pub fn steps(s: &Setting) -> (i64, i64) {
+    match settings::range(s) {
+        Some((min, max, fine)) if settings::step_count(min, max, fine) <= 20 => (fine, 0),
         Some((_, _, fine)) => (fine, fine.saturating_mul(10)),
         None => (1, 10),
     }
@@ -1000,19 +992,19 @@ fn shell_word(word: String) -> Option<String> {
 
 /// A setting's legal values as words: on and off, its choices, or a short
 /// integer range.
-fn value_words(s: &p::Setting) -> Vec<String> {
-    if model::kind(s) == Some(Type::Bool) {
+fn value_words(s: &Setting) -> Vec<String> {
+    if settings::kind(s) == Type::Bool {
         return vec!["on".into(), "off".into()];
     }
-    let choices = model::choices(s);
+    let choices = settings::choices(s);
     if !choices.is_empty() {
         return choices
             .iter()
-            .filter_map(|c| shell_word(value_string(c)))
+            .filter_map(|c| shell_word(value_string(s.field.leaf, c)))
             .collect();
     }
-    if let Some((min, max, fine)) = model::range(s)
-        && model::step_count(min, max, fine) < 16
+    if let Some((min, max, fine)) = settings::range(s)
+        && settings::step_count(min, max, fine) < 16
     {
         return (0..16)
             .map_while(|i| fine.checked_mul(i).and_then(|d| min.checked_add(d)))
@@ -1083,7 +1075,6 @@ const DEVICE_COMMANDS: &[&str] = &[
     "device unpair",
     "device refresh",
     "device set",
-    "warning list",
     "setting list",
     "setting get",
     "setting set",
@@ -1148,11 +1139,14 @@ fn profile_words(st: &State) -> Vec<String> {
 
 /// The cached settings of a saved device named in a command line. Completion
 /// never reads from the adapter.
-fn known_settings<'a>(word: &str, st: &'a State) -> Vec<&'a p::Setting> {
+fn known_settings(word: &str, st: &State) -> Vec<Setting> {
     let Some(id) = resolve(word, st) else {
         return Vec::new();
     };
-    catalog::presented(st.settings_of(id))
+    catalog::presented(&st.settings_of(id))
+        .into_iter()
+        .cloned()
+        .collect()
 }
 
 /// The words that can follow `words`. Connected, only what the adapter
@@ -1243,15 +1237,15 @@ fn completions(words: &[String], st: Option<&State>) -> Vec<String> {
             .map(|st| known_settings(&args[0], st))
             .unwrap_or_default()
             .into_iter()
-            .filter(|s| cmd != "setting forget" || model::saved(s).is_some())
-            .map(|s| s.key.clone())
+            .filter(|s| cmd != "setting forget" || s.saved.is_some())
+            .map(|s| s.field.path())
             .collect(),
         ("setting set", 2) => st
             .map(|st| known_settings(&args[0], st))
             .unwrap_or_default()
             .into_iter()
-            .find(|s| s.key == args[1])
-            .map(value_words)
+            .find(|s| s.field.path() == args[1])
+            .map(|s| value_words(&s))
             .unwrap_or_default(),
         (_, 0) if DEVICE_COMMANDS.contains(&cmd) => st
             .map(|st| device_words(st, cmd, |id| usable(cmd, id, st)))
@@ -1300,7 +1294,9 @@ pub fn complete(base: &str, st: Option<&State>) -> Vec<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use cordial_protocol::{CodeKind, ConfigurationInterface, DeviceState, keys};
+    use cordial_protocol::{
+        self as p, CodeKind, ConfigurationInterface, DeviceState, ResourceType,
+    };
 
     fn words(line: &str) -> Vec<String> {
         split(line).unwrap()
@@ -1345,22 +1341,29 @@ pub(crate) mod tests {
             transports: vec![
                 p::TransportSupport {
                     transport: Transport::Classic as i32,
-                    max_enabled: Some(4),
                     enabled: Some(true),
+                    resources: vec![devices(4)],
                 },
                 p::TransportSupport {
                     transport: Transport::Ble as i32,
-                    max_enabled: Some(7),
                     enabled: Some(true),
+                    resources: vec![devices(7)],
                 },
             ],
-            info: vec![p::Info {
-                key: keys::BUILD_DEVELOPMENT.into(),
-                value: Some(model::wire_value(p::value::Value::Bool(true))),
-            }],
-            profile_support: None,
-            configuration_interfaces: Vec::new(),
-            output_support: Vec::new(),
+            information: Some(p::AdapterInformation {
+                development_build: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// A transport's enabled-device allowance, with no count reported.
+    fn devices(limit: u32) -> p::ResourceCapacity {
+        p::ResourceCapacity {
+            r#type: ResourceType::Devices as i32,
+            count: None,
+            limit: Some(limit),
         }
     }
 
@@ -1374,10 +1377,17 @@ pub(crate) mod tests {
                 min: 4,
                 max: 0xe7,
             }],
-            max_remap_outputs: 4,
-            max_layers: 4,
-            memory_budget: 4096,
-            ..Default::default()
+            resources: [
+                (ResourceType::Outputs, 4),
+                (ResourceType::Layers, 4),
+                (ResourceType::Memory, 4096),
+            ]
+            .map(|(kind, limit)| p::ResourceCapacity {
+                r#type: kind as i32,
+                count: None,
+                limit: Some(limit),
+            })
+            .to_vec(),
         });
         status.configuration_interfaces = [
             (ConfigurationInterface::Via, ConfigurationInterface::Vial),
@@ -1387,6 +1397,7 @@ pub(crate) mod tests {
         .map(|(i, other)| p::ConfigurationInterfaceSupport {
             interface: i as i32,
             enabled: false,
+            active: false,
             profile: 0,
             conflicts: vec![other as i32],
         })
@@ -1414,22 +1425,17 @@ pub(crate) mod tests {
 
     #[test]
     fn extreme_integer_ranges_neither_overflow_nor_enumerate_far() {
-        let ranged = |min: i64, max: i64, step: u64| p::Setting {
-            key: "pointer.sensor.0.dpi".into(),
-            r#type: Some(p::setting::Type::Integer(p::IntegerSetting {
-                limits: Some(p::integer_setting::Limits::Range(p::IntegerRange {
-                    min,
-                    max,
-                    step,
-                })),
-                ..Default::default()
-            })),
-            ..Default::default()
+        let ranged = |min: i64, max: i64, step: u64| {
+            catalog::tests::of(settings::tests::sensor(
+                0,
+                settings::tests::ranged(None, min, max, step),
+            ))
+            .remove(0)
         };
         let all = ranged(i64::MIN, i64::MAX, 1);
         assert_eq!(steps(&all), (1, 10));
         assert!(value_words(&all).is_empty());
-        assert!(model::accepts(&all, &p::value::Value::Integer(i64::MAX)));
+        assert!(settings::accepts(&all, &settings::Value::Integer(i64::MAX)));
         let top = ranged(i64::MAX - 2, i64::MAX, 1);
         assert_eq!(value_words(&top).len(), 3);
         let wide = ranged(0, i64::MAX, u64::MAX);
@@ -1505,13 +1511,19 @@ pub(crate) mod tests {
         );
         assert!(parse(&words("device set 1 enabled maybe")).is_err());
         assert_eq!(run("device refresh 1"), Command::Refresh(Target::Id(1)));
-        assert_eq!(run("warning list 1"), Command::Warnings(Target::Id(1)));
         assert_eq!(
-            run("setting set 1 pointer.sensor.0.dpi 1600"),
+            run("setting set 1 pointer_sensor.0.dpi 1600"),
             Command::SettingSet(
                 Target::Id(1),
-                "pointer.sensor.0.dpi".into(),
+                Field::hidpp(settings::Leaf::Dpi, Some(0)),
                 SettingInput::Text("1600".into())
+            )
+        );
+        assert_eq!(
+            run("setting forget 1 backlight.external_power"),
+            Command::SettingForget(
+                Target::Id(1),
+                Field::hidpp(settings::Leaf::ExternalPower, None)
             )
         );
         assert_eq!(
@@ -1660,8 +1672,7 @@ pub(crate) mod tests {
             role: p::Role::Gamepad as i32,
             modes: vec![p::OutputModeSupport {
                 mode: OutputMode::Hid as i32,
-                max_slots: 4,
-                slots: Some(1),
+                resources: Vec::new(),
             }],
         }];
         assert!(
@@ -1731,8 +1742,7 @@ pub(crate) mod tests {
             role: p::Role::Gamepad as i32,
             modes: vec![p::OutputModeSupport {
                 mode: OutputMode::Hid as i32,
-                max_slots: 4,
-                slots: None,
+                resources: Vec::new(),
             }],
         }];
         st.devices[1].output_preferences = gamepad(7);
@@ -1774,7 +1784,7 @@ pub(crate) mod tests {
         );
         assert!(help_on(None, Some("exit")).starts_with("quit | exit"));
         let mut production = state();
-        production.status.info.clear();
+        production.status.information = None;
         assert!(help_on(Some(&production), Some("file get")).starts_with("file get [--raw] PATH"));
     }
 
@@ -1782,7 +1792,7 @@ pub(crate) mod tests {
     fn development_commands_are_offered_only_by_development_firmware() {
         let mut st = state();
         assert!(help(Some(&st)).contains("file list"));
-        st.status.info.clear();
+        st.status.information = None;
         let shown = help(Some(&st));
         assert!(!shown.contains("file list") && !shown.contains("adapter bootloader"));
         assert!(shown.contains("except adapter status."), "{shown}");

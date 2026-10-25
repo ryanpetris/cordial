@@ -1,5 +1,6 @@
 // Run-time validation of actions arriving over IPC from the window.
 import type { Action } from "../shared/state.ts";
+import { FIELDS as SETTING_FIELDS } from "./convert.ts";
 
 type Kind =
   | "string"
@@ -71,6 +72,14 @@ const PREFERENCES: Record<string, "boolean" | "number"> = {
 const id = (value: unknown) => typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
 const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 
+/** A setting field's identity: a known group and field, and a sensor's index or null. */
+function setting(value: unknown): boolean {
+  if (!record(value) || Object.keys(value).some((k) => !["integration", "group", "index", "field"].includes(k))) return false;
+  const fields = typeof value.group === "string" && Object.hasOwn(SETTING_FIELDS, value.group) ? SETTING_FIELDS[value.group as keyof typeof SETTING_FIELDS] : undefined;
+  return id(value.integration) && !!fields && typeof value.field === "string" && Object.hasOwn(fields, value.field)
+    && (value.group === "pointer_sensor" ? id(value.index) : value.index === null);
+}
+
 function fits(value: unknown, kind: Kind): boolean {
   switch (kind) {
     case "string":
@@ -95,7 +104,7 @@ function fits(value: unknown, kind: Kind): boolean {
         const fields = change.type === "set" ? ["type", "setting", "value"] : ["type", "setting"];
         return (change.type === "set" || change.type === "forget")
           && Object.keys(change).every((k) => fields.includes(k))
-          && fits(change.setting, "string") && (change.type === "forget" || fits(change.value, "value"));
+          && setting(change.setting) && (change.type === "forget" || fits(change.value, "value"));
       });
     case "page":
       return value === "first" || value === "next" || value === "previous";

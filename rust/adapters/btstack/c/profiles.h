@@ -70,6 +70,7 @@ int cordial_profiles_connect(cordial_link, cordial_peer, bool pairing, const cor
 int cordial_profiles_incoming(uint32_t attempt, const cordial_link *accept, const cordial_layout *layout);
 void cordial_profiles_disconnect(cordial_link);
 int cordial_profiles_adopt(cordial_link);
+void cordial_profiles_promote(cordial_link);
 int cordial_profiles_reply(cordial_link, uint8_t method, bool accept, const char *value);
 int cordial_profiles_write(cordial_link, uint32_t sequence, uint16_t service, uint8_t kind,
                       uint16_t report_id, const uint8_t *data, uint16_t size);

@@ -97,11 +97,6 @@ fn indicators_wait_for_completion_and_late_completion_cannot_cross_reconnect() {
         12,
     )
     .unwrap();
-    assert!(
-        l.warnings
-            .iter()
-            .any(|w| w.code == cordial_core::model::errors::WarningCode::IndicatorWriteFailed)
-    );
 }
 
 #[test]
@@ -344,7 +339,6 @@ fn a_failed_indicator_report_does_not_block_later_reports_and_retries_only_the_f
     link.output_complete(id, Ok(()), &mut catalog, &mut forward, 1_002)
         .unwrap();
     assert!(link.output(2, 1_003).unwrap().is_none());
-    assert!(link.warnings.is_empty());
 }
 
 #[test]
@@ -409,11 +403,6 @@ fn an_indicator_read_failure_does_not_block_another_services_lights() {
     let read = link.report_read(&catalog, 0).unwrap();
     link.report_read_complete(read.id, read.kind, Err(ErrorCode::Timeout), &mut catalog, 1);
     assert_eq!(link.output(2, 2).unwrap().unwrap().service, ServiceId(2));
-    assert_eq!(
-        link.warnings[0].code,
-        cordial_core::model::errors::WarningCode::IndicatorReadFailed
-    );
-    assert_eq!(link.warnings[0].service, 1);
 }
 
 #[test]
@@ -436,9 +425,9 @@ fn indicator_target_reversal_updates_reports_already_written_for_an_intermediate
 }
 
 #[test]
-fn relative_indicators_use_input_feedback_and_clear_precise_unknown_state_warnings() {
+fn relative_indicators_use_input_feedback() {
     use cordial_core::bluetooth::{InputReport, ReportType};
-    use cordial_core::model::errors::WarningCode;
+
     let mut descriptor = KEYBOARD.to_vec();
     // The first Output item carries relative toggles for the five lock lights.
     let output = descriptor.windows(2).position(|w| w == [0x91, 2]).unwrap();
@@ -479,21 +468,12 @@ fn relative_indicators_use_input_feedback_and_clear_precise_unknown_state_warnin
     let write = output.id;
     link.output_complete(write, Ok(()), &mut catalog, &mut forward, 7)
         .unwrap();
-    assert_eq!(link.warnings.len(), 4);
-    assert!(
-        link.warnings
-            .iter()
-            .all(|w| w.code == WarningCode::IndicatorStateUnknown
-                && w.bit_offset.is_some()
-                && w.usage_page == Some(8)
-                && w.usage != Some(2))
-    );
+
     assert!(link.output(2, 8).unwrap().is_none());
 }
 
 #[test]
 fn unsupported_indicator_writes_are_distinct_from_retryable_failures() {
-    use cordial_core::model::errors::WarningCode;
     let mut catalog = Catalog::default();
     let mut link = link(&mut catalog, 1);
     let mut forward = Forwarder::default();
@@ -506,10 +486,7 @@ fn unsupported_indicator_writes_are_distinct_from_retryable_failures() {
         1,
     )
     .unwrap();
-    assert_eq!(
-        link.warnings[0].code,
-        WarningCode::IndicatorWriteUnsupported
-    );
+
     let id = link.output(2, 2).unwrap().unwrap().id;
     link.output_complete(id, Ok(()), &mut catalog, &mut forward, 3)
         .unwrap();

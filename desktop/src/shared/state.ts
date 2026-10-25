@@ -3,21 +3,28 @@
 // and the development server's JSON. Enum values are the protocol's names in
 // lower case; a value this app doesn't know reads as the enum's zero value.
 import type {
+  BacklightEffect,
+  BacklightMode,
+  BacklightStatus,
   CapacityReason,
   CodeKind,
   DeviceState,
   ErrorCode,
+  FunctionRowMode,
   InactiveReason,
   IntegrationState,
+  KeyboardPlatform,
   Kind,
   OutputMode,
   OutputState,
   Platform,
-  ReportType,
+  ResourceType,
   Role,
   SettingState,
+  SettingsGroup,
   Transport,
-  WarningCode,
+  VendorRegistry,
+  WheelMode,
 } from "@cordial/protocol";
 
 type Name<E> = Lowercase<Extract<keyof E, string>>;
@@ -36,12 +43,20 @@ export type OutputModeName = Name<typeof OutputMode>;
 export type OutputStateName = Name<typeof OutputState>;
 export type IntegrationStateName = Name<typeof IntegrationState>;
 export type SettingStateName = Name<typeof SettingState>;
-export type WarningName = Name<typeof WarningCode>;
-export type ReportTypeName = Exclude<Name<typeof ReportType>, "unknown">;
+export type ResourceTypeName = Exclude<Name<typeof ResourceType>, "unknown">;
 export type CodeKindName = Name<typeof CodeKind>;
+export type SettingsGroupName = Exclude<Name<typeof SettingsGroup>, "unknown">;
+export type KeyboardPlatformName = Name<typeof KeyboardPlatform>;
+export type FunctionRowModeName = Name<typeof FunctionRowMode>;
+export type BacklightStatusName = Name<typeof BacklightStatus>;
+export type BacklightModeName = Name<typeof BacklightMode>;
+export type BacklightEffectName = Name<typeof BacklightEffect>;
+export type WheelModeName = Name<typeof WheelMode>;
+export type VendorRegistryName = Name<typeof VendorRegistry>;
 
+/** A setting or reading value; enum values are the protocol's names in lower case. */
 export type Scalar = boolean | number | string;
-export type ValueType = "bool" | "integer" | "enum" | "text" | "color";
+export type ValueType = "bool" | "integer" | "enum";
 
 /** A protocol error, with what the Dongle added to it. */
 export interface WireError {
@@ -52,11 +67,61 @@ export interface WireError {
   outcomeUnknown: boolean;
 }
 
-/** One read-only fact. Keys come from the key catalog; colors are 0xRRGGBB. */
-export interface InfoEntry {
-  key: string;
-  type: "bool" | "integer" | "text" | "color";
-  value: Scalar;
+/** Facts about the adapter itself; each is null while unknown. */
+export interface AdapterInformation {
+  firmwareVersion: string | null;
+  boardName: string | null;
+  developmentBuild: boolean | null;
+}
+
+/** Facts from the device's current connection; each is null while unknown, including while
+ * disconnected. Configurable behavior appears here only when the device doesn't take writes for it. */
+export interface DeviceInformation {
+  identity: {
+    manufacturer: string | null;
+    model: string | null;
+    serial: string | null;
+    firmwareVersion: string | null;
+    bootloaderVersion: string | null;
+    hardwareRevision: string | null;
+    softwareRevision: string | null;
+    vendor: { registry: VendorRegistryName | null; id: number | null };
+    product: { id: number | null; version: number | null };
+  };
+  battery: { level: number | null; charging: boolean | null };
+  keyboard: { platform: KeyboardPlatformName | null; functionRow: FunctionRowModeName | null };
+  power: { autoOff: number | null };
+  backlight: {
+    currentBrightness: number | null;
+    status: BacklightStatusName | null;
+    enabled: boolean | null;
+    mode: BacklightModeName | null;
+    brightness: number | null;
+    delay: { handsAway: number | null; handsNearby: number | null; externalPower: number | null };
+    startupEffect: boolean | null;
+    dialEffect: boolean | null;
+    powerSave: boolean | null;
+    effect: BacklightEffectName | null;
+  };
+  /** In ascending index order. */
+  pointerSensors: { index: number; dpi: number | null }[];
+  wheel: {
+    resolutionMultiplier: number | null;
+    ratchetsPerRotation: number | null;
+    diameter: number | null;
+    mode: WheelModeName | null;
+    freeSpinThreshold: number | null;
+    invert: boolean | null;
+  };
+  thumbwheel: { invert: boolean | null };
+}
+
+/** A resource count and its allowance, in units the record holding it defines. Either is null
+ * while unknown, which is neither zero nor unlimited. */
+export interface Resource {
+  type: ResourceTypeName;
+  count: number | null;
+  limit: number | null;
 }
 
 export interface AdapterStatus {
@@ -64,32 +129,36 @@ export interface AdapterStatus {
   name: string;
   platform: HostPlatform;
   ready: boolean;
-  /** Transports the firmware supports and whether each is enabled; `maxEnabled` is null while
-   * unknown. */
-  transports: { transport: TransportName; maxEnabled: number | null; enabled: boolean }[];
-  info: InfoEntry[];
+  /** The adapter's current problems. */
+  errors: Code[];
+  /** USB usage: `interfaces` counts the exposed USB interfaces. */
+  resources: Resource[];
+  /** Transports the firmware supports and whether each is enabled, with their `devices` and
+   * `connections` usage. */
+  transports: { transport: TransportName; enabled: boolean; resources: Resource[] }[];
+  information: AdapterInformation;
   /** Null on a board without profile support, which has no configuration interfaces either. */
   profileSupport: ProfileSupport | null;
   /** Every configuration interface the firmware supports, enabled or not. */
   interfaces: InterfaceState[];
   /** Output modes the firmware implements, by role; a mode not listed is unsupported. */
-  outputSupport: { role: RoleName; modes: { mode: OutputModeName; maxSlots: number; slots: number | null }[] }[];
+  outputSupport: { role: RoleName; modes: { mode: OutputModeName; resources: Resource[] }[] }[];
 }
 
-/** What the adapter supports for profiles. */
+/** What the adapter supports for profiles: `memory` in bytes of loaded profiles, and `layers`, the
+ * most profiles one device's layers can list. */
 export interface ProfileSupport {
-  /** Bytes of memory for loaded profiles, and how many are in use. */
-  memoryBudget: number;
-  memoryUsed: number;
-  /** The most profiles one device's layers can list. */
-  maxLayers: number;
+  resources: Resource[];
 }
 
 /** A configuration interface's saved preferences. */
 export interface InterfaceState {
   /** The protocol's ConfigurationInterface number, passed back unchanged. */
   interface: number;
+  /** The saved preference; it can be enabled without fitting in the USB allocation. */
   enabled: boolean;
+  /** Whether it is currently exposed over USB. */
+  active: boolean;
   /** The profile it edits; 0 when none is selected. */
   profile: number;
   /** Interfaces it can't be enabled alongside. */
@@ -151,16 +220,14 @@ export interface DeviceRecord {
   paused: boolean;
   /** Null when the adapter uses the device. */
   inactive: Inactive | null;
-  /** The last failed connection attempt. */
-  error: Code | null;
+  /** The last failed connection attempt, and why a connected device's profiles aren't loaded. */
+  errors: Code[];
   security: Security | null;
   hidpp: Integration | null;
-  info: InfoEntry[];
+  information: DeviceInformation;
   roles: RoleName[];
   /** The device's layers: profile IDs in the order they apply. Null without profile support. */
   profiles: number[] | null;
-  /** Why the connected device's profiles aren't loaded. */
-  profileError: Code | null;
   /** Saved output choices; a missing gamepad choice means Disabled. A mode this app doesn't know
    * is null. */
   outputPreferences: { role: RoleName; mode: OutputModeName | null }[];
@@ -168,23 +235,35 @@ export interface DeviceRecord {
   outputs: { role: RoleName; mode: OutputModeName | null; state: OutputStateName; slot: number | null }[];
 }
 
-export interface DeviceWarning {
-  code: WarningName;
-  service: number;
-  reportType: ReportTypeName | null;
-  reportId: number | null;
-  bitOffset: number | null;
-  usagePage: number | null;
-  usage: number | null;
+/** The protocol's field names of each settings group, with the backlight delay's fields at the
+ * group's level. */
+export interface SettingFields {
+  keyboard: "platform" | "function_row";
+  power: "auto_off";
+  backlight: "enabled" | "mode" | "brightness" | "hands_away" | "hands_nearby" | "external_power" | "startup_effect" | "dial_effect" | "power_save" | "effect";
+  pointer_sensor: "dpi";
+  wheel: "mode" | "free_spin_threshold" | "invert";
+  thumbwheel: "invert";
 }
 
+/** One field of a settings object: the object's integration, group and component index, and the
+ * field in it. */
+export type SettingField = {
+  [G in SettingsGroupName]: {
+    /** The protocol's IntegrationKind number, passed back unchanged. */
+    integration: number;
+    group: G;
+    /** The component index, for pointer sensors; null in other groups. */
+    index: number | null;
+    field: SettingFields[G];
+  };
+}[SettingsGroupName];
+
 /** A value the adapter can change on the device and save. */
-export interface Setting {
-  /** The protocol's IntegrationKind number, passed back unchanged. */
-  integration: number;
-  key: string;
+export type Setting = SettingField & {
   type: ValueType;
-  /** The last value read from the device; current only while its integration is active. */
+  /** The last value read from the device; current only while its integration is active. An enum
+   * reading the app can't interpret is `unknown`. */
   value: Scalar | null;
   /** The value saved on the adapter; null when the adapter leaves the setting alone. */
   saved: Scalar | null;
@@ -192,14 +271,13 @@ export interface Setting {
   state: SettingStateName | null;
   /** The last apply's failure. */
   error: Code | null;
-  /** Accepted enum or integer values; empty when not a fixed list. */
+  /** Accepted enum or integer values; empty when not a fixed list. An enum setting without choices
+   * takes no value. */
   choices: Scalar[];
   min: number | null;
   max: number | null;
   step: number | null;
-  /** The longest text the device takes, in UTF-8 bytes. */
-  maxBytes: number | null;
-}
+};
 
 export interface Battery {
   /** Current charge; null while unknown. */
@@ -212,8 +290,8 @@ export interface Battery {
 
 /** A value or policy change staged for the device's settings form. */
 export type SettingsChange =
-  | { type: "set"; setting: string; value: Scalar }
-  | { type: "forget"; setting: string };
+  | { type: "set"; setting: SettingField; value: Scalar }
+  | { type: "forget"; setting: SettingField };
 
 export interface SettingsSaveItem {
   change: SettingsChange;
@@ -267,7 +345,7 @@ export interface AdapterEntry {
   /** Whether the adapter's devices are yet to be listed: it is reconnecting, or its session is
    * still reading them for the first time. */
   listing: boolean;
-  /** Problems worth the tray's attention badge. */
+  /** Problems worth a banner and the tray's attention badge. */
   attention: string[];
   /** The Profiles list's page; null without profile support. */
   profilePage: ProfilePage | null;
@@ -290,10 +368,6 @@ export interface DeviceEntry {
   battery: Battery | null;
   /** Commands in flight for this device. */
   pending: string[];
-  /** Null until the list has been read. */
-  warnings: DeviceWarning[] | null;
-  /** Why the last read of the warning list failed, in words. */
-  warningsError: string | null;
   /** Null until the list has been read. */
   settings: Setting[] | null;
   /** Why the last read of the settings list failed, in words. */
@@ -341,7 +415,7 @@ export interface PairingState {
 /** Profile problems worth a notification: the adapter's profile memory nearly full, or a connected
  * device whose profiles aren't loaded. */
 export type ProfileAlert =
-  | { kind: "memory"; adapterId: string; name: string; percent: number }
+  | { kind: "memory"; adapterId: string; name: string }
   | { kind: "device"; key: string; name: string; code: Code };
 
 export interface Preferences {
@@ -381,7 +455,7 @@ export interface AppState {
 }
 
 export type Action =
-  /** `device.refresh` reads the connected device again; `device.reload` reads its warning and settings lists from the adapter again. */
+  /** `device.refresh` reads the connected device again; `device.reload` reads its settings list from the adapter again. */
   | { type: "device.connect" | "device.disconnect" | "device.unpair" | "device.refresh" | "device.reload"; key: string }
   /** Changes the given device settings in one request; omitted ones stay as they are. */
   | ({ type: "device.update"; key: string } & DeviceChanges)

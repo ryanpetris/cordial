@@ -1,13 +1,13 @@
 //! The session's view of the Dongle, built from responses and events in the order the Dongle
 //! sent them. A device, profile or status record arrives whole and replaces what the view held. A
-//! listing page replaces what the view held in the range it covers, and change events update the
-//! settings and warnings the view holds. An accepted Set request carries no result: the Dongle
-//! now holds what was sent in the form the command saves it, so the view takes the sent values in
-//! that form.
+//! listing page replaces what the view held in the range it covers, and change events replace or
+//! remove the settings objects the view holds. An accepted Set request carries no result: the
+//! Dongle now holds what was sent in the form the command saves it, so the view takes the sent
+//! values in that form.
+use crate::settings::{self, Setting};
 use cordial_client::paging::{self, Page};
 use cordial_protocol::{
-    self as p, device_list_entry, event, profile_list_entry, request::Command, response, setting,
-    setting_change, value::Value,
+    self as p, device_list_entry, event, profile_list_entry, request::Command, response,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,10 +47,8 @@ pub struct State {
     pub last_scan: Option<p::ScanDone>,
     /// The latest pairing event.
     pub pairing: Option<p::Pairing>,
-    /// Each device's settings, once listed or reported.
-    pub settings: BTreeMap<u32, Vec<p::Setting>>,
-    /// Each device's warnings, once listed or reported.
-    pub warnings: BTreeMap<u32, Vec<p::DeviceWarning>>,
+    /// Each device's settings objects in listing order, once listed.
+    pub settings: BTreeMap<u32, Vec<p::SettingsObject>>,
     /// Profiles by ID, from listed pages, results and events. It holds only the profiles this
     /// session has seen, never necessarily all of them.
     pub profiles: BTreeMap<u32, p::Profile>,
@@ -76,23 +74,6 @@ fn merge_page<P: Page>(list: &mut Vec<P::Entry>, after: Option<&P::Key>, page: &
     list.sort_by(|a, b| P::order(&P::key(a), &P::key(b)));
 }
 
-/// Sets a setting's saved value, when the value fits its type.
-fn set_saved(s: &mut p::Setting, value: Option<Value>) {
-    match (&mut s.r#type, value) {
-        (Some(setting::Type::Bool(t)), Some(Value::Bool(v))) => t.saved = Some(v),
-        (Some(setting::Type::Integer(t)), Some(Value::Integer(v))) => t.saved = Some(v),
-        (Some(setting::Type::Enum(t)), Some(Value::Text(v))) => t.saved = Some(v),
-        (Some(setting::Type::Text(t)), Some(Value::Text(v))) => t.saved = Some(v),
-        (Some(setting::Type::Color(t)), Some(Value::Color(v))) => t.saved = Some(v),
-        (Some(setting::Type::Bool(t)), None) => t.saved = None,
-        (Some(setting::Type::Integer(t)), None) => t.saved = None,
-        (Some(setting::Type::Enum(t)), None) => t.saved = None,
-        (Some(setting::Type::Text(t)), None) => t.saved = None,
-        (Some(setting::Type::Color(t)), None) => t.saved = None,
-        _ => {}
-    }
-}
-
 impl State {
     pub fn device(&self, id: u32) -> Option<&p::Device> {
         self.devices.iter().find(|d| d.id == id)
@@ -103,12 +84,10 @@ impl State {
     }
 
     /// The device's settings, or none when they have not been listed.
-    pub fn settings_of(&self, id: u32) -> &[p::Setting] {
-        self.settings.get(&id).map_or(&[], Vec::as_slice)
-    }
-
-    pub fn warnings_of(&self, id: u32) -> &[p::DeviceWarning] {
-        self.warnings.get(&id).map_or(&[], Vec::as_slice)
+    pub fn settings_of(&self, id: u32) -> Vec<Setting> {
+        self.settings
+            .get(&id)
+            .map_or_else(Vec::new, |objects| settings::settings(objects))
     }
 
     pub fn profile(&self, id: u32) -> Option<&p::Profile> {
@@ -138,7 +117,6 @@ impl State {
         self.devices.retain(|d| d.id != id);
         self.unreadable.remove(&id);
         self.settings.remove(&id);
-        self.warnings.remove(&id);
     }
 
     /// Replaces the devices in a page's range with the page's devices.
@@ -179,37 +157,24 @@ impl State {
         }
     }
 
-    /// Applies settings changes to a device whose settings the view holds.
+    /// Applies settings changes to a device whose settings the view holds: each changed object
+    /// replaces the one with its identity, and each removed one goes with all of its fields.
     fn settings_changed(&mut self, changed: &p::SettingsChanged) {
         let Some(list) = self.settings.get_mut(&changed.device) else {
             return;
         };
-        list.retain(|s| {
-            let key = paging::setting_ref(s);
+        list.retain(|o| {
+            let key = paging::settings_ref(o);
             !changed.removed.contains(&key)
                 && !changed
                     .changed
                     .iter()
-                    .any(|c| paging::setting_ref(c) == key)
+                    .any(|c| paging::settings_ref(c) == key)
         });
         list.extend(changed.changed.iter().cloned());
         list.sort_by(|a, b| {
-            paging::setting_order(&paging::setting_ref(a), &paging::setting_ref(b))
+            paging::settings_order(&paging::settings_ref(a), &paging::settings_ref(b))
         });
-    }
-
-    /// Applies warning changes. A device has warnings only while it has a link, and those of
-    /// every linked device are listed once the devices are, so a device the view holds none for
-    /// has none.
-    fn warnings_changed(&mut self, changed: &p::WarningsChanged) {
-        let list = self.warnings.entry(changed.device).or_default();
-        list.retain(|w| !changed.removed.contains(w));
-        for w in &changed.added {
-            if !list.contains(w) {
-                list.push(*w);
-            }
-        }
-        list.sort_by(paging::warning_order);
     }
 
     /// Takes the preferences an accepted SetAdapter saved, with the name trimmed as the adapter
@@ -297,26 +262,9 @@ impl State {
     /// Takes the values an accepted SetSettings saved and forgot, for a device whose settings
     /// the view holds. A saved value waits to be applied.
     fn settings_saved(&mut self, update: &p::SetSettings) {
-        let Some(list) = self.settings.get_mut(&update.device) else {
-            return;
-        };
-        for change in &update.changes {
-            let Some(s) = list
-                .iter_mut()
-                .find(|s| s.integration == change.integration && s.key == change.key)
-            else {
-                continue;
-            };
-            match &change.change {
-                Some(setting_change::Change::Value(v)) => {
-                    set_saved(s, v.value.clone());
-                    s.status = Some(setting::Status::State(p::SettingState::Pending as i32));
-                }
-                Some(setting_change::Change::Forget(_)) => {
-                    set_saved(s, None);
-                    s.status = None;
-                }
-                None => {}
+        if let Some(list) = self.settings.get_mut(&update.device) {
+            for change in &update.changes {
+                settings::take_update(list, change);
             }
         }
     }
@@ -345,7 +293,6 @@ impl State {
             event::Kind::Device(device) => self.put_device(device.clone()),
             event::Kind::DeviceRemoved(removed) => self.remove_device(removed.id),
             event::Kind::SettingsChanged(s) => self.settings_changed(s),
-            event::Kind::WarningsChanged(w) => self.warnings_changed(w),
             event::Kind::ScanFound(c) => match self.candidates.iter_mut().find(|o| o.id == c.id) {
                 Some(o) => *o = c.clone(),
                 None => self.candidates.push(c.clone()),
@@ -395,12 +342,6 @@ impl State {
             {
                 let list = self.settings.entry(s.device).or_default();
                 merge_page(list, l.after.as_ref(), s);
-            }
-            (Some(Command::ListWarnings(l)), Some(response::Result::Warnings(w)))
-                if self.device(w.device).is_some() =>
-            {
-                let list = self.warnings.entry(w.device).or_default();
-                merge_page(list, l.after.as_ref(), w);
             }
             (Some(Command::ListProfiles(l)), Some(response::Result::Profiles(list))) => {
                 self.profile_page(l.after, list)
@@ -602,89 +543,90 @@ mod tests {
         assert!(st.profile(9).is_none());
     }
 
-    fn integer(key: &str, saved: Option<i64>) -> p::Setting {
-        p::Setting {
-            integration: p::IntegrationKind::Hidpp as i32,
-            key: key.into(),
-            status: saved.map(|_| setting::Status::State(p::SettingState::Applied as i32)),
-            r#type: Some(setting::Type::Integer(p::IntegerSetting {
-                value: Some(1),
-                saved,
-                limits: None,
-            })),
-        }
+    use crate::settings::{
+        Field, Leaf, Value,
+        tests::{ranged, sensor, wheel},
+    };
+
+    fn sensor_ref(index: u32) -> p::SettingsRef {
+        Field::hidpp(Leaf::Dpi, Some(index)).object()
     }
 
-    fn setting_ref(key: &str) -> p::SettingRef {
-        p::SettingRef {
-            integration: p::IntegrationKind::Hidpp as i32,
-            key: key.into(),
-        }
+    fn fields(st: &State) -> Vec<(Field, Option<Value>)> {
+        st.settings_of(1)
+            .into_iter()
+            .map(|s| (s.field, s.value))
+            .collect()
     }
 
     #[test]
-    fn setting_pages_and_changes_merge_into_the_listed_settings() {
+    fn setting_pages_and_changes_replace_whole_objects() {
         let mut st = State::default();
         st.event(&event::Kind::Device(device(1)));
         // Changes to settings that were never listed are left to the listing.
         st.event(&event::Kind::SettingsChanged(p::SettingsChanged {
             device: 1,
-            changed: vec![integer("c", None)],
+            changed: vec![sensor(2, ranged(Some(1), 1, 9, 1))],
             removed: Vec::new(),
         }));
         assert!(!st.settings.contains_key(&1));
-        let list = |after: Option<&str>, settings: Vec<p::Setting>, end: bool| {
+        let list = |after: Option<p::SettingsRef>, objects: Vec<p::SettingsObject>, end: bool| {
             answered(
-                Command::ListSettings(p::ListSettings {
-                    device: 1,
-                    after: after.map(setting_ref),
-                }),
+                Command::ListSettings(p::ListSettings { device: 1, after }),
                 response::Result::Settings(p::DeviceSettings {
                     device: 1,
-                    settings,
+                    objects,
                     end,
                 }),
             )
         };
-        let (request, response) = list(None, vec![integer("a", None), integer("b", None)], false);
+        // Sensor 0 is the first object, so the second page's cursor keeps its zero index.
+        let (request, response) = list(
+            None,
+            vec![
+                sensor(0, ranged(Some(800), 200, 4000, 50)),
+                sensor(1, ranged(Some(400), 200, 4000, 50)),
+            ],
+            false,
+        );
         st.response(&request, &response);
-        let (request, response) = list(Some("b"), vec![integer("d", None)], true);
+        let (request, response) = list(
+            Some(sensor_ref(1)),
+            vec![wheel(Some(p::WheelMode::Stepped as i32), Some(false))],
+            true,
+        );
         st.response(&request, &response);
-        let keys = |st: &State| {
-            st.settings_of(1)
-                .iter()
-                .map(|s| s.key.clone())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(keys(&st), ["a", "b", "d"]);
+        let dpi = |n: u32| Field::hidpp(Leaf::Dpi, Some(n));
+        let mode = Field::hidpp(Leaf::WheelMode, None);
+        let invert = Field::hidpp(Leaf::WheelInvert, None);
+        let stepped = Some(Value::Choice(p::WheelMode::Stepped as i32));
+        assert_eq!(
+            fields(&st),
+            [
+                (dpi(0), Some(Value::Integer(800))),
+                (dpi(1), Some(Value::Integer(400))),
+                (mode, stepped),
+                (invert, Some(Value::Bool(false))),
+            ]
+        );
+        // A changed object replaces every field of the old one; a field it omits goes.
+        let mut wheel_without_invert = wheel(None, None);
+        if let Some(p::settings_object::Group::Wheel(w)) = &mut wheel_without_invert.group {
+            w.invert = None;
+        }
         st.event(&event::Kind::SettingsChanged(p::SettingsChanged {
             device: 1,
-            changed: vec![integer("c", None), integer("a", Some(4))],
-            removed: vec![setting_ref("b"), setting_ref("x")],
+            changed: vec![sensor(2, ranged(Some(1), 1, 9, 1)), wheel_without_invert],
+            removed: vec![sensor_ref(0), sensor_ref(5)],
         }));
-        assert_eq!(keys(&st), ["a", "c", "d"]);
-        assert_eq!(st.settings_of(1)[0], integer("a", Some(4)));
-    }
-
-    #[test]
-    fn warning_changes_add_and_remove_warnings() {
-        let mut st = State::default();
-        let warning = |service| p::DeviceWarning {
-            service,
-            ..Default::default()
-        };
-        st.event(&event::Kind::WarningsChanged(p::WarningsChanged {
-            device: 1,
-            added: vec![warning(2), warning(1)],
-            removed: Vec::new(),
-        }));
-        assert_eq!(st.warnings_of(1), [warning(1), warning(2)]);
-        st.event(&event::Kind::WarningsChanged(p::WarningsChanged {
-            device: 1,
-            added: vec![warning(1)],
-            removed: vec![warning(2), warning(3)],
-        }));
-        assert_eq!(st.warnings_of(1), [warning(1)]);
+        assert_eq!(
+            fields(&st),
+            [
+                (dpi(1), Some(Value::Integer(400))),
+                (dpi(2), Some(Value::Integer(1))),
+                (mode, None),
+            ]
+        );
     }
 
     #[test]
@@ -692,13 +634,18 @@ mod tests {
         let mut st = State::default();
         st.status.transports = vec![p::TransportSupport {
             transport: p::Transport::Ble as i32,
-            max_enabled: None,
             enabled: Some(true),
+            resources: Vec::new(),
         }];
         st.status.name = "Desk".into();
         st.event(&event::Kind::Device(device(1)));
+        let mut saved = sensor(1, ranged(Some(800), 200, 4000, 50));
+        crate::settings::take_update(
+            std::slice::from_mut(&mut saved),
+            &crate::settings::update(Field::hidpp(Leaf::Dpi, Some(1)), Some(Value::Integer(3))),
+        );
         st.settings
-            .insert(1, vec![integer("a", None), integer("b", Some(3))]);
+            .insert(1, vec![sensor(0, ranged(Some(800), 200, 4000, 50)), saved]);
         let (request, response) = accepted(Command::SetAdapter(p::SetAdapter {
             name: Some("Office".into()),
             platform: Some(p::Platform::Mac as i32),
@@ -751,24 +698,23 @@ mod tests {
         let (request, response) = accepted(Command::SetSettings(p::SetSettings {
             device: 1,
             changes: vec![
-                p::SettingChange {
-                    integration: p::IntegrationKind::Hidpp as i32,
-                    key: "a".into(),
-                    change: Some(setting_change::Change::Value(p::Value {
-                        value: Some(Value::Integer(7)),
-                    })),
-                },
-                p::SettingChange {
-                    integration: p::IntegrationKind::Hidpp as i32,
-                    key: "b".into(),
-                    change: Some(setting_change::Change::Forget(p::SettingForget {})),
-                },
+                crate::settings::update(Field::hidpp(Leaf::Dpi, Some(0)), Some(Value::Integer(0))),
+                crate::settings::update(Field::hidpp(Leaf::Dpi, Some(1)), None),
             ],
         }));
         st.response(&request, &response);
-        let mut a = integer("a", Some(7));
-        a.status = Some(setting::Status::State(p::SettingState::Pending as i32));
-        assert_eq!(st.settings_of(1), [a, integer("b", None)]);
+        let saved: Vec<_> = st
+            .settings_of(1)
+            .into_iter()
+            .map(|s| (s.saved, s.status))
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                (Some(Value::Integer(0)), Some(Ok(p::SettingState::Pending))),
+                (None, None)
+            ]
+        );
         // A refused request changes nothing.
         let request = p::Request {
             command: Some(Command::SetAdapter(p::SetAdapter {

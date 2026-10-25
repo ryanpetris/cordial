@@ -219,11 +219,12 @@ impl Record {
         self.source = Some(source);
         self.fresh = true;
         self.error = None;
-        self.state = if self
-            .preference
-            .as_ref()
-            .is_some_and(|p| !self.metadata.accepts(p.value))
-        {
+        self.state = if self.preference.as_ref().is_some_and(|p| {
+            !self.writable
+                || self.metadata.feature != p.metadata.feature
+                || self.metadata.scope != p.metadata.scope
+                || !self.metadata.accepts(p.value)
+        }) {
             self.error = Some(ErrorCode::UnsupportedSetting);
             SettingState::Unsupported
         } else {

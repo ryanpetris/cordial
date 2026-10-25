@@ -1,10 +1,7 @@
 // The Cordial serial API: protobuf messages generated from
-// proto/cordial.proto, the frame encoding used on the USB serial port, and the
-// information and setting keys from proto/keys.toml.
+// proto/cordial.proto and the frame encoding used on the USB serial port.
 export * from "./gen/cordial_pb.ts";
 export * from "./framing.ts";
-export * as keys from "./keys.ts";
-export type { KeyEntry, KeyType } from "./keys.ts";
 
 /** USB vendor ID of every Dongle (pid.codes). */
 export const USB_VENDOR_ID = 0x1209;

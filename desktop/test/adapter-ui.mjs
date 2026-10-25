@@ -29,8 +29,8 @@ try {
   const status = {
     ...adapter.status,
     interfaces: [
-      { interface: 1, enabled: true, profile: 1, conflicts: [2] },
-      { interface: 2, enabled: false, profile: 0, conflicts: [1] },
+      { interface: 1, enabled: true, active: true, profile: 1, conflicts: [2] },
+      { interface: 2, enabled: false, active: false, profile: 0, conflicts: [1] },
     ],
   };
   const ready = { ...real, adapters: [{ ...adapter, connection: "connected", readiness: "ready", status, profilePage, pickerPage: profilePage, profileNames }] };
@@ -91,6 +91,26 @@ try {
   await openAdapter();
   assert.deepEqual(await page.getByRole("tab").allTextContents(), ["Details", "Settings", "Profiles", "Diagnostics"]);
 
+  // Details names each USB capacity problem. Only a shortfall of required capacity also warns in
+  // a banner.
+  const required = "The adapter doesn't have enough USB capacity for every required interface.";
+  const usbFact = page.locator(".fact").filter({ has: page.locator("dt", { hasText: /^Interfaces$/ }) });
+  status.errors = ["usb_required_capacity_exceeded", "usb_reserved_capacity_exceeded"];
+  ready.adapters[0].attention = [required];
+  await publish(ready);
+  await page.locator(".banner").getByText(required, { exact: true }).waitFor();
+  await usbFact.getByText("Required Capacity Exceeded", { exact: true }).waitFor();
+  await usbFact.getByText("Reserved Capacity Exceeded", { exact: true }).waitFor();
+  status.errors = ["usb_reserved_capacity_exceeded"];
+  ready.adapters[0].attention = [];
+  await publish(ready);
+  await page.locator(".banner").getByText(required, { exact: true }).waitFor({ state: "detached" });
+  await usbFact.getByText("Reserved Capacity Exceeded", { exact: true }).waitFor();
+  assert.equal(await usbFact.getByText("Required Capacity Exceeded", { exact: true }).count(), 0);
+  status.errors = [];
+  await publish(ready);
+  await usbFact.getByText("Reserved Capacity Exceeded", { exact: true }).waitFor({ state: "detached" });
+
   // Each profile shows an icon for each role it changes.
   await tab("Profiles").click();
   await page.getByRole("img", { name: "Media Keys", exact: true }).waitFor();
@@ -107,17 +127,9 @@ try {
   await page.getByRole("img", { name: "VIA, Changed" }).waitFor();
   assert.deepEqual(await actions(), []);
 
-  // Save asks before reconnecting USB. A confirmation left open when USB goes away can't be
-  // confirmed; the staged value stays.
-  await save.click();
-  const confirm = dialog.getByRole("button", { name: "Save", exact: true });
-  await dialog.getByText("The adapter will disconnect from this computer for a moment after it saves these changes.").waitFor();
-  assert.equal(await confirm.isDisabled(), false);
+  // While USB is away, the staged value stays with the controls disabled.
   await publish(retained);
   await disabled(via, true);
-  assert.equal(await confirm.isDisabled(), true);
-  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
-  await dialog.waitFor({ state: "hidden" });
   await selected("Profiles");
   assert.equal(await via.isChecked(), false);
   assert.equal(await save.isDisabled(), true);
@@ -184,8 +196,7 @@ try {
   // A failed save keeps the staged values.
   await answer({ ok: false, message: "The adapter couldn't save the change." });
   await save.click();
-  await dialog.getByRole("button", { name: "Save", exact: true }).click();
-  await dialog.waitFor({ state: "hidden" });
+  assert.equal(await dialog.isVisible(), false);
   await bar.getByText("The adapter couldn't save the change.").waitFor();
   await tab("Profiles").click();
   assert.equal(await via.isChecked(), false);
@@ -198,10 +209,11 @@ try {
   };
   assert.deepEqual(await actions(), [pick, change]);
 
+  // Saving sends at once, without asking first, even though it reconnects USB.
   await answer({ ok: true });
   await save.click();
-  await dialog.getByRole("button", { name: "Save", exact: true }).click();
   await disabled(save, true);
+  assert.equal(await dialog.isVisible(), false);
   assert.deepEqual(await actions(), [pick, change, change]);
   assert.equal(await via.isChecked(), true);
   assert.equal(await vial.isChecked(), false);

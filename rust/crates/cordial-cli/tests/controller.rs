@@ -8,10 +8,10 @@ use cordial_cli::{
     },
     error::Error,
     profiles::{self, InterfaceUpdate},
+    settings::{Field, Leaf, Value},
 };
 use cordial_protocol::{
     self as p, ConfigurationInterface, DeviceState, ErrorCode, SettingState, Transport,
-    value::Value,
 };
 use std::{
     sync::mpsc::{self, Receiver},
@@ -93,31 +93,23 @@ fn run_with(
 }
 
 #[test]
-fn opening_loads_status_devices_and_warnings_then_events_keep_the_view() {
+fn opening_loads_status_and_devices_then_events_keep_the_view() {
     let dongle = Dongle::with(|sim| {
         sim.devices[0].state = DeviceState::Connected as i32;
-        sim.warnings.insert(
-            1,
-            vec![p::DeviceWarning {
-                code: p::WarningCode::IndicatorWriteFailed as i32,
-                service: 0,
-                report_type: p::ReportType::Output as i32,
-                report_id: Some(1),
-                ..Default::default()
-            }],
-        );
+        sim.devices[0].errors = vec![ErrorCode::ProfileLoadFailed as i32];
+        sim.settings.insert(1, vec![dpi(0, 800, None)]);
     });
     let (c, rx) = ready(&dongle);
     let st = c.state().unwrap();
     assert_eq!(st.status.name, "Desk");
     assert_eq!(st.devices.len(), 2);
-    assert_eq!(st.warnings_of(1).len(), 1);
-    assert!(st.ready());
-    // Only the connected device has warnings to read.
     assert_eq!(
-        dongle.sent(),
-        ["get_status", "list_devices", "list_warnings"]
+        cordial_cli::model::profile_error(st.device(1).unwrap()),
+        Some(ErrorCode::ProfileLoadFailed)
     );
+    assert!(st.ready());
+    assert_eq!(dongle.sent(), ["get_status", "list_devices"]);
+    run(&c, &rx, Command::Settings(id(1))).unwrap();
     // A device event replaces the record; a removal drops it with its lists.
     let mut connected = device(1, "Renamed Mouse", Transport::Ble);
     connected.state = DeviceState::Connected as i32;
@@ -125,7 +117,7 @@ fn opening_loads_status_devices_and_warnings_then_events_keep_the_view() {
     eventually(&c, &rx, |st| st.device(1).unwrap().name == "Renamed Mouse");
     dongle.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 1 }));
     eventually(&c, &rx, |st| {
-        st.device(1).is_none() && st.warnings_of(1).is_empty()
+        st.device(1).is_none() && st.settings_of(1).is_empty() && !st.settings.contains_key(&1)
     });
 }
 
@@ -378,23 +370,38 @@ fn a_one_shot_scan_waits_for_its_end() {
 #[test]
 fn saving_settings_sends_one_write_and_events_report_the_apply() {
     let dongle = Dongle::with(|sim| {
-        sim.settings.insert(1, vec![dpi(800, None)]);
+        // Two sensors on two pages: the cursor after the first sensor keeps its zero index.
+        sim.settings
+            .insert(1, vec![dpi(0, 800, None), dpi(1, 1600, Some(1600))]);
+        sim.page_size = 1;
     });
     let (c, rx) = ready(&dongle);
     run(&c, &rx, Command::Settings(id(1))).unwrap();
+    {
+        let sim = dongle.0.lock().unwrap();
+        let afters: Vec<Option<u32>> = sim
+            .log
+            .iter()
+            .filter_map(|c| match c {
+                p::request::Command::ListSettings(l) => {
+                    Some(l.after.as_ref().and_then(|r| r.index))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(afters, [None, Some(0)]);
+    }
+    let first = Field::hidpp(Leaf::Dpi, Some(0));
+    assert_eq!(c.state().unwrap().settings_of(1).len(), 2);
     let error = run(
         &c,
         &rx,
-        Command::SettingSet(
-            id(1),
-            "pointer.sensor.0.dpi".into(),
-            SettingInput::Text("1234".into()),
-        ),
+        Command::SettingSet(id(1), first, SettingInput::Text("1234".into())),
     )
     .unwrap_err();
     assert_eq!(
         error.message,
-        "pointer.sensor.0.dpi takes an integer from 400 through 4000 in steps of 50"
+        "pointer_sensor.0.dpi takes an integer from 400 through 4000 in steps of 50"
     );
     assert!(!dongle.sent().contains(&"set_settings"));
     let outcome = run(
@@ -402,36 +409,44 @@ fn saving_settings_sends_one_write_and_events_report_the_apply() {
         &rx,
         Command::SettingsSave {
             device: 1,
-            set: vec![("pointer.sensor.0.dpi".into(), Value::Integer(1600))],
+            set: vec![(first, Value::Integer(1600))],
             forget: vec![],
         },
     )
     .unwrap();
-    assert!(matches!(outcome, Outcome::Saved { set, .. } if set == ["pointer.sensor.0.dpi"]));
-    let applied = Some(p::setting::Status::State(SettingState::Applied as i32));
+    assert!(matches!(outcome, Outcome::Saved { set, .. } if set == [first]));
+    let applied = Some(Ok(SettingState::Applied));
     eventually(&c, &rx, |st| st.settings_of(1)[0].status == applied);
-    let forgot = run(
-        &c,
-        &rx,
-        Command::SettingForget(id(1), "pointer.sensor.0.dpi".into()),
-    )
-    .unwrap();
-    assert!(matches!(forgot, Outcome::Saved { forget, .. } if forget.len() == 1));
-    // A forget is a change in the same SetSettings command.
+    let second = Field::hidpp(Leaf::Dpi, Some(1));
+    let forgot = run(&c, &rx, Command::SettingForget(id(1), second)).unwrap();
+    assert!(matches!(forgot, Outcome::Saved { forget, .. } if forget == [second]));
+    // A forget is a change in the same SetSettings command, for the second sensor only.
     {
         let sim = dongle.0.lock().unwrap();
         let Some(p::request::Command::SetSettings(last)) = sim.log.last() else {
             panic!("{:?}", sim.log.last());
         };
-        assert!(matches!(
-            last.changes[..],
-            [p::SettingChange {
-                change: Some(p::setting_change::Change::Forget(_)),
+        let [
+            p::SettingsUpdate {
+                group: Some(p::settings_update::Group::PointerSensor(sensor)),
                 ..
-            }]
+            },
+        ] = &last.changes[..]
+        else {
+            panic!("{last:?}");
+        };
+        assert_eq!(sensor.index, 1);
+        assert!(matches!(
+            sensor.dpi.as_ref().and_then(|d| d.change),
+            Some(p::integer_setting_update::Change::Forget(_))
         ));
     }
-    let unknown = run(&c, &rx, Command::SettingGet(id(1), "wheel.mode".into())).unwrap_err();
+    eventually(&c, &rx, |st| {
+        let all = st.settings_of(1);
+        all[1].saved.is_none() && all[0].saved == Some(Value::Integer(1600))
+    });
+    let mode = Field::hidpp(Leaf::WheelMode, None);
+    let unknown = run(&c, &rx, Command::SettingGet(id(1), mode)).unwrap_err();
     assert_eq!(unknown.code_of(), Some(ErrorCode::NotFound));
 }
 

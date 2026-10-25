@@ -166,8 +166,8 @@ The adapter saves each controller's choice and forwards input without a Cordial
 app or host service running. HID and XInput each have an independent USB pool
 of `min(4, paired devices selecting that mode)` slots. Disconnected devices still
 count; devices with gamepad output Disabled do not. More than four paired devices
-may select a mode. The limit remains four live Bluetooth connections across all
-device types and both transports.
+may select a mode. Bluetooth connections have independent allowances per transport,
+separate from the USB pools. See [Bluetooth capacity](docs/protocol/limits-and-errors.md#bluetooth-capacity).
 
 Connecting or disconnecting a controller assigns or releases a slot without
 reconnecting USB. An empty HID slot stays visible with neutral controls; an empty

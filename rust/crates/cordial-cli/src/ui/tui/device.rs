@@ -16,7 +16,7 @@ use crate::{
     model, profiles,
     ui::text,
 };
-use cordial_protocol::{self as p, DeviceState, ErrorCode, InactiveReason, OutputMode, keys};
+use cordial_protocol::{self as p, DeviceState, ErrorCode, InactiveReason, OutputMode};
 use ratatui::{style::Style, text::Line};
 
 /// The staged values in `draft` that differ from the device's saved ones.
@@ -34,24 +34,24 @@ pub fn device_pending(draft: &DeviceUpdate, d: &p::Device) -> DeviceUpdate {
     }
 }
 
-/// Information keys the Information card shows, in order.
-const DETAIL_KEYS: [&str; 6] = [
-    keys::DEVICE_MANUFACTURER,
-    keys::DEVICE_MODEL,
-    keys::DEVICE_SERIAL,
-    keys::FIRMWARE_VERSION,
-    keys::HARDWARE_REVISION,
-    keys::SOFTWARE_REVISION,
+/// Identity facts the Information card shows, in order.
+const DETAILS: [&str; 6] = [
+    "Manufacturer",
+    "Model",
+    "Serial Number",
+    "Firmware",
+    "Hardware",
+    "Software",
 ];
 
-/// Information keys the Identifiers card shows, in order.
-const IDENTIFIER_KEYS: [&str; 5] = [
-    keys::VENDOR_REGISTRY,
-    keys::VENDOR_ID,
-    keys::PRODUCT_ID,
-    keys::PRODUCT_VERSION,
-    keys::BOOTLOADER_VERSION,
-];
+/// The device's identity facts with these labels, in the labels' order.
+fn facts(d: &p::Device, labels: &[&str]) -> Vec<(&'static str, String)> {
+    let all = text::identity(d.information.as_ref());
+    labels
+        .iter()
+        .filter_map(|l| all.iter().find(|(label, _)| label == l).cloned())
+        .collect()
+}
 
 impl<F: Fleet> Model<F> {
     fn device_key(d: &DeviceView) -> (String, u32) {
@@ -251,12 +251,11 @@ impl<F: Fleet> Model<F> {
             }
             Action::DiagnosticsRefresh if !self.device_busy(&d) && self.adapter_ready(&d) => {
                 let spot = Spot::Diagnostics(key.0.clone(), key.1);
-                let read_failed =
-                    self.settings_errors.contains_key(&key) || self.warnings_failed.contains(&key);
+                let read_failed = self.settings_errors.contains_key(&key);
                 if read_failed || !d.connected() {
                     self.notes.remove(&spot);
                     self.list_settings(adapter, id);
-                    self.run(adapter, Kind::Device(id, spot), Command::Warnings(target));
+                    self.run(adapter, Kind::Device(id, spot), Command::Get(target));
                 } else {
                     self.device_command(&d, Command::Refresh(target), spot);
                 }
@@ -383,13 +382,7 @@ impl<F: Fleet> Model<F> {
                     self.notes.insert(Spot::Dialog, words::failure(e));
                 }
             }
-            (Kind::Device(device, _), Ok(_)) if matches!(job.command, Command::Warnings(_)) => {
-                self.warnings_failed.remove(&(adapter, *device));
-            }
-            (Kind::Device(device, spot), Err(e)) => {
-                if matches!(job.command, Command::Warnings(_)) {
-                    self.warnings_failed.insert((adapter.clone(), *device));
-                }
+            (Kind::Device(_, spot), Err(e)) => {
                 let text = match self.state_of(&adapter).map(|st| st.status.clone()) {
                     Some(status) => match &job.command {
                         Command::Connect(_) => {
@@ -401,7 +394,7 @@ impl<F: Fleet> Model<F> {
                                 None => words::failure(e),
                             }
                         }
-                        Command::Warnings(_) => words::read_failure(e),
+                        Command::Get(_) => words::read_failure(e),
                         _ => words::failure(e),
                     },
                     None => words::failure(e),
@@ -581,10 +574,8 @@ impl<F: Fleet> Model<F> {
         } else {
             dim()
         };
-        for key in DETAIL_KEYS {
-            if let Some(value) = model::info(&d.d.info, key) {
-                b.fact(words::info_label(key), &words::info_value(key, value), look);
-            }
+        for (label, value) in facts(&d.d, &DETAILS) {
+            b.fact(label, &text::display(&value), look);
         }
         let adapter = self
             .adapter(&d.adapter)
@@ -761,29 +752,12 @@ impl<F: Fleet> Model<F> {
 
     fn device_diagnostics(&self, d: &DeviceView, v: &mut PageView) {
         let (a, id) = Self::device_key(d);
-        let st = self.state_of(&a);
-        let warnings = st.map(|st| st.warnings_of(id).to_vec()).unwrap_or_default();
         let look = if d.connected() {
             layout::plain()
         } else {
             dim()
         };
         let b = &mut v.body;
-        let warnings_failed = self.warnings_failed.contains(&(a.clone(), id));
-        if warnings_failed || !warnings.is_empty() {
-            b.section("Device Warnings");
-            if warnings_failed {
-                b.para(words::WARNINGS_READ_FAILED, layout::plain());
-            }
-            for w in &warnings {
-                b.fact(
-                    text::warning_label(w.code()),
-                    text::warning_text(w.code()),
-                    look,
-                );
-                b.fact("", &text::warning_context(w), dim());
-            }
-        }
         if let Some(code) = model::last_error(&d.d) {
             b.section("Connection");
             b.fact("Last Error", &words::code_text(code), layout::plain());
@@ -829,10 +803,8 @@ impl<F: Fleet> Model<F> {
             }
         }
         b.section("Identifiers");
-        for key in IDENTIFIER_KEYS {
-            if let Some(value) = model::info(&d.d.info, key) {
-                b.fact(words::info_label(key), &words::info_value(key, value), look);
-            }
+        for (label, value) in facts(&d.d, &text::IDENTIFIERS) {
+            b.fact(label, &text::display(&value), look);
         }
         b.fact("Device ID", &id.to_string(), layout::plain());
 
@@ -845,9 +817,7 @@ impl<F: Fleet> Model<F> {
         if busy_now {
             bar.label(&format!("{}", super::spinner()), layout::accent());
         }
-        let retry = self.settings_errors.contains_key(&(a.clone(), id))
-            || self.warnings_failed.contains(&(a, id))
-            || self.notes.contains_key(&spot);
+        let retry = self.settings_errors.contains_key(&(a, id)) || self.notes.contains_key(&spot);
         let label = if retry { "Retry" } else { "Refresh" };
         let mut right = Layout::new(bar.width);
         button_if(

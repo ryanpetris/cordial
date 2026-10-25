@@ -770,10 +770,11 @@ impl Engine {
         for r in c.records.iter().filter(|r| self.matches(r, true)) {
             if !r.available
                 || !r.writable
-                || !r
-                    .preference
-                    .as_ref()
-                    .is_some_and(|p| r.metadata.accepts(p.value))
+                || !r.preference.as_ref().is_some_and(|p| {
+                    r.metadata.feature == p.metadata.feature
+                        && r.metadata.scope == p.metadata.scope
+                        && r.metadata.accepts(p.value)
+                })
             {
                 return Err(Error::UnsupportedSetting);
             }

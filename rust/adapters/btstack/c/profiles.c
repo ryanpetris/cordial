@@ -1,4 +1,5 @@
 #include "profiles_internal.h"
+#include "bond_db.h"
 #ifdef ENABLE_CLASSIC
 int cordial_classic_set_report(uint16_t cid, hid_report_type_t type,
                               uint16_t report_id, const uint8_t *data, uint16_t size);
@@ -16,7 +17,7 @@ static cordial_emit emit;
 static void *context;
 static btstack_packet_callback_registration_t hci_events, sm_events;
 #ifdef ENABLE_CLASSIC
-static uint8_t classic_descriptors[8192];
+static uint8_t classic_descriptors[(CORDIAL_CLASSIC_CONNECTIONS + 1) * CORDIAL_DESCRIPTOR_BYTES];
 static char pin[17];
 #endif
 // Enabled transports, indexed by transport; Classic starts disabled and BLE
@@ -28,7 +29,7 @@ static bool transport_enabled[2];
 typedef struct { uint32_t attempt; cordial_peer peer; uint16_t cid, handle, supervision_ms; uint64_t deadline; bool closing, offered; uint8_t auth_error; } cordial_incoming;
 static cordial_incoming incoming[CORDIAL_LINKS];
 static uint32_t next_attempt;
-static cordial_peer reconnect_peers[8];
+static cordial_peer reconnect_peers[CORDIAL_BLE_CONNECTIONS];
 static size_t reconnect_count;
 static bool auto_active, auto_started, auto_cancel, auto_dirty, auto_consumed;
 // A cancelled accept-list Create Connection ends by then. The controller
@@ -75,11 +76,11 @@ static bd_addr_t page_address;
 #define EARLY_REPORT 64
 static struct { hci_con_handle_t handle; uint16_t used; uint8_t bytes[EARLY_BYTES]; } early[CORDIAL_LINKS];
 // One explicit pairing at a time. Retain addresses only, never native keys.
-static cordial_peer paired_before[16];
+static cordial_peer paired_before[NVM_NUM_LINK_KEYS + NVM_NUM_DEVICE_DB_ENTRIES];
 static unsigned paired_before_count;
 // Controller-resolved advertisements contain an identity, not the on-air RPA.
-// Read that RPA while its resolving-list entry still exists. Eight queued
-// identities cover the native bond limit; ordinary advertisements need no query.
+// Read that RPA while its resolving-list entry still exists. Queued identities
+// cover the native bond limit; ordinary advertisements need no query.
 static struct {
     bool used, connectable;
     uint64_t scan;
@@ -87,8 +88,8 @@ static struct {
     int16_t rssi;
     uint16_t appearance;
     uint8_t name[31], length;
-} rpa_reports[8];
-static unsigned rpa_read = 8;
+} rpa_reports[NVM_NUM_DEVICE_DB_ENTRIES];
+static unsigned rpa_read = NVM_NUM_DEVICE_DB_ENTRIES;
 // LE Read Supported States has no parameters; use its wire definition here.
 static const hci_cmd_t read_supported_states = { HCI_OPCODE_HCI_LE_READ_SUPPORTED_STATES, "" };
 static const hci_cmd_t read_peer_rpa = { HCI_OPCODE_HCI_LE_READ_PEER_RESOLVABLE_ADDRESS, "1B" };
@@ -386,8 +387,53 @@ void cordial_fail(cordial_connection *l, uint8_t error) {
     l->error = error;
     cordial_profiles_disconnect(l->id);
 }
+static unsigned normal_limit(uint8_t transport) {
+    return transport == CORDIAL_CLASSIC ? CORDIAL_CLASSIC_CONNECTIONS : CORDIAL_BLE_CONNECTIONS;
+}
+static unsigned normal_links(uint8_t transport) {
+    unsigned count = 0;
+    for (unsigned i = 0; i < CORDIAL_LINKS; ++i)
+        count += cordial_connections[i].used && cordial_connections[i].peer.transport == transport
+            && !cordial_connections[i].pairing;
+    return count;
+}
+#ifdef ENABLE_CLASSIC
+// Unowned ACLs reserve normal capacity until admission or physical teardown.
+// The peer being admitted transfers its existing reservation to its owner.
+static unsigned pending_classic(cordial_peer peer) {
+    unsigned count = 0;
+    btstack_linked_list_iterator_t it;
+    hci_connections_get_iterator(&it);
+    while (btstack_linked_list_iterator_has_next(&it)) {
+        hci_connection_t *connection = (hci_connection_t *)btstack_linked_list_iterator_next(&it);
+        if (connection->address_type != BD_ADDR_TYPE_ACL) continue;
+        cordial_peer pending = { .transport = CORDIAL_CLASSIC };
+        memcpy(pending.address, connection->address, sizeof pending.address);
+        count += !peer_equal(pending, peer) && !by_peer(pending);
+    }
+    return count;
+}
+// Reject unsolicited ACLs before they can consume the pairing reserve. Pending
+// HCI links count too, including those still awaiting their HID offer or teardown.
+static int accept_classic(bd_addr_t address, hci_link_type_t type) {
+    if (!ready || !transport_enabled[CORDIAL_CLASSIC] || type != HCI_LINK_TYPE_ACL) return 0;
+    cordial_peer peer = { .transport = CORDIAL_CLASSIC };
+    memcpy(peer.address, address, sizeof peer.address);
+    cordial_connection *owned = by_peer(peer);
+    if (owned) return !owned->closing;
+    return has_key(peer) && normal_links(CORDIAL_CLASSIC) + pending_classic(peer) < CORDIAL_CLASSIC_CONNECTIONS;
+}
+#endif
 static cordial_connection *allocate(cordial_link id, cordial_peer peer, bool pairing) {
     if (!id.generation || id.slot >= CORDIAL_LINKS || cordial_by_id(id) || by_peer(peer)) return NULL;
+    unsigned count = normal_links(peer.transport);
+#ifdef ENABLE_CLASSIC
+    if (peer.transport == CORDIAL_CLASSIC) count += pending_classic(peer);
+#endif
+    if (count >= normal_limit(peer.transport) + (unsigned)pairing) return NULL;
+    if (pairing)
+        for (unsigned i = 0; i < CORDIAL_LINKS; ++i)
+            if (cordial_connections[i].used && cordial_connections[i].pairing) return NULL;
     for (unsigned i = 0; i < CORDIAL_LINKS; ++i) {
         cordial_connection *l = &cordial_connections[i];
         if (l->used) continue;
@@ -439,13 +485,17 @@ static void bonded(cordial_connection *l) {
 int cordial_profiles_adopt(cordial_link id) {
     cordial_connection *l = cordial_by_id(id);
     if (!l || !l->bonded || l->closing || l->ended || !has_key(l->peer)) return CORDIAL_CONNECTION;
-    l->adopted = true; l->pairing = false; l->deadline = now_ms + 30000;
+    l->adopted = true; l->deadline = now_ms + 30000;
     gap_set_bondable_mode(0);
     cordial_ready(l);
     return CORDIAL_OK;
 }
+void cordial_profiles_promote(cordial_link id) {
+    cordial_connection *l = cordial_by_id(id);
+    if (l) l->pairing = false;
+}
 static void prompt(cordial_connection *l, uint8_t method, uint32_t number) {
-    if (l && l->pairing && !l->closing)
+    if (l && l->pairing && !l->adopted && !l->closing)
         cordial_emit_event(l, (cordial_event){ .kind = CORDIAL_PROMPT, .code = method, .number = number });
 }
 void cordial_write_done(cordial_connection *l, uint8_t error) {
@@ -621,7 +671,7 @@ static void security_ready(cordial_connection *l) {
     if (!l || l->closing || l->security_requested) return;
     irk_lookup_state_t state = sm_identity_resolving_state(l->handle);
     if (state != IRK_LOOKUP_SUCCEEDED && state != IRK_LOOKUP_FAILED) return;
-    if (!l->pairing) {
+    if (!l->pairing || l->adopted) {
         // The connected address does not resolve with the saved device's IRK:
         // the device now uses keys from another bond.
         if (state == IRK_LOOKUP_FAILED) cordial_fail(l, CORDIAL_AUTHENTICATION);
@@ -689,7 +739,7 @@ static void sm_handler(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t
             }
             // Native persistence precedes this callback. Even if cancellation
             // is already underway, retain the new identity for terminal cleanup.
-            if (!l->pairing || !l->security_requested) { cordial_fail(l, CORDIAL_AUTHENTICATION); break; }
+            if (!l->pairing || l->adopted || !l->security_requested) { cordial_fail(l, CORDIAL_AUTHENTICATION); break; }
             cordial_peer identity;
             if (!le_identity(sm_le_device_index(l->handle), &identity)) { cordial_fail(l, CORDIAL_STORAGE); break; }
             l->peer = identity;
@@ -706,7 +756,7 @@ static void sm_handler(uint8_t type, uint16_t channel, uint8_t *packet, uint16_t
                 cordial_fail(l, security_error(sm_event_reencryption_complete_get_status(packet))); break;
             }
             // Old keys on a pairing link, or a key too short to accept.
-            if (l->pairing || gap_encryption_key_size(l->handle) < 7) { cordial_fail(l, CORDIAL_AUTHENTICATION); break; }
+            if ((l->pairing && !l->adopted) || gap_encryption_key_size(l->handle) < 7) { cordial_fail(l, CORDIAL_AUTHENTICATION); break; }
             l->authenticated = true;
             if (l->ready) (void)publish_security(l);
             cordial_begin_profile(l); break;
@@ -721,13 +771,13 @@ static void resolved_found(cordial_peer peer, const uint8_t *name, uint16_t leng
     // Wake reconnect needs only identity and must not wait for the RPA query.
     cordial_emit_event(NULL, (cordial_event){ .kind = CORDIAL_FOUND, .peer = peer, .address = { .transport = 0xff }, .operation = scan_id,
         .rssi = rssi, .code = connectable });
-    unsigned slot = 8;
-    for (unsigned i = 0; i < 8; ++i) {
+    unsigned slot = NVM_NUM_DEVICE_DB_ENTRIES;
+    for (unsigned i = 0; i < NVM_NUM_DEVICE_DB_ENTRIES; ++i) {
         if (rpa_reports[i].used && peer_equal(rpa_reports[i].peer, peer) &&
             (i != rpa_read || rpa_reports[i].scan == scan_id)) { slot = i; break; }
-        if (!rpa_reports[i].used && slot == 8) slot = i;
+        if (!rpa_reports[i].used && slot == NVM_NUM_DEVICE_DB_ENTRIES) slot = i;
     }
-    if (slot == 8) return;
+    if (slot == NVM_NUM_DEVICE_DB_ENTRIES) return;
     if (!rpa_reports[slot].used || rpa_reports[slot].scan != scan_id ||
         !peer_equal(rpa_reports[slot].peer, peer)) {
         rpa_reports[slot].appearance = 0;
@@ -746,9 +796,9 @@ static void resolved_found(cordial_peer peer, const uint8_t *name, uint16_t leng
     }
 }
 static void rpa_complete(const uint8_t *packet, uint16_t size) {
-    if (rpa_read == 8) return;
+    if (rpa_read == NVM_NUM_DEVICE_DB_ENTRIES) return;
     unsigned slot = rpa_read;
-    rpa_read = 8;
+    rpa_read = NVM_NUM_DEVICE_DB_ENTRIES;
     if (size >= 12 && packet[5] == ERROR_CODE_SUCCESS && ready && scan_ble && rpa_reports[slot].scan == scan_id) {
         cordial_peer address = { .transport = CORDIAL_BLE, .random = 1 };
         reverse_bd_addr(&packet[6], address.address);
@@ -788,7 +838,7 @@ static void packet_handler(uint8_t type, uint16_t channel, uint8_t *packet, uint
                 gap_connectable_control(transport_enabled[CORDIAL_CLASSIC]);
 #endif
                 states_pending=true;states_sent=false;scan_and_connect=false;
-                memset(rpa_reports, 0, sizeof rpa_reports); rpa_read = 8;
+                memset(rpa_reports, 0, sizeof rpa_reports); rpa_read = NVM_NUM_DEVICE_DB_ENTRIES;
                 (void)gap_load_resolving_list_from_le_device_db();
             }
             break;
@@ -1000,17 +1050,17 @@ static void packet_handler(uint8_t type, uint16_t channel, uint8_t *packet, uint
         case HCI_EVENT_PIN_CODE_REQUEST:
             if (size < 8) return;
             hci_event_pin_code_request_get_bd_addr(packet, peer.address); l = by_peer(peer);
-            if (l && l->pairing && !l->closing) prompt(l, CORDIAL_ENTER_PIN, 0); else gap_pin_code_negative(peer.address);
+            if (l && l->pairing && !l->adopted && !l->closing) prompt(l, CORDIAL_ENTER_PIN, 0); else gap_pin_code_negative(peer.address);
             break;
         case HCI_EVENT_USER_PASSKEY_REQUEST:
             if (size < 8) return;
             hci_event_user_passkey_request_get_bd_addr(packet, peer.address); l = by_peer(peer);
-            if (l && l->pairing && !l->closing) prompt(l, CORDIAL_ENTER_PASSKEY, 0); else gap_ssp_passkey_negative(peer.address);
+            if (l && l->pairing && !l->adopted && !l->closing) prompt(l, CORDIAL_ENTER_PASSKEY, 0); else gap_ssp_passkey_negative(peer.address);
             break;
         case HCI_EVENT_USER_CONFIRMATION_REQUEST:
             if (size < 12) return;
             hci_event_user_confirmation_request_get_bd_addr(packet, peer.address); l = by_peer(peer);
-            if (!l || !l->pairing || l->closing) gap_ssp_confirmation_negative(peer.address);
+            if (!l || !l->pairing || l->adopted || l->closing) gap_ssp_confirmation_negative(peer.address);
             else if (l->remote_io != SSP_IO_CAPABILITY_DISPLAY_YES_NO) gap_ssp_confirmation_response(peer.address);
             else prompt(l, CORDIAL_CONFIRM, hci_event_user_confirmation_request_get_numeric_value(packet));
             break;
@@ -1092,7 +1142,7 @@ int cordial_profiles_scan(uint64_t id, bool classic, bool ble) {
     if (ble && scan_id != id) gap_set_scan_parameters(1, 0x60, 0x30);
 
     if (!ble || scan_id != id) {
-        for (unsigned i = 0; i < 8; ++i) if (i != rpa_read) rpa_reports[i].used = false;
+        for (unsigned i = 0; i < NVM_NUM_DEVICE_DB_ENTRIES; ++i) if (i != rpa_read) rpa_reports[i].used = false;
     }
     scan_id = id; scan_classic = classic; scan_ble = ble;
     return CORDIAL_OK;
@@ -1111,7 +1161,7 @@ static uint8_t begin_connect(cordial_connection *l) {
 }
 int cordial_profiles_reconnect(const cordial_peer *peers,size_t count) {
     if(!ready)return restarting || stopping ? CORDIAL_BUSY:CORDIAL_RADIO;
-    if(count>8)return CORDIAL_CAPACITY;
+    if(count>CORDIAL_BLE_CONNECTIONS)return CORDIAL_CAPACITY;
     for(size_t i=0;i<count;i++) {
         if(peers[i].transport!=CORDIAL_BLE)return CORDIAL_TRANSPORT;
         if(peers[i].random>1)return CORDIAL_ARGUMENT;
@@ -1158,12 +1208,12 @@ int cordial_profiles_connect(cordial_link id, cordial_peer peer, bool pairing, c
     if (serialize_initiation && (initiating[CORDIAL_CLASSIC] || initiating[CORDIAL_BLE])) return CORDIAL_BUSY;
     if (has_key(peer) == pairing) return CORDIAL_AUTHENTICATION;
     if (pairing) {
-        cordial_peer peers[16];
-        int count = cordial_profiles_bonds(peers, 16);
+        cordial_peer peers[NVM_NUM_LINK_KEYS + NVM_NUM_DEVICE_DB_ENTRIES];
+        int count = cordial_profiles_bonds(peers, NVM_NUM_LINK_KEYS + NVM_NUM_DEVICE_DB_ENTRIES);
         if (count < 0) return -count;
         unsigned selected_count = 0;
         for (int i = 0; i < count; ++i) selected_count += peers[i].transport == peer.transport;
-        if (selected_count >= 8) return CORDIAL_CAPACITY;
+        if (selected_count >= cordial_bond_capacity(peer.transport + 1)) return CORDIAL_CAPACITY;
         for (unsigned i = 0; i < CORDIAL_LINKS; ++i)
             if (cordial_connections[i].used && cordial_connections[i].pairing && !cordial_connections[i].adopted) return CORDIAL_BUSY;
         paired_before_count = (unsigned)count;
@@ -1326,7 +1376,8 @@ static void resume_radio(void) {
         gap_start_scan();
         if(!scan_and_connect)return;
     }
-    if(!transport_enabled[CORDIAL_BLE] || exclusive || unacknowledged(CORDIAL_CLASSIC) || !reconnect_count || auto_consumed)return;
+    if(!transport_enabled[CORDIAL_BLE] || exclusive || unacknowledged(CORDIAL_CLASSIC) || !reconnect_count || auto_consumed
+        || normal_links(CORDIAL_BLE) >= CORDIAL_BLE_CONNECTIONS)return;
     if(!scan_ble)gap_stop_scan();
     if(auto_dirty) {
         if(gap_whitelist_clear())goto failed;
@@ -1377,11 +1428,11 @@ void cordial_profiles_poll(uint64_t now) {
         restart();
     }
     resume_radio();
-    if (ready && rpa_read == 8 && hci_can_send_command_packet_now()) {
-        for (unsigned i = 0; i < 8; ++i) if (rpa_reports[i].used) {
+    if (ready && rpa_read == NVM_NUM_DEVICE_DB_ENTRIES && hci_can_send_command_packet_now()) {
+        for (unsigned i = 0; i < NVM_NUM_DEVICE_DB_ENTRIES; ++i) if (rpa_reports[i].used) {
             rpa_read = i;
             if (hci_send_cmd(&read_peer_rpa, rpa_reports[i].peer.random, rpa_reports[i].peer.address)) {
-                rpa_read = 8;
+                rpa_read = NVM_NUM_DEVICE_DB_ENTRIES;
                 rpa_reports[i].used = false;
             }
             break;
@@ -1459,7 +1510,7 @@ void cordial_profiles_init(void *ctx, cordial_emit callback) {
     memset(early,0,sizeof early);
     memset(incoming,0,sizeof incoming);next_attempt=0;reconnect_count=0;
     auto_active=auto_started=auto_cancel=auto_dirty=auto_consumed=false;
-    memset(rpa_reports, 0, sizeof rpa_reports); rpa_read = 8;
+    memset(rpa_reports, 0, sizeof rpa_reports); rpa_read = NVM_NUM_DEVICE_DB_ENTRIES;
     l2cap_init(); sm_init(); gatt_client_init();
     att_server_init(profile_data, NULL, NULL);
     sm_set_secure_connections_only_mode(false);
@@ -1487,6 +1538,9 @@ void cordial_profiles_init(void *ctx, cordial_emit callback) {
     // HID links: 7.5 ms interval, no peripheral latency, 2.56 s supervision.
     gap_set_connection_parameters(0x0010, 0x0010, 6, 6, 0, 0x0100, 0, 0);
     gap_set_scan_duplicate_filter(true);
+#ifdef ENABLE_CLASSIC
+    gap_register_classic_connection_filter(accept_classic);
+#endif
     hci_events.callback = packet_handler; hci_add_event_handler(&hci_events);
     sm_events.callback = sm_handler; sm_add_event_handler(&sm_events);
 }

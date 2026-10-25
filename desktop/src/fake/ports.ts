@@ -14,7 +14,7 @@ function devicesWithLayers() {
     state: "connected",
     roles: ["gamepad"],
     gamepadOutput: "xinput",
-    info: { "device.manufacturer": "Example Co", "battery.level": 64, "battery.charging": false },
+    info: { identity: { manufacturer: "Example Co" }, battery: { level: 64, charging: false } },
   }));
   return devices;
 }

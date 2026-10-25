@@ -526,6 +526,19 @@ impl Rules {
             .iter()
             .fold(0, |roles, e| roles | role(e.collection))
     }
+    /// USB roles produced by the profile's remaps, scales and axis rules.
+    pub fn output_roles(&self) -> u8 {
+        self.entries.iter().fold(0, |roles, entry| {
+            roles
+                | match self.found(entry) {
+                    Found::Remap(outputs) => outputs
+                        .iter()
+                        .fold(0, |bits, output| bits | role(output.collection)),
+                    Found::Scale(..) => role(entry.collection),
+                    Found::Axis(..) => crate::outputs::GAMEPAD,
+                }
+        })
+    }
     /// Merges this table with changes sorted by input usage and collection. A change replaces
     /// only the rule for that pair.
     fn merged<'a>(&'a self, changes: &'a [Change]) -> impl Iterator<Item = Merged<'a>> + 'a {

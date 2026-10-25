@@ -12,11 +12,13 @@
 Board definitions live in `rust/boards/`. They specify pins, flash allocation, clock settings,
 backends and `profile_memory_budget`: the bytes of RAM for loaded [input
 profiles](input-profiles.md), or `null` for a board without profile support. Without profile support
-the firmware omits profiles and configuration interfaces, so VIA and Vial are unavailable. The Pico
-W preset leaves profiles out to keep its limited RAM for connections. The other presets budget
-40 KiB for eight distinct fully remapped VIA profiles, two per connected device across four
-connections. Pico presets use `pico-sdk-cyw43`; `embassy-cyw43` is also supported. The XIAO preset
-uses `esp-nimble` and `esp-idf`.
+the firmware omits profiles and configuration interfaces, so VIA and Vial are unavailable. The
+Pico W preset leaves profiles out to keep its limited RAM for connections. The other presets budget
+40 KiB for loaded profiles, shared across connections.
+Bluetooth pool sizes derive from the same `CORDIAL_CONFIG` for Rust and C. See
+[Bluetooth capacity](protocol/limits-and-errors.md#bluetooth-capacity) for the independent transport
+allowances and pairing reserve. Pico presets use `pico-sdk-cyw43`; `embassy-cyw43` is also supported.
+The XIAO preset uses `esp-nimble` and `esp-idf`.
 
 To use custom wiring or another backend, copy a preset, edit it and pass its path
 to `python3 rust/tools/build_firmware.py`. USB and Bluetooth identities are
@@ -254,12 +256,11 @@ npm --prefix desktop/packages/protocol run generate
 
 `make check` runs Rust tests and Clippy, native Bluetooth regression checks,
 Python tool tests, desktop type checks and tests, and the protocol checks:
-`tools/check_keys.py`, `buf lint`, and `buf breaking` against the newest earlier release in the
+`buf lint` and `buf breaking` against the newest earlier release in the
 same series as `CORDIAL_VERSION`, or the newest release for a development build
 (`PROTOCOL_BASE` overrides it). A series is one minor version before 1.0 and one major version
 from 1.0; the first release of a series is not compared. Rust code is generated from `proto/` at build time;
-the second command regenerates the checked-in TypeScript messages and key constants
-after `proto/cordial.proto` or `proto/keys.toml` changes.
+the second command regenerates the checked-in TypeScript messages after a schema changes.
 Install Clippy with `(cd rust && rustup component add clippy)` before checking.
 
 Linux CLI terminal checks additionally require `pyte` and a built CLI:
@@ -268,21 +269,7 @@ Linux CLI terminal checks additionally require `pyte` and a built CLI:
 CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py
 ```
 
-The ARM allocation check prepares development firmware for each Pico board and runs the
-workloads with that board's configuration, such as its profile memory budget, against its linked
-heap bounds. It runs in the Pico firmware image, which includes QEMU:
-
-```sh
-make check-memory
-```
-
-The allocation check runs simulated device workloads on QEMU without accessing hardware. Boards
-with profile support load eight distinct full VIA profiles across four connected devices and verify
-their memory accounting against the configured budget. It also includes four live gamepads with
-2,048-byte descriptors, 96 fields, 16 report IDs and 512-byte payloads per map. It exercises
-normalization, slot assignment and digital queue overflow through the priority loop without
-per-report allocation. Static USB queues are included in each linked firmware's memory
-use. Clippy for the firmware platform crates also runs in the firmware images, for one board and
+Clippy for the firmware platform crates runs in the firmware images, for one board and
 profile or for all of them:
 
 ```sh
@@ -305,7 +292,7 @@ Adapter names are stored on the adapter. Rename through adapter settings in the 
 - `rust/`: firmware, CLI/TUI, shared crates, adapters, board definitions and their tools/tests.
 - `desktop/`: Electron, React and TypeScript application, its web version and development server.
 - `docs/`: control protocol, storage format and HID++ references.
-- `proto/`: serial protocol messages and the information and settings key catalog.
+- `proto/`: serial protocol messages and persistent storage records.
 - `docker/`: build images for the applications, firmware and distribution packages.
 - `packaging/`: the distribution packaging steps and their installation checks.
 - `tools/`: version validation, package checks and their tests.
@@ -317,8 +304,8 @@ build outputs while preserving downloaded dependencies and toolchains.
 
 Pico W, Pico 2 W and Waveshare RP2350B-Plus-W enable the `cordial-usb/gamepad`
 feature. ESP32-S3 omits its classes and worker storage. The Pico builds advertise
-Disabled, HID and XInput gamepad output modes. All boards retain the existing
-Bluetooth connection limit.
+Disabled, HID and XInput gamepad output modes. USB gamepad slot limits are separate from the
+board's Bluetooth transport allowances.
 
 The largest USB allocation needs 12 interfaces and 10 handlers. The firmware
 build script sets `EMBASSY_USB_MAX_INTERFACE_COUNT=12` and

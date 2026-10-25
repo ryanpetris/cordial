@@ -107,3 +107,76 @@ fn unknown_fields_are_ignored() {
     prost::encoding::string::encode(15, &"later".to_string(), &mut bytes);
     assert_eq!(GetDevice::decode(bytes.as_slice()).unwrap().device, 1);
 }
+
+#[test]
+fn resource_values_preserve_independent_presence_and_explicit_zero() {
+    use cordial_protocol::{ResourceCapacity, ResourceType};
+
+    for count in [None, Some(0), Some(7)] {
+        for limit in [None, Some(0), Some(4)] {
+            let resource = ResourceCapacity {
+                r#type: ResourceType::Slots as i32,
+                count,
+                limit,
+            };
+            let decoded = ResourceCapacity::decode(resource.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, resource);
+        }
+    }
+}
+
+#[test]
+fn typed_information_preserves_unknown_false_zero_and_enum_readings() {
+    use cordial_protocol::{
+        AdapterInformation, BatteryInformation, DeviceInformation, FunctionRowModeSetting,
+        IntegerSetting, KeyboardInformation,
+    };
+
+    let adapter = AdapterInformation {
+        firmware_version: Some("0.0.0".into()),
+        board_name: Some("Board".into()),
+        development_build: Some(false),
+    };
+    assert_eq!(
+        AdapterInformation::decode(adapter.encode_to_vec().as_slice()).unwrap(),
+        adapter
+    );
+    let information = DeviceInformation {
+        battery: Some(BatteryInformation {
+            level: Some(0),
+            charging: Some(false),
+        }),
+        keyboard: Some(KeyboardInformation {
+            platform: Some(999),
+            function_row: None,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        DeviceInformation::decode(information.encode_to_vec().as_slice()).unwrap(),
+        information
+    );
+    for value in [None, Some(0), Some(-1)] {
+        for saved in [None, Some(0), Some(800)] {
+            let setting = IntegerSetting {
+                value,
+                saved,
+                ..Default::default()
+            };
+            assert_eq!(
+                IntegerSetting::decode(setting.encode_to_vec().as_slice()).unwrap(),
+                setting
+            );
+        }
+    }
+    let setting = FunctionRowModeSetting {
+        value: Some(999),
+        saved: None,
+        status: None,
+        choices: vec![1, 2],
+    };
+    assert_eq!(
+        FunctionRowModeSetting::decode(setting.encode_to_vec().as_slice()).unwrap(),
+        setting
+    );
+}

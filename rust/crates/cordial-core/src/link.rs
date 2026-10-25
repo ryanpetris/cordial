@@ -1,13 +1,12 @@
 //! A live HID connection. Backends copy submitted bytes before returning and
 //! report completion with the same token; callbacks never borrow this owner.
 use crate::model::{
-    errors::{DeviceWarning, ErrorCode as Error, WarningCode},
+    errors::ErrorCode as Error,
     hidpp::ProtocolState,
     identifiers::{HostPlatform, NormalizationState, SettingsState},
     settings::SettingKey,
 };
 use crate::{
-    bluetooth::ReportType,
     features::Engine,
     forward::Forwarder,
     hid::{self, Held, Input, Map, State},
@@ -108,7 +107,6 @@ enum Writing {
         report: usize,
         target: u8,
         rearm: bool,
-        unknown: u8,
         complete: bool,
     },
 }
@@ -133,7 +131,6 @@ pub struct Link {
     pub client: Client,
     pub settings: Engine,
     pub roles: u8,
-    pub warnings: Vec<DeviceWarning>,
     profiles: Box<[Profile]>,
     raw_gamepad: Cell<Option<hid::Gamepad>>,
     pub(crate) gamepad_transport: crate::model::identifiers::Transport,
@@ -200,26 +197,6 @@ impl Link {
         }
         let max_output = max_output.min(hid::REPORT_BYTES);
         let mut roles = 0;
-        let mut warnings = Vec::new();
-        let warning_capacity: usize = profiles
-            .iter()
-            .map(|p| {
-                p.map.limitations().len()
-                    + p.map.indicator_field_count()
-                    + p.indicators
-                        .iter()
-                        .map(|state| {
-                            p.map
-                                .indicator_locations_kind(state.report, state.kind, 31)
-                                .count()
-                                + 1
-                        })
-                        .sum::<usize>()
-            })
-            .sum();
-        warnings
-            .try_reserve_exact(warning_capacity)
-            .map_err(|_| Error::Capacity)?;
         let mut vendor_service = None;
         let mut reports = 0;
         for (i, profile) in profiles.iter().enumerate() {
@@ -227,19 +204,6 @@ impl Link {
                 return Err(Error::UnsupportedHid);
             }
             roles |= profile.map.roles;
-            warnings.extend(profile.map.limitations().iter().map(|l| DeviceWarning {
-                code: l.code,
-                service: profile.service.0,
-                report_id: profile.map.numbered.then_some(l.report_id),
-                report_type: Some(match l.kind {
-                    1 => ReportType::Output,
-                    2 => ReportType::Feature,
-                    _ => ReportType::Input,
-                }),
-                bit_offset: Some(l.bit_offset),
-                usage_page: Some(l.usage_page),
-                usage: Some(l.usage),
-            }));
             if vendor_service.is_none()
                 && profile.map.hidpp_reports != 0
                 && max_output
@@ -291,7 +255,6 @@ impl Link {
             client,
             settings,
             roles,
-            warnings,
             profiles: profiles.into_boxed_slice(),
             raw_gamepad: Cell::new(None),
             gamepad_transport: crate::model::identifiers::Transport::Classic,
@@ -787,7 +750,6 @@ impl Link {
                                     report: index,
                                     target: leds,
                                     rearm,
-                                    unknown: encoding.unknown,
                                     complete: encoding.complete,
                                 },
                                 now,
@@ -804,31 +766,7 @@ impl Link {
                         self.led_read_needed = true;
                         return Ok(None);
                     }
-                    Err(failure) => {
-                        let code = match failure.reason {
-                            hid::IndicatorError::ReadRequired => WarningCode::IndicatorReadFailed,
-                            hid::IndicatorError::StateUnknown => WarningCode::IndicatorStateUnknown,
-                            hid::IndicatorError::ArrayCapacity => WarningCode::IndicatorArrayFull,
-                            hid::IndicatorError::RelativeArray => {
-                                WarningCode::IndicatorRelativeSelectorUnsupported
-                            }
-                            hid::IndicatorError::Range => WarningCode::IndicatorRangeUnsupported,
-                            hid::IndicatorError::Buffered => {
-                                WarningCode::BufferedIndicatorUnsupported
-                            }
-                            hid::IndicatorError::Mode => WarningCode::IndicatorModeUnsupported,
-                            hid::IndicatorError::Nonlinear => {
-                                WarningCode::IndicatorNonlinearUnsupported
-                            }
-                            hid::IndicatorError::Scale => WarningCode::IndicatorScaleUnsupported,
-                        };
-                        self.indicator_field_warning(
-                            self.led_profile,
-                            index,
-                            code,
-                            failure.bit_offset,
-                            failure.usage,
-                        );
+                    Err(_) => {
                         self.profiles[self.led_profile].indicator_mut(index).settled = Some(leds);
                     }
                     Ok(None) => {}
@@ -869,83 +807,6 @@ impl Link {
         self.led_base_valid = false;
         self.led_feedback_cursor = 0;
         self.led_read_attempted = false;
-    }
-    fn indicator_warning(&mut self, profile: usize, report: usize, code: WarningCode) {
-        self.indicator_field_warning(profile, report, code, None, None);
-    }
-    fn indicator_field_warning(
-        &mut self,
-        profile: usize,
-        report: usize,
-        code: WarningCode,
-        bit_offset: Option<u16>,
-        usage: Option<u32>,
-    ) {
-        let p = &self.profiles[profile];
-        let r = &p.map.reports()[p.indicator(report).report];
-        let warning = DeviceWarning {
-            code,
-            service: p.service.0,
-            report_id: p.map.numbered.then_some(r.id),
-            report_type: Some(p.indicator(report).kind),
-            bit_offset,
-            usage_page: Some(usage.map_or(8, |u| (u >> 16) as u16)),
-            usage: usage.map(|u| u as u16),
-        };
-        self.warnings.retain(|w| {
-            matches!(
-                w.code,
-                WarningCode::NumericSelectorUnsupported
-                    | WarningCode::PointerSelectorUnsupported
-                    | WarningCode::BufferedInputUnsupported
-            ) || w.service != warning.service
-                || w.report_id != warning.report_id
-                || w.report_type != warning.report_type
-                || w.bit_offset != warning.bit_offset
-                || w.usage_page != warning.usage_page
-                || w.usage != warning.usage
-        });
-        self.warnings.push(warning);
-    }
-    fn read_indicator_warning(&mut self, request: ReportRead, code: WarningCode) {
-        self.warnings.retain(|w| {
-            !(matches!(
-                w.code,
-                WarningCode::IndicatorReadFailed
-                    | WarningCode::IndicatorReadUnsupported
-                    | WarningCode::IndicatorReportTooLarge
-            ) && w.service == request.service.0
-                && w.report_id == request.report_id
-                && w.report_type == Some(request.kind)
-                && w.bit_offset.is_none())
-        });
-        self.warnings.push(DeviceWarning {
-            code,
-            service: request.service.0,
-            report_id: request.report_id,
-            report_type: Some(request.kind),
-            bit_offset: None,
-            usage_page: Some(8),
-            usage: None,
-        });
-    }
-    fn clear_indicator_warning(&mut self, profile: usize, report: usize) {
-        let p = &self.profiles[profile];
-        let report_id = p
-            .map
-            .numbered
-            .then_some(p.map.reports()[p.indicator(report).report].id);
-        let report_type = Some(p.indicator(report).kind);
-        self.warnings.retain(|w| {
-            matches!(
-                w.code,
-                WarningCode::NumericSelectorUnsupported
-                    | WarningCode::PointerSelectorUnsupported
-                    | WarningCode::BufferedInputUnsupported
-            ) || w.service != p.service.0
-                || w.report_id != report_id
-                || w.report_type != report_type
-        });
     }
     fn poll_legacy(&mut self, catalog: &mut Catalog, now: u64) {
         if self.legacy_waiting {
@@ -1150,17 +1011,6 @@ impl Link {
                 })
                 .map(|r| r.payload());
             if let Some(bytes) = bytes {
-                self.warnings.retain(|w| {
-                    !(matches!(
-                        w.code,
-                        WarningCode::IndicatorReadFailed
-                            | WarningCode::IndicatorReadUnsupported
-                            | WarningCode::IndicatorReportTooLarge
-                    ) && w.service == request.service.0
-                        && w.report_id == request.report_id
-                        && w.report_type == Some(request.kind)
-                        && w.bit_offset.is_none())
-                });
                 p.map.remember_indicator_values(
                     &mut p.indicator_cache,
                     request.report_id.unwrap_or(0),
@@ -1197,13 +1047,6 @@ impl Link {
             } else {
                 let unsupported = matches!(result, Err(Error::UnsupportedHid));
                 let permanent = unsupported || matches!(result, Err(Error::HidReportTooLarge));
-                let code = if unsupported {
-                    WarningCode::IndicatorReadUnsupported
-                } else if matches!(result, Err(Error::HidReportTooLarge)) {
-                    WarningCode::IndicatorReportTooLarge
-                } else {
-                    WarningCode::IndicatorReadFailed
-                };
                 let actual = p.indicator(self.led_report);
                 let actual_read = !color_read
                     && request.kind == actual.kind
@@ -1220,7 +1063,6 @@ impl Link {
                             &mut self.output,
                         )
                         .is_err();
-                self.read_indicator_warning(request, code);
                 if !permanent || cannot_write {
                     let state = self.profiles[self.led_profile].indicator_mut(self.led_report);
                     if permanent {
@@ -1319,7 +1161,6 @@ impl Link {
                 report,
                 target,
                 rearm,
-                unknown,
                 complete,
             } => {
                 self.led_base_valid = false;
@@ -1367,27 +1208,6 @@ impl Link {
                         {
                             p.map.capture_colors(&mut p.indicator_cache, target);
                         }
-                        self.clear_indicator_warning(profile, report);
-                        let p = &self.profiles[profile];
-                        for (bit_offset, usage) in p.map.unknown_indicator_locations(
-                            p.indicator(report).report,
-                            p.indicator(report).kind,
-                            unknown,
-                            &p.indicator_cache,
-                        ) {
-                            self.warnings.push(DeviceWarning {
-                                code: WarningCode::IndicatorStateUnknown,
-                                service: p.service.0,
-                                report_type: Some(p.indicator(report).kind),
-                                report_id: p
-                                    .map
-                                    .numbered
-                                    .then_some(p.map.reports()[p.indicator(report).report].id),
-                                bit_offset: Some(bit_offset),
-                                usage_page: Some((usage >> 16) as u16),
-                                usage: Some(usage as u16),
-                            });
-                        }
                         if complete && confirmed {
                             self.advance_indicator();
                         } else if !confirmed {
@@ -1415,17 +1235,6 @@ impl Link {
                     let unsupported = matches!(
                         result,
                         Err(Error::UnsupportedHid | Error::HidReportTooLarge)
-                    );
-                    self.indicator_warning(
-                        profile,
-                        report,
-                        if matches!(result, Err(Error::HidReportTooLarge)) {
-                            WarningCode::IndicatorReportTooLarge
-                        } else if unsupported {
-                            WarningCode::IndicatorWriteUnsupported
-                        } else {
-                            WarningCode::IndicatorWriteFailed
-                        },
                     );
                     if unsupported {
                         self.profiles[profile].indicator_mut(report).settled = Some(target);

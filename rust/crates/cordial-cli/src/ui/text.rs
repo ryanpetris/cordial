@@ -6,13 +6,14 @@ use crate::{
     error::Error,
     model::{self, Prompt, Up},
     profiles,
+    settings::{self, Field, Leaf, Value},
     ui::catalog,
 };
 use cordial_client::{paging::Page, serial::PortInfo};
 use cordial_protocol::{
     self as p, CapacityReason, CodeKind, DeviceState, ErrorCode, InactiveReason, Kind, OutputMode,
-    OutputState, Platform, ReportType, Role, Transport, WarningCode, event, keys,
-    profile_list_entry, value::Value,
+    OutputState, Platform, ResourceType, Role, Transport, VendorRegistry, event,
+    profile_list_entry,
 };
 use ratatui::buffer::CellWidth;
 use std::fmt::Write;
@@ -277,108 +278,6 @@ pub fn role_names(roles: &[Role]) -> String {
         .join(", ")
 }
 
-pub fn warning_text(w: WarningCode) -> &'static str {
-    match w {
-        WarningCode::NumericSelectorUnsupported => {
-            "The adapter can't derive a value from this numeric selector field."
-        }
-        WarningCode::PointerSelectorUnsupported => {
-            "The adapter can't forward pointer coordinates from a selector field."
-        }
-        WarningCode::BufferedInputUnsupported => {
-            "The adapter can't interpret this input field's custom byte format."
-        }
-        WarningCode::IndicatorReportTooLarge => {
-            "The indicator report is larger than the Bluetooth connection allows."
-        }
-        WarningCode::IndicatorReadUnsupported => {
-            "The device doesn't support reading this indicator report."
-        }
-        WarningCode::IndicatorWriteUnsupported => {
-            "The device doesn't support writing this indicator report."
-        }
-        WarningCode::BufferedIndicatorUnsupported => {
-            "The adapter can't interpret this indicator field's custom byte format."
-        }
-        WarningCode::IndicatorStateUnknown => {
-            "The device doesn't report the indicator state needed for this update."
-        }
-        WarningCode::IndicatorReadFailed => "The adapter couldn't read the indicator report.",
-        WarningCode::IndicatorWriteFailed => "The adapter couldn't update the indicator lights.",
-        WarningCode::IndicatorArrayFull => {
-            "The indicator report has no room for all active lights."
-        }
-        WarningCode::IndicatorRelativeSelectorUnsupported => {
-            "The adapter can't forward this relative indicator selector."
-        }
-        WarningCode::IndicatorModeUnsupported => {
-            "The indicator doesn't provide a usable on/off control."
-        }
-        WarningCode::IndicatorNonlinearUnsupported => {
-            "The adapter can't convert this indicator's nonlinear values."
-        }
-        WarningCode::IndicatorScaleUnsupported => {
-            "The indicator's units don't provide a usable value conversion."
-        }
-        WarningCode::IndicatorRangeUnsupported => {
-            "The indicator's value range can't represent both states."
-        }
-        WarningCode::Unknown => "The adapter can't use part of this device.",
-    }
-}
-
-pub fn warning_label(w: WarningCode) -> &'static str {
-    match w {
-        WarningCode::NumericSelectorUnsupported
-        | WarningCode::PointerSelectorUnsupported
-        | WarningCode::BufferedInputUnsupported => "Input Field",
-        WarningCode::Unknown => "Device Warning",
-        _ => "Lock Indicators",
-    }
-}
-
-pub fn warning_context(w: &p::DeviceWarning) -> String {
-    let mut context = format!("Service {}", w.service);
-    let kind = match w.report_type() {
-        ReportType::Input => Some("Input Report"),
-        ReportType::Output => Some("Output Report"),
-        ReportType::Feature => Some("Feature Report"),
-        ReportType::Unknown => None,
-    };
-    match (kind, w.report_id) {
-        (Some(kind), Some(id)) => {
-            let _ = write!(context, ", {kind} {id}");
-        }
-        (Some(kind), None) => {
-            let _ = write!(context, ", {kind}");
-        }
-        (None, Some(id)) => {
-            let _ = write!(context, ", Report {id}");
-        }
-        (None, None) => {}
-    }
-    if let Some(bit) = w.bit_offset {
-        let _ = write!(context, ", Bit {bit}");
-    }
-    if let Some(page) = w.usage_page {
-        let _ = write!(context, ", Usage {page:04X}");
-        if let Some(usage) = w.usage {
-            let _ = write!(context, ":{usage:04X}");
-        }
-    }
-    context
-}
-
-/// A warning on one line: its label, explanation and where on the device it is.
-pub fn warning_line(w: &p::DeviceWarning) -> String {
-    format!(
-        "{}: {} {}",
-        warning_label(w.code()),
-        warning_text(w.code()),
-        warning_context(w)
-    )
-}
-
 pub fn platform_name(p: Platform) -> &'static str {
     match p {
         Platform::Linux => "Linux",
@@ -424,8 +323,49 @@ fn general_text(code: ErrorCode) -> Option<&'static str> {
         Cancelled => "the operation was cancelled",
         ConnectionFailed => "the adapter couldn't connect to this device",
         UnsupportedHid => "the adapter can't use this device's input format",
+        StorageFull => "the adapter's storage is full",
+        ProfileMemoryLow => "the adapter is almost out of profile memory",
+        UsbRequiredCapacityExceeded => {
+            "the adapter doesn't have enough USB capacity for every required interface"
+        }
+        UsbReservedCapacityExceeded => {
+            "the adapter doesn't have enough USB capacity for every reserved interface"
+        }
+        ProfileMemoryExceeded => "the adapter doesn't have room for this device's profiles",
+        ProfileLoadFailed => "the adapter couldn't read one of this device's profiles",
         _ => return None,
     })
+}
+
+/// Status labels of the adapter's USB capacity errors, in the order shown. Each applies on its
+/// own, and both can apply at once.
+pub const USB_CAPACITY: [(ErrorCode, &str); 2] = [
+    (
+        ErrorCode::UsbRequiredCapacityExceeded,
+        "Required Capacity Exceeded",
+    ),
+    (
+        ErrorCode::UsbReservedCapacityExceeded,
+        "Reserved Capacity Exceeded",
+    ),
+];
+
+/// The adapter's USB capacity errors, by their labels.
+pub fn usb_capacity(st: &p::Status) -> Vec<(ErrorCode, &'static str)> {
+    USB_CAPACITY
+        .into_iter()
+        .filter(|(code, _)| model::has_error(st, *code))
+        .collect()
+}
+
+/// A resource's usage in a few words: "3 of 7", or what is known of it.
+pub fn capacity_text(r: &p::ResourceCapacity) -> String {
+    match (r.count, r.limit) {
+        (Some(count), Some(limit)) => format!("{count} of {limit}"),
+        (Some(count), None) => count.to_string(),
+        (None, Some(limit)) => format!("Up to {limit}"),
+        (None, None) => "Unknown".into(),
+    }
 }
 
 /// Short explanations of integration and setting failures, as device and
@@ -735,14 +675,13 @@ pub fn state_token(d: &p::Device) -> String {
 /// Why a connected device's profiles aren't loaded, as sentences for its diagnostics.
 pub fn profile_error_words(code: ErrorCode) -> String {
     match code {
-        ErrorCode::NoCapacity => "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.".into(),
-        ErrorCode::StorageFailed => "The adapter couldn't read one of this device's profiles.".into(),
+        ErrorCode::ProfileMemoryExceeded => "The adapter doesn't have room for them. Disconnect another device or give this one fewer profiles.".into(),
         code => sentence(&code_text(code, None)),
     }
 }
 
 /// One saved device on a line for the shell.
-pub fn device_line(d: &p::Device, warnings: usize) -> String {
+pub fn device_line(d: &p::Device) -> String {
     let mut policy = String::from(if d.trusted { "trusted" } else { "untrusted" });
     if d.blocked {
         policy.push_str(" blocked");
@@ -775,9 +714,6 @@ pub fn device_line(d: &p::Device, warnings: usize) -> String {
             None => "not-reported".into(),
         };
         let _ = write!(line, " security={words}");
-    }
-    if warnings > 0 {
-        let _ = write!(line, " warnings={warnings}");
     }
     if let Some(code) = model::last_error(d) {
         let _ = write!(line, " error={}", model::code_token(code));
@@ -833,10 +769,11 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
         let _ = write!(b, "\n  {key}: {}", safe(value));
     };
     field("Port", port);
-    if let Some(v) = model::info_text(&st.info, keys::FIRMWARE_VERSION) {
+    let information = st.information.clone().unwrap_or_default();
+    if let Some(v) = &information.firmware_version {
         field("Firmware", v);
     }
-    if let Some(v) = model::info_text(&st.info, keys::BOARD_NAME) {
+    if let Some(v) = &information.board_name {
         field("Board", v);
     }
     field("Name", &display(&st.name));
@@ -847,8 +784,12 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
         }
     }
     field("Ready", &yes_no(st.ready).to_lowercase());
-    if let Some(full) = model::info_bool(&st.info, keys::STORAGE_FULL) {
-        field("Storage Full", &yes_no(full).to_lowercase());
+    field(
+        "Storage Full",
+        &yes_no(model::storage_full(st)).to_lowercase(),
+    );
+    for (_, label) in usb_capacity(st) {
+        field("USB", label);
     }
     let transports: Vec<&str> = model::transports(st)
         .into_iter()
@@ -872,23 +813,32 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
             .to_string(),
     );
     for t in model::enabled_transports(st) {
-        let enabled = devices
-            .iter()
-            .filter(|d| d.enabled && d.transport == t as i32)
-            .count() as u32;
-        let value = match model::max_enabled(st, t) {
-            Some(max) => format!(
-                "{enabled} of {max} in use, {} free",
-                max.saturating_sub(enabled)
+        let Some(r) = model::enabled_devices(st, t) else {
+            continue;
+        };
+        let value = match (r.count, r.limit) {
+            (Some(count), Some(limit)) => format!(
+                "{count} of {limit} in use, {} free",
+                limit.saturating_sub(count)
             ),
-            None => format!("{enabled} in use"),
+            (Some(count), None) => format!("{count} in use"),
+            (None, Some(limit)) => format!("at most {limit}"),
+            (None, None) => continue,
         };
         field(&format!("Enabled Places ({})", transport_name(t)), &value);
     }
+    if let Some(r) = model::resource(&st.resources, ResourceType::Interfaces) {
+        field("USB Interfaces", &capacity_text(r).to_lowercase());
+    }
     for m in model::gamepad_support(st) {
-        let value = match m.slots {
-            Some(slots) => format!("{slots} of {}", m.max_slots),
-            None => format!("at most {}", m.max_slots),
+        let Some(r) = model::resource(&m.resources, ResourceType::Slots) else {
+            continue;
+        };
+        let value = match (r.count, r.limit) {
+            (Some(count), Some(limit)) => format!("{count} of {limit}"),
+            (Some(count), None) => count.to_string(),
+            (None, Some(limit)) => format!("at most {limit}"),
+            (None, None) => continue,
         };
         field(
             &format!("Gamepad Slots ({})", output_mode_name(m.mode())),
@@ -899,7 +849,7 @@ pub fn adapter_info(port: &str, st: &p::Status, devices: &[p::Device]) -> String
 }
 
 /// `device get` of a saved device, one field per line after bluetoothctl.
-pub fn device_info(d: &p::Device, warnings: &[p::DeviceWarning]) -> String {
+pub fn device_info(d: &p::Device) -> String {
     let mut b = format!("Device {} ({})", d.id, transport_token(d.transport()));
     let mut field = |key: &str, value: &str| {
         let _ = write!(b, "\n  {key}: {value}");
@@ -941,16 +891,6 @@ pub fn device_info(d: &p::Device, warnings: &[p::DeviceWarning]) -> String {
             }
         }
     }
-    for warning in warnings {
-        field(
-            warning_label(warning.code()),
-            &format!(
-                "{} {}",
-                warning_text(warning.code()),
-                warning_context(warning)
-            ),
-        );
-    }
     if let Some(code) = model::last_error(d) {
         let e = p::Error {
             code: code as i32,
@@ -968,30 +908,22 @@ pub fn device_info(d: &p::Device, warnings: &[p::DeviceWarning]) -> String {
             ),
         );
     }
-    for r in info_rows(&d.info) {
-        field(&r.label, &r.value);
+    for r in info_rows(d.information.as_ref()) {
+        field(&r.label, &safe(&r.value));
     }
     b
 }
 
-/// A value of an information key in words.
-pub fn info_value(key: &str, v: &Value) -> String {
-    match (key, v) {
-        (keys::VENDOR_ID | keys::PRODUCT_ID | keys::PRODUCT_VERSION, Value::Integer(n)) => {
-            format!("0x{n:04X}")
-        }
-        (keys::BATTERY_LEVEL, Value::Integer(n)) => format!("{n}%"),
-        (keys::POWER_AUTO_OFF, Value::Integer(0)) => "Never".into(),
+/// A reading of device information in words.
+pub fn reading_value(leaf: Leaf, v: &Value) -> String {
+    match (leaf, v) {
+        (Leaf::AutoOff, Value::Integer(0)) => "Never".into(),
         (_, Value::Bool(b)) => yes_no(*b).into(),
-        (_, Value::Text(t)) if model::key(key).is_some_and(|(k, _)| k.kind == keys::Kind::Enum) => {
-            safe(&catalog::choice_words(key, t))
-        }
-        (_, Value::Text(t)) => safe(t),
-        (_, Value::Integer(n)) => match catalog::unit(key) {
+        (_, Value::Choice(n)) => catalog::choice_words(leaf, *n),
+        (_, Value::Integer(n)) => match catalog::unit(leaf) {
             "" => n.to_string(),
             unit => format!("{n} {unit}"),
         },
-        (_, v) => safe(&catalog::value_string(v)),
     }
 }
 
@@ -1035,81 +967,104 @@ impl Battery {
 }
 
 /// The device's battery, or None when it reports neither charge nor charging.
-pub fn battery(info: &[p::Info]) -> Option<Battery> {
+pub fn battery(info: Option<&p::DeviceInformation>) -> Option<Battery> {
+    let battery = info?.battery.as_ref()?;
     let b = Battery {
-        percent: model::info_integer(info, keys::BATTERY_LEVEL),
-        charging: model::info_bool(info, keys::BATTERY_CHARGING),
+        percent: battery.level.map(i64::from),
+        charging: battery.charging,
     };
     (b.percent.is_some() || b.charging.is_some()).then_some(b)
 }
 
-/// A labeled line of device information.
+/// A labeled line of device information, its value as reported.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InfoRow {
-    /// The information key the row shows.
-    pub key: String,
     pub label: String,
     pub value: String,
 }
 
-/// Information keys that identify the device rather than describe it, shown with its
-/// diagnostics.
-pub const IDENTIFIER_KEYS: [&str; 5] = [
-    keys::VENDOR_REGISTRY,
-    keys::VENDOR_ID,
-    keys::PRODUCT_ID,
-    keys::PRODUCT_VERSION,
-    keys::BOOTLOADER_VERSION,
+/// Identity facts that identify the device rather than describe it, shown with its diagnostics.
+pub const IDENTIFIERS: [&str; 5] = [
+    "Vendor ID Namespace",
+    "Vendor ID",
+    "Product ID",
+    "Product Version",
+    "Bootloader",
 ];
 
-/// The reported information in display order: the battery's charge and
-/// charging, then the other keys this build knows. With either battery value
-/// reported, both rows are shown and an unknown one reads "Unknown". A vendor
-/// ID is read with its namespace, on one row.
-pub fn info_rows(info: &[p::Info]) -> Vec<InfoRow> {
+/// The device's identity in display order, each fact labelled, with text as the device reported
+/// it.
+pub fn identity(info: Option<&p::DeviceInformation>) -> Vec<(&'static str, String)> {
+    let Some(id) = info.and_then(|i| i.identity.as_ref()) else {
+        return Vec::new();
+    };
+    let hex = |n: Option<u32>| n.map(|n| format!("0x{n:04X}"));
+    let registry = id.vendor.as_ref().and_then(|v| v.registry).map(|r| {
+        match VendorRegistry::try_from(r) {
+            Ok(VendorRegistry::Usb) => "USB",
+            Ok(VendorRegistry::Bluetooth) => "Bluetooth",
+            _ => "Unknown",
+        }
+        .to_owned()
+    });
+    [
+        ("Manufacturer", id.manufacturer.clone()),
+        ("Model", id.model.clone()),
+        ("Serial Number", id.serial.clone()),
+        ("Firmware", id.firmware_version.clone()),
+        ("Bootloader", id.bootloader_version.clone()),
+        ("Hardware", id.hardware_revision.clone()),
+        ("Software", id.software_revision.clone()),
+        ("Vendor ID Namespace", registry),
+        ("Vendor ID", hex(id.vendor.as_ref().and_then(|v| v.id))),
+        ("Product ID", hex(id.product.as_ref().and_then(|p| p.id))),
+        (
+            "Product Version",
+            hex(id.product.as_ref().and_then(|p| p.version)),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(label, value)| Some((label, value?)))
+    .collect()
+}
+
+/// The reported information in display order: the battery's charge and charging, the identity,
+/// then the readings this build knows. With either battery value reported, both rows are shown
+/// and an unknown one reads "Unknown". A vendor ID is read with its namespace, on one row.
+pub fn info_rows(info: Option<&p::DeviceInformation>) -> Vec<InfoRow> {
     let mut rows: Vec<InfoRow> = Vec::new();
-    if let Some(b) = battery(info) {
+    let mut row = |label: &str, value: String| {
         rows.push(InfoRow {
-            key: keys::BATTERY_LEVEL.into(),
-            label: catalog::label(keys::BATTERY_LEVEL),
-            value: b.percent_words(),
-        });
-        rows.push(InfoRow {
-            key: keys::BATTERY_CHARGING.into(),
-            label: catalog::label(keys::BATTERY_CHARGING),
-            value: b.charging_words(),
-        });
-    }
-    let registry = model::info(info, keys::VENDOR_REGISTRY);
-    let vendor = model::info(info, keys::VENDOR_ID).is_some();
-    for i in catalog::presented_info(info) {
-        let key = i.key.as_str();
-        match key {
-            keys::BATTERY_LEVEL | keys::BATTERY_CHARGING => continue,
-            keys::VENDOR_REGISTRY if vendor => continue,
-            _ => {}
-        }
-        let Some(v) = i.value.as_ref().and_then(|v| v.value.as_ref()) else {
-            continue;
-        };
-        let mut value = info_value(key, v);
-        if key == keys::VENDOR_ID
-            && let Some(r) = registry
-        {
-            value = format!("{value} ({})", info_value(keys::VENDOR_REGISTRY, r));
-        }
-        rows.push(InfoRow {
-            key: key.into(),
-            label: catalog::label(key),
+            label: label.into(),
             value,
-        });
+        })
+    };
+    if let Some(b) = battery(info) {
+        row("Battery", b.percent_words());
+        row("Charging", b.charging_words());
+    }
+    let identity = identity(info);
+    let registry = identity
+        .iter()
+        .find(|(label, _)| *label == "Vendor ID Namespace")
+        .map(|(_, v)| v.clone());
+    let vendor = identity.iter().any(|(label, _)| *label == "Vendor ID");
+    for (label, value) in identity {
+        match (label, &registry) {
+            ("Vendor ID Namespace", _) if vendor => {}
+            ("Vendor ID", Some(r)) => row(label, format!("{value} ({r})")),
+            _ => row(label, value),
+        }
+    }
+    for (field, v) in info.map(settings::readings).unwrap_or_default() {
+        row(&catalog::label(&field), reading_value(field.leaf, &v));
     }
     rows
 }
 
 /// A device's battery for `device list`, or None when it reports none.
 pub fn battery_list(d: &p::Device) -> Option<String> {
-    Some(battery(&d.info)?.compact("(charging)"))
+    Some(battery(d.information.as_ref())?.compact("(charging)"))
 }
 
 pub fn scan_summary(count: u32, truncated: bool) -> String {
@@ -1149,7 +1104,7 @@ pub fn devices(st: &State, filter: Filter) -> String {
             Filter::Trusted => d.trusted,
         })
         .map(|d| {
-            let mut line = device_line(d, st.warnings_of(d.id).len());
+            let mut line = device_line(d);
             if let Some(b) = battery_list(d) {
                 let _ = write!(line, " battery={b}");
             }
@@ -1215,18 +1170,6 @@ pub fn file_line(e: &p::FileEntry) -> String {
         e.size,
         safe(&e.name)
     )
-}
-
-/// `warning list DEV`.
-pub fn warnings_text(subject: &Subject, warnings: &[p::DeviceWarning]) -> String {
-    let mut b = format!("Warnings of {}", label(subject));
-    if warnings.is_empty() {
-        b.push_str("\n  No warnings.");
-    }
-    for w in warnings {
-        let _ = write!(b, "\n  {}", warning_line(w));
-    }
-    b
 }
 
 /// A command's result for the shell and scripts; empty when the command has
@@ -1320,8 +1263,7 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
             let label = label(subject);
             match command {
                 Command::Get(_) => {
-                    let mut b =
-                        device_info(device, state.map_or(&[][..], |s| s.warnings_of(device.id)));
+                    let mut b = device_info(device);
                     if let Some(st) = state.filter(|st| profiles::available(&st.status)) {
                         let _ = write!(b, "\n  Profiles: {}", layer_names(st, device));
                     }
@@ -1357,7 +1299,6 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
         Outcome::Refreshing(subject) => {
             format!("Reading current information from {}.", label(subject))
         }
-        Outcome::Warnings { subject, warnings } => warnings_text(subject, warnings),
         Outcome::Settings(subject) => catalog::subject_text(subject, state),
         Outcome::Setting { subject, setting } => match state.and_then(|s| s.device(subject.id)) {
             Some(d) => catalog::setting_detail(d, setting),
@@ -1414,28 +1355,53 @@ fn profile_ref(state: Option<&State>, id: u32) -> String {
 
 /// The adapter's profile support and configuration interfaces, as `adapter status` adds them.
 fn profile_fields(status: &p::Status, state: Option<&State>) -> String {
-    let Some(support) = profiles::support(status) else {
+    if !profiles::available(status) {
         return String::new();
-    };
-    let mut b = format!(
-        "\n  Profile Memory: {} of {} in use\n  Profiles Per Device: {}",
-        bytes(support.memory_used.into()),
-        bytes(support.memory_budget.into()),
-        support.max_layers
-    );
+    }
+    let mut b = String::new();
+    let memory = profiles::resource(status, ResourceType::Memory);
+    match memory.map(|m| (m.count, m.limit)) {
+        Some((Some(used), Some(budget))) => {
+            let _ = write!(
+                b,
+                "\n  Profile Memory: {} of {} in use",
+                bytes(used.into()),
+                bytes(budget.into())
+            );
+        }
+        Some((Some(used), None)) => {
+            let _ = write!(b, "\n  Profile Memory: {} in use", bytes(used.into()));
+        }
+        Some((None, Some(budget))) => {
+            let _ = write!(b, "\n  Profile Memory: {}", bytes(budget.into()));
+        }
+        _ => {}
+    }
+    if let Some(max) = profiles::max_layers(status) {
+        let _ = write!(b, "\n  Profiles Per Device: {max}");
+    }
     for s in profiles::interfaces(status) {
         let _ = write!(
             b,
             "\n  {}: {}, profile {}",
             profiles::interface_label(s.interface()),
-            on_off(s.enabled),
+            interface_words(s),
             profile_ref(state, s.profile)
         );
     }
     b
 }
 
-/// A configuration interface's saved preferences after a change.
+/// An interface's saved preference, and whether an enabled one isn't exposed over USB.
+fn interface_words(s: &p::ConfigurationInterfaceSupport) -> &'static str {
+    match (s.enabled, s.active) {
+        (true, false) => "on (inactive)",
+        (on, _) => on_off(on),
+    }
+}
+
+/// A configuration interface's saved preferences after a change. Whether the adapter exposes it
+/// follows from the save, so it isn't known yet.
 fn interface_text(
     interface: p::ConfigurationInterface,
     status: &p::Status,
@@ -1445,7 +1411,7 @@ fn interface_text(
     match profiles::interface(status, interface) {
         Some(s) => format!(
             "{label} {}, profile {}.",
-            if s.enabled { "on" } else { "off" },
+            on_off(s.enabled),
             profile_ref(state, s.profile)
         ),
         None => format!("Saved {label}."),
@@ -1553,8 +1519,11 @@ pub fn paired_disabled(subject: &Subject, reason: InactiveReason, transport: Tra
 }
 
 /// A failed command's error line for the shell and scripts. The caller adds the `Error: `
-/// prefix where the shell uses one.
-pub fn failure_text(error: &Error) -> String {
+/// prefix where the shell uses one. A save cut off by the connection's end may have been stored.
+pub fn failure_text(command: &Command, error: &Error) -> String {
+    if command.saves() && error.unanswered() {
+        return "the adapter couldn't confirm whether the change was saved".into();
+    }
     safe(&error_line(error))
 }
 
@@ -1581,18 +1550,15 @@ pub fn notice(n: &Notice, state: Option<&State>) -> Option<String> {
 fn event_line(
     kind: &event::Kind,
     first: bool,
-    changed: &[String],
+    changed: &[Field],
     state: Option<&State>,
 ) -> Option<String> {
-    let warnings = |id: u32| state.map_or(0, |s| s.warnings_of(id).len());
     match kind {
         event::Kind::ScanFound(c) if first => Some(format!("[NEW] {}", candidate_line(c))),
         event::Kind::ScanFound(_) => None,
         event::Kind::ScanDone(done) => Some(scan_summary(done.count, done.truncated)),
-        event::Kind::Device(d) if first => {
-            Some(format!("[NEW] {}", device_line(d, warnings(d.id))))
-        }
-        event::Kind::Device(d) => Some(format!("[CHG] {}", device_line(d, warnings(d.id)))),
+        event::Kind::Device(d) if first => Some(format!("[NEW] {}", device_line(d))),
+        event::Kind::Device(d) => Some(format!("[CHG] {}", device_line(d))),
         event::Kind::DeviceRemoved(r) => Some(format!("[DEL] {}", r.id)),
         event::Kind::Adapter(a) => {
             let mut line = format!(
@@ -1613,28 +1579,27 @@ fn event_line(
                     on_off(s.enabled),
                     s.profile
                 );
+                if s.enabled && !s.active {
+                    line.push_str(",inactive");
+                }
+            }
+            let errors: Vec<String> = a
+                .errors
+                .iter()
+                .map(|n| model::code_token(model::code(*n)))
+                .collect();
+            if !errors.is_empty() {
+                let _ = write!(line, " errors={}", errors.join(","));
             }
             Some(line)
         }
         event::Kind::SettingsChanged(s) => {
             let d = state?.device(s.device)?;
-            let lines: Vec<String> = catalog::presented(&s.changed)
+            let all = settings::settings(&s.changed);
+            let lines: Vec<String> = catalog::presented(&all)
                 .into_iter()
-                .filter(|setting| changed.contains(&setting.key))
+                .filter(|setting| changed.contains(&setting.field))
                 .map(|setting| format!("[CHG] {}{}", s.device, catalog::setting_line(d, setting)))
-                .collect();
-            (!lines.is_empty()).then(|| lines.join("\n"))
-        }
-        event::Kind::WarningsChanged(w) => {
-            let lines: Vec<String> = w
-                .added
-                .iter()
-                .map(|warning| format!("[CHG] {} {}", w.device, warning_line(warning)))
-                .chain(
-                    w.removed
-                        .iter()
-                        .map(|warning| format!("[DEL] {} {}", w.device, warning_line(warning))),
-                )
                 .collect();
             (!lines.is_empty()).then(|| lines.join("\n"))
         }
@@ -1692,8 +1657,8 @@ mod tests {
             kinds: vec![Kind::Keyboard as i32],
             ..Default::default()
         };
-        assert!(!device_line(&keyboard, 0).contains("gamepad"));
-        assert!(!device_info(&keyboard, &[]).contains("Gamepad"));
+        assert!(!device_line(&keyboard).contains("gamepad"));
+        assert!(!device_info(&keyboard).contains("Gamepad"));
         let mut pad = p::Device {
             id: 2,
             roles: vec![Role::Gamepad as i32],
@@ -1706,9 +1671,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(model::gamepad_mode(&pad), Some(OutputMode::Disabled));
-        assert!(device_line(&pad, 0).ends_with(" gamepad-output=disabled"));
-        assert!(device_info(&pad, &[]).contains("\n  Gamepad Output: Disabled"));
-        assert!(!device_info(&pad, &[]).contains("Gamepad Status"));
+        assert!(device_line(&pad).ends_with(" gamepad-output=disabled"));
+        assert!(device_info(&pad).contains("\n  Gamepad Output: Disabled"));
+        assert!(!device_info(&pad).contains("Gamepad Status"));
         pad.output_preferences = vec![p::OutputPreference {
             role: Role::Gamepad as i32,
             mode: OutputMode::Xinput as i32,
@@ -1720,10 +1685,10 @@ mod tests {
             slot: Some(1),
         };
         assert!(
-            device_line(&pad, 0)
+            device_line(&pad)
                 .ends_with(" gamepad-output=xinput gamepad-state=active gamepad-slot=2")
         );
-        let info = device_info(&pad, &[]);
+        let info = device_info(&pad);
         assert!(
             info.contains(
                 "\n  Gamepad Output: XInput\n  Gamepad Status: Active\n  Gamepad Slot: 2"
@@ -1742,33 +1707,35 @@ mod tests {
             slot: None,
         }];
         assert_eq!(model::gamepad_mode(&unknown), None);
+        assert!(device_line(&unknown).ends_with(" gamepad-output=unknown gamepad-state=pending"));
         assert!(
-            device_line(&unknown, 0).ends_with(" gamepad-output=unknown gamepad-state=pending")
-        );
-        assert!(
-            device_info(&unknown, &[])
+            device_info(&unknown)
                 .contains("\n  Gamepad Output: Unknown\n  Gamepad Status: Setting Up")
         );
 
         let mut status = p::Status::default();
         assert!(!adapter_info("", &status, &[]).contains("Gamepad"));
+        let slots = |count, limit| {
+            vec![p::ResourceCapacity {
+                r#type: ResourceType::Slots as i32,
+                count,
+                limit,
+            }]
+        };
         status.output_support = vec![p::OutputSupport {
             role: Role::Gamepad as i32,
             modes: vec![
                 p::OutputModeSupport {
                     mode: OutputMode::Disabled as i32,
-                    max_slots: 0,
-                    slots: None,
+                    resources: slots(Some(0), Some(0)),
                 },
                 p::OutputModeSupport {
                     mode: OutputMode::Hid as i32,
-                    max_slots: 4,
-                    slots: Some(2),
+                    resources: slots(Some(2), Some(4)),
                 },
                 p::OutputModeSupport {
                     mode: OutputMode::Xinput as i32,
-                    max_slots: 4,
-                    slots: None,
+                    resources: slots(None, Some(4)),
                 },
             ],
         }];
@@ -1780,14 +1747,150 @@ mod tests {
     }
 
     #[test]
-    fn auto_off_information_reads_never_at_zero() {
+    fn readings_read_never_at_zero_and_unknown_enums_as_unknown() {
+        assert_eq!(reading_value(Leaf::AutoOff, &Value::Integer(0)), "Never");
+        assert_eq!(reading_value(Leaf::AutoOff, &Value::Integer(600)), "600 s");
+        assert_eq!(reading_value(Leaf::WheelMode, &Value::Choice(0)), "Unknown");
         assert_eq!(
-            info_value(keys::POWER_AUTO_OFF, &Value::Integer(0)),
-            "Never"
+            reading_value(Leaf::WheelMode, &Value::Choice(77)),
+            "Unknown"
         );
+        assert_eq!(reading_value(Leaf::WheelInvert, &Value::Bool(false)), "No");
+    }
+
+    #[test]
+    fn information_rows_follow_the_typed_records() {
+        let info = p::DeviceInformation {
+            identity: Some(p::DeviceIdentity {
+                manufacturer: Some("Logi".into()),
+                vendor: Some(p::VendorIdentity {
+                    registry: Some(VendorRegistry::Bluetooth as i32),
+                    id: Some(0x046d),
+                }),
+                product: Some(p::ProductIdentity {
+                    id: Some(0xb023),
+                    version: None,
+                }),
+                ..Default::default()
+            }),
+            battery: Some(p::BatteryInformation {
+                level: Some(0),
+                charging: None,
+            }),
+            pointer_sensors: vec![
+                p::PointerSensorInformation {
+                    index: 0,
+                    dpi: Some(1000),
+                },
+                p::PointerSensorInformation {
+                    index: 1,
+                    dpi: None,
+                },
+            ],
+            wheel: Some(p::WheelInformation {
+                diameter: Some(24),
+                free_spin_threshold: Some(255),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rows: Vec<(String, String)> = info_rows(Some(&info))
+            .into_iter()
+            .map(|r| (r.label, r.value))
+            .collect();
+        let expected = [
+            ("Battery", "0%"),
+            ("Charging", "Unknown"),
+            ("Manufacturer", "Logi"),
+            ("Vendor ID", "0x046D (Bluetooth)"),
+            ("Product ID", "0xB023"),
+            ("Pointer Sensitivity", "1000 DPI"),
+            ("Automatic Free Spin Threshold", "255"),
+            ("Wheel Diameter", "24 mm"),
+        ];
+        assert_eq!(rows, expected.map(|(l, v)| (l.to_owned(), v.to_owned())));
+        assert!(info_rows(None).is_empty());
+    }
+
+    #[test]
+    fn device_errors_split_into_connection_and_profile_errors() {
+        let mut d = p::Device {
+            errors: vec![
+                ErrorCode::Timeout as i32,
+                ErrorCode::ProfileMemoryExceeded as i32,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(model::last_error(&d), Some(ErrorCode::Timeout));
         assert_eq!(
-            info_value(keys::POWER_AUTO_OFF, &Value::Integer(600)),
-            "600 s"
+            model::profile_error(&d),
+            Some(ErrorCode::ProfileMemoryExceeded)
+        );
+        assert!(device_line(&d).contains(" error=timeout"));
+        assert!(device_line(&d).contains(" profile-error=profile_memory_exceeded"));
+        d.state = DeviceState::Connected as i32;
+        assert!(device_info(&d).contains(
+            "Profiles: Not Loaded (profile_memory_exceeded): The adapter doesn't have room for them."
+        ));
+        d.errors = vec![ErrorCode::ProfileLoadFailed as i32];
+        assert_eq!(model::last_error(&d), None);
+        assert!(
+            device_info(&d).contains("The adapter couldn't read one of this device's profiles.")
+        );
+    }
+
+    #[test]
+    fn adapter_status_shows_errors_and_resources_independently() {
+        let mut status = p::Status {
+            information: Some(p::AdapterInformation {
+                firmware_version: Some("1.0".into()),
+                board_name: None,
+                development_build: Some(false),
+            }),
+            transports: vec![p::TransportSupport {
+                transport: Transport::Ble as i32,
+                enabled: Some(true),
+                resources: vec![p::ResourceCapacity {
+                    r#type: ResourceType::Devices as i32,
+                    count: Some(0),
+                    limit: None,
+                }],
+            }],
+            resources: vec![p::ResourceCapacity {
+                r#type: ResourceType::Interfaces as i32,
+                count: None,
+                limit: Some(8),
+            }],
+            ..Default::default()
+        };
+        let info = adapter_info("", &status, &[]);
+        assert!(info.contains("\n  Firmware: 1.0\n"), "{info}");
+        assert!(!info.contains("Board"));
+        assert!(info.contains("\n  Storage Full: no"));
+        assert!(!info.contains("USB:"));
+        // A zero count is a count, not unknown.
+        assert!(
+            info.contains("\n  Enabled Places (BLE): 0 in use"),
+            "{info}"
+        );
+        assert!(info.contains("\n  USB Interfaces: up to 8"), "{info}");
+        status.errors = vec![
+            ErrorCode::StorageFull as i32,
+            ErrorCode::UsbRequiredCapacityExceeded as i32,
+            ErrorCode::UsbReservedCapacityExceeded as i32,
+        ];
+        let info = adapter_info("", &status, &[]);
+        assert!(info.contains("\n  Storage Full: yes"));
+        assert!(
+            info.contains("\n  USB: Required Capacity Exceeded\n  USB: Reserved Capacity Exceeded")
+        );
+        status.errors = vec![ErrorCode::UsbReservedCapacityExceeded as i32];
+        let info = adapter_info("", &status, &[]);
+        assert!(!info.contains("Required") && info.contains("Reserved Capacity Exceeded"));
+        let line = event_line(&event::Kind::Adapter(status), false, &[], None).unwrap();
+        assert!(
+            line.ends_with(" errors=usb_reserved_capacity_exceeded"),
+            "{line}"
         );
     }
 

@@ -36,6 +36,7 @@ def normalize(config, profile):
 
 def generate(config, out):
     from firmware_config import profile_memory_budget
+    from bluetooth_config import limits
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     partitions = out / "partitions.csv"
@@ -45,9 +46,11 @@ factory,app,factory,0x10000,{config['storage_offset'] - 0x10000:#x}
 cordial_layout,data,0x40,{config['storage_offset']:#x},0x1000
 cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_bytes'] - 4096:#x}
 """)
+    _, ble_connections = limits(config)
     values = {
         "IDF_TARGET": "esp32s3", "BT_ENABLED": True, "BT_CONTROLLER_ENABLED": True,
         "CORDIAL_DEVELOPMENT": config["profile"] != "production",
+        "BT_CTRL_BLE_MAX_ACT": ble_connections + 2,
         "ESP_CONSOLE_NONE": True, "ESP_CONSOLE_SECONDARY_NONE": True,
         "USJ_ENABLE_USB_SERIAL_JTAG": True, "LOG_DEFAULT_LEVEL_NONE": True,
         "BOOTLOADER_LOG_LEVEL_NONE": True,
@@ -67,7 +70,8 @@ cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_byte
                        # can query our services even while we are the central.
                        "BT_NIMBLE_ROLE_PERIPHERAL": True, "BT_NIMBLE_GATT_SERVER": True,
                        "BT_NIMBLE_ROLE_BROADCASTER": False,
-                       "BT_NIMBLE_MAX_CONNECTIONS": 4, "BT_NIMBLE_MAX_BONDS": 8,
+                       "BT_NIMBLE_MAX_CONNECTIONS": ble_connections + 1,
+                       "BT_NIMBLE_MAX_BONDS": ble_connections + 1,
                        "BT_NIMBLE_NVS_PERSIST": False, "BT_NIMBLE_STATIC_TO_DYNAMIC": False})
     def encode(value):
         return ("y" if value else "n") if isinstance(value, bool) else json.dumps(value)

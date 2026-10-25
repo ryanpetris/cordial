@@ -24,13 +24,14 @@ type Maps = [Option<Vec<u8>>; LAYOUT_SERVICES];
 type Cached = (Layout, heapless::Vec<Descriptor, LAYOUT_SERVICES>);
 struct Pending {
     events: VecDeque<Event>,
-    descriptors: [heapless::Vec<Descriptor, LAYOUT_SERVICES>; 4],
+    descriptors:
+        [heapless::Vec<Descriptor, LAYOUT_SERVICES>; cordial_core::devices::ACTIVE_CONNECTIONS],
     /// Raw report maps by service: discovered maps until Connected, or the
     /// maps a verification found until its result.
-    maps: [Maps; 4],
+    maps: [Maps; cordial_core::devices::ACTIVE_CONNECTIONS],
     /// The saved layout a link uses until its verification ends.
-    layouts: [Option<Layout>; 4],
-    generations: [u64; 4],
+    layouts: [Option<Layout>; cordial_core::devices::ACTIVE_CONNECTIONS],
+    generations: [u64; cordial_core::devices::ACTIVE_CONNECTIONS],
 }
 /// A saved layout lent to C for one call.
 struct Native {
@@ -197,7 +198,7 @@ impl<S: RecordStore + 'static> State<S> {
                 descriptors: core::array::from_fn(|_| heapless::Vec::new()),
                 maps: Default::default(),
                 layouts: Default::default(),
-                generations: [0; 4],
+                generations: [0; cordial_core::devices::ACTIVE_CONNECTIONS],
             }),
         })
     }
@@ -273,7 +274,7 @@ impl<S: RecordStore + 'static> State<S> {
         let slot = usize::from(link.slot);
         let mut pending = self.pending.borrow_mut();
         if matches!(raw.kind, 5..=12 | 14..=16) {
-            if slot >= 4 || link.generation == 0 {
+            if slot >= cordial_core::devices::ACTIVE_CONNECTIONS || link.generation == 0 {
                 return 0;
             }
             if pending.generations[slot] != link.generation {
@@ -810,6 +811,9 @@ impl<S: RecordStore + 'static> Bluetooth for Backend<S> {
         self.pairing_ended(link);
         Ok(())
     }
+    fn promote(&mut self, link: LinkId) {
+        unsafe { ffi::cordial_profiles_promote(raw_link(link)) };
+    }
     fn pair_reply(
         &mut self,
         link: LinkId,
@@ -916,7 +920,7 @@ impl<S: RecordStore + 'static> Bluetooth for Backend<S> {
     }
     async fn bonds(&mut self) -> Result<Vec<Peer>, Error> {
         self.healthy()?;
-        let mut peers = [ffi::Peer::default(); 16];
+        let mut peers = [ffi::Peer::default(); cordial_core::devices::ACTIVE_CONNECTIONS + 1];
         let count = unsafe { ffi::cordial_profiles_bonds(peers.as_mut_ptr(), peers.len() as u32) };
         self.healthy()?;
         if count < 0 {
@@ -1012,6 +1016,31 @@ mod tests {
         let io = Box::leak(Box::new(Io::new()));
         State::new(storage, io, || 0, || panic!("fatal")).unwrap()
     }
+    #[test]
+    fn every_compiled_slot_accepts_events_and_the_next_slot_is_rejected() {
+        let state = state();
+        for slot in 0..cordial_core::devices::ACTIVE_CONNECTIONS {
+            let link = LinkId {
+                slot: slot as u8,
+                generation: slot as u64 + 1,
+            };
+            assert_eq!(state.activate(link, None), Some(0));
+            let mut event = raw(7, link.generation);
+            event.link.slot = link.slot;
+            event.service = 0;
+            assert_eq!(state.copy_event(&event, &KEYBOARD), 1);
+            assert_eq!(state.pending.borrow().descriptors[slot].len(), 1);
+        }
+        let outside = LinkId {
+            slot: cordial_core::devices::ACTIVE_CONNECTIONS as u8,
+            generation: 100,
+        };
+        assert_eq!(state.activate(outside, None), None);
+        let mut event = raw(7, outside.generation);
+        event.link.slot = outside.slot;
+        assert_eq!(state.copy_event(&event, &KEYBOARD), 0);
+    }
+
     const LINK: LinkId = LinkId {
         slot: 0,
         generation: 1,
