@@ -43,7 +43,8 @@ function trayDevice(d: DeviceEntry, threshold: number, ready: boolean): TrayDevi
 
 export function trayModel(state: AppState): TrayModel {
   const threshold = state.preferences.lowBatteryPercent;
-  const adapters = state.adapters.filter((a) => a.connection === "connected");
+  // An adapter that is reconnecting keeps its devices listed, as last known.
+  const adapters = state.adapters.filter((a) => a.connection === "connected" || a.connection === "reconnecting");
   const ids = new Set(adapters.map((a) => a.id));
   const devices = state.devices.filter((d) => ids.has(d.adapterId));
   const ready = new Set(adapters.filter((a) => a.readiness === "ready").map((a) => a.id));

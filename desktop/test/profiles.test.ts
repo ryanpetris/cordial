@@ -326,7 +326,7 @@ describe("Profiles", () => {
     const request = fake.received.filter((r) => r.command.case === "setAdapter").at(-1)!.command.value;
     expect(request).toMatchObject({ platform: 2, configurationInterfaces: [{ interface: 2, enabled: true, profile: 1 }] });
     // The adapter reconnects USB after answering; its page waits for it.
-    await until(() => adapter(state).connection === "connecting");
+    await until(() => adapter(state).connection === "reconnecting");
     expect(fake.usbReconnects).toBe(1);
     expect(fake.serial).toBe(`${ID}-vial:f64c2b3c`);
     await until(() => fake.present);

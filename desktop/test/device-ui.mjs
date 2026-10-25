@@ -231,25 +231,21 @@ try {
   const outputFacts = page.locator("section").filter({ has: page.getByRole("heading", { name: "Gamepad Output" }) });
   assert.equal(await outputFacts.locator("dd").allTextContents().then((t) => t.join()), "Active,1");
 
-  // A Gamepad Output change can re-enumerate USB. While the adapter reconnects and lists its
-  // devices again, the page keeps its tab and staged choice with its controls disabled, and a
-  // save cut short stays reported until the device shows the choice saved.
+  // A Gamepad Output change can re-enumerate USB. While the adapter reconnects, its device
+  // records stay unavailable: the page keeps its tab and staged choice with its controls disabled,
+  // and a save cut short stays reported until the device shows the choice saved.
   const padAdapter = state.adapters.find((a) => a.id === pad.adapterId);
-  const reconnect = async (adapter, devices) => {
-    const all = state.devices;
-    Object.assign(padAdapter, adapter);
-    state.devices = devices;
+  const reconnect = async (away) => {
+    Object.assign(padAdapter, away ? { connection: "reconnecting", readiness: "waiting" } : { connection: "connected", readiness: "ready" });
+    padAdapter.profilesAvailable = !away;
+    for (const d of state.devices) if (d.adapterId === pad.adapterId) d.available = d.settingsAvailable = !away;
     await publish();
-    state.devices = all;
   };
-  const others = state.devices.filter((d) => d.adapterId !== pad.adapterId);
-  const unlisted = { connection: "connected", readiness: "ready", listing: true };
-  const usable = { connection: "connected", readiness: "ready", listing: false };
   await tab("Settings").click();
   await outputMode("HID").click();
   await app.evaluate(() => { globalThis.uiHold = "device.update"; });
   await save.click();
-  await reconnect({ connection: "connecting", readiness: "waiting", listing: true }, others);
+  await reconnect(true);
   await output.locator("xpath=ancestor::fieldset[1][@disabled]").waitFor();
   assert.equal(await tab("Settings").getAttribute("aria-selected"), "true");
   assert.equal(await save.getAttribute("aria-disabled"), "true");
@@ -259,8 +255,7 @@ try {
     globalThis.uiReply({ ok: false, message });
   }, lost);
   await page.getByText(lost, { exact: true }).waitFor();
-  await reconnect(unlisted, others);
-  await reconnect(usable, state.devices);
+  await reconnect(false);
   await output.locator("xpath=ancestor::fieldset[1][not(@disabled)]").waitFor();
   assert.equal(await tab("Settings").getAttribute("aria-selected"), "true");
   assert.equal(await outputMode("HID").getAttribute("aria-checked"), "true");
@@ -278,18 +273,21 @@ try {
   await outputMarker.waitFor({ state: "detached" });
   padOutput.mode = "xinput";
   await publish();
-  await reconnect({ connection: "connecting", readiness: "waiting", listing: true }, others);
+  await reconnect(true);
   await output.locator("xpath=ancestor::fieldset[1][@disabled]").waitFor();
   assert.equal(await outputMode("XInput").getAttribute("aria-checked"), "true");
-  await reconnect(usable, state.devices);
+  await reconnect(false);
   await output.locator("xpath=ancestor::fieldset[1][not(@disabled)]").waitFor();
   assert.equal(await tab("Settings").getAttribute("aria-selected"), "true");
   assert.equal(await outputMode("XInput").getAttribute("aria-checked"), "true");
   assert.equal(await outputMarker.count(), 0);
   assert.equal(await page.locator(".page-bar .error-text").count(), 0);
   // A device the adapter no longer lists once it has read its devices again isn't shown.
-  await reconnect(usable, others);
+  const all = state.devices;
+  state.devices = all.filter((d) => d.key !== pad.key);
+  await publish();
   await output.waitFor({ state: "detached" });
+  state.devices = all;
   await publish();
 
   // A device with no settings to show has no Settings tab.
@@ -696,13 +694,19 @@ try {
   await pairing.getByRole("button", { name: "Done", exact: true }).click();
   state.pairing = null;
   await publish();
-  // The dialog closes when no adapter is ready, cancelling its pairing and stopping its search.
+  // The dialog stays while its adapter isn't ready, and closes once the adapter is gone,
+  // cancelling its pairing and stopping its search.
   await page.getByRole("button", { name: "Add Device", exact: true }).click();
   state.pairing = { adapterId: entry.adapterId, candidateId: 7, name: "Nearby Keyboard", phase: "pairing", prompt: null, deviceKey: null, message: null };
   await publish();
   await pairing.getByText("Pairing with Nearby Keyboard…", { exact: true }).waitFor();
   const before = (await actions()).length;
   for (const a of state.adapters) a.readiness = "waiting";
+  await publish();
+  await pairing.getByText("Pairing with Nearby Keyboard…", { exact: true }).waitFor();
+  assert.equal((await actions()).length, before);
+  state.adapters = [];
+  state.devices = [];
   await publish();
   await pairing.waitFor({ state: "hidden" });
   for (const type of ["pair.cancel", "scan.stop", "pair.dismiss"])

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { AppState, Candidate, PairingPrompt } from "../../shared/state.ts";
+import type { AdapterEntry, AppState, Candidate, PairingPrompt } from "../../shared/state.ts";
 import { STORAGE_FULL, TRANSPORTS, clean, displayKind, storageFull, transportDisabledText } from "../../shared/text.ts";
 import { act, useAction } from "../api.ts";
 import { Banner, Dialog, Spinner, Switch } from "./common.tsx";
@@ -96,10 +96,17 @@ export function AddDevice({
   onClose: () => void;
   onOpenDevice: (key: string) => void;
 }) {
-  const ready = state.adapters.filter((a) => a.connection === "connected" && a.readiness === "ready");
+  const usable = (a: AdapterEntry) => a.connection === "connected" && a.readiness === "ready";
+  const ready = state.adapters.filter(usable);
   const [adapterId, setAdapterId] = useState<string | null>(null);
   const [unnamed, setUnnamed] = useState(false);
-  const chosen = ready.find((a) => a.id === adapterId) ?? ready.find((a) => !storageFull(a.status)) ?? ready[0];
+  // The adapter chosen on opening stays chosen while it reconnects or restarts, with searching and
+  // pairing unavailable until it is ready again.
+  const chosen = adapterId
+    ? state.adapters.find((a) => a.id === adapterId && (a.connection === "connected" || a.connection === "reconnecting"))
+    : (ready.find((a) => !storageFull(a.status)) ?? ready[0]);
+  const available = !!chosen && usable(chosen);
+  const choices = chosen && !available ? [...ready, chosen] : ready;
   const scan = state.scan;
   const pairing = state.pairing;
   // Why starting a search or pairing failed; cleared by the next attempt.
@@ -119,12 +126,12 @@ export function AddDevice({
     else if (chosen && adapterId !== chosen.id) setAdapterId(chosen.id);
   }, [open, chosen?.id]);
 
-  // Search while the dialog is open and no pairing is running.
+  // Search while the dialog is open, the adapter is ready and no pairing is running.
   useEffect(() => {
-    if (!open || !chosen || pairing) return;
+    if (!open || !chosen || !available || pairing) return;
     if (scan?.adapterId === chosen.id) return;
     void attempt({ type: "scan.start", adapterId: chosen.id });
-  }, [open, chosen?.id, pairing === null]);
+  }, [open, chosen?.id, available, pairing === null]);
 
   const close = () => {
     if (pairing?.phase === "pairing") void act({ type: "pair.cancel" }, true);
@@ -135,7 +142,7 @@ export function AddDevice({
     onClose();
   };
 
-  // Without a ready adapter the dialog closes, ending its search and pairing.
+  // Without an adapter the dialog closes, ending its search and pairing.
   useEffect(() => {
     if (open && !chosen) close();
   }, [open, chosen]);
@@ -203,13 +210,13 @@ export function AddDevice({
             </button>
           ) : null}
           {pairing.phase === "failed" || pairing.phase === "cancelled" ? (
-            <button onClick={again}>
+            <button disabled={!available} onClick={again}>
               <RefreshIcon /> {pairing.phase === "failed" ? "Retry" : "Refresh"}
             </button>
           ) : null}
           {pairing.phase === "connected" || pairing.phase === "saved" ? (
             <>
-              <button onClick={again}>
+              <button disabled={!available} onClick={again}>
                 <PlusIcon /> Add Another
               </button>
               <button
@@ -234,11 +241,11 @@ export function AddDevice({
   } else {
     body = (
       <>
-        {ready.length > 1 ? (
+        {choices.length > 1 ? (
           <label className="field">
             Adapter
             <select value={chosen?.id} onChange={(e) => setAdapterId(e.target.value)}>
-              {ready.map((a) => (
+              {choices.map((a) => (
                 <option key={a.id} value={a.id}>
                   {a.name}
                 </option>
@@ -252,11 +259,11 @@ export function AddDevice({
               <Spinner /> Searching…
             </>
           ) : (problem ?? scan?.error) ? (
-            <Banner kind="error" action={<button disabled={starting} onClick={again}><RefreshIcon /> {searchFailed || scan?.error ? "Retry" : "Refresh"}</button>}>
+            <Banner kind="error" action={<button disabled={starting || !available} onClick={again}><RefreshIcon /> {searchFailed || scan?.error ? "Retry" : "Refresh"}</button>}>
               {problem ?? scan?.error}
             </Banner>
           ) : (
-            <button disabled={starting} onClick={again}>
+            <button disabled={starting || !available} onClick={again}>
               <RefreshIcon /> Refresh
             </button>
           )}
@@ -276,7 +283,7 @@ export function AddDevice({
                 ) : c.transport && disabled(c) ? (
                   <span className="muted small">{transportDisabledText(c.transport)}</span>
                 ) : (
-                  <button className="suggested" disabled={starting} onClick={() => chosen && void attempt({ type: "pair.start", adapterId: chosen.id, candidateId: c.id })}>
+                  <button className="suggested" disabled={starting || !available} onClick={() => chosen && void attempt({ type: "pair.start", adapterId: chosen.id, candidateId: c.id })}>
                     <LinkIcon /> Pair
                   </button>
                 )}

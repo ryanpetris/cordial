@@ -346,14 +346,17 @@ export interface AdapterEntry {
   id: string;
   /** Name reported by the adapter. */
   name: string;
-  connection: "connected" | "connecting" | "disconnected";
+  /** Reconnecting retains the session during automatic transport recovery. */
+  connection: "connected" | "connecting" | "reconnecting" | "disconnected";
   /** Why the last Connect failed. */
   connectError: string | null;
   readiness: "waiting" | "ready";
   status: AdapterStatus | null;
-  /** Whether the adapter's devices are yet to be listed: it is reconnecting, or its session is
-   * still reading them for the first time. */
+  /** Whether the session is still reading its devices for the first time. */
   listing: boolean;
+  /** Why the latest device listing on the connected, ready adapter failed, until another
+   * listing starts. */
+  listError: string | null;
   /** Problems worth a banner and the tray's attention badge. */
   attention: string[];
   /** The Profiles list's page; null without profile support. */
@@ -366,6 +369,8 @@ export interface AdapterEntry {
   unreadableDevices: { id: number; error: WireError }[];
   /** The profiles this session has seen, by ID, for naming layers and interface profiles. */
   profileNames: Record<string, Profile>;
+  /** The profile listing has succeeded on the current ready transport. */
+  profilesAvailable: boolean;
 }
 
 export interface DeviceEntry {
@@ -373,6 +378,8 @@ export interface DeviceEntry {
   key: string;
   adapterId: string;
   device: DeviceRecord;
+  /** Whether the current adapter transport has confirmed the device listing. */
+  available: boolean;
   /** The device's name cleaned for display. */
   name: string;
   kind: DeviceKind;
@@ -382,6 +389,8 @@ export interface DeviceEntry {
   pending: string[];
   /** Null until the list has been read. */
   settings: Setting[] | null;
+  /** The settings list has succeeded on the current ready transport. */
+  settingsAvailable: boolean;
   /** Why the last read of the settings list failed, in words. */
   settingsError: string | null;
   /** Why the adapter's last device listing couldn't read this device's record. `device` then holds

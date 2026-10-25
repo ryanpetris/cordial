@@ -1,5 +1,6 @@
 // Launches the built app with simulated adapters, walks through the main
-// views and saves screenshots. Run under a display, e.g. xvfb-run.
+// views and saves screenshots, then runs the adapter reconnect checks in
+// test/reconnect-ui.mjs. Run under a display, e.g. xvfb-run.
 import { _electron as electron } from "playwright";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -89,15 +90,20 @@ await shot("adapter-interface");
 if ((await viaEnabled()) !== before) throw new Error("the interface changed before Save");
 // The accepted save shows its values at once, before the adapter reconnects USB, so the run
 // follows the published state and notes the adapter leaving to tell the reconnect apart from
-// the state before it. waitForFunction needs a synchronous predicate: it treats a returned
-// promise as true.
-await page.evaluate((id) => {
+// the state before it. Every state published meanwhile keeps the adapter, reconnecting, and its
+// devices. waitForFunction needs a synchronous predicate: it treats a returned promise as true.
+const smokeKeys = (await page.evaluate(() => window.cordial.state())).devices.filter((d) => d.adapterId === smokeAdapter.id).map((d) => d.key).join();
+await page.evaluate(([id, keys]) => {
   window.smokeLeft = false;
+  window.smokeTorn = null;
   window.cordial.onState((s) => {
     window.smokeAdapter = s.adapters.find((a) => a.id === id);
-    if (window.smokeAdapter?.connection !== "connected") window.smokeLeft = true;
+    const connection = window.smokeAdapter?.connection;
+    if (connection !== "connected") window.smokeLeft = true;
+    const listed = s.devices.filter((d) => d.adapterId === id).map((d) => d.key).join();
+    if ((connection !== "connected" && connection !== "reconnecting") || listed !== keys) window.smokeTorn ??= `${connection}: ${listed}`;
   });
-}, smokeAdapter.id);
+}, [smokeAdapter.id, smokeKeys]);
 await save.click();
 if (await page.getByRole("dialog").count()) throw new Error("saving an interface change opened a dialog");
 // The adapter reconnects USB; its page and chosen tab stay through it.
@@ -109,6 +115,8 @@ await page.waitForFunction((v) => {
 }, !before);
 await page.waitForFunction(() => document.querySelector(".page-bar button.suggested")?.disabled);
 if ((await profilesTab.getAttribute("aria-selected")) !== "true") throw new Error("the adapter tab changed across a reconnect");
+const torn = await page.evaluate(() => window.smokeTorn);
+if (torn) throw new Error(`the adapter or its devices left during a reconnect: ${torn}`);
 // Creating and copying profiles act at once.
 await page.getByRole("button", { name: "New Profile" }).click();
 const created = page.getByRole("dialog", { name: "New Profile" });
@@ -159,3 +167,4 @@ if (errors.length) {
   process.exit(1);
 }
 console.log(`screenshots in ${out}`);
+await import("../test/reconnect-ui.mjs");

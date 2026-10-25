@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
-import type { AdapterChanges, DeviceChanges, DeviceEntry, Navigation } from "../shared/state.ts";
+import type { AdapterChanges, DeviceChanges, Navigation } from "../shared/state.ts";
 import { api, setReporter, useAppState } from "./api.ts";
 import { AddDevice } from "./components/AddDevice.tsx";
 import { AdapterPage } from "./components/AdapterPage.tsx";
@@ -66,15 +66,7 @@ export function App() {
   // returns home only once a target that was shown disappears.
   const devices = state?.devices ?? [];
   const adapters = state?.adapters ?? [];
-  // The device page stays while its adapter reconnects or reads its devices again, such as when a
-  // Gamepad Output change re-enumerates USB, so its tab and the outcome of a save stay shown.
-  const last = useRef<DeviceEntry | null>(null);
-  const live = selection.page === "device" ? devices.find((d) => d.key === selection.key) : undefined;
-  if (live) last.current = live;
-  const held = last.current;
-  const device =
-    live ?? (selection.page === "device" && held?.key === selection.key
-      && adapters.some((a) => a.id === held.adapterId && a.listing) ? held : undefined);
+  const device = selection.page === "device" ? devices.find((d) => d.key === selection.key) : undefined;
   const current =
     selection.page === "device"
       ? device
@@ -84,14 +76,11 @@ export function App() {
   const shown = current ? selection : HOME;
   const shownId = selection.page === "device" ? selection.key : selection.page === "adapter" ? selection.id : null;
   const seen = useRef<string | null>(null);
-  // A device whose adapter is still listed, such as while its USB reconnects, keeps the selection
-  // and is shown again once the adapter lists it.
-  const kept = selection.page === "device" && adapters.some((a) => selection.key.startsWith(`${a.id}/`));
 
   useEffect(() => {
     if (current) seen.current = shownId;
-    else if (seen.current === shownId && !kept) setSelection(HOME);
-  }, [current, shownId, kept]);
+    else if (seen.current === shownId) setSelection(HOME);
+  }, [current, shownId]);
 
   if (!state) return <div className="loading" />;
 

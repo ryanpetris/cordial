@@ -1,7 +1,9 @@
 // Exercises the adapter page across a USB reconnect with published state: the controller's
-// retained entry (connecting, waiting, last status and profiles), a new session without a status,
-// the ready adapter and a manual disconnect, with staged settings and configuration interfaces
-// saved together. Run from desktop: xvfb-run -a node test/adapter-ui.mjs
+// reconnecting entry (waiting, last status and profiles), a new session without a status, a
+// returning adapter that reports its status before it is ready, a failed first device list, the
+// ready adapter and a manual disconnect, with staged settings and configuration interfaces saved
+// together. Run from desktop:
+// xvfb-run -a node test/adapter-ui.mjs
 import { _electron } from "playwright";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -33,14 +35,15 @@ try {
       { interface: 2, enabled: false, active: false, profile: 0, conflicts: [1] },
     ],
   };
-  const ready = { ...real, adapters: [{ ...adapter, connection: "connected", readiness: "ready", status, profilePage, pickerPage: profilePage, profileNames }] };
-  // As the controller lists an adapter whose USB went away: its last status and profiles stay.
+  const ready = { ...real, adapters: [{ ...adapter, connection: "connected", readiness: "ready", status, profilePage, pickerPage: profilePage, profileNames, profilesAvailable: true }] };
+  // As the controller lists an adapter whose USB went away: its last status, profiles and device
+  // records stay, unavailable.
   const retained = {
     ...real,
-    devices: real.devices.filter((d) => d.adapterId !== adapter.id),
+    devices: real.devices.map((d) => (d.adapterId === adapter.id ? { ...d, available: false } : d)),
     adapters: [{
       ...adapter,
-      connection: "connecting",
+      connection: "reconnecting",
       connectError: null,
       readiness: "waiting",
       status,
@@ -48,11 +51,14 @@ try {
       profilePage: pageOf(profiles, "The adapter stopped responding"),
       pickerPage: null,
       profileNames,
+      profilesAvailable: false,
     }],
   };
+  // The same session once USB returns, before the adapter is ready.
+  const returned = { ...retained, adapters: [{ ...retained.adapters[0], connection: "connected", status: { ...status, ready: false } }] };
   // A new session before the adapter reports its status.
-  const starting = { ...retained, adapters: [{ ...adapter, connection: "connected", readiness: "waiting", status: null, attention: [], profilePage: null, pickerPage: null, profileNames: {} }] };
-  const disconnected = { ...retained, adapters: [{ ...adapter, connection: "disconnected", connectError: null, readiness: "waiting", status: null, attention: [], profilePage: null, pickerPage: null, profileNames: {} }] };
+  const starting = { ...retained, adapters: [{ ...adapter, connection: "connected", readiness: "waiting", status: null, attention: [], profilePage: null, pickerPage: null, profileNames: {}, profilesAvailable: false }] };
+  const disconnected = { ...retained, adapters: [{ ...adapter, connection: "disconnected", connectError: null, readiness: "waiting", status: null, attention: [], profilePage: null, pickerPage: null, profileNames: {}, profilesAvailable: false }] };
 
   await app.evaluate(({ ipcMain }, state) => {
     globalThis.uiState = state;
@@ -128,6 +134,44 @@ try {
   ready.adapters[0].unreadableDevices = [];
   await publish(ready);
   await page.getByText("Device 9", { exact: true }).waitFor({ state: "detached" });
+
+  // A fresh adapter whose first device list fails needs attention, and Diagnostics names the
+  // failure with Retry. Retry lists again as the adapter is starting, and a listing that succeeds
+  // leaves the adapter ready. The chosen tab and staged settings stay throughout.
+  const pill = page.locator(".page-header .pill");
+  const listFailure = page.getByText("The adapter couldn't read its devices. Try again.", { exact: true });
+  const retry = page.getByRole("button", { name: "Retry", exact: true });
+  const firstList = (listing, listError) => ({
+    ...ready,
+    devices: ready.devices.filter((d) => d.adapterId !== adapter.id),
+    adapters: [{ ...ready.adapters[0], readiness: "waiting", listing, listError, profilePage: null, pickerPage: null, profileNames: {}, profilesAvailable: false }],
+  });
+  await tab("Settings").click();
+  await page.getByRole("radio", { name: "Windows" }).click();
+  await page.getByRole("img", { name: "Platform, Changed", exact: true }).waitFor();
+  await tab("Diagnostics").click();
+  await publish(firstList(true, null));
+  await pill.getByText("Starting…", { exact: true }).waitFor();
+  assert.equal(await listFailure.count(), 0);
+  assert.equal(await retry.count(), 0);
+  await publish(firstList(false, "The adapter couldn't read its saved data. Try again."));
+  await pill.getByText("Needs Attention", { exact: true }).waitFor();
+  await listFailure.waitFor();
+  await retry.click();
+  assert.deepEqual(await actions(), [{ type: "devices.reload", adapterId: adapter.id }]);
+  await app.evaluate(() => { globalThis.uiActions = []; });
+  await publish(firstList(true, null));
+  await pill.getByText("Starting…", { exact: true }).waitFor();
+  await listFailure.waitFor({ state: "detached" });
+  assert.equal(await retry.count(), 0);
+  await publish(ready);
+  await pill.getByText("Ready", { exact: true }).waitFor();
+  await selected("Diagnostics");
+  assert.equal(await listFailure.count(), 0);
+  await tab("Settings").click();
+  assert.equal(await page.getByRole("radio", { name: "Windows" }).getAttribute("aria-checked"), "true");
+  await discard.click();
+  await page.getByRole("img", { name: "Platform, Changed", exact: true }).waitFor({ state: "detached" });
   await tab("Details").click();
 
   // Each profile shows an icon for each role it changes.
@@ -157,12 +201,15 @@ try {
   assert.equal(await page.getByRole("button", { name: "VIA Profile", exact: true }).isDisabled(), true);
   for (const b of await page.getByRole("button", { name: /, Options$/ }).all()) assert.equal(await b.isDisabled(), true);
 
-  // The other settings stay shown and disabled too; Details reports the reconnect.
+  // The other settings stay shown and disabled too; Details keeps the last status and reports the
+  // adapter disconnected.
   await tab("Settings").click();
   assert.equal(await page.getByRole("radio", { name: "Linux" }).isDisabled(), true);
   for (const s of await page.getByRole("switch").all()) assert.equal(await s.isDisabled(), true);
   await tab("Details").click();
-  await empty("Connecting…").waitFor();
+  await page.locator(".page-header .pill").getByText("Disconnected", { exact: true }).waitFor();
+  await page.getByRole("heading", { name: "Information", exact: true }).waitFor();
+  assert.equal(await page.locator(".page-empty").count(), 0);
   await tab("Profiles").click();
 
   // A new session has no status for a moment: the tab stays chosen without its contents.
@@ -170,27 +217,67 @@ try {
   await empty("Starting…").waitFor();
   await selected("Profiles");
   assert.equal(await via.count(), 0);
-  // A fault reported while starting needs attention rather than reading as starting.
+  // A fault reported while starting needs attention rather than reading as starting, and the
+  // status it comes with shows with its controls disabled.
   const fault = { ...status, ready: false, errors: [{ code: "not_ready", reason: "radio", outcome: "unspecified", related: [] }] };
   await publish({ ...starting, adapters: [{ ...starting.adapters[0], status: fault }] });
-  await empty("Needs Attention").waitFor();
+  await page.locator(".page-header .pill").getByText("Needs Attention", { exact: true }).waitFor();
+  await disabled(via, true);
+  assert.equal(await page.locator(".page-empty").count(), 0);
   await publish(starting);
   await empty("Starting…").waitFor();
 
-  // A name dialog opened while ready can't submit once USB goes away.
+  // A name dialog opened while ready can't submit once USB goes away, nor while the returning
+  // adapter isn't ready yet. The dialog keeps the name, and the staged settings stay.
   await publish(ready);
   await via.waitFor();
   await disabled(via, false);
+  const transport = { ble: "Bluetooth LE", classic: "Bluetooth Classic" }[status.transports[0].transport];
+  const bluetooth = page.getByRole("switch", { name: transport, exact: true });
+  const bluetoothStaged = page.getByRole("img", { name: `${transport}, Changed`, exact: true });
+  const windows = page.getByRole("radio", { name: "Windows" });
+  await tab("Settings").click();
+  await windows.click();
+  await bluetooth.click();
+  await bluetoothStaged.waitFor();
+  await tab("Profiles").click();
   await page.getByRole("button", { name: "New Profile", exact: true }).click();
   const create = dialog.getByRole("button", { name: "Create", exact: true });
-  await page.getByRole("textbox", { name: "Profile name" }).fill("Travel");
+  const profileName = page.getByRole("textbox", { name: "Profile name" });
+  await profileName.fill("Travel");
   assert.equal(await create.isDisabled(), false);
   await publish(retained);
   await disabled(via, true);
   assert.equal(await create.isDisabled(), true);
-  await page.getByRole("textbox", { name: "Profile name" }).press("Enter");
+  await profileName.press("Enter");
+  await publish(returned);
+  await page.locator(".page-header .pill").getByText("Disconnected", { exact: true }).waitFor({ state: "detached" });
+  await selected("Profiles");
+  assert.equal(await dialog.isVisible(), true);
+  assert.equal(await profileName.inputValue(), "Travel");
+  assert.equal(await create.isDisabled(), true);
+  assert.equal(await via.isDisabled(), true);
+  await publish(ready);
+  await disabled(create, false);
+  assert.equal(await profileName.inputValue(), "Travel");
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   await dialog.waitFor({ state: "hidden" });
+  await publish(returned);
+  await disabled(via, true);
+  await tab("Settings").click();
+  assert.equal(await windows.getAttribute("aria-checked"), "true");
+  assert.equal(await windows.isDisabled(), true);
+  assert.equal(await bluetooth.isDisabled(), true);
+  await bluetoothStaged.waitFor();
+  await tab("Details").click();
+  await page.getByRole("heading", { name: "Information", exact: true }).waitFor();
+  assert.equal(await page.locator(".page-empty").count(), 0);
+  await publish(ready);
+  await tab("Settings").click();
+  await disabled(bluetooth, false);
+  await bluetooth.click();
+  await bluetoothStaged.waitFor({ state: "detached" });
+  await tab("Profiles").click();
   assert.deepEqual(await actions(), []);
 
   // Staged edits on both tabs survive visiting another page and go out together. With VIA staged
@@ -218,6 +305,25 @@ try {
   }
   assert.equal(await page.getByRole("radio", { name: "Windows" }).getAttribute("aria-checked"), "true");
 
+  // A ready adapter that hasn't read its profiles since reconnecting can't save the staged
+  // interfaces until a fresh read succeeds. The other settings and Retry stay available.
+  await publish({ ...ready, adapters: [{ ...ready.adapters[0], profilePage: pageOf(profiles, "The adapter stopped responding"), pickerPage: null, profilesAvailable: false }] });
+  await disabled(save, true);
+  assert.equal(await page.getByRole("radio", { name: "Windows" }).isDisabled(), false);
+  assert.equal(await page.getByRole("radio", { name: "Windows" }).getAttribute("aria-checked"), "true");
+  assert.equal(await discard.isDisabled(), false);
+  await tab("Profiles").click();
+  await page.getByRole("img", { name: "Vial, Changed" }).waitFor();
+  assert.equal(await vial.isChecked(), true);
+  assert.equal(await save.isDisabled(), true);
+  assert.equal(await page.getByRole("button", { name: "Retry", exact: true }).isDisabled(), false);
+  await publish(ready);
+  await disabled(save, false);
+  assert.equal(await vial.isChecked(), true);
+  assert.equal(await via.isChecked(), false);
+  await tab("Settings").click();
+  assert.deepEqual(await actions(), [pick]);
+
   // A failed save keeps the staged values.
   await answer({ ok: false, message: "The adapter couldn't save the change." });
   await save.click();
@@ -238,6 +344,7 @@ try {
   await answer({ ok: true });
   await save.click();
   await disabled(save, true);
+  for (const name of ["VIA, Changed", "Vial, Changed"]) await page.getByRole("img", { name }).waitFor({ state: "detached" });
   assert.equal(await dialog.isVisible(), false);
   assert.deepEqual(await actions(), [pick, change, change]);
   assert.equal(await via.isChecked(), true);

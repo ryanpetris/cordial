@@ -137,7 +137,7 @@ describe("Gamepad Output changes", () => {
       outputPreferences: [{ role: Role.GAMEPAD, mode: OutputMode.XINPUT }],
       integrations: [],
     });
-    await until(() => adapter().connection === "connecting");
+    await until(() => adapter().connection === "reconnecting");
     expect(fake.usbReconnects).toBe(1);
     await until(() => fake.present);
     await c.manager.rescan();
@@ -168,7 +168,7 @@ describe("Gamepad Output changes", () => {
     release();
     expect(await pending).toEqual({ ok: false, message: "The adapter couldn't confirm whether the change was saved." });
     // USB still reconnects for the new allocation.
-    await until(() => state()!.adapters[0]!.connection === "connecting" && fake.usbReconnects === 1);
+    await until(() => state()!.adapters[0]!.connection === "reconnecting" && fake.usbReconnects === 1);
     await until(() => fake.present);
     await c.manager.rescan();
     await until(() => state()!.adapters[0]!.connection === "connected" && loaded(state(), 3));

@@ -1,5 +1,5 @@
 import { vi } from "vitest";
-import type { PortInfo } from "@cordial/client";
+import type { ByteStream, PortInfo } from "@cordial/client";
 import { IntegrationKind } from "@cordial/protocol";
 import { FakeAdapter, type FakeOptions } from "../src/fake/adapter.ts";
 import { Controller } from "../src/core/controller.ts";
@@ -52,7 +52,7 @@ export async function openSession(options: FakeOptions = {}) {
 export function controller(fakes: Record<string, FakeAdapter>) {
   let state: AppState | null = null;
   // Tests may replace the port list and count opens after construction.
-  const ports = { list: null as null | (() => Promise<PortInfo[]>), opened: 0 };
+  const ports = { list: null as null | (() => Promise<PortInfo[]>), open: null as null | ((path: string) => Promise<ByteStream>), opened: 0 };
   const deps = {
     preferences: { ...DEFAULT_PREFERENCES },
     savePreferences: vi.fn(),
@@ -66,6 +66,7 @@ export function controller(fakes: Record<string, FakeAdapter>) {
     listPorts: async () => (ports.list ? ports.list() : Object.entries(deps.ports).filter(([, f]) => f.present).map(([path, f]) => ({ path, serial: f.serial }))),
     openTransport: async (path: string) => {
       ports.opened++;
+      if (ports.open) return ports.open(path);
       const f = deps.ports[path];
       if (!f) throw new Error("no such port");
       return f.open();

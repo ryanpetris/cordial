@@ -462,7 +462,7 @@ const starting = (entry: DeviceEntry) => isConnected(entry) && entry.device.hidp
  * Save. Its buttons go in the page bar, `bar`, outside the form. */
 function Settings({ entry, live, adapter, drafts, details, onDetails, bar }: {
   entry: DeviceEntry;
-  /** False while the page shows the device's last state as its adapter reconnects. */
+  /** False while the device's adapter reconnects and its record is only last known. */
   live: boolean;
   adapter: AdapterEntry | undefined;
   drafts: Drafts;
@@ -492,8 +492,8 @@ function Settings({ entry, live, adapter, drafts, details, onDetails, bar }: {
   const connected = isConnected(entry) || !!entry.readError;
   const reachable = live && adapter?.connection === "connected";
   const occupied = saving || refreshing || settingsBusy(entry);
-  // Saving needs the adapter ready; refreshing a connected device doesn't.
-  const busy = !reachable || !adapter.status?.ready || occupied;
+  // Saved settings stay locked until their list succeeds on this transport.
+  const busy = !reachable || !adapter.status?.ready || !entry.settingsAvailable || occupied;
   const guards: FormGuards = { locked: busy, busy };
   const submission = entry.settingsSave;
   const items = submission?.items ?? [];
@@ -555,7 +555,7 @@ function Settings({ entry, live, adapter, drafts, details, onDetails, bar }: {
   const loadProblem = (
     <>
       <span className="muted">The adapter couldn't read the device's settings.</span>
-      <button type="button" disabled={reloading} onClick={() => void runReload({ type: "device.reload", key: entry.key })}>
+      <button type="button" disabled={reloading || !reachable} onClick={() => void runReload({ type: "device.reload", key: entry.key })}>
         <RefreshIcon /> Retry
       </button>
     </>
@@ -742,7 +742,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
   const d = entry.device;
   const adapter = state.adapters.find((a) => a.id === entry.adapterId);
   const connected = isConnected(entry);
-  const live = state.devices.some((x) => x.key === entry.key);
+  const live = entry.available;
   const settings = hasSettings(entry) || offersGamepadOutput(d, adapter?.status ?? null);
   useEffect(() => setFailure(null), [d.state]);
   const perform = async (at: string, runner: typeof run, action: Parameters<typeof run>[0]) => {
@@ -775,7 +775,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
   const shown = ofTab(changes, tab);
   const dirty = Object.keys(shown).length > 0;
   const detailsDirty = Object.keys(detailChanges).length > 0;
-  const locked = !ready || saving;
+  const locked = !ready || saving || (tab === "profiles" && !adapter?.profilesAvailable);
   const canSave = !locked && dirty;
   const value = {
     enabled: details.enabled ?? d.enabled,
@@ -1072,7 +1072,7 @@ export function DevicePage({ state, entry, drafts, details, onDetails }: {
           </button>
           <button
             className="destructive"
-            disabled={busy}
+            disabled={busy || !live}
             onClick={async () => {
               const result = await perform("unpair", run, { type: "device.unpair", key: entry.key });
               if (result.ok) setForgetting(false);

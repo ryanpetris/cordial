@@ -7,8 +7,8 @@ export function settingsBusy(entry: Pick<DeviceEntry, "pending" | "settingsSave"
 }
 
 /** Setting values are current readings only while HID++ is up on a connected device. */
-export function settingsCurrent(entry: Pick<DeviceEntry, "device" | "readError">): boolean {
-  return connected(entry) && entry.device.hidpp?.state === "active";
+export function settingsCurrent(entry: Pick<DeviceEntry, "device" | "readError" | "available" | "settingsAvailable">): boolean {
+  return entry.settingsAvailable && connected(entry) && entry.device.hidpp?.state === "active";
 }
 
 export function hidppBusy(entry: Pick<DeviceEntry, "pending">): boolean {

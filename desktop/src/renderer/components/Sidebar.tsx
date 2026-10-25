@@ -203,7 +203,7 @@ export function Sidebar({
       </div>
       {state.devices.length ? (
         <footer className="sidebar-footer">
-          <button className="suggested wide" onClick={onAdd}>
+          <button className="suggested wide" disabled={!canAdd} onClick={onAdd}>
             <PlusIcon /> Add Device
           </button>
         </footer>

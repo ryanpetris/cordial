@@ -214,26 +214,50 @@ The desktop application uses the same commands and session rules as the CLI.
 - Discovery: it lists serial ports once at startup, then again after USB hotplug events (with short
   retries while udev sets up a new node) or an explicit refresh. A port must match the [USB
   discovery descriptors](transport.md#discovery), and the first `GetStatus` identifies the adapter.
-  The web version lists the ports the user has granted by vendor and product ID. Ports that fail
-  stay hidden. An unexpectedly disconnected adapter keeps its page and last reported settings for 15
-  seconds while awaiting reconnection. Its devices leave the list immediately and configuration
-  controls are disabled. The selected device page keeps its tab, staged changes and save result
-  while the adapter reconnects and reads its devices again. If the whole listing fails, the device
-  is actually absent, or the wait expires, the application leaves the page. A per-record read
-  error retains last-known device data as described above. A selected adapter tab also
-  stays selected.
-  A session that ends after running normally is reopened once if its port is still present.
+  The web version lists the ports the user has granted by vendor and product ID. Unidentified
+  ports stay hidden. When an adapter has a readable USB serial number that matches its status ID,
+  an unexpected connection loss marks the adapter unavailable and its devices Disconnected.
+  The existing adapter and device entries, pages, selected tabs, staged changes and save results
+  remain in place during a 15-second reconnect window.
+  Configuration controls stay disabled until current data is confirmed. The application retries
+  every 500 milliseconds throughout the window, including after an early connection loss or a
+  temporary failure to reopen the port. Port enumeration continues while other ports are opening.
+  It recognizes the same adapter by the adapter ID at the start of its USB serial number,
+  even on a different port, confirms that ID in the handshake, and updates the existing state.
+  A candidate without a matching readable USB serial number cannot resume that state.
+  The entries and pages remain in place between the new session's handshake and device listing.
+  A failed listing retains them; a
+  completed listing removes devices that are absent. A per-record read error retains last-known
+  device data as described above. Settings and profile lists remain visible while their reads are
+  pending or fail, but their writes stay disabled until the relevant read succeeds. Failed reads
+  can be retried. An adapter that returns with a radio or storage fault remains listed with its
+  current status and disabled device actions, even beyond the window. Its existing device records
+  remain until it becomes ready and lists them again. When the original window expires, the
+  application removes an adapter whose transport or ready device listing has not recovered, and
+  its devices, and leaves their pages. Without a usable USB serial number, a session loss or
+  disappearance from the port list removes the adapter and its devices immediately, without a
+  reconnect window or automatic retries. This includes Web Serial, which cannot read USB serial
+  numbers. A later hotplug scan or explicit refresh creates a fresh connection, including on the
+  same port, and does not restore the previous session's state.
 - Sessions: after `GetStatus` it reads the complete device list and each device's settings, then
-  follows events, and lists the devices again when the adapter becomes ready. A USB reconnect
-  opens a fresh session and reads status instead of expecting an event from the old session.
+  follows events, and lists the devices again when the adapter becomes ready. When a device
+  listing fails on a connected, ready adapter, the adapter's Diagnostics tab names the failure with
+  Retry, which lists the devices again. If the devices haven't been listed since the adapter last
+  became ready, it shows Needs Attention rather than Starting until Retry or another listing starts. A USB
+  reconnect opens a fresh session and reads status instead of expecting an event from the old
+  session.
+  Bluetooth radio loss leaves paired devices listed.
 - Disconnect: the user can disconnect an adapter from its context menu. The application closes the
   port and does not reopen it, recognizing it by the first 16 characters of its USB serial number,
   until the user chooses Connect or restarts the application. The web version recognizes it by its
-  port instead.
+  port instead. This intentional disconnect does not start the reconnect window.
 - Pairing: Add Device scans the transports the firmware supports and has enabled while its dialog is
   open, stops the scan before pairing, answers prompts in the dialog, and follows the new device
   until it connects or fails. Closing the dialog, or hiding the window, stops a scan or cancels an
-  unsaved pairing.
+  unsaved pairing. A settled pairing result that confirms a saved device can continue following
+  that device after reconnect. Candidates and active pairing prompts from the previous session
+  cannot be used in the new session. An interrupted active pairing reports that the adapter could
+  not confirm whether the device was paired; it is not replayed.
 - Devices open on the Details tab, with the connection switches and the device's own facts. Settings
   follows when the device has settings to show, then Profiles when the adapter supports profiles,
   with the device's layers (an ordered list of profiles, empty for a new device), then Diagnostics:
@@ -307,9 +331,10 @@ or a USB-capacity pre-check. Save sends other staged device settings before Game
 since its save can change USB allocation. If those settings fail to save or their outcome is
 unknown, Gamepad Output stays staged. A received success confirms the saved preference; active
 USB exposure is reported separately. If the response is lost, clients report an unknown outcome
-and may read the device after reconnecting. Automatic reconnect tracking restores the device page
-and its staged state, using a fresh status read in the new session. Neither output mode requires
-a running Host service or an additional configuration interface.
+and may read the device after reconnecting. When the adapter has a usable USB serial number,
+automatic reconnect tracking keeps the device page and its staged state in place while reading
+fresh status in the new session. Neither output mode requires a running Host service or an
+additional configuration interface.
 
 Clients show both USB capacity errors when both appear in `Status.errors`. Required capacity has
 a prominent warning and tray attention. Reserved capacity has a subtle indicator and no large

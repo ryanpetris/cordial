@@ -528,11 +528,14 @@ export function batteryText(b: Battery | null): string | null {
 export const batteryStale = (b: Battery) => (b.percent != null && !b.percentFresh) || (b.charging != null && !b.chargingFresh);
 
 /** Whether the device is connected as far as the adapter last confirmed; a record the latest
- * listing couldn't read confirms nothing. */
-export const connected = (e: Pick<DeviceEntry, "device" | "readError">) => !e.readError && e.device.state === "connected";
+ * listing couldn't read, or one its adapter hasn't listed again since reconnecting, confirms
+ * nothing. */
+export const connected = (e: Pick<DeviceEntry, "device" | "readError" | "available">) =>
+  e.available && !e.readError && e.device.state === "connected";
 
 /** The device's state in a few words, as lists show it. */
-export function deviceStatus({ device: d, readError }: Pick<DeviceEntry, "device" | "readError">): string {
+export function deviceStatus({ device: d, readError, available }: Pick<DeviceEntry, "device" | "readError" | "available">): string {
+  if (!available) return "Disconnected";
   if (readError) return "Couldn't Read";
   if (d.blocked) return "Blocked";
   switch (d.state) {
@@ -555,9 +558,9 @@ export const adapterFaults = (s: AdapterStatus | null) => s?.errors.filter((e) =
 
 /** The adapter's state in a few words, and whether it needs attention. */
 export function adapterStatus(a: AdapterEntry): { text: string; warn: boolean } {
-  if (a.connection === "disconnected") return { text: "Disconnected", warn: false };
+  if (a.connection === "disconnected" || a.connection === "reconnecting") return { text: "Disconnected", warn: false };
   if (a.connection === "connecting") return { text: "Connecting…", warn: false };
-  if (a.readiness === "waiting") return adapterFaults(a.status).length ? { text: "Needs Attention", warn: true } : { text: "Starting…", warn: false };
+  if (a.readiness === "waiting") return adapterFaults(a.status).length || a.listError ? { text: "Needs Attention", warn: true } : { text: "Starting…", warn: false };
   return a.attention.length ? { text: "Needs Attention", warn: true } : { text: "Ready", warn: false };
 }
 

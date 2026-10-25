@@ -139,15 +139,8 @@ export function AdapterPage({
   const s = adapter.status;
   const connected = adapter.connection === "connected";
   const ready = connected && !!s?.ready;
-  // The status the tabs show: the adapter's own once it is ready, and the last one it reported
-  // while it reconnects, shown with its controls disabled. Null while a new session starts.
-  const view = s?.ready ? s : null;
-  // Whether the adapter has profiles, kept while its status is unknown so a reconnect leaves the
-  // Profiles tab in place.
-  const known = view ? !!view.profileSupport : null;
-  const [profiles, setProfiles] = useState(known ?? false);
-  if (known !== null && known !== profiles) setProfiles(known);
-  const hasTab = (t: AdapterTab) => t !== "profiles" || profiles;
+  // A chosen Profiles tab stays while the status is unknown, so it is still chosen when it returns.
+  const hasTab = (t: AdapterTab) => t !== "profiles" || (s ? !!s.profileSupport : chosen === "profiles");
   const tab = hasTab(chosen) ? chosen : "details";
   const closeRename = () => {
     setEditing(false);
@@ -157,20 +150,21 @@ export function AdapterPage({
   const done = () => { if (!quietBusy) closeRename(); };
   const status = adapterStatus(adapter);
   // Settings and Profiles edits stage in `draft` and go to the adapter together with Save.
-  const changes = view ? pending(draft, view) : {};
+  const changes = s ? pending(draft, s) : {};
   const dirty = Object.keys(changes).length > 0;
   const locked = !ready || saving;
-  const canSave = !locked && dirty;
+  // Interface changes name profiles, which the adapter must have read since it last connected.
+  const canSave = !locked && dirty && (!changes.interfaces || adapter.profilesAvailable);
   const stage = (update: AdapterChanges) => {
-    if (!view) return;
+    if (!s) return;
     setSaveError(null);
     onDraft((d) => {
       const interfaces = { ...d.interfaces };
       for (const [i, change] of Object.entries(update.interfaces ?? {})) interfaces[i] = { ...interfaces[i], ...change };
-      return pending({ ...d, ...update, transports: { ...d.transports, ...update.transports }, interfaces }, view);
+      return pending({ ...d, ...update, transports: { ...d.transports, ...update.transports }, interfaces }, s);
     });
   };
-  const platform = draft.platform ?? view?.platform;
+  const platform = draft.platform ?? s?.platform;
   const save = async () => {
     if (!canSave) return;
     setSaveError(null);
@@ -182,8 +176,8 @@ export function AdapterPage({
   const requestSave = () => { void save(); };
   // A save whose outcome was unknown no longer is once the adapter reports the staged values.
   useEffect(() => {
-    if (view && !dirty) setSaveError(null);
-  }, [view, dirty]);
+    if (s && !dirty) setSaveError(null);
+  }, [s, dirty]);
   const discard = () => {
     setSaveError(null);
     onDraft(() => ({}));
@@ -211,12 +205,10 @@ export function AdapterPage({
   const connectFailure = connected ? null : (adapter.connectError ?? connectError);
   const devices = state.devices.filter((d) => d.adapterId === adapter.id);
   const threshold = state.preferences.lowBatteryPercent;
-  const transports = view?.transports ?? [];
-  // Details reports the adapter's live state, so it shows only while connected.
-  const live = connected ? view : null;
-  const usbInterfaces = resource(live?.resources, "interfaces");
-  const usbErrors = USB_CAPACITY.filter(([code]) => hasError(live?.errors, code));
-  const enabledDevices = live?.transports.flatMap((t) => {
+  const transports = s?.transports ?? [];
+  const usbInterfaces = resource(s?.resources, "interfaces");
+  const usbErrors = USB_CAPACITY.filter(([code]) => hasError(s?.errors, code));
+  const enabledDevices = s?.transports.flatMap((t) => {
     const r = resource(t.resources, "devices");
     return t.enabled && r && (r.count !== null || r.limit !== null) ? [{ transport: t.transport, r }] : [];
   }) ?? [];
@@ -263,7 +255,7 @@ export function AdapterPage({
         ) : (
           <>
             {connectFailure ? <span className="bar-start error-text">{connectFailure}</span> : null}
-            {busy || quietBusy || adapter.connection === "connecting" ? <Spinner /> : null}
+            {busy || quietBusy || adapter.connection === "connecting" || adapter.connection === "reconnecting" ? <Spinner /> : null}
             <button disabled={!ready} onClick={() => setEditing(true)}>
               <PencilIcon /> Rename
             </button>
@@ -296,7 +288,7 @@ export function AdapterPage({
 
       <TabPanel id={tabs} value={tab}>
         {tab === "settings" ? (
-          view ? (
+          s ? (
             <>
               <Card>
                 <div className="row">
@@ -339,12 +331,12 @@ export function AdapterPage({
             empty
           )
         ) : tab === "profiles" ? (
-          view ? (
+          s ? (
             <>
-              <ProfileMemory status={view} />
+              <ProfileMemory status={s} />
               <ConfigurationInterfaces
                 adapter={adapter}
-                interfaces={stagedInterfaces(view, draft)}
+                interfaces={stagedInterfaces(s, draft)}
                 changed={changes.interfaces ?? {}}
                 locked={locked}
                 onChange={(i, change) => stage({ interfaces: { [i]: change } })}
@@ -356,14 +348,14 @@ export function AdapterPage({
           )
         ) : tab === "diagnostics" ? (
           <>
-            {connected && s?.errors.length ? (
+            {s?.errors.length ? (
               <Card title="Errors">
                 {s.errors.map((e) => (
                   <Row key={JSON.stringify(e)} title={errorText(e)} />
                 ))}
               </Card>
             ) : null}
-            {adapter.unreadableDevices.length ? (
+            {adapter.listError || adapter.unreadableDevices.length ? (
               <Card
                 title="Saved Devices"
                 footer={
@@ -372,6 +364,9 @@ export function AdapterPage({
                   </button>
                 }
               >
+                {adapter.listError ? (
+                  <Row title={adapter.listError === READ_FAILED ? "The adapter couldn't read its devices. Try again." : `The adapter couldn't read its devices. ${adapter.listError}`} />
+                ) : null}
                 {adapter.unreadableDevices.map(({ id, error }) => {
                   const detail = errorText(error, "read");
                   return <Row key={id} title={`Device ${id}`} subtitle={detail === READ_FAILED ? "Couldn't Read" : `Couldn't Read: ${reasonText(detail)}`} dim />;
@@ -386,7 +381,7 @@ export function AdapterPage({
           </>
         ) : (
           <>
-            {live ? null : empty}
+            {s ? null : empty}
             {devices.length ? (
               <Card title="Devices">
                 {devices.map((d) => {
@@ -437,23 +432,23 @@ export function AdapterPage({
               </Card>
             ) : null}
 
-            {live && live.transports.some((t) => t.enabled) ? (
+            {s && s.transports.some((t) => t.enabled) ? (
               <Card title="New Pairings">
                 <Facts>
-                  {live.transports.filter((t) => t.enabled).map(({ transport }) => (
+                  {s.transports.filter((t) => t.enabled).map(({ transport }) => (
                     <Fact key={transport} label={TRANSPORTS[transport]}>
-                      {storageFull(live) ? STORAGE_FULL : "Available"}
+                      {storageFull(s) ? STORAGE_FULL : "Available"}
                     </Fact>
                   ))}
                 </Facts>
               </Card>
             ) : null}
 
-            {live ? (
+            {s ? (
               <Card title="Information">
                 <Facts>
-                  <Fact label="Firmware">{live.information.firmwareVersion ?? "Unknown"}</Fact>
-                  {live.information.boardName !== null ? <Fact label="Board">{live.information.boardName}</Fact> : null}
+                  <Fact label="Firmware">{s.information.firmwareVersion ?? "Unknown"}</Fact>
+                  {s.information.boardName !== null ? <Fact label="Board">{s.information.boardName}</Fact> : null}
                 </Facts>
               </Card>
             ) : null}

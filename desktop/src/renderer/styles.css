@@ -298,7 +298,8 @@ input.number {
   background: var(--selected);
 }
 
-.side-row.off {
+.side-row.off,
+.tile.off {
   opacity: 0.6;
 }
 

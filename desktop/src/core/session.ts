@@ -74,12 +74,19 @@ export class AdapterSession {
   readonly devices = new Map<number, DeviceRecord>();
   /** What has been listed and reported of each device's settings, in the adapter's order. */
   readonly settings = new Map<number, Setting[]>();
+  /** Devices whose settings list has succeeded on the current ready transport. */
+  readonly settingsAvailable = new Set<number>();
+  /** Whether the profile listing succeeded on the current ready transport. */
+  profilesAvailable = false;
+  readonly #currentProfiles = new Set<number>();
   readonly settingsErrors = new Map<number, string>();
   /** Why the latest device listing couldn't read a device's record, until the device's next
    * record arrives. */
   readonly readErrors = new Map<number, WireError>();
   /** The devices have been listed. */
   listed = false;
+  /** Why the latest device listing failed, until the next one starts. */
+  listError: string | null = null;
   /** Profiles seen this session, by ID. */
   readonly profileNames = new Map<number, Profile>();
   #profiles: ProfileListing | null = null;
@@ -93,6 +100,9 @@ export class AdapterSession {
 
   readonly #hooks: SessionHooks;
   #connection!: Connection;
+  #receiver: { session: AdapterSession; closing: Promise<void> | null } = { session: this, closing: null };
+  /** Whether device actions can use the current transport. */
+  available = false;
   /** Commands in flight, per device. */
   readonly #pending = new Map<number, string[]>();
   #syncing: Promise<void> | null = null;
@@ -106,11 +116,20 @@ export class AdapterSession {
   /** Starts a session and reads the adapter's status; rejects if the port isn't a working adapter. */
   static async open(stream: ByteStream, hooks: SessionHooks): Promise<AdapterSession> {
     const session = new AdapterSession(hooks);
-    session.#connection = await Connection.open(stream, {
-      onEvent: (event) => session.#event(event),
-      onResponse: (request, response) => session.#response(request, response),
-      onClose: (error) => hooks.closed(error),
-      log: hooks.log,
+    const receiver = session.#receiver;
+    session.#connection = await Connection.open({
+      onData: (listener) => stream.onData(listener),
+      onClose: (listener) => stream.onClose(listener),
+      write: (bytes) => stream.write(bytes),
+      close: () => receiver.closing ??= stream.close(),
+    }, {
+      onEvent: (event) => receiver.session.#event(event),
+      onResponse: (request, response) => receiver.session.#response(request, response),
+      onClose: (error) => {
+        receiver.session.#unavailable();
+        receiver.session.#hooks.closed(error);
+      },
+      log: (message) => receiver.session.#hooks.log(message),
     });
     // Callbacks during the handshake have already applied the status and any later adapter event.
     session.status ??= convert.status(session.#connection.status);
@@ -129,6 +148,34 @@ export class AdapterSession {
     return this.#connection;
   }
 
+  /** Replaces a failed transport while keeping the session's authoritative records and pages. */
+  replace(opened: AdapterSession) {
+    if (!this.closed || opened.adapterId !== this.adapterId || opened.closed) throw new ConnectionClosedError();
+    this.#connection = opened.#connection;
+    this.#receiver = opened.#receiver;
+    this.#receiver.session = this;
+    this.status = opened.status;
+    this.#unavailable();
+    this.#syncing = null;
+    this.#syncAgain = false;
+    this.listError = null;
+    this.#naming.clear();
+    this.#unnamed.clear();
+    this.run();
+  }
+
+  #unavailable() {
+    this.available = false;
+    this.settingsAvailable.clear();
+    this.profilesAvailable = false;
+    this.#currentProfiles.clear();
+  }
+
+  /** Whether a profile has a readable record on the current transport. */
+  profileAvailable(id: number): boolean {
+    return this.profilesAvailable && this.#currentProfiles.has(id);
+  }
+
   /** Reads the devices and keeps them current. */
   run() {
     this.#sync();
@@ -136,12 +183,14 @@ export class AdapterSession {
 
   /** Sends a command for a device, tracking it as pending while it runs. */
   async perform<T>(device: number, command: string, run: (c: Connection) => Promise<T>): Promise<T> {
+    if (!this.available || this.closed) throw new ConnectionClosedError();
+    const connection = this.#connection;
     const list = this.#pending.get(device) ?? [];
     list.push(command);
     this.#pending.set(device, list);
     this.#hooks.changed();
     try {
-      return await run(this.#connection);
+      return await run(connection);
     } finally {
       list.splice(list.indexOf(command), 1);
       if (!list.length) this.#pending.delete(device);
@@ -164,25 +213,39 @@ export class AdapterSession {
       this.#syncAgain = true;
       return;
     }
+    const connection = this.#connection;
+    if (connection.closed) return;
     this.#syncing = (async () => {
       do {
         this.#syncAgain = false;
+        if (this.listError) {
+          this.listError = null;
+          this.#hooks.changed();
+        }
         try {
           // The response replaces the devices as it arrives.
-          await this.#connection.listDevices();
+          await connection.listDevices();
+          if (connection !== this.#connection || connection.closed) break;
+          if (!this.available) break;
           this.listed = true;
           this.#hooks.changed();
           if (this.status.profileSupport) {
             this.#pages.list ??= 0;
             await this.#readProfiles();
+            if (connection !== this.#connection || connection.closed) break;
             await this.#nameReferences();
           }
-          for (const id of [...this.devices.keys()]) await this.#readSettings(id);
+          for (const id of [...this.devices.keys()]) {
+            if (connection !== this.#connection || connection.closed) break;
+            await this.#readSettings(id);
+          }
         } catch (error) {
-          if (this.closed) break;
-          this.#hooks.log(`listing devices failed: ${failure(error, true)}`);
+          if (connection !== this.#connection || connection.closed) break;
+          this.listError = failure(error, true);
+          this.#hooks.log(`listing devices failed: ${this.listError}`);
         }
-      } while (this.#syncAgain && !this.closed);
+      } while (this.#syncAgain && connection === this.#connection && !connection.closed);
+      if (connection !== this.#connection) return;
       this.#syncing = null;
       this.#hooks.changed();
     })();
@@ -231,7 +294,7 @@ export class AdapterSession {
   /** Shows the first, next or previous page of profiles, or the shown one again. The first page
    * and the shown one again list the profiles again; moving between pages uses what was listed. */
   async readPage(page: "first" | "next" | "previous" | "again", view: PageView = "list") {
-    if (!this.status.profileSupport || this.closed) return;
+    if (!this.available || !this.status.profileSupport || this.closed) return;
     const index = this.#pages[view] ?? 0;
     this.#pages[view] = page === "first" ? 0 : page === "next" ? Math.min(index + 1, this.#lastPage) : page === "previous" ? Math.max(0, index - 1) : index;
     if (page === "first" || page === "again" || !this.#profiles) await this.#readProfiles();
@@ -241,16 +304,19 @@ export class AdapterSession {
   /** Lists the profiles. The response replaces the listing as it arrives; a failure leaves what
    * was listed before. */
   async #readProfiles() {
+    const connection = this.#connection;
     const listing = (this.#profiles ??= { profiles: [], unreadable: [], loading: false, error: null });
+    this.profilesAvailable = false;
     listing.loading = true;
     this.#hooks.changed();
     try {
-      await this.#connection.listProfiles();
+      await connection.listProfiles();
     } catch (error) {
-      if (this.closed) return;
+      if (connection !== this.#connection || connection.closed) return;
       listing.error = failure(error, true);
       this.#hooks.log(`profiles unavailable: ${listing.error}`);
     } finally {
+      if (connection !== this.#connection) return;
       listing.loading = false;
       this.#hooks.changed();
     }
@@ -263,30 +329,35 @@ export class AdapterSession {
 
   /** Names the profiles in devices' layers and interfaces that nothing has named yet. */
   async #nameReferences() {
-    if (!this.status.profileSupport || !this.listed || this.closed) return;
+    if (!this.available || !this.status.profileSupport || !this.listed || this.closed) return;
+    const connection = this.#connection;
     const ids = this.status.interfaces.map((i) => i.profile);
     for (const d of this.devices.values()) ids.push(...(d.profiles ?? []));
     for (const id of new Set(ids)) {
-      if (!id || this.profileNames.has(id) || this.#naming.has(id) || this.#unnamed.has(id)) continue;
+      if (connection !== this.#connection || connection.closed) return;
+      if (!id || this.#currentProfiles.has(id) || this.#naming.has(id) || this.#unnamed.has(id)) continue;
       this.#naming.add(id);
       try {
-        await this.#connection.getProfile(id);
+        await connection.getProfile(id);
       } catch (error) {
-        if (this.closed) return;
+        if (connection !== this.#connection || connection.closed) return;
         this.#unnamed.add(id);
         this.#hooks.log(`profile ${id} unavailable: ${failure(error, true)}`);
       } finally {
-        this.#naming.delete(id);
+        if (connection === this.#connection) this.#naming.delete(id);
       }
     }
   }
 
   async #readSettings(id: number) {
-    if (!this.devices.has(id) || this.closed) return;
-    await this.#connection.listSettings(id).then(
-      () => this.settingsErrors.delete(id),
+    if (!this.available || !this.devices.has(id) || this.closed) return;
+    this.settingsAvailable.delete(id);
+    this.#hooks.changed();
+    const connection = this.#connection;
+    await connection.listSettings(id).then(
+      () => { if (connection === this.#connection && !connection.closed) this.settingsErrors.delete(id); },
       (error: unknown) => {
-        if (this.closed || !this.devices.has(id)) return;
+        if (connection !== this.#connection || connection.closed || !this.devices.has(id)) return;
         const reason = failure(error, true);
         this.#hooks.log(`settings of ${id} unavailable: ${reason}`);
         this.settingsErrors.set(id, reason);
@@ -327,6 +398,7 @@ export class AdapterSession {
         this.#setStatus(result.value);
         break;
       case "devices": {
+        if (!this.status.ready) break;
         // The listing replaces the devices. A device whose record couldn't be read keeps what was
         // known of it, as last known: a failed read is no proof that it is gone.
         const { entries } = result.value;
@@ -341,24 +413,30 @@ export class AdapterSession {
           this.readErrors.set(u.id, error);
           this.#hooks.log(`device ${u.id} unreadable: ${errorText(error, "read")}`);
         }
+        this.available = true;
         break;
       }
       case "device":
         this.#putDevice(convert.device(result.value), false);
         break;
       case "settings": {
+        if (!this.available) break;
         const { device, objects } = result.value;
         if (!this.devices.has(device)) break;
         this.settings.set(device, convert.settings(objects).sort(convert.compareSettings));
+        this.settingsAvailable.add(device);
         break;
       }
       case "profile":
         this.#named(convert.profile(result.value));
         break;
       case "profiles": {
+        if (!this.available) break;
         const { entries } = result.value;
         const profiles = entries.flatMap((e) => (e.entry.case === "profile" ? [convert.profile(e.entry.value)] : []));
+        this.#currentProfiles.clear();
         for (const p of profiles) this.#named(p);
+        this.profilesAvailable = true;
         const listing = (this.#profiles ??= { profiles: [], unreadable: [], loading: false, error: null });
         listing.profiles = profiles.sort((a, b) => a.id - b.id);
         listing.unreadable = entries
@@ -440,6 +518,8 @@ export class AdapterSession {
 
   #event(event: Event) {
     const kind = event.kind;
+    // A replacement transport's listing confirms which device IDs are current.
+    if (!this.available && kind.case !== "adapter") return;
     switch (kind.case) {
       case "adapter": {
         const wasReady = this.status?.ready;
@@ -478,6 +558,7 @@ export class AdapterSession {
   }
 
   #named(p: Profile) {
+    this.#currentProfiles.add(p.id);
     this.#unnamed.delete(p.id);
     this.profileNames.set(p.id, p);
   }
@@ -492,6 +573,7 @@ export class AdapterSession {
   }
 
   #profileRemoved(id: number) {
+    this.#currentProfiles.delete(id);
     this.#unnamed.delete(id);
     this.profileNames.delete(id);
     const listing = this.#profiles;
@@ -505,6 +587,7 @@ export class AdapterSession {
     const next = convert.status(status);
     // Another adapter can't answer on this session; keep the identity it opened with.
     if (!this.status || next.id === this.status.id) this.status = next;
+    if (!this.status.ready) this.#unavailable();
     void this.#nameReferences();
   }
 
@@ -520,12 +603,15 @@ export class AdapterSession {
   #remove(id: number) {
     this.devices.delete(id);
     this.settings.delete(id);
+    this.settingsAvailable.delete(id);
     this.settingsErrors.delete(id);
     this.readErrors.delete(id);
   }
 
   /** Ends the session; the adapter stops any scan and unsaved pairing. */
   async close() {
+    this.#unavailable();
     await this.#connection.close();
+    await this.#receiver.closing?.catch(() => {});
   }
 }

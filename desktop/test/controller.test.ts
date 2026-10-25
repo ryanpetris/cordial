@@ -4,7 +4,7 @@ import { AdapterManager } from "../src/core/manager.ts";
 import { AdapterSession } from "../src/core/session.ts";
 import { FakeAdapter, device, profile } from "../src/fake/adapter.ts";
 import type { AppState } from "../src/shared/state.ts";
-import { adapterStatus, codeText, connected, deviceStatus, inactiveText, transportDisabledText } from "../src/shared/text.ts";
+import { READ_FAILED, adapterStatus, codeText, connected, deviceStatus, inactiveText, transportDisabledText } from "../src/shared/text.ts";
 import { controller, openSession, until } from "./helpers.ts";
 
 /** Every adapter is ready and `devices` devices are listed. */
@@ -14,6 +14,61 @@ const loaded = (s: AppState | null, devices: number) =>
 const commands = (fake: FakeAdapter) => fake.received.map((r) => r.command.case);
 
 describe("Controller", () => {
+  it("keeps a fresh adapter connected while its first device list is pending", async () => {
+    const fake = new FakeAdapter();
+    const { c } = controller({ "/a": fake });
+    let release = () => {};
+    const write = fake.write.bind(fake);
+    const spy = vi.spyOn(fake, "write").mockImplementation(async (bytes) => {
+      await write(bytes);
+      if (fake.received.at(-1)?.command.case === "getStatus") release = fake.hold();
+    });
+    try {
+      await c.manager.rescan();
+      await until(() => fake.received.some((r) => r.command.case === "listDevices"));
+      expect(c.state().adapters[0]).toMatchObject({ connection: "connected", listing: true, listError: null });
+      expect(adapterStatus(c.state().adapters[0]!)).toEqual({ text: "Starting…", warn: false });
+      expect(c.manager.connected.get(fake.id)!.session.available).toBe(false);
+      release();
+      await until(() => loaded(c.state(), 4));
+    } finally {
+      spy.mockRestore();
+      release();
+      await c.stop();
+    }
+  });
+
+  it("retries a failed first device list on the live adapter", async () => {
+    const fake = new FakeAdapter();
+    fake.failures.listDevices = [ErrorCode.STORAGE_FAILED];
+    const { c, deps } = controller({ "/a": fake });
+    let release = () => {};
+    try {
+      await c.manager.rescan();
+      await until(() => deps.log.mock.calls.some(([message]) => message.includes("listing devices failed")) && !c.state().adapters[0]!.listing);
+      const entry = c.manager.connected.get(fake.id)!;
+      expect(entry.recovery).toBeNull();
+      expect(entry.session.available).toBe(false);
+      expect(c.state().adapters[0]).toMatchObject({ connection: "connected", listing: false, listError: READ_FAILED });
+      expect(adapterStatus(c.state().adapters[0]!)).toEqual({ text: "Needs Attention", warn: true });
+      // While Retry lists again, the adapter is starting and the failure is gone.
+      release = fake.hold();
+      expect(await c.act({ type: "devices.reload", adapterId: fake.id })).toEqual({ ok: true });
+      await until(() => fake.received.filter((r) => r.command.case === "listDevices").length === 2);
+      expect(c.state().adapters[0]).toMatchObject({ connection: "connected", listing: true, listError: null });
+      expect(adapterStatus(c.state().adapters[0]!)).toEqual({ text: "Starting…", warn: false });
+      release();
+      await until(() => loaded(c.state(), 4));
+      expect(c.state().adapters[0]).toMatchObject({ listing: false, listError: null });
+      expect(adapterStatus(c.state().adapters[0]!)).toEqual({ text: "Ready", warn: false });
+      expect(c.manager.connected.get(fake.id)).toBe(entry);
+      expect(fake.received.filter((r) => r.command.case === "listDevices")).toHaveLength(2);
+    } finally {
+      release();
+      await c.stop();
+    }
+  });
+
   it("closes a reconnect that finishes opening after shutdown", async () => {
     const fake = new FakeAdapter({ adapterId: "AAAA0001" });
     const open = vi.fn(async () => fake.open());
@@ -61,7 +116,7 @@ describe("Controller", () => {
     });
     await manager.rescan();
     expect(manager.connected.size).toBe(0);
-    expect(log).toHaveBeenCalledWith("/a: session ended while opening");
+    await until(() => log.mock.calls.some(([message]) => message === "/a: session ended while opening"));
     await manager.stop();
   });
 
@@ -140,14 +195,15 @@ describe("Controller", () => {
     await c.manager.rescan();
     await until(() => loaded(state(), 4) && state()!.adapters[0]!.profilePage?.profiles.length === 1);
     const before = c.state().adapters[0]!;
+    const devices = c.state().devices;
     vi.useFakeTimers();
     try {
       delete deps.ports["/a"];
       if (source === "session") a.unplug();
       else await c.manager.rescan();
       await vi.advanceTimersByTimeAsync(0);
-      expect(c.state().adapters).toEqual([{ ...before, connection: "connecting", readiness: "waiting", listing: true, attention: [] }]);
-      expect(c.state().devices).toEqual([]);
+      expect(c.state().adapters).toEqual([{ ...before, connection: "reconnecting", readiness: "waiting", profilesAvailable: false }]);
+      expect(c.state().devices).toEqual(devices.map((d) => ({ ...d, available: false, settingsAvailable: false, battery: d.battery && { ...d.battery, percentFresh: false, chargingFresh: false } })));
       expect(await c.act({ type: "profile.delete", adapterId: a.id, profile: 1 })).toMatchObject({ ok: false });
       expect(a.profiles).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(14999);
@@ -164,28 +220,32 @@ describe("Controller", () => {
 
   it("waits for a returning adapter's devices only while it is listing them", async () => {
     const a = new FakeAdapter({ adapterId: "AAAA0001" });
-    const { c, deps, ports, state } = controller({ "/a": a });
-    ports.list = async () => Object.keys(deps.ports).map((path) => ({ path, serial: null }));
+    const { c, deps, state } = controller({ "/a": a });
     await c.manager.rescan();
     await until(() => loaded(state(), 4));
     expect(c.state().adapters[0]!.listing).toBe(false);
     delete deps.ports["/a"];
     a.unplug();
-    await until(() => c.state().adapters[0]?.connection === "connecting");
-    expect(c.state().adapters[0]!.listing).toBe(true);
+    await until(() => c.state().adapters[0]?.connection === "reconnecting");
+    expect(c.state().adapters[0]!.listing).toBe(false);
+    const before = c.state().devices;
     a.failures.listDevices = [ErrorCode.STORAGE_FAILED];
     deps.ports["/b"] = a;
     await c.manager.rescan();
-    await until(() => c.state().adapters[0]?.connection === "connected" && !c.state().adapters[0]!.listing);
-    expect(c.state().adapters[0]!.connection).toBe("connected");
-    expect(c.state().devices).toEqual([]);
+    await until(() => a.received.some((r) => r.command.case === "listDevices"));
+    expect(c.state().adapters[0]!.connection).toBe("reconnecting");
+    expect(c.state().devices).toEqual(before);
+    // A failed listing during recovery leaves the adapter reconnecting rather than reporting it.
+    await until(() => deps.log.mock.calls.some(([message]) => message.includes("listing devices failed")));
+    expect(c.state().adapters[0]).toMatchObject({ connection: "reconnecting", listError: null });
+    await until(() => c.state().adapters[0]?.connection === "connected");
+    expect(c.state().devices).toHaveLength(4);
     await c.stop();
   });
 
   it("reconnects by adapter identity on a new port and cancels the expiry", async () => {
     const a = new FakeAdapter({ adapterId: "AAAA0001" });
-    const { c, deps, ports, state } = controller({ "/a": a });
-    ports.list = async () => Object.keys(deps.ports).map((path) => ({ path, serial: null }));
+    const { c, deps, state } = controller({ "/a": a });
     await c.manager.rescan();
     await until(() => loaded(state(), 4));
     vi.useFakeTimers();
@@ -193,20 +253,20 @@ describe("Controller", () => {
       delete deps.ports["/a"];
       a.unplug();
       await vi.advanceTimersByTimeAsync(14000);
-      expect(c.state().adapters[0]?.connection).toBe("connecting");
+      expect(c.state().adapters[0]?.connection).toBe("reconnecting");
       deps.ports["/b"] = a;
       await c.manager.rescan();
       await vi.advanceTimersByTimeAsync(100);
       expect(loaded(c.state(), 4)).toBe(true);
-      expect(c.manager.reconnecting.size).toBe(0);
+      expect([...c.manager.connected.values()].some((c) => c.recovery)).toBe(false);
       await vi.advanceTimersByTimeAsync(2000);
       expect(c.state().adapters).toHaveLength(1);
       expect(c.state().adapters[0]?.connection).toBe("connected");
       delete deps.ports["/b"];
       await c.manager.rescan();
-      expect(c.manager.reconnecting.size).toBe(1);
+      expect([...c.manager.connected.values()].some((c) => c.recovery)).toBe(true);
       await c.stop();
-      expect(c.manager.reconnecting.size).toBe(0);
+      expect([...c.manager.connected.values()].some((c) => c.recovery)).toBe(false);
       await vi.advanceTimersByTimeAsync(100);
       expect(vi.getTimerCount()).toBe(0);
     } finally {
@@ -331,9 +391,8 @@ describe("Controller", () => {
     expect(await c.act({ type: "device.update", key: "AAAA0001/1", trusted: false })).toEqual(notReady);
     expect(await c.act({ type: "settings.save", key: "AAAA0001/2", changes: [] })).toEqual(notReady);
     expect(a.received.length).toBe(sent);
-    // Refreshing a connected device and disconnecting need neither Bluetooth nor storage.
-    expect(await c.act({ type: "device.refresh", key: "AAAA0001/2" })).toEqual({ ok: true });
-    expect(await c.act({ type: "device.disconnect", key: "AAAA0001/2" })).toEqual({ ok: true });
+    expect(await c.act({ type: "device.refresh", key: "AAAA0001/2" })).toEqual(notReady);
+    expect(await c.act({ type: "device.disconnect", key: "AAAA0001/2" })).toEqual(notReady);
     await c.stop();
   });
 
@@ -596,9 +655,9 @@ describe("Controller", () => {
     await until(() => !!state()!.pairing?.prompt);
     delete deps.ports["/a"];
     a.unplug();
-    await until(() => state()!.adapters[0]?.connection === "connecting");
+    await until(() => state()!.adapters[0]?.connection === "reconnecting");
     expect(state()!.scan).toBeNull();
-    expect(state()!.pairing).toBeNull();
+    expect(state()!.pairing).toMatchObject({ phase: "failed", prompt: null });
     await c.stop();
   });
 });

@@ -117,7 +117,9 @@ export function AdapterProfiles({ adapter, locked }: { adapter: AdapterEntry; lo
   const ready = adapter.connection === "connected" && !!adapter.status?.ready;
   const page = adapter.profilePage;
   const profiles = page?.profiles ?? [];
-  const disabled = busy || locked || !ready;
+  const disabled = busy || locked || !ready || !adapter.profilesAvailable;
+  const dialogAvailable = ready && adapter.profilesAvailable &&
+    (open?.kind === "create" || !!(open && profiles.some((p) => p.id === open.profile.id)));
   const close = () => {
     if (busy) return;
     setOpen(null);
@@ -154,7 +156,13 @@ export function AdapterProfiles({ adapter, locked }: { adapter: AdapterEntry; lo
     )),
     ...(page?.unreadable ?? []).map(({ id, error }) => {
       const detail = errorText(error, "read");
-      return <Row key={id} title={`Profile ${id}`} subtitle={detail === READ_FAILED ? "Couldn't Read" : `Couldn't Read: ${reasonText(detail)}`} dim />;
+      return (
+        <Row key={id} title={profileText(adapter, id)} subtitle={detail === READ_FAILED ? "Couldn't Read" : `Couldn't Read: ${reasonText(detail)}`} dim>
+          <button disabled={busy || locked || !ready} onClick={() => void run({ type: "adapter.reload", adapterId: adapter.id })}>
+            <RefreshIcon /> Retry
+          </button>
+        </Row>
+      );
     }),
   ];
   return (
@@ -173,7 +181,7 @@ export function AdapterProfiles({ adapter, locked }: { adapter: AdapterEntry; lo
       >
         {page?.error ? (
           <Row title={page.error === READ_FAILED ? "The adapter couldn't read its profiles. Try again." : `The adapter couldn't read its profiles. ${page.error}`}>
-            <button disabled={disabled} onClick={() => void run({ type: "adapter.reload", adapterId: adapter.id })}>
+            <button disabled={busy || locked || !ready} onClick={() => void run({ type: "adapter.reload", adapterId: adapter.id })}>
               <RefreshIcon /> Retry
             </button>
           </Row>
@@ -203,7 +211,7 @@ export function AdapterProfiles({ adapter, locked }: { adapter: AdapterEntry; lo
             initial={open.kind === "create" ? "" : copyName(open.profile.name)}
             label={open.kind === "create" ? "Create" : "Copy"}
             busy={busy}
-            available={ready}
+            available={dialogAvailable}
             error={failure}
             onCancel={close}
             onSubmit={(name) =>
@@ -218,7 +226,7 @@ export function AdapterProfiles({ adapter, locked }: { adapter: AdapterEntry; lo
               <button disabled={busy} onClick={close}>
                 <CloseIcon /> Cancel
               </button>
-              <button className="destructive" disabled={busy || !ready} onClick={() => void inDialog({ type: "profile.delete", adapterId: adapter.id, profile: open.profile.id })}>
+              <button className="destructive" disabled={busy || !dialogAvailable} onClick={() => void inDialog({ type: "profile.delete", adapterId: adapter.id, profile: open.profile.id })}>
                 <TrashIcon /> Delete
               </button>
             </footer>
@@ -259,6 +267,7 @@ function ProfilePicker({ adapter, value, none, label, onChoose, onCancel }: {
   const [chosen, setChosen] = useState(value);
   const group = useId();
   const page = adapter.pickerPage;
+  const off = adapter.connection !== "connected" || !adapter.status?.ready || !adapter.profilesAvailable;
   const adapterId = adapter.id;
   useEffect(() => void act({ type: "profiles.page", adapterId, page: "first", picker: true }, true), [adapterId]);
   const choices: [number, string, RoleName[]][] = [
@@ -276,7 +285,7 @@ function ProfilePicker({ adapter, value, none, label, onChoose, onCancel }: {
               <span className="row-text">{text}</span>
               <span className="row-end">
                 <RoleIcons roles={roles} />
-                <input type="radio" className="radio" name={group} aria-label={text} checked={chosen === id} onChange={() => setChosen(id)} />
+                <input type="radio" className="radio" name={group} aria-label={text} disabled={off} checked={chosen === id} onChange={() => setChosen(id)} />
               </span>
             </label>
           ))}
@@ -285,11 +294,11 @@ function ProfilePicker({ adapter, value, none, label, onChoose, onCancel }: {
       </div>
       <footer className="dialog-footer">
         {page?.loading ? <Spinner /> : null}
-        <PageControls adapter={adapter} picker disabled={false} />
+        <PageControls adapter={adapter} picker disabled={off} />
         <button onClick={onCancel}>
           <CloseIcon /> Cancel
         </button>
-        <button className="suggested" disabled={!none && !chosen} onClick={() => onChoose(chosen)}>
+        <button className="suggested" disabled={off || (!none && !chosen)} onClick={() => onChoose(chosen)}>
           <CheckIcon /> Choose
         </button>
       </footer>
@@ -320,10 +329,10 @@ export function ConfigurationInterfaces({ adapter, interfaces, changed, locked, 
         return (
           <Row key={i.interface} title={name}>
             {staged ? <Staged label={name} /> : i.enabled && !i.active ? <span className="muted small">Inactive</span> : null}
-            <button aria-label={`${name} Profile`} aria-haspopup="dialog" disabled={locked} onClick={() => setPicking(i)}>
+            <button aria-label={`${name} Profile`} aria-haspopup="dialog" disabled={locked || !adapter.profilesAvailable} onClick={() => setPicking(i)}>
               {i.profile ? profileText(adapter, i.profile) : "Choose Profile"}
             </button>
-            <Switch label={name} checked={i.enabled} disabled={locked || (!i.enabled && !canEnable(interfaces, i))} onChange={(enabled) => onChange(i.interface, { enabled })} />
+            <Switch label={name} checked={i.enabled} disabled={locked || !adapter.profilesAvailable || (!i.enabled && !canEnable(interfaces, i))} onChange={(enabled) => onChange(i.interface, { enabled })} />
           </Row>
         );
       })}

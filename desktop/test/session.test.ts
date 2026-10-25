@@ -289,7 +289,7 @@ describe("AdapterSession", () => {
       { integration: 1, group: "pointer_sensor", index: 1, field: "dpi", type: "integer", value: 800, saved: null, state: null, error: null, choices: [400, 800], min: null, max: null, step: null },
       { integration: 1, group: "wheel", index: null, field: "mode", type: "enum", value: "stepped", saved: "free_spin", state: null, error: { code: "timeout", reason: "unknown", outcome: "unspecified", related: [] }, choices: ["free_spin", "stepped"], min: null, max: null, step: null },
     ]);
-    const entry = () => ({ device: session.devices.get(1)!, readError: null });
+    const entry = () => ({ device: session.devices.get(1)!, readError: null, available: session.available, settingsAvailable: session.settingsAvailable.has(1) });
     expect(settingsCurrent(entry())).toBe(true);
     expect(versionText(entry().device.hidpp!)).toBe("4.2");
     fake.changeDevice(1, { hidppState: IntegrationState.STARTING });
@@ -315,7 +315,8 @@ describe("AdapterSession", () => {
 
   it("lists the devices again once the adapter becomes ready", async () => {
     const { fake, session } = await openSession({ ready: false });
-    await until(() => session.listed);
+    await until(() => !session.listing);
+    expect(session.available).toBe(false);
     expect(session.status.ready).toBe(false);
     fake.changeAdapter({ ready: true });
     await until(() => fake.received.filter((r) => r.command.case === "listDevices").length === 2);

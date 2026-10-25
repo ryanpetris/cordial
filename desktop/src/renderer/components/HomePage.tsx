@@ -19,8 +19,10 @@ export function HomePage({ state, onSelect }: { state: AppState; onSelect: (s: S
 
   const threshold = state.preferences.lowBatteryPercent;
   const adapterName = (id: string) => state.adapters.find((a) => a.id === id)?.name ?? "";
-  const several = state.adapters.filter((a) => a.connection === "connected").length > 1;
+  const several = state.adapters.filter((a) => a.connection === "connected" || a.connection === "reconnecting").length > 1;
   const connected = state.devices.filter(isConnected);
+  // Devices last reported connected keep their tiles while their adapter reconnects.
+  const tiles = state.devices.filter((d) => !d.readError && d.device.state === "connected");
   const low = state.devices.filter((d) => isLow(d.battery, threshold));
   return (
     <Page icon={<HomeIcon size={20} />} title="Overview">
@@ -49,15 +51,15 @@ export function HomePage({ state, onSelect }: { state: AppState; onSelect: (s: S
         </Card>
       ) : null}
 
-      {connected.length ? (
+      {tiles.length ? (
         <section className="group">
-          <h2>Connected</h2>
+          <h2>Devices</h2>
           <div className="tiles">
-            {connected.map((d) => {
+            {tiles.map((d) => {
               const percent = d.battery?.percent;
               const dim = isLow(d.battery, threshold);
               return (
-                <button key={d.key} className="card tile" onClick={() => onSelect({ page: "device", key: d.key })}>
+                <button key={d.key} className={d.available ? "card tile" : "card tile off"} onClick={() => onSelect({ page: "device", key: d.key })}>
                   <span className="tile-icon">
                     <DeviceIcon kind={d.kind} size={26} />
                   </span>
