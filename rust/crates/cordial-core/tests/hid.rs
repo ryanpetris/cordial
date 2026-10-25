@@ -300,13 +300,13 @@ fn consumer_field(usage: u16, size: u8, minimum: i16, maximum: u16, flags: u8) -
 }
 
 #[test]
-fn consumer_counts_keep_order_and_retry_bytes_until_completion() {
+fn consumer_motion_keeps_order_and_non_volume_backlog() {
     let map = Map::compile(&consumer_field(0xe0, 16, i16::MIN, i16::MAX as u16, 6)).unwrap();
     let mut state = map.state().unwrap();
     let mut forward = Forwarder::default();
     drain(&mut forward);
     let axis = CONSUMER_AXES.iter().position(|&u| u == 0xe0).unwrap();
-    for value in [i16::MAX, -3] {
+    for value in [1i16, -1] {
         let input = map.decode(&mut state, 0, &value.to_le_bytes()).unwrap();
         assert_eq!(input.consumer_motion[axis], i64::from(value));
         assert_eq!(input.held, Held::default());
@@ -317,16 +317,17 @@ fn consumer_counts_keep_order_and_retry_bytes_until_completion() {
     assert_eq!(first.bytes(), forward.packet().unwrap().bytes());
     assert_eq!(
         i32::from_le_bytes(first.bytes()[axis * 4..axis * 4 + 4].try_into().unwrap()),
-        i32::from(i16::MAX)
+        1
     );
     forward.complete();
     let second = forward.packet().unwrap().clone();
     assert_eq!(
         i32::from_le_bytes(second.bytes()[axis * 4..axis * 4 + 4].try_into().unwrap()),
-        -3
+        -1
     );
     forward.complete();
     assert!(forward.packet().is_none());
+    let axis = CONSUMER_AXES.iter().position(|&u| u == 0xe1).unwrap();
     let mut large = Input::default();
     large.consumer_motion[axis] = MOTION_LIMIT;
     forward.input(0, large).unwrap();
@@ -347,6 +348,132 @@ fn consumer_counts_keep_order_and_retry_bytes_until_completion() {
             .iter()
             .all(|p| p.id != REPORT_CONSUMER_MOTION)
     );
+}
+
+fn wide_consumer_field(usage: u16, size: u8) -> Vec<u8> {
+    let [usage_lo, usage_hi] = usage.to_le_bytes();
+    vec![
+        5, 12, 9, 1, 0xa1, 1, 0x0a, usage_lo, usage_hi, 0x17, 0, 0, 0, 0x80, 0x27, 0xff, 0xff,
+        0xff, 0x7f, 0x75, size, 0x95, 1, 0x81, 6, 0xc0,
+    ]
+}
+
+#[test]
+fn relative_volume_parser_saturates_extremes_and_excess_aggregation() {
+    let axis = CONSUMER_AXES.iter().position(|&u| u == 0xe0).unwrap();
+    for (size, reports) in [
+        (
+            32,
+            vec![
+                (i32::MIN.to_le_bytes().to_vec(), -1),
+                ((-2i32).to_le_bytes().to_vec(), -1),
+                (2i32.to_le_bytes().to_vec(), 1),
+                (i32::MAX.to_le_bytes().to_vec(), 1),
+            ],
+        ),
+        (
+            64,
+            vec![
+                (i64::MIN.to_le_bytes().to_vec(), -1),
+                ((-2i64).to_le_bytes().to_vec(), -1),
+                (2i64.to_le_bytes().to_vec(), 1),
+                (i64::MAX.to_le_bytes().to_vec(), 1),
+            ],
+        ),
+    ] {
+        let map = Map::compile(&wide_consumer_field(0xe0, size)).unwrap();
+        for (report, expected) in reports {
+            assert_eq!(
+                map.decode(&mut map.state().unwrap(), 0, &report)
+                    .unwrap()
+                    .consumer_motion[axis],
+                expected
+            );
+        }
+    }
+
+    let repeated = [
+        5, 12, 9, 1, 0xa1, 1, 0x0a, 0xe0, 0, 0x15, 0xff, 0x25, 1, 0x75, 2, 0x95, 3, 0x81, 6, 0xc0,
+    ];
+    let map = Map::compile(&repeated).unwrap();
+    for (report, expected) in [(0x15, 1), (0x3f, -1), (0x35, 0), (0x1f, 0)] {
+        assert_eq!(
+            map.decode(&mut map.state().unwrap(), 0, &[report])
+                .unwrap()
+                .consumer_motion[axis],
+            expected
+        );
+    }
+}
+
+#[test]
+fn relative_volume_bound_survives_queue_backpressure() {
+    let volume = CONSUMER_AXES.iter().position(|&u| u == 0xe0).unwrap();
+    let other = CONSUMER_AXES.iter().position(|&u| u == 0xe1).unwrap();
+    let mut forward = Forwarder::default();
+    drain(&mut forward);
+
+    for (value, expected) in [
+        (-1, -1),
+        (1, 1),
+        (-2, -1),
+        (2, 1),
+        (i64::from(i32::MIN), -1),
+        (i64::from(i32::MAX), 1),
+        (i64::MIN, -1),
+        (i64::MAX, 1),
+    ] {
+        let mut input = Input::default();
+        input.consumer_motion[volume] = value;
+        input.consumer_motion[other] = 7;
+        forward.input(0, input).unwrap();
+        let packet = forward.packet().unwrap().clone();
+        assert_eq!(packet.id, REPORT_CONSUMER_MOTION);
+        assert_eq!(
+            i32::from_le_bytes(
+                packet.bytes()[volume * 4..volume * 4 + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            expected
+        );
+        assert_eq!(
+            i32::from_le_bytes(packet.bytes()[other * 4..other * 4 + 4].try_into().unwrap()),
+            7
+        );
+        forward.complete();
+    }
+    assert!(forward.packet().is_none());
+
+    let mut step = Input::default();
+    step.consumer_motion[volume] = 1;
+    forward.input(0, step).unwrap();
+    let pending = forward.packet().unwrap().clone();
+    assert_eq!(pending.bytes(), forward.packet().unwrap().bytes());
+    for n in 0..QUEUE {
+        step.consumer_motion[volume] = if n % 2 == 0 { -1 } else { 1 };
+        forward.input(1 + n % 2, step).unwrap();
+    }
+    let before = forward.pending();
+    step.consumer_motion[volume] = i64::MAX;
+    assert_eq!(forward.input(0, step), Err(Error::Overflow));
+    assert_eq!(forward.pending(), before);
+    step.consumer_motion[volume] = 1;
+    assert_eq!(forward.input(0, step), Err(Error::Overflow));
+    forward.complete();
+    let packets = drain(&mut forward);
+    assert_eq!(packets.len(), QUEUE);
+    assert!(packets.iter().all(|packet| {
+        packet.id == REPORT_CONSUMER_MOTION
+            && matches!(
+                i32::from_le_bytes(
+                    packet.bytes()[volume * 4..volume * 4 + 4]
+                        .try_into()
+                        .unwrap()
+                ),
+                -1 | 1
+            )
+    }));
 }
 
 #[test]

@@ -1,7 +1,32 @@
 //! Raw HID configuration interfaces and the USB serial marker that follows them.
 use crate::{Interface, Io, RawPacket};
-use embassy_futures::select::{Either, select};
-use embassy_usb::{class::hid, driver::Driver};
+use embassy_futures::select::select;
+use embassy_usb::{
+    class::hid,
+    control::{Recipient, Request, RequestType},
+    driver::{Direction, Driver, EndpointError},
+};
+
+/// Raw HID supports report transfers only; idle retransmission would duplicate editor replies.
+pub(crate) fn valid_request(io: &Io, req: Request) -> bool {
+    if req.request_type != RequestType::Class
+        || req.recipient != Recipient::Interface
+        || !io.raw.iter().any(|queue| {
+            let number = queue
+                .interface_number
+                .load(core::sync::atomic::Ordering::Relaxed);
+            number != u8::MAX && req.index == u16::from(number)
+        })
+    {
+        return true;
+    }
+    io.status().configured
+        && match req.request {
+            1 => req.direction == Direction::In && req.value == 0x0100 && req.length != 0,
+            9 => req.direction == Direction::Out && req.value == 0x0200 && req.length == 32,
+            _ => false,
+        }
+}
 
 /// Vial discovers adapters whose USB serial ends with this marker.
 pub const VIAL_SERIAL_SUFFIX: &[u8; 14] = b"-vial:f64c2b3c";
@@ -26,12 +51,29 @@ impl embassy_usb::Handler for SerialNumber<'_> {
     }
 }
 
-/// Accepts output reports sent through the control endpoint, including by hidapi.
+/// Serves the last completed input report and accepts control output reports, including hidapi.
 pub struct ReportHandler<'a> {
     pub io: &'a Io,
     pub slot: usize,
 }
 impl hid::RequestHandler for ReportHandler<'_> {
+    fn get_report(&mut self, id: hid::ReportId, buf: &mut [u8]) -> Option<usize> {
+        let generation = self.io.status().generation;
+        let interface = current_request(self.io, generation, self.slot)?;
+        if id != hid::ReportId::In(0) {
+            return None;
+        }
+        let length = buf.len().min(32);
+        buf[..length].fill(0);
+        self.io.raw[self.slot].input.lock(|input| {
+            if let Some(input) = input.borrow().as_ref()
+                && input.interface == interface
+            {
+                buf[..length].copy_from_slice(&input.bytes[..length]);
+            }
+        });
+        Some(length)
+    }
     fn set_report(&mut self, id: hid::ReportId, data: &[u8]) -> embassy_usb::control::OutResponse {
         use embassy_usb::control::OutResponse;
         let generation = self.io.status().generation;
@@ -81,41 +123,61 @@ pub async fn run<'d, D: Driver<'d>>(
     slot: usize,
 ) {
     let (mut reader, mut writer) = hid.split();
-    let mut read_status = io.status.receiver().unwrap();
-    let receive = async {
-        loop {
-            let mut bytes = [0; 32];
-            let generation = read_status.get_and(|s| s.configured).await.generation;
-            if let Either::First(Ok(32)) = select(
-                reader.read(&mut bytes),
-                read_status.changed_and(|s| s.generation != generation),
-            )
-            .await
-                && let Some(interface) = current_request(io, generation, slot)
-            {
-                io.raw[slot]
-                    .rx
-                    .send(RawPacket {
-                        generation,
-                        interface,
-                        bytes,
-                    })
-                    .await;
+    let mut status = io.status.receiver().unwrap();
+    loop {
+        let generation = status.get_and(|s| s.configured).await.generation;
+        let receive = async {
+            loop {
+                let mut bytes = [0; 32];
+                reader.ready().await;
+                if let Ok(32) = reader.read(&mut bytes).await
+                    && let Some(interface) = current_request(io, generation, slot)
+                {
+                    io.raw[slot]
+                        .rx
+                        .send(RawPacket {
+                            generation,
+                            interface,
+                            bytes,
+                        })
+                        .await;
+                    io.changed.signal(());
+                }
+            }
+        };
+        let transmit = async {
+            loop {
+                let response = io.raw[slot].tx.receive().await;
                 io.changed.signal(());
+                while current_request(io, response.generation, slot) == Some(response.interface) {
+                    writer.ready().await;
+                    if current_request(io, response.generation, slot) != Some(response.interface) {
+                        break;
+                    }
+                    match writer.write(&response.bytes).await {
+                        Ok(()) => {
+                            if current_request(io, response.generation, slot)
+                                == Some(response.interface)
+                            {
+                                io.raw[slot]
+                                    .input
+                                    .lock(|input| *input.borrow_mut() = Some(response));
+                            }
+                            break;
+                        }
+                        Err(EndpointError::Disabled) => {}
+                        Err(_) => break,
+                    }
+                }
             }
-        }
-    };
-    let transmit = async {
-        loop {
-            let response = io.raw[slot].tx.receive().await;
-            io.changed.signal(());
-            writer.ready().await;
-            if current_request(io, response.generation, slot) == Some(response.interface) {
-                let _ = writer.write(&response.bytes).await;
-            }
-        }
-    };
-    embassy_futures::join::join(receive, transmit).await;
+        };
+        // Consume buffered OUT reports under their original generation before cancelling reads.
+        select(
+            embassy_futures::join::join(receive, transmit),
+            status.changed_and(|s| s.generation != generation),
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]

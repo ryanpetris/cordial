@@ -21,6 +21,9 @@ pub mod owner;
 mod serial;
 #[cfg(test)]
 mod tests;
+mod wake;
+#[cfg(test)]
+mod wake_tests;
 #[cfg(feature = "gamepad")]
 pub mod xinput;
 
@@ -127,6 +130,8 @@ fn used_slots(set: u8) -> usize {
 struct RawQueue {
     rx: Channel<CS, RawPacket, 1>,
     tx: Channel<CS, RawPacket, 1>,
+    input: Mutex<CS, RefCell<Option<RawPacket>>>,
+    interface_number: AtomicU8,
 }
 
 /// The configuration interfaces USB starts with: the saved enabled set, without interfaces whose
@@ -268,12 +273,14 @@ pub struct Io {
     serial_done: Channel<CS, SerialDone, 1>,
     serial_rx: Channel<CS, SerialRx, 1>,
     rx_drained: Watch<CS, u64, 1>,
+    control: Mutex<CS, RefCell<serial::ControlState>>,
     raw: [RawQueue; SLOTS],
     /// The enabled configuration interfaces the current enumeration exposes.
     interfaces: AtomicU8,
     desktop: AtomicBool,
     budget: Budget,
     reconnect: Signal<CS, Topology>,
+    wake: wake::Wake,
     #[cfg(feature = "gamepad")]
     outputs: outputs::Outputs,
 }
@@ -307,22 +314,27 @@ impl Io {
             serial_done: Channel::new(),
             serial_rx: Channel::new(),
             rx_drained: Watch::new_with(0),
+            control: Mutex::new(RefCell::new(serial::ControlState::new())),
             raw: [const {
                 RawQueue {
                     rx: Channel::new(),
                     tx: Channel::new(),
+                    input: Mutex::new(RefCell::new(None)),
+                    interface_number: AtomicU8::new(u8::MAX),
                 }
             }; SLOTS],
             interfaces: AtomicU8::new(0),
             desktop: AtomicBool::new(false),
             budget: compiled_budget(budget),
             reconnect: Signal::new(),
+            wake: wake::Wake::new(),
             #[cfg(feature = "gamepad")]
             outputs: outputs::Outputs::new(),
         }
     }
     /// Set the allocation before starting the owner and when rebuilding USB.
     pub fn set_topology(&self, topology: Topology) {
+        self.wake.reset();
         self.desktop.store(topology.desktop, Ordering::Relaxed);
         self.set_interfaces(topology.interfaces);
         #[cfg(feature = "gamepad")]
@@ -363,9 +375,13 @@ impl Io {
         self.changed.signal(());
     }
     fn reset(&self, configured: bool) {
+        self.wake.suspend(false);
         #[cfg(feature = "gamepad")]
         self.outputs.reset();
         self.reports.lock(|r| *r.borrow_mut() = idle_reports());
+        for queue in &self.raw {
+            queue.input.lock(|input| *input.borrow_mut() = None);
+        }
         self.hid_idle.lock(|idle| idle.set([u32::MAX; 10]));
         self.hid_settings.signal(());
         self.update(|s| {
@@ -402,20 +418,26 @@ impl Handler for BusHandler<'_> {
     }
     fn enabled(&mut self, enabled: bool) {
         if !enabled {
+            self.0.wake.arm(false);
             self.0.reset(false);
         }
     }
     fn reset(&mut self) {
+        self.0.wake.arm(false);
         self.0.reset(false);
     }
     fn configured(&mut self, configured: bool) {
         self.0.reset(configured);
     }
     fn suspended(&mut self, suspended: bool) {
+        self.0.wake.suspend(suspended);
         self.0.update(|s| {
             s.suspended = suspended;
             s.generation = s.generation.wrapping_add(1);
         });
+    }
+    fn remote_wakeup_enabled(&mut self, enabled: bool) {
+        self.0.wake.arm(enabled);
     }
 }
 /// Borrowed descriptor/class storage has the same lifetime as the USB tasks.
@@ -495,6 +517,7 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         config.device_protocol = 0x01;
         config.composite_with_iads = true;
         config.max_power = 100;
+        config.supports_remote_wakeup = true;
         buffers.serial_number.bytes[..16].copy_from_slice(serial.as_bytes());
         buffers.serial_number.bytes[16..].copy_from_slice(configuration::VIAL_SERIAL_SUFFIX);
         // A malformed startup allocation must still expose the management port.
@@ -504,6 +527,23 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
             Topology::default()
         };
         io.set_topology(topology);
+        io.control
+            .lock(|state| *state.borrow_mut() = serial::ControlState::new());
+        // Raw HID follows CDC's two interfaces, desktop HID and the gamepad interfaces.
+        let raw_start = 2
+            + u8::from(topology.desktop)
+            + topology.gamepads.hid_gamepads
+            + topology.gamepads.xinput_gamepads;
+        for (index, queue) in io.raw.iter().enumerate() {
+            queue.interface_number.store(
+                if index < used_slots(topology.interfaces) {
+                    raw_start + index as u8
+                } else {
+                    u8::MAX
+                },
+                Ordering::Relaxed,
+            );
+        }
         let mut builder = Builder::new(
             serial::SessionDriver { driver, io },
             config,
@@ -592,12 +632,7 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
             io,
         } = self;
         let mut tx_status = io.status.receiver().unwrap();
-        let bus = async {
-            match select(device.run(), io.reconnect.wait()).await {
-                Either::Second(topology) => topology,
-                Either::First(_) => unreachable!(),
-            }
-        };
+        let bus = wake::run(&mut device, io);
         let workers = join4(
             {
                 let mut slot = 0;

@@ -55,9 +55,43 @@ pub struct Profile {
     map: Map,
     input: State,
     held: Held,
+    observed: [u8; 32],
+    position: [Option<u16>; 3],
     indicators: Box<[IndicatorState]>,
     indicator_cache: hid::IndicatorCache,
     colors_ready: bool,
+}
+fn pressed(before: Held, after: Held) -> bool {
+    after
+        .keys
+        .iter()
+        .zip(before.keys)
+        .any(|(&a, b)| a & !b != 0)
+        || after.buttons & !before.buttons != 0
+        || after.system & !before.system != 0
+        || after.radio & !before.radio & 1 != 0
+        || after
+            .consumers
+            .iter()
+            .any(|&u| u != 0 && !before.consumers.contains(&u))
+}
+fn gamepad_pressed(before: hid::Gamepad, after: hid::Gamepad) -> bool {
+    let directions = |gamepad: hid::Gamepad| {
+        gamepad.dpad
+            | gamepad
+                .hat
+                .and_then(|hat| [1, 5, 4, 6, 2, 10, 8, 9].get(usize::from(hat)).copied())
+                .unwrap_or(0)
+    };
+    after.buttons & !before.buttons != 0
+        || directions(after) & !directions(before) != 0
+        || after.start && !before.start
+        || after.select && !before.select
+        || after.menu && !before.menu
+        || after
+            .consumers
+            .iter()
+            .any(|&u| u != 0 && !before.consumers.contains(&u))
 }
 impl Profile {
     fn indicator(&self, report: usize) -> &IndicatorState {
@@ -96,6 +130,8 @@ impl Profile {
             map,
             input,
             held: Held::default(),
+            observed: [0; 32],
+            position: [None; 3],
         })
     }
 }
@@ -144,6 +180,7 @@ pub struct Link {
     forward_pending: bool,
     /// An input report reached the forwarder since [`Link::take_input_forwarded`] last asked.
     input_forwarded: bool,
+    input_activity: bool,
     normalization: NormalizationState,
     protocol: ProtocolState,
     sequence: u32,
@@ -267,6 +304,7 @@ impl Link {
             activate_pending: false,
             forward_pending: false,
             input_forwarded: false,
+            input_activity: false,
             normalization: NormalizationState::Pending,
             protocol: ProtocolState::Unknown,
             sequence: 0,
@@ -537,10 +575,20 @@ impl Link {
             }
             let mut changed =
                 !self.configure_pending && self.settings.receive(catalog, report_id, payload, now);
-            if self.client.receive(report_id, payload, now) {
+            let before = self.client.held;
+            let mut observed = false;
+            let held_changed = self
+                .client
+                .receive_observed(report_id, payload, now, &mut observed);
+            let seen = profile.observed[report_id as usize / 8] & (1 << (report_id % 8)) != 0;
+            if observed {
+                profile.observed[report_id as usize / 8] |= 1 << (report_id % 8);
+            }
+            if held_changed {
                 self.forward(Input::default(), forward)?;
                 self.input_forwarded = true;
             }
+            self.input_activity |= observed && seen && pressed(before, self.client.held);
             changed |= self.hidpp_changed(catalog);
             return Ok(changed);
         }
@@ -560,6 +608,8 @@ impl Link {
             );
         }
         self.raw_gamepad.set(None);
+        let before = profile.held;
+        let gamepad_before = profile.map.gamepad(&profile.input);
         let input = match profile.map.decode(&mut profile.input, report_id, payload) {
             Ok(input) => input,
             Err(hid::Error::Rollover | hid::Error::Ignored) => return Ok(false),
@@ -572,6 +622,24 @@ impl Link {
                 };
             }
         };
+        let seen = profile.observed[report_id as usize / 8] & (1 << (report_id % 8)) != 0;
+        profile.observed[report_id as usize / 8] |= 1 << (report_id % 8);
+        let activity = input.motion.iter().any(|&v| v != 0)
+            || input.consumer_motion.iter().any(|&v| v != 0)
+            || pressed(Held::default(), input.pulses)
+            || seen
+                && (pressed(before, input.held)
+                    || gamepad_pressed(gamepad_before, profile.map.gamepad(&profile.input)))
+            || input
+                .position
+                .iter()
+                .zip(profile.position)
+                .any(|(&next, old)| matches!((old, next), (Some(a), Some(b)) if a != b));
+        for (old, next) in profile.position.iter_mut().zip(input.position) {
+            if next.is_some() {
+                *old = next;
+            }
+        }
         let numeric = profile.map.observe_numeric_indicators(
             &mut profile.indicator_cache,
             report_id,
@@ -608,7 +676,13 @@ impl Link {
             return Err(error);
         }
         self.input_forwarded = true;
+        self.input_activity |= activity;
         Ok(false)
+    }
+    /// Accepted new presses and pointer motion, independent of USB forwarding.
+    /// Initial held snapshots establish a baseline; setup and resync do not count.
+    pub fn take_input_activity(&mut self) -> bool {
+        core::mem::take(&mut self.input_activity)
     }
     /// Whether an input report reached the forwarder since the last call. Rollover reports,
     /// omitted vendor reports, vendor reports of other services and HID++ responses forward nothing.
@@ -1351,5 +1425,156 @@ mod battery_tests {
             b.field(InfoKey::BatteryCharging).value,
             SettingValue::Bool(true)
         );
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    const KEYS: &[u8] = &[
+        5, 1, 9, 6, 0xa1, 1, 0x85, 1, 5, 7, 0x19, 4, 0x29, 11, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8,
+        0x81, 2, 0xc0, // Independent battery report on the same service.
+        5, 6, 9, 1, 0xa1, 1, 0x85, 2, 9, 0x20, 0x15, 0, 0x26, 0xff, 0, 0x75, 8, 0x95, 1, 0x81, 2,
+        0xc0,
+    ];
+    const MOUSE: &[u8] = &[
+        5, 1, 9, 2, 0xa1, 1, 5, 9, 0x19, 1, 0x29, 8, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8, 0x81, 2,
+        5, 1, 9, 0x30, 9, 0x31, 9, 0x38, 0x15, 0x81, 0x25, 0x7f, 0x75, 8, 0x95, 3, 0x81, 6, 0xc0,
+    ];
+    const PAD: &[u8] = &[
+        5, 1, 9, 5, 0xa1, 1, 5, 9, 0x19, 1, 0x29, 8, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8, 0x81, 2,
+        5, 1, 9, 0x30, 0x15, 0, 0x26, 0xff, 0, 0x75, 8, 0x95, 1, 0x81, 2, 0xc0,
+    ];
+    fn runtime(descriptor: &[u8]) -> (Link, Catalog, Forwarder) {
+        let mut catalog = Catalog::default();
+        let link = Link::new(
+            LinkId {
+                slot: 0,
+                generation: 1,
+            },
+            alloc::vec![Profile::compile(ServiceId(0), descriptor).unwrap()],
+            64,
+            false,
+            HostPlatform::Linux,
+            &mut catalog,
+        )
+        .unwrap();
+        let mut forward = Forwarder::default();
+        forward.enable(false);
+        (link, catalog, forward)
+    }
+    #[test]
+    fn only_new_accepted_presses_count_while_forwarding_is_disabled() {
+        let (mut link, mut catalog, mut forward) = runtime(KEYS);
+        for (report, bytes, activity) in [
+            (1, &[1][..], false), // Held at connection time.
+            (1, &[1][..], false),
+            (2, &[42][..], false), // Battery status is not input activity.
+            (1, &[0][..], false),
+            (1, &[1][..], true),
+            (1, &[1][..], false),
+            (1, &[3][..], true),
+            (1, &[0][..], false),
+        ] {
+            link.input(ServiceId(0), report, bytes, &mut catalog, &mut forward, 0)
+                .unwrap();
+            assert_eq!(link.take_input_activity(), activity);
+            assert!(!link.take_input_activity());
+        }
+        forward.resync();
+        link.forward(Input::default(), &mut forward).unwrap();
+        assert!(!link.take_input_activity());
+        assert!(
+            link.input(ServiceId(0), 1, &[], &mut catalog, &mut forward, 0)
+                .is_err()
+        );
+        assert!(!link.take_input_activity());
+    }
+    #[test]
+    fn mouse_motion_and_scroll_count_even_when_buttons_do_not_change() {
+        let (mut link, mut catalog, mut forward) = runtime(MOUSE);
+        for (bytes, activity) in [
+            ([0, 0, 0, 0], false),
+            ([1, 0, 0, 0], true),
+            ([1, 0, 0, 0], false),
+            ([1, 1, 0, 0], true),
+            ([1, 1, 0, 0], true), // Relative samples are not duplicate held state.
+            ([1, 0, 0, 1], true),
+            ([0, 0, 0, 0], false),
+        ] {
+            link.input(ServiceId(0), 0, &bytes, &mut catalog, &mut forward, 0)
+                .unwrap();
+            assert_eq!(link.take_input_activity(), activity);
+        }
+    }
+    #[test]
+    fn relative_consumer_motion_counts_only_accepted_nonzero_samples() {
+        for (usage, flags) in [(0xe0u16, 6), (0xe1, 6), (0xe0, 0x46)] {
+            let [lo, hi] = usage.to_le_bytes();
+            let descriptor = [
+                5, 12, 9, 1, 0xa1, 1, 0x0a, lo, hi, 0x15, 0xff, 0x25, 1, 0x75, 2, 0x95, 1, 0x81,
+                flags, 0xc0,
+            ];
+            let (mut link, mut catalog, mut forward) = runtime(&descriptor);
+            for (raw, activity) in [
+                (0, false),
+                (1, true),
+                (1, false),
+                (0, false),
+                (3, true),
+                (3, false),
+                (0, false),
+                (2, flags == 6), // Out-of-range samples clamp unless null is allowed.
+            ] {
+                link.input(ServiceId(0), 0, &[raw], &mut catalog, &mut forward, 0)
+                    .unwrap();
+                assert_eq!(link.take_input_activity(), activity, "{usage:x}: {raw}");
+            }
+        }
+    }
+    #[test]
+    fn gamepad_hat_releases_do_not_count_as_presses() {
+        let descriptor = [
+            5, 1, 9, 5, 0xa1, 1, 9, 0x39, 0x15, 1, 0x25, 8, 0x75, 8, 0x95, 1, 0x81, 0x42, 0xc0,
+        ];
+        for diagonal in [2, 4, 6, 8] {
+            for component in [diagonal - 1, diagonal % 8 + 1] {
+                let (mut link, mut catalog, mut forward) = runtime(&descriptor);
+                for (hat, activity) in [
+                    (diagonal, false), // Initial held snapshot.
+                    (diagonal, false),
+                    (component, false),
+                    (diagonal, true),
+                    (component, false),
+                    (0, false),
+                    (component, true),
+                    (component, false),
+                ] {
+                    link.input(ServiceId(0), 0, &[hat], &mut catalog, &mut forward, 0)
+                        .unwrap();
+                    assert_eq!(link.take_input_activity(), activity, "{diagonal}: {hat}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_gamepad_buttons_count_without_output_assignment_but_axes_do_not() {
+        let (mut link, mut catalog, mut forward) = runtime(PAD);
+        for (bytes, activity) in [
+            ([1, 127], false),
+            ([1, 128], false),
+            ([0, 127], false),
+            ([2, 128], true),
+            ([2, 129], false),
+            ([3, 127], true),
+        ] {
+            link.input(ServiceId(0), 0, &bytes, &mut catalog, &mut forward, 0)
+                .unwrap();
+            assert_eq!(link.take_input_activity(), activity);
+            forward.resync();
+            forward.profiles_assigned(0, false);
+            link.forward(Input::default(), &mut forward).unwrap();
+            assert!(!link.take_input_activity());
+        }
     }
 }

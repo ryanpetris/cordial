@@ -103,6 +103,9 @@ refused while it is in a device's layers or selected by an interface.
 - QMK Configurator produces keyboard firmware and is not a live editor protocol. ZMK Studio is not
   implemented.
 
+Both editors use the [Raw HID control report behavior](protocol/hid-forwarding.md#usb-control-requests).
+Commands receive replies on interrupt IN; control reads return a snapshot without consuming a reply.
+
 The virtual keyboard presents Keyboard/Keypad usages 0x04..0xa4, the eight modifiers 0xe0..0xe7,
 seven media controls (Next Track, Previous Track, Stop, Play/Pause, Mute, Volume Up and Volume
 Down), the System Power Down, Sleep and Wake Up controls, the other 16 Consumer controls QMK's

@@ -15,6 +15,9 @@ pub const CONSUMER_AXES: [u16; 17] = [
     0x71, 0x7b, 0x86, 0xbd, 0xbf, 0xe0, 0xe1, 0xe3, 0xe4, 0x101, 0x103, 0x105, 0x109, 0x170, 0x22f,
     0x235, 0x238,
 ];
+pub(crate) const CONSUMER_VOLUME_AXIS: usize = 5;
+/// Relative Consumer Volume carries one ordinary host volume step per input report.
+pub(crate) const RELATIVE_VOLUME_LIMIT: i64 = 1;
 pub const KEYBOARD: u8 = 1;
 pub const MOUSE: u8 = 2;
 pub const CONSUMER: u8 = 4;
@@ -4051,7 +4054,14 @@ impl Input {
             } else if page == 12
                 && let Some(axis) = CONSUMER_AXES.iter().position(|&u| u as usize == code)
             {
-                self.consumer_motion[axis] += value;
+                let motion = &mut self.consumer_motion[axis];
+                if axis != CONSUMER_VOLUME_AXIS {
+                    *motion += value;
+                } else {
+                    let value = value.clamp(-RELATIVE_VOLUME_LIMIT, RELATIVE_VOLUME_LIMIT);
+                    *motion =
+                        (*motion + value).clamp(-RELATIVE_VOLUME_LIMIT, RELATIVE_VOLUME_LIMIT);
+                }
             }
         } else if usage == 0x100c6 {
             self.held.radio |= 1;

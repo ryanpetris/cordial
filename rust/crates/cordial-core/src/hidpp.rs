@@ -369,9 +369,10 @@ impl Client {
             self.request(Step::Info, self.controls_feature, 1, &[index], now);
         }
     }
-    fn notification(&mut self, parameters: &[u8]) -> bool {
+    fn notification(&mut self, parameters: &[u8], observed: &mut bool) -> bool {
         let mut held = Held::default();
         let mut ended = false;
+        let mut supported = parameters[..8] == [0; 8];
         for j in 0..4 {
             let cid = u16::from_be_bytes([parameters[2 * j], parameters[2 * j + 1]]);
             if cid == 0 {
@@ -388,6 +389,7 @@ impl Client {
             if self.selected & (1 << index) == 0 {
                 continue;
             }
+            supported = true;
             if translation.key != 0 {
                 held.keys[translation.key as usize / 8] |= 1 << (translation.key % 8);
             }
@@ -406,9 +408,21 @@ impl Client {
         }
         let changed = held != self.held;
         self.held = held;
+        *observed = supported;
         changed
     }
     pub fn receive(&mut self, report_id: u8, payload: &[u8], now: u64) -> bool {
+        self.receive_observed(report_id, payload, now, &mut false)
+    }
+    /// Reports accepted control snapshots separately from held-state changes.
+    pub(crate) fn receive_observed(
+        &mut self,
+        report_id: u8,
+        payload: &[u8],
+        now: u64,
+        observed: &mut bool,
+    ) -> bool {
+        *observed = false;
         let mut changed = self.tick(now);
         let valid = (report_id == 0x11 && self.reports & HIDPP_LONG != 0 && payload.len() == 19)
             || (report_id == 0x10 && self.reports & HIDPP_SHORT != 0 && payload.len() == 6);
@@ -420,7 +434,7 @@ impl Client {
             && payload[1] == self.controls_feature
             && payload[2] == 0
         {
-            return (payload.len() >= 11 && self.notification(&payload[3..])) || changed;
+            return (payload.len() >= 11 && self.notification(&payload[3..], observed)) || changed;
         }
         if !self.waiting {
             return changed;

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "control_tests.rs"]
+mod control;
 use cordial_core::link::LinkId;
 use cordial_core::storage::RecordStore;
 use cordial_core::{
@@ -478,6 +480,27 @@ fn descriptor_ranges_are_valid_for_signed_global_item_parsers() {
         }
     }
     let map = cordial_core::hid::Map::compile(descriptor::REPORT_DESCRIPTOR).unwrap();
+    assert_eq!(
+        map.reports()
+            .iter()
+            .find(|report| report.id == 4)
+            .unwrap()
+            .bits[0],
+        17 * 32
+    );
+    let volume = cordial_core::hid::CONSUMER_AXES
+        .iter()
+        .position(|&usage| usage == 0xe0)
+        .unwrap();
+    let other = volume + 1;
+    for (raw, expected) in [(2i32, 1), (-2, -1)] {
+        let mut payload = [0u8; 68];
+        payload[volume * 4..volume * 4 + 4].copy_from_slice(&raw.to_le_bytes());
+        payload[other * 4..other * 4 + 4].copy_from_slice(&i32::MIN.to_le_bytes());
+        let input = map.decode(&mut map.state().unwrap(), 4, &payload).unwrap();
+        assert_eq!(input.consumer_motion[volume], expected);
+        assert_eq!(input.consumer_motion[other], i64::from(i32::MIN));
+    }
     let mut payload = [0; 16];
     payload[..2].copy_from_slice(&0x500u16.to_le_bytes());
     assert_eq!(

@@ -1,6 +1,6 @@
 use crate::hid::{
-    CONSUMER, CONSUMER_AXES, CONSUMER_SWITCHES, Error, Held, Input, KEYBOARD, MOTION_LIMIT, MOUSE,
-    QUEUE, RADIO, SOURCES, SYSTEM,
+    CONSUMER, CONSUMER_AXES, CONSUMER_SWITCHES, CONSUMER_VOLUME_AXIS, Error, Held, Input, KEYBOARD,
+    MOTION_LIMIT, MOUSE, QUEUE, RADIO, RELATIVE_VOLUME_LIMIT, SOURCES, SYSTEM,
 };
 
 pub const REPORT_KEYBOARD: u8 = 1;
@@ -267,7 +267,7 @@ impl Forwarder {
         }
         self.mapped_input(source, input)
     }
-    fn mapped_input(&mut self, source: usize, input: Input) -> Result<(), Error> {
+    fn mapped_input(&mut self, source: usize, mut input: Input) -> Result<(), Error> {
         if source >= SOURCES {
             return Err(Error::Invalid);
         }
@@ -286,6 +286,8 @@ impl Forwarder {
         {
             return Err(Error::Invalid);
         }
+        input.consumer_motion[CONSUMER_VOLUME_AXIS] = input.consumer_motion[CONSUMER_VOLUME_AXIS]
+            .clamp(-RELATIVE_VOLUME_LIMIT, RELATIVE_VOLUME_LIMIT);
         if input
             .consumer_motion
             .iter()
@@ -538,9 +540,11 @@ impl Forwarder {
             held.radio |= 4 | (u8::from(value) << 1);
         }
         let motion = active.map_or([0; 4], |q| q.motion);
-        let consumer_motion = active.map_or([0; CONSUMER_AXES.len()], |q| {
+        let mut consumer_motion = active.map_or([0; CONSUMER_AXES.len()], |q| {
             q.consumer_motion.map(ConsumerDelta::value)
         });
+        consumer_motion[CONSUMER_VOLUME_AXIS] = consumer_motion[CONSUMER_VOLUME_AXIS]
+            .clamp(-RELATIVE_VOLUME_LIMIT, RELATIVE_VOLUME_LIMIT);
         let mut packet = Packet {
             id: 0,
             bytes: [0; 68],
@@ -633,7 +637,11 @@ impl Forwarder {
             packet.id = REPORT_CONSUMER_MOTION;
             packet.length = 4 * CONSUMER_AXES.len();
             for (i, value) in consumer_motion.iter().enumerate() {
-                let value = (*value).clamp(i32::MIN.into(), i32::MAX.into()) as i32;
+                let value = if i == CONSUMER_VOLUME_AXIS {
+                    (*value).clamp(-RELATIVE_VOLUME_LIMIT, RELATIVE_VOLUME_LIMIT) as i32
+                } else {
+                    (*value).clamp(i32::MIN.into(), i32::MAX.into()) as i32
+                };
                 packet.consumer_motion[i] = value;
                 packet.bytes[4 * i..4 * i + 4].copy_from_slice(&value.to_le_bytes());
             }

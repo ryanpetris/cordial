@@ -96,6 +96,91 @@ fn notification(client: &mut Client, cids: &[u16], now: u64) -> bool {
     client.receive(0x11, &bytes, now)
 }
 #[test]
+fn wake_baseline_requires_an_accepted_control_notification() {
+    use cordial_core::{
+        forward::Forwarder,
+        link::{Link, LinkId, Profile, ServiceId},
+        settings::Catalog,
+    };
+
+    let descriptor: Vec<_> = include_str!("fixtures/mx_keys_descriptor.hex")
+        .split_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+        .collect();
+    let mut neutral = [0; 19];
+    neutral[..3].copy_from_slice(&[0xff, 8, 0]);
+    let mut unsupported = neutral;
+    unsupported[3..5].copy_from_slice(&0xffffu16.to_be_bytes());
+    let mut unselected = neutral;
+    unselected[3..5].copy_from_slice(&0xd1u16.to_be_bytes());
+    let mut duplicate = neutral;
+    duplicate[3..7].copy_from_slice(&[0, 0xc7, 0, 0xc7]);
+    let mut after_terminator = neutral;
+    after_terminator[5..7].copy_from_slice(&[0, 0xc7]);
+    let mut battery = neutral;
+    battery[1] = 12;
+    battery[3] = 50;
+    let mut settings = neutral;
+    settings[2] = 0x21;
+    let mut wrong_device = neutral;
+    wrong_device[0] = 1;
+
+    for (initial, baseline) in [
+        (&neutral[..], true),
+        (&unsupported[..], false),
+        (&unselected[..], false),
+        (&duplicate[..], false),
+        (&after_terminator[..], false),
+        (&battery[..], false),
+        (&settings[..], false),
+        (&wrong_device[..], false),
+        (&neutral[..6], false),
+    ] {
+        let (client, now) = activate(HostPlatform::Linux, 4);
+        let mut catalog = Catalog::default();
+        let mut link = Link::new(
+            LinkId {
+                slot: 0,
+                generation: 1,
+            },
+            vec![Profile::compile(ServiceId(0), &descriptor).unwrap()],
+            64,
+            true,
+            HostPlatform::Linux,
+            &mut catalog,
+        )
+        .unwrap();
+        link.client = client;
+        let mut forward = Forwarder::default();
+        forward.enable(false);
+
+        // A native report cannot establish the diverted controls' baseline.
+        link.input(ServiceId(0), 1, &[0; 8], &mut catalog, &mut forward, now)
+            .unwrap();
+        assert!(!link.take_input_activity());
+        assert!(link.take_input_forwarded());
+        link.input(ServiceId(0), 0x11, initial, &mut catalog, &mut forward, now)
+            .unwrap();
+        assert!(!link.take_input_activity());
+        assert!(!link.take_input_forwarded());
+        for (cid, activity, forwarded) in [
+            (0xc7u16, baseline, true),
+            (0xc7, false, false),
+            (0, false, true),
+            (0xc7, true, true),
+            (0, false, true),
+        ] {
+            let mut bytes = neutral;
+            bytes[3..5].copy_from_slice(&cid.to_be_bytes());
+            link.input(ServiceId(0), 0x11, &bytes, &mut catalog, &mut forward, now)
+                .unwrap();
+            assert_eq!(link.take_input_activity(), activity, "{initial:?}: {cid:x}");
+            assert_eq!(link.take_input_forwarded(), forwarded);
+            assert_eq!(link.client.held.consumers.contains(&0x70), cid == 0xc7);
+        }
+    }
+}
+#[test]
 fn normalization_uses_temporary_diversion_and_standard_host_translations() {
     for platform in [
         HostPlatform::Linux,

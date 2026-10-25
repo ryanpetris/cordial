@@ -1,4 +1,4 @@
-//! Drain old CDC OUT bytes before acknowledging a serial session boundary.
+//! Validate control requests and drain CDC OUT before acknowledging session boundaries.
 use super::*;
 use core::{
     future::{Future, poll_fn},
@@ -6,12 +6,49 @@ use core::{
     task::Poll,
 };
 use embassy_usb::driver::{
-    ControlPipe, EndpointAddress, EndpointAllocError, EndpointError, EndpointType,
+    Bus, ControlPipe, Direction, Endpoint, EndpointAddress, EndpointAllocError, EndpointError,
+    EndpointType, Event, Unsupported,
 };
+
+/// Allocation and enablement observed at the driver boundary, independently for each direction.
+pub(crate) struct ControlState {
+    allocated: u32,
+    active: u32,
+    isochronous: u32,
+    addressed: bool,
+}
+impl ControlState {
+    pub const fn new() -> Self {
+        Self {
+            allocated: 0,
+            active: 0,
+            isochronous: 0,
+            addressed: false,
+        }
+    }
+    fn allocate(&mut self, endpoint: &impl Endpoint) {
+        let bit = endpoint_bit(endpoint.info().addr);
+        self.allocated |= bit;
+        if endpoint.info().ep_type == EndpointType::Isochronous {
+            self.isochronous |= bit;
+        }
+    }
+    fn reset(&mut self) {
+        self.active = 0;
+        self.addressed = false;
+    }
+}
+fn endpoint_bit(address: EndpointAddress) -> u32 {
+    1 << (address.index() + if address.is_in() { 16 } else { 0 })
+}
 
 pub struct SessionDriver<'a, D> {
     pub driver: D,
     pub io: &'a Io,
+}
+pub struct SessionBus<'a, B> {
+    bus: B,
+    io: &'a Io,
 }
 pub struct SessionControl<'a, P> {
     pipe: P,
@@ -20,7 +57,7 @@ pub struct SessionControl<'a, P> {
 impl<'d, D: Driver<'d>> Driver<'d> for SessionDriver<'d, D> {
     type EndpointOut = D::EndpointOut;
     type EndpointIn = D::EndpointIn;
-    type Bus = D::Bus;
+    type Bus = SessionBus<'d, D::Bus>;
     type ControlPipe = SessionControl<'d, D::ControlPipe>;
     fn alloc_endpoint_out(
         &mut self,
@@ -29,8 +66,13 @@ impl<'d, D: Driver<'d>> Driver<'d> for SessionDriver<'d, D> {
         size: u16,
         interval: u8,
     ) -> Result<Self::EndpointOut, EndpointAllocError> {
-        self.driver
-            .alloc_endpoint_out(kind, address, size, interval)
+        let endpoint = self
+            .driver
+            .alloc_endpoint_out(kind, address, size, interval)?;
+        self.io
+            .control
+            .lock(|state| state.borrow_mut().allocate(&endpoint));
+        Ok(endpoint)
     }
     fn alloc_endpoint_in(
         &mut self,
@@ -39,11 +81,122 @@ impl<'d, D: Driver<'d>> Driver<'d> for SessionDriver<'d, D> {
         size: u16,
         interval: u8,
     ) -> Result<Self::EndpointIn, EndpointAllocError> {
-        self.driver.alloc_endpoint_in(kind, address, size, interval)
+        let endpoint = self
+            .driver
+            .alloc_endpoint_in(kind, address, size, interval)?;
+        self.io
+            .control
+            .lock(|state| state.borrow_mut().allocate(&endpoint));
+        Ok(endpoint)
     }
     fn start(self, size: u16) -> (Self::Bus, Self::ControlPipe) {
         let (bus, pipe) = self.driver.start(size);
-        (bus, SessionControl { pipe, io: self.io })
+        (
+            SessionBus { bus, io: self.io },
+            SessionControl { pipe, io: self.io },
+        )
+    }
+}
+impl<B: Bus> Bus for SessionBus<'_, B> {
+    async fn enable(&mut self) {
+        self.io.control.lock(|state| state.borrow_mut().reset());
+        self.bus.enable().await;
+    }
+    async fn disable(&mut self) {
+        self.io.control.lock(|state| state.borrow_mut().reset());
+        self.bus.disable().await;
+    }
+    async fn poll(&mut self) -> Event {
+        let event = self.bus.poll().await;
+        if matches!(event, Event::Reset | Event::PowerRemoved) {
+            self.io.control.lock(|state| state.borrow_mut().reset());
+        }
+        event
+    }
+    fn endpoint_set_enabled(&mut self, address: EndpointAddress, enabled: bool) {
+        self.bus.endpoint_set_enabled(address, enabled);
+        self.io.control.lock(|state| {
+            let mut state = state.borrow_mut();
+            let bit = endpoint_bit(address);
+            if enabled {
+                state.active |= bit;
+            } else {
+                state.active &= !bit;
+            }
+        });
+    }
+    fn endpoint_set_stalled(&mut self, address: EndpointAddress, stalled: bool) {
+        self.bus.endpoint_set_stalled(address, stalled);
+    }
+    fn endpoint_is_stalled(&mut self, address: EndpointAddress) -> bool {
+        self.bus.endpoint_is_stalled(address)
+    }
+    fn force_reset(&mut self) -> Result<(), Unsupported> {
+        self.bus.force_reset()
+    }
+    async fn remote_wakeup(&mut self) -> Result<(), Unsupported> {
+        self.bus.remote_wakeup().await
+    }
+}
+impl<P> SessionControl<'_, P> {
+    fn valid_request(&self, req: Request) -> bool {
+        if req.request_type != RequestType::Standard {
+            return configuration::valid_request(self.io, req);
+        }
+        if req.recipient == Recipient::Device && req.request == Request::GET_DESCRIPTOR {
+            // All Cordial platforms are full-speed only. USB 2.0 section 9.6.2
+            // requires a request error for descriptors describing another speed.
+            return !matches!(req.value >> 8, 6 | 7);
+        }
+        if req.recipient == Recipient::Device && req.request == Request::SET_ADDRESS {
+            return !self.io.status().configured
+                && req.direction == Direction::Out
+                && req.value <= 127
+                && req.index == 0
+                && req.length == 0;
+        }
+        if req.recipient == Recipient::Interface && req.request == Request::SET_INTERFACE {
+            return self.io.status().configured
+                && req.direction == Direction::Out
+                && req.index <= 255
+                && req.value <= 255
+                && req.length == 0;
+        }
+        self.io.control.lock(|state| {
+            let state = state.borrow();
+            if req.recipient == Recipient::Device && req.request == Request::SET_CONFIGURATION {
+                return state.addressed
+                    && req.direction == Direction::Out
+                    && req.value <= 1
+                    && req.index == 0
+                    && req.length == 0;
+            }
+            if req.recipient != Recipient::Endpoint {
+                return true;
+            }
+            if req.index & !0x8f != 0 || !state.addressed {
+                return false;
+            }
+            let address = EndpointAddress::from(req.index as u8);
+            let bit = endpoint_bit(address);
+            if address.index() != 0
+                && (!self.io.status().configured || state.allocated & state.active & bit == 0)
+            {
+                return false;
+            }
+            match req.request {
+                Request::GET_STATUS => {
+                    req.direction == Direction::In && req.value == 0 && req.length == 2
+                }
+                Request::CLEAR_FEATURE | Request::SET_FEATURE => {
+                    req.direction == Direction::Out
+                        && req.value == Request::FEATURE_ENDPOINT_HALT
+                        && req.length == 0
+                        && state.isochronous & bit == 0
+                }
+                _ => false,
+            }
+        })
     }
 }
 impl<P: ControlPipe> ControlPipe for SessionControl<'_, P> {
@@ -51,11 +204,19 @@ impl<P: ControlPipe> ControlPipe for SessionControl<'_, P> {
         self.pipe.max_packet_size()
     }
     async fn setup(&mut self) -> [u8; 8] {
-        let mut request = self.pipe.setup().await;
-        if request[..4] == [0x80, 6, 3, 3] {
-            request[2] = configuration::SERIAL_INDEX;
+        loop {
+            let mut request = self.pipe.setup().await;
+            // Embassy dispatches standard endpoint requests directly to the bus,
+            // before class handlers. Reject here before an invalid address reaches it.
+            if !self.valid_request(Request::parse(&request)) {
+                self.pipe.reject().await;
+                continue;
+            }
+            if request[..4] == [0x80, 6, 3, 3] {
+                request[2] = configuration::SERIAL_INDEX;
+            }
+            return request;
         }
-        request
     }
     async fn data_out(
         &mut self,
@@ -86,6 +247,9 @@ impl<P: ControlPipe> ControlPipe for SessionControl<'_, P> {
     }
     async fn accept_set_address(&mut self, addr: u8) {
         self.pipe.accept_set_address(addr).await;
+        self.io
+            .control
+            .lock(|state| state.borrow_mut().addressed = addr != 0);
     }
 }
 

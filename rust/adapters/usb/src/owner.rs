@@ -154,7 +154,17 @@ impl<'a> Priority<'a> {
         #[cfg(feature = "gamepad")]
         app.set_output_enumeration(Some(self.io.outputs.enumeration(status.input_ready())));
         while let Some(event) = radio.next_event() {
+            let input_status = self.io.status();
             app.event(event, store, radio, now).await;
+            // Link observes accepted controls before USB slot assignment and
+            // forwarding. Drain activity even while wake is not armed.
+            for connection in app.manager.connections.iter_mut().flatten() {
+                if let Some(link) = &mut connection.runtime
+                    && link.take_input_activity()
+                {
+                    self.io.wake.request(input_status);
+                }
+            }
             #[cfg(feature = "gamepad")]
             self.io
                 .outputs

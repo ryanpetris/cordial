@@ -340,7 +340,7 @@ async fn hid_worker<'d, D: Driver<'d>>(mut hid: gamepad::Gamepad<'d, D>, io: &Io
                     neutral = false;
                 }
                 Either3::Third(Err(_)) => {
-                    status.changed().await;
+                    select(status.changed(), hid.ready()).await;
                 }
                 _ => {}
             }
@@ -543,7 +543,7 @@ async fn xinput_worker<'d, D: Driver<'d>>(channel: xinput::Channel<'d, D>, io: &
                         }
                     }
                     Either3::Third(Err(_)) => {
-                        status.changed().await;
+                        select(status.changed(), input.wait_enabled()).await;
                     }
                     _ => {}
                 }

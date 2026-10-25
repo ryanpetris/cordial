@@ -23,10 +23,11 @@ Identical ordered usage-span lists share immutable map storage. Usage order,
 selector offsets, and repeated-last-usage semantics remain intact.
 
 Pointer motion is limited to 1,048,576 counts per sample and queue entry and is
-split into signed 16-bit USB reports. Relative Consumer values use signed 32-bit
-USB fields and a signed 40-bit queue accumulator, preserving the sum of every
-32-bit field that fits in a Bluetooth report. The Consumer report can span two
-USB endpoint packets. Completion advances the queue only after the entire
+split into signed 16-bit USB reports. Relative Consumer report 4 contains 17 signed
+32-bit USB fields in the usage order below. Except for Volume `0x00e0`, relative
+Consumer values use a signed 40-bit queue accumulator, preserving the sum of every
+32-bit field that fits in a Bluetooth report. The 68-byte Consumer payload can
+span two USB endpoint packets. Completion advances the queue only after the entire
 report is submitted. Absolute values use 16-bit USB fields, with an explicit
 null value for unchanged axes. Coalescing retains the latest value for each axis
 without crossing source, key/button, pulse, or switch transitions.
@@ -38,6 +39,15 @@ changes are forwarded as HID values. They do not require synthetic media-key
 presses. Standard Consumer on/off controls use separate toggle and explicit
 signed-state reports, with neutral rearming for edge controls. Contact Edited,
 Contact Added, and Contact Record Active use these reports too.
+
+Relative Volume `0x00e0` is limited to `-1..1` per input and USB report. Each
+nonzero contribution is reduced to its direction before aggregation. Aggregation
+discards only the excess at either bound, so later contributions in the opposite
+direction still apply. Out-of-range Volume values submitted to the forwarder are
+reduced to one step. Excess values do not become a backlog of repeated steps. This
+bounds host volume changes and avoids prolonged volume input from one extreme
+value. Volume occupies the sixth 32-bit field at payload byte offset 20, excluding
+the report ID, with a USB logical range of `-1..1`.
 
 Repeated relative on/off controls for the same usage compose in field order.
 One-shot controls retain repeated edges as separate press/release transitions.
@@ -83,6 +93,111 @@ must also cover pre-OS keyboard input, separate gamepad recognition in host appl
 repeated editor enable/disable cycles on both Pico and ESP32-S3 boards. Allocation pressure,
 connected-device preemption, a host that stops reading serial, and reconnecting with held controls
 also need hardware validation.
+
+## USB control requests
+
+Cordial validates standard endpoint requests before Embassy dispatches them to the USB bus.
+Validation uses the full endpoint address, including direction, and rejects reserved address bits
+and nonzero upper bytes. Endpoint requests require an assigned USB device address. Nonzero
+endpoints must also be allocated and active in the current configuration and alternate setting.
+`GET_STATUS` and endpoint-halt requests check their direction, value and length; isochronous
+endpoints reject halt requests. `SET_ADDRESS`, `SET_CONFIGURATION` and `SET_INTERFACE` also check
+their setup fields and required USB state. Invalid requests stall the control transfer; later valid
+requests can proceed.
+
+On RP2040, RP2350 and ESP32-S3, Cordial-owned USB wrappers preserve queued transfers
+when the Host sets or clears HALT on non-control endpoints. A halted endpoint pauses
+submission and rearming. `CLEAR_FEATURE(ENDPOINT_HALT)` resets the next packet's data sequence to
+DATA0, even if the endpoint was not halted. This applies independently to IN and
+OUT endpoints, preserving queued payloads and completed OUT packets awaiting a read.
+An idle endpoint also starts its next transfer at DATA0. Recovery does not flush
+the endpoint or replay a completed packet.
+ESP32-S3 asserts Global OUT NAK before it disables and halts an active OUT receive.
+Clearing HALT re-primes that receive, while a completed packet remains buffered for
+its pending read.
+
+`SET_CONFIGURATION` and `SET_INTERFACE` clear HALT and initialize DATA0 on the
+selected bulk and interrupt endpoints, including when the selection is unchanged.
+On ESP32-S3, the wrapper stops active transfers before reinitializing endpoints
+and resets DATA0 before Embassy primes OUT reception. Disabled endpoints remain
+inactive, and `SET_INTERFACE` leaves other interfaces unchanged. Pending endpoint
+operations report cancellation even after immediate re-enabling. An interrupted
+HID report is retried from its first packet without consuming undelivered input.
+Desktop idle refreshes and gamepad transmissions resume when their endpoint is
+enabled, without waiting for a separate USB status change. A disabled endpoint
+waits for re-enabling before retrying.
+
+All Cordial platforms use full-speed USB. Requests for `DeviceQualifier` or
+`OtherSpeedConfiguration` descriptors stall.
+
+On a configured VIA or Vial Raw HID interface, `GET_REPORT` for Input report ID 0 returns a
+32-byte snapshot of the last successfully completed interrupt IN reply. A shorter requested
+length returns that prefix; a longer request returns only 32 bytes. The snapshot starts at zero
+and returns zeros after reset, configuration selection, USB disable or topology rebuild
+until another reply completes. Pending or failed interrupt
+writes do not replace it. Reading the snapshot consumes no queued reply and executes no editor
+command. A reply cancelled by `SET_INTERFACE` is retried in queue order when its endpoint
+is enabled, without executing the command again. Replies from an earlier USB generation or a
+retargeted interface are discarded.
+
+Raw HID accepts 32-byte commands through interrupt OUT or `SET_REPORT` for Output report ID 0.
+It rejects other report types or IDs, zero-length `GET_REPORT`, malformed report requests,
+`GET_IDLE`, `SET_IDLE`, `GET_PROTOCOL` and `SET_PROTOCOL`. These restrictions apply to Raw HID;
+the desktop boot keyboard retains its protocol switching and idle reporting.
+
+## USB remote wake
+
+RP2040, RP2350 and ESP32-S3 support standard USB remote wake through Cordial-owned
+USB wrappers. No custom host driver or Cordial application is required. The adapter
+can request wake only while USB is configured, suspended and armed by the Host
+through `SET_FEATURE(DEVICE_REMOTE_WAKEUP)`. The Host can revoke permission through
+`CLEAR_FEATURE(DEVICE_REMOTE_WAKEUP)`. Host settings, hub support and platform sleep
+policy determine whether USB wake is armed and whether it can wake the computer
+from a particular sleep state. Support does not guarantee wake from every OS sleep
+state.
+
+Accepted new key or button presses and pointer motion can request wake, including
+scrolling and changes to an already observed absolute pointer position. This
+includes supported Consumer, system and radio controls and native gamepad digital
+controls, even without a USB gamepad slot. The first report for each input report
+ID establishes its held-control baseline. Status and battery reports, setup traffic,
+rejected input, releases alone, unchanged held controls, resynchronization and
+gamepad axis jitter do not request wake.
+
+The adapter waits at least 5 ms after detecting suspend before starting a nominal
+10 ms resume pulse. It waits for fresh host frames after the pulse before marking
+input ready. Reset, USB disable and topology rebuild cancel stale wake state and
+clear host permission. Disabling USB also deasserts any active resume signal.
+After resume, currently held controls resynchronize under the suspend policy above.
+A short tap fully released during wake can wake the Host without delivering the
+tap as input; old motion and taps are not replayed.
+
+### Board verification
+
+Endpoint halt recovery and remote wake have software fixtures but no physical
+verification. On RP2040, endpoint recovery relies on the USB ABORT behavior of B2
+or later silicon. Earlier silicon has an ABORT erratum and is not qualified by this
+implementation. The pinned RP USB driver forces VBUS present, so an externally
+powered adapter cannot independently detect physical cable removal. Software
+disable and topology rebuild are distinct from cable-removal detection.
+Power-supply design and suspend-current qualification are outside this
+implementation's scope.
+
+Hardware verification on RP2040, RP2350 and ESP32-S3 must cover:
+
+- Set and clear HALT in both IN and OUT directions with queued, completed and idle
+  packets. Check DATA0 recovery, payload preservation and no duplicate delivery,
+  including clearing an endpoint that is already unhalted.
+- USB reset, unconfigure/reconfigure and warm suspend/resume with held controls and
+  pending transfers. Check current-state resynchronization and continued traffic.
+- Host wake permission enabled, absent and cleared before a subsequent suspension.
+  Check accepted presses and pointer motion, first-report baselines, unchanged held
+  controls, status traffic, gamepad axis jitter and taps released during wake.
+- Suspend timing, resume pulse length and host-frame confirmation, including reset,
+  disable and rapid topology rebuild while wake is pending or signaling.
+- Linux `xpad` reset-resume of the whole composite device on RP boards with XInput
+  enabled, including sibling HID recovery and CDC serial reconnection. Check CDC
+  reconnection after topology rebuilds on all platforms.
 
 ## USB allocation
 

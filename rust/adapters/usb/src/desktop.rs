@@ -253,7 +253,7 @@ pub(crate) async fn run<'d, D: Driver<'d>>(mut hid: hid::HidWriter<'d, D, 69>, i
             && io.status().generation == generation
             && io.status().boot_keyboard == status.boot_keyboard
         {
-            status_rx.changed().await;
+            select(status_rx.changed(), hid.ready()).await;
         }
     }
 }
