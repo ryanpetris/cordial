@@ -122,7 +122,7 @@ fn opening_loads_status_and_devices_then_events_keep_the_view() {
 }
 
 #[test]
-fn opening_reads_every_page_of_devices() {
+fn opening_lists_every_device_in_one_response() {
     let dongle = Dongle::with(|sim| {
         for n in 3..=6 {
             sim.devices.push(device(n, "Pad", Transport::Ble));
@@ -135,26 +135,29 @@ fn opening_reads_every_page_of_devices() {
     let ids: Vec<u32> = st.devices.iter().map(|d| d.id).collect();
     assert_eq!(ids, [1, 2, 3, 5, 6]);
     assert!(st.unreadable.contains(&4));
-    let pages = dongle
-        .sent()
-        .iter()
-        .filter(|s| **s == "list_devices")
-        .count();
-    assert_eq!(pages, 3);
-    let sim = dongle.0.lock().unwrap();
-    let afters: Vec<u32> = sim
-        .log
-        .iter()
-        .filter_map(|c| match c {
-            p::request::Command::ListDevices(l) => Some(l.after),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(afters, [0, 2, 4]);
-    drop(sim);
-    // A refresh replaces the listing, page by page.
+    let lists = || {
+        dongle
+            .sent()
+            .iter()
+            .filter(|s| **s == "list_devices")
+            .count()
+    };
+    assert_eq!(lists(), 1);
+    // A refresh replaces the listing.
     dongle.0.lock().unwrap().devices.retain(|d| d.id != 5);
     run(&c, &rx, Command::Devices).unwrap();
+    let ids: Vec<u32> = c.state().unwrap().devices.iter().map(|d| d.id).collect();
+    assert_eq!(ids, [1, 2, 3, 6]);
+    assert_eq!(lists(), 2);
+    // A listing that ends in an error fails and changes nothing.
+    {
+        let mut sim = dongle.0.lock().unwrap();
+        sim.devices.retain(|d| d.id != 6);
+        sim.fail_late
+            .insert("list_devices", ErrorCode::StorageFailed);
+    }
+    let error = run(&c, &rx, Command::Devices).unwrap_err();
+    assert_eq!(error.code_of(), Some(ErrorCode::StorageFailed));
     let ids: Vec<u32> = c.state().unwrap().devices.iter().map(|d| d.id).collect();
     assert_eq!(ids, [1, 2, 3, 6]);
 }
@@ -370,27 +373,21 @@ fn a_one_shot_scan_waits_for_its_end() {
 #[test]
 fn saving_settings_sends_one_write_and_events_report_the_apply() {
     let dongle = Dongle::with(|sim| {
-        // Two sensors on two pages: the cursor after the first sensor keeps its zero index.
+        // Two sensors, one per Message of the listing's frame.
         sim.settings
             .insert(1, vec![dpi(0, 800, None), dpi(1, 1600, Some(1600))]);
-        sim.page_size = 1;
+        sim.batch_size = 1;
     });
     let (c, rx) = ready(&dongle);
     run(&c, &rx, Command::Settings(id(1))).unwrap();
-    {
-        let sim = dongle.0.lock().unwrap();
-        let afters: Vec<Option<u32>> = sim
-            .log
+    assert_eq!(
+        dongle
+            .sent()
             .iter()
-            .filter_map(|c| match c {
-                p::request::Command::ListSettings(l) => {
-                    Some(l.after.as_ref().and_then(|r| r.index))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(afters, [None, Some(0)]);
-    }
+            .filter(|s| **s == "list_settings")
+            .count(),
+        1
+    );
     let first = Field::hidpp(Leaf::Dpi, Some(0));
     assert_eq!(c.state().unwrap().settings_of(1).len(), 2);
     let error = run(
@@ -514,7 +511,7 @@ fn device_commands_take_only_saved_devices() {
 fn with_profiles() -> Dongle {
     Dongle::with(|sim| {
         common::enable_profiles(&mut sim.status);
-        sim.page_size = 2;
+        sim.batch_size = 2;
         for name in ["Work", "Games", "Mouse Fix", "Work"] {
             sim.add_profile(name, Vec::new());
         }
@@ -526,7 +523,7 @@ fn profile_commands_need_profile_support() {
     let dongle = Dongle::default();
     let (c, rx) = ready(&dongle);
     for command in [
-        Command::Profiles { after: 0 },
+        Command::Profiles,
         Command::ProfileCreate("Work".into()),
         Command::Layers(id(1), Vec::new()),
         Command::Interface {
@@ -542,22 +539,19 @@ fn profile_commands_need_profile_support() {
 }
 
 #[test]
-fn profiles_are_listed_by_page_and_found_by_unique_name() {
+fn profiles_are_listed_in_one_response_and_found_by_unique_name() {
     let dongle = with_profiles();
     let (c, rx) = ready(&dongle);
-    let Outcome::Profiles { list, .. } = run(&c, &rx, Command::Profiles { after: 0 }).unwrap()
-    else {
-        panic!()
-    };
-    assert_eq!(list.entries.len(), 2);
-    assert!(!list.end);
-    assert_eq!(cordial_client::paging::Page::next(&list), Some(2));
-    // Without a cursor, every page is read.
-    let Outcome::Profiles { list, .. } = run(&c, &rx, Command::AllProfiles).unwrap() else {
+    let Outcome::Profiles(list) = run(&c, &rx, Command::Profiles).unwrap() else {
         panic!()
     };
     assert_eq!(list.entries.len(), 4);
-    assert!(list.end);
+    let lists = dongle
+        .sent()
+        .iter()
+        .filter(|s| **s == "list_profiles")
+        .count();
+    assert_eq!(lists, 1);
     let Outcome::Profile(found) = run(&c, &rx, Command::ProfileShow(name("Mouse Fix"))).unwrap()
     else {
         panic!()

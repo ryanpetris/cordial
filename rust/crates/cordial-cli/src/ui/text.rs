@@ -9,7 +9,7 @@ use crate::{
     settings::{self, Field, Leaf, Value},
     ui::catalog,
 };
-use cordial_client::{paging::Page, serial::PortInfo};
+use cordial_client::serial::PortInfo;
 use cordial_protocol::{
     self as p, CapacityReason, CodeKind, DeviceState, ErrorCode, InactiveReason, Kind, OutputMode,
     OutputState, Platform, ResourceType, Role, Transport, VendorRegistry, event,
@@ -1183,7 +1183,7 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
             b.push_str(&profile_fields(status, state));
             b
         }
-        Outcome::Profiles { list, .. } => profiles_text(list),
+        Outcome::Profiles(list) => profiles_text(list),
         Outcome::Profile(profile) => match command {
             Command::ProfileCopy(..) => format!(
                 "Copied profile to {} ({}).",
@@ -1452,11 +1452,10 @@ fn profile_text(profile: &p::Profile) -> String {
     )
 }
 
-/// `profile list`: profiles and unreadable ones in ID order, and the command for the next page
-/// when the listing goes on.
+/// `profile list`: profiles and unreadable ones in ID order.
 fn profiles_text(list: &p::ProfileList) -> String {
     let mut b = "Profiles".to_owned();
-    if list.entries.is_empty() && list.end {
+    if list.entries.is_empty() {
         b.push_str("\n  No profiles.");
     }
     for entry in &list.entries {
@@ -1469,9 +1468,6 @@ fn profiles_text(list: &p::ProfileList) -> String {
             }
             None => {}
         }
-    }
-    if let Some(next) = list.next() {
-        let _ = write!(b, "\nNext page: profile list --after {next}");
     }
     b
 }

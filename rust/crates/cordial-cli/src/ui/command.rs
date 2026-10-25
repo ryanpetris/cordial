@@ -129,11 +129,7 @@ const SPECS: &[Spec] = &[
         "DEV enabled | trusted | blocked | hidpp on | off",
         "enabled uses a saved device for connections and needs a free enabled place; trusted allows automatic connections; blocked refuses connections; hidpp lets the adapter use HID++ for special keys and saved settings",
     ),
-    spec(
-        "profile list",
-        "[--after ID]",
-        "List profiles, with their roles; --after ID lists one page after that profile",
-    ),
+    spec("profile list", "", "List profiles, with their roles"),
     spec("profile show", "PROFILE", "Show a profile's name and roles"),
     spec("profile create", "NAME", "Create an empty profile"),
     spec("profile copy", "PROFILE NAME", "Copy on the adapter"),
@@ -674,28 +670,6 @@ fn take_flag(words: &mut Vec<&str>, name: &str) -> Result<bool, ()> {
     Ok(true)
 }
 
-/// Takes `--NAME VALUE` or `--NAME=VALUE` out of `words`, wherever it is.
-fn take_option<'a>(words: &mut Vec<&'a str>, name: &str) -> Result<Option<&'a str>, ()> {
-    let flag = format!("--{name}");
-    let prefix = format!("{flag}=");
-    let Some(i) = words
-        .iter()
-        .position(|w| *w == flag || w.starts_with(&prefix))
-    else {
-        return Ok(None);
-    };
-    let word = words.remove(i);
-    let value = match word.strip_prefix(&prefix) {
-        Some(value) => value,
-        None if i < words.len() => words.remove(i),
-        None => return Err(()),
-    };
-    if value.is_empty() || words.iter().any(|w| *w == flag || w.starts_with(&prefix)) {
-        return Err(());
-    }
-    Ok(Some(value))
-}
-
 /// Parses split words. Errors are complete messages.
 pub fn parse(args: &[String]) -> Result<Line, String> {
     let all: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -759,17 +733,7 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
                 None => return usage(),
             }
         }
-        ("profile list", 0) => Line::Run(Command::AllProfiles),
-        ("profile list", 1 | 2) => {
-            let mut rest = words.to_vec();
-            let after = match take_option(&mut rest, "after") {
-                Ok(Some(word)) if rest.is_empty() => word
-                    .parse()
-                    .map_err(|_| format!("{} is not a profile ID", quote(word)))?,
-                _ => return usage(),
-            };
-            Line::Run(Command::Profiles { after })
-        }
+        ("profile list", 0) => Line::Run(Command::Profiles),
         ("profile show", 1) => Line::Run(Command::ProfileShow(target(0)?)),
         ("profile create", 1) => Line::Run(Command::ProfileCreate(arg(0))),
         ("profile copy", 2) => Line::Run(Command::ProfileCopy(target(0)?, arg(1))),
@@ -1231,7 +1195,6 @@ fn completions(words: &[String], st: Option<&State>) -> Vec<String> {
             .map(|st| policy_words(&args[0], &args[1], st))
             .unwrap_or_else(|| owned(&["on", "off"])),
         (_, 0) if PROFILE_TARGETS.contains(&cmd) => profiles(),
-        ("profile list", 0) => owned(&["--after"]),
         ("file get", 0) => owned(&["--raw"]),
         ("setting get" | "setting set" | "setting forget", 1) => st
             .map(|st| known_settings(&args[0], st))
@@ -1883,17 +1846,8 @@ pub(crate) mod tests {
 
     #[test]
     fn profile_commands_parse() {
-        assert_eq!(
-            run("profile list --after 16"),
-            Command::Profiles { after: 16 }
-        );
-        assert_eq!(
-            run("profile list --after=3"),
-            Command::Profiles { after: 3 }
-        );
-        assert_eq!(run("profile list"), Command::AllProfiles);
-        assert!(parse(&words("profile list --after")).is_err());
-        assert!(parse(&words("profile list --after x")).is_err());
+        assert_eq!(run("profile list"), Command::Profiles);
+        assert!(parse(&words("profile list --after 3")).is_err());
         assert_eq!(
             run("profile create 'Work Keys'"),
             Command::ProfileCreate("Work Keys".into())

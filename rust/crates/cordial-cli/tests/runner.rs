@@ -658,8 +658,6 @@ profile rule remap 'Mouse Fix' 09:04@01:02 09:01\n\
 profile rule scale 'Mouse Fix' 01:38@01:02 -1/1\n\
 profile rule list 'Mouse Fix'\n\
 profile list\n\
-profile list --after 0\n\
-profile list --after 2\n\
 device set 'Office Mouse' profiles Work 'Mouse Fix'\n\
 adapter set interface via on Games\n\
 device get 1\n\
@@ -677,8 +675,6 @@ profile show 2\n",
         "Saved in Mouse Fix: 01:38@01:02 scale -1/1",
         "Rules of Mouse Fix\n  01:38@01:02 scale -1/1\n  09:04@01:02 remap 09:01@01:02\n",
         "Profiles\n  1\tnone\tWork\n  2\tmouse\tMouse Fix\n  3\tnone\tGames\n",
-        "Profiles\n  1\tnone\tWork\n  2\tmouse\tMouse Fix\nNext page: profile list --after 2\n",
-        "Profiles\n  3\tnone\tGames\n",
         "Profiles of Office Mouse set to Work (1), Mouse Fix (2).",
         "VIA on, profile Games (3).",
         "  Profiles: Work (1), Mouse Fix (2)",
@@ -706,28 +702,23 @@ profile show 2\n",
 }
 
 #[test]
-fn json_prints_every_page_of_a_listing() {
+fn json_prints_a_listing_as_one_response() {
     let dongle = Dongle::with(|sim| {
         sim.devices
             .push(common::device(5, "Pad", p::Transport::Ble));
     });
     let (result, out, _) = script(&dongle, &["device", "list"], true, b"");
     result.unwrap();
-    let pages: Vec<Value> = out
+    let listings: Vec<Value> = out
         .lines()
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
         .filter(|v| !v["response"]["devices"].is_null())
         .collect();
-    assert_eq!(pages.len(), 2, "{out}");
-    let entries = |page: &Value| {
-        page["response"]["devices"]["entries"]
-            .as_array()
-            .unwrap()
-            .len()
-    };
-    assert_eq!(entries(&pages[0]), 2);
-    assert_eq!(entries(&pages[1]), 1);
-    assert_eq!(pages[1]["response"]["devices"]["end"], true);
+    assert_eq!(listings.len(), 1, "{out}");
+    let entries = listings[0]["response"]["devices"]["entries"]
+        .as_array()
+        .unwrap();
+    assert_eq!(entries.len(), 3);
 }
 
 #[test]

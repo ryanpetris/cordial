@@ -1,7 +1,7 @@
 //! A simulated Dongle over in-memory byte streams. It answers each request frame from a small
 //! model and sends the events a real Dongle would.
 #![allow(dead_code)]
-use cordial_client::{Connection, Received, paging};
+use cordial_client::{Connection, Received, order};
 use cordial_protocol::{
     self as p, CodeKind, ConfigurationInterface, DeviceState, ErrorCode, IntegrationKind,
     MAX_REQUEST_BYTES, ResourceType, Role, SettingState, Transport, device_list_entry,
@@ -101,13 +101,15 @@ pub struct Sim {
     pub log: Vec<Command>,
     /// Commands answered with this error instead.
     pub refuse: BTreeMap<&'static str, ErrorCode>,
+    /// Listings that end with this error after their first Message of entries, once.
+    pub fail_late: BTreeMap<&'static str, ErrorCode>,
     /// Commands that take effect at once but whose replies leave only after this delay.
     pub slow: BTreeMap<&'static str, Duration>,
     /// Saved profiles and their rules; used only when the status has profile support.
     pub profiles: Vec<p::Profile>,
     pub rules: BTreeMap<u32, Vec<p::ProfileRule>>,
-    /// The most records one listing page holds.
-    pub page_size: usize,
+    /// The most entries one Message of a listing's response frame holds.
+    pub batch_size: usize,
     next_profile: u32,
     pairing: Option<u32>,
     out: Option<PipeWriter>,
@@ -339,10 +341,11 @@ impl Default for Sim {
             data: BTreeMap::new(),
             log: Vec::new(),
             refuse: BTreeMap::new(),
+            fail_late: BTreeMap::new(),
             slow: BTreeMap::new(),
             profiles: Vec::new(),
             rules: BTreeMap::new(),
-            page_size: 2,
+            batch_size: 2,
             next_profile: 1,
             pairing: None,
             out: None,
@@ -391,27 +394,11 @@ fn error(code: ErrorCode) -> Option<response::Result> {
     }))
 }
 
-/// The page of `ids` after `after`: the IDs it covers and its `next`.
-/// The page of `entries` after the key `after`, in key order, and whether it ends the listing.
-fn page<T: Clone, K: Ord>(
-    entries: &[T],
-    key: impl Fn(&T) -> K,
-    after: Option<K>,
-    size: usize,
-) -> (Vec<T>, bool) {
-    let mut later: Vec<T> = entries
-        .iter()
-        .filter(|e| after.as_ref().is_none_or(|a| key(e) > *a))
-        .cloned()
-        .collect();
-    later.sort_by_key(|e| key(e));
-    let end = later.len() <= size;
-    later.truncate(size);
-    (later, end)
-}
-
-fn id_after(after: u32) -> Option<u32> {
-    (after != 0).then_some(after)
+/// `entries` in key order.
+fn sorted<T: Clone, K: Ord>(entries: &[T], key: impl Fn(&T) -> K) -> Vec<T> {
+    let mut all = entries.to_vec();
+    all.sort_by_key(|e| key(e));
+    all
 }
 
 fn settings_key(r: &p::SettingsRef) -> (i32, i32, Option<u32>) {
@@ -465,6 +452,48 @@ impl Sim {
 
     fn respond(&mut self, result: Option<response::Result>) {
         self.send(message::Kind::Response(p::Response { result }));
+    }
+
+    /// Answers a listing with every entry in one frame: Messages of `batch_size` entries encoded
+    /// back to back, as the firmware streams them. A late failure for `command` follows the
+    /// first Message.
+    fn list<T: Clone>(
+        &mut self,
+        command: &'static str,
+        entries: Vec<T>,
+        result: impl Fn(Vec<T>) -> response::Result,
+    ) {
+        let late = self.fail_late.remove(command);
+        let piece = |result| {
+            p::Message {
+                kind: Some(message::Kind::Response(p::Response {
+                    result: Some(result),
+                })),
+            }
+            .encode_to_vec()
+        };
+        let mut bytes = Vec::new();
+        let mut rest = entries.as_slice();
+        loop {
+            let (batch, more) = rest.split_at(self.batch_size.min(rest.len()));
+            bytes.extend(piece(result(batch.to_vec())));
+            rest = more;
+            if let Some(code) = late {
+                bytes.extend(piece(response::Result::Error(p::Error {
+                    code: code as i32,
+                    ..Default::default()
+                })));
+                break;
+            }
+            if rest.is_empty() {
+                break;
+            }
+        }
+        let mut framed = Vec::new();
+        frame::encode_bytes(&bytes, &mut framed);
+        if let Some(out) = &mut self.out {
+            let _ = out.write_all(&framed);
+        }
     }
 
     fn device_mut(&mut self, id: u32) -> Option<&mut p::Device> {
@@ -783,7 +812,7 @@ impl Sim {
                 self.respond(None);
                 self.pair_failed(ErrorCode::Cancelled);
             }
-            Command::ListDevices(l) => {
+            Command::ListDevices(_) => {
                 let all: Vec<p::DeviceListEntry> = self
                     .devices
                     .iter()
@@ -795,16 +824,10 @@ impl Sim {
                     )
                     .map(|entry| p::DeviceListEntry { entry: Some(entry) })
                     .collect();
-                let (entries, end) = page(
-                    &all,
-                    paging::device_entry_id,
-                    id_after(l.after),
-                    self.page_size,
-                );
-                self.respond(Some(response::Result::Devices(p::DeviceList {
-                    entries,
-                    end,
-                })));
+                let entries = sorted(&all, order::device_entry_id);
+                self.list("list_devices", entries, |entries| {
+                    response::Result::Devices(p::DeviceList { entries })
+                });
             }
             Command::GetDevice(get) => match self.devices.iter().find(|d| d.id == get.device) {
                 Some(d) => {
@@ -923,19 +946,16 @@ impl Sim {
             {
                 self.respond(error(ErrorCode::UnknownCommand))
             }
-            Command::ListProfiles(l) => {
-                let (profiles, end) =
-                    page(&self.profiles, |p| p.id, id_after(l.after), self.page_size);
-                let entries = profiles
+            Command::ListProfiles(_) => {
+                let entries = sorted(&self.profiles, |p| p.id)
                     .into_iter()
                     .map(|profile| p::ProfileListEntry {
                         entry: Some(profile_list_entry::Entry::Profile(profile)),
                     })
                     .collect();
-                self.respond(Some(response::Result::Profiles(p::ProfileList {
-                    entries,
-                    end,
-                })));
+                self.list("list_profiles", entries, |entries| {
+                    response::Result::Profiles(p::ProfileList { entries })
+                });
             }
             Command::GetProfile(g) => match self.profiles.iter().find(|p| p.id == g.profile) {
                 Some(profile) => {
@@ -995,13 +1015,12 @@ impl Sim {
                     return self.respond(error(ErrorCode::NotFound));
                 }
                 let all = self.rules.get(&l.profile).cloned().unwrap_or_default();
-                let after = l.after.map(|r| ref_key(r.input, r.collection));
-                let (rules, end) = page(&all, rule_key, after, self.page_size);
-                self.respond(Some(response::Result::ProfileRules(p::ProfileRules {
-                    profile: l.profile,
-                    rules,
-                    end,
-                })));
+                self.list("list_profile_rules", sorted(&all, rule_key), |rules| {
+                    response::Result::ProfileRules(p::ProfileRules {
+                        profile: l.profile,
+                        rules,
+                    })
+                });
             }
             Command::SetProfileRules(s) => {
                 if !self.has_profile(s.profile) {
@@ -1023,14 +1042,13 @@ impl Sim {
             }
             Command::ListSettings(l) => {
                 let all = self.settings.get(&l.device).cloned().unwrap_or_default();
-                let after = l.after.as_ref().map(settings_key);
-                let key = |o: &p::SettingsObject| settings_key(&paging::settings_ref(o));
-                let (objects, end) = page(&all, key, after, self.page_size);
-                self.respond(Some(response::Result::Settings(p::DeviceSettings {
-                    device: l.device,
-                    objects,
-                    end,
-                })));
+                let key = |o: &p::SettingsObject| settings_key(&order::settings_ref(o));
+                self.list("list_settings", sorted(&all, key), |objects| {
+                    response::Result::Settings(p::DeviceSettings {
+                        device: l.device,
+                        objects,
+                    })
+                });
             }
             Command::SetSettings(set) => {
                 // Saves and applies pointer sensor sensitivities, the only settings it has.
@@ -1072,7 +1090,6 @@ impl Sim {
             }
             Command::ListFeatures(_) => {
                 self.respond(Some(response::Result::Features(p::FeatureList {
-                    end: true,
                     features: vec![p::Feature {
                         integration: IntegrationKind::Hidpp as i32,
                         supported: true,
@@ -1087,9 +1104,10 @@ impl Sim {
             }
             Command::ListFiles(l) => match self.files.get(&l.path).cloned() {
                 Some(all) => {
-                    let after = (!l.after.is_empty()).then_some(l.after);
-                    let (entries, end) = page(&all, |e| e.name.clone(), after, self.page_size);
-                    self.respond(Some(response::Result::Files(p::FileList { entries, end })))
+                    let entries = sorted(&all, |e| e.name.clone());
+                    self.list("list_files", entries, |entries| {
+                        response::Result::Files(p::FileList { entries })
+                    })
                 }
                 None => self.respond(error(ErrorCode::NotFound)),
             },

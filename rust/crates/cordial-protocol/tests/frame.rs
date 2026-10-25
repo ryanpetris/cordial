@@ -180,3 +180,31 @@ fn typed_information_preserves_unknown_false_zero_and_enum_readings() {
         setting
     );
 }
+
+#[test]
+fn incremental_encoder_matches_contiguous_encoding_at_every_split() {
+    for length in [0, 1, 253, 254, 255, 508, 509, 1024] {
+        for zeros in [false, true] {
+            let bytes: Vec<_> = (0..length)
+                .map(|i| {
+                    if zeros && i % 13 == 0 {
+                        0
+                    } else {
+                        (i % 251 + 1) as u8
+                    }
+                })
+                .collect();
+            let mut expected = Vec::new();
+            frame::encode_bytes(&bytes, &mut expected);
+            for split in 0..=length {
+                let mut encoder = frame::Encoder::new();
+                let mut encoded = Vec::new();
+                encoder.push(&bytes[..split], &mut encoded);
+                assert!(!encoded.contains(&0));
+                encoder.push(&bytes[split..], &mut encoded);
+                encoder.finish(&mut encoded);
+                assert_eq!(encoded, expected, "length {length}, split {split}");
+            }
+        }
+    }
+}

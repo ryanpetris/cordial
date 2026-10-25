@@ -26,7 +26,6 @@ import {
   type ProfileListEntry,
   type ProfileRule,
   type ProfileRules,
-  type ProfileRuleRefSchema,
   type Request,
   type Response,
   type SetAdapterSchema,
@@ -34,11 +33,9 @@ import {
   type SetProfileRulesSchema,
   type SetSettingsSchema,
   type SettingsObject,
-  type SettingsRefSchema,
   type Status,
   type Transport,
 } from "@cordial/protocol";
-import { featureRef, ruleRef, settingsRef } from "./order.ts";
 import type { ByteStream } from "./stream.ts";
 
 /** A request, as the command it carries. */
@@ -75,33 +72,6 @@ export class UnexpectedResponseError extends Error {
   }
 }
 
-/** One page of a listing: its entries in the listing's order, and whether nothing follows them. */
-export interface Page<E> {
-  entries: E[];
-  end: boolean;
-}
-
-/**
- * Reads a listing to its end. Each request passes the key of the last entry received as `after`,
- * undefined for the first; the Dongle chooses how many entries each page holds. An entry whose
- * key is undefined, such as one of a kind newer than this client, is kept but never continues the
- * listing: the next page follows the last entry with a key. A page that does not end the listing
- * and has no entry with a key breaks the protocol, or can't be continued, and rejects with
- * UnexpectedResponseError.
- */
-export async function readAll<E, K>(command: string, read: (after: K | undefined) => Promise<Page<E>>, key: (entry: E) => K | undefined): Promise<E[]> {
-  const all: E[] = [];
-  let after: K | undefined;
-  for (;;) {
-    const page = await read(after);
-    all.push(...page.entries);
-    if (page.end) return all;
-    const last = page.entries.map(key).findLast((k) => k !== undefined);
-    if (last === undefined) throw new UnexpectedResponseError(command);
-    after = last;
-  }
-}
-
 /** The ID a device or profile listing entry is listed by; undefined for an entry of a kind this
  * client doesn't know. */
 export const entryId = (e: DeviceListEntry | ProfileListEntry): number | undefined =>
@@ -127,10 +97,9 @@ export interface ConnectionOptions {
   /** The session ended by itself: the port closed or the Dongle broke the protocol. */
   onClose?: (error: Error) => void;
   log?: (message: string) => void;
-  /** How long the first response may take. */
+  /** How long the first response may stall without incoming bytes. */
   openTimeoutMs?: number;
-  /** How long any later response may take before the session ends; a lost
-   * response would leave every later one answering the wrong request. */
+  /** How long any later response may stall without incoming bytes before the session ends. */
   timeoutMs?: number;
 }
 
@@ -221,8 +190,14 @@ export class Connection {
     const pending = this.#queue.shift();
     if (!pending) return;
     this.#sent = pending;
-    this.#timer = setTimeout(() => this.#fail(new Error(`${pending.request.command.case} got no response`)), pending.timeoutMs);
+    this.#armTimeout();
     this.#stream.write(pending.frame).catch((error: Error) => this.#fail(new Error(`serial write failed: ${error.message}`)));
+  }
+
+  #armTimeout() {
+    clearTimeout(this.#timer);
+    const pending = this.#sent;
+    if (pending) this.#timer = setTimeout(() => this.#fail(new Error(`${pending.request.command.case} got no response`)), pending.timeoutMs);
   }
 
   async #call<C extends ResultCase>(command: Command, result: C): Promise<ResultOf<C>> {
@@ -269,13 +244,12 @@ export class Connection {
   cancelPairing(): Promise<void> {
     return this.#void({ case: "cancelPairing", value: {} });
   }
-  /** One page of saved devices with IDs above `after`, the ID of the last entry received. */
-  listDevices(after = 0): Promise<DeviceList> {
-    return this.#call({ case: "listDevices", value: { after } }, "devices");
+  /** Every saved device, including IDs whose records could not be read. */
+  listDevices(): Promise<DeviceList> {
+    return this.#call({ case: "listDevices", value: {} }, "devices");
   }
-  /** Every saved device, and the IDs of those whose record could not be read. */
-  listAllDevices(): Promise<DeviceListEntry[]> {
-    return readAll("listDevices", (after = 0) => this.listDevices(after), entryId);
+  async listAllDevices(): Promise<DeviceListEntry[]> {
+    return (await this.listDevices()).entries;
   }
   getDevice(device: number): Promise<Device> {
     return this.#call({ case: "getDevice", value: { device } }, "device");
@@ -298,29 +272,24 @@ export class Connection {
   refreshDevice(device: number): Promise<void> {
     return this.#void({ case: "refreshDevice", value: { device } });
   }
-  /** One page of a device's settings objects following `after`, the identity of the last object
-   * received. */
-  listSettings(device: number, after?: MessageInitShape<typeof SettingsRefSchema>): Promise<DeviceSettings> {
-    return this.#call({ case: "listSettings", value: { device, after } }, "settings");
+  /** Every settings object of the device. */
+  listSettings(device: number): Promise<DeviceSettings> {
+    return this.#call({ case: "listSettings", value: { device } }, "settings");
   }
-  listAllSettings(device: number): Promise<SettingsObject[]> {
-    return readAll("listSettings", async (after: MessageInitShape<typeof SettingsRefSchema> | undefined) => {
-      const page = await this.listSettings(device, after);
-      return { entries: page.objects, end: page.end };
-    }, settingsRef);
+  async listAllSettings(device: number): Promise<SettingsObject[]> {
+    return (await this.listSettings(device)).objects;
   }
   /** Saves and forgets settings in one write, applied in order. Success means the Dongle saved
    * exactly what was sent; a settings_changed event follows. */
   setSettings(update: MessageInitShape<typeof SetSettingsSchema>): Promise<void> {
     return this.#void({ case: "setSettings", value: update });
   }
-  /** One page of saved profiles with IDs above `after`, the ID of the last entry received. */
-  listProfiles(after = 0): Promise<ProfileList> {
-    return this.#call({ case: "listProfiles", value: { after } }, "profiles");
+  /** Every saved profile, including IDs whose records could not be read. */
+  listProfiles(): Promise<ProfileList> {
+    return this.#call({ case: "listProfiles", value: {} }, "profiles");
   }
-  /** Every saved profile, and the IDs of those whose record could not be read. */
-  listAllProfiles(): Promise<ProfileListEntry[]> {
-    return readAll("listProfiles", (after = 0) => this.listProfiles(after), entryId);
+  async listAllProfiles(): Promise<ProfileListEntry[]> {
+    return (await this.listProfiles()).entries;
   }
   getProfile(profile: number): Promise<Profile> {
     return this.#call({ case: "getProfile", value: { profile } }, "profile");
@@ -338,41 +307,31 @@ export class Connection {
   deleteProfile(profile: number): Promise<void> {
     return this.#void({ case: "deleteProfile", value: { profile } });
   }
-  /** One page of a profile's rules following `after`, the input and collection of the last rule
-   * received. */
-  listProfileRules(profile: number, after?: MessageInitShape<typeof ProfileRuleRefSchema>): Promise<ProfileRules> {
-    return this.#call({ case: "listProfileRules", value: { profile, after } }, "profileRules");
+  /** Every rule of the profile. */
+  listProfileRules(profile: number): Promise<ProfileRules> {
+    return this.#call({ case: "listProfileRules", value: { profile } }, "profileRules");
   }
-  listAllProfileRules(profile: number): Promise<ProfileRule[]> {
-    return readAll("listProfileRules", async (after: MessageInitShape<typeof ProfileRuleRefSchema> | undefined) => {
-      const page = await this.listProfileRules(profile, after);
-      return { entries: page.rules, end: page.end };
-    }, ruleRef);
+  async listAllProfileRules(profile: number): Promise<ProfileRule[]> {
+    return (await this.listProfileRules(profile)).rules;
   }
   /** Saves and forgets rules in one write, applied in order. Success means the Dongle saved exactly
    * what was sent. */
   setProfileRules(update: MessageInitShape<typeof SetProfileRulesSchema>): Promise<void> {
     return this.#void({ case: "setProfileRules", value: update });
   }
-  /** One page of a device's features following `after`, the last feature received. */
-  listFeatures(device: number, after?: ReturnType<typeof featureRef>): Promise<FeatureList> {
-    return this.#call({ case: "listFeatures", value: { device, after } }, "features");
+  /** Every feature of the device. Development firmware only. */
+  listFeatures(device: number): Promise<FeatureList> {
+    return this.#call({ case: "listFeatures", value: { device } }, "features");
   }
-  listAllFeatures(device: number): Promise<Feature[]> {
-    return readAll("listFeatures", async (after: ReturnType<typeof featureRef> | undefined) => {
-      const page = await this.listFeatures(device, after);
-      return { entries: page.features, end: page.end };
-    }, featureRef);
+  async listAllFeatures(device: number): Promise<Feature[]> {
+    return (await this.listFeatures(device)).features;
   }
-  /** One page of a directory's entries whose names follow `after`, the last name received. */
-  listFiles(path: string, after = ""): Promise<FileList> {
-    return this.#call({ case: "listFiles", value: { path, after } }, "files");
+  /** Every entry of a directory. Development firmware only. */
+  listFiles(path: string): Promise<FileList> {
+    return this.#call({ case: "listFiles", value: { path } }, "files");
   }
-  listAllFiles(path: string): Promise<FileEntry[]> {
-    return readAll("listFiles", async (after: string | undefined) => {
-      const page = await this.listFiles(path, after);
-      return { entries: page.entries, end: page.end };
-    }, (e) => e.name);
+  async listAllFiles(path: string): Promise<FileEntry[]> {
+    return (await this.listFiles(path)).entries;
   }
   async readFile(path: string): Promise<Uint8Array> {
     return (await this.#call({ case: "readFile", value: { path } }, "file")).data;
@@ -381,6 +340,8 @@ export class Connection {
   // ---- Input ----------------------------------------------------------------
 
   #receive(chunk: Uint8Array) {
+    if (this.#closed) return;
+    if (chunk.length) this.#armTimeout();
     for (const frame of this.#decoder.push(chunk)) {
       if (this.#closed) return;
       let problem: string | null = null;
@@ -445,6 +406,7 @@ export class Connection {
     const closed = error instanceof ConnectionClosedError ? error : new ConnectionClosedError(error.message);
     for (const pending of [...(this.#sent ? [this.#sent] : []), ...this.#queue.splice(0)]) pending.reject(closed);
     this.#sent = null;
+    this.#decoder.reset();
   }
 
   #fail(error: Error) {

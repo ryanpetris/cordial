@@ -1,7 +1,8 @@
 // A simulated adapter speaking the serial API over an in-memory ByteStream,
 // following the firmware's behavior: every command answers at once, and
-// changes follow as events after the response. Listings come in pages of
-// `pageSize` entries, and settings events carry only what changed since the
+// changes follow as events after the response. Each listing is one response
+// frame holding Messages of `batchSize` entries encoded back to back, as the
+// firmware streams them, and settings events carry only what changed since the
 // client last listed or heard of them. Tests and the demo
 // mode use it; all data is synthetic.
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
@@ -141,8 +142,8 @@ export interface FakeOptions {
   memoryBudget?: number;
   /** Profiles per device layer list. */
   maxLayers?: number;
-  /** Entries per listed page. */
-  pageSize?: number;
+  /** Entries per Message in a listing's response frame. */
+  batchSize?: number;
   /** USB interfaces the board can expose. */
   usbInterfaces?: number;
   /** Whether the board has HID and XInput gamepad outputs; every board but the ESP32-S3 does. */
@@ -250,12 +251,8 @@ const rolesOf = (p: FakeProfile) => ROLE_ORDER.filter((r) => p.rules.some((rule)
 const sizeOf = (p: FakeProfile) => p.size ?? PROFILE_BYTES + RULE_BYTES * p.rules.length;
 const hex = (bytes: Uint8Array) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 
-/** The page of `list`, sorted by `compare`, whose keys follow `after`, and whether it ends the list. */
-function page<E, K>(list: E[], after: K | undefined, size: number, key: (e: E) => K, compare: (a: K, b: K) => number) {
-  const later = list.filter((e) => after === undefined || compare(key(e), after) > 0).sort((a, b) => compare(key(a), key(b)));
-  const entries = later.slice(0, size);
-  return { entries, end: entries.length === later.length };
-}
+/** `list` sorted by `compare` on each entry's key. */
+const sorted = <E, K>(list: E[], key: (e: E) => K, compare: (a: K, b: K) => number) => [...list].sort((a, b) => compare(key(a), key(b)));
 
 export function device(id: number, patch: Partial<FakeDevice> = {}): FakeDevice {
   return {
@@ -432,6 +429,9 @@ export class FakeAdapter implements ByteStream {
   events: NonNullable<MessageInitShape<typeof EventSchema>["kind"]>[] = [];
   /** Error codes to answer the next requests of a command with, in order, by command case. */
   failures: Record<string, ErrorCode[]> = {};
+  /** Error codes that end the next listings of a command after their first Message of entries,
+   * in order, by command case. */
+  lateFailures: Record<string, ErrorCode[]> = {};
   /** Whether a STORAGE_FAILED failure leaves the outcome of its write unknown. */
   uncertainWrites = false;
   readonly profileSupport: boolean;
@@ -441,7 +441,7 @@ export class FakeAdapter implements ByteStream {
   interfaces: Record<InterfaceName, { enabled: boolean; profile: number }>;
   memoryBudget: number;
   maxLayers: number;
-  pageSize: number;
+  batchSize: number;
   /** Records whose flash read fails: listed as unreadable, and a profile here can't load. */
   unreadableDevices = new Set<number>();
   unreadableProfiles = new Set<number>();
@@ -507,7 +507,7 @@ export class FakeAdapter implements ByteStream {
     };
     this.memoryBudget = options.memoryBudget ?? 4096;
     this.maxLayers = options.maxLayers ?? 4;
-    this.pageSize = options.pageSize ?? 8;
+    this.batchSize = options.batchSize ?? 8;
     this.usbInterfaces = options.usbInterfaces ?? 16;
     this.#nextProfile = Math.max(0, ...this.profiles.map((p) => p.id)) + 1;
     this.#nextDevice = Math.max(9, ...this.devices.map((d) => d.id)) + 1;
@@ -626,10 +626,11 @@ export class FakeAdapter implements ByteStream {
     };
   }
 
-  /** Queues a message behind earlier ones, after the reply delay. */
-  #message(message: MessageInit) {
+  /** Queues messages, encoded back to back in one frame, behind earlier ones, after the reply
+   * delay. */
+  #message(...messages: MessageInit[]) {
     const session = this.#session;
-    const frame = encodeFrame(toBinary(MessageSchema, create(MessageSchema, message)));
+    const frame = encodeFrame(new Uint8Array(messages.flatMap((m) => [...toBinary(MessageSchema, create(MessageSchema, m))])));
     const gate = this.#gate;
     this.#outbox = this.#outbox.then(async () => {
       if (gate) await gate;
@@ -641,6 +642,21 @@ export class FakeAdapter implements ByteStream {
 
   #reply(response: MessageInitShape<typeof ResponseSchema>) {
     this.#message({ kind: { case: "response", value: response } });
+  }
+
+  /** Answers a listing with every entry in one frame, `batchSize` entries per Message. A late
+   * failure for `command` follows the first Message. */
+  #list<E>(command: string, entries: E[], result: (batch: E[]) => MessageInitShape<typeof ResponseSchema>["result"]) {
+    const late = this.lateFailures[command]?.shift();
+    const pieces: MessageInit[] = [];
+    for (let i = 0; i === 0 || i < entries.length; i += this.batchSize) {
+      pieces.push({ kind: { case: "response", value: { result: result(entries.slice(i, i + this.batchSize)) } } });
+      if (late !== undefined) {
+        pieces.push({ kind: { case: "response", value: { result: { case: "error", value: { code: late } } } } });
+        break;
+      }
+    }
+    this.#message(...pieces);
   }
 
   #event(event: NonNullable<MessageInitShape<typeof EventSchema>["kind"]>) {
@@ -1112,11 +1128,10 @@ export class FakeAdapter implements ByteStream {
         return;
       }
       case "listDevices": {
-        const { entries, end } = page(this.devices, command.value.after, this.pageSize, (d) => d.id, (a, b) => a - b);
-        const listed = entries.map((d) =>
+        const listed = sorted(this.devices, (d) => d.id, (a, b) => a - b).map((d) =>
           this.newerDevices.has(d.id) ? { entry: { case: undefined } }
             : this.unreadableDevices.has(d.id) ? { entry: { case: "unreadable" as const, value: d.id } } : { entry: { case: "device" as const, value: this.record(d) } });
-        return this.#reply({ result: { case: "devices", value: { entries: listed, end } } });
+        return this.#list(command.case, listed, (entries) => ({ case: "devices", value: { entries } }));
       }
       case "getDevice": {
         const d = this.find(command.value.device);
@@ -1174,12 +1189,11 @@ export class FakeAdapter implements ByteStream {
       }
       case "listSettings": {
         const d = this.find(command.value.device);
-        const after = command.value.after;
-        const { entries, end } = page(this.settingsOf(d), after && { integration: after.integration, group: after.group, index: after.index }, this.pageSize, (o) => settingsRef(o)!, compareSettingsRefs);
+        const objects = sorted(this.settingsOf(d), (o) => settingsRef(o)!, compareSettingsRefs);
         const seen = this.#seenSettings.get(d.id) ?? new Map<string, string>();
-        for (const o of entries) seen.set(JSON.stringify(settingsRef(o)), hex(toBinary(SettingsObjectSchema, o)));
+        for (const o of objects) seen.set(JSON.stringify(settingsRef(o)), hex(toBinary(SettingsObjectSchema, o)));
         this.#seenSettings.set(d.id, seen);
-        return this.#reply({ result: { case: "settings", value: { device: d.id, objects: entries, end } } });
+        return this.#list(command.case, objects, (batch) => ({ case: "settings", value: { device: d.id, objects: batch } }));
       }
       case "setSettings":
         return this.#setSettings(command.value);
@@ -1194,9 +1208,9 @@ export class FakeAdapter implements ByteStream {
         return this.#runProfile(command);
       case "listFeatures":
         this.find(command.value.device);
-        return this.#reply({ result: { case: "features", value: { features: [], end: true } } });
+        return this.#list(command.case, [], (features) => ({ case: "features", value: { features } }));
       case "listFiles":
-        return this.#reply({ result: { case: "files", value: { entries: [], end: true } } });
+        return this.#list(command.case, [], (entries) => ({ case: "files", value: { entries } }));
       default:
         throw new Refusal(ErrorCode.UNKNOWN_COMMAND);
     }
@@ -1327,11 +1341,10 @@ export class FakeAdapter implements ByteStream {
   #runProfile(command: Extract<Request["command"], { case: "listProfiles" | "getProfile" | "createProfile" | "copyProfile" | "deleteProfile" | "listProfileRules" | "setProfileRules" }>) {
     switch (command.case) {
       case "listProfiles": {
-        const { entries, end } = page(this.profiles, command.value.after, this.pageSize, (p) => p.id, (a, b) => a - b);
-        const listed = entries.map((p) =>
+        const listed = sorted(this.profiles, (p) => p.id, (a, b) => a - b).map((p) =>
           this.newerProfiles.has(p.id) ? { entry: { case: undefined } }
             : this.unreadableProfiles.has(p.id) ? { entry: { case: "unreadable" as const, value: p.id } } : { entry: { case: "profile" as const, value: this.#profileRecord(p) } });
-        return this.#reply({ result: { case: "profiles", value: { entries: listed, end } } });
+        return this.#list(command.case, listed, (entries) => ({ case: "profiles", value: { entries } }));
       }
       case "getProfile": {
         const p = this.#profile(command.value.profile);
@@ -1364,9 +1377,8 @@ export class FakeAdapter implements ByteStream {
       }
       case "listProfileRules": {
         const p = this.#profile(command.value.profile);
-        const after = command.value.after && ruleRef(command.value.after);
-        const { entries, end } = page(p.rules, after, this.pageSize, ruleRef, compareRuleRefs);
-        return this.#reply({ result: { case: "profileRules", value: { profile: p.id, rules: entries, end } } });
+        const rules = sorted(p.rules, ruleRef, compareRuleRefs);
+        return this.#list(command.case, rules, (batch) => ({ case: "profileRules", value: { profile: p.id, rules: batch } }));
       }
       case "setProfileRules": {
         const p = this.#profile(command.value.profile);

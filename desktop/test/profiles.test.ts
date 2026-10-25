@@ -6,6 +6,7 @@ import { FakeAdapter, axis, device, profile, remap, scale } from "../src/fake/ad
 import { canEnable, copyName, interfaceProblem, profileInUse, stagedInterfaces } from "../src/shared/profiles.ts";
 import type { AdapterStatus, AppState, DeviceEntry } from "../src/shared/state.ts";
 import { memoryPercent, profileAlertText } from "../src/shared/text.ts";
+import { PROFILES_PER_PAGE } from "../src/core/session.ts";
 import { controller, record, until } from "./helpers.ts";
 
 const ID = "0123456789ABCDEF";
@@ -65,97 +66,102 @@ describe("Profiles", () => {
     await c.stop();
   });
 
-  it("shows one page at a time and moves between pages", async () => {
-    const profiles = [1, 2, 3, 4, 5].map((id) => profile(id, `P${id}`));
-    const { fake, c, state } = await start({ profiles, pageSize: 2 });
-    expect(ids(state)).toEqual([1, 2]);
+  it("shows one page at a time of a single listing and moves between pages", async () => {
+    const profiles = Array.from({ length: 25 }, (_, i) => profile(i + 1, `P${i + 1}`));
+    const { fake, c, state } = await start({ profiles, batchSize: 4 });
+    const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
+    expect(ids(state)).toEqual(range(1, PROFILES_PER_PAGE));
     expect(page(state)).toMatchObject({ previous: false, next: true });
     await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
-    expect(ids(state)).toEqual([3, 4]);
+    expect(ids(state)).toEqual(range(11, 20));
     await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
-    expect(ids(state)).toEqual([5]);
+    expect(ids(state)).toEqual(range(21, 25));
     expect(page(state)).toMatchObject({ previous: true, next: false });
     await c.request({ type: "profiles.page", adapterId: ID, page: "previous" });
-    expect(ids(state)).toEqual([3, 4]);
-    // A failed read leaves the shown page and its cursors as they were.
-    fake.failures.listProfiles = [ErrorCode.BUSY];
-    await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
-    expect(page(state)).toMatchObject({ previous: true, next: true, error: expect.stringContaining("busy") });
-    expect(ids(state)).toEqual([3, 4]);
+    expect(ids(state)).toEqual(range(11, 20));
+    expect(commands(fake).filter((x) => x === "listProfiles")).toHaveLength(1);
+    // A listing that fails after some entries leaves the listed profiles and the shown page.
+    fake.profiles = fake.profiles.slice(1);
+    fake.lateFailures.listProfiles = [ErrorCode.BUSY];
+    await c.request({ type: "adapter.reload", adapterId: ID });
+    await until(() => !page(state).loading && page(state).error !== null);
+    expect(page(state).error).toContain("busy");
+    expect(ids(state)).toEqual(range(11, 20));
     await c.request({ type: "profiles.page", adapterId: ID, page: "previous" });
-    expect(ids(state)).toEqual([1, 2]);
-    expect(page(state)).toMatchObject({ previous: false, error: null });
-    const afters = fake.received.flatMap((r) => (r.command.case === "listProfiles" ? [r.command.value.after] : []));
-    expect(afters).toEqual([0, 2, 4, 2, 4, 0]);
+    expect(ids(state)).toEqual(range(1, 10));
+    await c.request({ type: "adapter.reload", adapterId: ID });
+    await until(() => !page(state).loading && page(state).error === null);
+    expect(ids(state)).toEqual(range(2, 11));
     await c.stop();
   });
 
-  it("keeps the cursors when moving back from an emptied next page fails", async () => {
-    const profiles = [1, 2, 3, 4, 5, 6].map((id) => profile(id, `P${id}`));
-    const { fake, c, state } = await start({ profiles, pageSize: 2 });
-    await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
-    expect(ids(state)).toEqual([3, 4]);
-    // The following page empties without the adapter saying so, and reading the shown one fails.
-    fake.profiles = fake.profiles.filter((p) => p.id < 5);
-    fake.failures.listProfiles = [undefined as unknown as ErrorCode, ErrorCode.BUSY];
-    await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
-    expect(page(state)).toMatchObject({ previous: true, error: expect.stringContaining("busy") });
-    expect(ids(state)).toEqual([3, 4]);
-    await c.request({ type: "profiles.page", adapterId: ID, page: "previous" });
-    expect(ids(state)).toEqual([1, 2]);
-    await c.stop();
-  });
-
-  it("pages on after the last profile listing entry of a known kind", async () => {
-    const fake = new FakeAdapter({ adapterId: ID, devices: [], profiles: [1, 2, 3].map((id) => profile(id, `P${id}`)), pageSize: 2 });
+  it("skips profile listing entries of a kind newer than this app", async () => {
+    const fake = new FakeAdapter({ adapterId: ID, devices: [], profiles: [1, 2, 3].map((id) => profile(id, `P${id}`)), batchSize: 2 });
     fake.newerProfiles.add(2);
     const harness = controller({ "/a": fake });
     const { c } = harness;
     const state = harness.state as () => AppState;
     await c.manager.rescan();
     await until(() => !!state()?.adapters[0]?.profilePage && !page(state).loading);
-    expect(ids(state)).toEqual([1]);
-    expect(page(state)).toMatchObject({ next: true });
-    await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
-    expect(ids(state)).toEqual([3]);
-    const afters = fake.received.flatMap((r) => (r.command.case === "listProfiles" ? [r.command.value.after] : []));
-    expect(afters).toEqual([0, 1]);
+    expect(ids(state)).toEqual([1, 3]);
+    expect(page(state)).toMatchObject({ previous: false, next: false });
     await c.stop();
   });
 
   it("pages the profile picker separately from the Profiles list", async () => {
-    const profiles = [1, 2, 3, 4, 5].map((id) => profile(id, `P${id}`));
-    const { c, state } = await start({ profiles, pageSize: 2 });
+    const profiles = Array.from({ length: 25 }, (_, i) => profile(i + 1, `P${i + 1}`));
+    const { c, state } = await start({ profiles });
     await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
-    expect(ids(state)).toEqual([3, 4]);
+    expect(ids(state)[0]).toBe(11);
     expect(adapter(state).pickerPage).toBeNull();
     const picked = () => adapter(state).pickerPage?.profiles.map((p) => p.id);
     await c.request({ type: "profiles.page", adapterId: ID, page: "first", picker: true });
-    expect(picked()).toEqual([1, 2]);
+    expect(picked()?.[0]).toBe(1);
     await c.request({ type: "profiles.page", adapterId: ID, page: "next", picker: true });
     await c.request({ type: "profiles.page", adapterId: ID, page: "next", picker: true });
-    expect(picked()).toEqual([5]);
+    expect(picked()).toEqual([21, 22, 23, 24, 25]);
     expect(adapter(state).pickerPage).toMatchObject({ previous: true, next: false });
-    expect(ids(state)).toEqual([3, 4]);
+    expect(ids(state)[0]).toBe(11);
     expect(page(state)).toMatchObject({ previous: true, next: true });
     // Profile events update both pages.
-    await c.act({ type: "profile.delete", adapterId: ID, profile: 5 });
-    await until(() => picked()?.join() === "3,4" && !adapter(state).pickerPage!.loading);
-    expect(ids(state)).toEqual([3, 4]);
+    await c.act({ type: "profile.delete", adapterId: ID, profile: 25 });
+    await until(() => picked()?.join() === "21,22,23,24");
+    expect(ids(state)[0]).toBe(11);
     await c.stop();
   });
 
   it("moves back a page when deleting leaves the shown one empty, and places new profiles", async () => {
-    const { c, state } = await start({ profiles: [profile(1, "A"), profile(2, "B"), profile(3, "C")], pageSize: 2 });
+    const profiles = Array.from({ length: 11 }, (_, i) => profile(i + 1, `P${i + 1}`));
+    const { fake, c, state } = await start({ profiles });
     await c.request({ type: "profiles.page", adapterId: ID, page: "next" });
-    expect(ids(state)).toEqual([3]);
+    expect(ids(state)).toEqual([11]);
     expect(await c.act({ type: "profile.create", adapterId: ID, name: "D" })).toEqual({ ok: true });
     await until(() => ids(state).length === 2);
-    expect(ids(state)).toEqual([3, 4]);
-    await c.act({ type: "profile.delete", adapterId: ID, profile: 3 });
-    await c.act({ type: "profile.delete", adapterId: ID, profile: 4 });
-    await until(() => ids(state).join() === "1,2" && !page(state).loading);
+    expect(ids(state)).toEqual([11, 12]);
+    await c.act({ type: "profile.delete", adapterId: ID, profile: 11 });
+    await c.act({ type: "profile.delete", adapterId: ID, profile: 12 });
+    await until(() => ids(state)[0] === 1);
     expect(page(state)).toMatchObject({ previous: false, next: false });
+    // A profile that starts a new page leaves the shown page where it is.
+    await c.act({ type: "profile.create", adapterId: ID, name: "E" });
+    await until(() => page(state).next);
+    expect(ids(state)[0]).toBe(1);
+    // Events keep the listing current without listing again.
+    expect(commands(fake).filter((x) => x === "listProfiles")).toHaveLength(1);
+    await c.stop();
+  });
+
+  it("applies profile events that follow a listing to what it listed", async () => {
+    const { fake, c, state } = await start({ profiles: [profile(1, "A"), profile(2, "B")], batchSize: 1 });
+    const { connection } = c.manager.connected.get(ID)!.session;
+    // The listing and the removal's event arrive together, in the adapter's order.
+    const release = fake.hold();
+    const listed = connection.listProfiles();
+    const removed = connection.deleteProfile(2);
+    release();
+    expect((await listed).entries).toHaveLength(2);
+    await removed;
+    await until(() => ids(state).join() === "1");
     await c.stop();
   });
 
@@ -182,10 +188,10 @@ describe("Profiles", () => {
   });
 
   it("keys rules by input and collection", async () => {
-    const { fake, c, state } = await start({ profiles: [profile(1, "A")], pageSize: 1 });
+    const { fake, c, state } = await start({ profiles: [profile(1, "A")], batchSize: 1 });
     const { connection } = c.manager.connected.get(ID)!.session;
     const save = (...rules: ReturnType<typeof remap>[]) => connection.setProfileRules({ profile: 1, changes: rules.map((value) => ({ change: { case: "rule" as const, value } })) });
-    const list = async () => (await connection.listAllProfileRules(1)).map((r) => [r.input?.usagePage, r.input?.usage, r.collection?.usage]);
+    const list = async () => (await connection.listProfileRules(1)).rules.map((r) => [r.input?.usagePage, r.input?.usage, r.collection?.usage]);
     // Mouse Button 1 and Game Pad Button 1 share a usage but are different inputs.
     await save(
       remap([0x09, 0x01], [0x01, 0x02], [[0x07, 0x04]]),
@@ -193,14 +199,12 @@ describe("Profiles", () => {
       axis([0x02, 0xc5], [0x02, 0xc4], true),
     );
     const sent = fake.received.length;
-    const listed = await connection.listAllProfileRules(1);
+    const { rules: listed } = await connection.listProfileRules(1);
     expect(listed.map((r) => [r.input?.usagePage, r.input?.usage, r.collection?.usage])).toEqual([[0x02, 0xc5, 0x05], [0x09, 0x01, 0x02], [0x09, 0x01, 0x05]]);
     expect(listed[0]!.effect).toMatchObject({ case: "axis", value: { destination: { usagePage: 0x02, usage: 0xc4 }, invert: true } });
     expect(listed[1]!.effect).toMatchObject({ case: "remap", value: { outputs: [{ usage: { usagePage: 0x07, usage: 0x04 }, collection: { usagePage: 0x01, usage: 0x06 } }] } });
     expect(listed[2]!.effect).toMatchObject({ case: "remap", value: { outputs: [{ usage: { usagePage: 0x09, usage: 0x01 }, collection: { usagePage: 0x01, usage: 0x02 } }] } });
-    // A page can end between the two inputs that share a usage.
-    const cursors = fake.received.slice(sent).flatMap((r) => (r.command.case === "listProfileRules" ? [r.command.value.after] : []));
-    expect(cursors.map((a) => a && [a.input?.usage, a.collection?.usage])).toEqual([undefined, [0xc5, 0x05], [0x01, 0x02]]);
+    expect(fake.received.slice(sent).map((r) => r.command.case)).toEqual(["listProfileRules"]);
     await until(() => page(state).profiles[0]!.roles.length === 2);
     expect(page(state).profiles[0]!.roles).toEqual(["mouse", "gamepad"]);
     // Forgetting one leaves the other.
@@ -234,7 +238,7 @@ describe("Profiles", () => {
     const save = (value: ReturnType<typeof remap>) => connection.setProfileRules({ profile: 1, changes: [{ change: { case: "rule", value } }] });
     // Only the Mouse collection sends Button 1 here.
     await save(remap([0x09, 0x01], [0x01, 0x05], [[0x07, 0x04], [0x09, 0x01]]));
-    const [rule] = await connection.listAllProfileRules(1);
+    const [rule] = (await connection.listProfileRules(1)).rules;
     expect(rule!.effect.value).toMatchObject({ outputs: [{ collection: { usage: 0x06 } }, { collection: { usage: 0x02 } }] });
     for (const bad of [remap([0x07, 0x04], [0x01, 0x06], [[0x09, 0x01]], [0x01, 0x05]), axis([0x01, 0x30], [0x01, 0x31])]) {
       await expect(save(bad)).rejects.toMatchObject({ code: ErrorCode.BAD_ARGS });
@@ -242,15 +246,15 @@ describe("Profiles", () => {
     await c.stop();
   });
 
-  it("names the profiles in layers and interfaces that no page has shown", async () => {
+  it("names the profiles in layers and interfaces when the profiles can't be listed", async () => {
     const profiles = [1, 2, 3].map((id) => profile(id, `P${id}`, ["keyboard"]));
     const fake = new FakeAdapter({
       adapterId: ID,
       devices: [device(1, { profiles: [3, 9] })],
       profiles,
-      pageSize: 1,
       interfaces: { vial: { enabled: false, profile: 2 } },
     });
+    fake.failures.listProfiles = [ErrorCode.BUSY];
     const { c, state } = controller({ "/a": fake });
     await c.manager.rescan();
     await until(() => !!state()?.adapters[0]?.profileNames[3] && !!state()!.adapters[0]!.profileNames[2]);

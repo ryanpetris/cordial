@@ -36,40 +36,50 @@ describe("AdapterSession", () => {
     await session.close();
   });
 
-  it("reads every page of devices, keeping a device whose record can't be read", async () => {
+  it("reads every device in one response, keeping a device whose record can't be read", async () => {
     const devices = [1, 2, 3, 4, 5].map((id) => device(id));
-    const { fake, session } = await openSession({ devices, pageSize: 2 });
+    const { fake, session } = await openSession({ devices, batchSize: 2 });
     await until(() => session.listed);
-    const afters = () => fake.received.flatMap((r) => (r.command.case === "listDevices" ? [r.command.value.after] : []));
-    expect(afters()).toEqual([0, 2, 4]);
+    const lists = () => fake.received.filter((r) => r.command.case === "listDevices").length;
+    expect(lists()).toBe(1);
     expect([...session.devices.keys()]).toEqual([1, 2, 3, 4, 5]);
-    // A listing again replaces each page's range: a device gone without an event leaves, and one
-    // that can't be read stays as it was.
+    // A listing again replaces the devices: one gone without an event leaves, and one that can't
+    // be read stays as it was.
     fake.devices = fake.devices.filter((d) => d.id !== 2);
     fake.unreadableDevices.add(3);
     fake.changeAdapter({ ready: false });
     fake.changeAdapter({ ready: true });
-    await until(() => afters().length === 5);
-    expect(afters().slice(3)).toEqual([0, 3]);
-    await until(() => !session.devices.has(2));
+    await until(() => lists() === 2 && !session.devices.has(2));
     expect([...session.devices.keys()].sort()).toEqual([1, 3, 4, 5]);
     await session.close();
   });
 
-  it("continues listing devices after the last entry of a known kind", async () => {
-    const fake = new FakeAdapter({ devices: [1, 2, 3, 4, 5].map((id) => device(id)), pageSize: 2 });
+  it("skips listing entries of a kind newer than this app", async () => {
+    const fake = new FakeAdapter({ devices: [1, 2, 3, 4, 5].map((id) => device(id)), batchSize: 2 });
     fake.newerDevices = new Set([2, 4]);
     const hooks = { changed: vi.fn(), closed: vi.fn(), event: vi.fn(), log: vi.fn() };
     const session = await AdapterSession.open(fake.open(), hooks);
     session.run();
     await until(() => session.listed);
-    const afters = fake.received.flatMap((r) => (r.command.case === "listDevices" ? [r.command.value.after] : []));
-    expect(afters).toEqual([0, 1, 3]);
     expect([...session.devices.keys()]).toEqual([1, 3, 5]);
     await session.close();
   });
 
-  it("reads every page of settings objects in the adapter's order and applies change events", async () => {
+  it("applies nothing from a listing that ends in an error", async () => {
+    const devices = [1, 2, 3, 4, 5].map((id) => device(id));
+    const { fake, session } = await openSession({ devices, batchSize: 2 });
+    await until(() => session.listed);
+    fake.devices = fake.devices.filter((d) => d.id !== 1);
+    fake.lateFailures.listDevices = [ErrorCode.STORAGE_FAILED];
+    await expect(session.connection.listDevices()).rejects.toMatchObject({ code: ErrorCode.STORAGE_FAILED });
+    expect([...session.devices.keys()]).toEqual([1, 2, 3, 4, 5]);
+    // The session goes on, and the next listing applies.
+    expect((await session.connection.listDevices()).entries).toHaveLength(4);
+    expect([...session.devices.keys()]).toEqual([2, 3, 4, 5]);
+    await session.close();
+  });
+
+  it("reads every settings object in the adapter's order and applies change events", async () => {
     const settings = [
       setting("wheel", "mode", { choices: ["free_spin", "stepped"], value: "stepped", saved: "free_spin", state: "applied" }),
       setting("backlight", "brightness", { value: 3 }),
@@ -78,7 +88,7 @@ describe("AdapterSession", () => {
       setting("pointer_sensor", "dpi", { index: 0, value: 400 }),
       setting("backlight", "enabled", { value: true }),
     ];
-    const { fake, session } = await openSession({ devices: [device(1, { state: "connected", settings })], pageSize: 1 });
+    const { fake, session } = await openSession({ devices: [device(1, { state: "connected", settings })], batchSize: 1 });
     await until(() => session.listed && session.settings.get(1)?.length === 6);
     const fields = () => session.settings.get(1)!.map((x) => [x.group, x.index, x.field]);
     expect(fields()).toEqual([
@@ -89,9 +99,7 @@ describe("AdapterSession", () => {
       ["wheel", null, "mode"],
       ["wheel", null, "invert"],
     ]);
-    // One page per object; a sensor index of 0 stays in the cursor.
-    const afters = fake.received.flatMap((r) => (r.command.case === "listSettings" ? [r.command.value.after && [r.command.value.after.group, r.command.value.after.index]] : []));
-    expect(afters).toEqual([undefined, [SettingsGroup.BACKLIGHT, undefined], [SettingsGroup.POINTER_SENSOR, 0], [SettingsGroup.POINTER_SENSOR, 1]]);
+    expect(fake.received.filter((r) => r.command.case === "listSettings")).toHaveLength(1);
     // Disconnecting leaves only the saved field: the event replaces its object and removes the others.
     fake.changeDevice(1, { state: "disconnected" });
     await until(() => session.settings.get(1)!.length === 1);

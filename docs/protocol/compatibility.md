@@ -134,35 +134,39 @@ optional record, `0` means none.
 
 ## Listings
 
-Every `List` command reads its list in pages, the same way:
+Every `List` command returns the complete list in one logical protobuf `Message` and one
+continuous COBS frame. There are no cursors or followup requests. The final frame delimiter marks
+completion. An empty list explicitly selects its response variant.
 
-- The request carries `after`, the key of the last entry the client received. A missing `after`,
-  `0` or `""` starts from the beginning.
-- The reply holds the entries that follow `after` in the listing's order, and `end` is set when
-  nothing follows the last of them. A reply holds at least one entry unless `end` is set.
-- The Dongle chooses how many entries a page holds, and can choose differently for every page. A
-  client never assumes a page size, and reads until `end` when it needs the whole list.
-- The listing reflects the Dongle's state as each page is read. Entries that change between pages
-  are reported by events, so a client that applies events while it pages ends with the current list.
-
-| Command | `after` | Order |
+| Command | Result | Order |
 | --- | --- | --- |
-| `ListDevices` | Device ID | Ascending ID |
-| `ListProfiles` | Profile ID | Ascending ID |
-| `ListProfileRules` | `ProfileRuleRef`: input usage and collection | Input usage page, input usage, collection usage page, then collection usage |
-| `ListSettings` | `SettingsRef`: integration, group and optional component index | Integration, group, then component index |
-| `ListFeatures` | `FeatureRef`: integration and index | Integration, then index |
-| `ListFiles` | Entry name | Name compared bytewise |
+| `ListDevices` | `DeviceList.entries` | Ascending ID |
+| `ListProfiles` | `ProfileList.entries` | Ascending ID |
+| `ListProfileRules` | `ProfileRules.rules` | Input usage page, input usage, collection usage page, then collection usage |
+| `ListSettings` | `DeviceSettings.objects` | Integration, group, then component index |
+| `ListFeatures` | `FeatureList.features` | Integration, then index |
+| `ListFiles` | `FileList.entries` | Name compared bytewise |
 
-A listing of saved records bounded only by flash, `ListDevices` and `ListProfiles`, holds one entry
-per record: the record, or its ID as `unreadable` when its saved record could not be read from
-flash, so the listing continues past it. An undecodable record is removed as lost and is not
-listed.
+The Dongle iterates live state rather than taking a snapshot. It serializes bounded batches as
+ordinary `Message` values containing the same `Response` list variant and concatenates their
+protobuf bytes before incremental COBS encoding. Protobuf merges repeated occurrences of the same
+nested message, appending repeated entries. Identity fields such as `DeviceSettings.device` and
+`ProfileRules.profile` stay constant throughout the response. Batch boundaries have no wire
+meaning and need not align with COBS blocks, USB packets or host reads.
 
-A client skips a `DeviceListEntry` or `ProfileListEntry` holding a variant newer than the client,
-and reads the next page after the last entry it could read. A page that does not end the listing
-and holds no entry the client can read leaves it nothing to continue after, so the client reports
-the listing as failed.
+A failure after list data has been emitted appends an ordinary `Message` containing
+`Response.error` to the same COBS frame. The response oneof replaces the list with that error.
+Clients decode and apply only completed frames, so they never apply partial success. A disconnect
+discards an incomplete frame. Adapter-to-host messages have no total protocol size cap.
+
+Events never interleave within a response frame. The Dongle preserves changes that occur during
+the listing for subsequent events. A client replaces its list with the completed response, then
+applies those events in receive order. Profile rules have no change event, so clients list them
+again when they need a fresh view.
+
+`ListDevices` and `ListProfiles` hold one entry per saved record: the record, or its ID as
+`unreadable` when its flash read fails. An undecodable record is removed as lost and is not listed.
+A client skips entry variants it does not understand and continues reading the same frame.
 
 ## Information and settings
 
@@ -182,8 +186,7 @@ or an empty `SettingForget` marker. Missing leaves the preference unchanged; `fo
 the saved preference and never resets the actual device value. False and zero remain explicit
 writes. See [settings records](records.md#settings) for metadata and event replacement rules.
 
-Settings pages and change events pack whole objects into at most 1024 protobuf bytes for the
-enclosing `Message`. An object, including its integration, selected group and saved metadata, is
-at most 960 protobuf bytes. These bounds apply to typed settings messages, not general response
-frames. Other lists retain Dongle-selected entry counts, with at least one entry unless `end` is
-set. Clients do not infer a general response-size limit from the 1024-byte request limit.
+Settings responses and change events have no transport-derived object or message size limit.
+Ranges, choices and saved metadata remain complete. Device and resource constraints still apply,
+such as at most six Pointer Sensor DPI choices. The 1024-byte limit applies only to the complete
+host `Request`, including its command envelope and all entries, before COBS encoding.

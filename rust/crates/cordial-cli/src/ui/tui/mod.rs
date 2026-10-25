@@ -35,7 +35,7 @@ use cordial_client::serial::PortInfo;
 use cordial_protocol::{self as p, ConfigurationInterface, OutputMode, Platform, Transport};
 use fleet::{Fleet, Slot};
 use layout::Hit;
-use profiles::{ProfilePage, Step};
+use profiles::ProfilePage;
 use settings::Draft;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -272,11 +272,9 @@ pub(super) enum Kind {
     /// A read whose failure needs no report.
     Quiet,
     SettingsList(u32),
-    /// A page of profiles for the list, or the picker.
+    /// The profiles for the list, or the picker.
     Page {
         picker: bool,
-        step: Step,
-        after: u32,
     },
     Lookup,
     AdapterSave(AdapterUpdate),
@@ -874,7 +872,7 @@ impl<F: Fleet> Model<F> {
     }
 
     /// The adapter became ready and its saved devices are loaded: reads each device's settings
-    /// and the shown profile pages.
+    /// and the profiles.
     fn ready(&mut self, slot: Slot) {
         let Some(s) = self.session_mut(slot) else {
             return;
@@ -889,9 +887,9 @@ impl<F: Fleet> Model<F> {
             self.list_settings(&id, d.id);
         }
         if crate::profiles::available(&st.status) {
-            self.read_page(&id, false, Step::Again);
+            self.read_page(&id, false, false);
             if self.picker_open(&id) {
-                self.read_page(&id, true, Step::Again);
+                self.read_page(&id, true, false);
             }
         }
     }
@@ -911,8 +909,8 @@ impl<F: Fleet> Model<F> {
             self.failed.remove(&s.port);
         }
         let (mut list, mut picker) = (s.list, s.picker);
-        list.reading = None;
-        picker.reading = None;
+        list.reading = false;
+        picker.reading = false;
         self.held.insert(
             s.id.clone(),
             Held {
@@ -1067,8 +1065,13 @@ impl<F: Fleet> Model<F> {
         let Some(id) = self.session(slot).map(|s| s.id.clone()) else {
             return;
         };
-        let Notice::Event { event, first, .. } = notice else {
-            return;
+        let (event, first) = match notice {
+            Notice::Event { event, first, .. } => (event, first),
+            Notice::Response(p::Response {
+                result: Some(p::response::Result::Profiles(list)),
+                ..
+            }) => return self.profiles_listed(&id, list),
+            _ => return,
         };
         let Some(kind) = event.kind else { return };
         match kind {

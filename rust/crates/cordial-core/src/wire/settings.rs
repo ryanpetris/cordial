@@ -6,7 +6,6 @@ use crate::{
 };
 use alloc::vec::Vec;
 use cordial_protocol as p;
-use prost::Message;
 
 /// Public enum members follow the documented persisted choice order, starting after UNKNOWN.
 pub(super) fn enum_value(key: SettingKey, value: &SettingValue) -> Option<i32> {
@@ -215,39 +214,50 @@ macro_rules! enum_setting {
 
 /// Complete objects in integration, group and component order. Metadata is never truncated.
 pub fn settings(catalog: &Catalog) -> Result<Vec<p::SettingsObject>, p::Error> {
+    let mut objects = Vec::new();
+    while let Some(object) = next_settings(catalog, objects.last().map(object_ref).as_ref())? {
+        objects.push(object);
+    }
+    Ok(objects)
+}
+
+/// Builds only the next complete object from the current catalog.
+pub fn next_settings(
+    catalog: &Catalog,
+    after: Option<&p::SettingsRef>,
+) -> Result<Option<p::SettingsObject>, p::Error> {
     use p::settings_object::Group;
-    let mut objects: Vec<p::SettingsObject> = Vec::new();
-    for record in catalog
-        .records()
-        .iter()
-        .filter(|r| (r.writable && r.available) || r.preference.is_some())
-    {
-        let reference = settings_ref(record.metadata.key);
-        let index = match objects.iter().position(|o| object_ref(o) == reference) {
-            Some(index) => index,
-            None => {
-                let group = match p::SettingsGroup::try_from(reference.group).unwrap() {
-                    p::SettingsGroup::Keyboard => Group::Keyboard(Default::default()),
-                    p::SettingsGroup::Power => Group::Power(Default::default()),
-                    p::SettingsGroup::Backlight => Group::Backlight(Default::default()),
-                    p::SettingsGroup::PointerSensor => {
-                        Group::PointerSensor(p::PointerSensorSettings {
-                            index: reference.index.unwrap(),
-                            ..Default::default()
-                        })
-                    }
-                    p::SettingsGroup::Wheel => Group::Wheel(Default::default()),
-                    p::SettingsGroup::Thumbwheel => Group::Thumbwheel(Default::default()),
-                    p::SettingsGroup::Unknown => continue,
-                };
-                objects.push(p::SettingsObject {
-                    integration: reference.integration,
-                    group: Some(group),
-                });
-                objects.len() - 1
-            }
-        };
-        match (record.metadata.key, objects[index].group.as_mut().unwrap()) {
+    let visible = || {
+        catalog
+            .records()
+            .iter()
+            .filter(|r| (r.writable && r.available) || r.preference.is_some())
+    };
+    let Some(reference) = visible()
+        .map(|r| settings_ref(r.metadata.key))
+        .filter(|r| after.is_none_or(|after| settings_order(r) > settings_order(after)))
+        .min_by_key(settings_order)
+    else {
+        return Ok(None);
+    };
+    let group = match p::SettingsGroup::try_from(reference.group).unwrap() {
+        p::SettingsGroup::Keyboard => Group::Keyboard(Default::default()),
+        p::SettingsGroup::Power => Group::Power(Default::default()),
+        p::SettingsGroup::Backlight => Group::Backlight(Default::default()),
+        p::SettingsGroup::PointerSensor => Group::PointerSensor(p::PointerSensorSettings {
+            index: reference.index.unwrap(),
+            ..Default::default()
+        }),
+        p::SettingsGroup::Wheel => Group::Wheel(Default::default()),
+        p::SettingsGroup::Thumbwheel => Group::Thumbwheel(Default::default()),
+        p::SettingsGroup::Unknown => unreachable!(),
+    };
+    let mut object = p::SettingsObject {
+        integration: reference.integration,
+        group: Some(group),
+    };
+    for record in visible().filter(|r| settings_ref(r.metadata.key) == reference) {
+        match (record.metadata.key, object.group.as_mut().unwrap()) {
             (SettingKey::KeyboardPlatform, Group::Keyboard(s)) => {
                 s.platform = Some(enum_setting!(record, KeyboardPlatformSetting))
             }
@@ -306,11 +316,7 @@ pub fn settings(catalog: &Catalog) -> Result<Vec<p::SettingsObject>, p::Error> {
             _ => continue,
         }
     }
-    if objects.iter().any(|o| o.encoded_len() > 960) {
-        return Err(too_long());
-    }
-    objects.sort_by_key(|o| settings_order(&object_ref(o)));
-    Ok(objects)
+    Ok(Some(object))
 }
 
 /// Validates typed updates and keeps the final write to each internal field.
@@ -554,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_catalog_preserves_typed_presence_and_fits_enclosing_messages() {
+    fn complete_catalog_preserves_typed_presence() {
         let mut catalog = Catalog {
             records: SettingKey::ALL
                 .into_iter()
@@ -585,26 +591,6 @@ mod tests {
         let enabled = backlight.enabled.as_ref().unwrap();
         assert_eq!((enabled.value, enabled.saved), (Some(false), Some(false)));
         assert!(enabled.status.is_some());
-        let response = p::Message {
-            kind: Some(p::message::Kind::Response(p::Response {
-                result: Some(p::response::Result::Settings(p::DeviceSettings {
-                    device: u32::MAX,
-                    objects: objects.clone(),
-                    end: true,
-                })),
-            })),
-        };
-        assert!(response.encoded_len() <= 1024);
-        let event = p::Message {
-            kind: Some(p::message::Kind::Event(p::Event {
-                kind: Some(p::event::Kind::SettingsChanged(p::SettingsChanged {
-                    device: u32::MAX,
-                    changed: objects,
-                    removed: Vec::new(),
-                })),
-            })),
-        };
-        assert!(event.encoded_len() <= 1024);
         catalog.connection(false, false);
         let objects = settings(&catalog).unwrap();
         let Some(p::settings_object::Group::Backlight(backlight)) = &objects[2].group else {

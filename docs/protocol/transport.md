@@ -39,11 +39,12 @@ or the protocol, and opening the port or changing the baud rate never reboots th
 - Client to Dongle, every frame is a `Request`. Dongle to client, every frame is a `Message` holding
   either a `Response` or an `Event`.
 - Empty frames (two delimiters in a row) are ignored.
-- A client frame is at most 1024 bytes before COBS encoding. A longer frame is discarded through
-  its delimiter and answered with `ERROR_CODE_TOO_LONG`.
-- General Dongle frames have no length limit. Typed settings pages and change events fit their
-  enclosing `Message` in 1024 protobuf bytes, with whole objects at most 960 bytes. The Dongle
-  writes long frames incrementally and never interleaves two frames.
+- The complete client `Request`, including its command envelope and all repeated entries, is at
+  most 1024 protobuf bytes before COBS encoding. A longer frame is discarded through its delimiter
+  and answered with `ERROR_CODE_TOO_LONG`.
+- Dongle frames have no total protocol size limit, including typed settings and saved metadata.
+  The Dongle writes long frames incrementally and never interleaves two frames. Lists use bounded
+  batches inside one frame; see [Listings](compatibility.md#listings).
 - USB checksums every packet, so frames carry no checksum of their own.
 
 ## Requests and responses
@@ -66,6 +67,10 @@ Every command returns promptly. A command responds once it is accepted and any s
 written; Bluetooth work that takes longer, such as connecting, pairing, scanning or disconnecting,
 reports its progress through events.
 
+Host request timeouts measure inactivity between incoming bytes rather than a fixed response
+deadline. A large response may take longer while it keeps progressing; a stalled request still
+ends the session because losing a response would misalign every later request.
+
 ## Events
 
 An event can arrive between any two frames, including between a request and its response; a
@@ -74,19 +79,22 @@ An event can arrive between any two frames, including between a request and its 
 Most events carry the complete current state of one thing: the adapter, a device, a profile, a scan
 candidate, or the pairing. A client replaces what it had with the latest one.
 
-Settings are listed as whole domain objects in pages. `settings_changed` carries complete objects
-that changed or appeared, and references to those that went away. A client replaces objects by
-integration, group and optional component index
-and ignores removal of an entry it does not hold. It lists again from the start when it needs a
-fresh view, such as in a new session. A change can name an object the client has not listed yet;
-a later page simply replaces it. There are no revisions. Profile rules have no change event;
-a client lists them again when it needs a fresh view.
+Settings are listed as complete lists of whole domain objects. `settings_changed` carries complete
+objects that changed or appeared, and references to those that went away. A client replaces objects
+by integration, group and optional component index, and ignores removal of an entry it does not
+hold. A completed listing replaces the list before later events apply. There are no revisions.
+Profile rules have no change event; a client lists them again when it needs a fresh view, such as
+in a new session.
 
 The Dongle keeps one pending slot per thing. When a thing changes again before its event is
 written, the event that goes out carries the newer state, and a change event covers every change
 since the previous one, so events are never lost under output pressure; intermediate states can be
 skipped. Events are written only when no response is waiting, and a client that stops reading holds
-back only the serial port, never HID forwarding.
+back only the serial port, never HID forwarding. List production shares secondary steps with
+configuration editor packets, connection setup, settings jobs, pairing and deferred saves, even
+when the host keeps reading or records yield no list entries. This work also runs while serial output
+is blocked. Cleanup of corrupt saved records waits for its removal and reference-change events to
+drain, retaining a bounded rescan cursor rather than every affected ID.
 
 ## Sessions
 
@@ -96,9 +104,9 @@ back only the serial port, never HID forwarding.
   client cannot merge with it, and ignores everything up to the first `Response` after its first
   request.
 - Closing the port (DTR falling), USB reset or USB disconnection ends the session, including the USB
-  reconnect that follows a USB allocation change. Ending a session stops a running scan and
-  cancels a pairing that has not saved its bond; a new session starts with no events waiting and no
-  scan candidates. Saved devices, connections, automatic reconnection and HID forwarding carry on
+  reconnect that follows a USB allocation change. Clients discard incomplete received frames.
+  Ending a session stops a running scan and cancels a pairing that has not saved its bond. A new
+  session starts with no events waiting and no scan candidates. Saved devices, connections, automatic reconnection and HID forwarding carry on
   without a client.
 
 The CLI cycles DTR low then high when it opens a port. The desktop application opens the port from

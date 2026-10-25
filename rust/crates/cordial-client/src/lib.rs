@@ -7,13 +7,13 @@
 //! [`Event`](protocol::Event) to the caller. The `serialport` feature adds [`serial`], which
 //! lists attached Dongles and opens their USB serial ports.
 //!
-//! Every listing is paged; [`paging`] reads a listing page by page and orders its entries.
+//! Every listing returns its complete response. [`order`] identifies and orders its entries.
 //! [`rules`] puts profile rules in the form the Dongle saves them.
 //!
 //! The library keeps no state beyond the open connection and writes nothing to stdout or logs.
 mod connection;
 mod error;
-pub mod paging;
+pub mod order;
 pub mod rules;
 #[cfg(feature = "serialport")]
 pub mod serial;

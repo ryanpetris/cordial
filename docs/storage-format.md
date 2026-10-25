@@ -397,17 +397,24 @@ when its last connection or configuration interface lets it go and its edits are
 configuration interface releases its profile after five seconds without a packet, when its profile
 changes or when it is disabled, and writes its edits then.
 
-A device or profile listing page takes one pass over the record directory, selecting the lowest IDs
-above `after`, then reads those records one per step. The pass lists record directories without
-opening them; a directory whose record file is missing is left out when its record is read, so a
-page can list fewer records than its size while more follow. A page of a device's settings reads the
-device's policy and, while it is disconnected, its saved preferences, one per step; a page of a
-profile's rules reads its metadata and then its rules file from the start only as far as the page, a
-part at a time, skipping earlier rules without decoding them, or uses the loaded rules. Features
-come from memory. A directory page reads one entry per step and keeps the lowest names
-after `after`. Each response and event is encoded into one frame buffer, held until the USB endpoint
-has written it; requests are not read while a response waits. File reads use one 512-byte chunk and
-return the whole file in one response.
+A device or profile listing walks the record directory in ascending ID order and reads records one
+at a time. A directory whose record file is missing is left out when its record is read. Settings
+listings read the device's policy and, while disconnected, its saved preferences. Profile rule
+listings read metadata and walk the rules file incrementally, or use the loaded rules. Features
+come from memory, and directory listings walk entries in bytewise name order. Listings iterate
+live state without collecting the complete list. Corrupt nonresident device records and corrupt
+profile metadata stay on storage while a response or pending cleanup events block reporting. The
+adapter remembers a rescan for each record kind, then rechecks one record at a time and drains its
+removal or reference-change events before continuing cleanup. Read failures leave records intact
+and retry in a later pass. A paused profile cleanup retains one bounded device cursor separately
+from bond sync and resident admission, so those operations can progress while its events wait.
+Closing the session discards its events; cleanup continues without them.
+
+The adapter serializes bounded batches as ordinary list responses, concatenates their protobuf
+bytes and feeds one incremental COBS encoder. Each listing is one logical response in one frame.
+Requests wait until that response finishes, and changes during it remain pending for subsequent
+events. File reads use one 512-byte chunk and return the whole file in one response. See
+[list streaming](protocol/compatibility.md#listings).
 
 Filesystem operations are synchronous. Two loops on one executor share the application, its storage
 and the Bluetooth stack, one at a time:
@@ -425,11 +432,14 @@ and the Bluetooth stack, one at a time:
   keeps arriving, for a pass 5 ms after its last step ended, so continuous input cannot hold up
   serial requests, configuration editors and background work indefinitely. Each step reads or
   writes about one record: a command or background task that touches many records takes one step
-  per record, and a read, change and save of one record happens within one step. A command in
-  progress runs until it responds, with no other request or background work in between; background
-  work in progress waits while commands run, requests go before new background work, and events
-  and background work take turns. A dirty record that is due is written before the next request
-  or editor packet is read. A step that wrote flash is followed by a rest at least as long as the
+  per record, and a read, change and save of one record happens within one step. List production
+  alternates with turns for deferred saves, editor packets and background work, even when every
+  listed record is missing or corrupt. While list output is blocked, each secondary step can
+  advance that same work, including pairing, connection hydration and saved settings jobs. The
+  response reserves the serial output until its delimiter, so events wait. Other commands finish
+  before another request or background step runs. Requests go before new background work, and
+  events and background work take turns. A dirty record that is due is written before the next
+  request or editor packet is read. A step that wrote flash is followed by a rest at least as long as the
   step took, so input keeps at least half the time while writes follow one another.
 
 Input therefore waits for at most one step of the secondary loop at a time. A
@@ -445,10 +455,8 @@ background step after other work. The interface provides no asynchronous-latency
 
 ## Development access
 
-See [development filesystem access](protocol/development.md#development-filesystem-access) for streamed
-`storage.list` and `storage.read`. Downloads may contain Bluetooth secrets.
-The CLI keeps payloads out of event logs, uses private temporary files on Unix,
-and renames only after a successful terminal response with matching length. The
-CLI and TUI save a downloaded record as JSON; see
-[downloaded records](protocol/clients.md#downloaded-records).
-Production firmware omits the handlers and transfer state.
+`ListFiles` lists a directory and `ReadFile` returns a complete file in one response frame. See
+[development commands](protocol/development.md). Downloads may contain Bluetooth secrets.
+The CLI keeps payloads out of event logs and uses private temporary files on Unix. It saves a
+downloaded record as JSON; see [downloaded records](protocol/clients.md#downloaded-records).
+Production firmware omits the handlers.

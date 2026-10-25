@@ -3,7 +3,7 @@
 //! apply status and limits. Readings of the same behavior from Device.information use the same
 //! leaves.
 use crate::model;
-use cordial_client::paging;
+use cordial_client::order;
 use cordial_protocol::{
     self as p, ErrorCode, IntegrationKind, SettingState, SettingsGroup as G, integer_setting,
     setting_status, settings_object::Group, settings_update::Group as U,
@@ -508,7 +508,7 @@ macro_rules! save {
 /// Takes the preferences an accepted SetSettings update saved and forgot into the objects held.
 pub fn take_update(objects: &mut [p::SettingsObject], update: &p::SettingsUpdate) {
     let Some(o) = objects.iter_mut().find(|o| {
-        let r = paging::settings_ref(o);
+        let r = order::settings_ref(o);
         r.integration == update.integration
             && match (&update.group, &o.group) {
                 (Some(U::PointerSensor(u)), Some(Group::PointerSensor(s))) => u.index == s.index,

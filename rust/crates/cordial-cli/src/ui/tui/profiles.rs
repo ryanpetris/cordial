@@ -1,7 +1,8 @@
 //! Profiles: an adapter's profile memory, its configuration interfaces, each with a switch and a
-//! profile staged until Save, and one page of profiles at a time, each labelled with its roles,
-//! with creating, copying and deleting them at once. The picker of a profile for an interface or
-//! a device's layers pages on its own. Profile rules are never read or changed here.
+//! profile staged until Save, and the listed profiles a page at a time, each labelled with its
+//! roles, with creating, copying and deleting them at once. The picker of a profile for an
+//! interface or a device's layers lists and pages on its own. Profile rules are never read or
+//! changed here.
 use super::{
     Action, Dialog, Job, Kind, Menu, Model, PickFor, Spot,
     fleet::Fleet,
@@ -15,43 +16,79 @@ use crate::{
     error::Error,
     profiles,
 };
-use cordial_client::paging::Page;
+use cordial_client::order::profile_entry_id;
 use cordial_protocol::{self as p, ConfigurationInterface, event, profile_list_entry};
 use ratatui::{style::Style, text::Line};
 
-/// How a page read moves through the pages once it succeeds.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Step {
-    /// The first page.
-    Open,
-    Forward,
-    Back,
-    /// The shown page again, or the first when none is shown.
-    Again,
-}
+/// Profiles shown on one page of the Profiles tab or the picker.
+const PER_PAGE: usize = 10;
 
-/// One page of profiles, as the Profiles tab or the picker shows it.
+/// The adapter's profiles, as the Profiles tab or the picker shows them a page at a time.
 #[derive(Clone, Debug, Default)]
 pub struct ProfilePage {
-    /// The cursors of the earlier pages shown, for Previous.
-    pub back: Vec<u32>,
-    /// The shown page's cursor; 0 for the first page.
-    pub after: u32,
-    pub list: Vec<p::Profile>,
-    /// The profiles on the shown page whose records can't be read, by ID.
-    pub unreadable: Vec<u32>,
-    /// The next page's cursor; 0 on the last page.
-    pub next: u32,
-    /// A page has been read.
-    pub shown: bool,
-    /// The read under way: how it moves, and the cursor it asked for.
-    pub reading: Option<(Step, u32)>,
+    /// Every listed profile, readable or not, in ID order, kept current by profile events.
+    pub entries: Vec<p::ProfileListEntry>,
+    /// The shown page, kept within the listing as it shrinks.
+    pub index: usize,
+    /// The profiles have been listed.
+    pub listed: bool,
+    pub reading: bool,
     pub error: Option<String>,
 }
 
 impl ProfilePage {
-    fn covers(&self, id: u32) -> bool {
-        id > self.after && (self.next == 0 || id <= self.next)
+    fn pages(&self) -> usize {
+        self.entries.len().div_ceil(PER_PAGE).max(1)
+    }
+
+    /// Moves back to the last page when the listing no longer reaches the shown one.
+    fn clamp(&mut self) {
+        self.index = self.index.min(self.pages() - 1);
+    }
+
+    pub fn previous(&self) -> bool {
+        self.index > 0
+    }
+
+    pub fn next(&self) -> bool {
+        self.index + 1 < self.pages()
+    }
+
+    /// The shown page's readable profiles, and the IDs of those that can't be read.
+    pub fn shown(&self) -> (Vec<&p::Profile>, Vec<u32>) {
+        let start = self.index * PER_PAGE;
+        let mut profiles = Vec::new();
+        let mut unreadable = Vec::new();
+        for e in self.entries.iter().skip(start).take(PER_PAGE) {
+            match &e.entry {
+                Some(profile_list_entry::Entry::Profile(profile)) => profiles.push(profile),
+                Some(profile_list_entry::Entry::Unreadable(id)) => unreadable.push(*id),
+                None => {}
+            }
+        }
+        (profiles, unreadable)
+    }
+
+    fn step(&mut self, forward: bool) {
+        self.index = if forward {
+            self.index + 1
+        } else {
+            self.index.saturating_sub(1)
+        };
+        self.clamp();
+    }
+
+    fn put(&mut self, profile: &p::Profile) {
+        let entry = p::ProfileListEntry {
+            entry: Some(profile_list_entry::Entry::Profile(profile.clone())),
+        };
+        match self
+            .entries
+            .binary_search_by_key(&profile.id, profile_entry_id)
+        {
+            Ok(i) => self.entries[i] = entry,
+            Err(i) => self.entries.insert(i, entry),
+        }
     }
 }
 
@@ -79,32 +116,29 @@ impl<F: Fleet> Model<F> {
         })
     }
 
-    /// Reads a page for the picker when `picker`, else for the Profiles tab.
-    pub(super) fn read_page(&mut self, adapter: &str, picker: bool, step: Step) {
+    /// Lists the profiles for the picker when `picker`, else for the Profiles tab, showing the
+    /// first page when `first`.
+    pub(super) fn read_page(&mut self, adapter: &str, picker: bool, first: bool) {
         let Some(page) = self.page_mut(adapter, picker) else {
             return;
         };
-        let after = match step {
-            Step::Open => 0,
-            Step::Forward => page.next,
-            Step::Back => page.back.last().copied().unwrap_or(0),
-            Step::Again => page.after,
-        };
-        page.reading = Some((step, after));
+        if first {
+            page.index = 0;
+        }
+        page.reading = true;
         page.error = None;
-        self.run(
-            adapter,
-            Kind::Page {
-                picker,
-                step,
-                after,
-            },
-            Command::Profiles { after },
-        );
+        self.run(adapter, Kind::Page { picker }, Command::Profiles);
+    }
+
+    /// Shows the next listed page when `forward`, else the previous one.
+    pub(super) fn step_page(&mut self, adapter: &str, picker: bool, forward: bool) {
+        if let Some(page) = self.page_mut(adapter, picker) {
+            page.step(forward);
+        }
     }
 
     pub(super) fn open_picker(&mut self, adapter: &str) {
-        self.read_page(adapter, true, Step::Open);
+        self.read_page(adapter, true, true);
     }
 
     pub(super) fn picker_open(&self, adapter: &str) -> bool {
@@ -129,89 +163,52 @@ impl<F: Fleet> Model<F> {
         }
     }
 
-    /// Follows a changed or removed profile on the shown pages.
+    /// Follows a changed or removed profile in the listed profiles.
     pub(super) fn profile_event(&mut self, adapter: &str, kind: &event::Kind) {
         for picker in [false, true] {
-            let shown = !picker || self.picker_open(adapter);
-            let Some(page) = self.page_mut(adapter, picker) else {
+            let Some(page) = self.page_mut(adapter, picker).filter(|p| p.listed) else {
                 continue;
             };
-            let idle = page.reading.is_none();
-            let again = match kind {
-                event::Kind::Profile(profile) => {
-                    match page.list.iter_mut().find(|p| p.id == profile.id) {
-                        Some(entry) => {
-                            *entry = profile.clone();
-                            false
-                        }
-                        None => page.shown && page.covers(profile.id),
-                    }
-                }
+            match kind {
+                event::Kind::Profile(profile) => page.put(profile),
                 event::Kind::ProfileRemoved(removed) => {
-                    let had = page.list.iter().any(|p| p.id == removed.id)
-                        || page.unreadable.contains(&removed.id);
-                    page.list.retain(|p| p.id != removed.id);
-                    page.unreadable.retain(|id| *id != removed.id);
-                    had && page.list.is_empty() && page.unreadable.is_empty()
+                    page.entries.retain(|e| profile_entry_id(e) != removed.id);
+                    page.clamp();
                 }
-                _ => false,
-            };
-            if again && shown && idle {
-                self.read_page(adapter, picker, Step::Again);
+                _ => {}
             }
         }
     }
 
-    pub(super) fn page_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
-        let Kind::Page {
-            picker,
-            step,
-            after,
-        } = job.kind
-        else {
-            return;
-        };
-        let adapter = job.adapter.clone();
-        let Some(page) = self.page_mut(&adapter, picker) else {
-            return;
-        };
-        if page.reading != Some((step, after)) {
-            return;
+    /// Fills the pages waiting for a list with a profile list response. It arrives in order with
+    /// the events around it, so the profile events that follow it apply on top.
+    pub(super) fn profiles_listed(&mut self, adapter: &str, list: p::ProfileList) {
+        let mut entries: Vec<_> = list
+            .entries
+            .into_iter()
+            .filter(|e| e.entry.is_some())
+            .collect();
+        entries.sort_by_key(profile_entry_id);
+        for picker in [false, true] {
+            let Some(page) = self.page_mut(adapter, picker).filter(|p| p.reading) else {
+                continue;
+            };
+            page.entries = entries.clone();
+            page.listed = true;
+            page.clamp();
         }
-        page.reading = None;
-        match result {
-            Ok(Outcome::Profiles { after: shown, list }) => {
-                match step {
-                    Step::Open => page.back.clear(),
-                    Step::Forward => page.back.push(page.after),
-                    Step::Back => {
-                        page.back.pop();
-                    }
-                    Step::Again => {}
-                }
-                page.after = *shown;
-                page.shown = true;
-                page.list.clear();
-                page.unreadable.clear();
-                for e in &list.entries {
-                    match &e.entry {
-                        Some(profile_list_entry::Entry::Profile(profile)) => {
-                            page.list.push(profile.clone())
-                        }
-                        Some(profile_list_entry::Entry::Unreadable(id)) => {
-                            page.unreadable.push(*id)
-                        }
-                        None => {}
-                    }
-                }
-                page.next = list.next().unwrap_or(0);
-                // A page that has emptied shows the page before it instead.
-                if list.entries.is_empty() && !page.back.is_empty() {
-                    self.read_page(&adapter, picker, Step::Back);
-                }
-            }
-            Ok(_) => {}
-            Err(e) => page.error = Some(words::read_failure(e)),
+    }
+
+    pub(super) fn page_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
+        let Kind::Page { picker } = job.kind else {
+            return;
+        };
+        let Some(page) = self.page_mut(&job.adapter, picker) else {
+            return;
+        };
+        page.reading = false;
+        if let Err(e) = result {
+            page.error = Some(words::read_failure(e));
         }
     }
 
@@ -229,11 +226,10 @@ impl<F: Fleet> Model<F> {
         match action {
             Action::ProfilePage(next) => {
                 if ready {
-                    let step = if *next { Step::Forward } else { Step::Back };
-                    self.read_page(adapter, false, step);
+                    self.step_page(adapter, false, *next);
                 }
             }
-            Action::ProfilesRetry if !disabled => self.read_page(adapter, false, Step::Again),
+            Action::ProfilesRetry if !disabled => self.read_page(adapter, false, false),
             Action::ProfileMenu(id) if !disabled => {
                 let (x, y) = self
                     .hits
@@ -327,21 +323,6 @@ impl<F: Fleet> Model<F> {
             Some(Dialog::ProfileName(a, _) | Dialog::ProfileDelete(a, _)) if *a == job.adapter
         );
         match result {
-            Ok(Outcome::Profile(created)) => {
-                if dialog_of_adapter {
-                    self.dialog = None;
-                    self.form_focused = false;
-                }
-                // A new profile shows on the page whose range covers it.
-                let adapter = job.adapter.clone();
-                if let Some(page) = self.page_mut(&adapter, false)
-                    && page.shown
-                    && page.covers(created.id)
-                    && page.reading.is_none()
-                {
-                    self.read_page(&adapter, false, Step::Again);
-                }
-            }
             Ok(_) => {
                 if dialog_of_adapter {
                     self.dialog = None;
@@ -481,7 +462,8 @@ impl<F: Fleet> Model<F> {
                 row,
             );
         }
-        for profile in &page.list {
+        let (list, unreadable) = page.shown();
+        for profile in list {
             let mut label = Line::from(layout::span(words::clean(&profile.name), Style::new()));
             let marks: Vec<&str> = profiles::roles(profile)
                 .into_iter()
@@ -502,17 +484,17 @@ impl<F: Fleet> Model<F> {
             );
             b.labelled(label, row);
         }
-        for id in &page.unreadable {
+        for id in unreadable {
             b.line(Line::from(vec![
                 layout::span(format!("Profile {id}"), dim()),
                 layout::span("  Couldn't Read", dim()),
             ]));
         }
         let mut footer = Layout::new(b.width);
-        if page.reading.is_some() || self.profiles_busy(&a.id) {
+        if page.reading || self.profiles_busy(&a.id) {
             footer.label(&format!("{}", super::spinner()), layout::accent());
         }
-        if !page.back.is_empty() {
+        if page.previous() {
             button_if(
                 &mut footer,
                 "Previous",
@@ -521,7 +503,7 @@ impl<F: Fleet> Model<F> {
                 ready,
             );
         }
-        if page.next != 0 {
+        if page.next() {
             button_if(
                 &mut footer,
                 "Next",
@@ -530,14 +512,17 @@ impl<F: Fleet> Model<F> {
                 ready,
             );
         }
-        let primary = page.list.is_empty() && page.unreadable.is_empty() && page.back.is_empty();
-        let tone = if primary { Tone::Primary } else { Tone::Normal };
+        let tone = if page.entries.is_empty() {
+            Tone::Primary
+        } else {
+            Tone::Normal
+        };
         button_if(
             &mut footer,
             "+ New Profile",
             Action::ProfileNew,
             tone,
-            !disabled && page.shown,
+            !disabled && page.listed,
         );
         b.add(footer);
     }
@@ -648,7 +633,8 @@ impl<F: Fleet> Model<F> {
         if none {
             choice(&mut body, "None".into(), String::new(), 0);
         }
-        for profile in &page.list {
+        let (list, _) = page.shown();
+        for profile in &list {
             let marks = profiles::roles(profile)
                 .into_iter()
                 .filter_map(words::role_text)
@@ -656,7 +642,7 @@ impl<F: Fleet> Model<F> {
                 .join(", ");
             choice(&mut body, words::clean(&profile.name), marks, profile.id);
         }
-        if current != 0 && !page.list.iter().any(|p| p.id == current) {
+        if current != 0 && !list.iter().any(|p| p.id == current) {
             choice(
                 &mut body,
                 self.profile_text(adapter, current),
@@ -668,11 +654,11 @@ impl<F: Fleet> Model<F> {
             body.para(e, err());
         }
         let mut buttons = Layout::new(w);
-        let loading = page.reading.is_some();
+        let loading = page.reading;
         if loading {
             buttons.label(&format!("{}", super::spinner()), layout::accent());
         }
-        if !page.back.is_empty() {
+        if page.previous() {
             button_if(
                 &mut buttons,
                 "Previous",
@@ -681,7 +667,7 @@ impl<F: Fleet> Model<F> {
                 !loading,
             );
         }
-        if page.next != 0 {
+        if page.next() {
             button_if(
                 &mut buttons,
                 "Next",

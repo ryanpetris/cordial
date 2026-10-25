@@ -15,19 +15,18 @@
 //! before free space is checked for a new profile, a pairing or a new setting. Saves that commands
 //! promise, and bonds, are written before the command responds.
 //!
-//! A command that reads many records, such as a listing, proceeds one record per `proceed`, and no
-//! other secondary work runs until it has responded. A listing answers one page; a page of a list
-//! held in memory is answered in one step. Every other command validates, acts and responds at
-//! once. Work that outlives a command (scanning, pairing, matching a pairing's bond with a saved
-//! device, an unpair waiting for its link to close, settings jobs) lives here and reports its
-//! progress through events. Adapter, device, profile, scan and pairing events carry the complete
-//! current state of one thing; settings events carry what changed since the client
-//! last listed or was told. Changed things are marked dirty and written one frame at a
+//! A list read takes turns with background work, one bounded step per `proceed`. Lists produce
+//! bounded batches as serial output drains, all in one response frame. Corrupt records omitted
+//! from a list are rescanned for cleanup once their removal events can drain. Every other command
+//! validates, acts and responds at once. Work that outlives a command (scanning, pairing, matching
+//! a pairing's bond with a saved device, an unpair waiting for its link to close, settings jobs)
+//! lives here and reports its progress through events. Adapter, device, profile, scan and pairing
+//! events carry the complete current state of one thing; settings events carry what changed since
+//! the client last listed or was told. Changed things are marked dirty and written one frame at a
 //! time when the serial output is free.
 use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
 
 use cordial_protocol::{self as p, event::Kind as Ev, request::Command, response::Result as R};
-use prost::Message;
 
 use crate::{
     bluetooth::{Bluetooth, Event},
@@ -165,68 +164,15 @@ impl Records {
     }
 }
 
-/// One page of a device or profile listing, read one record per step.
-struct Listing {
-    /// The last ID the listing has passed.
-    cursor: u64,
-    /// IDs of the current page still to read.
-    ids: VecDeque<u64>,
-    /// IDs remain after the current page.
-    more: bool,
-    /// A page has been read.
-    read: bool,
-}
-enum Turn {
-    Read(u64),
-    Paged,
-    /// The response is complete; whether nothing follows it.
-    Finished(bool),
-}
-impl Listing {
-    fn new(after: u32) -> Self {
-        Self {
-            cursor: after.into(),
-            ids: VecDeque::new(),
-            more: false,
-            read: false,
-        }
-    }
-    /// The next step of the listing. Pages that hold nothing to list are passed over until one
-    /// does or the records end; `found` says whether the response holds anything yet.
-    async fn turn<S: RecordStore>(
-        &mut self,
-        kind: u8,
-        size: usize,
-        found: bool,
-        store: &mut S,
-    ) -> Result<Turn, Error> {
-        if let Some(id) = self.ids.pop_front() {
-            self.cursor = id;
-            return Ok(Turn::Read(id));
-        }
-        if self.read && (found || !self.more) {
-            return Ok(Turn::Finished(!self.more));
-        }
-        let mut ids = store
-            .record_ids(kind, self.cursor, size + 1)
-            .await
-            .map_err(|_| Error::StorageFailed)?;
-        self.more = ids.len() > size;
-        ids.truncate(size);
-        self.ids = ids.into();
-        self.read = true;
-        Ok(Turn::Paged)
-    }
-}
-
 /// A command that reads many records, waiting for its next step.
 enum Pending {
-    Devices(Listing, p::DeviceList),
-    Profiles(Listing, p::ProfileList),
-    /// A page of a disconnected device's saved settings, once its policy has been read.
+    Devices(Records),
+    Profiles(Records),
+    /// The next settings object after the last emitted identity.
     Settings(Policy, Option<p::SettingsRef>),
-    /// A page of a profile's rules, once its record has been read.
+    /// The next batch of rules after the last emitted identity.
     Rules(u32, Option<profiles::RuleRef>),
+    Features(u32, usize),
     Files(FileListing),
     /// Deleting a profile once no saved device refers to it.
     DeleteProfile(u64, Records),
@@ -240,13 +186,13 @@ struct PairingStart {
     name: Box<str>,
 }
 
-/// A page of a directory listing. Entries are read one per step, keeping the first ones by name
-/// after `after`, whatever order the store gives them in.
+/// One bounded batch of a directory listing. Entries are read one per step, keeping the first
+/// ones by name after `after`, whatever order the store gives them in.
 struct FileListing {
     path: String,
     after: String,
     index: usize,
-    /// At most one more entry than a page holds, in ascending name order.
+    /// At most FILES_BATCH entries, in ascending name order.
     page: Vec<p::FileEntry>,
 }
 
@@ -259,8 +205,6 @@ enum Work {
         changed: bool,
     },
     Bonds(BondSync),
-    /// Removing the references to a lost profile, then deleting it.
-    LostProfile(u64, Option<Records>),
 }
 /// Syncing the stack's bonds with the resident entries.
 enum BondSync {
@@ -326,11 +270,10 @@ pub(crate) struct Editor {
 const DEVICE: u8 = 1;
 const SETTINGS: u8 = 2;
 
-/// Entries in one page of a list held in memory. Pages of records read from flash use the
-/// page sizes of their records.
-const RULES_PAGE: usize = 32;
-const FEATURES_PAGE: usize = 32;
-const FILES_PAGE: usize = 16;
+/// Maximum entries serialized in one producer step.
+const RULES_BATCH: usize = 32;
+const FEATURES_BATCH: usize = 32;
+const FILES_BATCH: usize = 16;
 
 const PAIR_TIMEOUT_MS: u64 = 120_000;
 const PROMPT_TIMEOUT_MS: u64 = 30_000;
@@ -407,8 +350,15 @@ pub struct Application {
     bonds_retry: Backoff,
     /// The command waiting for its next step.
     pending: Option<Pending>,
-    /// Background work in progress. It pauses while commands run.
+    /// Background work in progress. Atomic commands pause it.
     work: Option<Work>,
+    /// Lost-profile references resume from this cursor once their events can drain.
+    lost_cleanup: Option<(u64, Option<Records>)>,
+    /// List production and background work take turns while output drains.
+    stream_work_turn: bool,
+    /// Corrupt metadata stays on storage until cleanup and its events can advance together.
+    rescan_lost_profiles: bool,
+    lost_scan: Option<Records>,
     /// The slot the next profile load retry starts from.
     retry_from: usize,
     /// Memory was released before the current pass of profile load retries started.
@@ -519,55 +469,6 @@ fn rule(value: &p::ProfileRule) -> Option<profiles::Rule> {
         effect,
     })
 }
-/// One page of the settings `catalog` holds, after `after`, and whether nothing follows it.
-fn settings_page(
-    catalog: &Catalog,
-    after: Option<&p::SettingsRef>,
-    device: u32,
-) -> Result<(Vec<p::SettingsObject>, bool), p::Error> {
-    if after.is_some_and(|r| wire::settings_bit(r) == 0) {
-        return Err(bad_args());
-    }
-    let mut objects = wire::settings(catalog)?;
-    if let Some(after) = after {
-        objects
-            .retain(|s| wire::settings_order(&wire::object_ref(s)) > wire::settings_order(after));
-    }
-    let count = objects.len();
-    let mut page = p::DeviceSettings {
-        device,
-        objects,
-        end: true,
-    };
-    loop {
-        let message = p::Message {
-            kind: Some(p::message::Kind::Response(p::Response {
-                result: Some(R::Settings(page)),
-            })),
-        };
-        let length = message.encoded_len();
-        let Some(p::message::Kind::Response(p::Response {
-            result: Some(R::Settings(owned)),
-        })) = message.kind
-        else {
-            unreachable!()
-        };
-        page = owned;
-        if length <= 1024 || page.objects.is_empty() {
-            break;
-        }
-        page.objects.pop();
-    }
-    page.end = page.objects.len() == count;
-    if page.objects.is_empty() && !page.end {
-        return Err(p::Error {
-            code: p::ErrorCode::TooLong as i32,
-            ..Default::default()
-        });
-    }
-    Ok((page.objects, page.end))
-}
-
 fn wire_interface(interface: Interface) -> p::ConfigurationInterface {
     match interface {
         Interface::Via => p::ConfigurationInterface::Via,
@@ -620,6 +521,10 @@ impl Application {
             bonds_retry: Backoff::default(),
             pending: None,
             work: None,
+            lost_cleanup: None,
+            stream_work_turn: false,
+            rescan_lost_profiles: false,
+            lost_scan: None,
             retry_from: 0,
             retry_released: false,
             maintenance_turn: false,
@@ -1035,8 +940,8 @@ impl Application {
         false
     }
 
-    /// Answers one request completely, taking every step of a command that reads many records.
-    /// For an owner that runs the application from one loop.
+    /// Advances a request until it finishes or waits for serial output.
+    /// The owner drains output and calls `proceed` while a command remains pending.
     pub async fn dispatch<S: RecordStore, B: Bluetooth>(
         &mut self,
         request: p::Request,
@@ -1045,15 +950,47 @@ impl Application {
         now: u64,
     ) {
         self.begin(request, store, radio, now).await;
-        while self.command_pending() {
+        while self.command_pending() && (!self.streaming() || self.serial.stream_ready()) {
             self.proceed(store, radio, now).await;
         }
     }
 
-    /// Whether a command is waiting for its next step. No other request is read, and no other
-    /// secondary work runs, until it has responded.
+    /// Whether a command is waiting for its next step. No other request is read until it responds.
+    /// List reads share secondary steps with background work.
     pub fn command_pending(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// A list read may be discarded when its serial session closes.
+    pub fn streaming(&self) -> bool {
+        matches!(
+            self.pending,
+            Some(
+                Pending::Devices(_)
+                    | Pending::Profiles(_)
+                    | Pending::Settings(..)
+                    | Pending::Rules(..)
+                    | Pending::Features(..)
+                    | Pending::Files(_)
+            )
+        )
+    }
+
+    fn stream(&mut self, result: R, finished: bool) {
+        self.serial.stream_response(
+            p::Response {
+                result: Some(result),
+            },
+            finished,
+        );
+    }
+
+    /// Gives a list's next turn to other secondary work, including when output is blocked.
+    /// Owners call this before `proceed` to run saves and editor packets on that turn.
+    /// Direct callers of `proceed` use the same turn for application background work.
+    pub fn yield_command(&mut self) -> bool {
+        self.streaming()
+            && (core::mem::take(&mut self.stream_work_turn) || !self.serial.stream_ready())
     }
 
     /// Takes the next step of the command in progress: reads one record, or responds.
@@ -1063,6 +1000,11 @@ impl Application {
         radio: &mut B,
         now: u64,
     ) {
+        if self.yield_command() {
+            self.work(store, radio, now).await;
+            return;
+        }
+        self.stream_work_turn = self.streaming();
         // Storage can stop being ready between steps, such as after a write in the priority loop
         // fails. The command then fails as it would have at its start, instead of answering with
         // records left out.
@@ -1072,17 +1014,35 @@ impl Application {
         }
         match self.pending.take() {
             None => {}
-            Some(Pending::Devices(listing, list)) => {
-                self.list_devices(listing, list, store, radio).await
-            }
-            Some(Pending::Profiles(listing, list)) => {
-                self.list_profiles(listing, list, store, radio).await
-            }
+            Some(Pending::Devices(listing)) => self.list_devices(listing, store, radio).await,
+            Some(Pending::Profiles(listing)) => self.list_profiles(listing, store, radio).await,
             Some(Pending::Settings(policy, after)) => {
-                match self.saved_catalog(&policy, store).await {
-                    Ok(catalog) => {
-                        let page = settings_page(&catalog, after.as_ref(), policy.id as u32);
-                        self.reply_settings(policy.id, page);
+                let slot = self.manager.find(policy.id);
+                let object = match self.live_catalog(slot) {
+                    Some(catalog) => wire::next_settings(catalog, after.as_ref()),
+                    None => match self.saved_catalog(&policy, store).await {
+                        Ok(catalog) => wire::next_settings(&catalog, after.as_ref()),
+                        Err(e) => return self.fail(e),
+                    },
+                };
+                match object {
+                    Ok(object) => {
+                        let next = object.as_ref().map(wire::object_ref);
+                        if let Some(reference) = &next
+                            && let Some(reported) = self.reported(policy.id)
+                        {
+                            reported.keys |= wire::settings_bit(reference);
+                        }
+                        self.stream(
+                            R::Settings(p::DeviceSettings {
+                                device: policy.id as u32,
+                                objects: object.into_iter().collect(),
+                            }),
+                            next.is_none(),
+                        );
+                        if next.is_some() {
+                            self.pending = Some(Pending::Settings(policy, next));
+                        }
                     }
                     Err(e) => self.fail(e),
                 }
@@ -1090,17 +1050,57 @@ impl Application {
             Some(Pending::Rules(id, after)) => match self.rules_page(id.into(), after, store).await
             {
                 Ok(rules) => {
-                    let mut page: Vec<p::ProfileRule> = rules.into_iter().map(wire_rule).collect();
-                    let end = page.len() <= RULES_PAGE;
-                    page.truncate(RULES_PAGE);
-                    self.reply(Some(R::ProfileRules(p::ProfileRules {
-                        profile: id,
-                        rules: page,
-                        end,
-                    })));
+                    let next = rules.last().map(|r| profiles::RuleRef {
+                        input: r.input,
+                        collection: r.collection,
+                    });
+                    let finished = rules.len() < RULES_BATCH;
+                    self.stream(
+                        R::ProfileRules(p::ProfileRules {
+                            profile: id,
+                            rules: rules.into_iter().map(wire_rule).collect(),
+                        }),
+                        finished,
+                    );
+                    if !finished {
+                        self.pending = Some(Pending::Rules(id, next));
+                    }
                 }
                 Err(e) => self.fail(e),
             },
+            Some(Pending::Features(id, index)) => {
+                let features: Vec<_> = self
+                    .manager
+                    .find(id.into())
+                    .and_then(|s| self.manager.devices[s].as_ref())
+                    .and_then(|d| d.live.as_ref())
+                    .map(|live| {
+                        live.catalog
+                            .features()
+                            .iter()
+                            .enumerate()
+                            .skip(index)
+                            .take(FEATURES_BATCH)
+                            .map(|(index, f)| p::Feature {
+                                integration: p::IntegrationKind::Hidpp as i32,
+                                supported: f.supported(),
+                                detail: Some(p::feature::Detail::Hidpp(p::HidppFeature {
+                                    index: index as u32,
+                                    id: f.id.0.into(),
+                                    version: f.version.0.into(),
+                                    flags: f.flags.0.into(),
+                                })),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let next = index + features.len();
+                let finished = features.len() < FEATURES_BATCH;
+                self.stream(R::Features(p::FeatureList { features }), finished);
+                if !finished {
+                    self.pending = Some(Pending::Features(id, next));
+                }
+            }
             Some(Pending::Files(listing)) => self.list_files(listing, store).await,
             Some(Pending::DeleteProfile(id, scan)) => {
                 self.delete_profile(id, scan, store, radio).await
@@ -1138,14 +1138,11 @@ impl Application {
                 let status = self.status(radio);
                 self.reply(Some(R::Status(status)));
             }
-            Command::ListProfiles(args) if profiles => {
+            Command::ListProfiles(_) if profiles => {
                 if !self.manager.storage_ready {
                     return self.fail(failure(Error::RadioUnavailable));
                 }
-                self.pending = Some(Pending::Profiles(
-                    Listing::new(args.after),
-                    p::ProfileList::default(),
-                ));
+                self.pending = Some(Pending::Profiles(Records::new(profiles::METADATA)));
             }
             Command::GetProfile(args) if profiles => {
                 match self.profile_record(args.profile, store, radio).await {
@@ -1165,15 +1162,8 @@ impl Application {
                 self.start_delete_profile(args.profile, store, radio).await
             }
             Command::ListProfileRules(args) if profiles => {
-                let after = match &args.after {
-                    None => None,
-                    Some(after) => match rule_reference(after) {
-                        Some(after) => Some(after),
-                        None => return self.fail(bad_args()),
-                    },
-                };
                 match self.profile_record(args.profile, store, radio).await {
-                    Ok(_) => self.pending = Some(Pending::Rules(args.profile, after)),
+                    Ok(_) => self.pending = Some(Pending::Rules(args.profile, None)),
                     Err(e) => self.fail(e),
                 }
             }
@@ -1201,14 +1191,11 @@ impl Application {
                 self.stop_pairing(Error::Cancelled, radio);
                 self.reply(None);
             }
-            Command::ListDevices(args) => {
+            Command::ListDevices(_) => {
                 if !self.manager.storage_ready {
                     return self.fail(failure(Error::RadioUnavailable));
                 }
-                self.pending = Some(Pending::Devices(
-                    Listing::new(args.after),
-                    p::DeviceList::default(),
-                ));
+                self.pending = Some(Pending::Devices(Records::new(2)));
             }
             Command::GetDevice(args) => self.device_result(args.device, store, radio).await,
             Command::SetDevice(args) => self.set_device(args, store, radio).await,
@@ -1222,67 +1209,15 @@ impl Application {
             }
             Command::UnpairDevice(args) => self.unpair(args.device, store, radio).await,
             Command::RefreshDevice(args) => self.refresh(args.device, store, radio, now).await,
-            Command::ListSettings(args) => {
-                let (policy, slot) = match self.policy_of(args.device, store, radio).await {
-                    Ok(found) => found,
-                    Err(e) => return self.fail(e),
-                };
-                match self.live_catalog(slot) {
-                    Some(catalog) => {
-                        // The catalog is borrowed from the device; the page is built from it.
-                        let page = settings_page(catalog, args.after.as_ref(), policy.id as u32);
-                        self.reply_settings(policy.id, page);
-                    }
-                    None => self.pending = Some(Pending::Settings(policy, args.after)),
-                }
-            }
+            Command::ListSettings(args) => match self.policy_of(args.device, store, radio).await {
+                Ok((policy, _)) => self.pending = Some(Pending::Settings(policy, None)),
+                Err(e) => self.fail(e),
+            },
             Command::SetSettings(args) => self.change_settings(args, store, radio, now).await,
             Command::ListFeatures(args) if development => {
-                let after = args
-                    .after
-                    .as_ref()
-                    .map(|a| (a.integration, a.index))
-                    .unwrap_or_default();
-                let features = self
-                    .manager
-                    .find(args.device.into())
-                    .and_then(|s| self.manager.devices[s].as_ref())
-                    .and_then(|d| d.live.as_ref())
-                    .map(|live| {
-                        live.catalog
-                            .features()
-                            .iter()
-                            .enumerate()
-                            .filter(|(index, _)| {
-                                args.after.is_none()
-                                    || (p::IntegrationKind::Hidpp as i32, *index as u32) > after
-                            })
-                            .take(FEATURES_PAGE + 1)
-                            .map(|(index, f)| p::Feature {
-                                integration: p::IntegrationKind::Hidpp as i32,
-                                supported: f.supported(),
-                                detail: Some(p::feature::Detail::Hidpp(p::HidppFeature {
-                                    index: index as u32,
-                                    id: f.id.0.into(),
-                                    version: f.version.0.into(),
-                                    flags: f.flags.0.into(),
-                                })),
-                            })
-                            .collect::<Vec<_>>()
-                    });
-                match features {
-                    Some(mut features) => {
-                        let end = features.len() <= FEATURES_PAGE;
-                        features.truncate(FEATURES_PAGE);
-                        self.reply(Some(R::Features(p::FeatureList { features, end })))
-                    }
-                    None => match self.policy_of(args.device, store, radio).await {
-                        Ok(_) => self.reply(Some(R::Features(p::FeatureList {
-                            features: Vec::new(),
-                            end: true,
-                        }))),
-                        Err(e) => self.fail(e),
-                    },
+                match self.policy_of(args.device, store, radio).await {
+                    Ok(_) => self.pending = Some(Pending::Features(args.device, 0)),
+                    Err(e) => self.fail(e),
                 }
             }
             Command::ListFiles(args) if development => {
@@ -1291,7 +1226,7 @@ impl Application {
                 }
                 self.pending = Some(Pending::Files(FileListing {
                     path: args.path,
-                    after: args.after,
+                    after: String::new(),
                     index: 0,
                     page: Vec::new(),
                 }));
@@ -1301,39 +1236,46 @@ impl Application {
                 self.fail(failure(Error::UnknownCommand))
             }
         }
+        if self.streaming() {
+            self.serial.start_stream();
+            self.stream_work_turn = false;
+            self.manager.defer_lost_devices = true;
+        }
     }
 
-    /// One step of a page of saved devices in ascending ID order.
+    /// Reads and emits one saved device in ascending ID order.
     async fn list_devices<S: RecordStore, B: Bluetooth>(
         &mut self,
-        mut listing: Listing,
-        mut list: p::DeviceList,
+        mut listing: Records,
         store: &mut S,
         radio: &mut B,
     ) {
         use p::device_list_entry::Entry;
-        let found = !list.entries.is_empty();
-        match listing.turn(2, devices::PAGE_SIZE, found, store).await {
+        match listing.next(store).await {
             Err(code) => return self.fail(failure(code)),
-            Ok(Turn::Finished(end)) => {
-                list.end = end;
-                return self.reply(Some(R::Devices(list)));
-            }
-            Ok(Turn::Paged) => {}
-            Ok(Turn::Read(id)) => match self.policy_of(id as u32, store, radio).await {
-                Ok((policy, slot)) => list.entries.push(p::DeviceListEntry {
-                    entry: Some(Entry::Device(wire::device(&self.manager, &policy, slot))),
-                }),
-                Err(e) if e.code == p::ErrorCode::StorageFailed as i32 => {
-                    list.entries.push(p::DeviceListEntry {
-                        entry: Some(Entry::Unreadable(id as u32)),
-                    })
+            Ok(Visit::Done) => return self.stream(R::Devices(p::DeviceList::default()), true),
+            Ok(Visit::Page) => {}
+            Ok(Visit::Record(id)) => {
+                let entry = match self.policy_of(id as u32, store, radio).await {
+                    Ok((policy, slot)) => {
+                        Some(Entry::Device(wire::device(&self.manager, &policy, slot)))
+                    }
+                    Err(e) if e.code == p::ErrorCode::StorageFailed as i32 => {
+                        Some(Entry::Unreadable(id as u32))
+                    }
+                    Err(_) => None,
+                };
+                if let Some(entry) = entry {
+                    self.stream(
+                        R::Devices(p::DeviceList {
+                            entries: alloc::vec![p::DeviceListEntry { entry: Some(entry) }],
+                        }),
+                        false,
+                    );
                 }
-                // A lost record is removed and left out.
-                Err(_) => {}
-            },
+            }
         }
-        self.pending = Some(Pending::Devices(listing, list));
+        self.pending = Some(Pending::Devices(listing));
     }
 
     /// The settings of device `id`: the readings of its connection and its saved values, or the
@@ -1359,25 +1301,6 @@ impl Application {
             .and_then(|d| d.live.as_ref())
             .filter(|l| l.policy.is_some())
             .map(|l| &l.catalog)
-    }
-
-    /// Responds with a page of device `id`'s settings, which the client then holds.
-    fn reply_settings(&mut self, id: u64, page: Result<(Vec<p::SettingsObject>, bool), p::Error>) {
-        let (objects, end) = match page {
-            Ok(page) => page,
-            Err(error) => return self.fail(error),
-        };
-        let keys = objects.iter().fold(0, |keys, object| {
-            keys | wire::settings_bit(&wire::object_ref(object))
-        });
-        if let Some(reported) = self.reported(id) {
-            reported.keys |= keys;
-        }
-        self.reply(Some(R::Settings(p::DeviceSettings {
-            device: id as u32,
-            objects,
-            end,
-        })));
     }
 
     /// A catalog holding a disconnected device's saved settings.
@@ -1424,7 +1347,11 @@ impl Application {
                 roles: wire::roles(self.pending_roles(id).unwrap_or(meta.roles).0),
             }),
             Err(crate::storage::Error::Corrupt) => {
-                self.lost_profile(id);
+                if !self.cleanup_ready() {
+                    self.rescan_lost_profiles = true;
+                } else {
+                    self.lost_profile(id);
+                }
                 Err(failure(Error::NotFound))
             }
             Err(error) => Err(self.storage_error(error)),
@@ -1445,45 +1372,46 @@ impl Application {
 
     /// Queues the cleanup of a profile whose saved files are undecodable.
     fn lost_profile(&mut self, id: u64) {
-        let cleaning = matches!(self.work, Some(Work::LostProfile(lost, _)) if lost == id);
+        let cleaning = self
+            .lost_cleanup
+            .as_ref()
+            .is_some_and(|(lost, _)| *lost == id);
         if !cleaning && !self.manager.lost_profiles.contains(&id) {
             self.manager.lost_profiles.push(id);
         }
     }
 
-    /// One step of a page of saved profiles in ascending ID order.
+    /// Reads and emits one saved profile in ascending ID order.
     async fn list_profiles<S: RecordStore, B: Bluetooth>(
         &mut self,
-        mut listing: Listing,
-        mut list: p::ProfileList,
+        mut listing: Records,
         store: &mut S,
         radio: &mut B,
     ) {
         use p::profile_list_entry::Entry;
-        let found = !list.entries.is_empty();
-        match listing
-            .turn(profiles::METADATA, profiles::PAGE_SIZE, found, store)
-            .await
-        {
+        match listing.next(store).await {
             Err(code) => return self.fail(failure(code)),
-            Ok(Turn::Finished(end)) => {
-                list.end = end;
-                return self.reply(Some(R::Profiles(list)));
-            }
-            Ok(Turn::Paged) => {}
-            Ok(Turn::Read(id)) => match self.profile_record(id as u32, store, radio).await {
-                Ok(profile) => list.entries.push(p::ProfileListEntry {
-                    entry: Some(Entry::Profile(profile)),
-                }),
-                Err(e) if e.code == p::ErrorCode::StorageFailed as i32 => {
-                    list.entries.push(p::ProfileListEntry {
-                        entry: Some(Entry::Unreadable(id as u32)),
-                    })
+            Ok(Visit::Done) => return self.stream(R::Profiles(p::ProfileList::default()), true),
+            Ok(Visit::Page) => {}
+            Ok(Visit::Record(id)) => {
+                let entry = match self.profile_record(id as u32, store, radio).await {
+                    Ok(profile) => Some(Entry::Profile(profile)),
+                    Err(e) if e.code == p::ErrorCode::StorageFailed as i32 => {
+                        Some(Entry::Unreadable(id as u32))
+                    }
+                    Err(_) => None,
+                };
+                if let Some(entry) = entry {
+                    self.stream(
+                        R::Profiles(p::ProfileList {
+                            entries: alloc::vec![p::ProfileListEntry { entry: Some(entry) }],
+                        }),
+                        false,
+                    );
                 }
-                Err(_) => {}
-            },
+            }
         }
-        self.pending = Some(Pending::Profiles(listing, list));
+        self.pending = Some(Pending::Profiles(listing));
     }
 
     /// Profile `id`'s table in RAM, which its users share. A table waiting to be saved, or held
@@ -1493,8 +1421,7 @@ impl Application {
         self.manager.profiles.get(id)
     }
 
-    /// Up to one more than a page of profile `id`'s rules for inputs above `after`: from its table
-    /// in RAM when there is one, otherwise from the saved file, read only as far as the page.
+    /// A bounded batch of rules above `after`, from the current table in RAM or saved file.
     async fn rules_page<S: RecordStore>(
         &mut self,
         id: u64,
@@ -1502,9 +1429,9 @@ impl Application {
         store: &mut S,
     ) -> Result<Vec<profiles::Rule>, p::Error> {
         if let Some(map) = self.loaded(id) {
-            return Ok(map.borrow().after(after).take(RULES_PAGE + 1).collect());
+            return Ok(map.borrow().after(after).take(RULES_BATCH).collect());
         }
-        match profiles::saved_page(store, id, after, RULES_PAGE + 1).await {
+        match profiles::saved_page(store, id, after, RULES_BATCH).await {
             Ok(rules) => Ok(rules),
             Err(crate::storage::Error::Corrupt) => {
                 self.lost_profile(id);
@@ -1650,7 +1577,7 @@ impl Application {
         self.profile_dirty.retain(|p| *p != id);
         self.event_retries
             .retain(|(r, _)| *r != EventRead::Profile(id));
-        if !self.profile_removed.contains(&id) {
+        if self.serial.active() && !self.profile_removed.contains(&id) {
             self.profile_removed.push_back(id);
         }
     }
@@ -1986,7 +1913,9 @@ impl Application {
                             Err(_) => return Err(Error::StorageFailed),
                         }
                     }
-                    self.mark(device, DEVICE);
+                    if self.serial.active() {
+                        self.mark(device, DEVICE);
+                    }
                 }
             }
             Visit::Done => {
@@ -2851,8 +2780,7 @@ impl Application {
         self.reply(None);
     }
 
-    /// One step of a page of a directory's entries in ascending name order: reads one entry, or
-    /// responds once every entry has been read.
+    /// Reads one directory entry, or emits the next batch in ascending name order.
     async fn list_files<S: RecordStore>(&mut self, mut listing: FileListing, store: &mut S) {
         match store.file_entry(&listing.path, listing.index).await {
             Ok(Some(entry)) => {
@@ -2867,15 +2795,25 @@ impl Application {
                             size: entry.size as u64,
                         },
                     );
-                    listing.page.truncate(FILES_PAGE + 1);
+                    listing.page.truncate(FILES_BATCH);
                 }
                 self.pending = Some(Pending::Files(listing));
             }
             Ok(None) => {
-                let mut entries = listing.page;
-                let end = entries.len() <= FILES_PAGE;
-                entries.truncate(FILES_PAGE);
-                self.reply(Some(R::Files(p::FileList { entries, end })));
+                let finished = listing.page.len() < FILES_BATCH;
+                if let Some(entry) = listing.page.last() {
+                    listing.after = entry.name.clone();
+                }
+                self.stream(
+                    R::Files(p::FileList {
+                        entries: core::mem::take(&mut listing.page),
+                    }),
+                    finished,
+                );
+                if !finished {
+                    listing.index = 0;
+                    self.pending = Some(Pending::Files(listing));
+                }
             }
             Err(crate::storage::Error::Missing) => self.fail(failure(Error::NotFound)),
             Err(_) => self.fail(failure(Error::StorageFailed)),
@@ -2919,6 +2857,9 @@ impl Application {
     /// Follows the serial port opening and closing. Ending a session stops a running scan and
     /// cancels a pairing that has not saved its bond; a new session starts with nothing to report.
     pub fn session<B: Bluetooth>(&mut self, active: bool, radio: &mut B) {
+        if self.streaming() {
+            self.pending = None;
+        }
         if self.serial.session(active) {
             self.end_session(radio);
         }
@@ -4061,6 +4002,7 @@ impl Application {
         // A pairing's bond is matched before other work, so the device connects promptly.
         let worked = self.advance_pair(store, radio, now).await
             || self.continue_work(store, radio, now).await
+            || self.continue_cleanup(store, radio, now).await
             || self.setup(store, radio, now).await
             || self.finish_unpairs(store, radio, now).await
             || self.background(store, radio, now).await;
@@ -4137,12 +4079,14 @@ impl Application {
         // Work that takes several steps starts once the previous one has finished.
         if self.work.is_none() {
             if let Some(&id) = self.manager.lost_profiles.first()
+                && self.lost_cleanup.is_none()
+                && self.cleanup_ready()
                 && self.lost_retry.due(now)
                 && self.write_allowed(now)
             {
                 self.manager.lost_profiles.remove(0);
-                self.work = Some(Work::LostProfile(id, None));
-                return self.continue_work(store, radio, now).await;
+                self.lost_cleanup = Some((id, None));
+                return self.continue_cleanup(store, radio, now).await;
             }
             // A pairing attempt waiting for the sync does not wait out the backoff.
             let pairing = self.pair.is_some() && self.sync_wanted();
@@ -4164,6 +4108,17 @@ impl Application {
                 }
                 return self.continue_work(store, radio, now).await;
             }
+        }
+        if self.work.is_none()
+            && self.lost_cleanup.is_none()
+            && self.manager.lost_devices.is_empty()
+            && self.manager.lost_profiles.is_empty()
+            && self.cleanup_ready()
+            && self.lost_retry.due(now)
+            && self.write_allowed(now)
+            && self.rescan_lost(store, radio, now).await
+        {
+            return true;
         }
         // Free space is counted for the status once writes have stopped. Admission checks count
         // it themselves when it is out of date.
@@ -4196,6 +4151,78 @@ impl Application {
                 false
             }
         }
+    }
+
+    /// Cleanup waits for its previous events, so neither a long list nor a slow host retains
+    /// one removal or changed-device notification per saved record.
+    fn cleanup_ready(&self) -> bool {
+        !self.serial.active()
+            || (self.serial.idle()
+                && self.removed.is_empty()
+                && self.profile_removed.is_empty()
+                && self.dirty.is_empty()
+                && self.profile_dirty.is_empty()
+                && self.manager.removed.is_empty()
+                && self.manager.changed.is_empty())
+    }
+
+    /// Rechecks one record omitted while events were blocked. A failed read is not a loss.
+    /// Failed enumeration retries the same cursor after the cleanup backoff.
+    async fn rescan_lost<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> bool {
+        let scan = self.lost_scan.take().or_else(|| {
+            if core::mem::take(&mut self.manager.rescan_lost_devices) {
+                Some(Records::new(2))
+            } else if core::mem::take(&mut self.rescan_lost_profiles) {
+                Some(Records::new(profiles::METADATA))
+            } else {
+                None
+            }
+        });
+        let Some(mut scan) = scan else { return false };
+        match scan.next(store).await {
+            Ok(Visit::Done) => {
+                // A failed read is retried in a later pass. The other kind gets its turn first.
+                let (retry, next) = if scan.kind == 2 {
+                    (
+                        self.manager.rescan_lost_devices,
+                        core::mem::take(&mut self.rescan_lost_profiles)
+                            .then_some(profiles::METADATA),
+                    )
+                } else {
+                    (
+                        self.rescan_lost_profiles,
+                        core::mem::take(&mut self.manager.rescan_lost_devices).then_some(2),
+                    )
+                };
+                self.lost_scan = next.map(Records::new);
+                if retry {
+                    self.lost_retry.failed(now);
+                }
+                return true;
+            }
+            Ok(Visit::Page) => {}
+            Ok(Visit::Record(id)) => {
+                if scan.kind == 2 {
+                    if matches!(self.manager.policy_record(id, store, radio).await,
+                        Err(error) if !matches!(error, crate::storage::Error::Missing | crate::storage::Error::Corrupt))
+                    {
+                        self.manager.rescan_lost_devices = true;
+                    }
+                } else if let Err(error) = self.profile_record(id as u32, store, radio).await
+                    && error.code == p::ErrorCode::StorageFailed as i32
+                {
+                    self.rescan_lost_profiles = true;
+                }
+            }
+            Err(_) => self.lost_retry.failed(now),
+        }
+        self.lost_scan = Some(scan);
+        true
     }
 
     /// One step of the background work in progress, unless it is paused. Returns whether it did
@@ -4234,26 +4261,41 @@ impl Application {
                 }
                 self.sync_bonds(sync, store, radio, now).await;
             }
-            Work::LostProfile(id, scan) => {
-                if !self.write_allowed(now) {
-                    self.work = Some(Work::LostProfile(id, scan));
-                    return false;
+        }
+        true
+    }
+
+    /// Cleans one lost-profile reference without holding up bond sync or resident admission
+    /// while its events wait for the host.
+    async fn continue_cleanup<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) -> bool {
+        if !self.manager.storage_ready
+            || self.manager.starting(now)
+            || !self.cleanup_ready()
+            || !self.write_allowed(now)
+        {
+            return false;
+        }
+        let Some((id, scan)) = self.lost_cleanup.take() else {
+            return false;
+        };
+        match self.clean_lost_profile(id, scan, store, radio, now).await {
+            Ok(Some(scan)) => self.lost_cleanup = Some((id, Some(scan))),
+            Ok(None) => {
+                // A connection that found it lost meanwhile queued it again.
+                self.manager.lost_profiles.retain(|p| *p != id);
+                self.lost_retry.succeeded();
+            }
+            Err(_) => {
+                // Kept, behind any others, until a cleanup succeeds.
+                if !self.manager.lost_profiles.contains(&id) {
+                    self.manager.lost_profiles.push(id);
                 }
-                match self.clean_lost_profile(id, scan, store, radio, now).await {
-                    Ok(Some(scan)) => self.work = Some(Work::LostProfile(id, Some(scan))),
-                    Ok(None) => {
-                        // A connection that found it lost meanwhile queued it again.
-                        self.manager.lost_profiles.retain(|p| *p != id);
-                        self.lost_retry.succeeded();
-                    }
-                    Err(_) => {
-                        // Kept, behind any others, until a cleanup succeeds.
-                        if !self.manager.lost_profiles.contains(&id) {
-                            self.manager.lost_profiles.push(id);
-                        }
-                        self.lost_retry.failed(now);
-                    }
-                }
+                self.lost_retry.failed(now);
             }
         }
         true
@@ -4416,7 +4458,9 @@ impl Application {
         }
         while let Some(id) = self.manager.removed.pop() {
             self.forget_device(id);
-            self.removed.push_back(id);
+            if self.serial.active() {
+                self.removed.push_back(id);
+            }
             self.adapter_dirty = true;
         }
         while let Some(id) = self.manager.changed.pop() {
@@ -4591,25 +4635,6 @@ impl Application {
             changed: settings,
             removed: Vec::new(),
         };
-        let fits = |event: &mut p::SettingsChanged| {
-            let message = p::Message {
-                kind: Some(p::message::Kind::Event(p::Event {
-                    kind: Some(Ev::SettingsChanged(core::mem::take(event))),
-                })),
-            };
-            let fits = message.encoded_len() <= 1024;
-            let Some(p::message::Kind::Event(p::Event {
-                kind: Some(Ev::SettingsChanged(owned)),
-            })) = message.kind
-            else {
-                unreachable!()
-            };
-            *event = owned;
-            fits
-        };
-        while !event.changed.is_empty() && !fits(&mut event) {
-            event.changed.pop();
-        }
         let sent = event.changed.iter().fold(0, |bits, object| {
             bits | wire::settings_bit(&wire::object_ref(object))
         });
@@ -4620,10 +4645,6 @@ impl Application {
                 continue;
             }
             event.removed.push(wire::settings_ref(key));
-            if !fits(&mut event) {
-                event.removed.pop();
-                break;
-            }
             removed |= bit;
         }
         if let Some(reported) = self.reported(id) {
@@ -4731,6 +4752,8 @@ impl Application {
         radio: &mut B,
         now: u64,
     ) -> bool {
+        self.manager.defer_lost_devices =
+            !self.cleanup_ready() || !self.manager.lost_devices.is_empty();
         self.release_editor(store, now).await;
         if let Some(deadline) = self.reboot_at {
             if ((self.serial.queued() == 0 && self.manager.forward.pending() == 0)

@@ -6,7 +6,7 @@ use crate::{
     settings::tests::{ranged, sensor, wheel},
     ui::command::tests as fixture,
 };
-use cordial_protocol::{DeviceState, InactiveReason, IntegrationKind};
+use cordial_protocol::{ConfigurationInterface, DeviceState, InactiveReason, IntegrationKind};
 use ratatui::{
     buffer::Buffer,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -1040,6 +1040,194 @@ fn an_interface_save_is_sent_without_asking() {
     app.m.action(Action::AdapterSave);
     app.saved_without_asking();
     assert!(app.ran("AdapterSave"));
+}
+
+/// Profiles P01 to P`count`, as one listing.
+fn profile_list(count: u32) -> p::ProfileList {
+    p::ProfileList {
+        entries: (1..=count)
+            .map(|id| p::ProfileListEntry {
+                entry: Some(p::profile_list_entry::Entry::Profile(p::Profile {
+                    id,
+                    name: format!("P{id:02}"),
+                    roles: Vec::new(),
+                })),
+            })
+            .collect(),
+    }
+}
+
+impl App {
+    /// Delivers a response notice, as the session reports a command's response when it arrives.
+    fn respond(&mut self, slot: Slot, result: p::response::Result) {
+        self.m.update(Msg::Fleet(
+            slot,
+            Box::new(Event::Notice {
+                session: 1,
+                notice: crate::controller::Notice::Response(p::Response {
+                    result: Some(result),
+                }),
+            }),
+        ));
+    }
+
+    /// Answers the running profile listing for the list, or the picker: the response notice,
+    /// then the command's result.
+    fn list_profiles(&mut self, picker: bool, list: p::ProfileList) {
+        let slot = self.slot("00000000000FA001");
+        self.respond(slot, p::response::Result::Profiles(list.clone()));
+        self.finish_profiles(picker, Ok(Outcome::Profiles(list)));
+    }
+
+    /// Finishes the running profile listing for the list, or the picker.
+    fn finish_profiles(&mut self, picker: bool, result: Result<Outcome, Error>) {
+        let (slot, ticket) = *self
+            .m
+            .jobs
+            .iter()
+            .find(|(_, j)| matches!(j.kind, Kind::Page { picker: p } if p == picker))
+            .unwrap()
+            .0;
+        self.m.update(Msg::Fleet(
+            slot,
+            Box::new(Event::Done {
+                session: 1,
+                ticket,
+                result,
+            }),
+        ));
+    }
+
+    fn profile_event(&mut self, slot: Slot, kind: p::event::Kind) {
+        self.m.update(Msg::Fleet(
+            slot,
+            Box::new(Event::Notice {
+                session: 1,
+                notice: crate::controller::Notice::Event {
+                    event: p::Event { kind: Some(kind) },
+                    first: false,
+                    changed: Vec::new(),
+                },
+            }),
+        ));
+    }
+}
+
+#[test]
+fn profiles_show_one_listing_a_page_at_a_time() {
+    let mut app = App::two(110, 60);
+    app.click("Pico 2 W");
+    app.click("Profiles");
+    app.list_profiles(false, profile_list(25));
+    assert!(app.shows("P10") && !app.shows("P11") && app.find("Previous").is_none());
+    app.click("Next");
+    assert!(app.shows("P11") && app.shows("P20") && !app.shows("P10"));
+    app.click("Next");
+    assert!(app.shows("P25") && app.find("Next").is_none());
+    // Moving between pages lists nothing again.
+    assert!(!app.ran("Profiles"));
+    // Events change the listing, and an emptied last page shows the one before it.
+    let slot = app.slot("00000000000FA001");
+    for id in 21..=25 {
+        app.profile_event(
+            slot,
+            p::event::Kind::ProfileRemoved(p::ProfileRemoved { id }),
+        );
+    }
+    assert!(app.shows("P20") && app.find("Next").is_none());
+    app.profile_event(
+        slot,
+        p::event::Kind::Profile(p::Profile {
+            id: 30,
+            name: "Q30".into(),
+            ..Default::default()
+        }),
+    );
+    assert!(app.find("Next").is_some());
+    // A failed listing keeps what was listed.
+    app.m.action(Action::ProfilesRetry);
+    app.finish_profiles(false, Err(Error::new("the adapter is busy")));
+    assert!(app.shows("The adapter couldn't read its profiles.") && app.shows("P20"));
+}
+
+/// Renames P02, removes P03 and creates P04, as profile events.
+fn change_profiles(app: &mut App) {
+    let slot = app.slot("00000000000FA001");
+    for (id, name) in [(2, "Renamed"), (4, "P04")] {
+        app.profile_event(
+            slot,
+            p::event::Kind::Profile(p::Profile {
+                id,
+                name: name.into(),
+                ..Default::default()
+            }),
+        );
+    }
+    app.profile_event(
+        slot,
+        p::event::Kind::ProfileRemoved(p::ProfileRemoved { id: 3 }),
+    );
+}
+
+fn changed_profiles_shown(app: &mut App) -> bool {
+    app.shows("P01")
+        && app.shows("Renamed")
+        && !app.shows("P02")
+        && !app.shows("P03")
+        && app.shows("P04")
+}
+
+#[test]
+fn profile_events_after_a_listing_apply_before_its_command_finishes() {
+    let mut app = App::two(110, 60);
+    app.click("Pico 2 W");
+    app.click("Profiles");
+    let slot = app.slot("00000000000FA001");
+    // The events that follow the first listing's response arrive before its command finishes.
+    app.respond(slot, p::response::Result::Profiles(profile_list(3)));
+    change_profiles(&mut app);
+    app.finish_profiles(false, Ok(Outcome::Profiles(profile_list(3))));
+    assert!(changed_profiles_shown(&mut app));
+    // A refresh is overtaken by events the same way.
+    app.m.action(Action::ProfilesRetry);
+    app.respond(slot, p::response::Result::Profiles(profile_list(3)));
+    change_profiles(&mut app);
+    app.finish_profiles(false, Ok(Outcome::Profiles(profile_list(3))));
+    assert!(changed_profiles_shown(&mut app));
+    // A refresh that fails keeps the listing and the events applied to it.
+    app.m.action(Action::ProfilesRetry);
+    app.respond(slot, p::response::Result::Error(p::Error::default()));
+    app.profile_event(
+        slot,
+        p::event::Kind::Profile(p::Profile {
+            id: 5,
+            name: "P05".into(),
+            ..Default::default()
+        }),
+    );
+    app.finish_profiles(false, Err(Error::new("the adapter is busy")));
+    assert!(changed_profiles_shown(&mut app) && app.shows("P05"));
+    assert!(app.shows("The adapter couldn't read its profiles."));
+}
+
+#[test]
+fn the_picker_follows_events_after_its_listing_and_keeps_its_own_page() {
+    let mut app = App::two(110, 60);
+    app.click("Pico 2 W");
+    app.click("Profiles");
+    app.list_profiles(false, profile_list(25));
+    app.click("Next");
+    assert!(app.shows("P11"));
+    app.m
+        .action(Action::InterfacePick(ConfigurationInterface::Via));
+    let slot = app.slot("00000000000FA001");
+    app.respond(slot, p::response::Result::Profiles(profile_list(3)));
+    change_profiles(&mut app);
+    app.finish_profiles(true, Ok(Outcome::Profiles(profile_list(3))));
+    assert!(changed_profiles_shown(&mut app));
+    // The Profiles tab stays on its page, which the removal moved along by one.
+    app.key(KeyCode::Esc);
+    assert!(app.shows("P12") && app.shows("P21") && !app.shows("P11") && !app.shows("P01"));
 }
 
 #[test]

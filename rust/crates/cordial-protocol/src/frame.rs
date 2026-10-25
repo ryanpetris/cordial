@@ -42,6 +42,55 @@ pub fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
     out.push(DELIMITER);
 }
 
+/// Incremental COBS encoding of one frame, retaining at most one 254-byte block.
+pub struct Encoder {
+    block: [u8; 254],
+    length: usize,
+}
+
+impl Default for Encoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Encoder {
+    /// Starts an empty frame.
+    pub fn new() -> Self {
+        Self {
+            block: [0; 254],
+            length: 0,
+        }
+    }
+
+    /// Appends complete COBS blocks. Calls may split the input anywhere.
+    pub fn push(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
+        for &byte in bytes {
+            if byte == 0 {
+                self.flush(out);
+            } else {
+                self.block[self.length] = byte;
+                self.length += 1;
+                if self.length == self.block.len() {
+                    self.flush(out);
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self, out: &mut Vec<u8>) {
+        out.push((self.length + 1) as u8);
+        out.extend_from_slice(&self.block[..self.length]);
+        self.length = 0;
+    }
+
+    /// Ends the frame with the remaining block and its delimiter.
+    pub fn finish(mut self, out: &mut Vec<u8>) {
+        self.flush(out);
+        out.push(DELIMITER);
+    }
+}
+
 /// Why a received frame could not be used.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameError {

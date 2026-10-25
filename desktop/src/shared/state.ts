@@ -176,7 +176,7 @@ export interface Profile {
 /** The shown page of the adapter's profiles. */
 export interface ProfilePage {
   profiles: Profile[];
-  /** Profiles in the page's range whose record the adapter couldn't read. */
+  /** Profiles on the page whose record the adapter couldn't read. */
   unreadable: number[];
   /** Whether a previous or a following page exists. */
   previous: boolean;
@@ -349,7 +349,7 @@ export interface AdapterEntry {
   attention: string[];
   /** The Profiles list's page; null without profile support. */
   profilePage: ProfilePage | null;
-  /** The profile picker's page, read separately so paging it leaves the list where it is; null
+  /** The profile picker's page, paged separately so paging it leaves the list where it is; null
    * without profile support or before the picker first opens. */
   pickerPage: ProfilePage | null;
   /** The profiles this session has seen, by ID, for naming layers and interface profiles. */

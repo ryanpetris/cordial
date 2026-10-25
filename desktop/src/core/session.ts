@@ -1,25 +1,16 @@
 // One adapter's session: a Connection and the adapter's state, kept current
 // from responses and events in the order the adapter sent them. Each device
 // record, profile and settings object arrives whole, so the latest one wins.
-// Each page of a listing replaces what was known in the range of keys it
-// covers, and settings events replace or remove only the objects they name. A
-// successful change command means the adapter saved exactly what was sent, so
-// its values are applied here without reading them back. Opening
-// reads every page of devices and, when the adapter has profiles, the first
-// page of profiles, then each device's settings. Profiles are
-// shown a page at a time; profiles in a device's layers or selected by a
-// configuration interface that no page has shown are named with GetProfile.
-import {
-  Connection,
-  ConnectionClosedError,
-  CordialError,
-  UnexpectedResponseError,
-  compareSettingsRefs,
-  entryId,
-  settingsRef,
-  type ByteStream,
-} from "@cordial/client";
-import { ErrorCode, OutputMode, Platform, type Event, type Request, type Response, type SetAdapter, type SetDevice, type SettingsObject } from "@cordial/protocol";
+// Each listing is complete and replaces what was known of its kind, and
+// settings events replace or remove only the objects they name. A successful
+// change command means the adapter saved exactly what was sent, so its values
+// are applied here without reading them back. Opening lists the devices and,
+// when the adapter has profiles, the profiles, then each device's settings.
+// The Profiles list and the profile picker show the listed profiles a page at
+// a time; profiles in a device's layers or selected by a configuration
+// interface that the listing hasn't named are named with GetProfile.
+import { Connection, ConnectionClosedError, CordialError, UnexpectedResponseError, settingsRef, type ByteStream } from "@cordial/client";
+import { ErrorCode, OutputMode, Platform, type Event, type Request, type Response, type SetAdapter, type SetDevice } from "@cordial/protocol";
 import type { AdapterStatus, DeviceRecord, Profile, ProfilePage, Setting, SettingsChange } from "../shared/state.ts";
 import { sameField } from "../shared/settings.ts";
 import { READ_FAILED, asSentence, errorText } from "../shared/text.ts";
@@ -46,23 +37,6 @@ export const failure = (error: unknown, read = false) =>
       : error instanceof UnexpectedResponseError ? "The adapter returned an unexpected result."
       : asSentence((error as Error).message);
 
-/** Whether `id` is in the range a page read after `after` covers, up to `next` (0 ends the listing). */
-const inPage = (id: number, after: number, next: number) => id > after && (next === 0 || id <= next);
-
-/** The settings listed after a page of objects read after `after` (undefined from the start):
- * the page's objects replace those in the range it covers, up to its last object, or to the end of
- * the listing when `end` is set. */
-function mergeSettings(list: Setting[], page: SettingsObject[], after: Parameters<typeof compareSettingsRefs>[0] | undefined, end: boolean): Setting[] {
-  const hi = end ? undefined : page.map(settingsRef).findLast((r) => r !== undefined);
-  // A page without an object this app can name that doesn't end the listing covers nothing.
-  if (!end && hi === undefined) return list;
-  const covered = (s: Setting) => {
-    const ref = convert.objectRef(s);
-    return (after === undefined || compareSettingsRefs(ref, after) > 0) && (hi === undefined || compareSettingsRefs(ref, hi) <= 0);
-  };
-  return [...list.filter((s) => !covered(s)), ...convert.settings(page)].sort(convert.compareSettings);
-}
-
 /** A setting as the adapter lists it after SetSettings saved or forgot `change`'s value. */
 const changedSetting = (s: Setting, change: SettingsChange): Setting =>
   change.type === "forget" ? { ...s, saved: null, state: null, error: null } : { ...s, saved: change.value, state: "pending", error: null };
@@ -71,17 +45,17 @@ const changedSetting = (s: Setting, change: SettingsChange): Setting =>
  * which pages on its own. */
 export type PageView = "list" | "picker";
 
-/** The shown page of profiles, with the cursors that led to it. */
-interface PageState {
-  /** The `after` cursor of each shown page up to the current one, first page first. */
-  cursors: number[];
+/** Profiles shown on one page of the Profiles list or the profile picker. */
+export const PROFILES_PER_PAGE = 10;
+
+/** The adapter's profiles from the latest listing, kept current by profile events. */
+interface ProfileListing {
+  /** In ID order. */
   profiles: Profile[];
+  /** IDs of profiles whose record the adapter couldn't read, in ID order. */
   unreadable: number[];
-  next: number;
   loading: boolean;
   error: string | null;
-  /** Counts reads, so only the latest one's result is shown. */
-  read: number;
 }
 
 /**
@@ -102,11 +76,14 @@ export class AdapterSession {
   /** What has been listed and reported of each device's settings, in the adapter's order. */
   readonly settings = new Map<number, Setting[]>();
   readonly settingsErrors = new Map<number, string>();
-  /** Every page of devices has been read. */
+  /** The devices have been listed. */
   listed = false;
   /** Profiles seen this session, by ID. */
   readonly profileNames = new Map<number, Profile>();
-  readonly #pages: Record<PageView, PageState | null> = { list: null, picker: null };
+  #profiles: ProfileListing | null = null;
+  /** The page each view shows, kept within the listing as it shrinks; null before the view
+   * first opens. */
+  readonly #pages: Record<PageView, number | null> = { list: null, picker: null };
   /** IDs being named with GetProfile. */
   readonly #naming = new Set<number>();
   /** IDs the adapter couldn't name this session; asked again only after the profile changes. */
@@ -179,7 +156,7 @@ export class AdapterSession {
     return [...(this.#pending.get(id) ?? [])];
   }
 
-  /** Reads every page of devices, then each device's settings (single flight). */
+  /** Lists the devices, then the profiles and each device's settings (single flight). */
   #sync() {
     if (this.#syncing) {
       this.#syncAgain = true;
@@ -189,13 +166,13 @@ export class AdapterSession {
       do {
         this.#syncAgain = false;
         try {
-          // Each page's response updates the devices in its range as it arrives.
-          await this.#connection.listAllDevices();
+          // The response replaces the devices as it arrives.
+          await this.#connection.listDevices();
           this.listed = true;
           this.#hooks.changed();
           if (this.status.profileSupport) {
-            await this.readPage(this.#pages.list ? "again" : "first");
-            if (this.#pages.picker) await this.readPage("again", "picker");
+            this.#pages.list ??= 0;
+            await this.#readProfiles();
             await this.#nameReferences();
           }
           for (const id of [...this.devices.keys()]) await this.#readSettings(id);
@@ -219,59 +196,65 @@ export class AdapterSession {
     return this.#pageOf("picker");
   }
 
-  #pageOf(view: PageView): ProfilePage | null {
-    const p = this.#pages[view];
-    if (!p || !this.status.profileSupport) return null;
-    return { profiles: p.profiles, unreadable: p.unreadable, previous: p.cursors.length > 1, next: p.next !== 0, loading: p.loading, error: p.error };
+  /** The last page of the listing. */
+  get #lastPage(): number {
+    const count = (this.#profiles?.profiles.length ?? 0) + (this.#profiles?.unreadable.length ?? 0);
+    return Math.max(0, Math.ceil(count / PROFILES_PER_PAGE) - 1);
   }
 
-  /** Reads the first, next or previous page of profiles, or the shown one again. The cursors and
-   * the shown page change only when the read succeeds. A page that has emptied with an earlier
-   * one before it, as after deleting its last profile, shows the earlier one instead. */
+  /** Moves each view back to the last page when the listing no longer reaches its page. */
+  #clampPages() {
+    for (const view of ["list", "picker"] as const) {
+      const index = this.#pages[view];
+      if (index !== null) this.#pages[view] = Math.min(index, this.#lastPage);
+    }
+  }
+
+  #pageOf(view: PageView): ProfilePage | null {
+    const listing = this.#profiles;
+    const index = this.#pages[view];
+    if (!listing || index === null || !this.status.profileSupport) return null;
+    const all = [...listing.profiles.map((p) => [p.id, p] as const), ...listing.unreadable.map((id) => [id, null] as const)].sort((a, b) => a[0] - b[0]);
+    const shown = all.slice(index * PROFILES_PER_PAGE, (index + 1) * PROFILES_PER_PAGE);
+    return {
+      profiles: shown.flatMap(([, p]) => (p ? [p] : [])),
+      unreadable: shown.flatMap(([id, p]) => (p ? [] : [id])),
+      previous: index > 0,
+      next: all.length > (index + 1) * PROFILES_PER_PAGE,
+      loading: listing.loading,
+      error: listing.error,
+    };
+  }
+
+  /** Shows the first, next or previous page of profiles, or the shown one again. The first page
+   * and the shown one again list the profiles again; moving between pages uses what was listed. */
   async readPage(page: "first" | "next" | "previous" | "again", view: PageView = "list") {
     if (!this.status.profileSupport || this.closed) return;
-    const state = (this.#pages[view] ??= { cursors: [0], profiles: [], unreadable: [], next: 0, loading: false, error: null, read: 0 });
-    // The cursors before the page to show, and the cursor that starts reading it.
-    let before: number[];
-    let after: number;
-    if (page === "first") [before, after] = [[], 0];
-    else if (page === "next") {
-      if (!state.next) return;
-      [before, after] = [[...state.cursors], state.next];
-    } else if (page === "previous") {
-      if (state.cursors.length < 2) return;
-      [before, after] = [state.cursors.slice(0, -2), state.cursors.at(-2)!];
-    } else [before, after] = [state.cursors.slice(0, -1), state.cursors.at(-1) ?? 0];
-    const read = ++state.read;
-    state.loading = true;
+    const index = this.#pages[view] ?? 0;
+    this.#pages[view] = page === "first" ? 0 : page === "next" ? Math.min(index + 1, this.#lastPage) : page === "previous" ? Math.max(0, index - 1) : index;
+    if (page === "first" || page === "again" || !this.#profiles) await this.#readProfiles();
+    else this.#hooks.changed();
+  }
+
+  /** Lists the profiles. The response replaces the listing as it arrives; a failure leaves what
+   * was listed before. */
+  async #readProfiles() {
+    const listing = (this.#profiles ??= { profiles: [], unreadable: [], loading: false, error: null });
+    listing.loading = true;
     this.#hooks.changed();
     try {
-      let list = await this.#connection.listProfiles(after);
-      while (!list.entries.length && before.length) {
-        if (read !== state.read) return;
-        after = before.pop()!;
-        list = await this.#connection.listProfiles(after);
-      }
-      if (read !== state.read) return;
-      // The cursor of the following page is the key of this page's last entry with a known key.
-      const last = list.entries.map(entryId).findLast((id) => id !== undefined);
-      if (last === undefined && !list.end) throw new UnexpectedResponseError("listProfiles");
-      state.cursors = [...before, after];
-      state.profiles = list.entries.flatMap((e) => (e.entry.case === "profile" ? [convert.profile(e.entry.value)] : []));
-      state.unreadable = list.entries.flatMap((e) => (e.entry.case === "unreadable" ? [e.entry.value] : []));
-      state.next = list.end ? 0 : last!;
-      state.error = null;
+      await this.#connection.listProfiles();
     } catch (error) {
-      if (this.closed || read !== state.read) return;
-      state.error = failure(error, true);
-      this.#hooks.log(`profiles unavailable: ${state.error}`);
+      if (this.closed) return;
+      listing.error = failure(error, true);
+      this.#hooks.log(`profiles unavailable: ${listing.error}`);
     } finally {
-      if (read === state.read) state.loading = false;
+      listing.loading = false;
       this.#hooks.changed();
     }
   }
 
-  /** Reads the Profiles list's page again, as after a failed read. */
+  /** Lists the profiles again, as after a failed read. */
   reloadProfiles() {
     void this.readPage("again");
   }
@@ -298,7 +281,7 @@ export class AdapterSession {
 
   async #readSettings(id: number) {
     if (!this.devices.has(id) || this.closed) return;
-    await this.#connection.listAllSettings(id).then(
+    await this.#connection.listSettings(id).then(
       () => this.settingsErrors.delete(id),
       (error: unknown) => {
         if (this.closed || !this.devices.has(id)) return;
@@ -329,19 +312,13 @@ export class AdapterSession {
         this.#setStatus(result.value);
         break;
       case "devices": {
-        // The page replaces the devices in its range. A device whose record couldn't be read keeps
-        // what was known of it: a failed read is no proof that it is gone.
-        const after = command.case === "listDevices" ? command.value.after : 0;
-        const { entries, end } = result.value;
+        // The listing replaces the devices. A device whose record couldn't be read keeps what was
+        // known of it: a failed read is no proof that it is gone.
+        const { entries } = result.value;
         const devices = entries.flatMap((e) => (e.entry.case === "device" ? [e.entry.value] : []));
         const unreadable = entries.flatMap((e) => (e.entry.case === "unreadable" ? [e.entry.value] : []));
-        // The page covers up to its last entry with a known key; one without such an entry that
-        // doesn't end the listing covers nothing.
-        const last = entries.map(entryId).findLast((id) => id !== undefined);
-        const listed = new Set(devices.map((d) => d.id));
-        if (end || last !== undefined)
-          for (const id of [...this.devices.keys()])
-            if (inPage(id, after, end ? 0 : last!) && !listed.has(id) && !unreadable.includes(id)) this.#remove(id);
+        const listed = new Set([...devices.map((d) => d.id), ...unreadable]);
+        for (const id of [...this.devices.keys()]) if (!listed.has(id)) this.#remove(id);
         for (const d of devices) this.devices.set(d.id, convert.device(d));
         if (unreadable.length) this.#hooks.log(`devices ${unreadable.join(", ")} unreadable`);
         break;
@@ -350,17 +327,25 @@ export class AdapterSession {
         this.#putDevice(convert.device(result.value), false);
         break;
       case "settings": {
-        const { device, objects, end } = result.value;
-        if (!this.devices.has(device) || command.case !== "listSettings") break;
-        this.settings.set(device, mergeSettings(this.settings.get(device) ?? [], objects, command.value.after, end));
+        const { device, objects } = result.value;
+        if (!this.devices.has(device)) break;
+        this.settings.set(device, convert.settings(objects).sort(convert.compareSettings));
         break;
       }
       case "profile":
         this.#named(convert.profile(result.value));
         break;
-      case "profiles":
-        for (const e of result.value.entries) if (e.entry.case === "profile") this.#named(convert.profile(e.entry.value));
+      case "profiles": {
+        const { entries } = result.value;
+        const profiles = entries.flatMap((e) => (e.entry.case === "profile" ? [convert.profile(e.entry.value)] : []));
+        for (const p of profiles) this.#named(p);
+        const listing = (this.#profiles ??= { profiles: [], unreadable: [], loading: false, error: null });
+        listing.profiles = profiles.sort((a, b) => a.id - b.id);
+        listing.unreadable = entries.flatMap((e) => (e.entry.case === "unreadable" ? [e.entry.value] : [])).sort((a, b) => a - b);
+        listing.error = null;
+        this.#clampPages();
         break;
+      }
       case "profileCreated":
         if (command.case === "createProfile") this.#profileChanged({ id: result.value.profile, name: command.value.name, roles: [] });
         else if (command.case === "copyProfile")
@@ -475,35 +460,23 @@ export class AdapterSession {
     this.profileNames.set(p.id, p);
   }
 
-  /** Updates the shown pages for a created, copied or changed profile. */
+  /** Puts a created, copied or changed profile in the listing. */
   #profileChanged(p: Profile) {
     this.#named(p);
-    for (const view of ["list", "picker"] as const) {
-      const page = this.#pages[view];
-      if (!page) continue;
-      const i = page.profiles.findIndex((x) => x.id === p.id);
-      if (i !== -1) page.profiles = page.profiles.map((x, n) => (n === i ? p : x));
-      // A new profile in the shown page's range belongs on it, in ID order.
-      else if (inPage(p.id, page.cursors.at(-1) ?? 0, page.next)) page.profiles = [...page.profiles, p].sort((a, b) => a.id - b.id);
-    }
+    const listing = this.#profiles;
+    if (!listing) return;
+    listing.profiles = [...listing.profiles.filter((x) => x.id !== p.id), p].sort((a, b) => a.id - b.id);
+    listing.unreadable = listing.unreadable.filter((id) => id !== p.id);
   }
 
   #profileRemoved(id: number) {
     this.#unnamed.delete(id);
     this.profileNames.delete(id);
-    for (const view of ["list", "picker"] as const) {
-      const page = this.#pages[view];
-      if (!page || !page.profiles.some((p) => p.id === id)) continue;
-      page.profiles = page.profiles.filter((p) => p.id !== id);
-      // A page left empty is read again, which moves on to what follows or back to what precedes it.
-      if (!page.profiles.length && !page.unreadable.length) this.#refreshPage(view);
-    }
-  }
-
-  /** Reads a shown page again after a profile event, unless a read is already under way: an
-   * explicit Next or Previous in flight keeps its result. */
-  #refreshPage(view: PageView) {
-    if (!this.#pages[view]?.loading) void this.readPage("again", view);
+    const listing = this.#profiles;
+    if (!listing) return;
+    listing.profiles = listing.profiles.filter((p) => p.id !== id);
+    listing.unreadable = listing.unreadable.filter((x) => x !== id);
+    this.#clampPages();
   }
 
   #setStatus(status: Parameters<typeof convert.status>[0]) {

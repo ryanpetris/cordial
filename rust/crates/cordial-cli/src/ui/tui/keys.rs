@@ -565,12 +565,7 @@ impl<F: Fleet> Model<F> {
             }
             Action::PickPage(next) => {
                 if let Some(Dialog::Pick { adapter, .. }) = self.dialog.clone() {
-                    let step = if *next {
-                        super::Step::Forward
-                    } else {
-                        super::Step::Back
-                    };
-                    self.read_page(&adapter, true, step);
+                    self.step_page(&adapter, true, *next);
                 }
                 return;
             }

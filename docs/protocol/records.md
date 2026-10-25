@@ -96,10 +96,8 @@ adds none.
 | Supported Game Pad controls and absolute axes | Game Pad (`01:05`) | Gamepad |
 
 A `profile` event carries a profile's record when it is created or copied or its roles change, and
-`profile_removed` its ID when it is deleted. `ListProfileRules` lists the rules a page at a time in
-input usage page, input usage, collection usage page, then collection usage order. Its `after`
-cursor is a `ProfileRuleRef` with both the last rule's `input` and `collection`; omitting the cursor
-starts from the beginning.
+`profile_removed` its ID when it is deleted. `ListProfileRules` returns all rules in one response,
+ordered by input usage page, input usage, collection usage page, then collection usage.
 
 ## Devices
 
@@ -136,9 +134,9 @@ peripheral paired over both Classic and BLE has two records. Names are labels, n
   when profiles load or the device disconnects. An empty `errors` list clears all device problems.
 
 A `device` event carries the whole record whenever anything in it changes, including battery and
-other information; `device_removed` follows an unpair or a lost record. `ListDevices` returns saved
-devices a page at a time in ascending ID order; a device whose record cannot be read is listed by
-ID as an `unreadable` entry.
+other information; `device_removed` follows an unpair or a lost record. `ListDevices` returns every
+saved device in one response in ascending ID order. A device whose record cannot be read is listed
+by ID as an `unreadable` entry.
 
 `Device.output_preferences` holds saved output choices as `role` and `mode`. Only Gamepad is
 configurable, with Disabled, HID and XInput choices. A missing gamepad choice means Disabled.
@@ -282,7 +280,7 @@ readings on the rest. The integration state determines availability and freshnes
 `SettingsRef` identifies an entire domain by integration, group and optional `index`. Pointer
 Sensor requires a zero-based physical sensor index, stable across connections to the same device.
 At most two sensors are supported; other groups omit `index`. `ListSettings` sorts by integration,
-group, then index, and its next cursor is the identity of the last complete object received.
+group, then index, and returns every object in one response.
 
 Each `settings_changed.changed` object replaces the whole object with that identity. Omitted
 fields remove prior capabilities, a present wrapper without `value` clears the reading, and absent
@@ -290,11 +288,10 @@ fields remove prior capabilities, a present wrapper without `value` clears the r
 whole-object references. Objects not named in either list stay unchanged. Each identity appears
 at most once in an event and never in both lists.
 
-Settings pages and change events fit their enclosing `Message` in 1024 protobuf bytes before
-COBS encoding. They never split an object, whose maximum is 960 protobuf bytes including identity
-and saved metadata. Limits are complete and never truncated. A page returns at least one object
-unless `end` is true. Events may split between whole objects or references, and changes across
-separate events are not atomic.
+Settings responses and change events carry whole objects, including complete limits and saved
+metadata, without a transport-derived object or message size cap. Device constraints still apply,
+including at most six Pointer Sensor DPI choices. Events may split between whole objects or
+references, and changes across separate events are not atomic.
 
 `SettingsUpdate` chooses one domain and changes only its present fields, including nested delay
 fields. Each field must select either a typed value or the empty `SettingForget` marker; an empty

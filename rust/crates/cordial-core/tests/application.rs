@@ -186,12 +186,16 @@ impl Test {
         request
     }
     fn response(&mut self) -> p::Response {
-        for m in self.output() {
-            if let M::Response(r) = m {
-                return r;
+        for _ in 0..100_000 {
+            for m in self.output() {
+                if let M::Response(r) = m {
+                    return r;
+                }
             }
+            assert!(self.app.command_pending(), "no response");
+            block_on(self.app.proceed(&mut self.store, &mut self.radio, self.now));
         }
-        panic!("no response")
+        panic!("response did not finish")
     }
     fn request(&mut self, command: Command) -> p::Response {
         self.now += 1;
@@ -236,44 +240,19 @@ impl Test {
             other => panic!("{other:?}"),
         }
     }
-    /// Every setting of device `id`, read page by page.
     fn settings(&mut self, id: u32) -> Vec<p::SettingsObject> {
-        let mut settings: Vec<p::SettingsObject> = Vec::new();
-        loop {
-            let after = settings.last().map(cordial_core::wire::object_ref);
-            match self.ok(Command::ListSettings(p::ListSettings { device: id, after })) {
-                Some(R::Settings(page)) => {
-                    assert_eq!(page.device, id);
-                    assert!(page.end || !page.objects.is_empty());
-                    settings.extend(page.objects);
-                    if page.end {
-                        return settings;
-                    }
-                }
-                other => panic!("{other:?}"),
+        match self.ok(Command::ListSettings(p::ListSettings { device: id })) {
+            Some(R::Settings(list)) => {
+                assert_eq!(list.device, id);
+                list.objects
             }
+            other => panic!("{other:?}"),
         }
     }
-    /// Every saved device entry, read page by page.
     fn device_entries(&mut self) -> Vec<p::DeviceListEntry> {
-        use p::device_list_entry::Entry;
-        let mut entries: Vec<p::DeviceListEntry> = Vec::new();
-        loop {
-            let after = match entries.last().and_then(|e| e.entry.as_ref()) {
-                Some(Entry::Device(d)) => d.id,
-                Some(Entry::Unreadable(id)) => *id,
-                None => 0,
-            };
-            match self.ok(Command::ListDevices(p::ListDevices { after })) {
-                Some(R::Devices(page)) => {
-                    assert!(page.end || !page.entries.is_empty());
-                    entries.extend(page.entries);
-                    if page.end {
-                        return entries;
-                    }
-                }
-                other => panic!("{other:?}"),
-            }
+        match self.ok(Command::ListDevices(p::ListDevices {})) {
+            Some(R::Devices(list)) => list.entries,
+            other => panic!("{other:?}"),
         }
     }
     /// Applies `args`, which responds with no result, and reads the device back.
@@ -1127,10 +1106,7 @@ fn a_read_error_at_startup_deletes_nothing() {
     assert!(!t.status().ready);
     assert_eq!(t.store.records, saved);
     assert_eq!(
-        t.code(Command::ListSettings(p::ListSettings {
-            device: SAVED,
-            after: None
-        })),
+        t.code(Command::ListSettings(p::ListSettings { device: SAVED })),
         p::ErrorCode::NotReady
     );
 }
@@ -1365,15 +1341,9 @@ fn adapter_name_and_platform_are_partial_updates() {
 fn development_commands_exist_only_in_development_firmware() {
     let mut t = Test::new(false);
     for command in [
-        Command::ListFiles(p::ListFiles {
-            path: "/".into(),
-            after: String::new(),
-        }),
+        Command::ListFiles(p::ListFiles { path: "/".into() }),
         Command::ReadFile(p::ReadFile { path: "/a".into() }),
-        Command::ListFeatures(p::ListFeatures {
-            device: SAVED,
-            after: None,
-        }),
+        Command::ListFeatures(p::ListFeatures { device: SAVED }),
         Command::EnterBootloader(p::EnterBootloader {}),
     ] {
         assert_eq!(t.code(command), p::ErrorCode::UnknownCommand);
@@ -1391,26 +1361,10 @@ fn development_files_are_listed_and_read_whole() {
     for n in (0..20).rev() {
         t.store.files.insert(format!("/f{n:02}"), vec![n]);
     }
-    let mut entries: Vec<p::FileEntry> = Vec::new();
-    let mut pages = 0;
-    loop {
-        let after = entries.last().map(|e| e.name.clone()).unwrap_or_default();
-        match t.ok(Command::ListFiles(p::ListFiles {
-            path: "/".into(),
-            after,
-        })) {
-            Some(R::Files(f)) => {
-                pages += 1;
-                assert!(f.end || !f.entries.is_empty());
-                entries.extend(f.entries);
-                if f.end {
-                    break;
-                }
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-    assert!(pages > 1);
+    let Some(R::Files(list)) = t.ok(Command::ListFiles(p::ListFiles { path: "/".into() })) else {
+        panic!("missing files")
+    };
+    let entries = list.entries;
     assert_eq!(entries.len(), 21);
     assert!(entries.windows(2).all(|w| w[0].name < w[1].name));
     assert_eq!(
@@ -1904,6 +1858,14 @@ struct CountAllocations;
 thread_local! {
     static TRACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static ALLOCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HEAP: std::cell::Cell<(isize, isize)> = const { std::cell::Cell::new((0, 0)) };
+}
+fn heap_change(bytes: isize) {
+    let _ = HEAP.try_with(|heap| {
+        let (live, peak) = heap.get();
+        let live = live + bytes;
+        heap.set((live, peak.max(live)));
+    });
 }
 unsafe impl std::alloc::GlobalAlloc for CountAllocations {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
@@ -1913,9 +1875,14 @@ unsafe impl std::alloc::GlobalAlloc for CountAllocations {
         if TRACK.try_with(|v| v.get()).unwrap_or(false) {
             let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
         }
-        unsafe { std::alloc::System.alloc(layout) }
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        if !ptr.is_null() {
+            heap_change(layout.size() as isize);
+        }
+        ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        heap_change(-(layout.size() as isize));
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
@@ -1925,7 +1892,11 @@ unsafe impl std::alloc::GlobalAlloc for CountAllocations {
         if TRACK.try_with(|v| v.get()).unwrap_or(false) {
             let _ = ALLOCS.try_with(|n| n.set(n.get() + 1));
         }
-        unsafe { std::alloc::System.realloc(ptr, layout, size) }
+        let ptr = unsafe { std::alloc::System.realloc(ptr, layout, size) };
+        if !ptr.is_null() {
+            heap_change(size as isize - layout.size() as isize);
+        }
+        ptr
     }
 }
 #[global_allocator]
@@ -3213,7 +3184,7 @@ fn enabling_a_transport_fills_the_stack_with_its_devices() {
 }
 
 #[test]
-fn device_listings_are_paged_and_report_unreadable_and_lost_records() {
+fn device_listings_stream_and_report_unreadable_and_lost_records() {
     let mut t = Test::new(true);
     for n in 2..=11 {
         t.add_saved(n);
@@ -3225,7 +3196,7 @@ fn device_listings_are_paged_and_report_unreadable_and_lost_records() {
         cordial_core::storage::record_key(2, 82),
         UNDECODABLE.to_vec(),
     );
-    let page = |t: &mut Test, after| match t.ok(Command::ListDevices(p::ListDevices { after })) {
+    let list = |t: &mut Test| match t.ok(Command::ListDevices(p::ListDevices {})) {
         Some(R::Devices(list)) => list,
         r => panic!("{r:?}"),
     };
@@ -3239,7 +3210,7 @@ fn device_listings_are_paged_and_report_unreadable_and_lost_records() {
             })
             .collect()
     };
-    let first = page(&mut t, 0);
+    let first = list(&mut t);
     assert_eq!(
         ids(&first),
         [
@@ -3249,13 +3220,12 @@ fn device_listings_are_paged_and_report_unreadable_and_lost_records() {
             (80, false),
             (81, true),
             (83, true),
-            (84, true)
+            (84, true),
+            (85, true),
+            (86, true),
+            (87, true)
         ]
     );
-    assert!(!first.end);
-    let second = page(&mut t, 84);
-    assert_eq!(ids(&second), [(85, true), (86, true), (87, true)]);
-    assert!(second.end);
     // A failed read is never proof of loss; the undecodable record is deleted.
     assert!(
         t.store
@@ -3490,26 +3460,12 @@ fn remap_rule(collection: p::Usage, input: p::Usage, keys: &[u32]) -> cordial_co
     }
 }
 fn rules_of(t: &mut Test, profile: u32) -> Vec<p::ProfileRule> {
-    let mut rules: Vec<p::ProfileRule> = Vec::new();
-    loop {
-        let after = rules.last().map(|r| p::ProfileRuleRef {
-            input: r.input,
-            collection: r.collection,
-        });
-        match t.ok(Command::ListProfileRules(p::ListProfileRules {
-            profile,
-            after,
-        })) {
-            Some(R::ProfileRules(page)) => {
-                assert_eq!(page.profile, profile);
-                assert!(page.end || !page.rules.is_empty());
-                rules.extend(page.rules);
-                if page.end {
-                    return rules;
-                }
-            }
-            r => panic!("{r:?}"),
+    match t.ok(Command::ListProfileRules(p::ListProfileRules { profile })) {
+        Some(R::ProfileRules(list)) => {
+            assert_eq!(list.profile, profile);
+            list.rules
         }
+        r => panic!("{r:?}"),
     }
 }
 /// A profile whose rules remap each of `keys` to the key after it.
@@ -3642,7 +3598,7 @@ fn a_board_without_profile_support_refuses_profile_work() {
     assert!(status.profile_support.is_none());
     assert!(status.configuration_interfaces.is_empty());
     for command in [
-        Command::ListProfiles(p::ListProfiles { after: 0 }),
+        Command::ListProfiles(p::ListProfiles {}),
         Command::GetProfile(p::GetProfile { profile: 1 }),
         Command::CreateProfile(p::CreateProfile { name: "A".into() }),
         Command::CopyProfile(p::CopyProfile {
@@ -3650,10 +3606,7 @@ fn a_board_without_profile_support_refuses_profile_work() {
             name: "A".into(),
         }),
         Command::DeleteProfile(p::DeleteProfile { profile: 1 }),
-        Command::ListProfileRules(p::ListProfileRules {
-            profile: 1,
-            after: None,
-        }),
+        Command::ListProfileRules(p::ListProfileRules { profile: 1 }),
         Command::SetProfileRules(p::SetProfileRules {
             profile: 1,
             changes: vec![forget_rule(KEYBOARD_COLLECTION, key(4))],
@@ -3735,10 +3688,7 @@ fn profiles_are_created_copied_read_and_deleted() {
             name: "Missing".into(),
         }),
         Command::DeleteProfile(p::DeleteProfile { profile: 99 }),
-        Command::ListProfileRules(p::ListProfileRules {
-            profile: 99,
-            after: None,
-        }),
+        Command::ListProfileRules(p::ListProfileRules { profile: 99 }),
     ] {
         assert_eq!(t.code(command), p::ErrorCode::NotFound);
     }
@@ -3772,7 +3722,7 @@ fn creating_a_profile_that_does_not_fit_in_flash_is_refused() {
 }
 
 #[test]
-fn profile_listings_are_paged_and_report_unreadable_and_lost_records() {
+fn profile_listings_stream_and_report_unreadable_and_lost_records() {
     let mut t = Test::new(false);
     for i in 1..=20 {
         create(&mut t, &format!("Profile {i}"));
@@ -3783,7 +3733,7 @@ fn profile_listings_are_paged_and_report_unreadable_and_lost_records() {
         cordial_core::storage::record_key(8, 5),
         UNDECODABLE.to_vec(),
     );
-    let page = |t: &mut Test, after| match t.ok(Command::ListProfiles(p::ListProfiles { after })) {
+    let list = |t: &mut Test| match t.ok(Command::ListProfiles(p::ListProfiles {})) {
         Some(R::Profiles(list)) => list,
         r => panic!("{r:?}"),
     };
@@ -3797,17 +3747,10 @@ fn profile_listings_are_paged_and_report_unreadable_and_lost_records() {
             })
             .collect()
     };
-    let first = page(&mut t, 0);
+    let first = list(&mut t);
     let mut expected: Vec<(u32, bool)> = vec![(1, true), (2, true), (3, false)];
-    expected.extend((4..=16).filter(|id| *id != 5).map(|id| (id, true)));
+    expected.extend((4..=20).filter(|id| *id != 5).map(|id| (id, true)));
     assert_eq!(ids(&first), expected);
-    assert!(!first.end);
-    let second = page(&mut t, 16);
-    assert_eq!(
-        ids(&second),
-        [(17, true), (18, true), (19, true), (20, true)]
-    );
-    assert!(second.end);
     assert_eq!(
         t.code(Command::GetProfile(p::GetProfile { profile: 3 })),
         p::ErrorCode::StorageFailed
@@ -5364,15 +5307,9 @@ fn settings_events_carry_only_what_changed() {
             p::SettingsGroup::Wheel as i32
         ]
     );
-    match t.ok(Command::ListSettings(p::ListSettings {
-        device: SAVED,
-        after: Some(cordial_core::wire::settings_ref(
-            SettingKey::BacklightEnabled,
-        )),
-    })) {
+    match t.ok(Command::ListSettings(p::ListSettings { device: SAVED })) {
         Some(R::Settings(page)) => {
-            assert_eq!(page.objects, listed[1..]);
-            assert!(page.end);
+            assert_eq!(page.objects, listed);
         }
         other => panic!("{other:?}"),
     }
@@ -5423,7 +5360,7 @@ fn settings_events_carry_only_what_changed() {
 }
 
 #[test]
-fn settings_pages_and_events_preserve_whole_objects_and_order() {
+fn settings_lists_and_events_preserve_large_whole_objects_and_order() {
     use cordial_core::compact::Record;
     let mut t = Test::new(true);
     let link = connect_saved(&mut t, descriptor());
@@ -5445,33 +5382,20 @@ fn settings_pages_and_events_preserve_whole_objects_and_order() {
         .unwrap();
     let expected = cordial_core::wire::settings(&t.live(SAVED).catalog).unwrap();
     assert_eq!(expected.len(), 3);
-    let mut listed = Vec::new();
-    for index in 0..=expected.len() {
-        let after = listed.last().map(cordial_core::wire::object_ref);
-        let Some(R::Settings(page)) = t.ok(Command::ListSettings(p::ListSettings {
-            device: SAVED,
-            after,
-        })) else {
-            panic!("missing settings page")
-        };
-        assert_eq!(
-            page.objects,
-            expected[index..(index + 1).min(expected.len())]
-        );
-        assert_eq!(page.end, index + 1 >= expected.len());
-        let message = p::Message {
-            kind: Some(M::Response(p::Response {
-                result: Some(R::Settings(page.clone())),
-            })),
-        };
-        assert!(message.encoded_len() <= 1024);
-        listed.extend(page.objects);
-    }
+    let listed = t.settings(SAVED);
     assert_eq!(listed, expected);
+    assert!(
+        p::DeviceSettings {
+            device: SAVED,
+            objects: listed
+        }
+        .encoded_len()
+            > 1024
+    );
     let mut changed = Vec::new();
     for event in t.events() {
         if let Ev::SettingsChanged(settings) = event {
-            assert_eq!(settings.changed.len(), 1);
+            assert_eq!(settings.changed.len(), 3);
             assert!(settings.removed.is_empty());
             changed.extend(settings.changed.iter().cloned());
             let message = p::Message {
@@ -5479,7 +5403,7 @@ fn settings_pages_and_events_preserve_whole_objects_and_order() {
                     kind: Some(Ev::SettingsChanged(settings)),
                 })),
             };
-            assert!(message.encoded_len() <= 1024);
+            assert!(message.encoded_len() > 1024);
         }
     }
     assert_eq!(changed, expected);
@@ -5490,17 +5414,13 @@ fn settings_pages_and_events_preserve_whole_objects_and_order() {
         .catalog
         .replace_discovery(vec![Record::new(metadata, true)], vec![])
         .unwrap();
-    assert_eq!(
-        t.code(Command::ListSettings(p::ListSettings {
-            device: SAVED,
-            after: None,
-        })),
-        p::ErrorCode::TooLong
-    );
+    let objects = t.settings(SAVED);
+    assert_eq!(objects.len(), 1);
+    assert!(objects[0].encoded_len() > 960);
 }
 
 #[test]
-fn rule_listings_are_paged_in_input_order() {
+fn rule_listings_stream_in_input_order() {
     let mut t = Test::new(false);
     let id = profile_with(&mut t, "Many", (4..44).rev());
     let rules = rules_of(&mut t, id);
@@ -5513,24 +5433,7 @@ fn rule_listings_are_paged_in_input_order() {
         })
         .collect();
     assert!(inputs.windows(2).all(|w| w[0] < w[1]));
-    let page = |t: &mut Test, after| match t.ok(Command::ListProfileRules(p::ListProfileRules {
-        profile: id,
-        after,
-    })) {
-        Some(R::ProfileRules(page)) => page,
-        r => panic!("{r:?}"),
-    };
-    let first = page(&mut t, None);
-    assert!(!first.end && !first.rules.is_empty() && first.rules.len() < 40);
-    let last = page(
-        &mut t,
-        Some(p::ProfileRuleRef {
-            input: rules[38].input,
-            collection: rules[38].collection,
-        }),
-    );
-    assert_eq!(last.rules, rules[39..]);
-    assert!(last.end);
+    assert_eq!(rules_of(&mut t, id), rules);
 }
 
 #[test]
@@ -6097,7 +6000,7 @@ fn a_failed_deferred_save_is_reported_and_retried_with_a_backoff() {
             .any(|e| matches!(e, Ev::Adapter(s) if !s.ready))
     );
     assert!(matches!(
-        t.ok(Command::ListProfiles(p::ListProfiles { after: 0 })),
+        t.ok(Command::ListProfiles(p::ListProfiles {})),
         Some(R::Profiles(_))
     ));
     assert_eq!(set_first_key(&mut t, 6), 5);
@@ -6115,7 +6018,7 @@ fn a_failed_deferred_save_is_reported_and_retried_with_a_backoff() {
             .any(|e| matches!(e, Ev::Adapter(s) if !s.ready))
     );
     assert_eq!(
-        t.code(Command::ListProfiles(p::ListProfiles { after: 0 })),
+        t.code(Command::ListProfiles(p::ListProfiles {})),
         p::ErrorCode::NotReady
     );
     // The editor waits too.
@@ -6284,7 +6187,7 @@ fn bootloader_entry_saves_edits_first() {
 }
 
 #[test]
-fn rules_pages_read_only_as_far_as_the_page() {
+fn streamed_rules_read_the_complete_saved_table() {
     let mut t = Test::with_budget(false, Some(8192));
     let id = create(&mut t, "Many");
     let changes: Vec<_> = (4..=0xa4)
@@ -6300,18 +6203,17 @@ fn rules_pages_read_only_as_far_as_the_page() {
     t.store.part_bytes = 0;
     let first = match t.ok(Command::ListProfileRules(p::ListProfileRules {
         profile: id,
-        after: None,
     })) {
         Some(R::ProfileRules(page)) => page,
         r => panic!("{r:?}"),
     };
-    assert!(!first.end);
+    assert_eq!(first.rules.len(), count);
     assert!(
-        t.store.part_bytes < file / 2,
+        t.store.part_bytes >= file,
         "{} of {file} bytes",
         t.store.part_bytes
     );
-    // Every page together is the whole saved table.
+    // The merged response is the whole saved table.
     let listed = rules_of(&mut t, id);
     assert_eq!(listed.len(), count);
     let decoded: Vec<_> = block_on(cordial_core::profiles::rules(&mut t.store, id.into()))
@@ -7815,17 +7717,6 @@ fn rule_commands_require_collections_and_keep_same_usage_rules_separate() {
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].collection, Some(MOUSE_COLLECTION));
     assert_eq!(listed[1].collection, Some(gamepad));
-    let after = p::ProfileRuleRef {
-        input: Some(button),
-        collection: Some(MOUSE_COLLECTION),
-    };
-    let Some(R::ProfileRules(page)) = t.ok(Command::ListProfileRules(p::ListProfileRules {
-        profile: id,
-        after: Some(after),
-    })) else {
-        panic!("missing rules page");
-    };
-    assert_eq!(page.rules, listed[1..]);
     for collection in [None, Some(usage(0, 0))] {
         let change = p::ProfileRuleChange {
             change: Some(p::profile_rule_change::Change::Rule(p::ProfileRule {
@@ -7847,13 +7738,6 @@ fn rule_commands_require_collections_and_keep_same_usage_rules_separate() {
             input: Some(button),
             collection,
         };
-        assert_eq!(
-            t.code(Command::ListProfileRules(p::ListProfileRules {
-                profile: id,
-                after: Some(reference)
-            })),
-            p::ErrorCode::BadArgs
-        );
         assert_eq!(
             t.code(Command::SetProfileRules(p::SetProfileRules {
                 profile: id,
@@ -8019,4 +7903,728 @@ fn required_and_reserved_usb_errors_are_independent_and_resources_keep_unknown_p
             .errors
             .contains(&(p::ErrorCode::UsbReservedCapacityExceeded as i32))
     );
+}
+
+#[test]
+fn empty_lists_select_their_response_variants() {
+    let mut t = Test::new(false);
+    assert_eq!(
+        t.ok(Command::ListDevices(p::ListDevices {})),
+        Some(R::Devices(p::DeviceList::default()))
+    );
+    assert_eq!(
+        t.ok(Command::ListProfiles(p::ListProfiles {})),
+        Some(R::Profiles(p::ProfileList::default()))
+    );
+    let id = create(&mut t, "Empty");
+    assert_eq!(
+        t.ok(Command::ListProfileRules(p::ListProfileRules {
+            profile: id
+        })),
+        Some(R::ProfileRules(p::ProfileRules {
+            profile: id,
+            rules: vec![]
+        }))
+    );
+    let mut t = Test::new(true);
+    assert!(t.settings(SAVED).is_empty());
+    #[cfg(feature = "development")]
+    {
+        let (_, store, radio) = setup();
+        let mut t = Test::with(store, radio, build(true, None));
+        assert_eq!(
+            t.ok(Command::ListFeatures(p::ListFeatures { device: SAVED })),
+            Some(R::Features(p::FeatureList::default()))
+        );
+        assert_eq!(
+            t.ok(Command::ListFiles(p::ListFiles { path: "/".into() })),
+            Some(R::Files(p::FileList::default()))
+        );
+    }
+}
+
+#[test]
+fn large_device_and_profile_lists_are_single_responses() {
+    let mut t = Test::new(true);
+    for n in 2..=40 {
+        t.add_saved(n);
+    }
+    let entries = t.device_entries();
+    assert_eq!(entries.len(), 40);
+    assert!(p::DeviceList { entries }.encoded_len() > 1024);
+    for n in 0..80 {
+        create(&mut t, &format!("Profile number {n}"));
+    }
+    let Some(R::Profiles(list)) = t.ok(Command::ListProfiles(p::ListProfiles {})) else {
+        panic!()
+    };
+    assert_eq!(list.entries.len(), 80);
+    assert!(list.encoded_len() > 1024);
+}
+
+#[cfg(feature = "development")]
+#[test]
+fn large_features_and_files_are_single_ordered_responses() {
+    use cordial_core::{compact::FeatureEntry, model::hidpp::FeatureFlags};
+    let (_, store, radio) = setup();
+    let mut t = Test::with(store, radio, build(true, None));
+    let link = connect_saved(&mut t, descriptor());
+    press(&mut t, link, &[4]);
+    t.events();
+    let features = (0..100)
+        .map(|index| {
+            FeatureEntry {
+                id: FeatureId(0x1000 + index),
+                version: FeatureRevision(1),
+                flags: FeatureFlags(0),
+            }
+            .wire(index as usize)
+        })
+        .collect();
+    t.live(SAVED)
+        .catalog
+        .replace_discovery(vec![], features)
+        .unwrap();
+    let Some(R::Features(list)) = t.ok(Command::ListFeatures(p::ListFeatures { device: SAVED }))
+    else {
+        panic!()
+    };
+    assert_eq!(list.features.len(), 100);
+    assert!(list.encoded_len() > 1024);
+    for (index, feature) in list.features.iter().enumerate() {
+        let Some(p::feature::Detail::Hidpp(detail)) = &feature.detail else {
+            panic!()
+        };
+        assert_eq!(detail.index, index as u32);
+        assert_eq!(detail.id, 0x1000 + index as u32);
+    }
+    for n in 0..80 {
+        t.store
+            .files
+            .insert(format!("/record-number-{n:03}"), vec![1]);
+    }
+    let Some(R::Files(list)) = t.ok(Command::ListFiles(p::ListFiles { path: "/".into() })) else {
+        panic!()
+    };
+    assert_eq!(list.entries.len(), 80);
+    assert!(list.encoded_len() > 1024);
+    assert!(list.entries.windows(2).all(|w| w[0].name < w[1].name));
+}
+
+#[test]
+fn blocked_stream_stops_reading_and_a_late_error_replaces_partial_rules() {
+    let mut t = Test::with_budget(false, Some(8192));
+    let id = profile_with(&mut t, "Many", 4..100);
+    t.events();
+    block_on(t.app.begin(
+        p::Request {
+            command: Some(Command::ListProfileRules(p::ListProfileRules {
+                profile: id,
+            })),
+        },
+        &mut t.store,
+        &mut t.radio,
+        t.now,
+    ));
+    block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+    assert!(t.app.command_pending());
+    assert!(!t.app.serial.stream_ready());
+    let reads = t.store.loads;
+    let queued = t.app.serial.queued();
+    ALLOCS.set(0);
+    TRACK.set(true);
+    for _ in 0..10_000 {
+        block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+    }
+    TRACK.set(false);
+    assert_eq!(ALLOCS.get(), 0);
+    assert_eq!(t.store.loads, reads);
+    assert_eq!(t.app.serial.queued(), queued);
+    assert!(t.output().is_empty(), "no delimiter before completion");
+    t.store.fail_load = Some(record_key(9, id));
+    let Some(R::Error(error)) = t.response().result else {
+        panic!("partial list succeeded")
+    };
+    assert_eq!(error.code, p::ErrorCode::StorageFailed as i32);
+    assert!(!t.app.command_pending());
+    t.store.fail_load = None;
+    assert_eq!(rules_of(&mut t, id).len(), 96);
+}
+
+#[test]
+fn profile_stream_reads_current_records() {
+    let mut t = Test::new(false);
+    let ids: Vec<_> = (0..40)
+        .map(|n| create(&mut t, &format!("Profile {n}")))
+        .collect();
+    t.events();
+    block_on(t.app.begin(
+        p::Request {
+            command: Some(Command::ListProfiles(p::ListProfiles {})),
+        },
+        &mut t.store,
+        &mut t.radio,
+        t.now,
+    ));
+    for _ in 0..100 {
+        block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+        if !t.app.serial.stream_ready() {
+            break;
+        }
+    }
+    let last = *ids.last().unwrap();
+    let mut metadata =
+        block_on(cordial_core::profiles::metadata(&mut t.store, last.into())).unwrap();
+    metadata.name = "Changed during listing".into();
+    block_on(cordial_core::profiles::save_metadata(
+        &mut t.store,
+        last.into(),
+        &metadata,
+    ))
+    .unwrap();
+    let Some(R::Profiles(list)) = t.response().result else {
+        panic!()
+    };
+    let Some(p::profile_list_entry::Entry::Profile(profile)) = &list.entries.last().unwrap().entry
+    else {
+        panic!()
+    };
+    assert_eq!(profile.name, metadata.name);
+    assert_eq!(list.entries.len(), 40);
+}
+
+#[test]
+fn settings_changes_during_streaming_follow_the_complete_response() {
+    use cordial_core::compact::Record;
+    let mut t = Test::new(true);
+    let link = connect_saved(&mut t, descriptor());
+    press(&mut t, link, &[4]);
+    t.events();
+    let records = [SettingKey::FnRowDefault, SettingKey::BacklightMode].map(|key| {
+        let mut metadata = preference(key, FeatureId::BACKLIGHT, 1).metadata;
+        metadata.choices = vec![1; 600].into_boxed_slice();
+        Record::new(metadata, true)
+    });
+    t.live(SAVED)
+        .catalog
+        .replace_discovery(records.clone().into(), vec![])
+        .unwrap();
+    t.events();
+    block_on(t.app.begin(
+        p::Request {
+            command: Some(Command::ListSettings(p::ListSettings { device: SAVED })),
+        },
+        &mut t.store,
+        &mut t.radio,
+        t.now,
+    ));
+    block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+    assert!(!t.app.serial.stream_ready());
+    assert!(t.output().is_empty());
+    let mut changed = records;
+    changed[0].metadata.choices = vec![2; 600].into_boxed_slice();
+    t.live(SAVED)
+        .catalog
+        .replace_discovery(changed.into(), vec![])
+        .unwrap();
+    t.poll();
+    assert!(!t.app.serial.idle());
+    assert!(
+        t.output().is_empty(),
+        "events wait for the response delimiter"
+    );
+    let Some(R::Settings(list)) = t.response().result else {
+        panic!()
+    };
+    assert_eq!(list.objects.len(), 2);
+    let current = cordial_core::wire::settings(&t.live(SAVED).catalog).unwrap();
+    assert_ne!(list.objects[0], current[0]);
+    let events = t.events();
+    let event = events
+        .iter()
+        .find_map(|e| match e {
+            Ev::SettingsChanged(s) => Some(s),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(event.changed, current);
+}
+
+/// Synthetic flash keeps its allocation fixed throughout listing and cleanup. It has no read or
+/// write log, and enumeration allocates only the requested batch, as the firmware stores do.
+struct DamagedStore {
+    devices: Vec<bool>,
+    profiles: Vec<bool>,
+    fail_load: Option<(u8, u64)>,
+    fail_remove: bool,
+}
+impl DamagedStore {
+    fn records(&self, kind: u8) -> &[bool] {
+        match kind {
+            2 => &self.devices,
+            8 => &self.profiles,
+            _ => &[],
+        }
+    }
+}
+impl cordial_core::storage::RecordStore for DamagedStore {
+    async fn keys(
+        &mut self,
+    ) -> Result<Vec<cordial_core::storage::RecordKey>, cordial_core::storage::Error> {
+        panic!("cleanup must use bounded enumeration")
+    }
+    async fn record_ids(
+        &mut self,
+        kind: u8,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<u64>, cordial_core::storage::Error> {
+        Ok(self
+            .records(kind)
+            .iter()
+            .enumerate()
+            .skip(after as usize)
+            .filter(|(_, present)| **present)
+            .take(limit)
+            .map(|(index, _)| index as u64 + 1)
+            .collect())
+    }
+    async fn available(&mut self) -> Result<usize, cordial_core::storage::Error> {
+        Ok(65536)
+    }
+    async fn load(
+        &mut self,
+        key: cordial_core::storage::RecordKey,
+        value: &mut [u8],
+    ) -> Result<Option<usize>, cordial_core::storage::Error> {
+        let id = u64::from_be_bytes(key[1..].try_into().unwrap()) as usize;
+        if self.fail_load == Some((key[0], id as u64)) {
+            return Err(cordial_core::storage::Error::Io);
+        }
+        if id != 0 && self.records(key[0]).get(id - 1) == Some(&true) {
+            value[0] = 0xff;
+            Ok(Some(1))
+        } else {
+            Ok(None)
+        }
+    }
+    async fn save(
+        &mut self,
+        _: cordial_core::storage::RecordKey,
+        _: &[u8],
+    ) -> Result<(), cordial_core::storage::Error> {
+        panic!("corrupt metadata is removed")
+    }
+    async fn remove(
+        &mut self,
+        key: cordial_core::storage::RecordKey,
+    ) -> Result<(), cordial_core::storage::Error> {
+        if self.fail_remove {
+            return Err(cordial_core::storage::Error::Io);
+        }
+        let id = u64::from_be_bytes(key[1..].try_into().unwrap()) as usize;
+        let records = match key[0] {
+            2 => &mut self.devices,
+            8 => &mut self.profiles,
+            _ => return Ok(()),
+        };
+        if let Some(present) = id.checked_sub(1).and_then(|index| records.get_mut(index)) {
+            *present = false;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn corrupt_listings_and_removal_events_have_constant_heap_high_water() {
+    fn measure(count: usize, close: bool, fail_remove: bool) -> isize {
+        let mut t = Test::new(false);
+        t.events();
+        let mut store = DamagedStore {
+            devices: vec![true; count],
+            profiles: vec![true; count],
+            fail_load: None,
+            fail_remove: false,
+        };
+        let mut removed_devices = vec![false; count];
+        let mut removed_profiles = vec![false; count];
+        let baseline = HEAP.with(|heap| {
+            let live = heap.get().0;
+            heap.set((live, live));
+            live
+        });
+        for command in [
+            Command::ListDevices(p::ListDevices {}),
+            Command::ListProfiles(p::ListProfiles {}),
+        ] {
+            block_on(t.app.begin(
+                p::Request {
+                    command: Some(command),
+                },
+                &mut store,
+                &mut t.radio,
+                t.now,
+            ));
+            for _ in 0..count * 4 + 100 {
+                if !t.app.command_pending() {
+                    break;
+                }
+                block_on(t.app.proceed(&mut store, &mut t.radio, t.now));
+                assert!(t.app.manager.lost_profiles.len() <= 1);
+                assert!(t.app.manager.lost_devices.len() <= 1);
+            }
+            assert!(
+                !t.app.command_pending(),
+                "all corrupt entries must still finish the list"
+            );
+            let output = t.output();
+            assert_eq!(output.len(), 1);
+            for message in output {
+                match message {
+                    M::Response(p::Response {
+                        result: Some(R::Devices(list)),
+                    }) => assert!(list.entries.is_empty()),
+                    M::Response(p::Response {
+                        result: Some(R::Profiles(list)),
+                    }) => assert!(list.entries.is_empty()),
+                    other => panic!("unexpected output {other:?}"),
+                }
+            }
+        }
+        if close {
+            t.app.session(false, &mut t.radio);
+        }
+        store.fail_remove = fail_remove;
+        // The response is finished, but cleanup must also remain bounded when events stop draining.
+        for _ in 0..10_000 {
+            block_on(t.app.work(&mut store, &mut t.radio, t.now));
+        }
+        store.fail_remove = false;
+        t.now += FIRST_RETRY;
+        let mut events = 0;
+        for _ in 0..count * 40 + 1000 {
+            block_on(t.app.work(&mut store, &mut t.radio, t.now));
+            assert!(t.app.manager.lost_profiles.len() <= 1);
+            assert!(t.app.manager.lost_devices.len() <= 1);
+            for message in t.output() {
+                let (id, removed) = match message {
+                    M::Event(p::Event {
+                        kind: Some(Ev::DeviceRemoved(e)),
+                    }) => (e.id, &mut removed_devices),
+                    M::Event(p::Event {
+                        kind: Some(Ev::ProfileRemoved(e)),
+                    }) => (e.id, &mut removed_profiles),
+                    M::Event(p::Event {
+                        kind: Some(Ev::Adapter(_)),
+                    }) => continue,
+                    other => panic!("unexpected output {other:?}"),
+                };
+                assert!(
+                    !std::mem::replace(&mut removed[id as usize - 1], true),
+                    "duplicate removal"
+                );
+                events += 1;
+            }
+            if (close || events == count * 2)
+                && store
+                    .devices
+                    .iter()
+                    .chain(&store.profiles)
+                    .all(|present| !present)
+            {
+                break;
+            }
+        }
+        assert!(
+            store
+                .devices
+                .iter()
+                .chain(&store.profiles)
+                .all(|present| !present)
+        );
+        assert_eq!(events, if close { 0 } else { count * 2 });
+        HEAP.with(|heap| heap.get().1 - baseline)
+    }
+    for (close, fail_remove) in [(false, false), (false, true), (true, false), (true, true)] {
+        let small = measure(32, close, fail_remove);
+        let large = measure(2048, close, fail_remove);
+        eprintln!(
+            "corrupt devices + profiles, closed={close}, removal failure={fail_remove}: 32 each peak {small} bytes; 2048 each peak {large} bytes"
+        );
+        assert!(
+            large <= small + 256,
+            "heap grew with the number of corrupt records"
+        );
+    }
+}
+
+#[test]
+fn deferred_corrupt_record_rescan_retries_unreadable_records() {
+    for kind in [2, 8] {
+        let mut t = Test::new(false);
+        t.events();
+        let mut store = DamagedStore {
+            devices: vec![true; 4],
+            profiles: vec![true; 4],
+            fail_load: None,
+            fail_remove: false,
+        };
+        for command in [
+            Command::ListDevices(p::ListDevices {}),
+            Command::ListProfiles(p::ListProfiles {}),
+        ] {
+            block_on(t.app.begin(
+                p::Request {
+                    command: Some(command),
+                },
+                &mut store,
+                &mut t.radio,
+                t.now,
+            ));
+            while t.app.command_pending() {
+                block_on(t.app.proceed(&mut store, &mut t.radio, t.now));
+            }
+            assert_eq!(t.output().len(), 1);
+        }
+        store.fail_load = Some((kind, 2));
+        let mut removed = Vec::new();
+        for _ in 0..500 {
+            t.now += FIRST_RETRY;
+            block_on(t.app.work(&mut store, &mut t.radio, t.now));
+            removed.extend(t.output());
+        }
+        assert_eq!(store.records(kind), [false, true, false, false]);
+        assert!(!removed.iter().any(|message| match message {
+            M::Event(p::Event {
+                kind: Some(Ev::DeviceRemoved(e)),
+            }) => kind == 2 && e.id == 2,
+            M::Event(p::Event {
+                kind: Some(Ev::ProfileRemoved(e)),
+            }) => kind == 8 && e.id == 2,
+            _ => false,
+        }));
+        store.fail_load = None;
+        for _ in 0..500 {
+            t.now += FIRST_RETRY;
+            block_on(t.app.work(&mut store, &mut t.radio, t.now));
+            removed.extend(t.output());
+        }
+        assert_eq!(store.devices, [false; 4]);
+        assert_eq!(store.profiles, [false; 4]);
+        assert_eq!(
+            removed
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    M::Event(p::Event {
+                        kind: Some(Ev::DeviceRemoved(_) | Ev::ProfileRemoved(_))
+                    })
+                ))
+                .count(),
+            8
+        );
+    }
+}
+
+#[test]
+fn stalled_listing_allows_pairing_to_save_the_bond_and_reports_it_afterward() {
+    let mut t = Test::new(false);
+    for _ in 0..40 {
+        create(&mut t, "Profile");
+    }
+    let candidate = t.candidate(peer(2), peer(2));
+    t.pair(candidate);
+    t.events();
+    let link = t.radio.connects[0].0;
+    block_on(t.app.begin(
+        p::Request {
+            command: Some(Command::ListProfiles(p::ListProfiles {})),
+        },
+        &mut t.store,
+        &mut t.radio,
+        t.now,
+    ));
+    for _ in 0..100 {
+        block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+        if !t.app.serial.stream_ready() {
+            break;
+        }
+    }
+    assert!(t.app.streaming() && !t.app.serial.stream_ready());
+    t.radio.bonds.push(peer(2));
+    t.event(Event::Bonded {
+        link,
+        identity: peer(2),
+    });
+    for _ in 0..100 {
+        block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+    }
+    assert!(t.app.streaming() && !t.app.serial.stream_ready());
+    let device = t
+        .app
+        .manager
+        .devices
+        .iter()
+        .flatten()
+        .find(|d| d.peer == peer(2))
+        .unwrap()
+        .id as u32;
+    assert_eq!(t.saved(device).peer, peer(2));
+    assert!(
+        t.output().is_empty(),
+        "pairing events wait for the response delimiter"
+    );
+    assert!(matches!(t.response().result, Some(R::Profiles(list)) if list.entries.len() == 40));
+    assert_eq!(
+        pairing_steps(&t.events()),
+        [p::pairing::Step::Done(p::PairingDone { device })]
+    );
+}
+
+#[test]
+fn paused_profile_cleanup_allows_pairing_bond_sync_and_resident_fill() {
+    for streaming in [false, true] {
+        for pairing in [true, false] {
+            let mut t = Test::new(false);
+            let lost = create(&mut t, "Lost");
+            for _ in 0..40 {
+                create(&mut t, "Kept");
+            }
+            let first = t.add_saved(1);
+            let second = t.add_saved(2);
+            set_layers(&mut t, first, &[lost]);
+            set_layers(&mut t, second, &[lost]);
+            let candidate = t.candidate(peer(3), peer(3));
+            t.events();
+            lose_profile(&mut t, lost);
+            for _ in 0..100 {
+                block_on(t.app.work(&mut t.store, &mut t.radio, t.now));
+                if t.saved(first).profiles.is_empty() {
+                    break;
+                }
+                t.output();
+            }
+            assert!(t.saved(first).profiles.is_empty());
+            assert_eq!(t.saved(second).profiles, [u64::from(lost)]);
+            assert!(t.store.records.contains_key(&record_key(8, lost)));
+
+            if pairing {
+                t.pair(candidate);
+            } else {
+                let mut policy = Policy::paired(99, peer(9), b"Keyboard");
+                policy.setup_pending = false;
+                block_on(cordial_core::bonds::commit(
+                    &mut t.store,
+                    &policy,
+                    &bond(99, peer(9)),
+                ))
+                .unwrap();
+                t.app.manager.vacated = true;
+            }
+            if streaming {
+                block_on(t.app.begin(
+                    p::Request {
+                        command: Some(Command::ListProfiles(p::ListProfiles {})),
+                    },
+                    &mut t.store,
+                    &mut t.radio,
+                    t.now,
+                ));
+            }
+            for _ in 0..200 {
+                t.now += 1;
+                if streaming {
+                    block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+                } else {
+                    block_on(t.app.work(&mut t.store, &mut t.radio, t.now));
+                }
+            }
+            assert!(t.app.serial.queued() > 0);
+            assert_eq!(
+                t.saved(second).profiles,
+                [u64::from(lost)],
+                "cleanup waits for output"
+            );
+            if pairing {
+                let link = t
+                    .radio
+                    .connects
+                    .iter()
+                    .find(|(_, pairing)| *pairing)
+                    .expect("pairing opens its link while cleanup waits")
+                    .0;
+                t.radio.bonds.push(peer(3));
+                t.event(Event::Bonded {
+                    link,
+                    identity: peer(3),
+                });
+                for _ in 0..100 {
+                    block_on(t.app.work(&mut t.store, &mut t.radio, t.now));
+                }
+                let device = t
+                    .app
+                    .manager
+                    .devices
+                    .iter()
+                    .flatten()
+                    .find(|device| device.peer == peer(3))
+                    .expect("pairing saves the device")
+                    .id as u32;
+                assert_eq!(t.saved(device).peer, peer(3));
+            } else {
+                assert!(
+                    t.app.manager.find(99).is_some(),
+                    "fill admits a saved device while cleanup waits"
+                );
+                assert!(t.radio.bonds.contains(&peer(9)), "fill imports its bond");
+                assert!(!t.app.manager.bonds_pending);
+            }
+            assert!(t.store.records.contains_key(&record_key(8, lost)));
+            if streaming {
+                assert!(t.app.streaming() && !t.app.serial.stream_ready());
+                assert!(
+                    matches!(t.response().result, Some(R::Profiles(list)) if list.entries.len() == 40)
+                );
+            }
+            let mut events: Vec<_> = t
+                .output()
+                .into_iter()
+                .filter_map(|message| match message {
+                    M::Event(event) => event.kind,
+                    _ => panic!("only events follow the response"),
+                })
+                .collect();
+            t.store.reads.clear();
+            events.extend(t.events());
+            assert!(
+                !t.store.reads.contains(&record_key(8, lost)),
+                "cleanup resumes its device cursor without restarting metadata cleanup"
+            );
+            assert!(
+                t.store
+                    .reads
+                    .iter()
+                    .filter(|key| **key == record_key(2, first))
+                    .count()
+                    <= 1,
+                "only a pending device event may reread the already cleaned device"
+            );
+            assert!(t.saved(first).profiles.is_empty());
+            assert!(t.saved(second).profiles.is_empty());
+            assert!(!t.store.records.contains_key(&record_key(8, lost)));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, Ev::ProfileRemoved(p) if p.id == lost))
+                    .count(),
+                1
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Ev::Device(d) if d.id == second && d.profiles.as_ref().is_some_and(|p| p.profiles.is_empty())))
+            );
+            assert!(t.app.manager.lost_profiles.is_empty());
+        }
+    }
 }

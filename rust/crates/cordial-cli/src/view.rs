@@ -1,11 +1,11 @@
 //! The session's view of the Dongle, built from responses and events in the order the Dongle
 //! sent them. A device, profile or status record arrives whole and replaces what the view held. A
-//! listing page replaces what the view held in the range it covers, and change events replace or
+//! listing is complete and replaces what the view held of its kind, and change events replace or
 //! remove the settings objects the view holds. An accepted Set request carries no result: the
 //! Dongle now holds what was sent in the form the command saves it, so the view takes the sent
 //! values in that form.
 use crate::settings::{self, Setting};
-use cordial_client::paging::{self, Page};
+use cordial_client::order;
 use cordial_protocol::{
     self as p, device_list_entry, event, profile_list_entry, request::Command, response,
 };
@@ -49,8 +49,8 @@ pub struct State {
     pub pairing: Option<p::Pairing>,
     /// Each device's settings objects in listing order, once listed.
     pub settings: BTreeMap<u32, Vec<p::SettingsObject>>,
-    /// Profiles by ID, from listed pages, results and events. It holds only the profiles this
-    /// session has seen, never necessarily all of them.
+    /// Profiles by ID, from listings, results and events. Before a listing it holds only the
+    /// profiles this session has seen.
     pub profiles: BTreeMap<u32, p::Profile>,
     pub pending: Vec<Pending>,
     /// The connection is open.
@@ -59,19 +59,6 @@ pub struct State {
     pub loaded: bool,
     /// Candidates hidden locally until the next scan.
     pub hidden: BTreeSet<u32>,
-}
-
-/// The cursor an ID listing was read after, with 0 for the start.
-fn id_after(after: u32) -> Option<u32> {
-    (after != 0).then_some(after)
-}
-
-/// Replaces the entries of `list` in the range `page` covers with the page's entries, keeping the
-/// list in the listing's order.
-fn merge_page<P: Page>(list: &mut Vec<P::Entry>, after: Option<&P::Key>, page: &P) {
-    list.retain(|e| !page.covers(after, &P::key(e)));
-    list.extend(page.entries().iter().cloned());
-    list.sort_by(|a, b| P::order(&P::key(a), &P::key(b)));
 }
 
 impl State {
@@ -119,16 +106,15 @@ impl State {
         self.settings.remove(&id);
     }
 
-    /// Replaces the devices in a page's range with the page's devices.
-    fn device_page(&mut self, after: u32, list: &p::DeviceList) {
-        let after = id_after(after);
-        let listed: Vec<u32> = list.entries.iter().map(paging::device_entry_id).collect();
+    /// Replaces the devices with the listed ones.
+    fn devices_listed(&mut self, list: &p::DeviceList) {
+        let listed: Vec<u32> = list.entries.iter().map(order::device_entry_id).collect();
         let gone: Vec<u32> = self
             .devices
             .iter()
             .map(|d| d.id)
             .chain(self.unreadable.iter().copied())
-            .filter(|id| list.covers(after.as_ref(), id) && !listed.contains(id))
+            .filter(|id| !listed.contains(id))
             .collect();
         for id in gone {
             self.remove_device(id);
@@ -145,11 +131,9 @@ impl State {
         }
     }
 
-    /// Replaces the known profiles in a page's range with the page's profiles.
-    fn profile_page(&mut self, after: u32, list: &p::ProfileList) {
-        let after = id_after(after);
-        self.profiles
-            .retain(|id, _| !list.covers(after.as_ref(), id));
+    /// Replaces the known profiles with the listed ones.
+    fn profiles_listed(&mut self, list: &p::ProfileList) {
+        self.profiles.clear();
         for entry in &list.entries {
             if let Some(profile_list_entry::Entry::Profile(profile)) = &entry.entry {
                 self.profiles.insert(profile.id, profile.clone());
@@ -164,16 +148,16 @@ impl State {
             return;
         };
         list.retain(|o| {
-            let key = paging::settings_ref(o);
+            let key = order::settings_ref(o);
             !changed.removed.contains(&key)
                 && !changed
                     .changed
                     .iter()
-                    .any(|c| paging::settings_ref(c) == key)
+                    .any(|c| order::settings_ref(c) == key)
         });
         list.extend(changed.changed.iter().cloned());
         list.sort_by(|a, b| {
-            paging::settings_order(&paging::settings_ref(a), &paging::settings_ref(b))
+            order::settings_order(&order::settings_ref(a), &order::settings_ref(b))
         });
     }
 
@@ -334,18 +318,11 @@ impl State {
         match (&request.command, &response.result) {
             (_, Some(response::Result::Status(status))) => self.status = status.clone(),
             (_, Some(response::Result::Device(device))) => self.put_device(device.clone()),
-            (Some(Command::ListDevices(l)), Some(response::Result::Devices(list))) => {
-                self.device_page(l.after, list)
+            (_, Some(response::Result::Devices(list))) => self.devices_listed(list),
+            (_, Some(response::Result::Settings(s))) if self.device(s.device).is_some() => {
+                self.settings.insert(s.device, s.objects.clone());
             }
-            (Some(Command::ListSettings(l)), Some(response::Result::Settings(s)))
-                if self.device(s.device).is_some() =>
-            {
-                let list = self.settings.entry(s.device).or_default();
-                merge_page(list, l.after.as_ref(), s);
-            }
-            (Some(Command::ListProfiles(l)), Some(response::Result::Profiles(list))) => {
-                self.profile_page(l.after, list)
-            }
+            (_, Some(response::Result::Profiles(list))) => self.profiles_listed(list),
             (_, Some(response::Result::Profile(profile))) => {
                 self.profiles.insert(profile.id, profile.clone());
             }
@@ -447,47 +424,41 @@ mod tests {
     }
 
     #[test]
-    fn device_pages_replace_only_their_range() {
+    fn a_device_listing_replaces_the_devices() {
         let mut st = State::default();
         for id in [1, 3, 5, 8] {
             st.event(&event::Kind::Device(device(id)));
         }
         st.settings.insert(3, Vec::new());
-        // The first page covers IDs up to 4: 3 is gone and 2 can't be read.
+        // 3 and 5 are gone and 2 can't be read.
         let entry = |entry| p::DeviceListEntry { entry: Some(entry) };
         let (request, response) = answered(
-            Command::ListDevices(p::ListDevices { after: 0 }),
+            Command::ListDevices(p::ListDevices {}),
             response::Result::Devices(p::DeviceList {
                 entries: vec![
                     entry(device_list_entry::Entry::Device(device(1))),
                     entry(device_list_entry::Entry::Unreadable(2)),
                     entry(device_list_entry::Entry::Device(device(4))),
+                    entry(device_list_entry::Entry::Device(device(8))),
                 ],
-                end: false,
             }),
         );
         st.response(&request, &response);
         let ids = |st: &State| st.devices.iter().map(|d| d.id).collect::<Vec<_>>();
-        assert_eq!(ids(&st), [1, 4, 5, 8]);
+        assert_eq!(ids(&st), [1, 4, 8]);
         assert!(!st.settings.contains_key(&3));
         assert_eq!(st.unreadable, BTreeSet::from([2]));
-        // The last page covers everything after its cursor.
-        let (request, response) = answered(
-            Command::ListDevices(p::ListDevices { after: 4 }),
-            response::Result::Devices(p::DeviceList {
-                entries: vec![
-                    entry(device_list_entry::Entry::Device(device(8))),
-                    entry(device_list_entry::Entry::Device(device(9))),
-                ],
-                end: true,
-            }),
-        );
-        st.response(&request, &response);
-        assert_eq!(ids(&st), [1, 4, 8, 9]);
         // A device that becomes readable again leaves the unreadable list.
         st.event(&event::Kind::Device(device(2)));
         assert!(st.unreadable.is_empty());
-        assert_eq!(ids(&st), [1, 2, 4, 8, 9]);
+        assert_eq!(ids(&st), [1, 2, 4, 8]);
+        // An empty listing removes every device.
+        let (request, response) = answered(
+            Command::ListDevices(p::ListDevices {}),
+            response::Result::Devices(p::DeviceList::default()),
+        );
+        st.response(&request, &response);
+        assert!(st.devices.is_empty() && st.unreadable.is_empty());
     }
 
     #[test]
@@ -520,9 +491,9 @@ mod tests {
         st.event(&event::Kind::Profile(profile(4, "Play")));
         assert_eq!(st.profile(4).unwrap().name, "Play");
         st.event(&event::Kind::Profile(profile(9, "Later")));
-        // A page drops the profiles of its range it doesn't list.
+        // A listing drops the profiles it doesn't list.
         let (request, response) = answered(
-            Command::ListProfiles(p::ListProfiles { after: 0 }),
+            Command::ListProfiles(p::ListProfiles {}),
             response::Result::Profiles(p::ProfileList {
                 entries: vec![
                     p::ProfileListEntry {
@@ -532,15 +503,14 @@ mod tests {
                         entry: Some(profile_list_entry::Entry::Unreadable(5)),
                     },
                 ],
-                end: false,
             }),
         );
         st.response(&request, &response);
-        assert!(st.profile(1).is_none() && st.profile(4).is_none());
+        assert!(st.profile(1).is_none() && st.profile(4).is_none() && st.profile(9).is_none());
         assert_eq!(st.profile(2).unwrap().name, "Desk");
-        assert!(st.profile(9).is_some());
-        st.event(&event::Kind::ProfileRemoved(p::ProfileRemoved { id: 9 }));
-        assert!(st.profile(9).is_none());
+        st.event(&event::Kind::Profile(profile(9, "Later")));
+        st.event(&event::Kind::ProfileRemoved(p::ProfileRemoved { id: 2 }));
+        assert!(st.profile(2).is_none() && st.profile(9).is_some());
     }
 
     use crate::settings::{
@@ -560,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn setting_pages_and_changes_replace_whole_objects() {
+    fn setting_listings_and_changes_replace_whole_objects() {
         let mut st = State::default();
         st.event(&event::Kind::Device(device(1)));
         // Changes to settings that were never listed are left to the listing.
@@ -570,31 +540,20 @@ mod tests {
             removed: Vec::new(),
         }));
         assert!(!st.settings.contains_key(&1));
-        let list = |after: Option<p::SettingsRef>, objects: Vec<p::SettingsObject>, end: bool| {
+        let list = |objects: Vec<p::SettingsObject>| {
             answered(
-                Command::ListSettings(p::ListSettings { device: 1, after }),
-                response::Result::Settings(p::DeviceSettings {
-                    device: 1,
-                    objects,
-                    end,
-                }),
+                Command::ListSettings(p::ListSettings { device: 1 }),
+                response::Result::Settings(p::DeviceSettings { device: 1, objects }),
             )
         };
-        // Sensor 0 is the first object, so the second page's cursor keeps its zero index.
-        let (request, response) = list(
-            None,
-            vec![
-                sensor(0, ranged(Some(800), 200, 4000, 50)),
-                sensor(1, ranged(Some(400), 200, 4000, 50)),
-            ],
-            false,
-        );
+        let (request, response) = list(vec![sensor(9, ranged(Some(1), 1, 9, 1))]);
         st.response(&request, &response);
-        let (request, response) = list(
-            Some(sensor_ref(1)),
-            vec![wheel(Some(p::WheelMode::Stepped as i32), Some(false))],
-            true,
-        );
+        // A listing replaces every object held.
+        let (request, response) = list(vec![
+            sensor(0, ranged(Some(800), 200, 4000, 50)),
+            sensor(1, ranged(Some(400), 200, 4000, 50)),
+            wheel(Some(p::WheelMode::Stepped as i32), Some(false)),
+        ]);
         st.response(&request, &response);
         let dpi = |n: u32| Field::hidpp(Leaf::Dpi, Some(n));
         let mode = Field::hidpp(Leaf::WheelMode, None);

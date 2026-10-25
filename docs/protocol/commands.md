@@ -7,8 +7,8 @@ Each command is one `Request.command` variant; its message in
 each command does. Commands that need Bluetooth or storage return `ERROR_CODE_NOT_READY` until both
 have started.
 
-Every `List` command returns one page at a time and continues after the key of the last entry the
-client received; see [Listings](compatibility.md#listings) for the keys, orders and page rules.
+Every `List` command returns its complete list in one response frame; see
+[Listings](compatibility.md#listings) for ordering and streaming.
 Commands that change saved preferences respond with no result once the change is applied, and the
 changed object's event follows when anything changed; a change to what the Dongle already holds
 sends no event. A success means the Dongle now holds the values sent, in the saved form the
@@ -82,7 +82,7 @@ its own; there is no separate connect step.
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListDevices` | `DeviceList` | One page of saved devices in ascending ID order. A device whose record cannot be read is listed by ID as `unreadable` and the listing continues past it. |
+| `ListDevices` | `DeviceList` | All saved devices in ascending ID order. A device whose record cannot be read is listed by ID as `unreadable` and the listing continues past it. |
 | `GetDevice` | `Device` | One saved device. |
 | `SetDevice` | none | Partial update of `enabled`, `trusted`, `blocked`, integration preferences, output preferences and profile layers, saved in one write. Integration and output updates apply in order. Turning `enabled` off or `blocked` on closes the device's link. |
 | `ConnectDevice` | `Device` | Clears a disconnect pause and starts connecting, or joins an attempt already running. Refused for a disabled or blocked device and while a pairing runs. |
@@ -170,7 +170,7 @@ CLI commands and human-readable slot numbering are described in
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListSettings` | `DeviceSettings` | One page of complete typed settings domains, across integrations: configurable fields discovered on this connection plus every saved preference. Sends nothing to the device. |
+| `ListSettings` | `DeviceSettings` | All complete typed settings domains, across integrations: configurable fields discovered on this connection plus every saved preference. Sends nothing to the device. |
 | `SetSettings` | none | Saves and forgets values in one storage write. Each change either saves a value or, with `forget`, removes the saved value. A `settings_changed` event follows. |
 
 A valid value is always saved, whatever the device's current state: disconnected, busy, its
@@ -207,12 +207,12 @@ See [HID++](../hidpp.md) for the device operations behind each HID++ setting.
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListProfiles` | `ProfileList` | One page of saved profiles in ascending ID order. A profile whose record cannot be read is listed by ID as `unreadable` and the listing continues past it. |
+| `ListProfiles` | `ProfileList` | All saved profiles in ascending ID order. A profile whose record cannot be read is listed by ID as `unreadable` and the listing continues past it. |
 | `GetProfile` | `Profile` | One saved profile. |
 | `CreateProfile` | `ProfileCreated` | Saves a new, empty profile and returns its ID; a `profile` event follows. |
 | `CopyProfile` | `ProfileCreated` | Saves a new profile with the source's rules and returns its ID; a `profile` event follows. |
 | `DeleteProfile` | none | Deletes an unused profile with its rules; `profile_removed` follows. |
-| `ListProfileRules` | `ProfileRules` | One page of the profile's rules, ordered by input usage page, input usage, collection usage page, then collection usage. `after` is the last rule's `ProfileRuleRef`, containing both `input` and `collection`. |
+| `ListProfileRules` | `ProfileRules` | All of the profile's rules, ordered by input usage page, input usage, collection usage page, then collection usage. |
 | `SetProfileRules` | none | Saves and forgets rules in one storage write. Each change either saves a rule or, with `forget`, removes the rule for an input and collection. |
 
 A new profile is empty and passes every input through unchanged. Nothing is filled in on the
@@ -231,6 +231,11 @@ profile larger than `MEMORY.limit` in `ProfileSupport.resources` returns `ERROR_
 `CAPACITY_REASON_PROFILE_MEMORY`, since it could never be loaded. The Dongle applies every rule it accepts to every device that uses the profile, whatever
 kind of device it is. The number of saved profiles is limited only by flash; creating or copying one
 that does not fit returns `ERROR_CODE_NO_CAPACITY` with `CAPACITY_REASON_STORAGE`.
+
+The complete `SetProfileRules` request, including its command envelope and every change, must fit
+1024 protobuf bytes before COBS encoding. Clients reject an oversized request without sending it
+and do not split it automatically. Each accepted request is atomic. A caller that deliberately
+sends several bounded requests gets no atomicity across that sequence.
 
 A profile has at most one rule for each input and collection together. Changes in one
 `SetProfileRules` apply in order, so a later save or forget for the same input and collection

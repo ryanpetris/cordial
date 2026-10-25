@@ -96,6 +96,9 @@ pub struct Manager {
     pub lost_profiles: Vec<u64>,
     /// Lost device records waiting for background cleanup.
     pub lost_devices: Vec<u64>,
+    /// Nonresident corrupt records wait for a rescan while removal events cannot drain.
+    pub(crate) defer_lost_devices: bool,
+    pub(crate) rescan_lost_devices: bool,
     /// A resident entry left, so another enabled device may now fit in the stack.
     pub vacated: bool,
     /// The stack's bonds may differ from the resident entries until they are synced again.
@@ -136,6 +139,8 @@ impl Default for Manager {
             changed: Vec::new(),
             lost_profiles: Vec::new(),
             lost_devices: Vec::new(),
+            defer_lost_devices: false,
+            rescan_lost_devices: false,
             vacated: false,
             bonds_pending: false,
         }
@@ -1010,7 +1015,12 @@ impl Manager {
                 let _ = self.lose(id, store, radio).await;
             }
             Err(crate::storage::Error::Corrupt) => {
-                let _ = self.lose(id, store, radio).await;
+                if self.defer_lost_devices && self.find(id).is_none() {
+                    // The record remains the cleanup queue until its removal can be reported.
+                    self.rescan_lost_devices = true;
+                } else {
+                    let _ = self.lose(id, store, radio).await;
+                }
             }
             _ => {}
         }

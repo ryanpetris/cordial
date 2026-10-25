@@ -1,6 +1,5 @@
-// The orders the Dongle lists entries in, so a client can merge pages and changes into what it has
-// listed and keep it in the same order.
-import { SettingsGroup, type Feature, type FeatureRef, type ProfileRule, type SettingsObject, type SettingsRef, type Usage } from "@cordial/protocol";
+// Listing identities and order let clients apply changes to the entries they hold.
+import { SettingsGroup, type Feature, type ProfileRule, type SettingsObject, type SettingsRef, type Usage } from "@cordial/protocol";
 
 const encoder = new TextEncoder();
 
@@ -58,12 +57,14 @@ export const ruleRef = (r: Pick<ProfileRule, "input" | "collection">): { input: 
 export const compareRuleRefs = (a: ReturnType<typeof ruleRef>, b: ReturnType<typeof ruleRef>) =>
   compareUsages(a.input, b.input) || compareUsages(a.collection, b.collection);
 
+export type FeatureKey = Pick<Feature, "integration"> & { index: number };
+
 /** The key a feature is listed by. */
-export const featureRef = (f: Feature): Pick<FeatureRef, "integration" | "index"> => ({
+export const featureRef = (f: Feature): FeatureKey => ({
   integration: f.integration,
   index: f.detail.case === "hidpp" ? f.detail.value.index : 0,
 });
 
 /** Features order: integration, then index within the integration's table. */
-export const compareFeatureRefs = (a: Pick<FeatureRef, "integration" | "index">, b: Pick<FeatureRef, "integration" | "index">) =>
+export const compareFeatureRefs = (a: FeatureKey, b: FeatureKey) =>
   compareNumbers(a.integration, b.integration) || compareNumbers(a.index, b.index);

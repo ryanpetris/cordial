@@ -257,12 +257,8 @@ pub enum Command {
         forget: Vec<Field>,
     },
     Features(Target),
-    /// One page of saved profiles with IDs above `after`.
-    Profiles {
-        after: u32,
-    },
-    /// Every saved profile, read page by page.
-    AllProfiles,
+    /// Every saved profile.
+    Profiles,
     /// A profile's name and roles.
     ProfileShow(Target),
     /// Reads a profile's name, for showing where it is used.
@@ -386,12 +382,8 @@ pub enum Outcome {
         subject: Subject,
         features: Vec<p::Feature>,
     },
-    /// A page of profiles and the cursor it was read after, or every profile as one page that
-    /// ends the listing.
-    Profiles {
-        after: u32,
-        list: p::ProfileList,
-    },
+    /// Every saved profile.
+    Profiles(p::ProfileList),
     /// A created, copied, shown or looked up profile.
     Profile(p::Profile),
     ProfileDeleted(p::Profile),
@@ -516,11 +508,11 @@ impl Session {
         Ok(response)
     }
 
-    /// Reads every page of saved devices, and the names of the profiles devices and
-    /// configuration interfaces use.
+    /// Lists the saved devices, and reads the names of the profiles devices and configuration
+    /// interfaces use.
     fn load(&self) -> Result<(), Error> {
         self.connection
-            .all_devices()
+            .list_devices()
             .map_err(|e| Error::from_client(e, "device list"))?;
         for id in crate::profiles::unnamed(&self.state()) {
             // A name that can't be read is shown as the profile's ID.

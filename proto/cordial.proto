@@ -1,7 +1,8 @@
 // The Cordial serial API. A client sends one Request per frame and receives one Response for each,
 // in order; the Dongle also sends an Event whenever a device, its settings, a profile, the adapter,
-// a scan or a pairing changes. Each frame is one protobuf message,
-// COBS-encoded and followed by a zero byte. docs/protocol describes framing, sessions and the
+// a scan or a pairing changes. Each frame is one logical protobuf message, COBS-encoded and
+// followed by a zero byte. Requests fit in 1024 protobuf bytes before COBS encoding. Responses
+// and events have no protocol size limit. docs/protocol describes framing, sessions and the
 // compatibility rules.
 syntax = "proto3";
 
@@ -11,7 +12,9 @@ package cordial;
 // Envelopes
 // ---------------------------------------------------------------------------
 
-// Client to Dongle. Exactly one command is set.
+// Client to Dongle. Exactly one command is set. The complete encoded Request, including its
+// command and every list entry, is at most 1024 bytes before COBS encoding. USB write boundaries
+// do not affect this limit. A larger request returns ERROR_CODE_TOO_LONG without being executed.
 message Request {
   oneof command {
     GetStatus get_status = 1;
@@ -51,7 +54,24 @@ message Request {
   }
 }
 
-// Dongle to client.
+// Dongle to client. A frame contains either one response or one event. Clients decode the complete
+// frame before applying it; an unfinished frame is discarded when the session ends.
+//
+// A list response can be produced incrementally by concatenating protobuf encodings of Message
+// values with the same Response.result list variant. Embedded messages merge and repeated entries
+// append under protobuf's decoding rules. Identifying fields, such as device or profile, stay the
+// same throughout the response. The combined bytes pass through one continuous COBS encoding and
+// one final zero delimiter. The pieces have no separate framing or client continuation requests.
+// An empty list still sets its result variant.
+//
+// If a listing fails after some entries have been encoded, the Dongle appends a Message containing
+// Response.error and finishes the frame. The error replaces the list result under protobuf's oneof
+// rules; no list entries follow the error. Clients discard the partial list and report the error.
+// The Dongle never terminates a failed listing as a successful partial list.
+//
+// Events do not interleave with a response's pieces. The Dongle retains pending changes during the
+// response and sends their events afterward. It reads the next request only after the response
+// has been written. Listings reflect records as they are read, not a snapshot at one instant.
 message Message {
   oneof kind {
     Response response = 1;
@@ -85,7 +105,7 @@ message Response {
 }
 
 // Change events carry only what changed. A client applies them to what it has listed, and lists
-// again from the start when it needs a fresh view, such as in a new session.
+// again when it needs a fresh view, such as in a new session.
 message Event {
   oneof kind {
     // An adapter preference, readiness, information, error list or resource count changed.
@@ -389,21 +409,14 @@ enum CodeKind {
 // Devices
 // ---------------------------------------------------------------------------
 
-// One page of saved devices, in ascending ID order. Responds with DeviceList.
-message ListDevices {
-  // The ID of the last entry received. 0 starts from the beginning.
-  uint32 after = 1;
-}
+// Lists all saved devices in ascending ID order. Responds with DeviceList.
+message ListDevices {}
 
-// One page of a listing. Every List command pages the same way: the reply holds the entries that
-// follow `after` in the listing's order, and `end` is set when nothing follows the last of them.
-// The Dongle chooses how many entries a page holds, and a page holds at least one entry unless
-// `end` is set. A client passes the key of the last entry it received as the next request's
-// `after`.
+// All saved devices, in ascending ID order. Every List command returns its complete list in one
+// response, which the Dongle can encode incrementally as described by Message. Entries occur
+// once in the listing's order; an empty list is valid. The frame delimiter completes the response.
 message DeviceList {
   repeated DeviceListEntry entries = 1;
-  // Nothing follows the last entry.
-  bool end = 2;
 }
 
 message DeviceListEntry {
@@ -897,13 +910,11 @@ enum WheelMode {
 // Lists every configurable field discovered on this connection and every saved preference, across
 // integrations. Sends nothing to the device. Read-only behavior is in Device.information.
 // Objects are ordered by integration, then SettingsGroup number, then component index.
-// Listing is a live view, not a snapshot across requests; clients apply events as they arrive
-// and list again from the beginning when they need a fresh view. Responds with DeviceSettings.
+// Clients apply the complete response, then subsequent events, and list again when they need a
+// fresh view. Responds with DeviceSettings.
 message ListSettings {
   // Required.
   uint32 device = 1;
-  // The identity of the last object received. Missing starts from the beginning.
-  SettingsRef after = 2;
 }
 
 // Identifies a complete domain object, never an individual setting.
@@ -973,24 +984,20 @@ message SettingsUpdate {
   }
 }
 
-// One page, ordered as ListSettings. The Dongle packs whole objects so the enclosing Message
-// fits in 1024 protobuf bytes before COBS encoding. It never splits an object. At least one
-// object is returned unless end is true. Each object is at most 960 protobuf bytes, including
-// its integration and group. Limits include saved metadata and are never silently truncated.
+// All settings objects, ordered as ListSettings. Each object includes its complete settings and
+// saved metadata. Objects are never silently truncated to fit a transmission buffer.
 message DeviceSettings {
   // Required.
   uint32 device = 1;
   repeated SettingsObject objects = 2;
-  // Nothing follows the last object in listing order.
-  bool end = 3;
 }
 
 // Each changed object replaces the entire previous object with that identity. Omitted fields
 // remove prior capabilities; a present field with value absent resets its reading to unknown;
 // saved absent clears a saved preference. An object without any fields is removed instead.
 // Objects not named in changed or removed are unchanged. A ref occurs at most once in an event
-// and cannot occur in both lists. Events are split between whole objects/references so each
-// enclosing Message fits in 1024 protobuf bytes. Changes across events are not atomic.
+// and cannot occur in both lists. Clients apply an event only after its complete frame arrives.
+// Changes across events are not atomic.
 message SettingsChanged {
   // Required.
   uint32 device = 1;
@@ -1361,17 +1368,12 @@ message ProfileLayers {
   repeated uint32 profiles = 1;
 }
 
-// One page of saved profiles in ascending ID order. Responds with ProfileList.
-message ListProfiles {
-  // The ID of the last entry received. 0 starts from the beginning.
-  uint32 after = 1;
-}
+// Lists all saved profiles in ascending ID order. Responds with ProfileList.
+message ListProfiles {}
 
-// One page of saved profiles, paged as DeviceList.
+// All saved profiles in ascending ID order.
 message ProfileList {
   repeated ProfileListEntry entries = 1;
-  // Nothing follows the last entry.
-  bool end = 2;
 }
 
 message ProfileListEntry {
@@ -1438,14 +1440,11 @@ message Profile {
   repeated Role roles = 3;
 }
 
-// One page of the profile's rules, ordered by input usage page, input usage, collection usage
-// page, then collection usage.
-// Responds with ProfileRules.
+// Lists all of the profile's rules, ordered by input usage page, input usage, collection usage
+// page, then collection usage. Responds with ProfileRules.
 message ListProfileRules {
   // Required.
   uint32 profile = 1;
-  // The input and collection of the last rule received. Missing starts from the beginning.
-  ProfileRuleRef after = 2;
 }
 
 // Saves and forgets rules in one storage write and responds with no result. A saved rule replaces
@@ -1456,6 +1455,12 @@ message ListProfileRules {
 // fails, nothing is saved. A save that would make the profile larger than the
 // MEMORY limit in ProfileSupport.resources, or grow a loaded profile beyond the remaining budget,
 // returns ERROR_CODE_NO_CAPACITY with CAPACITY_REASON_PROFILE_MEMORY.
+//
+// The complete Request must fit in 1024 protobuf bytes. Clients divide larger sets of changes
+// into separate requests that each fit, waiting for success before sending the next batch. There
+// is no fixed rule count per request because encoded sizes vary. Each request saves its changes
+// together; separate requests are not one transaction. Earlier successful batches remain saved
+// if a later batch fails or the session ends.
 message SetProfileRules {
   // Required.
   uint32 profile = 1;
@@ -1482,14 +1487,12 @@ message ProfileRuleRef {
   Usage collection = 2;
 }
 
-// One page of a profile's rules, paged as DeviceList.
+// All of a profile's rules.
 message ProfileRules {
   // Required.
   uint32 profile = 1;
   // Ordered by input usage page, input usage, collection usage page, then collection usage.
   repeated ProfileRule rules = 2;
-  // Nothing follows the last rule.
-  bool end = 3;
 }
 
 // What one input does while the profile is applied. A profile has at most one rule for each
@@ -1549,28 +1552,16 @@ message ProfileRule {
 // Development only. Production firmware answers these with ERROR_CODE_UNKNOWN_COMMAND.
 // ---------------------------------------------------------------------------
 
-// One page of the device's feature tables, in ascending order of integration, then index within
+// Lists all of the device's feature tables, in ascending order of integration, then index within
 // the integration's table. Responds with FeatureList.
 message ListFeatures {
   // Required.
   uint32 device = 1;
-  // The last feature received. Missing starts from the beginning.
-  FeatureRef after = 2;
 }
 
-// Identifies one entry in a device's feature table.
-message FeatureRef {
-  // Required.
-  IntegrationKind integration = 1;
-  // The entry's index in the integration's table.
-  uint32 index = 2;
-}
-
-// One page of a device's features, paged as DeviceList.
+// All of a device's features, ordered as ListFeatures.
 message FeatureList {
   repeated Feature features = 1;
-  // Nothing follows the last feature.
-  bool end = 2;
 }
 
 // One entry in a device's feature table, for any integration.
@@ -1593,20 +1584,16 @@ message HidppFeature {
   uint32 flags = 4;
 }
 
-// One page of a directory's entries, in ascending order of name compared bytewise. Responds with
+// Lists all of a directory's entries, in ascending order of name compared bytewise. Responds with
 // FileList.
 message ListFiles {
   // Required. Absolute path.
   string path = 1;
-  // The name of the last entry received. "" starts from the beginning.
-  string after = 2;
 }
 
-// One page of a directory's entries, paged as DeviceList.
+// All of a directory's entries, ordered as ListFiles.
 message FileList {
   repeated FileEntry entries = 1;
-  // Nothing follows the last entry.
-  bool end = 2;
 }
 
 message FileEntry {
@@ -1644,7 +1631,7 @@ enum ErrorCode {
   ERROR_CODE_BAD_REQUEST = 1;      // The frame is not a Request.
   ERROR_CODE_UNKNOWN_COMMAND = 2;  // No such command in this firmware.
   ERROR_CODE_BAD_ARGS = 3;         // Missing Required field, wrong value type, or out of range.
-  ERROR_CODE_TOO_LONG = 4;         // The frame exceeded 1024 bytes.
+  ERROR_CODE_TOO_LONG = 4;         // The Request exceeded 1024 protobuf bytes before COBS encoding.
   ERROR_CODE_NOT_READY = 5;        // Bluetooth or storage has not started, or failed to start.
   ERROR_CODE_NOT_FOUND = 6;        // No such device, candidate, profile, setting or file.
   ERROR_CODE_NOT_CONNECTED = 7;    // The command needs a connected device.

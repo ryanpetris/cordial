@@ -1,7 +1,7 @@
 //! The saved form of profile rules. A successful `SetProfileRules` means the Dongle holds each
 //! rule sent in this form, so a client applies [`normalized`] to the rules it sent instead of
 //! listing them again.
-use crate::paging::usage_order;
+use crate::order::usage_order;
 use cordial_protocol::{self as p, profile_rule};
 use std::cmp::Ordering;
 
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn rules_order_by_input_then_collection() {
-        use crate::paging::{rule_order, rule_ref};
+        use crate::order::{rule_order, rule_ref};
         let key = usage(KEYBOARD_PAGE, 0x39);
         let button = usage(BUTTON_PAGE, 1);
         let mut rules = [

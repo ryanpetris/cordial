@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use cordial_protocol::{
     self as p, MAX_REQUEST_BYTES,
-    frame::{self, Decoder, FrameError},
+    frame::{self, Decoder, Encoder, FrameError},
 };
 use prost::Message;
 
@@ -32,6 +32,7 @@ pub struct Session {
     input: Decoder,
     output: Option<Frame>,
     response: Option<Vec<u8>>,
+    stream: Option<Encoder>,
     generation: u64,
     serial: u64,
     active: bool,
@@ -50,6 +51,7 @@ impl Session {
             input: Decoder::new(Some(MAX_REQUEST_BYTES)),
             output: None,
             response: None,
+            stream: None,
             generation: 0,
             serial: 0,
             active: false,
@@ -64,6 +66,7 @@ impl Session {
         self.input.reset();
         self.output = None;
         self.response = None;
+        self.stream = None;
         self.generation = self.generation.wrapping_add(1);
         ended
     }
@@ -76,15 +79,23 @@ impl Session {
     }
     /// Whether a response is waiting or being written.
     fn answering(&self) -> bool {
-        self.response.is_some() || self.output.as_ref().is_some_and(|f| f.response)
+        self.stream.is_some()
+            || self.response.is_some()
+            || self.output.as_ref().is_some_and(|f| f.response)
     }
     /// Whether the output is free for an event.
     pub fn idle(&self) -> bool {
-        self.active && self.output.is_none() && self.response.is_none()
+        self.active && self.output.is_none() && !self.answering()
     }
     /// Frames waiting to be written, including the one being written.
     pub fn queued(&self) -> usize {
-        usize::from(self.output.is_some()) + usize::from(self.response.is_some())
+        usize::from(self.output.is_some())
+            + usize::from(self.response.is_some())
+            + usize::from(
+                self.stream.is_some()
+                    && self.response.is_none()
+                    && !self.output.as_ref().is_some_and(|f| f.response),
+            )
     }
     fn encode(message: p::Message) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -96,10 +107,48 @@ impl Session {
         if !self.active {
             return;
         }
+        if self.stream.is_some() {
+            self.stream_response(response, true);
+            return;
+        }
         self.response = Some(Self::encode(p::Message {
             kind: Some(p::message::Kind::Response(response)),
         }));
     }
+    /// Reserves the output for a response produced over several application steps.
+    pub fn start_stream(&mut self) {
+        if self.active {
+            self.stream = Some(Encoder::new());
+        }
+    }
+
+    /// Whether the producer can supply its next bounded batch.
+    pub fn stream_ready(&self) -> bool {
+        self.output.is_none() && self.response.is_none()
+    }
+
+    /// Appends an ordinary response envelope to the current logical protobuf message.
+    /// The caller waits for `stream_ready` before producing another batch.
+    pub fn stream_response(&mut self, response: p::Response, finished: bool) {
+        if !self.active {
+            return;
+        }
+        assert!(self.stream_ready());
+        let encoder = self.stream.as_mut().expect("response stream");
+        let bytes = p::Message {
+            kind: Some(p::message::Kind::Response(response)),
+        }
+        .encode_to_vec();
+        let mut encoded = Vec::new();
+        encoder.push(&bytes, &mut encoded);
+        if finished {
+            self.stream.take().unwrap().finish(&mut encoded);
+        }
+        if !encoded.is_empty() {
+            self.response = Some(encoded);
+        }
+    }
+
     pub fn fail(&mut self, error: p::Error) {
         self.respond(p::Response {
             result: Some(p::response::Result::Error(error)),

@@ -6,9 +6,9 @@
 
 | Limit | Value |
 | --- | --- |
-| Request frame | 1024 bytes before frame encoding |
-| General response and event frames | No limit |
-| Typed settings pages and change events | Enclosing `Message` at most 1024 protobuf bytes; each whole settings object at most 960 bytes, including saved metadata |
+| Complete host `Request` | 1024 protobuf bytes, including the command envelope and all entries, before COBS encoding |
+| Adapter response and event frames | No total protocol size cap |
+| Pointer Sensor DPI choices | At most six per sensor, including saved metadata |
 | Scan candidates | 32 per scan |
 | Normal connections | `CONNECTIONS.limit` in each `TransportSupport.resources` entry, independently per transport |
 | Pairing connections | One additional connection overall, outside the normal transport allowances |
@@ -17,7 +17,7 @@
 | Saved profiles | Bounded by flash |
 | Loaded profiles | Each profile in a connected device's layers, plus each enabled configuration interface's profile while a Host editor uses it; shared by ID, within the memory budget |
 | Profiles per layer list | `LAYERS.limit` in `ProfileSupport.resources`; loaded layers also share the profile memory budget |
-| List pages | Chosen by the Dongle for every `List` command and every page; at least one entry unless `end` is set |
+| Lists | One complete response frame, streamed with bounded adapter memory |
 | Rule inputs | `ProfileSupport.ranges` of kind `KIND_REMAP_INPUT`, `KIND_SCALE_INPUT` or `KIND_AXIS_INPUT`, matching both usage and collection |
 | Remap outputs | `ProfileSupport.ranges` of kind `KIND_REMAP_OUTPUT`, and at most `OUTPUTS.limit` in `ProfileSupport.resources` per remap and per held input |
 | Absolute axis outputs | `ProfileSupport.ranges` of kind `KIND_AXIS_OUTPUT`, in the input's Game Pad collection |

@@ -136,13 +136,12 @@ fn device(id: u32) -> p::Device {
     }
 }
 
-fn devices(entries: Vec<p::device_list_entry::Entry>, end: bool) -> p::DeviceList {
+fn devices(entries: Vec<p::device_list_entry::Entry>) -> p::DeviceList {
     p::DeviceList {
         entries: entries
             .into_iter()
             .map(|entry| p::DeviceListEntry { entry: Some(entry) })
             .collect(),
-        end,
     }
 }
 
@@ -161,10 +160,10 @@ fn responses_match_requests_in_order_with_events_between() {
             }
             Command::ListDevices(_) => {
                 out.event(p::event::Kind::Device(device(2)));
-                out.respond(Some(response::Result::Devices(devices(
-                    vec![saved(2), saved(3)],
-                    true,
-                ))));
+                out.respond(Some(response::Result::Devices(devices(vec![
+                    saved(2),
+                    saved(3),
+                ]))));
             }
             Command::StopScan(_) => out.respond(None),
             other => panic!("{other:?}"),
@@ -172,11 +171,11 @@ fn responses_match_requests_in_order_with_events_between() {
     );
     let (connection, events) = Connection::new(reader, writer);
     assert_eq!(connection.status().unwrap().name, "Desk");
-    let page = connection.list_devices(0).unwrap();
+    let list = connection.list_devices().unwrap();
     assert_eq!(
-        page.entries
+        list.entries
             .iter()
-            .map(cordial_client::paging::device_entry_id)
+            .map(cordial_client::order::device_entry_id)
             .collect::<Vec<_>>(),
         [2, 3]
     );
@@ -351,11 +350,9 @@ fn profile_commands_carry_their_fields_and_results() {
                 out.respond(None);
             }
             Command::ListProfileRules(l) => {
-                assert_eq!(l.after, None);
                 out.respond(Some(response::Result::ProfileRules(p::ProfileRules {
                     profile: l.profile,
                     rules: vec![saved.clone()],
-                    end: true,
                 })))
             }
             Command::SetProfileRules(s) => {
@@ -392,7 +389,7 @@ fn profile_commands_carry_their_fields_and_results() {
 }
 
 #[test]
-fn typed_settings_keep_metadata_cursors_partial_updates_and_whole_events() {
+fn typed_settings_keep_metadata_partial_updates_and_whole_events() {
     let object = |index| p::SettingsObject {
         integration: p::IntegrationKind::Hidpp as i32,
         group: Some(p::settings_object::Group::PointerSensor(
@@ -441,7 +438,7 @@ fn typed_settings_keep_metadata_cursors_partial_updates_and_whole_events() {
     let event = p::SettingsChanged {
         device: 1,
         changed: vec![object(1)],
-        removed: vec![cordial_client::paging::settings_ref(&object(0))],
+        removed: vec![cordial_client::order::settings_ref(&object(0))],
     };
     let saved_change = change;
     let saved_event = event.clone();
@@ -451,16 +448,9 @@ fn typed_settings_keep_metadata_cursors_partial_updates_and_whole_events() {
             Command::GetStatus(_) => out.respond(Some(response::Result::Status(status("Desk")))),
             Command::ListSettings(list) => {
                 assert_eq!(list.device, 1);
-                let index = if let Some(after) = list.after {
-                    assert_eq!(after, cordial_client::paging::settings_ref(&object(0)));
-                    1
-                } else {
-                    0
-                };
                 out.respond(Some(response::Result::Settings(p::DeviceSettings {
                     device: 1,
-                    objects: vec![object(index)],
-                    end: index == 1,
+                    objects: vec![object(0), object(1)],
                 })));
             }
             Command::SetSettings(update) => {
@@ -483,73 +473,6 @@ fn typed_settings_keep_metadata_cursors_partial_updates_and_whole_events() {
 }
 
 #[test]
-fn listings_read_every_page_and_keep_unreadable_ids() {
-    let afters = Arc::new(Mutex::new(Vec::new()));
-    let log = afters.clone();
-    let (reader, writer, _, _out) = dongle(
-        |_| {},
-        move |command, out| match command {
-            Command::ListDevices(l) => {
-                log.lock().unwrap().push(l.after);
-                let list = match l.after {
-                    0 => devices(
-                        vec![
-                            saved(1),
-                            p::device_list_entry::Entry::Unreadable(2),
-                            saved(4),
-                        ],
-                        false,
-                    ),
-                    4 => devices(vec![saved(9)], true),
-                    other => panic!("{other}"),
-                };
-                out.respond(Some(response::Result::Devices(list)));
-            }
-            Command::ListProfiles(l) => {
-                // A page whose last entry does not move past the key would never end.
-                let id = if l.after == 0 { 5 } else { 3 };
-                out.respond(Some(response::Result::Profiles(p::ProfileList {
-                    entries: vec![p::ProfileListEntry {
-                        entry: Some(p::profile_list_entry::Entry::Unreadable(id)),
-                    }],
-                    end: false,
-                })))
-            }
-            Command::ListSettings(l) => {
-                // A page without entries that does not end the listing would never end.
-                assert_eq!(l.after, None);
-                out.respond(Some(response::Result::Settings(p::DeviceSettings {
-                    device: l.device,
-                    ..Default::default()
-                })))
-            }
-            other => panic!("{other:?}"),
-        },
-    );
-    let (connection, _events) = Connection::new(reader, writer);
-    let all = connection.all_devices().unwrap();
-    assert_eq!(
-        all.iter()
-            .map(cordial_client::paging::device_entry_id)
-            .collect::<Vec<_>>(),
-        [1, 2, 4, 9]
-    );
-    assert_eq!(
-        all[1].entry,
-        Some(p::device_list_entry::Entry::Unreadable(2))
-    );
-    assert_eq!(*afters.lock().unwrap(), [0, 4]);
-    assert!(matches!(
-        connection.all_profiles(),
-        Err(Error::UnexpectedResponse)
-    ));
-    assert!(matches!(
-        connection.all_settings(1),
-        Err(Error::UnexpectedResponse)
-    ));
-}
-
-#[test]
 fn a_result_of_the_wrong_kind_is_unexpected_and_unit_commands_accept_any_success() {
     let (reader, writer, _, _out) = dongle(
         |_| {},
@@ -557,7 +480,7 @@ fn a_result_of_the_wrong_kind_is_unexpected_and_unit_commands_accept_any_success
     );
     let (connection, _events) = Connection::new(reader, writer);
     assert!(matches!(
-        connection.list_devices(0),
+        connection.list_devices(),
         Err(Error::UnexpectedResponse)
     ));
     connection.refresh_device(1).unwrap();
@@ -622,7 +545,7 @@ fn the_stream_ending_fails_waiting_and_later_requests() {
     assert!(matches!(waiting.join().unwrap(), Err(Error::Closed)));
     assert!(events.recv_timeout(Duration::from_secs(1)).is_err());
     assert!(matches!(connection.closed(), Some(Error::Closed)));
-    assert!(matches!(connection.list_devices(0), Err(Error::Closed)));
+    assert!(matches!(connection.list_devices(), Err(Error::Closed)));
 }
 
 #[test]
@@ -670,7 +593,6 @@ fn a_handler_sees_events_and_responses_in_stream_order() {
                 out.respond(Some(response::Result::Settings(p::DeviceSettings {
                     device: 1,
                     objects: Vec::new(),
-                    end: true,
                 })));
                 out.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 1 }));
             }
@@ -687,7 +609,7 @@ fn a_handler_sees_events_and_responses_in_stream_order() {
         });
     });
     connection.status().unwrap();
-    let settings = connection.list_settings(1, None).unwrap();
+    let settings = connection.list_settings(1).unwrap();
     assert_eq!(settings.device, 1);
     // The response reached the handler before the request returned it.
     assert!(seen.lock().unwrap().len() >= 3);
@@ -790,4 +712,256 @@ impl Name for p::event::Kind {
             p::event::Kind::ProfileRemoved(_) => "profile_removed",
         }
     }
+}
+
+fn list_result(kind: usize, start: u32, count: u32) -> response::Result {
+    let ids = || start + 1..start + count + 1;
+    match kind {
+        0 => response::Result::Devices(devices(
+            ids().map(p::device_list_entry::Entry::Unreadable).collect(),
+        )),
+        1 => response::Result::Profiles(p::ProfileList {
+            entries: ids()
+                .map(|id| p::ProfileListEntry {
+                    entry: Some(p::profile_list_entry::Entry::Unreadable(id)),
+                })
+                .collect(),
+        }),
+        2 => response::Result::Settings(p::DeviceSettings {
+            device: 7,
+            objects: ids()
+                .map(|integration| p::SettingsObject {
+                    integration: integration as i32,
+                    ..Default::default()
+                })
+                .collect(),
+        }),
+        3 => response::Result::ProfileRules(p::ProfileRules {
+            profile: 7,
+            rules: ids()
+                .map(|usage| p::ProfileRule {
+                    input: Some(p::Usage {
+                        usage_page: 9,
+                        usage,
+                    }),
+                    collection: Some(p::Usage {
+                        usage_page: 1,
+                        usage: 5,
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+        }),
+        4 => response::Result::Features(p::FeatureList {
+            features: ids()
+                .map(|integration| p::Feature {
+                    integration: integration as i32,
+                    ..Default::default()
+                })
+                .collect(),
+        }),
+        5 => response::Result::Files(p::FileList {
+            entries: ids()
+                .map(|id| p::FileEntry {
+                    name: format!("entry-{id}"),
+                    ..Default::default()
+                })
+                .collect(),
+        }),
+        _ => unreachable!(),
+    }
+}
+
+fn read_list(connection: &Connection, kind: usize) -> cordial_client::Result<response::Result> {
+    match kind {
+        0 => connection.list_devices().map(response::Result::Devices),
+        1 => connection.list_profiles().map(response::Result::Profiles),
+        2 => connection.list_settings(7).map(response::Result::Settings),
+        3 => connection
+            .list_profile_rules(7)
+            .map(response::Result::ProfileRules),
+        4 => connection.list_features(7).map(response::Result::Features),
+        5 => connection
+            .list_files("/records")
+            .map(response::Result::Files),
+        _ => unreachable!(),
+    }
+}
+
+fn streaming_frame(results: impl IntoIterator<Item = response::Result>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for result in results {
+        p::Message {
+            kind: Some(message::Kind::Response(p::Response {
+                result: Some(result),
+            })),
+        }
+        .encode(&mut bytes)
+        .unwrap();
+    }
+    let mut frame = Vec::new();
+    frame::encode_bytes(&bytes, &mut frame);
+    frame
+}
+
+#[test]
+fn all_six_lists_merge_nested_messages_in_one_frame_without_followup_requests() {
+    for kind in 0..6 {
+        for count in [0, 300] {
+            let expected = list_result(kind, 0, count);
+            let results = if count == 0 {
+                vec![expected.clone()]
+            } else {
+                (0..count)
+                    .map(|start| list_result(kind, start, 1))
+                    .collect()
+            };
+            let frame = streaming_frame(results);
+            if count != 0 {
+                assert!(frame.len() > 1024);
+            }
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let log = requests.clone();
+            let (reader, writer, _, _out) = dongle(
+                |_| {},
+                move |command, out| {
+                    log.lock().unwrap().push(command);
+                    for chunk in frame.chunks(17) {
+                        out.raw(chunk);
+                    }
+                },
+            );
+            let (connection, _events) = Connection::new(reader, writer);
+            assert_eq!(read_list(&connection, kind).unwrap(), expected);
+            let expected_command = match kind {
+                0 => Command::ListDevices(p::ListDevices {}),
+                1 => Command::ListProfiles(p::ListProfiles {}),
+                2 => Command::ListSettings(p::ListSettings { device: 7 }),
+                3 => Command::ListProfileRules(p::ListProfileRules { profile: 7 }),
+                4 => Command::ListFeatures(p::ListFeatures { device: 7 }),
+                5 => Command::ListFiles(p::ListFiles {
+                    path: "/records".into(),
+                }),
+                _ => unreachable!(),
+            };
+            assert_eq!(*requests.lock().unwrap(), [expected_command]);
+        }
+    }
+}
+
+#[test]
+fn terminal_errors_replace_each_streamed_list_before_observers_see_it() {
+    for kind in 0..6 {
+        let error = p::Error {
+            code: p::ErrorCode::NotReady as i32,
+            ..Default::default()
+        };
+        let frame = streaming_frame([list_result(kind, 0, 1), response::Result::Error(error)]);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let log = observed.clone();
+        let (reader, writer, _, _out) = dongle(|_| {}, move |_, out| out.raw(&frame));
+        let connection = Connection::with_handler(reader, writer, move |received| {
+            if let Received::Response(_, response) = received {
+                log.lock().unwrap().push(response.clone());
+            }
+        });
+        assert!(matches!(read_list(&connection, kind), Err(Error::Dongle(e)) if e == error));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [p::Response {
+                result: Some(response::Result::Error(error))
+            }]
+        );
+    }
+}
+
+#[test]
+fn response_progress_extends_the_timeout_until_the_frame_finishes() {
+    let timeout = Duration::from_millis(300);
+    let (reader, writer, _, _out) = dongle(
+        |_| {},
+        |_, out| {
+            let frame = streaming_frame((0..20).map(|start| list_result(0, start, 1)));
+            for chunk in frame.chunks(30) {
+                thread::sleep(Duration::from_millis(100));
+                out.raw(chunk);
+            }
+        },
+    );
+    let (connection, _events) = Connection::new(reader, writer);
+    connection.set_timeout(Some(timeout));
+    let started = std::time::Instant::now();
+    assert_eq!(connection.list_devices().unwrap().entries.len(), 20);
+    assert!(started.elapsed() > timeout);
+    assert!(connection.closed().is_none());
+}
+
+#[test]
+fn incomplete_lists_never_reach_observers_and_close_discards_them() {
+    let (started, wait) = mpsc::channel();
+    let frame = streaming_frame([list_result(0, 0, 20)]);
+    let partial = frame[..frame.len() - 1].to_vec();
+    let (reader, writer, _, _out) = dongle(
+        |_| {},
+        move |_, out| {
+            out.raw(&partial);
+            started.send(()).unwrap();
+        },
+    );
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let log = observed.clone();
+    let connection = Arc::new(Connection::with_handler(reader, writer, move |received| {
+        if let Received::Response(_, response) = received {
+            log.lock().unwrap().push(response.clone());
+        }
+    }));
+    let pending = connection.clone();
+    let worker = thread::spawn(move || pending.list_devices());
+    wait.recv_timeout(Duration::from_secs(1)).unwrap();
+    connection.close();
+    assert!(matches!(worker.join().unwrap(), Err(Error::Closed)));
+    assert!(observed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_request_limit_includes_the_envelope_and_profile_rule_changes_are_not_split() {
+    let (reader, writer, received, _out) = dongle(|_| {}, |_, out| out.respond(None));
+    let (connection, _events) = Connection::new(reader, writer);
+    let mut update = p::SetAdapter {
+        name: Some(String::new()),
+        ..Default::default()
+    };
+    loop {
+        let request = p::Request {
+            command: Some(Command::SetAdapter(update.clone())),
+        };
+        if request.encoded_len() == MAX_REQUEST_BYTES {
+            break;
+        }
+        update.name.as_mut().unwrap().push('x');
+    }
+    connection.set_adapter(update.clone()).unwrap();
+    let accepted = received.lock().unwrap().clone();
+    update.name.as_mut().unwrap().push('x');
+    assert!(matches!(
+        connection.set_adapter(update),
+        Err(Error::TooLong)
+    ));
+    let change = p::ProfileRuleChange {
+        change: Some(p::profile_rule_change::Change::Forget(p::ProfileRuleRef {
+            input: Some(p::Usage {
+                usage_page: 9,
+                usage: 1,
+            }),
+            collection: Some(p::Usage {
+                usage_page: 1,
+                usage: 5,
+            }),
+        })),
+    };
+    assert!(matches!(
+        connection.set_profile_rules(7, vec![change; 100]),
+        Err(Error::TooLong)
+    ));
+    assert_eq!(*received.lock().unwrap(), accepted);
 }

@@ -14,7 +14,6 @@ use crate::{
     ui::{catalog, text},
     view::State,
 };
-use cordial_client::paging::{self as paging, Page};
 use cordial_protocol::{
     self as p, CapacityReason, CodeKind, ErrorCode, IntegrationKind, pairing, profile_list_entry,
     profile_rule_change, request::Command as C, response,
@@ -90,8 +89,7 @@ fn uses_profiles(command: &Command) -> bool {
     match command {
         Command::Interface { .. }
         | Command::Layers(..)
-        | Command::Profiles { .. }
-        | Command::AllProfiles
+        | Command::Profiles
         | Command::ProfileShow(_)
         | Command::ProfileLookup(_)
         | Command::ProfileCreate(_)
@@ -274,23 +272,19 @@ pub(crate) fn execute(
             Ok(Outcome::PairingCancelled)
         }
         Command::Devices => {
-            read_pages::<p::DeviceList>(session, "device list", true, |after| {
-                C::ListDevices(p::ListDevices {
-                    after: after.copied().unwrap_or(0),
-                })
-            })?;
+            session.call(C::ListDevices(p::ListDevices {}), "device list", true)?;
             Ok(Outcome::Devices)
         }
         Command::Files(path) => {
-            let entries = read_pages::<p::FileList>(session, "file list", true, |after| {
-                C::ListFiles(p::ListFiles {
-                    path: path.clone(),
-                    after: after.cloned().unwrap_or_default(),
-                })
-            })?;
+            let request = C::ListFiles(p::ListFiles { path: path.clone() });
+            let Some(response::Result::Files(list)) =
+                session.call(request, "file list", true)?.result
+            else {
+                return Err(unexpected());
+            };
             Ok(Outcome::Files {
                 path: path.clone(),
-                entries,
+                entries: list.entries,
             })
         }
         Command::FileGet {
@@ -338,29 +332,7 @@ pub(crate) fn execute(
                 unconverted,
             })
         }
-        Command::Profiles { after } => {
-            let list = read_page::<p::ProfileList>(
-                session,
-                C::ListProfiles(p::ListProfiles { after: *after }),
-                "profile list",
-                true,
-            )?;
-            Ok(Outcome::Profiles {
-                after: *after,
-                list,
-            })
-        }
-        Command::AllProfiles => {
-            let entries = read_pages::<p::ProfileList>(session, "profile list", true, |after| {
-                C::ListProfiles(p::ListProfiles {
-                    after: after.copied().unwrap_or(0),
-                })
-            })?;
-            Ok(Outcome::Profiles {
-                after: 0,
-                list: p::ProfileList { entries, end: true },
-            })
-        }
+        Command::Profiles => Ok(Outcome::Profiles(list_profiles(session, true)?)),
         Command::ProfileShow(target) => {
             let id = match target {
                 Target::Id(id) => *id,
@@ -427,14 +399,18 @@ pub(crate) fn execute(
         }
         Command::Rules(target) => {
             let profile = resolve_profile(session, &st, target)?;
-            let rules =
-                read_pages::<p::ProfileRules>(session, "profile rule list", true, |after| {
-                    C::ListProfileRules(p::ListProfileRules {
-                        profile: profile.id,
-                        after: after.copied(),
-                    })
-                })?;
-            Ok(Outcome::Rules { profile, rules })
+            let request = C::ListProfileRules(p::ListProfileRules {
+                profile: profile.id,
+            });
+            let Some(response::Result::ProfileRules(list)) =
+                session.call(request, "profile rule list", true)?.result
+            else {
+                return Err(unexpected());
+            };
+            Ok(Outcome::Rules {
+                profile,
+                rules: list.rules,
+            })
         }
         Command::RuleChange(target, change) => {
             if let Some(p::profile_rule_change::Change::Rule(rule)) = &change.change
@@ -513,32 +489,12 @@ fn unexpected() -> Error {
     Error::new("the adapter returned an unexpected result")
 }
 
-/// Reads one page of a listing.
-fn read_page<P: Page>(
-    session: &Session,
-    request: C,
-    name: &'static str,
-    reported: bool,
-) -> Result<P, Error> {
-    session
-        .call(request, name, reported)?
-        .result
-        .and_then(P::from_result)
-        .ok_or_else(unexpected)
-}
-
-/// Reads a listing from the start, one request per page; `request` builds the request for the
-/// page after a key.
-fn read_pages<P: Page>(
-    session: &Session,
-    name: &'static str,
-    reported: bool,
-    request: impl Fn(Option<&P::Key>) -> C,
-) -> Result<Vec<P::Entry>, Error> {
-    paging::read_pages(
-        |after| read_page::<P>(session, request(after), name, reported),
-        unexpected,
-    )
+fn list_profiles(session: &Session, reported: bool) -> Result<p::ProfileList, Error> {
+    let request = C::ListProfiles(p::ListProfiles {});
+    match session.call(request, "profile list", reported)?.result {
+        Some(response::Result::Profiles(list)) => Ok(list),
+        _ => Err(unexpected()),
+    }
 }
 
 /// Saves adapter preferences. The view takes the values sent once the adapter accepts them.
@@ -584,8 +540,8 @@ fn missing(error: Error, target: &Target) -> Error {
     }
 }
 
-/// Resolves a profile: an ID, else a name exactly one profile has. Names are found by reading
-/// every page of the adapter's profiles.
+/// Resolves a profile: an ID, else a name exactly one profile has. Names are found by listing
+/// the adapter's profiles.
 fn resolve_profile(session: &Session, st: &State, target: &Target) -> Result<p::Profile, Error> {
     match target {
         Target::Id(id) => match st.profile(*id) {
@@ -600,31 +556,27 @@ fn resolve_profile(session: &Session, st: &State, target: &Target) -> Result<p::
     }
 }
 
-/// Resolves several profiles in order, reading the profile pages at most once for their names.
+/// Resolves several profiles in order, listing the profiles at most once for their names.
 fn resolve_profiles(session: &Session, st: &State, targets: &[Target]) -> Result<Vec<u32>, Error> {
-    let mut pages = None;
+    let mut listed = None;
     targets
         .iter()
         .map(|target| match target {
             Target::Id(_) => resolve_profile(session, st, target).map(|p| p.id),
             Target::Name(name) => {
-                if pages.is_none() {
-                    pages = Some(all_profiles(session)?);
+                if listed.is_none() {
+                    listed = Some(all_profiles(session)?);
                 }
-                unique_name(pages.as_deref().unwrap_or_default(), name, target)
+                unique_name(listed.as_deref().unwrap_or_default(), name, target)
             }
         })
         .collect()
 }
 
-/// Every readable saved profile, read page by page.
+/// Every readable saved profile.
 fn all_profiles(session: &Session) -> Result<Vec<p::Profile>, Error> {
-    let entries = read_pages::<p::ProfileList>(session, "profile list", false, |after| {
-        C::ListProfiles(p::ListProfiles {
-            after: after.copied().unwrap_or(0),
-        })
-    })?;
-    Ok(entries
+    Ok(list_profiles(session, false)?
+        .entries
         .into_iter()
         .filter_map(|entry| match entry.entry {
             Some(profile_list_entry::Entry::Profile(profile)) => Some(profile),
@@ -1089,13 +1041,16 @@ fn device_command(
             save(session, &subject, set.clone(), forget.clone())
         }
         Command::Features(_) => {
-            let features = read_pages::<p::FeatureList>(session, "feature list", true, |after| {
-                C::ListFeatures(p::ListFeatures {
-                    device: id,
-                    after: after.copied(),
-                })
-            })?;
-            Ok(Outcome::Features { subject, features })
+            let request = C::ListFeatures(p::ListFeatures { device: id });
+            let Some(response::Result::Features(list)) =
+                session.call(request, "feature list", true)?.result
+            else {
+                return Err(unexpected());
+            };
+            Ok(Outcome::Features {
+                subject,
+                features: list.features,
+            })
         }
         _ => unreachable!(),
     }
@@ -1219,15 +1174,13 @@ pub fn enabled_full(st: &State, d: &p::Device) -> bool {
     enabled >= max as usize
 }
 
-/// Every setting of a device, read page by page.
+/// Every setting of a device.
 fn list_settings(session: &Session, id: u32, reported: bool) -> Result<Vec<Setting>, Error> {
-    let objects = read_pages::<p::DeviceSettings>(session, "setting list", reported, |after| {
-        C::ListSettings(p::ListSettings {
-            device: id,
-            after: after.cloned(),
-        })
-    })?;
-    Ok(settings::settings(&objects))
+    let request = C::ListSettings(p::ListSettings { device: id });
+    match session.call(request, "setting list", reported)?.result {
+        Some(response::Result::Settings(list)) => Ok(settings::settings(&list.objects)),
+        _ => Err(unexpected()),
+    }
 }
 
 /// The setting of `field`.

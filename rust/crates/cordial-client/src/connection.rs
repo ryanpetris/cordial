@@ -1,7 +1,4 @@
-use crate::{
-    Error, Result,
-    paging::{Page, read_pages},
-};
+use crate::{Error, Result};
 use cordial_protocol::{
     self as p, MAX_REQUEST_BYTES,
     frame::{self, Decoder},
@@ -22,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long a request waits for its response unless [`Connection::set_timeout`] changes it.
+/// How long a request may wait without incoming bytes unless [`Connection::set_timeout`] changes it.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a stalled write may take before the connection is closed.
@@ -65,6 +62,7 @@ struct Shared {
     started: AtomicBool,
     stop: AtomicBool,
     timeout: Mutex<Option<Duration>>,
+    last_received: Mutex<Instant>,
     /// Set once the reader thread has dropped the reading half.
     released: Mutex<bool>,
     release: Condvar,
@@ -142,6 +140,7 @@ impl Connection {
             started: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             timeout: Mutex::new(Some(DEFAULT_TIMEOUT)),
+            last_received: Mutex::new(Instant::now()),
             released: Mutex::new(false),
             release: Condvar::new(),
         });
@@ -155,8 +154,8 @@ impl Connection {
         Self { shared, reader }
     }
 
-    /// Sets how long each request waits for its response; `None` waits without limit. A request
-    /// that times out closes the connection.
+    /// Sets how long each request may wait without incoming bytes; `None` waits without limit.
+    /// Progressing responses may take longer. A stalled request closes the connection.
     pub fn set_timeout(&self, timeout: Option<Duration>) {
         *self.shared.timeout.lock().unwrap() = timeout;
     }
@@ -234,16 +233,30 @@ impl Connection {
             }
         }
         let timeout = *self.shared.timeout.lock().unwrap();
+        let started = Instant::now();
         let reply = match timeout {
-            Some(timeout) => rx.recv_timeout(timeout).map_err(|e| match e {
-                // Every later response would answer the wrong request if this one was lost, so
-                // the connection ends.
-                RecvTimeoutError::Timeout => {
-                    self.shared.close(Error::Timeout);
-                    Error::Timeout
+            Some(timeout) => loop {
+                let idle = (*self.shared.last_received.lock().unwrap())
+                    .max(started)
+                    .elapsed();
+                match rx.recv_timeout(timeout.saturating_sub(idle)) {
+                    Ok(reply) => break Ok(reply),
+                    Err(RecvTimeoutError::Timeout) => {
+                        if (*self.shared.last_received.lock().unwrap())
+                            .max(started)
+                            .elapsed()
+                            >= timeout
+                        {
+                            // A lost response would make every later response answer the wrong request.
+                            self.shared.close(Error::Timeout);
+                            break Err(Error::Timeout);
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        break Err(self.closed().unwrap_or(Error::Closed));
+                    }
                 }
-                RecvTimeoutError::Disconnected => self.closed().unwrap_or(Error::Closed),
-            }),
+            },
             None => rx
                 .recv()
                 .map_err(|_| self.closed().unwrap_or(Error::Closed)),
@@ -318,35 +331,16 @@ impl Connection {
         self.done(Command::CancelPairing(p::CancelPairing {}))
     }
 
-    /// Reads one page of a listing.
-    fn page<P: Page>(&self, command: Command) -> Result<P> {
-        self.call(command, P::from_result)
-    }
-
-    /// Reads every page of a listing from the start; `command` builds the request for the page
-    /// after a key.
-    fn pages<P: Page>(
-        &self,
-        command: impl Fn(Option<&P::Key>) -> Command,
-    ) -> Result<Vec<P::Entry>> {
-        read_pages(
-            |after| self.page::<P>(command(after)),
-            || Error::UnexpectedResponse,
-        )
-    }
-
-    /// One page of saved devices with IDs above `after`; 0 starts the listing.
-    pub fn list_devices(&self, after: u32) -> Result<p::DeviceList> {
-        self.page(Command::ListDevices(p::ListDevices { after }))
-    }
-
-    /// Every saved device, read page by page.
-    pub fn all_devices(&self) -> Result<Vec<p::DeviceListEntry>> {
-        self.pages::<p::DeviceList>(|after| {
-            Command::ListDevices(p::ListDevices {
-                after: after.copied().unwrap_or(0),
-            })
+    /// Every saved device, including IDs whose records could not be read.
+    pub fn list_devices(&self) -> Result<p::DeviceList> {
+        self.call(Command::ListDevices(p::ListDevices {}), |r| match r {
+            response::Result::Devices(list) => Some(list),
+            _ => None,
         })
+    }
+
+    pub fn all_devices(&self) -> Result<Vec<p::DeviceListEntry>> {
+        Ok(self.list_devices()?.entries)
     }
 
     pub fn get_device(&self, device: u32) -> Result<p::Device> {
@@ -381,23 +375,19 @@ impl Connection {
         self.done(Command::RefreshDevice(p::RefreshDevice { device }))
     }
 
-    /// One page of a device's settings after `after`; `None` starts the listing.
-    pub fn list_settings(
-        &self,
-        device: u32,
-        after: Option<p::SettingsRef>,
-    ) -> Result<p::DeviceSettings> {
-        self.page(Command::ListSettings(p::ListSettings { device, after }))
+    /// Every settings object of the device.
+    pub fn list_settings(&self, device: u32) -> Result<p::DeviceSettings> {
+        self.call(
+            Command::ListSettings(p::ListSettings { device }),
+            |r| match r {
+                response::Result::Settings(list) => Some(list),
+                _ => None,
+            },
+        )
     }
 
-    /// Every settings object of a device, read page by page.
     pub fn all_settings(&self, device: u32) -> Result<Vec<p::SettingsObject>> {
-        self.pages::<p::DeviceSettings>(|after| {
-            Command::ListSettings(p::ListSettings {
-                device,
-                after: after.cloned(),
-            })
-        })
+        Ok(self.list_settings(device)?.objects)
     }
 
     /// Saves and forgets settings in one request; the changes apply in order. Success carries no
@@ -406,18 +396,16 @@ impl Connection {
         self.done(Command::SetSettings(p::SetSettings { device, changes }))
     }
 
-    /// One page of saved profiles with IDs above `after`; 0 starts the listing.
-    pub fn list_profiles(&self, after: u32) -> Result<p::ProfileList> {
-        self.page(Command::ListProfiles(p::ListProfiles { after }))
+    /// Every saved profile, including IDs whose records could not be read.
+    pub fn list_profiles(&self) -> Result<p::ProfileList> {
+        self.call(Command::ListProfiles(p::ListProfiles {}), |r| match r {
+            response::Result::Profiles(list) => Some(list),
+            _ => None,
+        })
     }
 
-    /// Every saved profile, read page by page.
     pub fn all_profiles(&self) -> Result<Vec<p::ProfileListEntry>> {
-        self.pages::<p::ProfileList>(|after| {
-            Command::ListProfiles(p::ListProfiles {
-                after: after.copied().unwrap_or(0),
-            })
-        })
+        Ok(self.list_profiles()?.entries)
     }
 
     pub fn get_profile(&self, profile: u32) -> Result<p::Profile> {
@@ -455,26 +443,19 @@ impl Connection {
         self.done(Command::DeleteProfile(p::DeleteProfile { profile }))
     }
 
-    /// One page of a profile's rules after the rule `after` names; `None` starts the listing.
-    pub fn list_profile_rules(
-        &self,
-        profile: u32,
-        after: Option<p::ProfileRuleRef>,
-    ) -> Result<p::ProfileRules> {
-        self.page(Command::ListProfileRules(p::ListProfileRules {
-            profile,
-            after,
-        }))
+    /// Every rule of the profile.
+    pub fn list_profile_rules(&self, profile: u32) -> Result<p::ProfileRules> {
+        self.call(
+            Command::ListProfileRules(p::ListProfileRules { profile }),
+            |r| match r {
+                response::Result::ProfileRules(list) => Some(list),
+                _ => None,
+            },
+        )
     }
 
-    /// Every rule of a profile, read page by page.
     pub fn all_profile_rules(&self, profile: u32) -> Result<Vec<p::ProfileRule>> {
-        self.pages::<p::ProfileRules>(|after| {
-            Command::ListProfileRules(p::ListProfileRules {
-                profile,
-                after: after.copied(),
-            })
-        })
+        Ok(self.list_profile_rules(profile)?.rules)
     }
 
     /// Saves and forgets rules in one request; the changes apply in order. Success carries no
@@ -490,43 +471,34 @@ impl Connection {
         }))
     }
 
-    /// One page of a device's features after `after`; `None` starts the listing. Development
-    /// firmware only.
-    pub fn list_features(
-        &self,
-        device: u32,
-        after: Option<p::FeatureRef>,
-    ) -> Result<p::FeatureList> {
-        self.page(Command::ListFeatures(p::ListFeatures { device, after }))
+    /// Every feature of the device. Development firmware only.
+    pub fn list_features(&self, device: u32) -> Result<p::FeatureList> {
+        self.call(
+            Command::ListFeatures(p::ListFeatures { device }),
+            |r| match r {
+                response::Result::Features(list) => Some(list),
+                _ => None,
+            },
+        )
     }
 
-    /// Every feature of a device, read page by page. Development firmware only.
     pub fn all_features(&self, device: u32) -> Result<Vec<p::Feature>> {
-        self.pages::<p::FeatureList>(|after| {
-            Command::ListFeatures(p::ListFeatures {
-                device,
-                after: after.copied(),
-            })
-        })
+        Ok(self.list_features(device)?.features)
     }
 
-    /// One page of a directory's entries after the one named `after`; "" starts the listing.
-    /// Development firmware only.
-    pub fn list_files(&self, path: &str, after: &str) -> Result<p::FileList> {
-        self.page(Command::ListFiles(p::ListFiles {
-            path: path.into(),
-            after: after.into(),
-        }))
+    /// Every entry of a directory. Development firmware only.
+    pub fn list_files(&self, path: &str) -> Result<p::FileList> {
+        self.call(
+            Command::ListFiles(p::ListFiles { path: path.into() }),
+            |r| match r {
+                response::Result::Files(list) => Some(list),
+                _ => None,
+            },
+        )
     }
 
-    /// Every entry of a directory, read page by page. Development firmware only.
     pub fn all_files(&self, path: &str) -> Result<Vec<p::FileEntry>> {
-        self.pages::<p::FileList>(|after| {
-            Command::ListFiles(p::ListFiles {
-                path: path.into(),
-                after: after.cloned().unwrap_or_default(),
-            })
-        })
+        Ok(self.list_files(path)?.entries)
     }
 
     /// Development firmware only.
@@ -610,6 +582,7 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
         if shared.stop.load(Ordering::Acquire) {
             break Error::Closed;
         }
+        *shared.last_received.lock().unwrap() = Instant::now();
         let mut failed = None;
         for &byte in &buffer[..n] {
             let Some(frame) = decoder.push(byte) else {

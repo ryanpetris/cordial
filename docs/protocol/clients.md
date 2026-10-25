@@ -10,12 +10,9 @@ devices and applying saved settings after they exit.
 
 All three keep their view of the Dongle the same way:
 
-- Listing: a client reads a list one page at a time, passing the key of the last entry it received
-  as the next request's `after`, until `end` when it needs the whole list. It never assumes a page
-  size. Profile rules are ordered by input usage page, input usage, collection usage page, then
-  collection usage. Their `after` cursor is a `ProfileRuleRef` containing both the last rule's
-  `input` and `collection`; omitting it starts from the beginning. See
-  [Listings](compatibility.md#listings).
+- Listing: a client sends one request for the complete list. It waits for the frame delimiter,
+  decodes the merged protobuf response, and applies the complete collection or error in receive
+  order. It discards incomplete frames on disconnect. See [Listings](compatibility.md#listings).
 - Events: `device`, `adapter` and `profile` events replace the record they carry.
   `settings_changed` is applied to what the client has listed: whole domain objects are replaced by integration, group
   and optional component index, and removals of entries the client does not hold are ignored. Adapter and device error
@@ -31,6 +28,22 @@ All three keep their view of the Dongle the same way:
   state as they arrive.
 - Failed changes: only after an error, including a storage failure whose outcome is unknown, may a
   client query again to learn the current state, and only when it needs that state.
+
+## Client library listings
+
+Rust `Connection` methods `list_devices()`, `list_profiles()`, `list_settings(device)`,
+`list_profile_rules(profile)`, `list_features(device)` and `list_files(path)` return the complete
+protobuf response messages. TypeScript uses `listDevices()`, `listProfiles()`, `listSettings(device)`,
+`listProfileRules(profile)`, `listFeatures(device)` and `listFiles(path)` with the same result
+shapes. The collections are `entries`, `objects`, `rules` or `features`, as defined by each response.
+No method takes a cursor. The `all_*` and `listAll*` conveniences return the response collection
+from a single request. Rust identity and ordering helpers live in `cordial_client::order`.
+
+Both clients assemble responses on the host and preserve request FIFO and response/event ordering.
+Request timeouts measure incoming-byte inactivity so a progressing response can outlast the timeout.
+Every complete outgoing `Request` must fit 1024 protobuf bytes, including all entries and the
+command envelope. `SetProfileRules` is atomic per request, with no automatic splitting or atomicity
+across several requests.
 
 ## CLI
 
@@ -181,7 +194,7 @@ The desktop application uses the same commands and session rules as the CLI.
   longer listed, or the wait expires, the application leaves the page. A selected adapter tab also
   stays selected.
   A session that ends after running normally is reopened once if its port is still present.
-- Sessions: after `GetStatus` it reads every page of devices and each device's settings, then
+- Sessions: after `GetStatus` it reads the complete device list and each device's settings, then
   follows events, and lists the devices again when the adapter becomes ready. A USB reconnect
   opens a fresh session and reads status instead of expecting an event from the old session.
 - Disconnect: the user can disconnect an adapter from its context menu. The application closes the
@@ -204,10 +217,9 @@ The desktop application uses the same commands and session rules as the CLI.
   `ERROR_CODE_PROFILE_MEMORY_EXCEEDED` or `ERROR_CODE_PROFILE_LOAD_FAILED`. Each notification
   resets after its condition clears. Device errors appear on Diagnostics.
 - Adapters open on Details, with Settings, Profiles when the adapter supports them, and Diagnostics.
-  Profiles lists the profiles one page at a time, each with an icon for each role it changes, and
-  the configuration interfaces, each with its own switch and profile. The profile picker starts at
-  the first page and pages on its own. Changes on Settings and
-  Profiles stay staged, across tabs and pages, until Save sends them together in one request; a
+  Profiles lists every profile, each with an icon for each role it changes, and the configuration
+  interfaces, each with its own switch and profile. The profile picker reads the complete list.
+  Changes on Settings and Profiles stay staged across tabs until Save sends them together in one request; a
   failed save keeps them. Saving needs no reconnect confirmation dialog. Creating,
   copying and deleting profiles take effect at once.
 - Battery: a device's battery is low when a known `battery.level` is at or below the user's
@@ -332,13 +344,13 @@ Game Pad. A remap's output collection does not add a role. A Game Pad button rem
 button therefore gives the profile the gamepad role.
 
 These commands require `Status.profile_support`. A profile argument is its ID or a unique name; a
-name is found by reading the profile pages. A number is always taken as an ID, so a profile whose
+name is found by reading the profile list. A number is always taken as an ID, so a profile whose
 name is a number is addressed by its ID. LAYERS is one or more profile arguments in the order they
 apply, quoted as needed, or `none` for an empty list; a profile named `none` is addressed by its ID.
 
 | Command | Behavior |
 | --- | --- |
-| `profile list [--after ID]` | List every profile with its roles; with `--after`, list one page of profiles after that ID and the ID to pass as `--after` for the next page. |
+| `profile list` | List every profile with its roles. |
 | `profile show PROFILE` | Show a profile's name and roles. |
 | `profile create NAME` | Create an empty profile. |
 | `profile copy PROFILE NAME` | Copy on the adapter. |

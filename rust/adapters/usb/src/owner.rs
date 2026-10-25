@@ -249,11 +249,13 @@ impl<'a> Secondary<'a> {
         }
     }
     /// Follows the serial port opening and closing. A command in progress belongs to the session
-    /// that sent it: it finishes first, and its response is then discarded with the rest of that
+    /// that sent it. Atomic commands finish first; streamed reads are cancelled with the
     /// session's output and input.
     fn sync<S, B: EventSource>(&mut self, shared: &mut Shared<S, B>) {
         let status = self.io.status();
-        if status.session == self.seen.session || shared.app.command_pending() {
+        if status.session == self.seen.session
+            || (shared.app.command_pending() && !shared.app.streaming())
+        {
             return;
         }
         shared.app.session(status.serial_open(), &mut shared.radio);
@@ -264,9 +266,10 @@ impl<'a> Secondary<'a> {
         self.seen = status;
     }
     /// One step: asks USB to enumerate again when it should, saving everything waiting first, or
-    /// else continues the command in progress, or writes a deferred save that is due, or reads and
-    /// starts the next request, or answers one configuration editor packet, or does the
-    /// application's other work. Then it hands serial output to USB.
+    /// else continues a command that can progress, or writes a deferred save that is due, or reads
+    /// and starts the next request, or answers one configuration editor packet, or does the
+    /// application's other work. List steps alternate with saves, editor packets and background
+    /// work even when output is writable. Then it hands serial output to USB.
     pub async fn step<S: RecordStore, B: EventSource>(
         &mut self,
         shared: &mut Shared<S, B>,
@@ -311,7 +314,7 @@ impl<'a> Secondary<'a> {
             self.reconnect(app, radio);
             return;
         }
-        if app.command_pending() {
+        if app.command_pending() && !app.yield_command() {
             app.proceed(store, radio, now).await;
         } else if app.save(store, now).await {
             // The step wrote a deferred save.
@@ -381,13 +384,13 @@ impl<'a> Secondary<'a> {
         false
     }
     /// A stalled CDC reader cannot hold up USB reconfiguration indefinitely. The deadline starts
-    /// after the pending command responds and is unaffected by subsequent traffic or changes.
+    /// after an atomic command responds. Streamed reads may be cancelled at the deadline.
     fn reconnect_due(&mut self, app: &Application, now: u64) -> bool {
         if !app.manager.storage_ready || app.manager.usb_allocation().topology == self.topology {
             self.drain_since = None;
             return false;
         }
-        if app.command_pending() {
+        if app.command_pending() && !app.streaming() {
             return false;
         }
         let since = *self.drain_since.get_or_insert(now);

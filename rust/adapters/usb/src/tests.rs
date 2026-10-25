@@ -1016,19 +1016,19 @@ fn owner_reads(owner: &Owner<'static, support::Store, support::Radio>, kind: u8)
 #[test]
 fn a_listing_reads_one_record_per_step_and_input_goes_first() {
     use cordial_protocol::{request::Command, response::Result as R};
-    let (owner, io, link) = running(6, 0);
+    let (owner, io, link) = running(120, 0);
     let (response, read) = input_goes_first(
         &owner,
         io,
         link,
-        Command::ListProfiles(cordial_protocol::ListProfiles { after: 0 }),
+        Command::ListProfiles(cordial_protocol::ListProfiles {}),
         cordial_core::profiles::METADATA,
     );
     match response.result {
-        Some(R::Profiles(list)) => assert_eq!(list.entries.len(), 6),
+        Some(R::Profiles(list)) => assert_eq!(list.entries.len(), 120),
         other => panic!("{other:?}"),
     }
-    assert_eq!(read, 6);
+    assert_eq!(read, 120);
 }
 
 #[test]
@@ -1557,4 +1557,458 @@ fn stalled_response_detaches_at_a_fixed_deadline_despite_new_host_traffic() {
         block_on(outputs::saved_plan(&mut shared.store)).xinput_gamepads,
         1
     );
+}
+
+#[test]
+fn stalled_list_keeps_hid_running_and_reopen_cancels_the_read() {
+    use cordial_core::bluetooth::{Event, InputReport};
+    use cordial_protocol::{request::Command, response::Result as R};
+    let (owner, io, link) = running(80, 0);
+    let mut shared = block_on(owner.lock());
+    let mut loops = Loops::new(io, 0);
+    let mut host = Host::new();
+    for now in 0..100 {
+        loops.poll(&mut shared, NOW + now);
+        host.serve(io);
+    }
+    host.messages.clear();
+    host.send(io, Command::ListProfiles(cordial_protocol::ListProfiles {}));
+    for now in 100..200 {
+        loops.poll(&mut shared, NOW + now);
+        if io.serial_tx.is_full() {
+            break;
+        }
+    }
+    assert!(shared.app.streaming());
+    assert!(io.serial_tx.is_full());
+    let initial_reads = reads(&shared.store, cordial_core::profiles::METADATA);
+    let queued = shared.app.serial.queued();
+    let mut reports = 0;
+    for n in 0..1000 {
+        shared.radio.events.push_back(Event::Input(
+            InputReport::new(link, cordial_core::link::ServiceId(7), 0, &[(n % 2) as u8]).unwrap(),
+        ));
+        loops.poll(&mut shared, NOW + 200 + n);
+        if let Ok(tx) = io.hid_tx.try_receive() {
+            reports += 1;
+            io.hid_done
+                .try_send(HidDone {
+                    generation: tx.generation,
+                    sequence: tx.sequence,
+                    success: true,
+                })
+                .ok()
+                .unwrap();
+        }
+        assert_eq!(
+            reads(&shared.store, cordial_core::profiles::METADATA),
+            initial_reads
+        );
+        assert_eq!(shared.app.serial.queued(), queued);
+    }
+    assert!(
+        reports >= 999,
+        "{reports} HID reports during stalled serial output"
+    );
+    let stale = io.serial_tx.try_receive().ok().unwrap();
+    io.dtr(false);
+    io.dtr(true);
+    loops.poll(&mut shared, NOW + 2000);
+    assert!(!shared.app.command_pending());
+    io.serial_done
+        .try_send(SerialDone {
+            session: stale.session,
+            token: stale.token,
+            length: stale.length,
+        })
+        .ok()
+        .unwrap();
+    host = Host::new();
+    host.send(io, Command::GetStatus(cordial_protocol::GetStatus {}));
+    for now in 2001..2100 {
+        loops.poll(&mut shared, NOW + now);
+        host.serve(io);
+        if host.response().is_some() {
+            break;
+        }
+    }
+    assert!(matches!(
+        host.response().and_then(|r| r.result.as_ref()),
+        Some(R::Status(_))
+    ));
+    assert_eq!(
+        host.messages
+            .iter()
+            .filter(|m| matches!(m, cordial_protocol::message::Kind::Response(_)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn stalled_list_allows_raw_editor_writes_and_queries() {
+    use cordial_protocol::{message::Kind, request::Command, response::Result as R};
+    for interface in [Interface::Via, Interface::Vial] {
+        let io = Io::new();
+        let (mut app, mut store, _) = profile_application();
+        app.manager.preference.configuration_interfaces = std::vec![enabled(interface, 1)];
+        for _ in 2..80 {
+            block_on(cordial_core::profiles::create(
+                &mut store,
+                "Editor streaming profile",
+                &cordial_core::profiles::Rules::default(),
+            ))
+            .unwrap();
+        }
+        let mut shared = shared(app, store);
+        let mut loops = Loops::new(&io, interface.bit());
+        BusHandler(&io).configured(true);
+        io.dtr(true);
+        let mut host = Host::new();
+        for now in 0..100 {
+            loops.poll(&mut shared, NOW + now);
+            host.serve(&io);
+        }
+        host.messages.clear();
+        host.send(
+            &io,
+            Command::ListProfiles(cordial_protocol::ListProfiles {}),
+        );
+        for now in 100..200 {
+            loops.poll(&mut shared, NOW + now);
+            if io.serial_tx.is_full() {
+                break;
+            }
+        }
+        assert!(shared.app.streaming() && !shared.app.serial.stream_ready());
+        assert!(io.serial_tx.is_full());
+        let queued = shared.app.serial.queued();
+        host.send(&io, Command::GetStatus(cordial_protocol::GetStatus {}));
+        for (step, command) in [5, 4].into_iter().enumerate() {
+            let mut bytes = [0; 32];
+            bytes[0] = command;
+            if command == 5 {
+                bytes = set_keycode();
+            }
+            io.raw[0]
+                .rx
+                .try_send(RawPacket {
+                    generation: io.status().generation,
+                    interface,
+                    bytes,
+                })
+                .ok()
+                .unwrap();
+            loops.poll(&mut shared, NOW + 200 + step as u64);
+            let reply = io.raw[0].tx.try_receive().expect("raw editor reply");
+            assert_eq!(reply.interface, interface);
+            assert_eq!(&reply.bytes[..6], &[command, 0, 0, 0, 0, 28]);
+            assert_eq!(loaded_rules(&shared.app, 1), 1);
+            assert!(shared.app.streaming());
+            assert_eq!(shared.app.serial.queued(), queued);
+        }
+        assert_eq!(rules(&mut shared.store, 1), 0);
+        for now in 206..2200 {
+            loops.poll(&mut shared, NOW + now);
+        }
+        assert_eq!(rules(&mut shared.store, 1), 1);
+        assert!(shared.app.streaming() && io.serial_tx.is_full());
+        assert_eq!(shared.app.serial.queued(), queued);
+        assert!(host.messages.is_empty());
+        for now in 2200..4200 {
+            loops.poll(&mut shared, NOW + now);
+            host.serve(&io);
+        }
+        assert!(matches!(
+            host.messages.first(),
+            Some(Kind::Response(response)) if matches!(
+                &response.result, Some(R::Profiles(profiles)) if profiles.entries.len() == 80
+            )
+        ));
+        let responses: std::vec::Vec<_> = host
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Kind::Response(response) => response.result.as_ref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert!(matches!(responses[1], R::Status(_)));
+        assert!(host.messages.iter().skip(1).any(|message| matches!(
+            message,
+            Kind::Event(event) if matches!(
+                &event.kind, Some(cordial_protocol::event::Kind::Profile(profile)) if profile.id == 1
+            )
+        )));
+    }
+}
+
+#[test]
+fn stalled_list_allows_reconnect_settings_jobs_and_deferred_saves() {
+    use cordial_core::{
+        bluetooth::{Event, InputReport},
+        compact::{Metadata, Preference},
+        devices::{Policies, Roles},
+        model::{
+            hidpp::{FeatureId, FeatureRevision},
+            settings::{SettingKey, SettingScope},
+        },
+        settings::PreferenceStore,
+        storage::Preferences,
+    };
+    use cordial_protocol::request::Command;
+    let (owner, io, old_link) = running(80, 0);
+    let mut shared = block_on(owner.lock());
+    let mut loops = Loops::new(io, 0);
+    let mut host = Host::new();
+    for now in 0..100 {
+        loops.poll(&mut shared, NOW + now);
+        host.serve(io);
+    }
+    let mut policy = block_on(
+        Policies {
+            store: &mut shared.store,
+        }
+        .load(77),
+    )
+    .unwrap();
+    policy.name = "Reconnected keyboard".into();
+    policy.roles = Roles(0);
+    block_on(
+        Policies {
+            store: &mut shared.store,
+        }
+        .save(&policy),
+    )
+    .unwrap();
+    let preference = Preference {
+        metadata: Metadata {
+            key: SettingKey::BacklightEnabled,
+            feature: FeatureId::BACKLIGHT,
+            revision: FeatureRevision(3),
+            scope: SettingScope::Device,
+            choices: std::boxed::Box::new([]),
+            range: None,
+        },
+        value: 1,
+    };
+    block_on(
+        Preferences {
+            store: &mut shared.store,
+            device: 77,
+        }
+        .save(&preference),
+    )
+    .unwrap();
+    host.messages.clear();
+    host.send(io, Command::ListProfiles(cordial_protocol::ListProfiles {}));
+    for now in 100..200 {
+        loops.poll(&mut shared, NOW + now);
+        if io.serial_tx.is_full() {
+            break;
+        }
+    }
+    assert!(shared.app.streaming() && io.serial_tx.is_full());
+    let profile_reads = reads(&shared.store, cordial_core::profiles::METADATA);
+    shared.radio.events.push_back(Event::Disconnected {
+        link: old_link,
+        error: None,
+    });
+    loops.poll(&mut shared, NOW + 200);
+    let Shared {
+        app,
+        store: _,
+        radio,
+    } = &mut *shared;
+    let slot = app.manager.find(77).unwrap();
+    let link = app.manager.link_for(slot).unwrap_or_else(|| {
+        app.manager
+            .connect(slot, true, 90_000, None, radio)
+            .unwrap()
+            .unwrap()
+    });
+    shared.radio.events.push_back(Event::Connected {
+        link,
+        descriptors: support::descriptor(),
+        max_output: 255,
+        layout: None,
+    });
+    loops.poll(&mut shared, NOW + 201);
+    assert!(
+        shared.app.manager.devices[slot]
+            .as_ref()
+            .unwrap()
+            .live
+            .as_ref()
+            .unwrap()
+            .policy
+            .is_none()
+    );
+    shared.radio.events.push_back(Event::Input(
+        InputReport::new(link, cordial_core::link::ServiceId(7), 0, &[1]).unwrap(),
+    ));
+    let mut settings_started = false;
+    for now in 202..2200 {
+        loops.poll(&mut shared, NOW + now);
+        settings_started |= shared
+            .app
+            .manager
+            .connection(link)
+            .unwrap()
+            .runtime
+            .as_ref()
+            .unwrap()
+            .settings
+            .busy();
+        if let Ok(tx) = io.hid_tx.try_receive() {
+            io.hid_done
+                .try_send(HidDone {
+                    generation: tx.generation,
+                    sequence: tx.sequence,
+                    success: true,
+                })
+                .ok()
+                .unwrap();
+        }
+    }
+    let live = shared.app.manager.devices[slot]
+        .as_ref()
+        .unwrap()
+        .live
+        .as_ref()
+        .unwrap();
+    assert_eq!(&*live.policy.as_ref().unwrap().name, "Reconnected keyboard");
+    assert_eq!(
+        live.catalog.preferences().collect::<std::vec::Vec<_>>(),
+        [&preference]
+    );
+    assert!(
+        settings_started,
+        "hydration must start the saved-settings job"
+    );
+    let saved = block_on(
+        Policies {
+            store: &mut shared.store,
+        }
+        .load(77),
+    )
+    .unwrap();
+    assert_eq!(
+        saved.roles,
+        Roles(cordial_core::hid::KEYBOARD),
+        "deferred roles save must finish"
+    );
+    assert_eq!(
+        reads(&shared.store, cordial_core::profiles::METADATA),
+        profile_reads
+    );
+    assert!(shared.app.streaming() && io.serial_tx.is_full());
+    assert!(host.response().is_none());
+}
+
+#[test]
+fn draining_list_gives_raw_editors_a_turn_before_completion() {
+    use cordial_protocol::{message::Kind, request::Command, response::Result as R};
+    for interface in [Interface::Via, Interface::Vial] {
+        for corrupt in [false, true] {
+            let io = Io::new();
+            let (mut app, mut store, _) = profile_application();
+            app.manager.preference.configuration_interfaces = std::vec![enabled(interface, 1)];
+            for _ in 2..200 {
+                block_on(cordial_core::profiles::create(
+                    &mut store,
+                    "Editor streaming profile",
+                    &cordial_core::profiles::Rules::default(),
+                ))
+                .unwrap();
+            }
+            if corrupt {
+                for id in 3..=200 {
+                    store
+                        .records
+                        .insert(cordial_core::storage::record_key(8, id), std::vec![0xff]);
+                }
+            }
+            let mut shared = shared(app, store);
+            let mut loops = Loops::new(&io, interface.bit());
+            BusHandler(&io).configured(true);
+            io.dtr(true);
+            let mut host = Host::new();
+            for now in 0..100 {
+                loops.poll(&mut shared, NOW + now);
+                host.serve(&io);
+            }
+            host.messages.clear();
+            host.send(
+                &io,
+                Command::ListProfiles(cordial_protocol::ListProfiles {}),
+            );
+            let mut now = NOW + 100;
+            for _ in 0..40 {
+                loops.poll(&mut shared, now);
+                host.serve(&io);
+                now += 1;
+            }
+            assert!(shared.app.streaming());
+            host.send(&io, Command::GetStatus(cordial_protocol::GetStatus {}));
+            for command in [5, 4, 4, 4] {
+                let mut bytes = [0; 32];
+                bytes[0] = command;
+                if command == 5 {
+                    bytes = set_keycode();
+                }
+                io.raw[0]
+                    .rx
+                    .try_send(RawPacket {
+                        generation: io.status().generation,
+                        interface,
+                        bytes,
+                    })
+                    .ok()
+                    .unwrap();
+                let mut reply = None;
+                for _ in 0..4 {
+                    loops.poll(&mut shared, now);
+                    host.serve(&io);
+                    now += 1;
+                    assert!(
+                        shared.app.streaming(),
+                        "editor reply must precede list completion"
+                    );
+                    assert!(host.messages.is_empty(), "no interleaved response or event");
+                    reply = io.raw[0].tx.try_receive().ok();
+                    if reply.is_some() {
+                        break;
+                    }
+                }
+                let reply = reply.expect(
+                    "editor reply within four secondary steps while the host drains the list",
+                );
+                assert_eq!(&reply.bytes[..6], &[command, 0, 0, 0, 0, 28]);
+                assert_eq!(loaded_rules(&shared.app, 1), 1);
+            }
+            for _ in 0..4000 {
+                loops.poll(&mut shared, now);
+                host.serve(&io);
+                now += 1;
+            }
+            assert!(
+                matches!(host.messages.first(), Some(Kind::Response(response)) if matches!(
+                    &response.result, Some(R::Profiles(profiles)) if profiles.entries.len() == if corrupt { 2 } else { 200 }
+                ))
+            );
+            let responses: std::vec::Vec<_> = host
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Kind::Response(response) => response.result.as_ref(),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(responses.len(), 2);
+            assert!(matches!(responses[1], R::Status(_)));
+            assert_eq!(rules(&mut shared.store, 1), 1);
+        }
+    }
 }
