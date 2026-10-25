@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import re
 
+from firmware_artifact import write_text_if_changed
+
 ROOT = Path(__file__).resolve().parent.parent
 PICO_TARGETS = {
     ("rp2040", "rp2040"): ("rp2040", "thumbv6m-none-eabi", 29, 262144),
@@ -155,7 +157,7 @@ ASSERT(_heap_end > __sheap, "Static RAM leaves no application heap");
 """
     # link.x includes memory.x before defining its default _stext. Keeping the
     # insertion here also makes dependency links independent of argument order.
-    (out / "memory.x").write_text(memory + sections)
+    write_text_if_changed(out / "memory.x", memory + sections)
     # Concrete peripheral tokens keep pin ownership checked by Rust, including
     # arbitrary supported pin maps. No runtime table or unsafe pin stealing.
     code = f"""pub const FLASH_BYTES: usize = {flash};
@@ -188,7 +190,7 @@ pub const RADIO_LED: Option<(u8, bool)> = {('Some((' + str(radio['led']['pin']) 
 #[macro_export]
 macro_rules! indicator_pin {{ ($p:ident) => {{ {expression} }}; }}
 """
-    (out / "board.rs").write_text(code)
+    write_text_if_changed(out / "board.rs", code)
     if config["radio_backend"] == "pico-sdk-cyw43":
         defines = {
             "PICO_CYW43_SUPPORTED": 1, "PICO_FLASH_SIZE_BYTES": flash,
@@ -203,7 +205,7 @@ macro_rules! indicator_pin {{ ($p:ident) => {{ {expression} }}; }}
         }
         if config["chip"] == "rp2350":
             defines["PICO_RP2350A"] = int(config["package"] == "a")
-        (out / "cordial.h").write_text("#pragma once\n" + "".join(
+        write_text_if_changed(out / "cordial.h", "#pragma once\n" + "".join(
             f"#define {key} {value}\n" for key, value in defines.items()))
 
 

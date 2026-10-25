@@ -18,6 +18,18 @@ SUFFIXES = {"production": "", "debug": "-debug", "development": "-dev"}
 VERSION = rf"{RELEASE}(?:-debug|-dev)?"
 
 
+def write_text_if_changed(path, text):
+    """Write UTF-8 text without touching byte-identical generated files."""
+    path = Path(path)
+    data = text.encode("utf-8")
+    try:
+        if path.read_bytes() == data:
+            return
+    except FileNotFoundError:
+        pass
+    path.write_bytes(data)
+
+
 def version(profile):
     """The firmware version for a build profile."""
     return resolve() + SUFFIXES[profile]
@@ -39,7 +51,7 @@ def generate(config, out):
     value = manifest(config)
     blob = MAGIC + json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\0"
     section = ".rodata.cordial_metadata" if config["chip"] == "esp32s3" else ".cordial_metadata"
-    (Path(out) / "metadata.rs").write_text(
+    write_text_if_changed(Path(out) / "metadata.rs",
         f'const FIRMWARE_VERSION: &str = {json.dumps(value["version"])};\n'
         + '#[used]\n#[unsafe(no_mangle)]\n' + f'#[unsafe(link_section = "{section}")]\n'
         + f'pub static CORDIAL_METADATA: [u8; {len(blob)}] = {list(blob)!r};\n')

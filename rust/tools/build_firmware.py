@@ -24,6 +24,35 @@ def command(argv, env):
     subprocess.run(list(map(str, argv)), cwd=ROOT, env=env, check=True)
 
 
+def esp_build(argv, env):
+    """Build ESP firmware and locate the SDK output reported by this Cargo invocation."""
+    argv = list(map(str, argv)) + ["--message-format=json-render-diagnostics"]
+    messages = []
+    with subprocess.Popen(argv, cwd=ROOT, env=env, stdout=subprocess.PIPE, encoding="utf-8") as process:
+        for line in process.stdout:
+            if line.startswith("{"):
+                messages.append(line)
+            else:
+                print(line, end="", flush=True)
+        if process.wait():
+            raise subprocess.CalledProcessError(process.returncode, argv)
+    outputs = []
+    for line in messages:
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError("Invalid Cargo JSON message during ESP build") from error
+        if (message.get("reason") == "build-script-executed"
+                and "#esp-idf-sys@" in message.get("package_id", "")):
+            out_dir = message.get("out_dir")
+            if not isinstance(out_dir, str) or not Path(out_dir).is_absolute():
+                raise ValueError("Cargo reported an invalid esp-idf-sys OUT_DIR")
+            outputs.append(Path(out_dir) / "build")
+    if len(outputs) != 1:
+        raise ValueError("Expected one esp-idf-sys build-script-executed message from Cargo")
+    return outputs[0]
+
+
 def tool(name):
     found = shutil.which(name)
     if found:
@@ -133,7 +162,7 @@ def esp_startup_frames(disassembly):
     return frames
 
 
-def package(config, built, elf, output, name, gcc, env):
+def package(config, sdk, elf, output, name, gcc, env):
     destination = output / f"cordial-{name}"
     shutil.copy2(elf, destination.with_suffix(".elf"))
     if config["chip"] != "esp32s3":
@@ -150,11 +179,7 @@ def package(config, built, elf, output, name, gcc, env):
             [str(gcc).removesuffix("gcc") + "objdump", "-dC", str(elf)], env=env, text=True)
         frames = esp_startup_frames(disassembly)
         print(f"ESP startup stack frames: {frames}", flush=True)
-        sdk_outputs = list(built.glob("build/esp-idf-sys-*/out/build/flasher_args.json"))
-        if len(sdk_outputs) != 1:
-            raise ValueError("Expected one current ESP SDK build")
-        sdk = sdk_outputs[0].parent
-        settings = json.loads(sdk_outputs[0].read_text())["flash_settings"]
+        settings = json.loads((sdk / "flasher_args.json").read_text())["flash_settings"]
         if settings["flash_size"] != f"{config['flash_bytes']//1048576}MB":
             raise ValueError("ESP SDK flash size differs from board configuration")
         sdkconfig = dict(line.split("=", 1) for line in (sdk.parent / "sdkconfig").read_text().splitlines()
@@ -206,7 +231,7 @@ def build(config_path, profile, output, clippy=False):
     # esp-idf-sys regenerates its SDK configuration from these tracked defaults
     # whenever they change. It keeps the result under its own Cargo OUT_DIR.
     firmware_config.generate(config, generated)
-    (generated / "board.json").write_text(json.dumps(raw, sort_keys=True))
+    artifact.write_text_if_changed(generated / "board.json", json.dumps(raw, sort_keys=True))
     env = dict(os.environ, CORDIAL_PYTHON=sys.executable,
                EMBASSY_USB_MAX_INTERFACE_COUNT="12", EMBASSY_USB_MAX_HANDLER_COUNT="10")
     env["CORDIAL_VERSION"] = artifact.resolve()
@@ -239,17 +264,22 @@ def build(config_path, profile, output, clippy=False):
         cargo, extra = ["cargo"], []
     env[f"CC_{triple.replace('-', '_').replace('.', '_')}"] = str(gcc)
     env[f"AR_{triple.replace('-', '_').replace('.', '_')}"] = str(gcc).removesuffix("gcc") + "ar"
-    command(cargo + ["clippy" if clippy else "build", "--locked", "--manifest-path",
+    argv = cargo + ["clippy" if clippy else "build", "--locked", "--manifest-path",
                     ROOT / f"platforms/{platform}/Cargo.toml", "--target", triple,
-                    "--release", "--no-default-features", "--features", ",".join(features)]
-            + extra + (["--", "-D", "warnings"] if clippy else []), env)
+                    "--release", "--no-default-features", "--features", ",".join(features)] \
+            + extra + (["--", "-D", "warnings"] if clippy else [])
+    sdk_build = None
+    if platform == "esp32s3" and not clippy:
+        sdk_build = esp_build(argv, env)
+    else:
+        command(argv, env)
     if clippy:
         return
     built = directory / "cargo" / triple / "release"
     elf = built / f"cordial-{platform}"
     output = Path(output).resolve() / version / name
     def populate(staging):
-        package(config, built, elf, staging, name, gcc, env)
+        package(config, sdk_build, elf, staging, name, gcc, env)
         release_docs(staging)
         sdk = Path(env["IDF_PATH"]) if platform == "esp32s3" else None
         dependency_notices.record(cargo, platform, features, triple, env, staging, sdk)

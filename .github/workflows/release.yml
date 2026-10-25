@@ -59,6 +59,8 @@ jobs:
           persist-credentials: false
       - name: Build portable applications
         run: make package-desktop package-cli package-web
+      - name: Check Docker build cache
+        run: CORDIAL_TEST_DOCKER=docker python3 -m unittest discover -s tools -p test_build_cache.py
       - name: Check desktop archive
         run: |
           python3 tools/check_release_archive.py "desktop/dist/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" desktop "$CORDIAL_VERSION"

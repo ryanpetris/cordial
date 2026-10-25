@@ -24,7 +24,7 @@ def prepare_git(name, url, revision):
     source.mkdir(parents=True, exist_ok=True)
 
     def git(*args, capture=False):
-        result = subprocess.run(["git", "-C", str(source), *args], check=True,
+        result = subprocess.run(["git", "--no-optional-locks", "-C", str(source), *args], check=True,
                                 capture_output=capture, text=True)
         return result.stdout.strip() if capture else None
 

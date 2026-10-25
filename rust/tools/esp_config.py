@@ -3,6 +3,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from firmware_artifact import write_text_if_changed
+
 BACKENDS = {"btstack": "BT_CONTROLLER_ONLY", "esp-nimble": "BT_NIMBLE_ENABLED"}
 
 
@@ -40,7 +42,7 @@ def generate(config, out):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     partitions = out / "partitions.csv"
-    partitions.write_text(f"""# Name,Type,SubType,Offset,Size
+    write_text_if_changed(partitions, f"""# Name,Type,SubType,Offset,Size
 phy_init,data,phy,0xf000,0x1000
 factory,app,factory,0x10000,{config['storage_offset'] - 0x10000:#x}
 cordial_layout,data,0x40,{config['storage_offset']:#x},0x1000
@@ -86,8 +88,8 @@ cordial_app,data,0x83,{config['storage_offset'] + 4096:#x},{config['storage_byte
             digest.update(path.read_bytes())
     defaults = f"# Project native sources: {digest.hexdigest()}\n"
     defaults += "".join(f"CONFIG_{key}={encode(value)}\n" for key, value in values.items())
-    (out / "sdkconfig.defaults").write_text(defaults)
-    (out / "board.rs").write_text(f"""pub const DEFAULT_ADAPTER_NAME: &str = {json.dumps(config["default_adapter_name"], ensure_ascii=False)};
+    write_text_if_changed(out / "sdkconfig.defaults", defaults)
+    write_text_if_changed(out / "board.rs", f"""pub const DEFAULT_ADAPTER_NAME: &str = {json.dumps(config["default_adapter_name"], ensure_ascii=False)};
 pub const HARDWARE: &str = {json.dumps(config['name'])};
 pub const PROFILE_MEMORY_BUDGET: Option<u32> = {profile_memory_budget(config)};
 pub const STORAGE_START: u32 = {config['storage_offset']};

@@ -47,15 +47,28 @@ image-arch:
 image-deb:
 	$(DOCKER) build -t cordial-deb-$(DEB_DISTRIBUTION) --build-arg BASE=$(DEB_BASE) -f docker/deb.Dockerfile desktop/packaging/debian
 comma := ,
-# $(call build,IMAGE,COMMAND,OUTPUTS[,INPUT]) runs COMMAND with bash in the image and exports the
+# $(call build,IMAGE,COMMAND,OUTPUTS[,INPUT,NPM]) runs COMMAND with bash in the image and exports the
 # paths matching OUTPUTS, relative to the checkout; each replaces the checkout's copy, so nothing
 # from an earlier build is left inside it. INPUT is a file the build reads from /inputs. Each
-# target has its own working directories under .cache/docker/, so parallel builds stay apart.
+# target has its own working directories under .cache/docker/. Concurrent invocations of the same
+# target must use separate checkouts. The runtime hash selects the retained toolchain reference
+# and caches independently of image export metadata.
+# NPM selects the application dependency layer for desktop and web targets.
 define build
 rm -rf .cache/docker/$@
 mkdir -p .cache/docker/$@/inputs
 $(if $(4),cp --reflink=auto '$(4)' .cache/docker/$@/inputs/)
-$(DOCKER) build --progress=plain -f docker/build.Dockerfile --build-arg IMAGE=cordial-$(1) \
+image=$$($(DOCKER) image inspect --format '{{.Id}}' cordial-$(1))
+runtime_format='{{json .RootFS}} {{json .Config}} {{json .Os}} {{json .Architecture}} {{json (or .Variant "")}}'
+runtime=$$($(DOCKER) image inspect --format "$$runtime_format" "$$image")
+cache_key=$$(printf '%s\n' "$$runtime" | sha256sum | cut -d' ' -f1)
+image_ref="cordial-toolchain:$$cache_key"
+cached_runtime=$$($(DOCKER) image inspect --format "$$runtime_format" "$$image_ref" 2>/dev/null || true)
+if [ "$$cached_runtime" != "$$runtime" ]; then $(DOCKER) tag "$$image" "$$image_ref"; fi
+dependency_key=$$(sha256sum rust/tools/firmware_dependencies.py | cut -d' ' -f1)
+$(DOCKER) build --progress=plain -f docker/build.Dockerfile --build-arg IMAGE="$$image_ref" \
+  --build-arg PREPARE_STAGE=$(if $(5),application,toolchain) \
+  --build-arg CACHE_ID="$$cache_key" --build-arg DEPENDENCY_ID="$$dependency_key" \
   --build-arg CORDIAL_VERSION --build-arg SOURCE_DATE_EPOCH --build-arg CORDIAL_HOMEPAGE \
   --build-arg COMMAND='$(2)' --build-arg OUTPUTS='$(3)' --build-context inputs=.cache/docker/$@/inputs \
   --output type=local$(comma)dest=.cache/docker/$@/out .
@@ -70,13 +83,13 @@ done
 endef
 
 desktop: image-app
-	$(call build,app,make local-desktop,desktop/out/main desktop/out/preload desktop/out/renderer)
+	$(call build,app,make local-desktop,desktop/out/main desktop/out/preload desktop/out/renderer,,npm)
 web: image-app
-	$(call build,app,make local-web,desktop/out/web)
+	$(call build,app,make local-web,desktop/out/web,,npm)
 cli: image-app
 	$(call build,app,make local-cli,rust/target/release/cordial)
 
-desktop/node_modules/.package-lock.json: desktop/package.json desktop/package-lock.json $(wildcard desktop/packages/*/package.json)
+desktop/node_modules/.package-lock.json: desktop/package.json desktop/package-lock.json $(wildcard desktop/packages/*/package.json desktop/.npmrc desktop/npm-shrinkwrap.json)
 	npm ci --include=dev --prefix desktop
 local-desktop: desktop/node_modules/.package-lock.json
 	npm --prefix desktop run build
@@ -94,11 +107,11 @@ firmware-all:
 package-firmware: firmware
 
 package-desktop: image-app
-	$(call build,app,make local-package-desktop,desktop/dist/*.AppImage desktop/dist/*.tar.gz)
+	$(call build,app,make local-package-desktop,desktop/dist/*.AppImage desktop/dist/*.tar.gz,,npm)
 package-desktop-tar: image-app
-	$(call build,app,make local-package-desktop-tar,desktop/dist/*.tar.gz)
+	$(call build,app,make local-package-desktop-tar,desktop/dist/*.tar.gz,,npm)
 package-web: image-app
-	$(call build,app,make local-package-web,build/packages/web/*)
+	$(call build,app,make local-package-web,build/packages/web/*,,npm)
 package-cli package-cli-tar: image-app
 	$(call build,app,make local-package-cli CLI_TARGET=$(CLI_TARGET),build/release/cordial-cli-*.tar.gz)
 local-package-desktop-tar: DESKTOP_TARGETS = tar.gz

@@ -40,11 +40,59 @@ Each build runs in a toolchain image from `docker/`, created on first use and
 reused afterwards. The build copies the checkout into the image, leaving out the
 paths in `.dockerignore` (build outputs, caches, installed dependencies and Git
 data), builds there, and copies only its outputs back to the same places a local
-build would put them, replacing the earlier copy of each output. Every build
-starts from that clean copy, downloading its dependencies and compiling from
-scratch; only a build of identical sources can reuse Docker's cached result.
-Docker keeps those results until `docker builder prune` removes them, and
-firmware builds take several gigabytes each. Docker BuildKit is required.
+build would put them, replacing the earlier copy of each output. Docker BuildKit
+is required.
+
+BuildKit cache mounts retain Cargo downloads, Rust compilation outputs, pinned
+firmware dependencies, npm downloads, Electron and electron-builder downloads,
+and tools that use `XDG_CACHE_HOME`. Desktop, web and their portable packages
+share a Docker layer containing the complete npm installation, including native
+modules, workspace links and nested dependencies. The layer runs `npm ci` with
+development dependencies before copying application sources. Its inputs are
+`desktop/package.json`, `desktop/package-lock.json`, all workspace manifests,
+and `desktop/.npmrc` and `desktop/npm-shrinkwrap.json` when present.
+Changing those inputs or the toolchain runtime creates a new installation;
+application source edits reuse it. If installation hooks need repository files,
+include those files in the `npm_inputs` extraction in `docker/build-cache.py`.
+CLI, firmware and native archive repackaging skip this layer. Packaged outputs
+are not cached. Firmware keeps its board configuration and profile hash
+directories under `target/firmware/`; CLI target triples remain separate under
+`rust/target/`.
+
+Caches are shared by checkouts using the same Docker builder and toolchain runtime.
+The cache key hashes the image's filesystem layers, runtime configuration, OS,
+architecture and variant. Image export metadata, such as provenance, can change
+the image ID without changing this key. Changes to native libraries, compilers,
+runtime configuration or platform get separate caches. Firmware compilation and
+dependency caches also include the SHA-256 of `rust/tools/firmware_dependencies.py`,
+so different dependency pins never switch a shared SDK checkout. Cargo handles
+Rust dependency and compiler-option changes.
+Copied input files retain timestamps by content, so Cargo detects source changes
+even when another checkout supplies older timestamps. Installed `node_modules`
+trees are excluded from source hashing. The npm installation marker is refreshed
+after timestamp normalization so Make reuses the prepared installation. Build
+commands and artifact validation still run when the Docker result layer is not
+reusable.
+
+Builds using the same toolchain runtime serialize access to their cache mounts.
+This protects Cargo outputs, generated configuration and mutable SDK checkouts
+across concurrent builds. Different toolchain runtimes can build in parallel.
+Each Make target has an export scratch directory under `.cache/docker/`;
+concurrent invocations of the same target must use separate checkouts. Toolchain
+images also receive `cordial-toolchain:<runtime-hash>` tags. Each tag retains the
+first image with matching runtime contents, so provenance changes preserve the
+npm layer and a rebuild of the regular image tag preserves the selected
+environment. An existing runtime tag with different contents is replaced.
+
+`make clean` removes exported outputs but leaves BuildKit caches intact. To clear
+unused cache mounts for the active Docker builder, run
+`docker builder prune --filter type=exec.cachemount`. This affects all projects
+using that builder, so coordinate cleanup with other builds. Docker may also
+reclaim cache mounts during normal garbage collection; a missing cache triggers
+a rebuild. Pruning also recovers dependency caches left incomplete by an
+interrupted checkout. Cache mounts can use several gigabytes per toolchain and
+firmware configuration. Content-tagged toolchain images remain until their tags
+are removed with `docker image rm cordial-toolchain:<runtime-hash>`.
 
 The CLI executable is `rust/target/release/cordial`. The desktop build is in
 `desktop/out/`.
@@ -124,8 +172,8 @@ make firmware-all
 ```
 
 The Pico image has Rust and ARM GCC; the ESP32-S3 image adds Rust, espup and
-ldproxy to Espressif's ESP-IDF v6.1 image. Each build fetches the pinned Pico SDK
-and BTstack sources inside the image.
+ldproxy to Espressif's ESP-IDF v6.1 image. Builds fetch the pinned Pico SDK and
+BTstack sources into the dependency cache as needed.
 
 `BOARD` defaults to `pico_w`. `PROFILE` is `production`, `debug` or `development`
 and defaults to `development`, independently of compiler release optimization.
@@ -244,6 +292,12 @@ board a production firmware archive, `cordial-firmware-<version>-<board>.tar.gz`
 and a debug archive, `cordial-firmware-<version>-debug-<board>.tar.gz`, built with
 the debug profile. Each archive holds its firmware version's package directory.
 
+Release builds reuse Docker toolchain images and BuildKit caches within each job.
+Each firmware job reuses preparation between checking and packaging its board and
+profile. Production and debug profiles run in parallel. These caches last only for
+that job and are not transferred to other runners or later releases. Native
+application packaging jobs reuse the portable archives through workflow artifacts.
+
 Third-party license material is retained in `notices/`. Firmware and CLI packages
 include the project license, generated dependency inventories and license notices.
 
@@ -262,6 +316,18 @@ same series as `CORDIAL_VERSION`, or the newest release for a development build
 from 1.0; the first release of a series is not compared. Rust code is generated from `proto/` at build time;
 the second command regenerates the checked-in TypeScript messages after a schema changes.
 Install Clippy with `(cd rust && rustup component add clippy)` before checking.
+
+The build-cache tests also have a tiny npm workspace fixture that runs in Docker.
+Build the app image before running it:
+
+```sh
+make image-app
+CORDIAL_TEST_DOCKER=docker python3 -m unittest discover -s tools -p test_build_cache.py
+```
+
+`CORDIAL_TEST_APP_IMAGE` selects an alternative app toolchain image. The fixture
+checks installation reuse, source and manifest edits, runtime changes, workspace
+links, nested dependencies, failed-install retries and clean exports.
 
 Linux CLI terminal checks additionally require `pyte` and a built CLI:
 

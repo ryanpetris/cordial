@@ -15,6 +15,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", source.display());
     let git = |args: &[&str]| {
         let out = Command::new("git")
+            .arg("--no-optional-locks")
             .arg("-C")
             .arg(&source)
             .args(args)
