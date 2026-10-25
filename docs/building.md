@@ -238,11 +238,11 @@ arguments. ESP32-S3 uses its ROM download protocol and the regions in `flash.jso
 
 Firmware updates within one storage format, named by the layout identity in the
 [storage format](storage-format.md), preserve saved bonds, identities and
-preferences. Firmware never opens or reformats storage of another format, such
-as the `littlefs-json-1` storage of release 0.6.3 and earlier, so the adapter
-never becomes ready. A first installation also requires blank storage; data from
-factory or other firmware prevents provisioning. For a first installation or an
-update from another storage format, erase the board's whole flash before flashing
+preferences. Firmware never opens or reformats storage of another format, so
+the adapter cannot become ready with incompatible storage. A first installation
+also requires blank storage; data from factory or other firmware prevents
+provisioning. For a first installation or an update from another storage format,
+erase the board's whole flash before flashing
 it: on Pico boards in BOOTSEL mode with `picotool erase` (picotool 2.0 or later), then copy the
 UF2; on the ESP32-S3 with `esptool --chip esp32s3 erase_flash` before
 `write_flash`. The adapter then starts with a new Bluetooth identity and no

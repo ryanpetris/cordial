@@ -4,9 +4,8 @@ The application uses upstream LittleFS through `littlefs2` 0.8.1 on Pico and
 ESP32-S3. The layout identity is `littlefs-2`. Each file holds one protobuf
 message from [`proto/storage.proto`](../proto/storage.proto). There is no
 migration or automatic reformat on a read failure, and storage of another layout
-identity, such as an earlier release's `littlefs-json-1`, stays unopened until
-the board is re-flashed with its flash erased, as [building](building.md#firmware)
-describes.
+identity stays unopened until the board is re-flashed with its flash erased, as
+[building](building.md#firmware) describes.
 Application data and Bluetooth bonds use the common filesystem. The ESP32-S3
 partition table has no NVS partition.
 

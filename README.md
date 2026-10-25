@@ -125,11 +125,11 @@ Log out and back in after changing groups.
 Download your board's firmware from the
 [latest release](https://github.com/ryanpetris/cordial/releases/latest) and extract it.
 
-For a first installation, or an update from release 0.6.3 or earlier, erase the
-board's flash before flashing Cordial. Use `picotool erase` in BOOTSEL mode or
+For a first installation, erase the board's flash before flashing Cordial.
+Use `picotool erase` in BOOTSEL mode or
 `esptool --chip esp32s3 erase_flash` in download mode. This removes the existing
 firmware and saved data; pair your devices after flashing. Factory firmware and
-earlier storage formats can leave data that prevents Cordial from initializing
+incompatible storage formats can leave data that prevents Cordial from initializing
 its storage. Updates within the current storage format preserve saved devices
 and preferences without erasing flash. See [building](docs/building.md#firmware).
 
