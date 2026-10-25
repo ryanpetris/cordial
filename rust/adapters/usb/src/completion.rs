@@ -3,7 +3,7 @@ use core::{
     future::{Future, poll_fn},
     pin::{Pin, pin},
     sync::atomic::{AtomicBool, Ordering},
-    task::Poll,
+    task::{Context, Poll},
 };
 use embassy_time::Timer;
 use embassy_usb::driver::{
@@ -22,6 +22,12 @@ pub trait Completion: Copy {
     fn epoch(&self, _: EndpointAddress) -> u32 {
         0
     }
+    /// Reports a reset interrupt that the bus task has not processed yet.
+    fn reset_pending(&self) -> bool {
+        false
+    }
+    /// Keeps an OUT endpoint from accepting traffic after reset cancels a read.
+    fn cancel_out_read(&self, _: EndpointAddress) {}
     /// Reinitialize selected endpoints before enabling traffic on them.
     fn endpoint_set_enabled<B: Bus>(&self, bus: &mut B, address: EndpointAddress, enabled: bool) {
         bus.endpoint_set_enabled(address, enabled);
@@ -46,6 +52,33 @@ pub trait Completion: Copy {
     /// Prevent driver submission/rearm from overwriting a halted endpoint.
     fn stalled(&self, _: EndpointAddress) -> bool {
         false
+    }
+    /// Quiesces a reconfigured OUT endpoint before discarding its unread packet.
+    /// A true return keeps traffic blocked until `finish_out_drain`, in the same poll.
+    fn begin_out_drain(&self, _: EndpointAddress) -> bool {
+        false
+    }
+    /// Re-primes an empty endpoint or keeps a failed drain quarantined. Always
+    /// releases any global traffic gate acquired by `begin_out_drain`.
+    fn finish_out_drain(
+        &self,
+        _: &EndpointInfo,
+        result: Result<(), EndpointError>,
+    ) -> Result<(), EndpointError> {
+        result
+    }
+}
+
+fn drain_out(endpoint: &mut impl EndpointOut, cx: &mut Context<'_>) -> Result<(), EndpointError> {
+    // The largest USB packet fits here. Keep the scratch space outside the read
+    // future so endpoints do not retain it while waiting for host traffic.
+    let mut scratch = [0; 1024];
+    if usize::from(endpoint.info().max_packet_size) > scratch.len() {
+        return Err(EndpointError::BufferOverflow);
+    }
+    match pin!(endpoint.read(&mut scratch)).poll(cx) {
+        Poll::Ready(Err(error)) => Err(error),
+        Poll::Ready(Ok(_)) | Poll::Pending => Ok(()),
     }
 }
 
@@ -98,13 +131,28 @@ async fn cancellable<C: Completion, T>(
 ) -> Result<T, EndpointError> {
     let mut future = pin!(future);
     poll_fn(|cx| {
-        if completion.epoch(address) != epoch {
+        if completion.reset_pending() || completion.epoch(address) != epoch {
             Poll::Ready(Err(EndpointError::Disabled))
         } else {
-            future.as_mut().poll(cx)
+            let result = future.as_mut().poll(cx);
+            if completion.reset_pending() || completion.epoch(address) != epoch {
+                Poll::Ready(Err(EndpointError::Disabled))
+            } else {
+                result
+            }
         }
     })
     .await
+}
+
+async fn wait_enabled<E: Endpoint, C: Completion>(endpoint: &mut E, completion: C) {
+    loop {
+        endpoint.wait_enabled().await;
+        if !completion.reset_pending() {
+            return;
+        }
+        Timer::after_micros(125).await;
+    }
 }
 
 async fn transfer<C: Completion, F: Future>(
@@ -229,12 +277,12 @@ impl<'d, D: Driver<'d>, C: Completion + 'd> Driver<'d> for CompleteDriver<D, C> 
         )
     }
 }
-impl<E: Endpoint, C> Endpoint for CompleteEndpoint<E, C> {
+impl<E: Endpoint, C: Completion> Endpoint for CompleteEndpoint<E, C> {
     fn info(&self) -> &EndpointInfo {
         self.endpoint.info()
     }
     async fn wait_enabled(&mut self) {
-        self.endpoint.wait_enabled().await;
+        wait_enabled(&mut self.endpoint, self.completion).await;
     }
 }
 impl<E: EndpointIn, C: Completion> EndpointIn for CompleteEndpoint<E, C> {
@@ -258,24 +306,41 @@ impl<E: EndpointIn, C: Completion> EndpointIn for CompleteEndpoint<E, C> {
         result
     }
 }
-impl<E: Endpoint, C> Endpoint for CompleteOut<E, C> {
+impl<E: Endpoint, C: Completion> Endpoint for CompleteOut<E, C> {
     fn info(&self) -> &EndpointInfo {
         self.endpoint.info()
     }
     async fn wait_enabled(&mut self) {
-        self.endpoint.wait_enabled().await;
+        wait_enabled(&mut self.endpoint, self.completion).await;
     }
 }
 impl<E: EndpointOut, C: Completion> EndpointOut for CompleteOut<E, C> {
     async fn read(&mut self, bytes: &mut [u8]) -> Result<usize, EndpointError> {
         let address = self.endpoint.info().addr;
-        cancellable(
+        let result = cancellable(
             self.completion,
             address,
             self.completion.epoch(address),
-            transfer(self.completion, address, self.endpoint.read(bytes)),
+            transfer(self.completion, address, async {
+                poll_fn(|cx| {
+                    let result = if self.completion.begin_out_drain(address) {
+                        let result = drain_out(&mut self.endpoint, cx);
+                        self.completion
+                            .finish_out_drain(self.endpoint.info(), result)
+                    } else {
+                        Ok(())
+                    };
+                    Poll::Ready(result)
+                })
+                .await?;
+                self.endpoint.read(bytes).await
+            }),
         )
-        .await
+        .await;
+        if matches!(result, Err(EndpointError::Disabled)) && self.completion.reset_pending() {
+            self.completion.cancel_out_read(address);
+        }
+        result
     }
 }
 

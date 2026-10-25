@@ -106,8 +106,9 @@ their setup fields and required USB state. Invalid requests stall the control tr
 requests can proceed.
 
 On RP2040, RP2350 and ESP32-S3, Cordial-owned USB wrappers preserve queued transfers
-when the Host sets or clears HALT on non-control endpoints. A halted endpoint pauses
-submission and rearming. `CLEAR_FEATURE(ENDPOINT_HALT)` resets the next packet's data sequence to
+when the Host sets or clears HALT on non-control endpoints without reconfiguring them.
+A halted endpoint pauses submission and rearming.
+`CLEAR_FEATURE(ENDPOINT_HALT)` resets the next packet's data sequence to
 DATA0, even if the endpoint was not halted. This applies independently to IN and
 OUT endpoints, preserving queued payloads and completed OUT packets awaiting a read.
 An idle endpoint also starts its next transfer at DATA0. Recovery does not flush
@@ -118,9 +119,12 @@ its pending read.
 
 `SET_CONFIGURATION` and `SET_INTERFACE` clear HALT and initialize DATA0 on the
 selected bulk and interrupt endpoints, including when the selection is unchanged.
-On ESP32-S3, the wrapper stops active transfers before reinitializing endpoints
-and resets DATA0 before Embassy primes OUT reception. Disabled endpoints remain
-inactive, and `SET_INTERFACE` leaves other interfaces unchanged. Pending endpoint
+On ESP32-S3, the wrapper stops active transfers, resets DATA0 and discards completed,
+unread OUT packets from before reconfiguration. New OUT traffic receives NAK until
+the receive buffer is empty and a reader starts a fresh receive. Endpoints without
+a reader stay at NAK without blocking other interfaces. Cancellation, HALT and USB
+reset preserve this discard policy. Disabled endpoints remain inactive, and
+`SET_INTERFACE` leaves other interfaces unchanged. Pending endpoint
 operations report cancellation even after immediate re-enabling. An interrupted
 HID report is retried from its first packet without consuming undelivered input.
 Desktop idle refreshes and gamepad transmissions resume when their endpoint is

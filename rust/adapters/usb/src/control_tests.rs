@@ -29,6 +29,68 @@ struct Traffic {
     writes: Vec<(u8, Vec<u8>)>,
     reads: VecDeque<Vec<u8>>,
     block_write: bool,
+    otg: Option<OutBuffers>,
+    reset_pending: bool,
+    reset_hardware_pending: bool,
+    reset_after_bus_poll: bool,
+    reset_hardware_after_bus_poll: bool,
+    reset_during_read: bool,
+    reset_hardware_during_read: bool,
+}
+
+impl Traffic {
+    fn interrupt_reset(&mut self) {
+        self.reset_hardware_pending = true;
+        if self.reset_pending {
+            return;
+        }
+        if let Some(otg) = &mut self.otg {
+            otg.dirty.fill(true);
+        }
+        for epoch in &mut self.epochs {
+            *epoch += 1;
+        }
+        self.reset_pending = true;
+    }
+}
+
+/// Models the OTG software slot independently of its receive registers.
+#[derive(Default)]
+struct OutBuffers {
+    packets: [Option<Vec<u8>>; 6],
+    enabled: [bool; 6],
+    dirty: [bool; 6],
+    nak: [bool; 6],
+    pktcnt: [u8; 6],
+    global_nak: bool,
+    drain_count: usize,
+    lost: usize,
+    retries: usize,
+    arrival: Option<(usize, Vec<u8>)>,
+    error: Option<EndpointError>,
+}
+impl OutBuffers {
+    fn send(&mut self, index: usize, bytes: &[u8]) -> bool {
+        if !self.enabled[index] || self.global_nak || self.nak[index] || self.pktcnt[index] == 0 {
+            self.retries += 1;
+            return false;
+        }
+        if self.packets[index].is_some() {
+            self.lost += 1;
+        } else {
+            self.packets[index] = Some(bytes.to_vec());
+        }
+        self.pktcnt[index] = 0;
+        self.nak[index] = true;
+        true
+    }
+    fn boundary(&mut self) {
+        if let Some((index, bytes)) = self.arrival.take()
+            && !self.send(index, &bytes)
+        {
+            self.arrival = Some((index, bytes));
+        }
+    }
 }
 #[derive(Clone, Default)]
 struct Host(Rc<RefCell<Traffic>>);
@@ -127,6 +189,40 @@ impl EndpointIn for MockEndpoint {
 }
 impl EndpointOut for MockEndpoint {
     async fn read(&mut self, bytes: &mut [u8]) -> Result<usize, EndpointError> {
+        if self.0.0.borrow().otg.is_some() {
+            return poll_fn(|_| {
+                let mut traffic = self.0.0.borrow_mut();
+                // The pinned driver checks USBAEP before looking at out_size.
+                if !traffic.enabled.contains(&self.1.addr.into()) {
+                    return Poll::Ready(Err(EndpointError::Disabled));
+                }
+                let otg = traffic.otg.as_mut().unwrap();
+                if let Some(error) = otg.error.take() {
+                    return Poll::Ready(Err(error));
+                }
+                let index = self.1.addr.index();
+                let Some(packet) = otg.packets[index].as_ref() else {
+                    return Poll::Pending;
+                };
+                if packet.len() > bytes.len() {
+                    return Poll::Ready(Err(EndpointError::BufferOverflow));
+                }
+                let length = packet.len();
+                bytes[..length].copy_from_slice(packet);
+                otg.packets[index] = None;
+                otg.pktcnt[index] = 1;
+                otg.nak[index] = false;
+                otg.boundary();
+                if core::mem::take(&mut traffic.reset_hardware_during_read) {
+                    traffic.reset_hardware_pending = true;
+                }
+                if core::mem::take(&mut traffic.reset_during_read) {
+                    traffic.interrupt_reset();
+                }
+                Poll::Ready(Ok(length))
+            })
+            .await;
+        }
         let packet = poll_fn(|_| {
             if self.1.max_packet_size != 32 {
                 return Poll::Pending;
@@ -155,12 +251,24 @@ impl Host {
 impl Bus for Host {
     async fn enable(&mut self) {}
     async fn disable(&mut self) {
-        self.0.borrow_mut().enabled.clear();
+        let mut traffic = self.0.borrow_mut();
+        traffic.enabled.clear();
+        if let Some(otg) = &mut traffic.otg {
+            otg.enabled.fill(false);
+        }
     }
     async fn poll(&mut self) -> Event {
         let event = poll_fn(|_| {
-            self.0
-                .borrow_mut()
+            let mut traffic = self.0.borrow_mut();
+            if core::mem::take(&mut traffic.reset_hardware_after_bus_poll) {
+                traffic.reset_hardware_pending = true;
+                return Poll::Pending;
+            }
+            if core::mem::take(&mut traffic.reset_after_bus_poll) {
+                traffic.interrupt_reset();
+                return Poll::Pending;
+            }
+            traffic
                 .events
                 .pop_front()
                 .map_or(Poll::Pending, Poll::Ready)
@@ -168,10 +276,18 @@ impl Bus for Host {
         .await;
         if matches!(event, Event::Reset | Event::PowerRemoved) {
             let mut traffic = self.0.borrow_mut();
+            if matches!(event, Event::Reset) {
+                traffic.reset_hardware_pending = false;
+            }
             traffic.enabled.clear();
             traffic.halted.clear();
             traffic.data1.clear();
             traffic.active.clear();
+            if let Some(otg) = &mut traffic.otg {
+                otg.enabled.fill(false);
+                otg.pktcnt.fill(1);
+                otg.nak.fill(false);
+            }
         }
         event
     }
@@ -187,6 +303,11 @@ impl Bus for Host {
         }
         traffic.enabled.retain(|e| *e != u8::from(address));
         traffic.active.retain(|e| *e != u8::from(address));
+        if address.is_out()
+            && let Some(otg) = &mut traffic.otg
+        {
+            otg.enabled[address.index()] = enabled;
+        }
         if enabled {
             if traffic.reconfiguration {
                 assert!(!traffic.halted.contains(&address.into()));
@@ -195,6 +316,11 @@ impl Bus for Host {
             traffic.enabled.push(address.into());
             if address.is_out() {
                 traffic.active.push(address.into());
+                if let Some(otg) = &mut traffic.otg {
+                    otg.pktcnt[address.index()] = 1;
+                    otg.nak[address.index()] = false;
+                    otg.boundary();
+                }
             }
         }
     }
@@ -302,6 +428,13 @@ impl completion::Completion for Reconfiguration<'_> {
     fn epoch(&self, address: EndpointAddress) -> u32 {
         self.0.0.borrow().epochs[address.index() + 16 * usize::from(address.is_in())]
     }
+    fn reset_pending(&self) -> bool {
+        let traffic = self.0.0.borrow();
+        traffic.reset_pending || traffic.reset_hardware_pending
+    }
+    fn cancel_out_read(&self, address: EndpointAddress) {
+        self.0.0.borrow_mut().otg.as_mut().unwrap().nak[address.index()] = true;
+    }
     fn stalled(&self, address: EndpointAddress) -> bool {
         self.0.0.borrow().halted.contains(&address.into())
     }
@@ -320,6 +453,14 @@ impl completion::Completion for Reconfiguration<'_> {
     }
     fn endpoint_set_enabled<B: Bus>(&self, bus: &mut B, address: EndpointAddress, enabled: bool) {
         self.0.0.borrow_mut().epochs[address.index() + 16 * usize::from(address.is_in())] += 1;
+        if address.is_out()
+            && let Some(otg) = &mut self.0.0.borrow_mut().otg
+        {
+            assert!(!otg.global_nak);
+            otg.dirty[address.index()] = true;
+            otg.global_nak = true;
+            otg.boundary();
+        }
         if self.0.0.borrow().direct_enable {
             bus.endpoint_set_enabled(address, enabled);
             return;
@@ -348,6 +489,84 @@ impl completion::Completion for Reconfiguration<'_> {
                     .retain(|e| *e != u8::from(address));
             },
         );
+        if address.is_out()
+            && let Some(otg) = &mut self.0.0.borrow_mut().otg
+        {
+            otg.nak[address.index()] = true;
+            otg.boundary();
+            otg.global_nak = false;
+            otg.boundary();
+        }
+    }
+    fn begin_out_drain(&self, address: EndpointAddress) -> bool {
+        let mut traffic = self.0.0.borrow_mut();
+        let Some(otg) = &mut traffic.otg else {
+            return false;
+        };
+        if !otg.dirty[address.index()] {
+            return false;
+        }
+        assert!(!otg.global_nak);
+        otg.global_nak = true;
+        otg.drain_count += 1;
+        otg.boundary();
+        traffic.active.retain(|e| *e != u8::from(address));
+        true
+    }
+    fn finish_out_drain(
+        &self,
+        info: &EndpointInfo,
+        mut result: Result<(), EndpointError>,
+    ) -> Result<(), EndpointError> {
+        let mut traffic = self.0.0.borrow_mut();
+        let index = info.addr.index();
+        if traffic.reset_pending || traffic.reset_hardware_pending {
+            result = Err(EndpointError::Disabled);
+        }
+        let otg = traffic.otg.as_mut().unwrap();
+        assert!(otg.global_nak);
+        if result.is_ok() {
+            assert!(otg.packets[index].is_none());
+            otg.pktcnt[index] = 1;
+            otg.nak[index] = false;
+            otg.dirty[index] = false;
+        } else {
+            otg.nak[index] = true;
+            assert!(otg.dirty[index]);
+        }
+        otg.boundary();
+        otg.global_nak = false;
+        otg.boundary();
+        if result.is_ok() {
+            traffic.data1.retain(|e| *e != u8::from(info.addr));
+            traffic.active.push(info.addr.into());
+        }
+        result
+    }
+    fn endpoint_set_stalled<B: Bus>(&self, bus: &mut B, address: EndpointAddress, stalled: bool) {
+        bus.endpoint_set_stalled(address, stalled);
+        let mut traffic = self.0.0.borrow_mut();
+        if !stalled {
+            traffic.data1.retain(|e| *e != u8::from(address));
+        }
+        if address.is_out()
+            && let Some(otg) = &mut traffic.otg
+            && otg.dirty[address.index()]
+        {
+            otg.nak[address.index()] = true;
+        }
+    }
+    fn reset(&self) {
+        let mut traffic = self.0.0.borrow_mut();
+        if core::mem::take(&mut traffic.reset_pending) {
+            return;
+        }
+        if let Some(otg) = &mut traffic.otg {
+            otg.dirty.fill(true);
+            for epoch in &mut traffic.epochs {
+                *epoch += 1;
+            }
+        }
     }
 }
 
@@ -1180,6 +1399,374 @@ fn reconfiguration_cancels_out_reads_without_consuming_the_next_packet() {
 }
 
 #[test]
+fn otg_reconfiguration_discards_unread_packets_before_accepting_retries() {
+    for stale in [None, Some(vec![]), Some(vec![9; 64])] {
+        for transition in 0..4 {
+            let host = Host::default();
+            host.0.borrow_mut().reconfiguration = true;
+            host.0.borrow_mut().otg = Some(OutBuffers::default());
+            let mut config = [0; 256];
+            let mut bos = [0; 64];
+            let mut msos = [0; 64];
+            let mut control = [0; 64];
+            let mut builder = Builder::new(
+                completion::CompleteDriver {
+                    driver: MockDriver(host.clone()),
+                    completion: Reconfiguration(&host),
+                },
+                Config::new(0x1209, 0xc0d1),
+                &mut config,
+                &mut bos,
+                &mut msos,
+                &mut control,
+            );
+            let mut first = builder
+                .function(0xff, 0, 0)
+                .interface()
+                .alt_setting(0xff, 0, 0, None)
+                .endpoint_bulk_out(None, 64);
+            let second = builder
+                .function(0xff, 0, 0)
+                .interface()
+                .alt_setting(0xff, 0, 0, None)
+                .endpoint_bulk_out(None, 64);
+            let address = u8::from(first.info().addr);
+            let index = first.info().addr.index();
+            let unused = second.info().addr.index();
+            let mut device = builder.build();
+            let mut running = pin!(device.run());
+            configured(&host, running.as_mut());
+            let mut bytes = [0; 64];
+            let mut cx = Context::from_waker(Waker::noop());
+            {
+                let mut old = pin!(first.read(&mut bytes));
+                poll(old.as_mut());
+                {
+                    let mut traffic = host.0.borrow_mut();
+                    let otg = traffic.otg.as_mut().unwrap();
+                    if let Some(packet) = &stale {
+                        assert!(otg.send(index, packet));
+                    }
+                    otg.arrival = Some((index, vec![7; 64]));
+                }
+                match transition {
+                    0 | 1 => {
+                        let request = if transition == 0 {
+                            [1, 11, 0, 0, 0, 0, 0, 0]
+                        } else {
+                            [0, 9, 1, 0, 0, 0, 0, 0]
+                        };
+                        exchange(&host, running.as_mut(), request, false);
+                        exchange(&host, running.as_mut(), request, false);
+                    }
+                    2 => {
+                        exchange(&host, running.as_mut(), [0, 9, 0, 0, 0, 0, 0, 0], false);
+                        let mut traffic = host.0.borrow_mut();
+                        let otg = traffic.otg.as_mut().unwrap();
+                        assert!(!otg.enabled[index]);
+                        assert!(!otg.send(index, &[6; 64]));
+                        assert_eq!(otg.packets[index], stale);
+                        drop(traffic);
+                        exchange(&host, running.as_mut(), [0, 9, 1, 0, 0, 0, 0, 0], false);
+                    }
+                    _ => {
+                        host.0.borrow_mut().events.push_back(Event::Reset);
+                        poll(running.as_mut());
+                        // Reset leaves the endpoint inactive and retains out_size.
+                        let mut traffic = host.0.borrow_mut();
+                        let otg = traffic.otg.as_mut().unwrap();
+                        assert_eq!(otg.pktcnt[index], 1);
+                        assert!(!otg.enabled[index]);
+                        assert!(!otg.send(index, &[6; 64]));
+                        assert_eq!(otg.packets[index], stale);
+                        drop(traffic);
+                        configured(&host, running.as_mut());
+                    }
+                }
+                assert_eq!(
+                    old.as_mut().poll(&mut cx),
+                    Poll::Ready(Err(EndpointError::Disabled))
+                );
+            }
+            // HALT, repeated clear and dropping a stalled read cannot bypass cleanup.
+            for _ in 0..2 {
+                exchange(
+                    &host,
+                    running.as_mut(),
+                    [2, 3, 0, 0, address, 0, 0, 0],
+                    false,
+                );
+            }
+            {
+                let mut cancelled = pin!(first.read(&mut bytes));
+                poll(cancelled.as_mut());
+            }
+            assert!(host.0.borrow().otg.as_ref().unwrap().dirty[index]);
+            for _ in 0..2 {
+                exchange(
+                    &host,
+                    running.as_mut(),
+                    [2, 1, 0, 0, address, 0, 0, 0],
+                    false,
+                );
+            }
+            assert_eq!(block_on(first.read(&mut bytes)), Ok(64));
+            assert_eq!(bytes, [7; 64]);
+            {
+                let mut traffic = host.0.borrow_mut();
+                let otg = traffic.otg.as_mut().unwrap();
+                assert_eq!(otg.lost, 0);
+                assert!(otg.retries >= 6);
+                assert!(!otg.global_nak);
+                assert!(!otg.dirty[index]);
+                assert!(otg.dirty[unused] && otg.nak[unused]);
+                assert!(otg.send(index, &[8; 64]));
+                traffic.data1.push(address);
+            }
+            let drained = host.0.borrow().otg.as_ref().unwrap().drain_count;
+            assert_eq!(block_on(first.read(&mut bytes)), Ok(64));
+            assert_eq!(bytes, [8; 64]);
+            assert_eq!(host.0.borrow().otg.as_ref().unwrap().drain_count, drained);
+            assert!(host.0.borrow().data1.contains(&address));
+        }
+    }
+}
+
+#[test]
+fn otg_reset_interrupt_blocks_reads_until_the_bus_processes_reset() {
+    let host = Host::default();
+    host.0.borrow_mut().reconfiguration = true;
+    host.0.borrow_mut().otg = Some(OutBuffers::default());
+    let mut config = [0; 256];
+    let mut bos = [0; 64];
+    let mut msos = [0; 64];
+    let mut control = [0; 64];
+    let mut builder = Builder::new(
+        completion::CompleteDriver {
+            driver: MockDriver(host.clone()),
+            completion: Reconfiguration(&host),
+        },
+        Config::new(0x1209, 0xc0d1),
+        &mut config,
+        &mut bos,
+        &mut msos,
+        &mut control,
+    );
+    let mut endpoint = builder
+        .function(0xff, 0, 0)
+        .interface()
+        .alt_setting(0xff, 0, 0, None)
+        .endpoint_bulk_out(None, 64);
+    let index = endpoint.info().addr.index();
+    let mut device = builder.build();
+    let mut running = pin!(device.run());
+    configured(&host, running.as_mut());
+    let mut bytes = [0; 64];
+    let mut cx = Context::from_waker(Waker::noop());
+
+    // The first poll cleans the reconfiguration hold, then waits for traffic.
+    {
+        let mut read = pin!(endpoint.read(&mut bytes));
+        poll(read.as_mut());
+    }
+    assert!(!host.0.borrow().otg.as_ref().unwrap().dirty[index]);
+    assert!(
+        host.0
+            .borrow_mut()
+            .otg
+            .as_mut()
+            .unwrap()
+            .send(index, &[9; 64])
+    );
+
+    // Hardware reset becomes visible after Cordial's IRQ sample but before this read runs.
+    {
+        let mut old = pin!(endpoint.read(&mut bytes));
+        let epoch = host.0.borrow().epochs[index];
+        host.0.borrow_mut().reset_hardware_after_bus_poll = true;
+        poll(running.as_mut());
+        let traffic = host.0.borrow();
+        assert!(traffic.reset_hardware_pending);
+        assert!(!traffic.reset_pending);
+        assert_eq!(traffic.epochs[index], epoch);
+        drop(traffic);
+        assert_eq!(
+            old.as_mut().poll(&mut cx),
+            Poll::Ready(Err(EndpointError::Disabled))
+        );
+    }
+    assert_eq!(
+        host.0.borrow().otg.as_ref().unwrap().packets[index],
+        Some(vec![9; 64])
+    );
+    assert!(host.0.borrow().otg.as_ref().unwrap().nak[index]);
+    assert!(
+        !host
+            .0
+            .borrow_mut()
+            .otg
+            .as_mut()
+            .unwrap()
+            .send(index, &[8; 64])
+    );
+    {
+        let mut ready = pin!(endpoint.wait_enabled());
+        assert!(ready.as_mut().poll(&mut cx).is_pending());
+    }
+
+    host.0.borrow_mut().events.push_back(Event::Reset);
+    poll(running.as_mut());
+    configured(&host, running.as_mut());
+    {
+        let traffic = host.0.borrow();
+        assert!(!traffic.reset_hardware_pending);
+        assert!(!traffic.reset_pending);
+    }
+
+    // A second reset interrupts the synchronous stale-packet drain.
+    host.0.borrow_mut().reset_during_read = true;
+    {
+        let mut interrupted = pin!(endpoint.read(&mut bytes));
+        assert_eq!(
+            interrupted.as_mut().poll(&mut cx),
+            Poll::Ready(Err(EndpointError::Disabled))
+        );
+    }
+    {
+        let traffic = host.0.borrow();
+        let otg = traffic.otg.as_ref().unwrap();
+        assert!(traffic.reset_pending);
+        assert!(otg.dirty[index]);
+        assert!(otg.nak[index]);
+        assert!(otg.packets[index].is_none());
+        assert!(!otg.global_nak);
+    }
+    {
+        let mut ready = pin!(endpoint.wait_enabled());
+        assert!(ready.as_mut().poll(&mut cx).is_pending());
+    }
+
+    host.0.borrow_mut().events.push_back(Event::Reset);
+    poll(running.as_mut());
+    configured(&host, running.as_mut());
+    assert!(
+        !host
+            .0
+            .borrow_mut()
+            .otg
+            .as_mut()
+            .unwrap()
+            .send(index, &[7; 64])
+    );
+    {
+        let mut fresh = pin!(endpoint.read(&mut bytes));
+        poll(fresh.as_mut());
+        assert!(
+            host.0
+                .borrow_mut()
+                .otg
+                .as_mut()
+                .unwrap()
+                .send(index, &[7; 64])
+        );
+        assert_eq!(fresh.as_mut().poll(&mut cx), Poll::Ready(Ok(64)));
+    }
+    assert_eq!(bytes, [7; 64]);
+    assert!(!host.0.borrow().otg.as_ref().unwrap().dirty[index]);
+
+    // Live hardware reset after the underlying poll invalidates a completed read too.
+    assert!(
+        host.0
+            .borrow_mut()
+            .otg
+            .as_mut()
+            .unwrap()
+            .send(index, &[5; 64])
+    );
+    let epoch = host.0.borrow().epochs[index];
+    host.0.borrow_mut().reset_hardware_during_read = true;
+    {
+        let mut invalidated = pin!(endpoint.read(&mut bytes));
+        assert_eq!(
+            invalidated.as_mut().poll(&mut cx),
+            Poll::Ready(Err(EndpointError::Disabled))
+        );
+    }
+    let traffic = host.0.borrow();
+    assert!(traffic.reset_hardware_pending);
+    assert!(!traffic.reset_pending);
+    assert_eq!(traffic.epochs[index], epoch);
+    let otg = traffic.otg.as_ref().unwrap();
+    assert!(!otg.dirty[index]);
+    assert!(otg.nak[index]);
+    assert!(otg.packets[index].is_none());
+    drop(traffic);
+    assert!(
+        !host
+            .0
+            .borrow_mut()
+            .otg
+            .as_mut()
+            .unwrap()
+            .send(index, &[4; 64])
+    );
+    {
+        let mut ready = pin!(endpoint.wait_enabled());
+        assert!(ready.as_mut().poll(&mut cx).is_pending());
+    }
+}
+
+#[test]
+fn otg_failed_drain_releases_global_nak_and_keeps_cleanup_pending() {
+    use completion::Completion;
+    for error in [EndpointError::Disabled, EndpointError::BufferOverflow] {
+        let host = Host::default();
+        host.0.borrow_mut().otg = Some(OutBuffers::default());
+        let platform = Reconfiguration(&host);
+        let mut driver = completion::CompleteDriver {
+            driver: MockDriver(host.clone()),
+            completion: platform,
+        };
+        let mut endpoint = driver
+            .alloc_endpoint_out(EndpointType::Bulk, None, 64, 0)
+            .unwrap();
+        let index = endpoint.info().addr.index();
+        platform.endpoint_set_enabled(&mut host.clone(), endpoint.info().addr, true);
+        {
+            let mut traffic = host.0.borrow_mut();
+            let otg = traffic.otg.as_mut().unwrap();
+            otg.packets[index] = Some(vec![9; 64]);
+            otg.error = Some(error);
+            otg.arrival = Some((index, vec![7; 64]));
+        }
+        let mut bytes = [0; 64];
+        assert_eq!(block_on(endpoint.read(&mut bytes)), Err(error));
+        {
+            let traffic = host.0.borrow();
+            let otg = traffic.otg.as_ref().unwrap();
+            assert!(!otg.global_nak);
+            assert!(otg.dirty[index] && otg.nak[index]);
+            assert_eq!(otg.packets[index], Some(vec![9; 64]));
+        }
+        assert_eq!(block_on(endpoint.read(&mut bytes)), Ok(64));
+        assert_eq!(bytes, [7; 64]);
+        assert_eq!(host.0.borrow().otg.as_ref().unwrap().lost, 0);
+        // A disabled endpoint still owns its software packet until it is enabled.
+        platform.endpoint_set_enabled(&mut host.clone(), endpoint.info().addr, false);
+        host.0.borrow_mut().otg.as_mut().unwrap().packets[index] = Some(vec![]);
+        assert_eq!(
+            block_on(endpoint.read(&mut bytes)),
+            Err(EndpointError::Disabled)
+        );
+        assert_eq!(
+            host.0.borrow().otg.as_ref().unwrap().packets[index],
+            Some(vec![])
+        );
+        assert!(!host.0.borrow().otg.as_ref().unwrap().global_nak);
+    }
+}
+
+#[test]
 fn endpoint_requests_validate_address_fields_state_and_recover() {
     let host = Host::default();
     let io = Io::new();
@@ -1496,6 +2083,135 @@ fn endpoint_enablement_follows_alternate_settings_and_msos_still_works() {
         false,
     );
     assert_eq!(&msos[..4], &[10, 0, 0, 0]);
+}
+
+#[test]
+fn otg_raw_worker_discards_old_commands_and_executes_a_fresh_retry_once() {
+    for transition in 0..5 {
+        let host = Host::default();
+        host.0.borrow_mut().otg = Some(OutBuffers::default());
+        let io = Io::new();
+        let (mut app, store, _) = profile_application();
+        let interface = Interface::ALL[0];
+        app.manager.preference.configuration_interfaces = vec![enabled(interface, 1)];
+        let mut shared = shared(app, store);
+        let mut loops = Loops::new(&io, interface.bit());
+        let mut buffers = Buffers::new(&io);
+        let usb = Usb::new(
+            completion::CompleteDriver {
+                driver: MockDriver(host.clone()),
+                completion: Reconfiguration(&host),
+            },
+            "0000000000000000",
+            "Test adapter",
+            Topology {
+                interfaces: interface.bit(),
+                ..Default::default()
+            },
+            &io,
+            &mut buffers,
+        );
+        let out = host
+            .0
+            .borrow()
+            .allocations
+            .iter()
+            .find(|e| e.addr.is_out() && e.max_packet_size == 32)
+            .unwrap()
+            .addr
+            .index();
+        let input = host
+            .0
+            .borrow()
+            .allocations
+            .iter()
+            .rev()
+            .find(|e| e.addr.is_in())
+            .unwrap()
+            .addr
+            .into();
+        let mut running = pin!(usb.run_until_rebuild());
+        configured(&host, running.as_mut());
+        assert!(
+            host.0
+                .borrow_mut()
+                .otg
+                .as_mut()
+                .unwrap()
+                .send(out, &set_keycode())
+        );
+        // The device task handles setup before the endpoint worker next runs.
+        match transition {
+            0 => {
+                exchange(&host, running.as_mut(), [1, 11, 0, 0, 2, 0, 0, 0], false);
+            }
+            1 => {
+                exchange(&host, running.as_mut(), [0, 9, 1, 0, 0, 0, 0, 0], false);
+            }
+            2 => {
+                host.0.borrow_mut().events.push_back(Event::Reset);
+                poll(running.as_mut());
+                configured(&host, running.as_mut());
+            }
+            3 => {
+                // The bus future has already returned Pending when reset preempts the worker.
+                host.0.borrow_mut().reset_after_bus_poll = true;
+                poll(running.as_mut());
+                assert!(host.0.borrow().reset_pending);
+                assert_eq!(
+                    host.0.borrow().otg.as_ref().unwrap().packets[out],
+                    Some(set_keycode().to_vec())
+                );
+                host.0.borrow_mut().events.push_back(Event::Reset);
+                poll(running.as_mut());
+                configured(&host, running.as_mut());
+            }
+            _ => {
+                // Embassy sees reset after Cordial's IRQ-side sample.
+                let epoch = host.0.borrow().epochs[out];
+                host.0.borrow_mut().reset_hardware_after_bus_poll = true;
+                poll(running.as_mut());
+                let traffic = host.0.borrow();
+                assert!(traffic.reset_hardware_pending);
+                assert!(!traffic.reset_pending);
+                assert_eq!(traffic.epochs[out], epoch);
+                assert_eq!(
+                    traffic.otg.as_ref().unwrap().packets[out],
+                    Some(set_keycode().to_vec())
+                );
+                drop(traffic);
+                host.0.borrow_mut().events.push_back(Event::Reset);
+                poll(running.as_mut());
+                assert!(!host.0.borrow().reset_hardware_pending);
+                configured(&host, running.as_mut());
+            }
+        }
+        loops.poll(&mut shared, 1);
+        assert_eq!(loaded_rules(&shared.app, 1), 0);
+        assert!(writes(&host, input).is_empty());
+        assert!(io.raw[0].rx.is_empty());
+        assert!(
+            host.0
+                .borrow_mut()
+                .otg
+                .as_mut()
+                .unwrap()
+                .send(out, &set_keycode())
+        );
+        poll(running.as_mut());
+        loops.poll(&mut shared, 2);
+        poll(running.as_mut());
+        assert_eq!(loaded_rules(&shared.app, 1), 1);
+        assert_eq!(writes(&host, input).len(), 1);
+        let saved = shared.store.writes.len();
+        for tick in 3..6 {
+            loops.poll(&mut shared, tick);
+            poll(running.as_mut());
+        }
+        assert_eq!(writes(&host, input).len(), 1);
+        assert_eq!(shared.store.writes.len(), saved);
+        assert_eq!(host.0.borrow().otg.as_ref().unwrap().lost, 0);
+    }
 }
 
 #[test]
