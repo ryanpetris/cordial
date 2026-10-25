@@ -166,8 +166,9 @@ Before any item is considered done, all suites below must pass for the completed
 Use targeted tests during development, then complete this checklist before reporting completion.
 Passing results from the same work can be reused while their inputs remain unchanged. A skipped
 fixture or a missing prerequisite is not a pass; resolve it or report the item as incomplete.
-Keep this catalog aligned with `Makefile`, `desktop/package.json`, and
-`.github/workflows/release.yml`. It lists suites and fixtures, not individual test cases.
+Documentation-only changes do not run these suites. Keep this catalog aligned with `Makefile`,
+`desktop/package.json`, and `.github/workflows/release.yml`. It lists suites and fixtures, not
+individual test cases.
 
 | Suite or fixture | Required check and coverage |
 | --- | --- |
@@ -182,7 +183,7 @@ Keep this catalog aligned with `Makefile`, `desktop/package.json`, and
 | Repository tool fixtures | `make check-tools`: `tools/test_*.py`, covering versions, editor-definition validation, and release archive validation. |
 | Firmware and packaging tool fixtures | `make check-tools`: `rust/tests/test_*.py`, covering board configuration, firmware artifacts, flashing, dependency notices, packaging, native BLE, HID reports, and host terminal behavior. |
 | Linux CLI/TUI terminal fixture | Build the CLI and install `pyte`, then run `CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py`. The default tool run skips this fixture without these prerequisites. |
-| Firmware static checks | `make check-firmware BOARD=pico2_w PROFILE=production` and `make check-firmware BOARD=pico2_w PROFILE=debug`: firmware Clippy for the Pico 2 W. Also run them for another board (`pico_w`, `waveshare_rp2350b_plus_w`, `xiao_esp32s3`) when a change materially affects that board specifically, such as its board definition, platform code, radio backend, configuration, or partition or storage layout. |
+| Firmware static checks | `make check-firmware BOARD=pico2_w PROFILE=production` and `make check-firmware BOARD=pico2_w PROFILE=debug`: firmware Clippy for the Pico 2 W. Also run them for another board (`pico_w`, `waveshare_rp2350b_plus_w`, `esp32s3_8mb`) when a change materially affects that board specifically, such as its board definition, platform code, radio backend, configuration, or partition or storage layout. |
 | Firmware artifact validation | `make firmware BOARD=pico2_w PROFILE=production` and `make firmware BOARD=pico2_w PROFILE=debug`: link and package the Pico 2 W, including metadata, image layout, and storage-boundary checks in `rust/tools/build_firmware.py`. Also build another board under the same condition as its static checks. ESP builds check the linked Rust startup stack frames. |
 | Portable application packages | `make package-desktop package-cli package-web`; validate the desktop and CLI archives with `tools/check_release_archive.py` for the selected `CORDIAL_VERSION`. |
 | Arch package fixture | Build both native packages with `make package-desktop-arch package-cli-arch`, then run `packaging/check-arch.sh` in a clean Arch container. Checks independent installation, native modules, package contents, Namcap, reinstallation, and removal. |

@@ -56,9 +56,6 @@ Each supported transport has one additional native bond entry for pairing, but o
 connection can use the shared runtime reserve at a time. ESP32-S3 also configures 10 controller
 activities for its links and scanning. BLE requests a 7.5 ms connection interval.
 
-Simultaneous mixed 6 Classic plus 14 BLE connections and full-load latency remain unverified on
-hardware.
-
 ## Errors
 
 `Error` contains `code`, `reason`, `outcome` and repeated `related` errors. Every code can carry all

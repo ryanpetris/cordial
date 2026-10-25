@@ -13,11 +13,9 @@ kind of device: the adapter applies whichever rules match the input a device pro
   hold a fixed set of outputs instead, or disables it. Outputs can belong to different application
   collections, such as a Game Pad button holding a mouse button or a keyboard key with modifiers.
 - A scale rule multiplies a relative value, such as pointer motion or a scroll wheel, by a ratio.
-  A negative ratio inverts it. It does not change absolute positions. Hardware DPI and wheel modes
-  remain physical-device settings.
+  A negative ratio inverts it.
 - An axis rule routes an absolute Game Pad axis to a destination axis in the same Game Pad
-  collection. Its `invert` flag reverses the normalized axis range. It has no deadzones, curves or
-  sensitivity settings.
+  collection. Its `invert` flag reverses the normalized axis range.
 
 A rule identifies its input by both its HID usage and its application collection. Mouse button 1,
 `09:01` in Mouse collection `01:02`, and Game Pad button 1, `09:01` in Game Pad collection `01:05`,
@@ -100,8 +98,6 @@ refused while it is in a device's layers or selected by an interface.
   Vial desktop to discover it and download its embedded definition automatically. The definition
   comes from [`cordial-vial.json`](../configs/keyboards/cordial-vial.json). Regenerate its
   compressed bytes with `python3 tools/generate_vial_definition.py` after editing that definition.
-- QMK Configurator produces keyboard firmware and is not a live editor protocol. ZMK Studio is not
-  implemented.
 
 Both editors use the [Raw HID control report behavior](protocol/hid-forwarding.md#usb-control-requests).
 Commands receive replies on interrupt IN; control reads return a snapshot without consuming a reply.
@@ -133,10 +129,7 @@ buttons 9..16 as outputs and other combinations of held outputs, including a mod
 control or mouse button; a rule the selected external editor cannot represent keeps working on
 the adapter but cannot be read through that editor. Reading such a rule makes the editor's keymap
 read fail: a buffer read containing it returns 0xff for the entire chunk. The rule stays saved
-unchanged. Mixed-side modifier chords, mouse movement, wheel and acceleration keys, macros,
-layers, tap dance, combos, matrix spying, lighting, bootloader entry, and whole-adapter reset
-commands are unsupported. Enabling Vial explicitly authorizes fixed remap edits; the interface
-reports unlocked and provides no executable or timed actions.
+unchanged. Enabling Vial explicitly authorizes fixed remap edits, so the interface reports unlocked.
 
 Each supported edit packet changes the loaded rules atomically and is acknowledged at once, before
 it reaches flash: devices use the edit immediately, and the editor's edits are saved together once
@@ -154,51 +147,6 @@ The USB consumer report holds at most eight distinct simultaneous consumer usage
 connected devices, including remapped outputs. Exceeding that bound triggers the input-overflow
 failure and disconnects the source; the adapter does not silently drop part of a chord.
 
-## Hardware verification
-
-Software fixtures cover persistence, layers, shared live edits, held-key release, media keys,
-both editors' keycode tables, keymap reset, packet validation, unsupported actions and USB
-conditional interface allocation. Real USB enumeration and
-VIA, Vial and Remap sessions still require hardware verification.
-
-1. Flash an adapter and reset its storage. Pair a keyboard and mouse. Confirm every configuration
-   interface is disabled, no editor interface is enumerated, input works, and profile management is
-   available.
-2. Create an empty profile and add it to two keyboards' layers. Confirm the Host layout behaves as
-   before.
-3. Select the profile for VIA and enable VIA. Reopen the serial client after USB reconnects, load
-   the definition, remap a letter, modifier and media key, and verify both keyboards and the
-   profile's keyboard and media roles. Remap a key to System Sleep and to mouse button 3, remap a
-   mouse button to a letter, and verify the Host receives each.
-4. Hold a remapped key while editing its action or changing the layers. Release must end the
-   original outputs; the next press must use the new ones. Exercise overlapping modifiers from both
-   keyboards and disconnect one keyboard while it holds a key.
-5. Disable VIA and enable Vial with the same profile, select the automatically discovered adapter,
-   then repeat edits and a whole-map export/import, including mouse buttons 6..8. Try Remap with
-   VIA enabled. Confirm a keymap reset clears every rule in the selected profile, including Game Pad
-   rules and rules outside the matrix. Confirm unsupported macro, layer and whole-adapter reset
-   actions fail without erasing the map or any pairing.
-6. With the CLI, create a second profile that remaps a mouse button and inverts the wheel, and add
-   it after the first in both devices' layers. Verify both devices use both profiles, that chained
-   remaps apply in order, and that the second profile shows the mouse role.
-7. Copy a profile, edit each independently, give the two keyboards different layers, reboot, and
-   verify saved layers and rules. Verify referenced profiles cannot be deleted, including the
-   profile kept by a disabled interface.
-8. Change an enabled interface's profile with the editor closed, reopen it, and confirm it reads the
-   new profile. Disable the interface and verify it disappears while rules keep working. Confirm
-   enabling VIA and Vial together is refused as conflicting.
-9. Power up with VIA or Vial enabled and enough USB resources. Verify the adapter enumerates once
-   with the active interface,
-   and that input and serial access work, including in firmware setup, boot menus, and pre-boot
-   unlock screens used with the adapter.
-10. Measure the time from a keyboard's reconnection to its first key reaching the Host with and
-    without profiles in its layers; loading profiles should add only their flash reads.
-11. Load a whole layout in Vial while moving the mouse, and confirm the pointer does not stall and
-    the load completes promptly. Unplug the adapter at various moments: during the load, within a
-    second of the last edit, and a few seconds after. Plug it back in and confirm edits older than
-    about 2 s are kept. Make an edit and at once switch the interface between VIA and Vial; after
-    USB enumerates again, confirm the edit is kept.
-
 Protocol references: [QMK VIA commands](https://github.com/qmk/qmk_firmware/blob/master/quantum/via.h),
 [Vial VIA implementation](https://github.com/vial-kb/vial-qmk/blob/vial/quantum/via.c), and
 [Vial extensions](https://github.com/vial-kb/vial-qmk/blob/vial/quantum/vial.c).
@@ -207,7 +155,7 @@ On Linux, the active local user needs access to the adapter's `hidraw` node for 
 The Arch and Debian packages install [`50-cordial.rules`](../configs/50-cordial.rules), which grants
 the active seat user access to the adapter's serial port and HID nodes. Without the packages, copy
 `50-cordial.rules` from the release archive to `/etc/udev/rules.d/`, reload udev rules, and
-reconnect the adapter. The rule does not change access to other keyboards or serial devices.
+reconnect the adapter.
 
 ## Controller research credits
 

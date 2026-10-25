@@ -11,10 +11,9 @@
 
 Board definitions live in `rust/boards/`. They specify pins, flash allocation, clock settings,
 backends and `profile_memory_budget`: the bytes of RAM for loaded [input
-profiles](input-profiles.md), or `null` for a board without profile support. Without profile support
-the firmware omits profiles and configuration interfaces, so VIA and Vial are unavailable. The
-Pico W preset leaves profiles out to keep its limited RAM for connections. The other presets budget
-40 KiB for loaded profiles, shared across connections.
+profiles](input-profiles.md), or `null` to build without them. The Pico W preset leaves profiles
+out to keep its limited RAM for connections. The other presets budget 40 KiB for loaded profiles,
+shared across connections.
 Bluetooth pool sizes derive from the same `CORDIAL_CONFIG` for Rust and C. See
 [Bluetooth capacity](protocol/limits-and-errors.md#bluetooth-capacity) for the independent transport
 allowances and pairing reserve. Pico presets use `pico-sdk-cyw43`; `embassy-cyw43` is also supported.
@@ -22,16 +21,11 @@ The `esp32s3_8mb` preset uses `esp-nimble` and `esp-idf`.
 
 `esp32s3_8mb` targets ESP32-S3 boards with 8 MiB flash and native USB connected to the host.
 It reserves 2 MiB for firmware and budgets 40 KiB of internal RAM for loaded profiles.
-PSRAM is disabled, so boards without it can use the same image. `mcu_led` is `null`; the image
-does not configure a status LED or support onboard displays or application buttons. In particular,
-the [Atom S3 pin map](https://docs.m5stack.com/en/core/AtomS3#pinmap) assigns GPIO21 to LCD MOSI.
 
 The [Seeed Studio XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/),
 [M5Stack Atom S3](https://docs.m5stack.com/en/core/AtomS3) and
-[Atom S3U](https://docs.m5stack.com/en/core/AtomS3U) are expected compatible boards. Hardware
-validation of this image is pending. The preset does not cover every ESP32-S3 variant;
-flash capacity and native USB wiring must match. See the [flashing steps](../README.md#2-flash-the-adapter)
-for each board's download mode.
+[Atom S3U](https://docs.m5stack.com/en/core/AtomS3U) meet this preset's requirements. See the
+[flashing steps](installation.md#esp32-s3) for each board's download mode.
 
 To use custom wiring or another backend, copy a preset, edit it and pass its path
 to `python3 rust/tools/build_firmware.py`. USB and Bluetooth identities are
@@ -204,8 +198,7 @@ contain UF2; ESP packages contain bootloader and partition-table images plus
 `flash.json`. Packaging verifies image metadata and storage bounds. ESP packaging
 also checks the linked Rust startup frames: `main` has at most 1 KiB, and the
 initialization frames together have at most 16 KiB. This catches large constructor
-temporaries; SDK calls and executor workloads still need stack measurements on
-hardware before reducing the FreeRTOS stack allocation.
+temporaries.
 
 Every Pico board reserves 65536 bytes for the core 0 stack. Its synchronous entry
 installs `embassy_rp::install_core0_stack_guard` before executor or task
@@ -220,17 +213,7 @@ bottom of the stack reservation. Access to that subregion faults, but a large
 stack adjustment can jump over it and corrupt memory below the reservation
 without touching the guard. On RP2350, Embassy sets `MSPLIM` to the bottom of
 the reservation so main stack pointer updates below that limit fault. The guards
-provide overflow detection but do not prove that the reserved stack is sufficient
-or measure its high-water usage. They do not provide general memory protection.
-
-No on-device stack high-water measurement is recorded here. Before reducing
-stack reservations, measure both production and debug firmware on each affected
-chip. Use a debugger to fill only the unused stack with a known pattern after
-reset and before application startup. Inspect the boundary between the overwritten
-and intact pattern after startup and sustained USB and radio activity, including
-pairing, reconnections, storage writes and interrupt load. Keep the active stack
-and the guard region out of the fill. Record the workload, observed peak and
-remaining headroom. A passing workload does not bound untested paths.
+provide overflow detection.
 
 `rust/tools/flash_dev.py` inspects Pico UF2 artifacts and supports explicit
 storage-preserving development updates. See its `--help` for identity and mount
@@ -240,11 +223,10 @@ Firmware updates within one storage format, named by the layout identity in the
 [storage format](storage-format.md), preserve saved bonds, identities and
 preferences. Firmware never opens or reformats storage of another format, so
 the adapter cannot become ready with incompatible storage. A first installation
-also requires blank storage; data from factory or other firmware prevents
-provisioning. For a first installation or an update from another storage format,
-erase the board's whole flash before flashing
-it: on Pico boards in BOOTSEL mode with `picotool erase` (picotool 2.0 or later), then copy the
-UF2; on the ESP32-S3 with `esptool --chip esp32s3 erase_flash` before
+provisions storage only when the whole storage range is blank. For a first installation on flash
+not known to be blank, or an update from another storage format, erase the board's whole flash
+before flashing it: on RP2040 and RP2350 boards in BOOTSEL mode with `picotool erase` (picotool 2.0
+or later), then copy the UF2; on the ESP32-S3 with `esptool --chip esp32s3 erase_flash` before
 `write_flash`. The adapter then starts with a new Bluetooth identity and no
 saved devices, so pair each device again, removing the adapter from the device
 first where it keeps a pairing. `flash_dev.py` refuses an update whose storage
@@ -409,7 +391,7 @@ build outputs while preserving downloaded dependencies and toolchains.
 ## USB gamepad builds
 
 Pico W, Pico 2 W and Waveshare RP2350B-Plus-W enable the `cordial-usb/gamepad`
-feature. ESP32-S3 omits its classes and worker storage. The Pico builds advertise
+feature. These builds advertise
 Disabled, HID and XInput gamepad output modes. USB gamepad slot limits are separate from the
 board's Bluetooth transport allowances.
 
@@ -432,6 +414,4 @@ bytes and 256 control bytes. The maximum configuration uses 455 bytes, and the
 receiver's Microsoft OS descriptor uses 46 bytes.
 
 Windows driver binding uses the receiver function's `XUSB20` compatible ID and
-does not require a Cordial service. Manual Windows testing confirms XInput
-operation in MultiPadTester for the tested setup. Automated software checks run
-on Linux; see the [hardware validation limits](protocol/hid-forwarding.md#usb-gamepad-outputs).
+does not require a Cordial service.

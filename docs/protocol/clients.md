@@ -80,6 +80,9 @@ input runs as a script. `cordial tui` opens the TUI. Without `--port`, the CLI u
 adapter and fails when there are several. Controller selection uses USB ports, not the host's
 Bluetooth controllers.
 
+Only one app can manage an adapter at a time. Quit the desktop app, or disconnect the adapter in it,
+before using the CLI.
+
 | CLI command | Behavior |
 | --- | --- |
 | `adapter list` / `adapter select PORT` | List attached adapters, or switch to one. |
@@ -342,50 +345,6 @@ Overview banner. Resource displays use each reported optional value independentl
 limit only, both, or neither. Missing values are unknown and are never formatted as zero or
 unlimited.
 
-### Gamepad verification
-
-Hardware checks cover Waveshare RP2350B-Plus-W startup with zero gamepad slots
-and CLI readiness. Manual Windows testing confirms XInput operation in MultiPadTester
-and HIDAPI enumeration with button input. The USB descriptors implement native Windows
-binding through the receiver's `XUSB20` compatible ID; see
-[binding evidence and validation limits](hid-forwarding.md#usb-gamepad-outputs).
-Software checks run on Linux and do not establish physical controller compatibility.
-
-For a Linux hardware check:
-
-1. Start with all saved gamepad choices Disabled. Compare `cordial adapter status` and `lsusb -v`
-   with the actual allocation. Unconfigured extra gamepad slots may be exposed when resources
-   remain. Serial remains available; keyboard/mouse appears when configured devices require it.
-2. Pair a controller and check that Gamepad Output selects HID after first-connection
-   setup when supported and the saved HID pool has room. Otherwise it stays Disabled.
-   Test HID and XInput separately with `device set DEV gamepad-output hid` and
-   `device set DEV gamepad-output xinput` in the CLI shell. Use
-   `device get DEV` to inspect the saved choice and reported output state.
-3. Check driver binding with `lsusb -t` and input with `evtest`. Exercise buttons,
-   sticks, triggers and directional controls against the documented mapping.
-4. Disconnect and reconnect the controller. When the actual allocation stays the same, check that
-   the adapter stays enumerated. Held controls release, vacant HID slots are neutral, and XInput
-   reports absence and presence. Check keyboard, mouse and serial use alongside
-   gamepad input, then close Cordial and check that input continues.
-5. Change modes, connect devices or unpair a controller so the actual allocation changes. Check
-   that USB reconnects, the client returns to the same adapter and reads fresh status, and saved
-   choices survive. With multiple saved controllers, check each mode's independent pool against
-   [allocation priorities](hid-forwarding.md#usb-allocation), capped at its compiled maximum.
-6. Under allocation pressure, check connected-device preemption, independent required and reserved
-   errors, and both errors together. Omitted unconfigured extras produce neither error. A
-   still-omitted candidate must not cause repeated USB reconnects. Stop reading serial during a
-   save and check that the short drain deadline still allows reconfiguration.
-
-For a manual Windows check, configure the adapter on Linux first:
-
-1. Connect it to Windows and check native HID and XInput driver binding in Device
-   Manager, without a Cordial driver or service. Check controller input in Game
-   Controllers with `joy.cpl` and in an XInput application, using the documented
-   mapping limits.
-2. Repeat controller disconnect/reconnect, vacant-slot, held-control release and
-   keyboard/mouse coexistence checks. Check a USB unplug/replug and host
-   suspend/resume. Record the Windows version, chosen mode and observed result.
-
 ## Profile commands
 
 The desktop application and TUI manage profiles, layers and configuration interfaces, and never read
@@ -467,4 +426,4 @@ the two swap rules retain both source values. Each route moves its source to the
 takes precedence over the destination's unchanged input. Later profiles see the resulting axes.
 Axis rules add no deadzones, curves or sensitivity settings.
 
-See [Input profiles](../input-profiles.md) for external editors and hardware checks.
+See [Input profiles](../input-profiles.md) for external editors.

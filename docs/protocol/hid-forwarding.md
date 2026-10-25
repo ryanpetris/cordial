@@ -87,13 +87,6 @@ VIA or Vial requests one interface with an IN and an OUT endpoint while enabled.
 is separate from active USB exposure. Connected-device requirements can take priority over an
 editor, and whether an editor application is open does not change its priority.
 
-USB fixtures exercise descriptor and endpoint counts, independent controller reports and
-transitions, boot/report switching, rollover, lock LEDs, and idle reports. Hardware verification
-must also cover pre-OS keyboard input, separate gamepad recognition in host applications, and
-repeated editor enable/disable cycles on both Pico and ESP32-S3 boards. Allocation pressure,
-connected-device preemption, a host that stops reading serial, and reconnecting with held controls
-also need hardware validation.
-
 ## USB control requests
 
 Cordial validates standard endpoint requests before Embassy dispatches them to the USB bus.
@@ -176,32 +169,9 @@ After resume, currently held controls resynchronize under the suspend policy abo
 A short tap fully released during wake can wake the Host without delivering the
 tap as input; old motion and taps are not replayed.
 
-### Board verification
+### Board requirements
 
-Endpoint halt recovery and remote wake have software fixtures but no physical
-verification. On RP2040, endpoint recovery relies on the USB ABORT behavior of B2
-or later silicon. Earlier silicon has an ABORT erratum and is not qualified by this
-implementation. The pinned RP USB driver forces VBUS present, so an externally
-powered adapter cannot independently detect physical cable removal. Software
-disable and topology rebuild are distinct from cable-removal detection.
-Power-supply design and suspend-current qualification are outside this
-implementation's scope.
-
-Hardware verification on RP2040, RP2350 and ESP32-S3 must cover:
-
-- Set and clear HALT in both IN and OUT directions with queued, completed and idle
-  packets. Check DATA0 recovery, payload preservation and no duplicate delivery,
-  including clearing an endpoint that is already unhalted.
-- USB reset, unconfigure/reconfigure and warm suspend/resume with held controls and
-  pending transfers. Check current-state resynchronization and continued traffic.
-- Host wake permission enabled, absent and cleared before a subsequent suspension.
-  Check accepted presses and pointer motion, first-report baselines, unchanged held
-  controls, status traffic, gamepad axis jitter and taps released during wake.
-- Suspend timing, resume pulse length and host-frame confirmation, including reset,
-  disable and rapid topology rebuild while wake is pending or signaling.
-- Linux `xpad` reset-resume of the whole composite device on RP boards with XInput
-  enabled, including sibling HID recovery and CDC serial reconnection. Check CDC
-  reconnection after topology rebuilds on all platforms.
+On RP2040 boards, endpoint recovery relies on the USB ABORT behavior of B2 or later silicon.
 
 ## USB allocation
 
@@ -483,19 +453,15 @@ services prevent selection. The recognized layouts are:
   The fixture uses the complete
   [hid-tools Bluetooth descriptor](https://github.com/bentiss/hid-tools/blob/0579ecdb4e041ce93c18ca45b3e8a2584f9ce952/hidtools/device/sony_gamepad.py#L716-L900).
   [Linux's DS4 decoder](https://github.com/torvalds/linux/blob/v6.12/drivers/hid/hid-playstation.c#L2288-L2300)
-  supplies the button semantics. Enhanced Bluetooth report `0x11` and the USB
-  64-byte report `0x01` are outside this mapping. No feature request switches modes.
+  supplies the button semantics.
 
 Other Consumer controls, including Share and microphone, have no builtin output. Assigned custom
 profiles can remap the original controls, including those disabled by a builtin. Unrecognized
 layouts retain their HID usages; the fixed XInput conversion does not establish physical-control
 semantics for them. Definitions in `rust/crates/cordial-core/src/gamepad_profiles.rs` and descriptor
 fixtures in `rust/crates/cordial-core/tests/support/gamepad_descriptors.rs` credit their specific
-sources. Core `gamepad_profiles` and USB `gamepad_tests` fixtures cover mapping and encoding.
-Descriptor and driver evidence does not establish universal controller support. The manual Windows
-results below cover only the tested setup. Absolute axis rules select a destination in the same
-Game Pad collection and optionally invert its normalized range. Neither mode adds curves, deadzones
-or sensitivity. Host LED and rumble commands are consumed without forwarding them to the device.
+sources. Absolute axis rules select a destination in the same Game Pad collection and optionally
+invert its normalized range.
 
 Each slot has current axis state, a 16-entry digital transition queue and an independent writer. The
 priority loop publishes after every radio event, preserving button, hat, D-pad, Start and Select
@@ -521,13 +487,6 @@ Microsoft documents OS 2.0 descriptor support in Windows 8.1 and later.
 describe the binding mechanism. The receiver packet format follows
 [the reference transport](https://github.com/9names/xinput-device/blob/main/xinput-device/src/xinput.rs)
 and [Linux xpad](https://github.com/torvalds/linux/blob/master/drivers/input/joystick/xpad.c).
-
-Manual Windows testing reports working XInput in MultiPadTester and HIDAPI enumeration with button
-input. MultiPadTester's generic HID labels use buttons 1/2/3/4/5/6/7/8/9/10 for
-A/B/X/Y/LB/RB/Back/Start/LS/RS. Cordial's Linux convention above therefore explains the observed
-X-to-L1, L1-to-Back and R1-to-Start labels. Those labels do not establish a firmware mapping fault.
-Browser XInput visibility and right-stick visualization remain unresolved. Full HID axis and trigger
-behavior and multiple simultaneous channels have not been manually verified.
 
 An active VIA or Vial Raw HID interface follows the gamepad functions. Disabling an active editor
 rebuilds USB without its interface and endpoints. Vial's serial suffix follows its active exposure.
