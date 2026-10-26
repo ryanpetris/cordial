@@ -10,6 +10,12 @@ and callback offsets must fit the byte-addressed interface without wrapping.
 `Filesystem::grow` accepts growth within the driver range. Total and available
 space use the mounted block count.
 
+The patch also adds `Filesystem::make_consistent()` to resolve interrupted
+LittleFS operations before Cordial reads application data or removes temporary
+files. This prevents an interrupted cross-directory rename from hiding entries
+during startup validation. Recovery may write metadata; a recovery failure stops
+startup without formatting the filesystem.
+
 Cordial supplies block-aligned bounds and validates the application epoch before
 using or growing a filesystem. The record-storage fixtures exercise runtime
 sizes, growth, recovery and interrupted writes.
