@@ -28,24 +28,24 @@
     "check": "npm run check:generated && npm run typecheck && npm test"
   },
   "dependencies": {
-    "react": "19.3.0",
-    "react-dom": "19.3.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
     "serialport": "13.0.0",
-    "usb": "3.1.0"
+    "usb": "3.2.1"
   },
   "devDependencies": {
     "@cordial/client": "0.0.0",
     "@cordial/protocol": "0.0.0",
-    "@types/node": "26.6.3",
+    "@types/node": "26.6.5",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
-    "@vitejs/plugin-react": "6.1.1",
-    "electron": "44.4.5",
-    "electron-builder": "26.15.3",
-    "playwright": "1.63.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "electron": "45.0.0",
+    "electron-builder": "26.18.0",
+    "playwright": "1.64.1",
     "typescript": "7.0.2",
-    "vite": "8.3.1",
-    "vitest": "5.0.2"
+    "vite": "8.3.5",
+    "vitest": "5.0.5"
   },
   "desktopName": "cordial-desktop.desktop",
   "allowScripts": {
