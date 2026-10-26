@@ -490,49 +490,59 @@ mod tests {
 
     #[test]
     fn gsettings_round_trips_and_observes_external_changes() {
-        let root = root("settings");
-        let backend = gio::memory_settings_backend_new();
-        let settings = settings(&root, &backend);
-        let store = Store {
-            root: root.clone(),
-            settings: settings.clone(),
-        };
-        assert_eq!(store.get(), Preferences::default());
-        let p = Preferences {
-            always_show_tray: true,
-            low_battery_percent: 30,
-            ..Preferences::default()
-        };
-        store.set(p).unwrap();
-        assert_eq!(
-            Store {
-                root: root.clone(),
-                settings: settings.clone(),
-            }
-            .get(),
-            p
-        );
-        let external =
-            gio::Settings::new_full(&settings.settings_schema().unwrap(), Some(&backend), None);
-        let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let id = store.connect_changed({
-            let changed = changed.clone();
-            std::sync::Arc::new(move |_| changed.store(true, std::sync::atomic::Ordering::Relaxed))
-        });
-        external.set_boolean("notify-connections", true).unwrap();
-        assert!(store.get().notify_connections);
-        assert!(changed.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(
-            store
-                .set(Preferences {
-                    low_battery_percent: 51,
-                    ..p
-                })
-                .is_err()
-        );
-        assert_eq!(store.get().low_battery_percent, 30);
-        store.disconnect(id);
-        fs::remove_dir_all(root).unwrap();
+        glib::MainContext::new()
+            .with_thread_default(|| {
+                let root = root("settings");
+                let backend = gio::memory_settings_backend_new();
+                let settings = settings(&root, &backend);
+                let store = Store {
+                    root: root.clone(),
+                    settings: settings.clone(),
+                };
+                assert_eq!(store.get(), Preferences::default());
+                let p = Preferences {
+                    always_show_tray: true,
+                    low_battery_percent: 30,
+                    ..Preferences::default()
+                };
+                store.set(p).unwrap();
+                assert_eq!(
+                    Store {
+                        root: root.clone(),
+                        settings: settings.clone(),
+                    }
+                    .get(),
+                    p
+                );
+                let external = gio::Settings::new_full(
+                    &settings.settings_schema().unwrap(),
+                    Some(&backend),
+                    None,
+                );
+                let changed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let id = store.connect_changed({
+                    let changed = changed.clone();
+                    std::sync::Arc::new(move |_| {
+                        changed.store(true, std::sync::atomic::Ordering::Relaxed)
+                    })
+                });
+                assert!(!store.get().notify_connections);
+                external.set_boolean("notify-connections", true).unwrap();
+                assert!(store.get().notify_connections);
+                assert!(changed.load(std::sync::atomic::Ordering::Relaxed));
+                assert!(
+                    store
+                        .set(Preferences {
+                            low_battery_percent: 51,
+                            ..p
+                        })
+                        .is_err()
+                );
+                assert_eq!(store.get().low_battery_percent, 30);
+                store.disconnect(id);
+                fs::remove_dir_all(root).unwrap();
+            })
+            .unwrap();
     }
 
     #[test]
