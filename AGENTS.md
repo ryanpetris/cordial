@@ -173,8 +173,8 @@ Before any item is considered done, all suites below must pass for the completed
 Use targeted tests during development, then complete this checklist before reporting completion.
 Passing results from the same work can be reused while their inputs remain unchanged. A skipped
 fixture or a missing prerequisite is not a pass; resolve it or report the item as incomplete.
-Documentation-only changes do not run these suites. Keep this catalog aligned with `Makefile`,
-`desktop/package.json`, and `.github/workflows/release.yml`. It lists suites and fixtures, not
+Documentation-only changes do not run these suites. Keep this catalog aligned with `Makefile`
+and `.github/workflows/release.yml`. It lists suites and fixtures, not
 individual test cases.
 
 | Suite or fixture | Required check and coverage |
@@ -182,25 +182,23 @@ individual test cases.
 | Rust workspace | `make check-rust`: unit, integration, and documentation tests for all workspace crates with all features, including the core, protocol, client, CLI/TUI, USB, BLE HID, BTstack, and record storage adapters. Includes the ESP storage fixture. |
 | Rust static checks | `make check-rust`: workspace Clippy for all targets and features, with warnings treated as errors. |
 | Native BTstack callbacks | `make check-rust`: `rust/tools/test_btstack.py` builds and runs the capacity, profiles, GATT, device information, layout, and saved-security C fixtures. |
-| Generated desktop protocol | `make check-desktop`: regenerate and compare checked-in TypeScript protocol messages. |
-| Desktop type checks | `make check-desktop`: TypeScript checks for the desktop and shared packages. |
-| Desktop and shared client tests | `make check-desktop`: all Vitest fixtures in `desktop/test` and `desktop/packages/*/test`, including desktop state, settings, serial communication, notifications, tray, server, client transports, and framing. |
-| Desktop garbage-collection fixtures | `npm --prefix desktop test -- --execArgv=--expose-gc`: enables the notification and USB watcher lifetime checks that otherwise skip when `global.gc` is unavailable. |
 | Protocol compatibility | `make check-protocol`: Buf lint and breaking checks for the permanent handshake and retained serial revisions against prior released schemas, plus storage compatibility against `PROTOCOL_BASE`, selected from `CORDIAL_VERSION`. |
 | Repository tool fixtures | `make check-tools`: `tools/test_*.py`, covering versions, editor-definition validation, and release archive validation. |
 | Firmware and packaging tool fixtures | `make check-tools`: `rust/tests/test_*.py`, covering board configuration, firmware artifacts, flashing, dependency notices, packaging, native BLE, HID reports, and host terminal behavior. |
-| Linux CLI/TUI terminal fixture | Build the CLI and install `pyte`, then run `CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py`. The default tool run skips this fixture without these prerequisites. |
+| Linux CLI/TUI terminal fixture | Build the CLI and install `pyte`, then run `CORDIAL_TEST_BINARY="$PWD/rust/target/x86_64-unknown-linux-gnu/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py`. The default tool run skips this fixture without these prerequisites. |
 | Firmware static checks | `make check-firmware BOARD=pico2_w PROFILE=production` and `make check-firmware BOARD=pico2_w PROFILE=debug`: firmware Clippy for the Pico 2 W. Also run them for another board (`pico_w`, `waveshare_rp2350b_plus_w`, `esp32s3`) when a change materially affects that board specifically, such as its board definition, platform code, radio backend, configuration, or partition or storage layout. |
 | Firmware artifact validation | `make firmware BOARD=pico2_w PROFILE=production` and `make firmware BOARD=pico2_w PROFILE=debug`: link and package the Pico 2 W, including metadata, image layout, and storage-boundary checks in `rust/tools/build_firmware.py`. Also build another board under the same condition as its static checks. ESP builds check the linked Rust startup stack frames. |
-| Portable application packages | `make package-desktop package-cli package-web`; validate the desktop and CLI archives with `tools/check_release_archive.py` for the selected `CORDIAL_VERSION`. |
-| Arch package fixture | Build both native packages with `make package-desktop-arch package-cli-arch`, then run `packaging/check-arch.sh` in a clean Arch container. Checks independent installation, native modules, package contents, Namcap, reinstallation, and removal. |
-| Debian/Ubuntu package fixtures | Build both native packages with `make package-desktop-deb package-cli-deb DEB_DISTRIBUTION=...`, then run `packaging/check-deb.sh` in the matching clean container for `trixie`, `noble`, and `resolute`. Checks independent installation, native modules, package contents, Lintian, reinstallation, and removal. |
-| Installed desktop smoke fixture | Install the Noble desktop package, then run `CORDIAL_EXECUTABLE=/opt/cordial-desktop/cordial-desktop xvfb-run -a dbus-run-session -- node desktop/scripts/smoke.mjs desktop/out/package-smoke` with the Chromium sandbox enabled. Exercises the main views and pairing with simulated adapters. |
+| Portable application packages | `make package-desktop package-cli`; validate the unified host archive with `tools/check_release_archive.py` using kind `host` and the selected `CORDIAL_VERSION`. |
+| Arch package fixture | Build `cordial` with `make package-host-arch`, then run `packaging/check-arch.sh` in a clean Arch container. Checks installation, native dependencies, schema registration, package contents, Namcap, reinstallation, and removal. |
+| Debian/Ubuntu package fixtures | Build `cordial` with `make package-host-deb DEB_DISTRIBUTION=...`, then run `packaging/check-deb.sh` in matching clean containers for `trixie` and `resolute`. Checks installation, native dependencies, schema registration, contents, Lintian, reinstallation, removal, and purge. |
+| Installed desktop smoke fixture | Install the Resolute `cordial` package, then run `CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a dbus-run-session -- python3 rust/tests/gtk_smoke.py build/package-smoke`. Also run it with `build/empty-states-smoke --empty-states` for empty device profiles and per-adapter pairing actions. Exercises native navigation, profiles, pairing, files, GSettings, narrow layouts, immediate writes, and quit behavior with simulated adapters. |
+| GTK control fixtures | Run the ignored integer-control and rejected-preference tests under Xvfb and a private D-Bus session, as specified in the release workflow. |
+| AppImage smoke fixture | Run `tools/check_appimage.py` against the packaged AppImage in disposable Resolute and Arch environments. Verify desktop launch, bundled GIO modules, and persistent default-backend GSettings. |
 | Release asset validation | When assembling a release, verify all expected application and board/profile archives and their checksums using the asset checklist in `.github/workflows/release.yml`. Publishing is not a check and still requires authorization. |
 
-`make check` covers the Rust, desktop, protocol, and Python tool suites. It does not enable the
-garbage-collection or terminal prerequisites, or run the firmware, package
-installation, or installed desktop smoke checks. Run package installation fixtures only in
+`make check` covers the Rust, protocol, and Python tool suites. It does not supply the
+terminal prerequisites or run the display-dependent GTK controls, firmware, package
+installation, installed desktop, or AppImage smoke checks. Run package installation fixtures only in
 disposable environments, never against the developer's installed
 applications. See [building documentation](docs/building.md) and the release workflow for setup
 and the distribution matrix.

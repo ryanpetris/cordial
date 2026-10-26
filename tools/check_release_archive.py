@@ -6,9 +6,10 @@ import tarfile
 
 
 def check(path, application, version):
-    prefix = (f"cordial-cli-{version}-linux-amd64/" if application == "cli"
-              else f"cordial-desktop-{version}-x64/")
-    executable = "cordial" if application == "cli" else "cordial-desktop"
+    if application != "host":
+        raise ValueError("Expected a unified host archive")
+    prefix = f"cordial-{version}-linux-amd64/"
+    executable = "cordial"
     with tarfile.open(path, "r:gz") as archive:
         members = {}
         for member in archive:
@@ -31,9 +32,24 @@ def check(path, application, version):
             raise ValueError("Archive must contain a regular VERSION file")
         if archive.extractfile(metadata).read().decode("ascii").strip() != version:
             raise ValueError("Archive version does not match CORDIAL_VERSION")
-        rules = members.get(prefix + "50-cordial.rules")
-        if not rules or not rules.isfile():
-            raise ValueError("Archive must contain the udev rules")
+        required = ("50-cordial.rules", "LICENSE", "DEPENDENCIES.md", "dependencies.json",
+                    "SHA256SUMS", "dev.petris.cordial.desktop", "dev.petris.cordial.png",
+                    "dev.petris.cordial.svg", "docs/protocol/README.md", "proto/handshake.proto",
+                    "proto/serial/current", "share/glib-2.0/schemas/dev.petris.cordial.gschema.xml",
+                    "share/glib-2.0/schemas/gschemas.compiled")
+        for name in required:
+            member = members.get(prefix + name)
+            if not member or not member.isfile() or not member.size:
+                raise ValueError(f"Archive must contain a nonempty regular {name} file")
+        revision = archive.extractfile(members[prefix + "proto/serial/current"]).read(64).decode("ascii").strip()
+        if not revision.isdecimal() or len(revision) > 10:
+            raise ValueError("Archive must contain a valid serial revision")
+        schema = members.get(prefix + f"proto/serial/v{revision}/cordial.proto")
+        if not schema or not schema.isfile() or not schema.size:
+            raise ValueError("Archive must contain the current serial schema")
+        if not any(name.startswith(prefix + "notices/") and member.isfile() and member.size
+                   for name, member in members.items()):
+            raise ValueError("Archive must contain dependency notices")
         if not binary or not binary.isfile() or not binary.mode & 0o111:
             raise ValueError("Archive must contain the application executable")
         header = archive.extractfile(binary).read(20)
@@ -45,7 +61,7 @@ def check(path, application, version):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive")
-    parser.add_argument("application", choices=("desktop", "cli"))
+    parser.add_argument("application", choices=("host",))
     parser.add_argument("version")
     args = parser.parse_args()
     try:

@@ -34,7 +34,7 @@ pub enum HandshakeError {
     Malformed,
 }
 
-// Match uint32 key encodings in the TypeScript protobuf decoder, including inside groups.
+// Protobuf field keys fit in five bytes, including inside groups.
 fn key(bytes: &mut &[u8]) -> Result<(u32, WireType), HandshakeError> {
     let length = bytes.len();
     let key = decode_key(bytes).map_err(|_| HandshakeError::Malformed)?;

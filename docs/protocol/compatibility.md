@@ -21,28 +21,19 @@ hello whenever asked and accepts ordinary requests without it, so it has no comp
 never knows the host's revision. A host sends ordinary requests only after a valid `AdapterHello`
 names a revision it implements.
 
-Current applications use only the current operational schema. A matching native revision connects
+Current applications use the current operational schema. A matching native revision connects
 directly. A newer native revision is refused and requires an application upgrade. An older native
-revision can use a CLI shim only when that helper actually implements the revision and its
-conversion to the current schema. Revision `1` has no earlier nonzero revision and no historical
-conversion. Firmware without the permanent hello is unsupported; clients never infer a revision
-from a firmware release number or an ordinary response. Helpers expose only their compiled current
-revision to applications; they cannot impersonate an older application-side revision.
+revision requires an implemented converter to the current schema. Revision `1` has no earlier
+nonzero revision and no historical conversion. Firmware without the permanent hello is
+unsupported; clients never infer a revision from a firmware release number or an ordinary response.
 
-A host that implemented several revisions could pick the matching codec after the hello and keep
-using the same open port. The desktop application instead closes the port and hands an older
-adapter to a separate CLI process, which opens the port again.
-
-A CLI helper and the application must agree on both the current protocol revision and the exact
-operational schema fingerprint before exchanging ordinary traffic. Optional hello metadata is
-not a compatibility requirement. See [client implementations](clients.md) for helper selection.
+The native GTK desktop, CLI and TUI perform compatibility selection inside the Rust process.
+Optional hello metadata is not a compatibility requirement. See [client implementations](clients.md).
 
 Breaking operational changes get an explicitly approved new revision in `proto/serial/vN/`.
 Retain earlier revision directories as schema history. Default builds generate only the current
-revision and its imports, the handshake and existing storage records. The TypeScript generator
-checks every retained revision's `schema.sha256` and detects stale generated operational files;
-regeneration updates the digests and deletes stale output. Historical revisions remain source
-schemas without generated message exports. The operational revision is independent of application
+revision and its imports, the handshake and existing storage records. Historical revisions
+remain source schemas without generated message exports. The operational revision is independent of application
 release versions and storage versions. The breaking transition to revision `1` requires the next
 release to increment the minor version. Breaking protocol changes increment the release minor
 version while the application major version is `0`, or the major version from `1` onward. The
@@ -50,7 +41,7 @@ development release template remains `0.0.0`.
 
 ### Operational schema identity
 
-Rust and TypeScript expose `OPERATIONAL_SCHEMA_SHA256`, a lowercase hexadecimal SHA-256 digest of
+Rust exposes `OPERATIONAL_SCHEMA_SHA256`, a lowercase hexadecimal SHA-256 digest of
 the normalized protobuf `FileDescriptorSet` for the current operational schema and all its imports.
 The handshake and storage are not included. Normalization clears each file's `name` and
 `source_code_info`, recursively replaces dependency filenames with the SHA-256 digest of each
@@ -58,8 +49,8 @@ normalized dependency descriptor, sorts files by lexicographic order of their en
 bytes, then encodes and hashes the descriptor set.
 All other descriptor fields, declaration order and dependency order remain significant. Comments
 and incidental source paths do not affect the digest; operational fields and imported definitions
-do. Both generators use their protobuf descriptor encoders. A shared dependency fixture and the
-current schema's checked-in digest cross-check protox and Buf independently. Cargo rejects
+do. The Rust build generates the digest with its protobuf descriptor encoder. A dependency
+fixture and the current schema's checked-in digest verify normalization. Cargo rejects
 operational descriptors with custom option extensions because its typed descriptor conversion
 would omit them. Such schemas require lossless normalization support before use.
 

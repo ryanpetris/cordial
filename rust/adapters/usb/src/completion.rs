@@ -587,6 +587,45 @@ mod inflight_tests {
         completed.set(true);
         assert_eq!(neutral.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
     }
+    #[test]
+    fn final_serial_delimiter_waits_for_hardware_after_fifo_submission() {
+        let completed = Cell::new(true);
+        let packets = RefCell::new(std::vec::Vec::new());
+        let mut endpoint = CompleteEndpoint {
+            endpoint: Fifo {
+                info: EndpointInfo {
+                    addr: EndpointAddress::from_parts(1, embassy_usb::driver::Direction::In),
+                    ep_type: EndpointType::Bulk,
+                    max_packet_size: 64,
+                    interval_ms: 0,
+                },
+                completed: &completed,
+                packets: &packets,
+            },
+            completion: Witness(&completed),
+            pending: None,
+        };
+        let mut session = cordial_core::control::Session::new();
+        session.session(true);
+        session.end(cordial_protocol::SessionEndingReason::Reboot, 0);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut delimiter = false;
+        while let Some((token, bytes)) = session.output(1) {
+            let byte = bytes[0];
+            let bytes = [byte];
+            let mut write = pin!(endpoint.write(&bytes));
+            assert!(write.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(packets.borrow().last().unwrap(), &[byte]);
+            assert_ne!(session.queued(), 0);
+            assert!(session.output(1).is_none());
+            completed.set(true);
+            assert_eq!(write.as_mut().poll(&mut cx), Poll::Ready(Ok(())));
+            session.output_complete(token, 1);
+            delimiter = byte == cordial_protocol::frame::DELIMITER;
+            assert_eq!(session.queued() == 0, delimiter);
+        }
+        assert!(delimiter);
+    }
 }
 
 #[cfg(test)]

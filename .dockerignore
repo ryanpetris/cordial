@@ -1,14 +1,13 @@
 # Builds copy the checkout without its build outputs, caches or installed dependencies.
 .git
-**/node_modules
 **/__pycache__
 **/.embuild
 target
 rust/target
 rust/platforms/*/target
 build
-desktop/out
-desktop/dist
+release
+namcap.log
 .cache
 # Notes at the top level stay out; README.md is part of builds.
 *.md

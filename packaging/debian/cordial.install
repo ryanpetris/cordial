@@ -1,0 +1,12 @@
+cordial usr/bin
+dev.petris.cordial.desktop usr/share/applications
+dev.petris.cordial.png usr/share/icons/hicolor/512x512/apps
+dev.petris.cordial.svg usr/share/icons/hicolor/scalable/apps
+docs usr/share/doc/cordial
+proto usr/share/doc/cordial
+notices usr/share/doc/cordial
+dependencies.json usr/share/doc/cordial
+DEPENDENCIES.md usr/share/doc/cordial
+VERSION usr/share/doc/cordial
+50-cordial.rules usr/lib/udev/rules.d
+share/glib-2.0/schemas/*.gschema.xml usr/share/glib-2.0/schemas

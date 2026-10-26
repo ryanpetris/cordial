@@ -44,8 +44,7 @@ prerequisites are GNU Make, Git and [Docker](https://docs.docker.com/engine/inst
 with your user allowed to run it. `DOCKER=podman` uses Podman instead.
 
 ```sh
-make desktop
-make cli
+make host                   # one executable for desktop, CLI and TUI
 make firmware BOARD=pico_w
 ```
 
@@ -57,20 +56,9 @@ build would put them, replacing the earlier copy of each output. Docker BuildKit
 is required.
 
 BuildKit cache mounts retain Cargo downloads, Rust compilation outputs, pinned
-firmware dependencies, npm downloads, Electron and electron-builder downloads,
-and tools that use `XDG_CACHE_HOME`. Desktop, web and their portable packages
-share a Docker layer containing the complete npm installation, including native
-modules, workspace links and nested dependencies. The layer runs `npm ci` with
-development dependencies before copying application sources. Its inputs are
-`desktop/package.json`, `desktop/package-lock.json`, all workspace manifests,
-and `desktop/.npmrc` and `desktop/npm-shrinkwrap.json` when present.
-Changing those inputs or the toolchain runtime creates a new installation;
-application source edits reuse it. If installation hooks need repository files,
-include those files in the `npm_inputs` extraction in `docker/build-cache.py`.
-CLI, firmware and native archive repackaging skip this layer. Packaged outputs
-are not cached. Firmware keeps its board configuration and profile hash
-directories under `target/firmware/`; CLI target triples remain separate under
-`rust/target/`.
+firmware dependencies and tools that use `XDG_CACHE_HOME`. Packaged outputs are
+not cached. Firmware keeps its board configuration and profile hash directories
+under `target/firmware/`; host target triples remain separate under `rust/target/`.
 
 Caches are shared by checkouts using the same Docker builder and toolchain runtime.
 The cache key hashes the image's filesystem layers, runtime configuration, OS,
@@ -81,11 +69,8 @@ dependency caches also include the SHA-256 of `rust/tools/firmware_dependencies.
 so different dependency pins never switch a shared SDK checkout. Cargo handles
 Rust dependency and compiler-option changes.
 Copied input files retain timestamps by content, so Cargo detects source changes
-even when another checkout supplies older timestamps. Installed `node_modules`
-trees are excluded from source hashing. The npm installation marker is refreshed
-after timestamp normalization so Make reuses the prepared installation. Build
-commands and artifact validation still run when the Docker result layer is not
-reusable.
+even when another checkout supplies older timestamps. Build commands and artifact
+validation still run when the Docker result layer is not reusable.
 
 Builds using the same toolchain runtime serialize access to their cache mounts.
 This protects Cargo outputs, generated configuration and mutable SDK checkouts
@@ -93,9 +78,9 @@ across concurrent builds. Different toolchain runtimes can build in parallel.
 Each Make target has an export scratch directory under `.cache/docker/`;
 concurrent invocations of the same target must use separate checkouts. Toolchain
 images also receive `cordial-toolchain:<runtime-hash>` tags. Each tag retains the
-first image with matching runtime contents, so provenance changes preserve the
-npm layer and a rebuild of the regular image tag preserves the selected
-environment. An existing runtime tag with different contents is replaced.
+first image with matching runtime contents, so provenance changes and rebuilds
+of the regular image tag preserve the selected environment. An existing runtime
+tag with different contents is replaced.
 
 `make clean` removes exported outputs but leaves BuildKit caches intact. To clear
 unused cache mounts for the active Docker builder, run
@@ -107,76 +92,42 @@ interrupted checkout. Cache mounts can use several gigabytes per toolchain and
 firmware configuration. Content-tagged toolchain images remain until their tags
 are removed with `docker image rm cordial-toolchain:<runtime-hash>`.
 
-The CLI executable is `rust/target/release/cordial`. The desktop build is in
-`desktop/out/`.
+The executable is `rust/target/x86_64-unknown-linux-gnu/release/cordial`.
+`make desktop` and `make cli` are aliases for `make host`. `HOST_TARGET` defaults to
+`x86_64-unknown-linux-gnu`, the release architecture. The host image uses Ubuntu 26.04
+Resolute with glibc 2.43, GLib 2.88, GTK 4.22 and libadwaita 1.9. It installs the current
+distribution packages, including updates and security fixes.
 
 ### Building without Docker
 
-`make local-desktop`, `make local-web` and `make local-cli` build the desktop
-application, its web version and the CLI with locally installed tools. Install
-Python 3.11.4+, Node.js 26 with npm, Rust through [rustup](https://rustup.rs/), and
-native build tools. Cargo uses the pinned toolchain in `rust/rust-toolchain.toml`;
+`make local-host` builds the native desktop, CLI and TUI. `make local-desktop` and
+`make local-cli` are aliases. Install Python 3.11.4+, Rust through
+[rustup](https://rustup.rs/) and native build tools. Cargo uses the pinned
+toolchain in `rust/rust-toolchain.toml`;
 the rustup `cargo` and `rustc` commands must be on `PATH`. On Debian and Ubuntu:
 
 ```sh
-sudo apt-get install build-essential git clang libclang-dev pkg-config python3
+sudo apt-get install build-essential git clang libclang-dev pkg-config python3 libgtk-4-dev libadwaita-1-dev libglib2.0-bin
 ```
 
-On Arch, install `base-devel`, `git`, `clang`, `pkgconf` and `python`. Desktop
-targets run `npm ci` when the manifests change or dependencies are missing. After
-installing desktop dependencies, `npm --prefix desktop run start` builds and starts
-the desktop application. The software checks below use the same local tools.
+On Arch, install `base-devel`, `git`, `clang`, `pkgconf`, `python`, `gtk4` and
+`libadwaita`.
+The software checks below use the same local tools.
 
-### Web version
+The native GTK application requires GTK 4.14 or newer and libadwaita 1.5 or newer.
+Run the built executable with `rust/target/x86_64-unknown-linux-gnu/release/cordial desktop`.
+Direct Cargo runs need the schema setup described under Desktop preferences.
+The desktop, CLI and TUI share the Rust controller and run protocol compatibility and storage
+migration in-process. They do not launch another `cordial` process.
 
-The desktop window also runs in a browser, with the controller in the page and
-adapters reached through Web Serial. Web Serial exists only in Chromium-based
-browsers (Chrome, Edge) and only on `https://` pages or `http://localhost`.
+A custom headless build can omit GTK and libadwaita:
 
 ```sh
-make web
+cd rust
+cargo build --locked --release -p cordial --bin cordial --no-default-features
 ```
 
-The build is in `desktop/out/web/`, a static site with relative URLs that works
-under any path. Serve it locally with, for example,
-`python3 -m http.server 8000 --bind 127.0.0.1 --directory desktop/out/web`.
-The page asks for access to an adapter with **Choose Adapter**; the browser then
-remembers it. Only one tab manages adapters at a time. Add `?simulate=2` to the
-URL for a demo with two simulated adapters, which needs no Web Serial. The
-browser has no tray, notifications appear only while the page is open, and
-settings are kept in the browser.
-
-Web Serial can't read USB serial numbers. The page asks for the permanent hello
-and reads `GetStatus` only after the protocol revision matches. Hello metadata is
-optional; `GetStatus` supplies the authoritative adapter identity. A disconnected
-adapter is remembered by its port.
-When it is plugged in again, the page briefly opens the new port to identify it,
-then leaves it disconnected until you choose Connect.
-
-### Development server
-
-For testing, the desktop window can run in a browser while the adapters and the
-controller stay on another machine, such as a remote development host. It is
-never built into the application or packaged.
-
-```sh
-npm --prefix desktop run serve                  # adapters on this machine
-npm --prefix desktop run serve -- --simulate    # two simulated adapters
-```
-
-The server listens on `localhost:5180` only (`--port` changes it) and reloads
-the window when its sources change. From another machine, forward the port and
-open `http://localhost:5180`:
-
-```sh
-ssh -L 5180:localhost:5180 devhost
-```
-
-It refuses requests with another host name or origin, and actions that aren't
-JSON, so other web pages can't use it. It has no other authentication; anyone
-who can reach the port on the development host can manage its adapters. Quit the
-desktop application on that host first, since only one program can open an
-adapter. Changes in Settings last until the server stops.
+This custom executable provides CLI and TUI commands and is not the release package payload.
 
 ### Firmware
 
@@ -250,7 +201,7 @@ for revision matching and schema fingerprints.
 
 ```sh
 export CORDIAL_VERSION=1.2.3
-make package-desktop package-cli package-web package-firmware BOARD=pico_w
+make package-desktop package-cli package-firmware BOARD=pico_w
 ```
 
 The tag-triggered release workflow reads `GITHUB_REF_NAME`, validates
@@ -258,89 +209,88 @@ The tag-triggered release workflow reads `GITHUB_REF_NAME`, validates
 
 ### Portable archives
 
-`make package-desktop` uses electron-builder for AppImage and `.tar.gz` output in
-`desktop/dist/`. `make package-desktop-tar` builds just the archive. Both formats
-bundle Electron and the application's native modules.
+`make package-host-tar` builds the GNU/Linux native executable with documentation, protocol
+definitions and dependency notices in `build/release/cordial-<version>-linux-amd64.tar.gz`.
+`make package-cli`, `make package-cli-tar` and `make package-desktop-tar` are aliases.
+`make package-desktop` builds this archive and an AppImage at
+`build/release/cordial-desktop-<version>-x86_64.AppImage`. The AppImage bundles GTK, libadwaita,
+icons and their redistribution notices. Both formats use the Resolute glibc 2.43 baseline.
+The AppImage bundles GTK, libadwaita, text libraries and the dconf GIO module with its dependencies
+and redistribution notices. It loads GIO modules only from the bundle and uses the host's
+session D-Bus and dconf service. The compiler runtime, window-system
+libraries and graphics drivers, including Vulkan, come from the host.
 
-`make package-cli` builds the static Rust executable, documentation, protocol definitions and
-dependency notices, then creates `build/release/cordial-cli-<version>-linux-<arch>.tar.gz`.
-`make package-cli-tar` is the same target. The CLI has no Electron dependency.
-`CLI_TARGET` selects `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl`;
-the default matches the build machine. The app image includes both targets.
+`make package-host-appimage HOST_ARCHIVE=path/to/cordial-1.2.3-linux-amd64.tar.gz` repacks an
+existing unified archive. `make local-package-host-tar` and `make local-package-host-appimage`
+use local build tools instead of Docker. Local AppImage packaging needs the Resolute library
+and package metadata environment supplied by `docker/host.Dockerfile`.
 
-`make package-web` writes `build/packages/web/cordial-web-<version>/`, a directory
-ready for a static host. Firmware packages are separate from host applications.
+Firmware packages remain separate from host application packages.
 
 ### Native distribution packages
 
-Supported native targets are Arch Linux x86-64, Debian 13, Ubuntu 24.04 and
-Ubuntu 26.04. Each package is built in an image of its distribution from a
-portable archive, which the Make targets build first when none is supplied:
+Supported native targets are Arch Linux x86-64, Debian 13 and Ubuntu 26.04.
+Arch and Ubuntu packages use the Resolute host archive. Debian 13 builds its own executable
+and archive inside a Debian 13 image using the same host Dockerfile with `BASE=debian:13`.
+This keeps its glibc and GTK dependencies compatible with Debian 13. Each package owns
+`/usr/bin/cordial`, the `dev.petris.cordial` desktop entry and icons, the GSettings schema,
+`/usr/share/doc/cordial`, dependency notices, the license and
+`/usr/lib/udev/rules.d/50-cordial.rules`. The desktop entry runs `cordial desktop`.
+Distribution triggers maintain the GSettings schema cache.
 
 ```sh
-CORDIAL_VERSION=1.2.3 make package-desktop-arch package-cli-arch
-CORDIAL_VERSION=1.2.3 make package-desktop-deb package-cli-deb DEB_DISTRIBUTION=noble
+CORDIAL_VERSION=1.2.3 make package-host-arch
+CORDIAL_VERSION=1.2.3 make package-host-deb DEB_DISTRIBUTION=resolute
 ```
 
-Use `DESKTOP_ARCHIVE` and `CLI_ARCHIVE` to package existing archives:
+Supply an existing Resolute archive to Arch or Ubuntu packaging with `HOST_ARCHIVE`:
 
 ```sh
-export CORDIAL_VERSION=1.2.3
-make package-desktop-deb DESKTOP_ARCHIVE=cordial-desktop-1.2.3-x64.tar.gz
-make package-cli-deb CLI_ARCHIVE=cordial-cli-1.2.3-linux-amd64.tar.gz
+CORDIAL_VERSION=1.2.3 make package-host-deb DEB_DISTRIBUTION=resolute \
+  HOST_ARCHIVE=build/release/cordial-1.2.3-linux-amd64.tar.gz
 ```
 
-Archive versions and architectures are checked before packaging. Native desktop
-packages copy the bundled distribution to `/opt/cordial-desktop`, with a launcher
-in `/usr/bin`, desktop entry, icon and license in the standard locations. This
-follows the [Arch Electron guidelines](https://wiki.archlinux.org/title/Electron_package_guidelines)
-for applications with bundled Electron. The native packages configure Electron's
-sandbox helper; Debian and Ubuntu also install its AppArmor user namespace profile.
+Archive versions, architectures, permissions and extraction boundaries are checked before
+packaging. The Arch recipe in `packaging/arch/` exports
+`build/packages/host-arch/cordial-<version>-1-x86_64.pkg.tar.zst`. Debian recipes in
+`packaging/debian/` export
+`build/packages/host-deb/<distribution>/cordial_<version>-1~<distribution>_amd64.deb`.
+`DEB_DISTRIBUTION` is `trixie` or `resolute` and defaults to `trixie`.
+Trixie packaging rejects `HOST_ARCHIVE` and builds against the current Debian 13 libraries.
+`DEB_REVISION` defaults to `1~<distribution>`. Debian's library tools derive native dependency
+versions on each distribution.
 
-Arch packages are built with `makepkg` from `desktop/packaging/arch/` and
-`rust/packaging/arch/` into `build/packages/desktop-arch/` and
-`build/packages/cli-arch/` as `.pkg.tar.zst` files. Debian and Ubuntu packages are
-built with `dpkg-buildpackage` from `desktop/packaging/debian/` and
-`rust/packaging/debian/` into `build/packages/<application>-deb/<distribution>/`.
-`DEB_DISTRIBUTION` is `trixie`, `noble` or `resolute` and defaults to `trixie`;
-`DEB_REVISION` is `1~<distribution>`, producing distinct Debian and Ubuntu files.
-Debian's library tools derive dependency versions from the bundled binaries on
-each distribution.
+`CORDIAL_HOMEPAGE` overrides the native package homepage. `SOURCE_DATE_EPOCH` supplies the release
+timestamp in Unix seconds; native repackaging otherwise uses the archive's `VERSION` timestamp.
+Supplied archives and tracked recipes remain unchanged.
 
-`CORDIAL_HOMEPAGE` can override the project homepage in native package metadata.
-`SOURCE_DATE_EPOCH` can supply the release timestamp in Unix seconds; otherwise
-native packaging uses the archive's `VERSION` timestamp. Supplied archives and
-tracked recipes remain unchanged.
-
-The GitHub release workflow resolves the tag once and supplies the same version
-to desktop, web, CLI and firmware builds, which use the same Make targets and
-images as a local build. It builds the portable archives first, then each native
-package from those archives. Installation, native module loading, package checks
-and artifact checksums are verified in a clean container of each distribution
-before publication. Releases include the AppImage, desktop, CLI and web archives,
-both applications' Arch packages, separate Debian and Ubuntu packages, and for each
-board a production firmware archive, `cordial-firmware-<version>-<board>.tar.gz`,
-and a debug archive, `cordial-firmware-<version>-debug-<board>.tar.gz`, built with
-the debug profile. Each archive holds its firmware version's package directory.
+The release workflow validates one tag and supplies the same version to all builds. It checks
+clean installation, reinstallation, package file ownership, native dependencies, schema registration,
+removal and Debian purge in disposable distribution containers, including Namcap and Lintian checks.
+It runs the installed
+Resolute desktop through the native AT-SPI fixture and checks the actual AppImage's desktop launch.
+Release assets include the unified host archive, AppImage, one native package
+for each distribution, production and debug firmware archives for every board, and checksums.
+Each firmware archive holds its firmware version's package directory.
 
 Release builds reuse Docker toolchain images and BuildKit caches within each job.
 Each firmware job reuses preparation between checking and packaging its board and
 profile. Production and debug profiles run in parallel. These caches last only for
-that job and are not transferred to other runners or later releases. Native
-application packaging jobs reuse the portable archives through workflow artifacts.
+that job and are not transferred to other runners or later releases.
+Arch and Ubuntu packaging jobs reuse the portable archive through workflow artifacts.
+The Debian job compiles its executable in its distribution image.
 
-Third-party license material is retained in `notices/`. Firmware and CLI packages
+Third-party license material is retained in `notices/`. Firmware and native host packages
 include the project license, generated dependency inventories and license notices.
 
 ## Software checks
 
 ```sh
 make check
-npm --prefix desktop/packages/protocol run generate
 ```
 
 `make check` runs Rust tests and Clippy, native Bluetooth regression checks,
-Python tool tests, desktop type checks and tests, and the protocol checks:
+Python tool tests and the protocol checks:
 `buf lint` and `buf breaking`. The permanent handshake and serial revisions present in the current
 tree compare against every local release tag, regardless of application version or branch ancestry,
 except the release identified by `CORDIAL_VERSION`. Revisions released by ancestors must remain
@@ -350,26 +300,42 @@ ancestor release in the same series as `CORDIAL_VERSION`; `PROTOCOL_BASE` overri
 one minor version before 1.0 and one major version from 1.0. A series' first release skips only the
 storage and migration IPC comparisons. Development builds use the newest ancestor release for
 these comparisons. Selection uses local tags without fetching. Rust code is generated from
-`proto/` at build time; the second command regenerates the current TypeScript messages and their
-imports, updates all retained serial schema digests, and removes stale generated output.
+`proto/` at build time, including the operational schema fingerprint.
 Install Clippy with `(cd rust && rustup component add clippy)` before checking.
+Preference and host packaging fixtures also require `glib-compile-schemas`, supplied by
+`libglib2.0-bin` on Debian and Ubuntu or `glib2` on Arch.
 
-The build-cache tests also have a tiny npm workspace fixture that runs in Docker.
-Build the app image before running it:
+Protocol checks require the native Buf 1.75.0 executable from the
+[official release](https://github.com/bufbuild/buf/releases/tag/v1.75.0) on `PATH`.
+The release workflow installs and verifies the Linux x86-64 binary. `BUF` can
+select another executable for `make check-protocol` and the protocol fixtures.
+The lint and breaking rules live in `buf.yaml`.
+
+Run the GTK control checks with a display:
 
 ```sh
-make image-app
-CORDIAL_TEST_DOCKER=docker python3 -m unittest discover -s tools -p test_build_cache.py
+(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
+  desktop::settings::tests::integer_rows_commit_accepted_numbers -- --ignored --exact)
+(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
+  desktop::services::prefs::tests::dialog_rolls_back_controls_when_gsettings_rejects_saves -- --ignored --exact)
 ```
 
-`CORDIAL_TEST_APP_IMAGE` selects an alternative app toolchain image. The fixture
-checks installation reuse, source and manifest edits, runtime changes, workspace
-links, nested dependencies, failed-install retries and clean exports.
+The preference rollback test constructs a Settings page in a window and checks all five controls
+against a read-only GSettings backend. The normal Rust preference tests cover external updates
+and persistence.
+
+Install `xvfb`, `xauth` and `dbus-x11` for the display checks. Linux terminal fixtures need `pyte`
+and an actual release `cordial` executable. Debian dependency-version tests need `dpkg`; run them
+in a Debian or Ubuntu container when it is unavailable on the host. A missing prerequisite or skipped fixture does not
+complete validation.
+
+The build-cache fixtures check source timestamp reuse, cache boundaries and clean
+exports for native host and firmware builds.
 
 Linux CLI terminal checks additionally require `pyte` and a built CLI:
 
 ```sh
-CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py
+CORDIAL_TEST_BINARY="$PWD/rust/target/x86_64-unknown-linux-gnu/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py
 ```
 
 Clippy for the firmware platform crates runs in the firmware images, for one board and
@@ -383,8 +349,227 @@ make check-firmware-all
 To exercise the desktop with simulated adapters:
 
 ```sh
-npm --prefix desktop run simulate
+CORDIAL_DESKTOP_SIMULATE=2 rust/target/x86_64-unknown-linux-gnu/release/cordial desktop
 ```
+
+### Desktop preferences
+
+The Linux desktop stores preferences in the `dev.petris.cordial` GSettings schema at
+`/dev/petris/cordial/`. Reset individual preference keys to restore their defaults.
+Open Settings from the sidebar, Ctrl+, or the tray menu. Settings occupies the regular content
+pane and saves each change immediately. Its controls follow external GSettings changes.
+
+Native packages install the schema XML with the common `cordial` package. Distribution GLib
+triggers compile the shared schema cache. Portable archives include XML and a compiled cache
+under `share/glib-2.0/schemas`, next to the executable. AppImages include the same schema under
+`usr/share/glib-2.0/schemas`.
+
+`make local-host` prepares the schema beside the developer executable. For direct Cargo builds,
+compile the schema into a temporary directory and set `GSETTINGS_SCHEMA_DIR` when launching:
+
+```sh
+schema_dir=$(mktemp -d)
+glib-compile-schemas --strict --targetdir "$schema_dir" packaging
+(cd rust && GSETTINGS_SCHEMA_DIR="$schema_dir" cargo run -p cordial -- desktop)
+rm -r "$schema_dir"
+```
+
+No schema is needed for CLI or TUI commands. The GTK smoke fixture uses GLib's persistent
+keyfile backend under a private `XDG_CONFIG_HOME`. The AppImage fixture uses the default
+settings backend, private XDG directories, a private dconf profile and a private session D-Bus.
+It checks the bundled GIO module paths, reads preferences with the host's `gsettings` command
+before and after quitting, and checks preferences and autostart across a restart. It also changes
+and resets all five preferences with the host command while Settings stays open, checks the
+controls and host readback, and checks that external Start at Login changes update autostart.
+Both fixtures open the regular Settings pane through Ctrl+, and through its sidebar row.
+
+### Completion checks
+
+For host changes, run `make check`, the explicit GTK checks above, and the terminal fixture.
+Build and validate the unified archive and AppImage:
+
+```sh
+make package-desktop package-cli
+python3 tools/check_release_archive.py "build/release/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz" host "$CORDIAL_VERSION"
+```
+
+Run `packaging/check-arch.sh` in a disposable Arch container after `make package-host-arch`.
+Build `package-host-deb` and run `packaging/check-deb.sh` in a matching disposable container for
+each of `trixie` and `resolute`. Pass `CORDIAL_VERSION` and `DEB_DISTRIBUTION` to the
+Debian fixture. These fixtures install and remove packages, so use clean containers rather than
+a development system. Preserve Namcap and Lintian checks.
+
+In a disposable Resolute environment, install the matching `cordial` package, plus
+`python3-pyatspi`, `python3-gi`, `gir1.2-adw-1`, `xvfb`, `xauth`, `dbus-x11`, `imagemagick`,
+`adwaita-icon-theme` and `librsvg2-common`. The AppImage fixture also needs `libglib2.0-bin`,
+`dconf-gsettings-backend` and `dconf-service` for independent settings readback. Run:
+
+```sh
+CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s '-screen 0 1280x1024x24' \
+  dbus-run-session -- python3 rust/tests/gtk_smoke.py build/package-smoke
+xvfb-run -a -s '-screen 0 1280x1024x24' dbus-run-session -- python3 tools/check_appimage.py \
+  "build/release/cordial-desktop-$CORDIAL_VERSION-x86_64.AppImage" build/appimage-smoke
+```
+
+The installed fixture checks immediate adapter settings, transport and configuration interface
+changes, device connection switches, settings, Gamepad Output and profile layer changes. It keeps
+numeric edits focused through pauses and redraws, checks that the pre-edit numeric value and write
+count stay unchanged until commit, and checks persistence after committing an edit. The pre-edit
+text and numeric value are recorded in `numeric-baseline.json`.
+Before each normal configuration edit it records the matching simulator completion count, then
+waits for a new successful completion before Refresh or reconnect. Save and Discard are absent.
+Configuration interface profiles use native selection rows, with a separate enable switch in each
+row. The fixture selects VIA and Vial profiles by their interface names and checks them after
+reconnect. The adapter library and Add Profile picker expose all twelve seeded profiles without
+Next or Previous. The fixture scrolls to profiles 11 and 12, adds profile 11 through the picker,
+checks it after Refresh, and removes it before the three-layer drag checks.
+Device profile layers move by dragging a row onto another row. A three-layer pointer
+drag checks the final insertion order and exactly one completed write, then verifies the order
+after Refresh and reconnect. `device-profiles-drag-pointer.png` captures the pressed pointer,
+`device-profiles-drag-readback.png` captures the reconnected list, and
+`device-profiles-drag.json` records the pointer coordinates, write result and both readbacks.
+Each layer row has a drag handle and Remove. The fixture checks that there are no movement
+buttons or profile menus on these rows.
+
+Run the same GTK smoke command with `--empty-states` and a separate output directory to check
+empty Profiles and sidebar groups. This flow removes the mouse's last profile, checks the large
+icon, No Profiles title and centered Add Profile button at 980px and 480px, then adds a profile
+and reads it back after Refresh. It forgets every device on one adapter while the other stays
+populated, then empties both adapters and checks their separate Add Device rows. Pairing through
+each adapter's row verifies the target with the paired device's Adapter field. Screenshots,
+accessibility trees and `empty-profiles-*-bounds.json` record the empty layouts.
+
+The delayed flow checks rapid numeric edits while a write is pending, editable controls, retained
+values and the absence of apply progress and success indicators. Closing the window lets writes
+continue, and reopening retains the latest value. Explicit Quit commits the focused numeric edit,
+shows a separate Cordial window with "Settings are being applied", and exits after pending writes
+drain. Process exit is the completion barrier for coalesced edits, which can produce one or two
+jobs. Two fresh simulated sessions reject a settings write after Quit shows pending progress.
+These two sessions use a 2000ms write delay to allow the pending window's accessibility tree to
+be read before rejection. The quiet settings and profile drag flows use 800ms.
+Continue Editing restores a usable main window with the same error and no replay, then a deliberate
+control edit saves successfully and is read back after Refresh. Quit Anyway exits cleanly without
+replaying the rejected write. Both flows record their outcomes in `failed-quit-*.json` and capture
+pending and failed Quit windows. These GUI failures confirm that nothing was saved. Headless
+engine tests check the exact persisted latest values and known, unknown and detached write outcomes;
+unknown write outcomes are not injected by the GUI fixture.
+With delayed profile writes, a second pointer drag restores the original order while the first
+write is pending. The fixture checks that the rows stay editable and quiet, then reads the order
+after Refresh. `device-profiles-delayed.json` records both drags and the completed writes.
+Profile creation, copying and deletion, pairing, Forget Device and file overwrites retain their
+confirmation actions. It also covers preferences, autostart and lifecycle. Settings opens in the
+content pane with its sidebar row selected, without a modal dialog. Ctrl+N on Settings cannot
+pair through the adapter or device page it replaced. Adapter and device
+settings share their main Details page, without tab controls, and Profiles and Diagnostics open
+from links near the bottom. Navigation waits for the selected sidebar row and the requested page's
+visible header. The sidebar starts with Overview and Settings, then each adapter followed by its
+devices, including repeated device names across adapters. Separators divide the groups without
+Devices or Adapters heading rows. Battery icons expose their reading as accessible image names;
+the exact charge and full-width battery bar appear on the device page. Overview lists adapters
+first without an Adapters heading, followed by Needs Attention and Connected when populated.
+Failure dumps include selected states and accessible action names.
+The About dialog check opens Legal and checks its combined copyright and license text. It reads
+the Website destination through Copy Link and the MIT License destination through the Legal
+text's Hypertext interface without launching a browser. `about-main.png` and `about-legal.png`
+capture both views.
+Search coverage opens the sidebar header's Search button and uses Ctrl+F from content. It checks
+case-insensitive words across result titles and contexts, opens app, adapter and device controls,
+and checks their focus and scroll position without moving them from the fixture. Page results
+cover Overview, Settings, adapters, devices, Profiles and Diagnostics, with entry Enter and
+Down/Enter result activation. Clearing or replacing a matching query followed immediately by
+Enter cannot open its previous result. A matching replacement opens its current first result.
+Advertised VIA and Vial settings open Profiles and focus their closed profile selectors.
+Information searches open the mouse's Battery and Ratchets per Rotation rows, the adapter's
+Firmware row on Details, and the mouse's Device ID row on Diagnostics. Active Devices results
+name Bluetooth Classic or Bluetooth LE in their context and focus the row in the matching
+transport group. Each requires focus, full row visibility and no writes without scrolling from
+the fixture. `search-information.png` captures the diagnostic result.
+Profile searches open Typing in each adapter's library and its assigned layer on the second
+adapter's keyboard. Example Profile 11 opens its library row at normal and narrow widths. These
+checks require focus and full row visibility without scrolling from the fixture. They verify the
+selected adapter or device in the visible sidebar. At narrow widths, they check the requested
+page header on activation and sidebar selection on returning from content.
+No-results shows "No Results Found" and "Try a different search". Escape restores navigation.
+The same flow checks a device control, a late library profile and no-results at 480 pixels.
+Simulator writes, saved app preferences and autostart stay unchanged throughout search.
+`search-results.png`, `search-control-480.png`, `search-profile-480.png` and
+`search-no-results*.png` capture these states.
+Pairing opens through the Details header's Add Device button from both an adapter page and an
+attached device's page, with two adapters present. Profiles and Diagnostics have no Add Device
+button. After pairing, the fixture checks the new
+device's Adapter row against the chosen adapter before forgetting it. The scan dialog has no
+adapter selector or searching text, and its passive spinner is in the header. Scan screenshots
+named `pairing-scan-*` capture the spinner's spacing for visual review. Enter-code, compare-code,
+display-code cancellation and automatic pairing remain covered. Prompt and result screenshots
+have matching `*-bounds.json` files. The fixture waits for every answer to fit inside the current
+dialog during its resize animation, checks horizontal answers for two choices, and limits unused
+vertical space relative to the visible content. Pairing hides the scan header's title and uses
+a centered Code entry. The fixture pauses successful pairing with Tab, keeps the result open past
+the three-second countdown, captures its layout, and closes it with Dismiss. Automatic pairing
+instead closes without interaction and opens the new device's page. The observed dismissal times
+are recorded in `*-dismissal.json`. Rejecting a code comparison shows a failure that stays open
+until Retry; cancelled pairing also stays open. The display-code and cancellation flow runs
+inside a 480-pixel window.
+The fixture checks the visible header, device menus, settings rows, capacity rows, page menu
+items, profile actions and the Settings pane at 480, 661 and 700 pixels. Settings Back returns to
+the sidebar at 480 pixels. It scrolls rows into view through
+the enclosing GTK scrollbar's accessible Value interface before checking bounds or interacting.
+Header and control bounds use the accessible window's actual origin. The fixture logs raw,
+window and relative coordinates, and rejects negative relative bounds and window overflow.
+Setting markers are found by names such as "Pointer Sensitivity: Saved"; their visual states use
+only icons, without arrows, status words or tooltips. The fixture checks that markers precede their
+setting titles. A device's header shows its status without repeating its battery reading, and its
+page has no Status row. Device Menu contains Refresh followed by Connect or Disconnect on Details
+and Diagnostics; Profiles has no Device Menu. The fixture opens each menu at all three widths,
+checks that its items fit, and exercises Connect, Disconnect and Refresh through it. The Battery
+row retains its exact percentage and full-width meter. Adapter Menu offers Rename followed by
+Connect or Disconnect; the adapter's Details page has no Status row. Maintenance actions open
+from Adapter Menu on Diagnostics. New Profile sits beside the scrolling profile list.
+The last seeded library rows and profile 11 in the picker fit at all three
+widths. Layer rows and Remove fit at all three widths.
+Forget Device is at the end of the device's scrolling page.
+The seeded Active Devices rows must each contain a capacity bar. Its bounds must span the text
+line below the name and usage, relative to the row rather than a fixed pixel width.
+The AppImage fixture checks its packaged desktop launch with two simulated adapters using
+extraction when FUSE is unavailable. Both write screenshots and logs.
+The release workflow uploads this evidence on failure.
+
+Native simulation accepts `CORDIAL_SIM_WRITE_DELAY_MS` as an integer from `0` through `2000`.
+The GTK fixture uses `0` for the normal flow, `800` for delayed settings and profile changes,
+and `2000` for failed Quit.
+`CORDIAL_SIM_FAIL_SETTINGS_ONCE=1` rejects the first settings write on each simulated adapter with
+a storage failure that confirms no effect. Other values leave failure injection off. The failure
+uses the configured write delay, leaves saved settings unchanged, and is consumed once per adapter
+for that simulated session. It does not open hardware or retry a rejected write. The GTK fixture
+enables it only for its two failed-Quit sessions, both with a `2000` millisecond delay.
+`CORDIAL_SIM_WRITE_TRACE` names an absolute private file. After the engine handles a terminal
+apply result and updates the controller view, it appends one UTF-8 line per actual job:
+
+```text
+adapter <adapter-id> <ok|error|unknown>
+device <adapter-id> <device-id> <details|profiles|settings> <ok|error|unknown>
+settings <adapter-id> <device-id> <ok|error|unknown>
+```
+
+Staging, coalescing and unchanged values add no records. A session drop records an unknown result
+once, including when the job later returns. The fixture matches only seeded simulated identifiers,
+`SIMULATED0000001` and `SIMULATED0000002`, and copies the trace to `writes.txt` with its other artifacts.
+The trace supplies fixture completion barriers without adding indicators to the interface.
+An `ok` record means the adapter confirmed the write. The fixture reconnects for independent
+readback where needed.
+
+Run the AppImage fixture in a disposable Arch environment as well. Its prerequisites are
+`libgcc`, `libx11`, `libxcursor`, `libxdamage`, `libxext`, `libxfixes`, `libxi`, `libxinerama`,
+`libxrandr`, `libxrender`, `libxcb`, `wayland`, `libglvnd`, `vulkan-icd-loader`, `expat`, `e2fsprogs`, `gmp`,
+`libgpg-error`, `zlib`, `python-atspi`, `python-gobject`, `xorg-server-xvfb`, `xorg-xauth`, `dbus`,
+`imagemagick`, `glib2` and `dconf`. Use the same command with `--renderer cairo`. The release
+workflow runs Arch with Cairo and Resolute with software Mesa and GTK's default renderer.
+All AppImage runs use the default settings backend.
+
+Before completing a code change, also run Pico 2 W firmware Clippy and artifact builds for both
+`production` and `debug`. Run the same checks for any other board directly affected. Reuse passing
+results while their inputs remain unchanged. When assembling a release, verify every asset and
+checksum listed in `.github/workflows/release.yml`.
 
 ## Adapter names
 
@@ -392,15 +577,14 @@ Adapter names are stored on the adapter. Rename through adapter settings in the 
 
 ## Repository layout
 
-- `rust/`: firmware, CLI/TUI, shared crates, adapters, board definitions and their tools/tests.
-- `desktop/`: Electron, React and TypeScript application, its web version and development server.
+- `rust/`: firmware, native GTK desktop, CLI/TUI, shared crates, adapters and their tools/tests.
 - `docs/`: control protocol, storage format and HID++ references.
 - `proto/`: serial protocol messages and persistent storage records.
 - `docker/`: build images for the applications, firmware and distribution packages.
 - `packaging/`: the distribution packaging steps and their installation checks.
 - `tools/`: version validation, package checks and their tests.
 
-`make all` builds desktop, CLI and the selected firmware. `make clean` removes
+`make all` builds the unified host and the selected firmware. `make clean` removes
 build outputs while preserving downloaded dependencies and toolchains.
 
 ## USB gamepad builds

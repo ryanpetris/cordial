@@ -1,4 +1,4 @@
-//! Canonical descriptor bytes shared with the TypeScript generator.
+//! Canonical descriptor bytes for serial schema fingerprints.
 use prost::Message;
 use prost_types::{FileDescriptorProto, FileDescriptorSet};
 use sha2::{Digest, Sha256};

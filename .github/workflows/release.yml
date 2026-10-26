@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   validate:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 45
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -31,20 +31,31 @@ jobs:
       - name: Install build prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git clang libclang-dev pkg-config
+          sudo apt-get install -y build-essential git clang libclang-dev pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-bin python3-pyte xvfb xauth dbus-x11
       - name: Install Rust check components
         run: |
           cd rust
           rustup component add clippy
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '26'
-          cache: npm
-          cache-dependency-path: desktop/package-lock.json
-      - name: Check Rust and desktop
+      - name: Install Buf
         run: |
-          make check-rust check-desktop check-protocol
-      - name: Check build tools and board presets
+          curl --fail --location https://github.com/bufbuild/buf/releases/download/v1.75.0/buf-Linux-x86_64 --output "$RUNNER_TEMP/buf"
+          printf '%s  %s\n' fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b "$RUNNER_TEMP/buf" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/buf"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Check Rust and protocol
+        run: make check-rust check-protocol
+      - name: Check GTK integer controls with a display
+        working-directory: rust
+        run: xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib desktop::settings::tests::integer_rows_commit_accepted_numbers -- --ignored --exact
+      - name: Check rejected preference edits with a display
+        working-directory: rust
+        run: xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib desktop::services::prefs::tests::dialog_rolls_back_controls_when_gsettings_rejects_saves -- --ignored --exact
+      - name: Build terminal fixture executable
+        working-directory: rust
+        run: cargo build --locked --release -p cordial --bin cordial --target x86_64-unknown-linux-gnu
+      - name: Check build tools, terminal and board presets
+        env:
+          CORDIAL_TEST_BINARY: ${{ github.workspace }}/rust/target/x86_64-unknown-linux-gnu/release/cordial
         run: make check-tools
   linux:
     needs: validate
@@ -58,17 +69,38 @@ jobs:
         with:
           persist-credentials: false
       - name: Build portable applications
-        run: make package-desktop package-cli package-web
-      - name: Check Docker build cache
-        run: CORDIAL_TEST_DOCKER=docker python3 -m unittest discover -s tools -p test_build_cache.py
-      - name: Check desktop archive
+        run: make package-desktop package-cli
+      - name: Check unified host archive
+        run: python3 tools/check_release_archive.py "build/release/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz" host "$CORDIAL_VERSION"
+      - name: Check packaged AppImage on Resolute with the default renderer and software Mesa
         run: |
-          python3 tools/check_release_archive.py "desktop/dist/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" desktop "$CORDIAL_VERSION"
+          docker run --rm --init -v "$PWD:/src" -w /src ubuntu:26.04 bash -euxo pipefail -c '
+            apt-get update
+            apt-get install -y --no-install-recommends libc6 libgcc-s1 libstdc++6 libx11-6 libxau6 libxcursor1 libxdamage1 libxdmcp6 libxext6 libxfixes3 libxi6 libxinerama1 libxrandr2 libxrender1 libxcb1 libxcb-render0 libxcb-shm0 libwayland-client0 libwayland-cursor0 libwayland-egl1 libvulkan1 libexpat1 libcom-err2 libgmp10 libgpg-error0 zlib1g python3-pyatspi python3-gi xvfb xauth dbus-x11 imagemagick libgl1-mesa-dri libegl1 libgl1 libgles2 libopengl0 libx11-xcb1 libdrm2 libgbm1 libegl-mesa0 mesa-vulkan-drivers libglib2.0-bin dconf-gsettings-backend dconf-service
+            chmod +x build/release/*.AppImage
+            lavapipe=(/usr/share/vulkan/icd.d/lvp_icd*.json)
+            test -f "${lavapipe[0]}"
+            LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe VK_DRIVER_FILES="${lavapipe[0]}" xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 tools/check_appimage.py "build/release/cordial-desktop-$1-x86_64.AppImage" build/appimage-smoke-resolute
+          ' bash "$CORDIAL_VERSION"
+      - name: Check packaged AppImage on Arch with Cairo and the default settings backend
+        run: |
+          docker run --rm --init -v "$PWD:/src" -w /src archlinux:base bash -euxo pipefail -c '
+            pacman -Syu --noconfirm --needed libgcc libx11 libxcursor libxdamage libxext libxfixes libxi libxinerama libxrandr libxrender libxcb wayland libglvnd vulkan-icd-loader expat e2fsprogs gmp libgpg-error zlib python-atspi python-gobject xorg-server-xvfb xorg-xauth dbus imagemagick glib2 dconf
+            chmod +x build/release/*.AppImage
+            xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 tools/check_appimage.py "build/release/cordial-desktop-$1-x86_64.AppImage" build/appimage-smoke-arch --renderer cairo
+          ' bash "$CORDIAL_VERSION"
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: appimage-smoke-evidence
+          path: |
+            build/appimage-smoke-resolute/
+            build/appimage-smoke-arch/
+          if-no-files-found: warn
       - name: Prepare release archives
         run: |
           mkdir release
-          cp desktop/dist/*.AppImage desktop/dist/*.tar.gz build/release/*.tar.gz release/
-          tar -C build/packages/web -czf "release/cordial-web-$CORDIAL_VERSION.tar.gz" "cordial-web-$CORDIAL_VERSION"
+          cp build/release/*.AppImage build/release/*.tar.gz release/
           cd release
           sha256sum ./* > SHA256SUMS-linux
       - uses: actions/upload-artifact@v7
@@ -93,11 +125,11 @@ jobs:
         with:
           name: packages-linux
           path: build/portable
-      - name: Build native packages
+      - name: Build native package
         run: |
           (cd build/portable && sha256sum -c SHA256SUMS-linux)
-          make package-desktop-arch package-cli-arch DESKTOP_ARCHIVE="build/portable/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" CLI_ARCHIVE="build/portable/cordial-cli-$CORDIAL_VERSION-linux-amd64.tar.gz"
-      - name: Check independent installations, reinstall and removal
+          make package-host-arch HOST_ARCHIVE="build/portable/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz"
+      - name: Check installation, reinstall and removal
         run: docker run --rm -v "$PWD:$PWD" -w "$PWD" -e CORDIAL_VERSION archlinux:base-devel packaging/check-arch.sh
       - uses: actions/upload-artifact@v7
         with:
@@ -114,8 +146,6 @@ jobs:
         include:
           - image: debian:13
             distribution: trixie
-          - image: ubuntu:24.04
-            distribution: noble
           - image: ubuntu:26.04
             distribution: resolute
     env:
@@ -123,20 +153,25 @@ jobs:
       SOURCE_DATE_EPOCH: ${{ needs.validate.outputs.epoch }}
       CORDIAL_HOMEPAGE: https://github.com/${{ github.repository }}
       DEB_DISTRIBUTION: ${{ matrix.distribution }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/download-artifact@v8
+        if: matrix.distribution == 'resolute'
         with:
           name: packages-linux
           path: build/portable
-      - name: Build native packages
+      - name: Build native Debian executable and package
+        if: matrix.distribution == 'trixie'
+        run: make package-host-deb DEB_DISTRIBUTION=trixie
+      - name: Package the Resolute release executable
+        if: matrix.distribution == 'resolute'
         run: |
           (cd build/portable && sha256sum -c SHA256SUMS-linux)
-          make package-desktop-deb package-cli-deb DEB_DISTRIBUTION="$DEB_DISTRIBUTION" DESKTOP_ARCHIVE="build/portable/cordial-desktop-$CORDIAL_VERSION-x64.tar.gz" CLI_ARCHIVE="build/portable/cordial-cli-$CORDIAL_VERSION-linux-amd64.tar.gz"
-      - name: Check independent installations, reinstall and removal
+          make package-host-deb DEB_DISTRIBUTION=resolute HOST_ARCHIVE="build/portable/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz"
+      - name: Check installation, reinstall, removal and purge
         run: docker run --rm -v "$PWD:$PWD" -w "$PWD" -e CORDIAL_VERSION -e DEB_DISTRIBUTION '${{ matrix.image }}' packaging/check-deb.sh
       - uses: actions/upload-artifact@v7
         with:
@@ -147,7 +182,7 @@ jobs:
   desktop-smoke:
     needs: [validate, debian]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     env:
       CORDIAL_VERSION: ${{ needs.validate.outputs.version }}
     steps:
@@ -156,20 +191,24 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
-          name: packages-noble
+          name: packages-resolute
           path: build/native
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '26'
-          cache: npm
-          cache-dependency-path: desktop/package-lock.json
-      - name: Install desktop package and test dependencies
+      - name: Check installed native desktop in a disposable Resolute container
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb dbus-x11 ./build/native/cordial-desktop_*_amd64.deb
-          npm ci --ignore-scripts --no-audit --no-fund --prefix desktop
-      - name: Check installed desktop with sandbox enabled
-        run: CORDIAL_EXECUTABLE=/opt/cordial-desktop/cordial-desktop xvfb-run -a dbus-run-session -- node desktop/scripts/smoke.mjs desktop/out/package-smoke
+          docker run --rm --init -e CORDIAL_VERSION -v "$PWD:/src" -w /src ubuntu:26.04 bash -euxo pipefail -c '
+            apt-get update
+            apt-get install -y --no-install-recommends python3-pyatspi python3-gi gir1.2-adw-1 xvfb xauth dbus-x11 imagemagick adwaita-icon-theme librsvg2-common "./build/native/cordial_$CORDIAL_VERSION-1~resolute_amd64.deb"
+            CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 rust/tests/gtk_smoke.py build/package-smoke
+            CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 rust/tests/gtk_smoke.py build/empty-states-smoke --empty-states
+          '
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: native-desktop-smoke-evidence
+          path: |
+            build/package-smoke/
+            build/empty-states-smoke/
+          if-no-files-found: warn
   firmware:
     needs: validate
     runs-on: ubuntu-24.04
@@ -227,14 +266,10 @@ jobs:
           cat SHA256SUMS-* > SHA256SUMS
           sha256sum -c SHA256SUMS
           test -f "cordial-desktop-$CORDIAL_VERSION-x86_64.AppImage"
-          test -f "cordial-desktop-$CORDIAL_VERSION-x64.tar.gz"
-          test -f "cordial-cli-$CORDIAL_VERSION-linux-amd64.tar.gz"
-          test -f "cordial-web-$CORDIAL_VERSION.tar.gz"
-          for application in cordial-desktop cordial-cli; do
-            test -f "$application-$CORDIAL_VERSION-1-x86_64.pkg.tar.zst"
-            for distribution in trixie noble resolute; do
-              test -f "${application}_${CORDIAL_VERSION}-1~${distribution}_amd64.deb"
-            done
+          test -f "cordial-$CORDIAL_VERSION-linux-amd64.tar.gz"
+          test -f "cordial-$CORDIAL_VERSION-1-x86_64.pkg.tar.zst"
+          for distribution in trixie resolute; do
+            test -f "cordial_${CORDIAL_VERSION}-1~${distribution}_amd64.deb"
           done
           for board in pico_w pico2_w pimoroni_pico_plus2_w waveshare_rp2350b_plus_w esp32s3; do
             test -f "cordial-firmware-$CORDIAL_VERSION-$board.tar.gz"

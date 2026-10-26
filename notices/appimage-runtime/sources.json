@@ -1,0 +1,136 @@
+{
+  "runtime_sha256": "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d",
+  "runtime_debug_sha256": "1f3c4a8439e344d74b61bfd0610b89e8499453791bbc3c5b4ae38c181fe54942",
+  "build_sources": [
+    "https://github.com/AppImage/type2-runtime/blob/dd6cebedcbddde9c82f89b011e8e1d40b6e43868/scripts/docker/Dockerfile",
+    "https://github.com/AppImage/type2-runtime/blob/dd6cebedcbddde9c82f89b011e8e1d40b6e43868/scripts/common/install-dependencies.sh",
+    "https://github.com/AppImage/type2-runtime/blob/dd6cebedcbddde9c82f89b011e8e1d40b6e43868/src/runtime/Makefile"
+  ],
+  "provenance": "The runtime builds against floating Alpine 3.21 packages. Upstream versions below are identified from the pinned runtime and debug artifacts; exact Alpine package revisions and applied distribution patches are not recorded by the upstream release.",
+  "components": [
+    {
+      "name": "AppImage type 2 runtime",
+      "version": "20251108",
+      "revision": "dd6cebedcbddde9c82f89b011e8e1d40b6e43868",
+      "source": "https://github.com/AppImage/type2-runtime/tree/dd6cebedcbddde9c82f89b011e8e1d40b6e43868",
+      "sha256": "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d",
+      "linkage": "AppImage runtime prefix",
+      "notices": [
+        {
+          "file": "runtime-LICENSE",
+          "source": "https://raw.githubusercontent.com/AppImage/type2-runtime/dd6cebedcbddde9c82f89b011e8e1d40b6e43868/LICENSE",
+          "sha256": "aa154fc9070614bbe7921f89db11efd1dba7a1f3a41685958110e2230f9c0ca1"
+        }
+      ]
+    },
+    {
+      "name": "musl libc",
+      "version": "1.2.5",
+      "source": "https://musl.libc.org/releases/musl-1.2.5.tar.gz",
+      "version_evidence": "Pinned runtime debug information names the musl-1.2.5 source directory.",
+      "build_package": "Alpine 3.21 musl-dev; exact APK revision is not recorded by the upstream runtime build.",
+      "linkage": "Statically linked into the AppImage runtime prefix",
+      "notices": [
+        {
+          "file": "musl-COPYRIGHT",
+          "source": "https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5",
+          "sha256": "f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af"
+        }
+      ]
+    },
+    {
+      "name": "libfuse",
+      "version": "3.15.0",
+      "source": "https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz",
+      "source_sha256": "70589cfd5e1cff7ccd6ac91c86c01be340b227285c5e200baa284e401eea2ca0",
+      "version_evidence": "Runtime install-dependencies.sh pins this archive and checksum. Runtime strings identify 3.15.0.",
+      "patches": [
+        "https://github.com/AppImage/type2-runtime/blob/dd6cebedcbddde9c82f89b011e8e1d40b6e43868/patches/libfuse/mount.c.diff"
+      ],
+      "linkage": "Statically linked into the AppImage runtime prefix",
+      "notices": [
+        {
+          "file": "libfuse-LICENSE",
+          "source": "https://raw.githubusercontent.com/libfuse/libfuse/fuse-3.15.0/LICENSE",
+          "sha256": "b8832d9caaa075bbbd2aef24efa09f8b7ab66a832812d88c602da0c7b4397fad"
+        },
+        {
+          "file": "libfuse-LGPL2.txt",
+          "source": "https://raw.githubusercontent.com/libfuse/libfuse/fuse-3.15.0/LGPL2.txt",
+          "sha256": "dc626520dcd53a22f727af3ee42c770e56c97a64fe3adb063799d8ab032fe551"
+        },
+        {
+          "file": "libfuse-COPYRIGHT",
+          "source": "https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz",
+          "sha256": "73764efc062a40cc480b91d899a351e4eeb2a191fd89004442aee50ce38d1d14",
+          "extraction": "Copyright and licence preambles from lib/ and include/ source files in the checksum-pinned archive."
+        },
+        {
+          "file": "libfuse-GPL2.txt",
+          "source": "https://github.com/libfuse/libfuse/releases/download/fuse-3.15.0/fuse-3.15.0.tar.xz",
+          "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+        }
+      ]
+    },
+    {
+      "name": "squashfuse",
+      "version": "0.5.2",
+      "source": "https://github.com/vasi/squashfuse/archive/0.5.2.tar.gz",
+      "source_sha256": "db0238c5981dabbd80ee09ae15387f390091668ca060a7bc38047912491443d3",
+      "version_evidence": "Runtime install-dependencies.sh pins this archive and checksum. Runtime strings identify 0.5.2.",
+      "linkage": "Statically linked into the AppImage runtime prefix",
+      "notices": [
+        {
+          "file": "squashfuse-LICENSE",
+          "source": "https://raw.githubusercontent.com/vasi/squashfuse/0.5.2/LICENSE",
+          "sha256": "9e909cc8a8ba27b1a649c964cf9eda37de911f3138c2b64e6d2f01703904ac13"
+        }
+      ]
+    },
+    {
+      "name": "Zstandard",
+      "version": "1.5.6",
+      "source": "https://github.com/facebook/zstd/tree/v1.5.6",
+      "version_evidence": "Pinned runtime ZSTD_versionString points to 1.5.6.",
+      "build_package": "Alpine 3.21 zstd-static; exact APK revision is not recorded by the upstream runtime build.",
+      "linkage": "Statically linked into the AppImage runtime prefix",
+      "notices": [
+        {
+          "file": "zstd-LICENSE",
+          "source": "https://raw.githubusercontent.com/facebook/zstd/v1.5.6/LICENSE",
+          "sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"
+        }
+      ]
+    },
+    {
+      "name": "zlib",
+      "version": "1.3.1",
+      "source": "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
+      "version_evidence": "Pinned runtime strings identify 1.3.1.",
+      "build_package": "Alpine 3.21 zlib-static; exact APK revision is not recorded by the upstream runtime build.",
+      "linkage": "Statically linked into the AppImage runtime prefix",
+      "notices": [
+        {
+          "file": "zlib-LICENSE",
+          "source": "https://raw.githubusercontent.com/madler/zlib/v1.3.1/LICENSE",
+          "sha256": "845efc77857d485d91fb3e0b884aaa929368c717ae8186b66fe1ed2495753243"
+        }
+      ]
+    },
+    {
+      "name": "mimalloc",
+      "version": "2.1.7",
+      "source": "https://github.com/microsoft/mimalloc/tree/v2.1.7",
+      "version_evidence": "Pinned runtime mi_version returns 217.",
+      "build_package": "Alpine 3.21 mimalloc-dev, provided by mimalloc2-dev; exact APK revision is not recorded by the upstream runtime build.",
+      "linkage": "Statically linked into the AppImage runtime prefix",
+      "notices": [
+        {
+          "file": "mimalloc-LICENSE",
+          "source": "https://raw.githubusercontent.com/microsoft/mimalloc/v2.1.7/LICENSE",
+          "sha256": "19c99805e7a44a34b297a75d1edea9985e300066dfc024d5c99d4236d4573b5d"
+        }
+      ]
+    }
+  ]
+}

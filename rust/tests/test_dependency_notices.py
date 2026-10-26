@@ -66,15 +66,16 @@ class DependencyNotices(unittest.TestCase):
         self.target = next(line.removeprefix("host: ") for line in self.compiler.splitlines()
                            if line.startswith("host: "))
         (self.workspace / "Cargo.toml").write_text(
-            '[workspace]\nresolver="3"\nmembers=["crates/cordial-cli", "other"]\n'
+            '[workspace]\nresolver="3"\nmembers=["crates/cordial", "other"]\n'
             'exclude=["platforms/esp32s3"]\n')
         self.manifest = '''[package]
-name="cordial-cli"
+name="cordial"
 version="0.0.0"
 edition="2021"
 [features]
 default=["dep:default-only"]
 selected=["dep:feature-only"]
+desktop=["dep:feature-only"]
 [dependencies]
 common="=1.0.0"
 default-only={version="=1.0.0", optional=true}
@@ -86,7 +87,7 @@ dev-only="=1.0.0"
 [target.'cfg(any())'.dependencies]
 platform-only="=1.0.0"
 '''
-        self.package("crates/cordial-cli", self.manifest)
+        self.package("crates/cordial", self.manifest)
         self.package("other", '[package]\nname="other"\nversion="0.0.0"\nedition="2021"\n'
                      '[dependencies]\nunused="=1.0.0"\n')
 
@@ -121,9 +122,9 @@ platform-only="=1.0.0"
         return {entry["name"] for entry in entries}
 
     def test_cli_collects_notices_after_build_with_fresh_cache(self):
-        manifest = "crates/cordial-cli/Cargo.toml"
+        manifest = "crates/cordial/Cargo.toml"
         self.cargo("generate-lockfile")
-        self.cargo("build", "--locked", "-p", "cordial-cli", "--bin", "cordial-cli",
+        self.cargo("build", "--locked", "-p", "cordial", "--bin", "cordial",
                    "--target", self.target)
         self.assertFalse(list(self.home.glob("registry/src/*/unused-*")))
         offline = self.cargo("metadata", "--locked", "--offline", "--format-version", "1",
@@ -133,6 +134,13 @@ platform-only="=1.0.0"
         self.assertEqual(self.collect("host", [], self.workspace / "Cargo.lock"),
                          {"common", "default-only", "build-only"})
         self.assertTrue(list(self.home.glob("registry/src/*/unused-*")))
+
+    def test_native_host_collects_desktop_and_default_dependencies(self):
+        self.cargo("generate-lockfile")
+        self.cargo("build", "--locked", "-p", "cordial", "--features", "desktop",
+                   "--target", self.target)
+        self.assertEqual(self.collect("host", ["desktop"], self.workspace / "Cargo.lock"),
+                         {"common", "default-only", "feature-only", "build-only"})
 
     def test_firmware_collects_explicit_features_without_defaults(self):
         manifest = "platforms/esp32s3/Cargo.toml"

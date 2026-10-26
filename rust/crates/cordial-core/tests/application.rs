@@ -9739,3 +9739,113 @@ fn handshake_identifies_the_adapter_without_ready_storage_or_radio() {
         }
     }
 }
+
+#[cfg(feature = "development")]
+#[test]
+fn reboot_and_bootloader_emit_their_final_event_before_entering() {
+    for (command, reason) in [
+        (
+            Command::Restart(p::Restart {}),
+            p::SessionEndingReason::Reboot,
+        ),
+        (
+            Command::EnterBootloader(p::EnterBootloader {}),
+            p::SessionEndingReason::Bootloader,
+        ),
+    ] {
+        let mut t = Test::with(
+            Store::default(),
+            Radio::default(),
+            build(true, Some(|| panic!("bootloader"))),
+        );
+        drain_forward(&mut t);
+        block_on(t.app.begin(
+            p::Request {
+                command: Some(command),
+            },
+            &mut t.store,
+            &mut t.radio,
+            t.now,
+        ));
+        drain_forward(&mut t);
+        block_on(t.app.work(&mut t.store, &mut t.radio, t.now));
+        assert_eq!(
+            t.output(),
+            [
+                M::Response(p::Response { result: None }),
+                M::Event(p::Event {
+                    kind: Some(Ev::SessionEnding(p::SessionEnding {
+                        reason: reason as i32
+                    }))
+                }),
+            ]
+        );
+        let writes = t.store.writes.len();
+        block_on(t.app.begin(
+            p::Request {
+                command: Some(Command::SetAdapter(p::SetAdapter {
+                    name: Some("Never saved".into()),
+                    ..Default::default()
+                })),
+            },
+            &mut t.store,
+            &mut t.radio,
+            t.now,
+        ));
+        assert_eq!(t.store.writes.len(), writes);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(t.app.work(&mut t.store, &mut t.radio, t.now));
+        }))
+        .unwrap_err();
+        assert_eq!(
+            result.downcast_ref::<&str>(),
+            Some(&if reason == p::SessionEndingReason::Reboot {
+                "restarted"
+            } else {
+                "bootloader"
+            })
+        );
+    }
+}
+
+#[cfg(feature = "development")]
+#[test]
+fn ending_a_whole_file_stream_closes_the_declared_field_before_busy() {
+    let mut t = Test::with(Store::default(), Radio::default(), build(true, None));
+    t.store.files.insert("/data".into(), vec![0x55; 4096]);
+    block_on(t.app.begin(
+        p::Request {
+            command: Some(Command::ReadFile(p::ReadFile {
+                path: "/data".into(),
+                ..Default::default()
+            })),
+        },
+        &mut t.store,
+        &mut t.radio,
+        t.now,
+    ));
+    for _ in 0..4 {
+        block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+        assert!(t.output().is_empty());
+    }
+    assert!(t.app.streaming());
+    assert!(
+        t.app
+            .prepare_session_ending(p::SessionEndingReason::ConfigurationChange)
+    );
+    assert!(!t.app.command_pending());
+    t.store.files.remove("/data");
+    let messages = t.output();
+    assert_eq!(messages.len(), 2);
+    assert!(matches!(&messages[0], M::Response(p::Response {
+        result: Some(R::Error(error))
+    }) if error.code == p::ErrorCode::Busy as i32));
+    assert_eq!(
+        messages[1],
+        M::Event(p::Event {
+            kind: Some(Ev::SessionEnding(p::SessionEnding {
+                reason: p::SessionEndingReason::ConfigurationChange as i32
+            }))
+        })
+    );
+}

@@ -41,6 +41,8 @@ pub struct Session {
     open: bool,
     hello: Vec<u8>,
     stopped: bool,
+    ending: Option<p::SessionEndingReason>,
+    padding: u32,
 }
 
 impl Default for Session {
@@ -65,6 +67,8 @@ impl Session {
             })
             .expect("native protocol version"),
             stopped: false,
+            ending: None,
+            padding: 0,
         }
     }
     /// Includes build metadata available without reading storage. Metadata that exceeds the
@@ -90,6 +94,9 @@ impl Session {
         self.output = None;
         self.response = None;
         self.stream = None;
+        self.stopped = false;
+        self.ending = None;
+        self.padding = 0;
         self.generation = self.generation.wrapping_add(1);
         ended
     }
@@ -97,9 +104,29 @@ impl Session {
     pub fn open(&self) -> bool {
         self.open
     }
-    /// An accepted restart stops reading further requests.
-    pub fn stop_commands(&mut self) {
+    /// Stops dispatch and appends the final event after the owed response. A streamed response
+    /// finishes with BUSY. `padding` closes any declared whole-file bytes field before that error.
+    pub fn end(&mut self, reason: p::SessionEndingReason, padding: u32) {
+        if self.stopped {
+            return;
+        }
         self.stopped = true;
+        if !self.open() {
+            return;
+        }
+        self.ending = Some(reason);
+        self.padding = padding;
+        if self
+            .output
+            .as_ref()
+            .is_some_and(|frame| !frame.response && frame.offset == 0 && !frame.in_flight)
+        {
+            self.output = None;
+        }
+    }
+    /// Whether intentional shutdown has stopped command dispatch.
+    pub fn ending(&self) -> bool {
+        self.stopped
     }
     /// Whether a response is waiting or being written.
     fn answering(&self) -> bool {
@@ -109,11 +136,12 @@ impl Session {
     }
     /// Whether the output is free for an event.
     pub fn idle(&self) -> bool {
-        self.open() && self.output.is_none() && !self.answering()
+        self.open() && !self.stopped && self.output.is_none() && !self.answering()
     }
     /// Frames waiting to be written, including the one being written.
     pub fn queued(&self) -> usize {
-        usize::from(self.output.is_some())
+        usize::from(self.ending.is_some())
+            + usize::from(self.output.is_some())
             + usize::from(self.response.is_some())
             + usize::from(
                 self.stream.is_some()
@@ -254,10 +282,37 @@ impl Session {
         if max == 0 || !self.open() {
             return None;
         }
+        if self.ending.is_some() && self.stream.is_some() && self.stream_ready() {
+            if self.padding != 0 {
+                let length = self.padding.min(512) as usize;
+                self.padding -= length as u32;
+                self.stream_bytes(&[0; 512][..length], false);
+            } else {
+                self.fail(p::Error {
+                    code: p::ErrorCode::Busy as i32,
+                    ..Default::default()
+                });
+            }
+        }
         if self.output.is_none()
             && let Some(bytes) = self.response.take()
         {
             self.start(bytes, true);
+        }
+        if self.output.is_none()
+            && self.stream.is_none()
+            && let Some(reason) = self.ending.take()
+        {
+            self.start(
+                Self::encode(p::Message {
+                    kind: Some(p::message::Kind::Event(p::Event {
+                        kind: Some(p::event::Kind::SessionEnding(p::SessionEnding {
+                            reason: reason as i32,
+                        })),
+                    })),
+                }),
+                false,
+            );
         }
         let generation = self.generation;
         let f = self.output.as_mut()?;

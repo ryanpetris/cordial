@@ -1192,6 +1192,7 @@ impl Name for p::event::Kind {
             p::event::Kind::Pairing(_) => "pairing",
             p::event::Kind::Profile(_) => "profile",
             p::event::Kind::ProfileRemoved(_) => "profile_removed",
+            p::event::Kind::SessionEnding(_) => "session_ending",
         }
     }
 }
@@ -1759,4 +1760,44 @@ fn ordinary_events_do_not_extend_the_identity_deadline() {
     assert_eq!(requests.read(&mut [0]).unwrap(), 0);
     assert!(events.try_recv().is_err());
     incoming.join().unwrap();
+}
+
+#[test]
+fn session_ending_waits_for_its_delimiter_and_does_not_answer_a_pending_write() {
+    let ending = p::event::Kind::SessionEnding(p::SessionEnding { reason: 12345 });
+    let mut frame = framed(message::Kind::Event(p::Event {
+        kind: Some(ending.clone()),
+    }));
+    let delimiter = frame.pop().unwrap();
+    assert_eq!(delimiter, frame::DELIMITER);
+    let (release, wait) = mpsc::channel();
+    let (reader, writer) = scripted([
+        ReadStep::WaitForWrites(1),
+        bytes(framed(message::Kind::Response(p::Response {
+            result: Some(response::Result::Status(status("Desk"))),
+        }))),
+        ReadStep::WaitForWrites(2),
+        bytes(frame),
+        ReadStep::Wait(wait),
+        bytes(vec![delimiter]),
+        ReadStep::Fail(io::ErrorKind::BrokenPipe),
+    ]);
+    let (connection, events) = Connection::new(reader, writer);
+    connection.status().unwrap();
+    let connection = Arc::new(connection);
+    let writing = connection.clone();
+    let result = background(move || {
+        writing.request(Command::SetAdapter(p::SetAdapter {
+            name: Some("Studio".into()),
+            ..Default::default()
+        }))
+    });
+    assert!(events.try_recv().is_err());
+    release.send(()).unwrap();
+    assert_eq!(
+        events.recv_timeout(TEST_DEADLINE).unwrap().kind,
+        Some(ending)
+    );
+    assert!(result.recv_timeout(TEST_DEADLINE).unwrap().is_err());
+    connection.close();
 }

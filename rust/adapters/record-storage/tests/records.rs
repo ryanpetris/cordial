@@ -2569,9 +2569,9 @@ fn connect(management: &mut cordial_core::migration::management::Management) {
     );
     assert!(management.serial.open());
 }
-async fn request(
+async fn request<S: cordial_core::storage::RecordStore>(
     management: &mut cordial_core::migration::management::Management,
-    store: &mut Storage,
+    store: &mut S,
     command: cordial_protocol::request::Command,
 ) -> cordial_protocol::Response {
     use cordial_protocol::{self as p, frame::Decoder};
@@ -2608,8 +2608,46 @@ async fn request(
     }
 }
 
+fn complete_restart_event(management: &mut cordial_core::migration::management::Management) {
+    use cordial_protocol::{self as p, frame::Decoder};
+    use prost::Message;
+    assert!(management.restarting());
+    assert!(management.serial.ending());
+    assert!(!management.reset_ready());
+    assert_eq!(management.serial.queued(), 1);
+    let mut decoder = Decoder::new(None);
+    let mut messages = Vec::new();
+    while let Some((token, bytes)) = management.serial.output(1) {
+        let byte = bytes[0];
+        assert!(!management.reset_ready());
+        assert_eq!(management.serial.queued(), 1);
+        management.output_complete(token, 0);
+        assert!(!management.reset_ready());
+        let (retry, same) = management.serial.output(1).unwrap();
+        assert_eq!(same, [byte]);
+        if let Some(frame) = decoder.push(byte) {
+            messages.push(p::Message::decode(frame.unwrap()).unwrap());
+        }
+        assert!(!management.reset_ready());
+        assert_eq!(management.serial.queued(), 1);
+        management.output_complete(retry, 1);
+    }
+    assert_eq!(
+        messages,
+        [p::Message {
+            kind: Some(p::message::Kind::Event(p::Event {
+                kind: Some(p::event::Kind::SessionEnding(p::SessionEnding {
+                    reason: p::SessionEndingReason::Reboot as i32,
+                })),
+            })),
+        }]
+    );
+    assert_eq!(management.serial.queued(), 0);
+    assert!(management.reset_ready());
+}
+
 #[test]
-fn assisted_production_commands_keep_the_gate_until_restart_ack_drains() {
+fn assisted_production_commands_keep_the_gate_until_restart_event_drains() {
     use cordial_core::migration::Startup;
     use cordial_protocol::{self as p, request::Command as C, response::Result as R};
     block_on(async {
@@ -2693,38 +2731,61 @@ fn assisted_production_commands_keep_the_gate_until_restart_ack_drains() {
             panic!("not ready")
         };
         assert_eq!(error.code, p::ErrorCode::StorageMigrationRequired as i32);
-        management
-            .begin(
-                p::Request {
-                    command: Some(C::Restart(p::Restart {})),
-                },
-                &mut fs,
-            )
-            .await;
-        assert!(management.restarting());
-        assert!(!management.reset_ready());
-        let (token, bytes) = management.serial.output(1).unwrap();
-        let length = bytes.len();
-        management.output_complete(token, 0);
-        assert!(!management.reset_ready());
-        let (token, _) = management.serial.output(1).unwrap();
-        management.output_complete(token, length);
-        assert!(!management.reset_ready());
-        while let Some((token, bytes)) = management.serial.output(63) {
-            let length = bytes.len();
-            management.output_complete(token, length);
-        }
-        assert!(management.reset_ready());
-        management.session(false);
-        assert!(!management.reset_ready());
-        connect(&mut management);
         assert!(
             request(&mut management, &mut fs, C::Restart(p::Restart {}))
                 .await
                 .result
                 .is_none()
         );
+        complete_restart_event(&mut management);
+        management.session(false);
         assert!(management.reset_ready());
+    });
+}
+
+#[test]
+fn management_restart_can_reset_after_the_session_closes() {
+    use cordial_core::migration::Startup;
+    use cordial_protocol::{self as p, request::Command};
+    block_on(async {
+        let mut fs = Storage::open_or_recover(Flash::blank(), 4096..128 * 1024, [1; 32], random)
+            .await
+            .unwrap();
+        for response_received in [false, true] {
+            let mut management = management(Startup::Assisted);
+            connect(&mut management);
+            if response_received {
+                assert!(
+                    request(&mut management, &mut fs, Command::Restart(p::Restart {}))
+                        .await
+                        .result
+                        .is_none()
+                );
+            } else {
+                management
+                    .begin(
+                        p::Request {
+                            command: Some(Command::Restart(p::Restart {})),
+                        },
+                        &mut fs,
+                    )
+                    .await;
+            }
+            let (token, bytes) = management.serial.output(1).unwrap();
+            let length = bytes.len();
+            assert!(!management.reset_ready());
+            management.session(false);
+            assert!(management.restarting());
+            assert!(management.reset_ready());
+            assert_eq!(management.serial.queued(), 0);
+            assert!(management.serial.output(63).is_none());
+            management.output_complete(token, length);
+            assert!(management.reset_ready());
+            management.session(true);
+            assert!(!management.serial.open());
+            assert!(management.reset_ready());
+            assert!(management.serial.output(63).is_none());
+        }
     });
 }
 
@@ -2732,7 +2793,6 @@ fn assisted_production_commands_keep_the_gate_until_restart_ack_drains() {
 fn management_reports_the_committed_root_and_restarts_without_dataset_validation() {
     use cordial_core::{migration::Startup, storage::RecordStore};
     use cordial_protocol::{self as p, request::Command as C, response::Result as R};
-    use prost::Message;
     block_on(async {
         for startup in [Startup::Assisted, Startup::Blocked(Error::Corrupt)] {
             for (root, expected) in [
@@ -2795,7 +2855,7 @@ fn management_reports_the_committed_root_and_restarts_without_dataset_validation
                         .result
                         .is_none()
                 );
-                assert!(management.reset_ready());
+                complete_restart_event(&mut management);
                 assert_eq!(*flash.0.borrow(), before);
             }
         }
@@ -2803,28 +2863,7 @@ fn management_reports_the_committed_root_and_restarts_without_dataset_validation
             let mut fs: Result<Storage, Error> = Err(Error::Io);
             let mut management = management(startup);
             connect(&mut management);
-            management
-                .begin(
-                    p::Request {
-                        command: Some(C::GetStatus(p::GetStatus {})),
-                    },
-                    &mut fs,
-                )
-                .await;
-            let mut decoder = p::frame::Decoder::new(None);
-            let mut response = None;
-            while let Some((token, bytes)) = management.serial.output(63) {
-                let length = bytes.len();
-                for &byte in bytes {
-                    if let Some(frame) = decoder.push(byte) {
-                        response = Some(p::Message::decode(frame.unwrap()).unwrap());
-                    }
-                }
-                management.output_complete(token, length);
-            }
-            let Some(p::message::Kind::Response(response)) = response.unwrap().kind else {
-                panic!("response")
-            };
+            let response = request(&mut management, &mut fs, C::GetStatus(p::GetStatus {})).await;
             let Some(R::Status(status)) = response.result else {
                 panic!("status")
             };
@@ -2849,15 +2888,13 @@ fn management_reports_the_committed_root_and_restarts_without_dataset_validation
                 assert_eq!(status.errors[1].outcome, p::ErrorOutcome::NoEffect as i32);
                 assert!(status.errors[1].related.is_empty());
             }
-            management
-                .begin(
-                    p::Request {
-                        command: Some(C::Restart(p::Restart {})),
-                    },
-                    &mut fs,
-                )
-                .await;
-            assert!(management.restarting());
+            assert!(
+                request(&mut management, &mut fs, C::Restart(p::Restart {}))
+                    .await
+                    .result
+                    .is_none()
+            );
+            complete_restart_event(&mut management);
         }
     });
 }

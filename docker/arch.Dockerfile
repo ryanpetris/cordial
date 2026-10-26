@@ -4,7 +4,7 @@ FROM archlinux:base-devel
 
 COPY PKGBUILD /tmp/PKGBUILD
 RUN pacman -Syu --noconfirm --needed git python \
-    && bash -c 'CORDIAL_ARCHIVE_SHA256=SKIP source /tmp/PKGBUILD && pacman -S --noconfirm --needed "${depends[@]}"' \
+    && bash -c 'CORDIAL_ARCHIVE_SHA256=SKIP source /tmp/PKGBUILD && pacman -S --noconfirm --needed "${depends[@]}" "${makedepends[@]}"' \
     && pacman -Scc --noconfirm \
     && rm /tmp/PKGBUILD \
     && useradd -m builder

@@ -1,33 +1,36 @@
 #!/usr/bin/env bash
-# Installs, reinstalls and removes the built packages for DEB_DISTRIBUTION in a clean container of
-# that distribution, then collects them with their checksums in release/. Run as root from the
-# repository root.
+# Run in a disposable DEB_DISTRIBUTION container as root from the repository root.
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
-packages=build/packages
+package="./build/packages/host-deb/$DEB_DISTRIBUTION/cordial_$CORDIAL_VERSION-${DEB_REVISION:-1~$DEB_DISTRIBUTION}_amd64.deb"
+test -f "$package"
 apt-get update
-apt-get install -y --no-install-recommends lintian python3
-echo 'path-include=/usr/share/doc/cordial-*' > /etc/dpkg/dpkg.cfg.d/zz-cordial-check
-test "$(dpkg-deb -f ./$packages/desktop-deb/"$DEB_DISTRIBUTION"/cordial-desktop_*_amd64.deb Suggests)" = cordial-cli
-apt-get install -y --no-install-recommends ./$packages/cli-deb/"$DEB_DISTRIBUTION"/cordial-cli_*_amd64.deb
-python3 tools/check_linux_package.py cordial-cli --debian --version "$CORDIAL_VERSION"
-test ! -e /usr/bin/cordial-desktop
-apt-get purge -y cordial-cli
-apt-get install -y --no-install-recommends ./$packages/desktop-deb/"$DEB_DISTRIBUTION"/cordial-desktop_*_amd64.deb
-python3 tools/check_linux_package.py cordial-desktop --debian --version "$CORDIAL_VERSION"
+apt-get install -y --no-install-recommends lintian python3 dpkg-dev binutils libglib2.0-bin
+echo 'path-include=/usr/share/doc/cordial/*' > /etc/dpkg/dpkg.cfg.d/zz-cordial-check
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT
+apt-get install -y --no-install-recommends "$package"
+python3 tools/check_linux_package.py --debian --version "$CORDIAL_VERSION"
+# The package retains the release executable and its symbol table.
+lintian --suppress-tags unstripped-binary-or-object "$package"
+apt-get install -y --reinstall "$package"
+python3 tools/check_linux_package.py --debian --version "$CORDIAL_VERSION"
+dpkg --verify cordial
+apt-get remove -y cordial
 test ! -e /usr/bin/cordial
-test ! -e /opt/cordial-desktop/cordial
-apt-get install -y --no-install-recommends ./$packages/cli-deb/"$DEB_DISTRIBUTION"/cordial-cli_*_amd64.deb
-# Vendor ELF files retain their published bytes under /opt.
-lintian --suppress-tags dir-or-file-in-opt,embedded-library,shared-library-is-executable,unstripped-binary-or-object $packages/desktop-deb/"$DEB_DISTRIBUTION"/*.deb
-lintian --suppress-tags unstripped-binary-or-object $packages/cli-deb/"$DEB_DISTRIBUTION"/*.deb
-apt-get install -y --reinstall ./$packages/cli-deb/"$DEB_DISTRIBUTION"/*.deb ./$packages/desktop-deb/"$DEB_DISTRIBUTION"/*.deb
-apt-get purge -y cordial-cli
-test ! -e /usr/bin/cordial
-python3 tools/check_linux_package.py cordial-desktop --debian --version "$CORDIAL_VERSION"
-apt-get purge -y cordial-desktop
-test ! -e /usr/bin/cordial-desktop
+test ! -e /usr/share/glib-2.0/schemas/dev.petris.cordial.gschema.xml
+schemas=$(GSETTINGS_BACKEND=memory gsettings list-schemas)
+if grep -Fxq dev.petris.cordial <<< "$schemas"; then exit 1; fi
+test ! -e /usr/lib/udev/rules.d/50-cordial.rules
+test ! -e /usr/share/doc/cordial
+test ! -e /usr/share/applications/dev.petris.cordial.desktop
+test ! -e /usr/share/icons/hicolor/512x512/apps/dev.petris.cordial.png
+test ! -e /usr/share/icons/hicolor/scalable/apps/dev.petris.cordial.svg
+apt-get install -y --no-install-recommends "$package"
+apt-get purge -y cordial
+test ! -e /usr/share/doc/cordial
+test ! -e /usr/share/glib-2.0/schemas/dev.petris.cordial.gschema.xml
 mkdir -p release
-cp $packages/desktop-deb/"$DEB_DISTRIBUTION"/*.deb $packages/cli-deb/"$DEB_DISTRIBUTION"/*.deb release/
+cp "$package" release/
 cd release
-sha256sum ./*.deb > "SHA256SUMS-$DEB_DISTRIBUTION"
+sha256sum "$(basename "$package")" > "SHA256SUMS-$DEB_DISTRIBUTION"

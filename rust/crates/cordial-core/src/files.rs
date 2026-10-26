@@ -117,6 +117,14 @@ impl Reader {
             error: None,
         })
     }
+    /// Unwritten bytes inside an already declared file field, for a failed stream's padding.
+    pub fn remaining_bytes(&self) -> u32 {
+        if self.started {
+            self.size - self.offset
+        } else {
+            0
+        }
+    }
     fn header(&self) -> Result<Vec<u8>, Error> {
         use prost::encoding::{WireType, encode_key, encode_varint, encoded_len_varint};
         let mut fields = Vec::new();

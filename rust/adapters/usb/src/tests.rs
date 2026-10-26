@@ -10,6 +10,7 @@ use cordial_core::{
 };
 use embassy_futures::block_on;
 use owner::{Owner, Shared};
+use std::vec::Vec;
 #[allow(dead_code)]
 pub(super) mod support {
     use std::vec::Vec;
@@ -1426,7 +1427,19 @@ fn saved_pool_change_waits_for_successful_persistence_and_physical_response_comp
         assert!(host.response().is_some());
         if fail {
             assert!(!io.reconnect.signaled());
+            assert!(!host.messages.iter().any(|message| matches!(
+                message,
+                cordial_protocol::message::Kind::Event(cordial_protocol::Event {
+                    kind: Some(cordial_protocol::event::Kind::SessionEnding(_)),
+                })
+            )));
         } else {
+            assert_eq!(
+                host.messages.last(),
+                Some(&session_ending(
+                    cordial_protocol::SessionEndingReason::ConfigurationChange
+                ))
+            );
             assert_eq!(io.reconnect.try_take().unwrap().gamepads, saved);
         }
     }
@@ -1585,6 +1598,12 @@ fn allocation_change_during_a_long_command_gives_its_response_a_fresh_drain_dead
                 }
             }
             assert_eq!(host.response(), Some(&ok()));
+            assert_eq!(
+                host.messages.last(),
+                Some(&session_ending(
+                    cordial_protocol::SessionEndingReason::DeviceConnection
+                ))
+            );
         }
         assert!(io.reconnect.try_take().unwrap().desktop);
         assert!(!shared.app.serial.open());
@@ -1843,6 +1862,15 @@ fn stalled_list_allows_raw_editor_writes_and_queries() {
 
 #[test]
 fn stalled_list_allows_reconnect_settings_jobs_and_deferred_saves() {
+    stalled_list_reconnect(true);
+}
+
+#[test]
+fn stalled_list_allocation_change_aborts_without_losing_reconnect_settings_or_saves() {
+    stalled_list_reconnect(false);
+}
+
+fn stalled_list_reconnect(keep_allocation: bool) {
     use cordial_core::{
         bluetooth::{Event, InputReport},
         compact::{Metadata, Preference},
@@ -1871,7 +1899,11 @@ fn stalled_list_allows_reconnect_settings_jobs_and_deferred_saves() {
     )
     .unwrap();
     policy.name = "Reconnected keyboard".into();
-    policy.roles = Roles(0);
+    policy.roles = Roles(if keep_allocation {
+        cordial_core::hid::MOUSE
+    } else {
+        0
+    });
     block_on(
         Policies {
             store: &mut shared.store,
@@ -1879,6 +1911,7 @@ fn stalled_list_allows_reconnect_settings_jobs_and_deferred_saves() {
         .save(&policy),
     )
     .unwrap();
+    shared.app.manager.outputs.roles_changed(77, policy.roles.0);
     let preference = Preference {
         metadata: Metadata {
             key: SettingKey::BacklightEnabled,
@@ -1908,11 +1941,25 @@ fn stalled_list_allows_reconnect_settings_jobs_and_deferred_saves() {
     }
     assert!(shared.app.streaming() && io.serial_tx.is_full());
     let profile_reads = reads(&shared.store, cordial_core::profiles::METADATA);
+    let session = io.status().session;
     shared.radio.events.push_back(Event::Disconnected {
         link: old_link,
         error: None,
     });
     loops.poll(&mut shared, NOW + 200);
+    assert_eq!(
+        shared.app.manager.usb_allocation().topology.desktop,
+        keep_allocation
+    );
+    assert_eq!(shared.app.streaming(), keep_allocation);
+    assert_eq!(shared.app.serial.ending(), !keep_allocation);
+    if !keep_allocation {
+        assert_eq!(
+            shared.app.usb_change_reason(),
+            cordial_protocol::SessionEndingReason::DeviceDisconnection
+        );
+    }
+    assert!(!io.reconnect.signaled());
     let Shared {
         app,
         store: _,
@@ -1948,6 +1995,10 @@ fn stalled_list_allows_reconnect_settings_jobs_and_deferred_saves() {
     let mut settings_started = false;
     for now in 202..2200 {
         loops.poll(&mut shared, NOW + now);
+        assert_eq!(
+            io.reconnect.signaled(),
+            !keep_allocation && now >= 200 + owner::RESPONSE_DRAIN_MS
+        );
         settings_started |= shared
             .app
             .manager
@@ -2000,7 +2051,17 @@ fn stalled_list_allows_reconnect_settings_jobs_and_deferred_saves() {
         reads(&shared.store, cordial_core::profiles::METADATA),
         profile_reads
     );
-    assert!(shared.app.streaming() && io.serial_tx.is_full());
+    if keep_allocation {
+        assert!(shared.app.streaming() && io.serial_tx.is_full());
+        assert!(!shared.app.serial.ending());
+        assert_eq!(io.status().session, session);
+    } else {
+        assert!(!shared.app.command_pending());
+        assert!(!shared.app.serial.open());
+        assert_eq!(shared.app.serial.queued(), 0);
+        assert_ne!(io.status().session, session);
+        assert!(io.reconnect.try_take().unwrap().desktop);
+    }
     assert!(host.response().is_none());
 }
 
@@ -2298,4 +2359,248 @@ pub(super) fn complete_serial(io: &Io, tx: &SerialTx, sent: usize) {
         })
         .ok()
         .unwrap();
+}
+
+fn session_ending(
+    reason: cordial_protocol::SessionEndingReason,
+) -> cordial_protocol::message::Kind {
+    cordial_protocol::message::Kind::Event(cordial_protocol::Event {
+        kind: Some(cordial_protocol::event::Kind::SessionEnding(
+            cordial_protocol::SessionEnding {
+                reason: reason as i32,
+            },
+        )),
+    })
+}
+
+#[cfg(feature = "gamepad")]
+#[test]
+fn autonomous_allocation_changes_announce_the_trigger_and_wait_for_the_delimiter() {
+    use cordial_core::bluetooth::Event;
+    use cordial_protocol::{self as p, message::Kind};
+    use prost::Message;
+    for budget in [Budget::PICO, Budget::ESP] {
+        for disconnect in [false, true] {
+            let io = Io::with_budget(Budget {
+                config_bytes: 121,
+                ..budget
+            });
+            let (mut app, mut store, mut radio) = profile_application();
+            app.manager.output_support = outputs::SUPPORT;
+            app.manager.usb_budget = io.budget;
+            let slot = app.manager.find(77).unwrap();
+            let link = app
+                .manager
+                .connect(slot, true, 30_000, None, &mut radio)
+                .unwrap()
+                .unwrap();
+            if disconnect {
+                block_on(app.event(
+                    Event::Connected {
+                        link,
+                        descriptors: support::descriptor(),
+                        max_output: 255,
+                        layout: None,
+                    },
+                    &mut store,
+                    &mut radio,
+                    0,
+                ));
+            }
+            io.set_topology(app.manager.usb_allocation().topology);
+            assert_eq!(io.topology().desktop, disconnect);
+            let mut shared = Shared { app, store, radio };
+            let mut loops = Loops::new(&io, 0);
+            let mut host = Host::new();
+            BusHandler(&io).configured(true);
+            io.dtr(true);
+            negotiate(&mut loops, &mut shared, &mut host, &io, 1);
+            for now in 2..50 {
+                host.serve(&io);
+                loops.poll(&mut shared, now);
+            }
+            shared.radio.events.push_back(if disconnect {
+                Event::Disconnected { link, error: None }
+            } else {
+                Event::Connected {
+                    link,
+                    descriptors: support::descriptor(),
+                    max_output: 255,
+                    layout: None,
+                }
+            });
+            loops.poll(&mut shared, 50);
+            assert!(!io.reconnect.signaled());
+            let event = io.serial_tx.try_receive().unwrap();
+            let mut decoder = p::frame::Decoder::new(None);
+            let mut messages = Vec::new();
+            for &byte in &event.bytes[..event.length] {
+                if let Some(frame) = decoder.push(byte) {
+                    messages.push(p::Message::decode(frame.unwrap()).unwrap().kind.unwrap());
+                }
+            }
+            let reason = if disconnect {
+                p::SessionEndingReason::DeviceDisconnection
+            } else {
+                p::SessionEndingReason::DeviceConnection
+            };
+            assert_eq!(messages, [session_ending(reason)]);
+            assert!(
+                matches!(messages[0], Kind::Event(_)),
+                "no request is needed"
+            );
+            assert_eq!(event.bytes[event.length - 1], p::frame::DELIMITER);
+            complete_serial(&io, &event, event.length - 1);
+            loops.poll(&mut shared, 51);
+            assert!(!io.reconnect.signaled());
+            let delimiter = io.serial_tx.try_receive().unwrap();
+            assert_eq!(&delimiter.bytes[..delimiter.length], &[p::frame::DELIMITER]);
+            complete_serial(&io, &delimiter, 0);
+            loops.poll(&mut shared, 52);
+            assert!(!io.reconnect.signaled());
+            let retry = io.serial_tx.try_receive().unwrap();
+            assert_eq!(&retry.bytes[..retry.length], &[p::frame::DELIMITER]);
+            complete_serial(&io, &retry, 1);
+            loops.poll(&mut shared, 53);
+            assert_eq!(io.reconnect.try_take().unwrap().desktop, !disconnect);
+            assert_eq!(shared.app.serial.queued(), 0);
+        }
+    }
+}
+
+#[cfg(feature = "gamepad")]
+#[test]
+fn autonomous_allocation_without_a_session_reconnects_immediately() {
+    use cordial_core::bluetooth::Event;
+    let io = Io::with_budget(Budget {
+        config_bytes: 121,
+        ..Budget::PICO
+    });
+    let (mut app, store, mut radio) = profile_application();
+    app.manager.output_support = outputs::SUPPORT;
+    app.manager.usb_budget = io.budget;
+    io.set_topology(app.manager.usb_allocation().topology);
+    let slot = app.manager.find(77).unwrap();
+    let link = app
+        .manager
+        .connect(slot, true, 30_000, None, &mut radio)
+        .unwrap()
+        .unwrap();
+    radio.events.push_back(Event::Connected {
+        link,
+        descriptors: support::descriptor(),
+        max_output: 255,
+        layout: None,
+    });
+    let mut shared = Shared { app, store, radio };
+    let mut loops = Loops::new(&io, 0);
+    loops.poll(&mut shared, 0);
+    assert!(io.reconnect.try_take().unwrap().desktop);
+    assert!(io.serial_tx.is_empty());
+    assert_eq!(shared.app.serial.queued(), 0);
+}
+
+#[test]
+fn reconfiguration_stops_listing_entries_and_discards_queued_requests() {
+    use cordial_protocol::{self as p, message::Kind, request::Command, response::Result as R};
+    for stalled in [false, true] {
+        let io = Io::new();
+        let (app, store, radio) = profile_application();
+        let mut shared = Shared { app, store, radio };
+        let mut loops = Loops::new(&io, 0);
+        let mut host = Host::new();
+        BusHandler(&io).configured(true);
+        io.dtr(true);
+        negotiate(&mut loops, &mut shared, &mut host, &io, 1);
+        host.send(&io, Command::ListProfiles(p::ListProfiles {}));
+        loops.poll(&mut shared, 2);
+        loops.poll(&mut shared, 3);
+        assert!(shared.app.streaming());
+        host.send(
+            &io,
+            Command::SetAdapter(p::SetAdapter {
+                name: Some("Never saved".into()),
+                ..Default::default()
+            }),
+        );
+        shared.app.manager.preference.configuration_interfaces = vec![enabled(Interface::Via, 1)];
+        let name = shared.app.manager.preference.name.clone();
+        let reads_before = reads(&shared.store, cordial_core::profiles::METADATA);
+        loops.poll(&mut shared, 4);
+        assert!(!shared.app.command_pending());
+        for now in 5..=4 + owner::RESPONSE_DRAIN_MS {
+            if !stalled {
+                host.serve(&io);
+            }
+            loops.poll(&mut shared, now);
+            if io.reconnect.signaled() {
+                break;
+            }
+        }
+        assert_eq!(
+            io.reconnect.try_take().unwrap().interfaces,
+            Interface::Via.bit()
+        );
+        assert_eq!(
+            reads(&shared.store, cordial_core::profiles::METADATA),
+            reads_before
+        );
+        assert_eq!(shared.app.manager.preference.name, name);
+        if stalled {
+            assert_eq!(shared.app.serial.queued(), 0);
+            assert!(host.response().is_none());
+            continue;
+        }
+        let responses: Vec<_> = host
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                Kind::Response(response) => Some(response),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses.len(), 1);
+        assert!(
+            matches!(&responses[0].result, Some(R::Error(error)) if error.code == p::ErrorCode::Busy as i32)
+        );
+        assert_eq!(
+            host.messages.last(),
+            Some(&session_ending(p::SessionEndingReason::Unknown))
+        );
+    }
+}
+
+#[test]
+fn saved_name_change_keeps_the_session_when_allocation_is_unchanged() {
+    use cordial_protocol::{self as p, request::Command};
+    let io = Io::new();
+    let (mut app, store, radio) = profile_application();
+    app.manager.usb_budget = io.budget;
+    io.set_topology(app.manager.usb_allocation().topology);
+    let mut shared = Shared { app, store, radio };
+    let mut loops = Loops::new(&io, 0);
+    let mut host = Host::new();
+    BusHandler(&io).configured(true);
+    io.dtr(true);
+    negotiate(&mut loops, &mut shared, &mut host, &io, 1);
+    host.send(
+        &io,
+        Command::SetAdapter(p::SetAdapter {
+            name: Some("Office".into()),
+            ..Default::default()
+        }),
+    );
+    for now in 2..200 {
+        host.serve(&io);
+        loops.poll(&mut shared, now);
+    }
+    assert_eq!(host.response(), Some(&ok()));
+    assert!(!io.reconnect.signaled());
+    assert!(!shared.app.serial.ending());
+    assert!(!host.messages.iter().any(|message| matches!(
+        message,
+        p::message::Kind::Event(p::Event {
+            kind: Some(p::event::Kind::SessionEnding(_))
+        })
+    )));
 }

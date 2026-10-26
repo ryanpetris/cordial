@@ -354,8 +354,7 @@ After verifying the final root, the host sends `Restart`. Root uploads alone do
 not change assisted mode. Restart acknowledges before resetting the MCU and runs
 ordinary startup recovery without a separate migration completion validator.
 The migration worker reconnects by stable `Status.id`, repeats the permanent hello and checks exact
-target support again. This worker reconnects independently of any desktop session proxy, which
-never reconnects. The worker requires the same target, no migration-required marker and
+target support again. This worker reconnects independently of normal host sessions. The worker requires the same target, no migration-required marker and
 `ready = true` for success. Normal startup may also report the warnings `STORAGE_FULL`,
 `PROFILE_MEMORY_LOW`, `USB_REQUIRED_CAPACITY_EXCEEDED` and
 `USB_RESERVED_CAPACITY_EXCEEDED`, each without related errors. Any other error

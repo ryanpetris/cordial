@@ -30,7 +30,7 @@ reports what it says, such as battery levels.
 - [`proto/storage/v2/storage.proto`](../../proto/storage/v2/storage.proto) defines the operating saved
   records independently of the serial representation. Historical schemas remain under
   `proto/storage/v1/`. See [storage format](../storage-format.md).
-- [`proto/migration.proto`](../../proto/migration.proto) defines framed desktop/CLI subprocess IPC.
+- [`proto/migration.proto`](../../proto/migration.proto) defines framed migration-worker subprocess IPC.
   Its length prefix and bounds are separate from the serial API's COBS frames.
 
 `buf lint` checks all schemas. `make check-protocol` checks the permanent handshake and retained
@@ -42,14 +42,12 @@ release in the same application series. See [Compatibility rules](compatibility.
 The protocol and the connection are libraries that the apps build on, so other projects can use
 them too:
 
-| | Rust | TypeScript |
-| --- | --- | --- |
-| Messages and framing | `cordial-protocol` | `@cordial/protocol` |
-| Port discovery and connection | `cordial-client` | `@cordial/client` (`/node`, `/web`) |
-
-The protocol libraries do no I/O; the Rust one is `no_std` and shared with the firmware.
+`cordial-protocol` provides messages and framing. It performs no I/O, is `no_std`
+and is shared with the firmware. `cordial-client` provides port discovery and
+connections, without user-facing text or state beyond the open connection.
 Firmware compiles only the current v2 storage schema. Host clients also retain v1
-for preserving migration; the Rust `historical-storage` and `migration` features
-provide historical records and subprocess IPC to host builds. The client
-libraries carry no user-facing text and keep no state beyond the open connection. All examples in
+for preserving migration. The Rust `historical-storage` and `migration` features
+provide historical records and subprocess IPC to host builds. The native desktop,
+CLI and TUI share the Rust host coordinator and migration worker in-process.
+All examples in
 these documents use synthetic identifiers and values.

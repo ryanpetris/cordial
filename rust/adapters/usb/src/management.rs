@@ -3,7 +3,7 @@ use crate::{Io, SerialRx, SerialTx, Status};
 use cordial_core::{migration::management::Management, storage::RecordStore};
 use cordial_protocol::frame::DELIMITER;
 use embassy_futures::select::select;
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 
 pub async fn run<S: RecordStore>(
     io: &Io,
@@ -16,6 +16,7 @@ pub async fn run<S: RecordStore>(
     let mut separator = false;
     let mut input: Option<SerialRx> = None;
     let mut offset = 0;
+    let mut deadline = None;
     loop {
         while let Ok(done) = io.serial_done.try_receive() {
             if done.session == seen.session {
@@ -27,7 +28,7 @@ pub async fn run<S: RecordStore>(
                 }
             }
         }
-        if management.reset_ready() {
+        if management.reset_ready() || deadline.is_some_and(|at| Instant::now().as_millis() >= at) {
             reset();
         }
         let status = io.status();
@@ -38,6 +39,9 @@ pub async fn run<S: RecordStore>(
             input = None;
             offset = 0;
             seen = status;
+        }
+        if management.reset_ready() {
+            reset();
         }
         management.proceed(store).await;
         if !management.restarting() {
@@ -62,6 +66,16 @@ pub async fn run<S: RecordStore>(
                     management.begin(request, store).await;
                 }
             }
+        }
+        if management.restarting() && deadline.is_none() {
+            deadline = Some(
+                Instant::now()
+                    .as_millis()
+                    .saturating_add(crate::owner::RESPONSE_DRAIN_MS),
+            );
+            input = None;
+            offset = 0;
+            io.serial_rx.clear();
         }
         let status = io.status();
         if status.serial_open()
@@ -221,6 +235,33 @@ mod tests {
                 let tail = io.serial_tx.try_receive().unwrap();
                 assert_eq!(&tail.bytes[..tail.length], &ack.bytes[1..ack.length]);
                 complete_serial(&io, &tail, tail.length);
+                step();
+                let ending = io.serial_tx.try_receive().unwrap();
+                let message = ending.bytes[..ending.length]
+                    .iter()
+                    .find_map(|&byte| {
+                        decoder
+                            .push(byte)
+                            .map(|frame| p::Message::decode(frame.unwrap()).unwrap())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    message.kind,
+                    Some(p::message::Kind::Event(p::Event {
+                        kind: Some(p::event::Kind::SessionEnding(p::SessionEnding {
+                            reason: p::SessionEndingReason::Reboot as i32
+                        }))
+                    }))
+                );
+                complete_serial(&io, &ending, ending.length - 1);
+                step();
+                let delimiter = io.serial_tx.try_receive().unwrap();
+                assert_eq!(&delimiter.bytes[..delimiter.length], &[DELIMITER]);
+                complete_serial(&io, &delimiter, 0);
+                step();
+                let retry = io.serial_tx.try_receive().unwrap();
+                assert_eq!(&retry.bytes[..retry.length], &[DELIMITER]);
+                complete_serial(&io, &retry, 1);
                 let outcome =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)).unwrap_err();
                 assert_eq!(outcome.downcast_ref::<&str>(), Some(&"reset"));
@@ -229,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn disconnect_preserves_only_a_fully_drained_restart_ack() {
+    fn closing_the_session_during_restart_does_not_wait_for_serial() {
         for completion in [None, Some(0), Some(1), Some(usize::MAX)] {
             let mut store = Store::default();
             store.files.insert("/format.pb".into(), alloc::vec![8, 2]);
@@ -269,12 +310,68 @@ mod tests {
                         .is_pending()
                 );
             }));
-            match completion {
-                Some(usize::MAX) => {
-                    assert_eq!(outcome.unwrap_err().downcast_ref::<&str>(), Some(&"reset"))
-                }
-                _ => assert!(outcome.is_ok()),
-            }
+            assert_eq!(outcome.unwrap_err().downcast_ref::<&str>(), Some(&"reset"));
         }
+    }
+    #[test]
+    fn stalled_management_restart_has_a_fixed_drain_deadline() {
+        use embassy_time::Duration;
+        for startup in [
+            Startup::Assisted,
+            Startup::Blocked(cordial_core::storage::Error::Io),
+        ] {
+            crate::tests::TICKS.with(|ticks| ticks.set(0));
+            let io = Io::new();
+            io.update(|status| {
+                status.configured = true;
+                status.dtr = true;
+                status.session = 1;
+            });
+            let mut bytes = alloc::vec::Vec::new();
+            p::frame::encode(
+                &p::Request {
+                    command: Some(Command::Restart(p::Restart {})),
+                },
+                &mut bytes,
+            );
+            let mut packet = SerialRx {
+                session: 1,
+                bytes: [0; 64],
+                length: bytes.len(),
+            };
+            packet.bytes[..bytes.len()].copy_from_slice(&bytes);
+            io.serial_rx.try_send(packet).ok().unwrap();
+            let mut store = Store::default();
+            let mut running = pin!(run(&io, management(startup), &mut store, || {
+                std::panic::panic_any("reset")
+            }));
+            let mut step = || {
+                io.changed.signal(());
+                assert!(
+                    running
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            };
+            step();
+            for now in 1..crate::owner::RESPONSE_DRAIN_MS {
+                crate::tests::TICKS.with(|ticks| ticks.set(Duration::from_millis(now).as_ticks()));
+                let mut packet = SerialRx {
+                    session: 1,
+                    bytes: [0; 64],
+                    length: bytes.len(),
+                };
+                packet.bytes[..bytes.len()].copy_from_slice(&bytes);
+                let _ = io.serial_rx.try_send(packet);
+                step();
+            }
+            crate::tests::TICKS.with(|ticks| {
+                ticks.set(Duration::from_millis(crate::owner::RESPONSE_DRAIN_MS).as_ticks())
+            });
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)).unwrap_err();
+            assert_eq!(outcome.downcast_ref::<&str>(), Some(&"reset"));
+        }
+        crate::tests::TICKS.with(|ticks| ticks.set(0));
     }
 }

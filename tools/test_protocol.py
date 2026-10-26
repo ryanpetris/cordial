@@ -11,7 +11,7 @@ from check_protocol import check, version_storage_schema
 from version import protocol_base, released_tags
 
 ROOT = Path(__file__).resolve().parents[1]
-BUF = ROOT / 'desktop/node_modules/.bin/buf'
+BUF = os.environ.get('BUF', 'buf')
 
 
 class ProtocolBaselineTests(unittest.TestCase):
@@ -22,9 +22,9 @@ class ProtocolBaselineTests(unittest.TestCase):
         self.git('init', '-q')
         self.git('config', 'user.name', 'Fixture')
         self.git('config', 'user.email', 'fixture@example.invalid')
-        config = self.root / 'desktop/packages/protocol/buf.yaml'
-        config.parent.mkdir(parents=True)
-        shutil.copyfile(ROOT / 'desktop/packages/protocol/buf.yaml', config)
+        config = self.root / 'buf.yaml'
+        config.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / 'buf.yaml', config)
         self.schemas = {
             'shared/common.proto': 'syntax = "proto3"; package fixture.common; message Value { uint32 value = 1; }',
             'handshake.proto': 'syntax = "proto3"; package fixture.handshake; import "shared/common.proto"; '

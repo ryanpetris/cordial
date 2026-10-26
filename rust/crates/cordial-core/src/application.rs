@@ -347,6 +347,7 @@ pub struct Application {
     /// Scan results go before device events next time, so neither starves the other.
     scan_turn: bool,
     reboot_at: Option<(u64, fn() -> !)>,
+    usb_change: Option<(crate::usb::Topology, p::SessionEndingReason)>,
     /// Records saved once input pauses.
     unsaved: deferred::Dirty,
     lost_retry: Backoff,
@@ -535,6 +536,7 @@ impl Application {
             next_profile: 0,
             scan_turn: false,
             reboot_at: None,
+            usb_change: None,
             unsaved: deferred::Dirty::default(),
             lost_retry: Backoff::default(),
             event_retries: Vec::new(),
@@ -767,6 +769,35 @@ impl Application {
     pub fn set_usb_topology(&mut self, topology: crate::usb::Topology) {
         self.adapter_dirty |= self.usb_exposed != Some(topology);
         self.usb_exposed = Some(topology);
+    }
+
+    /// The controller trigger for the latest change to the required USB allocation.
+    pub fn usb_change_reason(&self) -> p::SessionEndingReason {
+        self.usb_change
+            .filter(|(topology, _)| *topology == self.manager.usb_allocation().topology)
+            .map_or(p::SessionEndingReason::Unknown, |(_, reason)| reason)
+    }
+
+    fn allocation_changed(&mut self, before: crate::usb::Topology, reason: p::SessionEndingReason) {
+        let topology = self.manager.usb_allocation().topology;
+        if topology != before {
+            self.usb_change = Some((topology, reason));
+        }
+    }
+
+    /// Stops dispatch and queues the final event after any owed response. Atomic commands must
+    /// finish first. Streamed reads finish their encoded piece and fail with BUSY.
+    pub fn prepare_session_ending(&mut self, reason: p::SessionEndingReason) -> bool {
+        if self.command_pending() && !self.streaming() {
+            return false;
+        }
+        let padding = match self.pending.as_ref() {
+            Some(Pending::File(reader)) => reader.remaining_bytes(),
+            _ => 0,
+        };
+        self.pending = None;
+        self.serial.end(reason, padding);
+        true
     }
 
     /// Supplies actual USB capacity and readiness, then marks changed status records.
@@ -1086,6 +1117,17 @@ impl Application {
         radio: &mut B,
         now: u64,
     ) {
+        let before = self.manager.usb_allocation().topology;
+        self.proceed_command(store, radio, now).await;
+        self.allocation_changed(before, p::SessionEndingReason::ConfigurationChange);
+    }
+
+    async fn proceed_command<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
         if self.yield_command() {
             self.work(store, radio, now).await;
             return;
@@ -1216,6 +1258,26 @@ impl Application {
         radio: &mut B,
         now: u64,
     ) {
+        if self.serial.ending() || self.reboot_at.is_some() {
+            return;
+        }
+        let before = self.manager.usb_allocation().topology;
+        let reason = match &request.command {
+            Some(Command::ConnectDevice(_)) => p::SessionEndingReason::DeviceConnection,
+            Some(Command::DisconnectDevice(_)) => p::SessionEndingReason::DeviceDisconnection,
+            _ => p::SessionEndingReason::ConfigurationChange,
+        };
+        self.begin_command(request, store, radio, now).await;
+        self.allocation_changed(before, reason);
+    }
+
+    async fn begin_command<S: RecordStore, B: Bluetooth>(
+        &mut self,
+        request: p::Request,
+        store: &mut S,
+        radio: &mut B,
+        now: u64,
+    ) {
         let Some(command) = request.command else {
             return self.fail(failure(Error::UnknownCommand));
         };
@@ -1268,7 +1330,9 @@ impl Application {
             | Command::SetProfileRules(_) => self.fail(failure(Error::UnknownCommand)),
             Command::SetAdapter(args) => self.set_adapter(args, store, radio, now).await,
             Command::EnterBootloader(_) => self.bootloader(now),
-            Command::Restart(_) => self.reboot(self.build.restart, now),
+            Command::Restart(_) => {
+                self.reboot(self.build.restart, p::SessionEndingReason::Reboot, now)
+            }
             Command::StartScan(args) => self.start_scan(args, radio, now),
             Command::StopScan(_) => {
                 self.stop_scan(radio);
@@ -2250,10 +2314,14 @@ impl Application {
         if !self.development() || self.build.bootloader.is_none() {
             return self.fail(failure(Error::UnknownCommand));
         }
-        self.reboot(self.build.bootloader.as_ref().unwrap().enter, now);
+        self.reboot(
+            self.build.bootloader.as_ref().unwrap().enter,
+            p::SessionEndingReason::Bootloader,
+            now,
+        );
     }
 
-    fn reboot(&mut self, enter: fn() -> !, now: u64) {
+    fn reboot(&mut self, enter: fn() -> !, reason: p::SessionEndingReason, now: u64) {
         if self.pair.is_some()
             || self
                 .manager
@@ -2265,7 +2333,7 @@ impl Application {
             return self.fail(failure(Error::Busy));
         }
         self.reply(None);
-        self.serial.stop_commands();
+        self.prepare_session_ending(reason);
         for source in 0..devices::ACTIVE_CONNECTIONS {
             self.manager.forward.remove(source);
         }
@@ -3024,8 +3092,10 @@ impl Application {
     }
 
     fn close<B: Bluetooth>(&mut self, link: LinkId, error: Option<Error>, radio: &mut B) {
+        let before = self.manager.usb_allocation().topology;
         let slot = self.manager.connection(link).and_then(|c| c.device);
         self.manager.close(link, error, radio);
+        self.allocation_changed(before, p::SessionEndingReason::DeviceDisconnection);
         if let Some(slot) = slot {
             self.mark_slot(slot, DEVICE | SETTINGS);
         }
@@ -3046,7 +3116,7 @@ impl Application {
         if self.streaming() {
             self.pending = None;
         }
-        if self.serial.session(active) {
+        if self.serial.session(active && self.reboot_at.is_none()) {
             self.end_session(radio);
         }
         self.dirty.clear();
@@ -3075,11 +3145,27 @@ impl Application {
         if self.reboot_at.is_some() {
             return;
         }
+        let reason = match &event {
+            Event::Disconnected { .. }
+            | Event::Failed(_)
+            | Event::Restarting(_)
+            | Event::Prompt { .. } => Some(p::SessionEndingReason::DeviceDisconnection),
+            Event::Connected { .. }
+            | Event::Incoming { .. }
+            | Event::Bonded { .. }
+            | Event::Layout { .. } => Some(p::SessionEndingReason::DeviceConnection),
+            Event::Ready => Some(p::SessionEndingReason::ConfigurationChange),
+            _ => None,
+        };
+        let before = reason.map(|_| self.manager.usb_allocation().topology);
         // Input and the other frequent events are handled without waiting. Connection and
         // pairing changes read or write records; their state lives on the heap while they run, so
         // the priority loop's task does not keep room for it.
         if let Some(event) = self.event_now(event, radio, now) {
             Box::pin(self.event_later(event, store, radio, now)).await;
+        }
+        if let Some((before, reason)) = before.zip(reason) {
+            self.allocation_changed(before, reason);
         }
     }
 
@@ -5037,7 +5123,6 @@ impl Application {
     ) -> bool {
         self.manager.defer_lost_devices =
             !self.cleanup_ready() || !self.manager.lost_devices.is_empty();
-        self.release_editor(store, now).await;
         if let Some((deadline, enter)) = self.reboot_at {
             if (self.serial.queued() == 0 && self.manager.forward.pending() == 0) || now >= deadline
             {
@@ -5046,6 +5131,10 @@ impl Application {
             }
             return false;
         }
+        if self.serial.ending() {
+            return false;
+        }
+        self.release_editor(store, now).await;
         if self.save(store, now).await {
             return true;
         }
@@ -5159,6 +5248,7 @@ impl Application {
     }
 
     fn dropped(&mut self, link: LinkId, error: Option<Error>, now: u64) {
+        let before = self.manager.usb_allocation().topology;
         if let Some(slot) = self.manager.disconnected(link, error, now) {
             if let Some(slot) = slot {
                 self.mark_slot(slot, DEVICE | SETTINGS);
@@ -5173,6 +5263,7 @@ impl Application {
                 }
             }
         }
+        self.allocation_changed(before, p::SessionEndingReason::DeviceDisconnection);
     }
 }
 

@@ -1,0 +1,298 @@
+include/cuse_lowlevel.h
+
+/*
+  CUSE: Character device in Userspace
+  Copyright (C) 2008-2009  SUSE Linux Products GmbH
+  Copyright (C) 2008-2009  Tejun Heo <tj@kernel.org>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+
+  Read example/cusexmp.c for usages.
+*/
+
+include/fuse.h
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+include/fuse_common.h
+
+/*  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+include/fuse_log.h
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2019  Red Hat, Inc.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+include/fuse_lowlevel.h
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+include/fuse_mount_compat.h
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2023 Giulio Benetti <giulio.benetti@benettiengineering.com>
+
+  Logging API.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file LICENSE
+*/
+
+include/fuse_opt.h
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+lib/buffer.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2010  Miklos Szeredi <miklos@szeredi.hu>
+
+  Functions for dealing with `struct fuse_buf` and `struct
+  fuse_bufvec`.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/compat.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Helper functions to create (simple) standalone programs. With the
+  aid of these functions it should be possible to create full FUSE
+  file system by implementing nothing but the request handlers.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+lib/cuse_lowlevel.c
+
+/*
+  CUSE: Character device in Userspace
+  Copyright (C) 2008       SUSE Linux Products GmbH
+  Copyright (C) 2008       Tejun Heo <teheo@suse.de>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+lib/fuse.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Implementation of the high-level FUSE API on top of the low-level
+  API.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/fuse_i.h
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/fuse_log.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2019  Red Hat, Inc.
+
+  Logging API.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/fuse_loop.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Implementation of the single-threaded FUSE session loop.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/fuse_loop_mt.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Implementation of the multi-threaded FUSE session loop.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+lib/fuse_lowlevel.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Implementation of (most of) the low-level FUSE API. The session loop
+  functions are implemented in separate files.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/fuse_misc.h
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/fuse_opt.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Implementation of option parsing routines (dealing with `struct
+  fuse_args`).
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/fuse_signals.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Utility functions for setting signal handlers.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/helper.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Helper functions to create (simple) standalone programs. With the
+  aid of these functions it should be possible to create full FUSE
+  file system by implementing nothing but the request handlers.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+lib/modules/iconv.c
+
+/*
+  fuse iconv module: file name charset conversion
+  Copyright (C) 2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/modules/subdir.c
+
+/*
+  fuse subdir module: offset paths with a base directory
+  Copyright (C) 2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB
+*/
+
+lib/mount.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Architecture specific file system mounting (Linux).
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+lib/mount_bsd.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2005-2008 Csaba Henk <csaba.henk@creo.hu>
+
+  Architecture specific file system mounting (FreeBSD).
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+lib/mount_util.c
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  Architecture-independent mounting code.
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/
+
+lib/mount_util.h
+
+/*
+  FUSE: Filesystem in Userspace
+  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
+
+  This program can be distributed under the terms of the GNU LGPLv2.
+  See the file COPYING.LIB.
+*/

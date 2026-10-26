@@ -1,6 +1,8 @@
 /build*/
 /.cache/
 /dist/
+/release/
+/namcap.log
 /target/
 __pycache__/
 .embuild/

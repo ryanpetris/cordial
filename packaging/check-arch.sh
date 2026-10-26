@@ -1,31 +1,32 @@
 #!/usr/bin/env bash
-# Installs, reinstalls and removes the built Arch packages in a clean Arch container, then collects
-# them with their checksums in release/. Run as root from the repository root.
+# Run in a disposable Arch container as root from the repository root.
 set -euxo pipefail
-pacman -Syu --noconfirm namcap python
+pacman -Syu --noconfirm namcap python binutils
 sed -i '/^NoExtract.*usr\/share\/doc/d' /etc/pacman.conf
-bsdtar -xOf build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst .PKGINFO | grep '^optdepend = cordial-cli: '
-pacman -U --noconfirm build/packages/cli-arch/cordial-cli-*.pkg.tar.zst
-python tools/check_linux_package.py cordial-cli --version "$CORDIAL_VERSION"
-test ! -e /usr/bin/cordial-desktop
-pacman -R --noconfirm cordial-cli
-pacman -U --noconfirm build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst
-python tools/check_linux_package.py cordial-desktop --version "$CORDIAL_VERSION"
+package="build/packages/host-arch/cordial-$CORDIAL_VERSION-1-x86_64.pkg.tar.zst"
+test -f "$package"
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT
+pacman -U --noconfirm "$package"
+python tools/check_linux_package.py --version "$CORDIAL_VERSION"
+namcap "$package" > "$temporary/namcap.log"
+cat "$temporary/namcap.log"
+if grep -q ' E:' "$temporary/namcap.log"; then exit 1; fi
+pacman -U --noconfirm "$package"
+python tools/check_linux_package.py --version "$CORDIAL_VERSION"
+pacman -Qkk cordial
+pacman -R --noconfirm cordial
 test ! -e /usr/bin/cordial
-test ! -e /opt/cordial-desktop/cordial
-pacman -U --noconfirm build/packages/cli-arch/cordial-cli-*.pkg.tar.zst
-# Bundled Electron belongs in /opt under the Arch Electron guidelines.
-namcap -e elfpaths build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst > namcap.log
-namcap build/packages/cli-arch/cordial-cli-*.pkg.tar.zst >> namcap.log
-cat namcap.log
-if grep -q ' E:' namcap.log; then exit 1; fi
-pacman -U --noconfirm build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst build/packages/cli-arch/cordial-cli-*.pkg.tar.zst
-pacman -R --noconfirm cordial-cli
-test ! -e /usr/bin/cordial
-python tools/check_linux_package.py cordial-desktop --version "$CORDIAL_VERSION"
-pacman -R --noconfirm cordial-desktop
-test ! -e /usr/bin/cordial-desktop
+test ! -e /usr/share/glib-2.0/schemas/dev.petris.cordial.gschema.xml
+schemas=$(GSETTINGS_BACKEND=memory gsettings list-schemas)
+if grep -Fxq dev.petris.cordial <<< "$schemas"; then exit 1; fi
+test ! -e /usr/lib/udev/rules.d/50-cordial.rules
+test ! -e /usr/share/doc/cordial
+test ! -e /usr/share/applications/dev.petris.cordial.desktop
+test ! -e /usr/share/icons/hicolor/512x512/apps/dev.petris.cordial.png
+test ! -e /usr/share/icons/hicolor/scalable/apps/dev.petris.cordial.svg
+test ! -e /usr/share/licenses/cordial
 mkdir -p release
-cp build/packages/desktop-arch/*.pkg.tar.zst build/packages/cli-arch/*.pkg.tar.zst release/
+cp "$package" release/
 cd release
-sha256sum ./*.pkg.tar.zst > SHA256SUMS-arch
+sha256sum "$(basename "$package")" > SHA256SUMS-arch

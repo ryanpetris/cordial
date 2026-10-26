@@ -2,6 +2,7 @@
 """Compare permanent serial contracts across releases and storage/IPC within a release series."""
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -77,7 +78,7 @@ def compare(base, root, buf, *, stable):
         selected = present
         if not selected:
             return
-    config = root / 'desktop/packages/protocol/buf.yaml'
+    config = root / 'buf.yaml'
     with tempfile.TemporaryDirectory(prefix='cordial-protocol-base-') as temporary:
         snapshot = Path(temporary) / 'proto'
         # Imports may live outside the selected contract. Build the baseline image with its
@@ -125,9 +126,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base', required=True, help='same-series storage and migration IPC baseline, or empty')
     parser.add_argument('--stable-base', help='override all local serial release baselines with one Git revision')
-    parser.add_argument('--buf', type=Path, default=Path(__file__).resolve().parents[1] / 'desktop/node_modules/.bin/buf')
+    parser.add_argument('--buf', default=os.environ.get('BUF', 'buf'), help='native Buf executable')
     args = parser.parse_args()
-    check(args.base, Path(__file__).resolve().parents[1], args.buf.resolve(), args.stable_base)
+    check(args.base, Path(__file__).resolve().parents[1], args.buf, args.stable_base)
 
 
 if __name__ == '__main__':

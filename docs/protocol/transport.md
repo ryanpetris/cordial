@@ -59,8 +59,7 @@ protobuf bytes, per received frame. This counts the complete `Message`, includin
 and every repeated listing batch. Its COBS receive buffer holds at most 33,686,537 encoded bytes,
 excluding the delimiter. This limit also applies while the client waits for the hello, since
 ordinary messages can arrive first; the hello itself has a 1024-byte decoded limit. The wire
-protocol has no overall cap on ordinary adapter-to-host frames, and the TypeScript desktop and web
-clients do not apply the 32 MiB limit.
+protocol has no overall cap on ordinary adapter-to-host frames.
 
 Once the encoded limit is exceeded, the decoder discards bytes without further buffer growth until
 the next delimiter. It also rejects a frame whose decoded size exceeds the limit. The decoder
@@ -115,11 +114,7 @@ compatible handshake.
 An `AdapterHello` is at most `MAX_HANDSHAKE_BYTES`, currently `1024` decoded protobuf bytes, and a
 `ClientHello` is always empty. Frames before the hello can be ordinary messages of any length, and
 none longer than the hello limit is accepted as a hello. The Rust client keeps its ordinary
-[receive limit](#rust-host-receive-limit) while it waits. The TypeScript desktop and web clients
-buffer at most `MAX_HANDSHAKE_BYTES` decoded bytes of a frame while they wait. They discard a
-longer frame undecoded through its delimiter and keep waiting until the same deadline. After a
-compatible hello they decode the following bytes, including the rest of the same read, without a
-size limit. The adapter hello decoders validate the complete bytes before generated decoding
+[receive limit](#rust-host-receive-limit) while it waits. The adapter hello decoders validate the complete bytes before generated decoding
 and reject missing, zero, duplicate, overflowing, wrong-wire or truncated versions and malformed
 protobuf structure. Field order does not matter. Nested fields do not count as the hello's version.
 Optional future fields are skipped, including opaque length-delimited contents and structurally
@@ -132,14 +127,6 @@ MAX_HANDSHAKE_BYTES}`. Decode helpers take unframed protobuf bytes and return `R
 helpers return validated protobuf bytes for `frame::encode_bytes`. `decode_client_hello` accepts
 only empty bytes. Hello types and both constants are also exported at the crate root.
 `OPERATIONAL_SCHEMA_SHA256` is a crate-root constant.
-
-TypeScript exports `ClientHello`, `AdapterHello`, `ClientHelloSchema`, `AdapterHelloSchema`,
-`decodeClientHello`, `decodeAdapterHello`, `encodeClientHello`, `encodeAdapterHello`,
-`HandshakeError`, `HandshakeErrorCode`, `CURRENT_PROTOCOL_VERSION`, `MAX_HANDSHAKE_BYTES` and
-`OPERATIONAL_SCHEMA_SHA256` from `@cordial/protocol`. Decode helpers accept unframed protobuf bytes;
-encode helpers return validated bytes for `encodeFrame`. `decodeClientHello` accepts only empty
-bytes. Validation throws `HandshakeError` with a technical `code` for the host to interpret. No
-user-facing messages belong to the protocol package.
 
 ## Requests and responses
 
@@ -196,8 +183,9 @@ which subsystem is ready. Radio recovery cannot clear an unresolved save.
 
 The Dongle keeps one pending slot per thing. When a thing changes again before its event is
 written, the event that goes out carries the newer state, and a change event covers every change
-since the previous one, so events are never lost under output pressure; intermediate states can be
-skipped. Events are written only when no response is waiting, and a client that stops reading holds
+since the previous one; intermediate states can be skipped. An intentional session ending discards
+pending change events, and a drain timeout can discard `SessionEnding`, under the rules below.
+Events are written only when no response is waiting, and a client that stops reading holds
 back only the serial port, never HID forwarding. List production shares secondary steps with
 configuration editor packets, connection setup, settings jobs, pairing and deferred saves, even
 when the host keeps reading or records yield no list entries. This work also runs while serial output
@@ -217,21 +205,60 @@ drain, retaining a bounded rescan cursor rather than every affected ID.
   session starts with no events waiting and no scan candidates. Saved devices, connections, automatic reconnection and HID forwarding carry on
   without a client.
 
-The CLI cycles DTR low then high when it opens a port. The desktop application opens the port from
-closed, which raises DTR, and its web version lowers DTR, waits 60 ms and raises it, because Web
-Serial changes DTR without a break request. All of them lower DTR when they close the port.
+The Rust host clients cycle DTR low then high when opening a port and lower DTR
+when they close it.
 
-A save that changes the actual USB allocation is durable before its response is sent. The Dongle
-normally finishes transmitting that response before detaching. A short backend-defined deadline
-bounds this response drain; continued host traffic cannot extend it. At detach the serial session
-closes and its partial input and pending output are discarded. A stalled host cannot prevent USB
-reconfiguration. There is no additional acknowledgement.
+### Intentional session endings
+
+With an open serial session, the Dongle sends `Event.session_ending` before intentionally
+disconnecting USB or resetting. The controller populates its structured `reason` with the trigger:
+`REBOOT`, `CONFIGURATION_CHANGE`, `DEVICE_CONNECTION`, `DEVICE_DISCONNECTION` or `BOOTLOADER`.
+These describe why the session ends, rather than how USB disconnects. This includes autonomous
+allocation changes when a Bluetooth device connects or disconnects. No pending request, user
+action or request correlation is needed. Clients do not display the reason. The controller uses
+`UNKNOWN` for an unclassified trigger. An unspecified or unknown future reason retains the event's
+reconnect semantics.
+With no active session, the Dongle reconfigures or restarts without an event or serial drain.
+
+Once the ending is committed, the Dongle stops accepting or dispatching new requests. Only an
+already-dispatched command may finish; queued or fully received but unexecuted requests are
+discarded. An atomic command already in progress completes before the transmission drain starts;
+streamed responses remain subject to the drain deadline. During the drain, the Dongle finishes any
+frame already in progress and the dispatched command's response, then sends `SessionEnding` as the
+last frame, all subject to that deadline. It never inserts the event into another frame.
+If a listing is still being produced, the Dongle stops producing entries, finishes the encoded
+piece in progress, appends `Response.error` with `ERROR_CODE_BUSY` through the failed-listing path,
+and finishes that frame before sending `SessionEnding`. It does not finish the remaining listing.
+A whole-file read also ends with `ERROR_CODE_BUSY`. Remaining bytes in its declared payload are
+zero-filled to close the protobuf field; the error makes the entire read invalid.
+Pending coalesced change events are discarded; clients read fresh state in the new session.
+Further requests, hellos or state changes cannot starve the final event or extend the deadline.
+A save that changes the actual USB allocation is durable before its response is sent.
+
+The Dongle waits for successful transport completion through the event's final `0x00` delimiter
+before resetting or detaching. Merely encoding or queueing the frame, or submitting its last USB
+packet, is not completion. A short backend-defined deadline bounds transmission, not the time
+needed to finish an already-dispatched atomic command. If the host stalls or the transport fails,
+the Dongle proceeds when the deadline expires or the session closes. At close it discards partial
+input and pending output, including any unfinished frame. A timeout or cable removal is not a
+successful drain, and even successful USB transmission cannot guarantee that the client decoded
+the event.
+There is no additional client acknowledgement.
 
 After USB reconnects, a client opens a new session and reads `GetStatus` and the records it needs.
-It does not wait for an adapter event from the old session. A received success confirms the saved
-preference even if its requested interface is absent from the new allocation. A lost response
-leaves the outcome unknown until the client reads the saved state. Reconfiguration never rolls
-back durable preferences. Clients never replay a write whose outcome is unknown.
+It does not wait for another event from the old session. In ordinary client sessions, only a
+received `SessionEnding` authorizes reconnect waiting for that adapter and session. All reasons,
+including `BOOTLOADER` and unspecified or unknown future reasons, have the same bounded wait.
+A disconnect without the event removes the adapter immediately, even after a command that might
+reconfigure or restart it. This deliberately gives ordinary sessions no reconnect hold with older
+firmware that sends no event. There is no interaction, capability or version fallback. The storage
+migration worker's separate reconnect-until-cancelled policy is unchanged.
+See [client retention and deadlines](clients.md#intentional-disconnects).
+
+A received success confirms the saved preference even if its requested interface is absent from
+the new allocation. A lost response leaves the outcome unknown until the client reads the saved
+state. Reconfiguration never rolls back durable preferences. `SessionEnding` is not a command result and never stands in for a
+successful response. Clients never replay a write whose outcome is unknown.
 
 A CLI proxy exits when its physical adapter disconnects and never reconnects itself. If the
 application stops reading pending proxy output for three seconds, the helper also exits. Partial

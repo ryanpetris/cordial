@@ -227,7 +227,7 @@ fn bad_frames_are_answered_without_reaching_the_application() {
 fn bootloader_entry_stops_reading_requests() {
     let mut s = Session::new();
     connect(&mut s);
-    s.stop_commands();
+    s.end(p::SessionEndingReason::Bootloader, 0);
     assert_eq!(s.feed(&status()), (0, None));
 }
 
@@ -483,4 +483,152 @@ fn optional_metadata_never_exceeds_the_handshake_bound() {
     let hello = negotiate(&mut session);
     assert_eq!(hello.protocol_version, Some(p::CURRENT_PROTOCOL_VERSION));
     assert!(hello.serial_number.is_none());
+}
+
+fn ending(reason: p::SessionEndingReason) -> M {
+    M::Event(p::Event {
+        kind: Some(p::event::Kind::SessionEnding(p::SessionEnding {
+            reason: reason as i32,
+        })),
+    })
+}
+
+#[test]
+fn session_ending_is_last_and_waits_for_its_delimiter_completion() {
+    for reason in [
+        p::SessionEndingReason::Unknown,
+        p::SessionEndingReason::Reboot,
+        p::SessionEndingReason::ConfigurationChange,
+        p::SessionEndingReason::DeviceConnection,
+        p::SessionEndingReason::DeviceDisconnection,
+        p::SessionEndingReason::Bootloader,
+    ] {
+        let mut session = Session::new();
+        session.session(true);
+        session.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 7 }));
+        session.respond(ok());
+        session.end(reason, 0);
+        let mut decoder = Decoder::new(None);
+        let mut messages = Vec::new();
+        while let Some((token, bytes)) = session.output(1) {
+            let byte = bytes[0];
+            assert_ne!(session.queued(), 0);
+            session.end(p::SessionEndingReason::Unknown, 0);
+            assert_eq!(session.feed(&status()), (0, None));
+            assert_eq!(session.feed(&hello()), (0, None));
+            session.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 9 }));
+            session.output_complete(token, 0);
+            let (retry, same) = session.output(1).unwrap();
+            assert_eq!(same, [byte]);
+            if let Some(frame) = decoder.push(byte) {
+                messages.push(p::Message::decode(frame.unwrap()).unwrap().kind.unwrap());
+            }
+            assert_ne!(session.queued(), 0, "submission is not completion");
+            session.output_complete(retry, 1);
+        }
+        assert_eq!(messages, [M::Response(ok()), ending(reason)]);
+        assert_eq!(session.queued(), 0);
+        assert!(!session.idle());
+        assert_eq!(session.feed(&status()), (0, None));
+    }
+}
+
+#[test]
+fn ending_finishes_the_event_already_in_flight() {
+    let mut session = Session::new();
+    session.session(true);
+    let event = p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 7 });
+    session.event(event.clone());
+    let (token, bytes) = session.output(1).unwrap();
+    let mut wire = bytes.to_vec();
+    session.end(p::SessionEndingReason::DeviceConnection, 0);
+    session.output_complete(token, 1);
+    while let Some((token, bytes)) = session.output(2) {
+        wire.extend_from_slice(bytes);
+        let length = bytes.len();
+        session.output_complete(token, length);
+    }
+    let mut decoder = Decoder::new(None);
+    let messages: Vec<_> = wire
+        .into_iter()
+        .filter_map(|byte| {
+            decoder
+                .push(byte)
+                .map(|frame| p::Message::decode(frame.unwrap()).unwrap().kind.unwrap())
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            M::Event(p::Event { kind: Some(event) }),
+            ending(p::SessionEndingReason::DeviceConnection)
+        ]
+    );
+}
+
+#[test]
+fn ending_aborts_a_partly_transmitted_listing_with_busy() {
+    let mut session = Session::new();
+    session.session(true);
+    session.start_stream();
+    for id in 1..=100 {
+        session.stream_response(list_response(id), false);
+        if !session.stream_ready() {
+            break;
+        }
+    }
+    let (token, bytes) = session.output(3).unwrap();
+    let mut wire = bytes.to_vec();
+    session.end(p::SessionEndingReason::ConfigurationChange, 0);
+    session.output_complete(token, 3);
+    while let Some((token, bytes)) = session.output(7) {
+        wire.extend_from_slice(bytes);
+        let length = bytes.len();
+        session.output_complete(token, length);
+    }
+    let mut decoder = Decoder::new(None);
+    let messages: Vec<_> = wire
+        .into_iter()
+        .filter_map(|byte| {
+            decoder
+                .push(byte)
+                .map(|frame| p::Message::decode(frame.unwrap()).unwrap().kind.unwrap())
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            M::Response(p::Response {
+                result: Some(p::response::Result::Error(p::Error {
+                    code: p::ErrorCode::Busy as i32,
+                    ..Default::default()
+                })),
+            }),
+            ending(p::SessionEndingReason::ConfigurationChange)
+        ]
+    );
+}
+
+#[test]
+fn closed_and_replaced_sessions_discard_the_final_event_and_its_completion() {
+    let mut session = Session::new();
+    session.end(p::SessionEndingReason::Reboot, 0);
+    assert_eq!(session.queued(), 0);
+    assert!(session.output(63).is_none());
+    session.session(true);
+    session.end(p::SessionEndingReason::DeviceConnection, 0);
+    let (stale, bytes) = session.output(63).unwrap();
+    let old_length = bytes.len();
+    session.session(false);
+    session.session(true);
+    assert!(session.feed(&status()).1.is_some());
+    session.respond(ok());
+    let (current, bytes) = session.output(63).unwrap();
+    let length = bytes.len();
+    session.output_complete(stale, old_length);
+    assert!(session.output(63).is_none());
+    assert_eq!(session.queued(), 1);
+    session.output_complete(current, length);
+    assert_eq!(session.queued(), 0);
+    assert!(session.idle());
 }

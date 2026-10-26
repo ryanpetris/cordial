@@ -329,10 +329,12 @@ impl<'a> Secondary<'a> {
         }
         if app.command_pending() && !app.yield_command() {
             app.proceed(store, radio, now).await;
+        } else if self.drain_since.is_some() {
+            // Only the response and final event can produce output during the drain.
+        } else if app.serial.ending() {
+            app.work(store, radio, now).await;
         } else if app.save(store, now).await {
             // The step wrote a deferred save.
-        } else if self.drain_since.is_some() {
-            // Drain the durable response without accepting more work from the host.
         } else if let Some(request) = self.read(app) {
             app.begin(request, store, radio, now).await;
         } else if !self.edit(app, store, now).await {
@@ -397,16 +399,22 @@ impl<'a> Secondary<'a> {
         false
     }
     /// A stalled CDC reader cannot hold up USB reconfiguration indefinitely. The deadline starts
-    /// after an atomic command responds. Streamed reads may be cancelled at the deadline.
-    fn reconnect_due(&mut self, app: &Application, now: u64) -> bool {
-        if !app.manager.storage_ready || app.manager.usb_allocation().topology == self.topology {
-            self.drain_since = None;
-            return false;
+    /// after an atomic command responds. A list finishes with BUSY before the final event.
+    fn reconnect_due(&mut self, app: &mut Application, now: u64) -> bool {
+        if self.drain_since.is_none() {
+            if !app.manager.storage_ready || app.manager.usb_allocation().topology == self.topology
+            {
+                return false;
+            }
+            if !app.prepare_session_ending(app.usb_change_reason()) {
+                return false;
+            }
+            self.drain_since = Some(now);
+            self.input = None;
+            self.offset = 0;
+            self.io.serial_rx.clear();
         }
-        if app.command_pending() && !app.streaming() {
-            return false;
-        }
-        let since = *self.drain_since.get_or_insert(now);
+        let since = self.drain_since.unwrap();
         (app.serial.queued() == 0 && !self.serial_pending)
             || now.saturating_sub(since) >= RESPONSE_DRAIN_MS
     }

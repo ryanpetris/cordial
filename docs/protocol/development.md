@@ -80,8 +80,10 @@ File access works while Bluetooth is unavailable and follows the shared
 
 `Restart` is available in production and debug firmware, in normal, assisted and
 blocked modes. It is refused with `ERROR_CODE_BUSY` while a pairing or setup link is
-open. Otherwise it drains an empty success response before resetting the MCU and
-reruns ordinary startup recovery as a power cycle would. It neither writes the
+open. Under the [session ending rules](transport.md#intentional-session-endings), it
+sends an empty success response followed by `SessionEnding` with reason `REBOOT` and drains
+both within the backend's deadline before resetting the MCU. It reruns ordinary startup
+recovery as a power cycle would. It neither writes the
 root nor performs a target check or strict dataset validation.
 
 A migration worker validates and converts files in RAM, verifies replacements,

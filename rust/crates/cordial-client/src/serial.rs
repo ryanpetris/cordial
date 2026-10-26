@@ -2,7 +2,6 @@
 use crate::{Connection, Received};
 use cordial_protocol::{self as p, USB_PRODUCT_ID, USB_VENDOR_ID};
 use std::{
-    collections::BTreeSet,
     io::{self, Read, Write},
     sync::mpsc::Receiver,
     thread,
@@ -58,16 +57,6 @@ fn is_cordial(info: &serialport::UsbPortInfo) -> bool {
 }
 
 fn unique_ports(mut found: Vec<PortInfo>) -> Vec<PortInfo> {
-    // macOS lists a callout and a dial-in name for the same USB serial port.
-    let callouts: BTreeSet<_> = found
-        .iter()
-        .filter_map(|p| p.port.strip_prefix("/dev/cu.").map(str::to_owned))
-        .collect();
-    found.retain(|p| {
-        p.port
-            .strip_prefix("/dev/tty.")
-            .is_none_or(|suffix| !callouts.contains(suffix))
-    });
     found.sort_by(|a, b| a.port.cmp(&b.port));
     found.dedup_by(|a, b| a.port == b.port);
     found
@@ -202,24 +191,18 @@ mod tests {
     }
 
     #[test]
-    fn mac_callout_aliases_count_once_without_merging_distinct_adapters() {
-        let ports = [
-            "/dev/tty.usbmodem1",
-            "/dev/cu.usbmodem1",
-            "/dev/cu.usbmodem2",
-            "/dev/tty.usbmodem2",
-            "/dev/ttyACM0",
-        ]
-        .into_iter()
-        .map(|port| PortInfo {
-            port: port.into(),
-            serial: "same-or-missing-serial".into(),
-        })
-        .collect();
+    fn discovery_orders_ports_and_keeps_distinct_paths_with_the_same_serial() {
+        let ports = ["/dev/ttyACM2", "/dev/ttyACM0", "/dev/ttyACM2"]
+            .into_iter()
+            .map(|port| PortInfo {
+                port: port.into(),
+                serial: "same-or-missing-serial".into(),
+            })
+            .collect();
         let found = unique_ports(ports);
         assert_eq!(
             found.iter().map(|p| p.port.as_str()).collect::<Vec<_>>(),
-            ["/dev/cu.usbmodem1", "/dev/cu.usbmodem2", "/dev/ttyACM0"]
+            ["/dev/ttyACM0", "/dev/ttyACM2"]
         );
     }
 }

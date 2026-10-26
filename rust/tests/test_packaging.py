@@ -4,17 +4,247 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import tarfile
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import build_firmware as build
+import package_host as host
+import build_appimage
 from dependency_notices import newlib_notice
+
+
+class HostPackaging(unittest.TestCase):
+    def test_archive_preserves_payload_and_previous_release_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "rust/target" / host.TARGET / "release/cordial"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"\x7fELF\x02\x01" + b"\0" * 12 + b"\x3e\0")
+            binary.chmod(0o755)
+            for name in ("docs/protocol/README.md", "proto/serial/current", "LICENSE",
+                         "configs/50-cordial.rules", "packaging/dev.petris.cordial.desktop",
+                         "packaging/icons/app-512.png", "packaging/icons/app.svg"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(name)
+            schema = root / "packaging/dev.petris.cordial.gschema.xml"
+            shutil.copy2(host.ROOT / "packaging/dev.petris.cordial.gschema.xml", schema)
+
+            def notices(cargo, platform, features, target, env, output):
+                self.assertEqual((cargo, platform, features, target),
+                                 (["cargo"], "host", ["desktop"], host.TARGET))
+                (output / "notices").mkdir()
+                (output / "notices/LICENSE").write_text("dependency license")
+                (output / "DEPENDENCIES.md").write_text("dependencies")
+                (output / "dependencies.json").write_text("{}")
+
+            with patch.object(host, "ROOT", root), \
+                    patch.object(host.subprocess, "check_output", return_value="1.2.3\n"), \
+                    patch.object(host.dependency_notices, "record", side_effect=notices), \
+                    patch.dict(os.environ, SOURCE_DATE_EPOCH="123"):
+                host.package(host.TARGET)
+                archive = root / "build/release/cordial-1.2.3-linux-amd64.tar.gz"
+                original = archive.read_bytes()
+                with tarfile.open(archive) as tar:
+                    members = {m.name: m for m in tar}
+                    prefix = "cordial-1.2.3-linux-amd64/"
+                    self.assertEqual(tar.extractfile(prefix + "cordial").read(), binary.read_bytes())
+                    self.assertEqual(tar.extractfile(prefix + "VERSION").read(), b"1.2.3\n")
+                    for name in ("docs/protocol/README.md", "dev.petris.cordial.desktop",
+                                 "dev.petris.cordial.png", "dev.petris.cordial.svg", "notices/LICENSE",
+                                 "share/glib-2.0/schemas/dev.petris.cordial.gschema.xml",
+                                 "share/glib-2.0/schemas/gschemas.compiled"):
+                        self.assertIn(prefix + name, members)
+                    self.assertEqual(tar.extractfile(
+                        prefix + "share/glib-2.0/schemas/gschemas.compiled").read(8), b"GVariant")
+                    for name, member in members.items():
+                        self.assertEqual((member.uid, member.gid, member.mtime), (0, 0, 123))
+                        self.assertEqual(member.mode, 0o755 if member.isdir() or name == prefix + "cordial"
+                                         else 0o644)
+                    checksums = tar.extractfile(prefix + "SHA256SUMS").read().decode().splitlines()
+                    for line in checksums:
+                        digest, name = line.split("  ./")
+                        self.assertEqual(digest, hashlib.sha256(tar.extractfile(prefix + name).read()).hexdigest())
+                host.package(host.TARGET)
+                self.assertEqual(archive.read_bytes(), original)
+                with patch.object(host.dependency_notices, "record", side_effect=ValueError("missing notice")):
+                    with self.assertRaisesRegex(ValueError, "missing notice"):
+                        host.package(host.TARGET)
+                self.assertEqual(archive.read_bytes(), original)
+                binary.write_bytes(b"wrong architecture")
+                with self.assertRaisesRegex(ValueError, "Linux x86-64"):
+                    host.package(host.TARGET)
+                self.assertEqual(archive.read_bytes(), original)
+
+    def test_appimage_launcher_selects_desktop_and_preserves_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "usr/bin/cordial"
+            binary.parent.mkdir(parents=True)
+            binary.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@"\n')
+            binary.chmod(0o755)
+            launcher = root / "AppRun"
+            launcher.write_text(build_appimage.APP_RUN)
+            launcher.chmod(0o755)
+            for arguments, expected in (([], ["desktop"]), (["--hidden"], ["desktop", "--hidden"]),
+                                        (["tui"], ["tui"]), (["desktop", "--hidden"], ["desktop", "--hidden"]),
+                                        (["--version"], ["--version"])):
+                with self.subTest(arguments=arguments):
+                    result = subprocess.check_output([str(launcher), *arguments], text=True,
+                                                     env=dict(os.environ, APPDIR=str(root)))
+                    self.assertEqual(result.splitlines(), expected)
+
+    def test_appimage_gtk_hook_preserves_theme_and_backend_without_probes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / "bin"
+            commands.mkdir()
+            for name in ("dbus-send", "gsettings"):
+                command = commands / name
+                command.write_text('#!/bin/sh\nprintf probe >> "$PROBE_LOG"\n')
+                command.chmod(0o755)
+            hook = root / "gtk.sh"
+            hook.write_text(build_appimage.GTK_HOOK)
+            result = subprocess.check_output([
+                "bash", "-eu", "-c", '. "$APPDIR/gtk.sh"; printf "%s\\n" '
+                '"$GTK_THEME" "$GDK_BACKEND" "$GTK_PATH" "$GSETTINGS_SCHEMA_DIR" '
+                '"$GDK_PIXBUF_MODULE_FILE" "$XDG_DATA_DIRS" "$GIO_MODULE_DIR" '
+                '"${GIO_EXTRA_MODULES-unset}" "$GSETTINGS_BACKEND"'], text=True,
+                env=dict(os.environ, APPDIR=str(root), GTK_THEME="Custom", GDK_BACKEND="wayland",
+                         XDG_DATA_DIRS="/custom/share", PROBE_LOG=str(root / "probes"),
+                         GIO_MODULE_DIR="/host/modules", GIO_EXTRA_MODULES="/extra/modules",
+                         GSETTINGS_BACKEND="dconf",
+                         PATH=str(commands) + os.pathsep + os.environ["PATH"]))
+            self.assertEqual(result.splitlines(), [
+                "Custom", "wayland", str(root / "usr/lib/gtk-4.0"),
+                str(root / "usr/share/glib-2.0/schemas"),
+                str(root / "usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"),
+                f"{root}/usr/share:/usr/share:/custom/share",
+                str(root / "usr/lib/gio/modules"), "unset", "dconf"])
+            self.assertFalse((root / "probes").exists())
+
+    def test_appimage_bundles_mime_database_and_source_definitions_with_icons(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            share = root / "share"
+            files = {
+                "icons/Adwaita/symbolic/actions/list-add-symbolic.svg": b"<svg/>",
+                "icons/hicolor/index.theme": b"[Icon Theme]\nName=Hicolor\n",
+                "mime/packages/freedesktop.org.xml": b'<mime-info><mime-type type="image/svg+xml"/></mime-info>',
+                "mime/mime.cache": b"compiled MIME database",
+            }
+            for name, data in files.items():
+                path = share / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            appdir = root / "AppDir"
+            build_appimage.gtk_data(appdir, share)
+            for name, data in files.items():
+                self.assertEqual((appdir / "usr/share" / name).read_bytes(), data)
+
+    def test_appimage_tools_execute_verified_private_copies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            cache.mkdir()
+            marker = root / "poisoned"
+            (cache / "bash").write_text(
+                '#!/bin/sh\ntouch "$POISON_LOG"\nexec /bin/bash "$@"\n')
+            (cache / "bash").chmod(0o755)
+            approved = {
+                name: (b"#!/usr/bin/env bash\n:\n" if name == "linuxdeploy-plugin-gtk.sh"
+                       else name.encode())
+                for name in build_appimage.TOOLS
+            }
+            tools = {
+                name: ("unused", hashlib.sha256(data).hexdigest())
+                for name, data in approved.items()
+            }
+            for name, data in approved.items():
+                (cache / name).write_bytes(data)
+
+            private = root / "private"
+            with patch.dict(build_appimage.TOOLS, tools, clear=True), \
+                    patch.dict(os.environ, PATH=str(cache), POISON_LOG=str(marker)):
+                build_appimage.prepare_tools(cache, private)
+                env = build_appimage.appimage_environment(private, 123)
+                (cache / "linuxdeploy-plugin-gtk.sh").write_bytes(b"changed after verification")
+                subprocess.run([str(private / "linuxdeploy-plugin-gtk.sh")], check=True, env=env)
+
+            self.assertEqual(set(path.name for path in private.iterdir()), set(approved))
+            for name, data in approved.items():
+                self.assertEqual((private / name).read_bytes(), data)
+            self.assertNotIn(str(cache), env["PATH"].split(os.pathsep))
+            self.assertEqual(env["TMPDIR"], str(private.parent))
+            self.assertFalse(marker.exists())
+
+    def test_appimage_gtk_plugin_copies_only_existing_module_directories(self):
+        script = '''#!/bin/bash
+set -e
+copy_lib_tree() { cp -a "$1" "$2"; }
+gtk4_libdir="$MODULES"
+APPDIR="$DESTINATION"
+        copy_lib_tree "$gtk4_libdir" "$APPDIR/"
+printf finished
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "cache"
+            private = root / "private"
+            approved = script.encode()
+            pin = ("unused", hashlib.sha256(approved).hexdigest())
+            cache.mkdir()
+            (cache / "linuxdeploy-plugin-gtk.sh").write_bytes(approved)
+            with patch.dict(build_appimage.TOOLS, {"linuxdeploy-plugin-gtk.sh": pin}, clear=True):
+                build_appimage.prepare_tools(cache, private)
+            plugin = private / "linuxdeploy-plugin-gtk.sh"
+            build_appimage.prepare_gtk_plugin(plugin)
+            modules = root / "gtk-4.0"
+            destination = root / "AppDir"
+            destination.mkdir()
+            env = dict(os.environ, MODULES=str(modules), DESTINATION=str(destination))
+            self.assertEqual(subprocess.check_output([str(plugin)], env=env), b"finished")
+            self.assertEqual(list(destination.iterdir()), [])
+            modules.mkdir()
+            (modules / "module.so").write_bytes(b"module")
+            self.assertEqual(subprocess.check_output([str(plugin)], env=env), b"finished")
+            self.assertEqual((destination / "gtk-4.0/module.so").read_bytes(), b"module")
+            self.assertEqual((cache / plugin.name).read_bytes(), approved)
+            plugin.write_text(script.replace('"$gtk4_libdir"', '"$other_libdir"'))
+            with self.assertRaisesRegex(ValueError, "Pinned GTK plugin module copy does not match"):
+                build_appimage.prepare_gtk_plugin(plugin)
+
+    def test_appimage_runtime_preserves_notices_and_rejects_mismatched_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "notices/appimage-runtime"
+            shutil.copytree(build_appimage.ROOT / "notices/appimage-runtime", source)
+            documentation = root / "docs"
+            inventory = {"native": []}
+            with patch.object(build_appimage, "ROOT", root):
+                build_appimage.runtime_notices(documentation, inventory)
+                self.assertEqual({entry["name"] for entry in inventory["native"]}, {
+                    "AppImage type 2 runtime", "musl libc", "libfuse", "squashfuse",
+                    "Zstandard", "zlib", "mimalloc"})
+                for entry in inventory["native"]:
+                    for notice in entry["notices"]:
+                        copied = documentation / notice["file"]
+                        self.assertEqual(copied.read_bytes(), (source / copied.name).read_bytes())
+                        self.assertEqual(hashlib.sha256(copied.read_bytes()).hexdigest(), notice["sha256"])
+                (source / "musl-COPYRIGHT").write_text("wrong notice")
+                with self.assertRaisesRegex(ValueError, "notice checksum mismatch: musl-COPYRIGHT"):
+                    build_appimage.runtime_notices(root / "bad-docs", {"native": []})
+                with patch.dict(build_appimage.TOOLS, {"runtime-x86_64": ("runtime", "wrong digest")}):
+                    with self.assertRaisesRegex(ValueError, "do not match the pinned runtime"):
+                        build_appimage.runtime_notices(root / "wrong-runtime", {"native": []})
 
 
 class EspBuild(unittest.TestCase):

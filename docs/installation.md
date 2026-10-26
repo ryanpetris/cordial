@@ -5,49 +5,59 @@ Every release ships a `SHA256SUMS` file for verifying them.
 
 ## Desktop app and CLI
 
-`cordial-desktop` is the desktop tray app. `cordial-cli` is the `cordial` command-line tool and
-TUI. You can install either package or both.
+Cordial uses one native Rust executable for the GTK4/libadwaita desktop app, CLI and TUI.
+The `cordial` package includes the executable, application menu entry, icons, settings schema,
+documentation, notices and adapter access rule.
+Protocol compatibility and storage migration run inside the application.
 
-The CLI is optional for direct desktop connections. The desktop app invokes `cordial` for assisted
-storage migration and for older serial revisions that the helper can convert. A protocol helper
-must match the app's current revision and exact operational schema fingerprint. Revision `1` has
-no earlier supported revision or historical protocol converter. The CLI and TUI run storage
-migration automatically when required.
+Launch **Cordial** from the application menu or run `cordial desktop`. Use `cordial tui` for the
+terminal interface. `cordial desktop --hidden` starts without presenting a window.
 
-For protocol proxying on Linux, the desktop runs the first of `~/.local/bin/cordial`,
-`/usr/local/bin/cordial` and `/usr/bin/cordial` that exists, or the absolute path in
-`CORDIAL_CLI_PATH` when set. The selected file must be executable and match the current protocol
-revision and operational schema fingerprint. If it doesn't, the app doesn't look further.
-
-For assisted storage migration, the desktop finds the first executable `cordial` on `PATH`.
-`CORDIAL_CLI_PATH` applies only to protocol proxying.
+Native packages target Arch Linux, Debian 13 and Ubuntu 26.04 on x86-64, using each
+distribution's GTK and libadwaita libraries. The unified host archive uses the Ubuntu 26.04
+baseline of glibc 2.43, GLib 2.88, GTK 4.22 and libadwaita 1.9. The Debian 13 package builds
+its executable on Debian 13 with that distribution's libraries.
+The AppImage bundles GTK, libadwaita, text libraries and the dconf settings backend.
+It requires a session D-Bus and the host's dconf service, provided by GNOME desktops. Install
+`dconf-service` on Debian or Ubuntu, or `dconf` on Arch, when using another desktop.
+The AppImage requires glibc 2.43 or newer and uses the host's compiler runtime,
+window-system libraries and graphics drivers,
+including EGL, OpenGL and Vulkan.
 
 ### Arch Linux
 
 ```sh
-sudo pacman -U cordial-desktop-*-x86_64.pkg.tar.zst
-sudo pacman -U cordial-cli-*-x86_64.pkg.tar.zst
+sudo pacman -U cordial-[0-9]*-1-x86_64.pkg.tar.zst
 ```
 
 ### Debian and Ubuntu
 
-Choose the files marked `trixie` for Debian 13, `noble` for Ubuntu 24.04, or `resolute` for
-Ubuntu 26.04.
+Choose the package marked `trixie` for Debian 13 or `resolute` for Ubuntu 26.04.
+This command uses Ubuntu 26.04; substitute your distribution's codename:
 
 ```sh
-sudo apt install ./cordial-desktop_*_amd64.deb
-sudo apt install ./cordial-cli_*_amd64.deb
+sudo apt install ./cordial_[0-9]*-1~resolute_amd64.deb
 ```
+
+### Upgrading
+
+To update an installed `cordial` package, download its new version and use the same installation
+command.
+
+Enable Start at Login in Settings to launch Cordial automatically.
+Package installation leaves user configuration unchanged.
 
 ### Other distributions
 
-Download `cordial-desktop-*-x86_64.AppImage` for the desktop app and make it executable with
-`chmod +x`. A desktop tar archive, `cordial-desktop-*-x64.tar.gz`, is also available; extract it
-and run the included `cordial-desktop`. For the command-line tool, download
-`cordial-cli-*-linux-amd64.tar.gz`.
+Download `cordial-desktop-<version>-x86_64.AppImage`, make it executable with `chmod +x`, and
+run it to open the desktop app. It also accepts CLI arguments, such as `tui`. If FUSE is
+unavailable, set `APPIMAGE_EXTRACT_AND_RUN=1` when launching it.
 
-For AppImage and portable desktop installations, put the extracted `cordial` executable on `PATH`
-for assisted storage migration. Protocol proxying uses the locations or override listed above.
+The unified `cordial-<version>-linux-amd64.tar.gz` archive contains the `cordial` executable,
+documentation, notices, adapter access rule and GSettings schemas. Keep `share/` beside the
+executable, including when launching it through a symlink. Extract it and run `./cordial desktop`,
+`./cordial tui` or another command. Install the required GTK and libadwaita runtime libraries
+with your distribution's package manager.
 
 ### Adapter access
 
@@ -62,7 +72,7 @@ Over SSH or without a desktop session, add yourself to the group that owns `/dev
 
 ### Tray icon on GNOME
 
-The tray icon needs the
+Cordial uses StatusNotifierItem for its tray icon. GNOME needs a supporting extension, such as the
 [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/).
 
 ## Firmware

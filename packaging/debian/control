@@ -1,0 +1,17 @@
+Source: cordial
+Section: utils
+Priority: optional
+Maintainer: Ryan Petris <ryan@petris.net>
+Build-Depends: debhelper-compat (= 13),
+ libadwaita-1-0 (>= 1.7), libgtk-4-1 (>= 4.18), librsvg2-common, libudev1
+Rules-Requires-Root: no
+Homepage: https://github.com/ryanpetris/cordial
+
+Package: cordial
+Architecture: amd64
+Depends: ${misc:Depends}, ${shlibs:Depends},
+ libadwaita-1-0 (>= 1.7), libgtk-4-1 (>= 4.18), librsvg2-common, udev,
+ adwaita-icon-theme, hicolor-icon-theme, dconf-gsettings-backend, dconf-service
+Description: Manager for Cordial Bluetooth adapters
+ Configure Cordial Bluetooth-to-USB keyboard and mouse adapters through
+ the desktop app, commands, an interactive shell, or the terminal UI.

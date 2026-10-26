@@ -75,10 +75,13 @@ message Request {
 // Response.error and finishes the frame. The error replaces the list result under protobuf's oneof
 // rules; no list entries follow the error. Clients discard the partial list and report the error.
 // The Dongle never terminates a failed listing as a successful partial list.
+// An intentional session ending stops an active listing through this path with ERROR_CODE_BUSY,
+// after finishing the encoded piece in progress, before sending SessionEnding.
 //
 // Events do not interleave with a response's pieces. The Dongle retains pending changes during the
 // response and sends their events afterward. It reads the next request only after the response
-// has been written. Listings reflect records as they are read, not a snapshot at one instant.
+// has been written. Intentional session endings discard pending change events. Listings reflect
+// records as they are read, not a snapshot at one instant.
 message Message {
   oneof kind {
     Response response = 1;
@@ -88,12 +91,11 @@ message Message {
 
 // The answer to one Request. No result set means success with no result. A successful save is
 // durable before its response is sent. If applying the saved preferences changes the USB layout,
-// the Dongle finishes transmitting the response before ending the serial session and reconnecting
-// USB, subject to a short response-drain deadline chosen by the backend. Continued host traffic
-// does not extend that deadline. At detach, the old serial session ends; after reconnecting, clients
-// read Status rather than waiting for an event from that session. The Dongle calculates the
-// allocation before disconnecting and exposes what fits without rolling back saved preferences.
-// USB capacity shortages appear in Status.errors and do not reject saves.
+// the Dongle sends SessionEnding after the response and drains both before reconnecting USB,
+// subject to the backend's bounded drain deadline. SessionEnding does not confirm a save's outcome.
+// At detach, the old serial session ends; after reconnecting, clients read Status. The Dongle
+// calculates the allocation before disconnecting and exposes what fits without rolling back
+// saved preferences. USB capacity shortages appear in Status.errors and do not reject saves.
 message Response {
   oneof result {
     Error error = 1;
@@ -136,6 +138,8 @@ message Event {
     ProfileRemoved profile_removed = 8;
     // Some of a device's settings changed, appeared or went away.
     SettingsChanged settings_changed = 9;
+    // The Dongle intentionally ends this session, independently of any request.
+    SessionEnding session_ending = 10;
   }
 }
 
@@ -145,7 +149,27 @@ message Event {
 
 message GetStatus {}
 
-// Responds with an empty success, drains the response, then performs a full hardware reset.
+// Announces an intentional session end, including autonomous USB allocation changes. Any response
+// to an already-dispatched command precedes this event. The Dongle waits for transport completion
+// through the event's final frame delimiter before closing the session, subject to a bounded
+// backend deadline. Queueing bytes alone is not completion. No client acknowledgement is required.
+message SessionEnding {
+  // The controller supplies the trigger, using UNKNOWN when unclassified. The reason is
+  // informational; every value, including unknown values, authorizes the same bounded wait.
+  SessionEndingReason reason = 1;
+}
+
+enum SessionEndingReason {
+  SESSION_ENDING_REASON_UNKNOWN = 0;
+  SESSION_ENDING_REASON_REBOOT = 1;
+  SESSION_ENDING_REASON_CONFIGURATION_CHANGE = 2;
+  SESSION_ENDING_REASON_DEVICE_CONNECTION = 3;
+  SESSION_ENDING_REASON_DEVICE_DISCONNECTION = 4;
+  SESSION_ENDING_REASON_BOOTLOADER = 5;
+}
+
+// Responds with an empty success, sends SessionEnding with reason REBOOT, drains both subject
+// to the backend's bounded deadline, then performs a full hardware reset.
 // Available in normal operation and management mode, including blocked storage. Restart does
 // not validate or convert files. Startup selects the operating mode again from saved storage.
 message Restart {}
@@ -165,7 +189,8 @@ message SetAdapter {
 }
 
 // Partial update of one configuration interface's preferences. USB reconnects only when the
-// resulting interface allocation changes, after the response has finished transmitting.
+// resulting interface allocation changes, after the response and SessionEnding drain subject
+// to the backend's bounded deadline.
 message ConfigurationInterfaceUpdate {
   // Required.
   ConfigurationInterface interface = 1;
@@ -187,7 +212,8 @@ message TransportUpdate {
   optional bool enabled = 2;
 }
 
-// Responds, then reboots into the ROM programming mode. Development firmware only.
+// Responds, sends SessionEnding with reason BOOTLOADER, drains both subject to the backend's
+// bounded deadline, then reboots into ROM programming mode. Development firmware only.
 message EnterBootloader {}
 
 message Status {

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="desktop/assets/icons/app.svg" width="112" alt="">
+  <img src="packaging/icons/app.svg" width="112" alt="">
 </p>
 
 <h1 align="center">Cordial</h1>
@@ -44,8 +44,9 @@
 - RP2040 and RP2350 boards can forward controllers as HID or XInput [gamepads](docs/gamepads.md).
 - [Input profiles](docs/input-profiles.md) remap keys, mouse buttons and controller inputs on the
   adapter. Edit key and mouse rules with VIA or Vial, and any rule with the CLI.
-- The desktop tray app shows battery status at a glance. The `cordial` CLI has an interactive
-  shell, one-shot commands with JSON output, and a full-screen TUI.
+- The native GTK4/libadwaita desktop app shows adapter and device status, settings and profiles.
+  The same `cordial` executable provides an interactive shell, one-shot commands with JSON output,
+  and a full-screen TUI.
 
 ## Supported boards
 
@@ -67,25 +68,25 @@ works with any computer.
 ### Desktop app and CLI
 
 Download the package for your distribution from the
-[latest release](https://github.com/ryanpetris/cordial/releases/latest). `cordial-desktop` is the
-desktop tray app and `cordial-cli` is the `cordial` command-line tool and TUI. Install either or
-both.
+[latest release](https://github.com/ryanpetris/cordial/releases/latest). The `cordial` package
+includes the GNOME application, CLI and TUI.
 
 On Arch Linux:
 
 ```sh
-sudo pacman -U cordial-desktop-*-x86_64.pkg.tar.zst
-sudo pacman -U cordial-cli-*-x86_64.pkg.tar.zst
+sudo pacman -U cordial-[0-9]*-1-x86_64.pkg.tar.zst
 ```
 
-On Debian 13, Ubuntu 24.04 or Ubuntu 26.04, use the files marked `trixie`, `noble` or `resolute`:
+On Ubuntu 26.04, use the files marked `resolute`. Substitute `trixie` for Debian 13:
 
 ```sh
-sudo apt install ./cordial-desktop_*_amd64.deb
-sudo apt install ./cordial-cli_*_amd64.deb
+sudo apt install ./cordial_[0-9]*-1~resolute_amd64.deb
 ```
 
-An AppImage and tar archives are available for other distributions. See
+Use the same command to update an installed `cordial` package.
+See [installation](docs/installation.md#desktop-app-and-cli) for desktop setup.
+
+An AppImage and a unified host tar archive are available for other distributions. See
 [installation](docs/installation.md#desktop-app-and-cli) for details.
 
 ### Firmware for RP2040 and RP2350 boards
@@ -107,6 +108,7 @@ For ESP32-S3, see [installation](docs/installation.md#esp32-s3).
 From the terminal:
 
 ```sh
+cordial desktop                 # native GNOME application
 cordial adapter list            # find your adapter
 cordial --port PORT             # interactive shell
 cordial tui                     # full-screen interface for every attached adapter

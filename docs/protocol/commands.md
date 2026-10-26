@@ -33,8 +33,8 @@ show the Dongle's error without refreshing when it refuses anyway.
 | --- | --- | --- |
 | `GetStatus` | `Status` | Refreshes the storage readings first. |
 | `SetAdapter` | none | Partial update of the name, host platform, enabled transports and configuration interfaces, saved together. A name is 1..64 UTF-8 bytes without control characters, trimmed; `""` restores the firmware default. Transport updates apply in order; one for a transport the firmware does not support returns `ERROR_CODE_UNSUPPORTED` and changes nothing. Any transport may be disabled, including all of them. An unchanged value writes nothing. A platform change reconfigures special-key translation on every connected device with HID++ on and re-applies its saved settings. Disabling a transport closes its links, fails a pairing over it that has not saved its bond with `ERROR_CODE_UNSUPPORTED`, drops it from a running scan (ending the scan when no transport is left), stops reconnecting its devices and declines their connections, and makes its saved devices inactive with `INACTIVE_REASON_TRANSPORT_DISABLED`. Enabling it makes them eligible again: after the response, the Dongle reads their saved records in the background, and a `device` event reports each device that becomes resident. Configuration interface changes are described under [Profiles](#profiles). |
-| `Restart` | none | Available in every mode, including assisted and blocked storage. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. After its empty response drains, the Dongle performs a full hardware reset and starts up as it would after a power cycle. It doesn't validate or convert files. |
-| `EnterBootloader` | none | Development firmware only. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. After responding, the Dongle stops reading requests, releases held input, and reboots into ROM programming mode (BOOTSEL on Pico, download mode on ESP32-S3) within about 250 ms. Saved data is untouched. |
+| `Restart` | none | Available in every mode, including assisted and blocked storage. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. Under the [session ending rules](transport.md#intentional-session-endings), the Dongle sends its empty response followed by `SessionEnding` with reason `REBOOT`, drains both within the backend's deadline, then performs a full hardware reset. It doesn't validate or convert files. |
+| `EnterBootloader` | none | Development firmware only. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. Under the [session ending rules](transport.md#intentional-session-endings), the Dongle stops accepting requests, sends its response followed by `SessionEnding` with reason `BOOTLOADER`, and drains both within the backend's deadline. It releases held input and reboots into ROM programming mode (BOOTSEL on Pico, download mode on ESP32-S3). Saved data is untouched. |
 
 An `adapter` event follows any change to the name, platform, enabled transports, configuration
 interfaces, readiness or adapter information. Best-effort storage recounts also report changes
@@ -318,8 +318,9 @@ nothing. A disabled interface keeps its profile. Saved `enabled` requests an int
 reports whether it fits in the actual USB allocation. Valid preferences save even when capacity
 omits the interface. USB reconnects only when the actual allocation changes. The plan is computed
 before durable save/apply and detach, and later failures do not roll back persisted preferences.
-The response normally finishes transmitting before detach, subject to the short response-drain
-deadline described under [sessions](transport.md#sessions). Bluetooth connections and held input
+Under the [session ending rules](transport.md#intentional-session-endings), the response
+and `SessionEnding` finish transmitting before detach, subject to the bounded drain deadline.
+Bluetooth connections and held input
 carry on. Clients reopen the serial session and read fresh status without a reconnect confirmation
 dialog.
 

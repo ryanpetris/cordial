@@ -47,17 +47,49 @@ candidates usable until a new scan or session end, subject to adapter readiness 
 Clients distinguish a scan failure from an ordinary timeout and preserve candidate-loss details
 related to a primary radio error.
 
+### Intentional disconnects
+
+For ordinary client sessions, the
+[intentional session ending](transport.md#intentional-session-endings) event alone authorizes
+reconnect waiting. Clients handle `SessionEnding` at any time in an established session,
+including while idle and when autonomous USB allocation changes have no associated request.
+Its reason describes the controller's trigger and is not displayed. An unspecified or unknown
+future reason still authorizes a bounded wait for the current known adapter. `BOOTLOADER` uses the same bounded wait.
+Neither a sent command, a successful response nor recent interaction substitutes for the event.
+Without it, a lost adapter and its devices leave the view immediately, including with older
+firmware that sends no event. There is no interaction, capability or version fallback.
+
+A received event arms only its receiving session and starts a 15-second absolute deadline.
+Repeated events within that session and reconnect attempts do not extend it. An event in a new
+established session starts that session's own deadline. A valid `AdapterHello` establishes a
+replacement session but does not confirm identity. Reconnect waiting ends when `GetStatus` matches
+the known adapter's ID; the original deadline still bounds retained entries and pages during
+reload. A replacement session that fails without its own event never inherits the old session's
+authorization, even before identity is confirmed; the adapter and its devices leave the view
+immediately. Failed attempts to reopen a port before a replacement session is established may be
+retried within the original deadline. Explicit disconnect, adapter selection or quitting cancels
+the wait. Timeout ends retention of old data and removes unconfirmed retained device records and
+their pages. An adapter whose replacement connection and `GetStatus` have succeeded remains
+listed, including when its current status reports a fault.
+An adapter still awaiting reconnection or identification is removed. A client unable to identify
+the same adapter does not retain it for reconnect.
+
+The storage migration worker has its own reconnect-until-cancelled contract in
+`proto/migration.proto`. The event gate and 15-second deadline govern ordinary client retention
+only and do not limit that worker.
+
+The event never completes a pending command or confirms a saved value. An interrupted write
+keeps its unknown outcome until readback in a new session and is never replayed automatically.
+
 ## Client library listings
 
 Rust `Connection` methods `list_devices()`, `list_profiles()`, `list_settings(device)`,
 `list_profile_rules(profile)`, `list_features(device)` and `list_files(path)` return the complete
-protobuf response messages. TypeScript uses `listDevices()`, `listProfiles()`, `listSettings(device)`,
-`listProfileRules(profile)`, `listFeatures(device)` and `listFiles(path)` with the same result
-shapes. The collections are `entries`, `objects`, `rules` or `features`, as defined by each response.
-No method takes a cursor. The `all_*` and `listAll*` conveniences return the response collection
+protobuf response messages. The collections are `entries`, `objects`, `rules` or `features`, as defined by each response.
+No method takes a cursor. The `all_*` conveniences return the response collection
 from a single request. Rust identity and ordering helpers live in `cordial_client::order`.
 
-Both clients assemble responses on the host and preserve request FIFO and response/event ordering.
+Clients assemble responses on the host and preserve request FIFO and response/event ordering.
 Request timeouts measure incoming-byte inactivity so a progressing response can outlast the timeout.
 Every complete outgoing `Request` must fit 1024 protobuf bytes, including all entries and the
 command envelope. `SetProfileRules` is atomic per request, with no automatic splitting or atomicity
@@ -68,9 +100,8 @@ answers it, including `Response.error` or a response with no result. It then all
 matches responses to requests in write order. If sending or waiting for the opening response fails,
 including a timeout or connection close, waiting callers fail without writing their requests.
 
-The Rust client library, CLI and TUI enforce a local 32 MiB decoded receive limit on each complete
-protobuf `Message`, including nested envelopes and all repeated listing batches. The TypeScript
-desktop and web clients do not apply this limit. See
+The Rust client library, native desktop, CLI and TUI enforce a local 32 MiB decoded receive limit on each complete
+protobuf `Message`, including nested envelopes and all repeated listing batches. See
 [Rust host receive limit](transport.md#rust-host-receive-limit) for overflow and session behavior.
 
 ## Protocol selection
@@ -81,14 +112,9 @@ never learns the client's revision, so this check is the client's alone. A curre
 connects directly. A newer revision requires an application upgrade. Firmware without the
 permanent hello is unsupported.
 
-The native desktop can use a CLI proxy for an older revision only when that helper implements
-conversion to the application's current schema. The helper must match both the application's
-current revision and its exact operational schema fingerprint. Revision `1` has no earlier
-supported revision and no historical converter. The browser cannot launch a CLI helper.
-
-A proxy preserves FIFO responses, event ordering and complete errors. Its death closes the
-desktop session. Recovery starts with a fresh direct connection and hello, so an adapter that
-now reports the current revision connects directly. The proxy never reconnects its physical port.
+The native GTK desktop, CLI and TUI select compatibility inside the Rust process. An older
+revision requires an implemented converter to the current schema. Revision `1` has no earlier
+supported revision and no historical converter.
 
 ## Storage migration
 
@@ -120,17 +146,13 @@ Restart button on the adapter's Diagnostics tab send it whenever the target is
 supported, without waiting for readiness or migration. The adapter refuses it with
 `ERROR_CODE_BUSY` while a pairing or setup link is open.
 
-The desktop runs assisted conversion in a CLI subprocess. Before starting it,
-the desktop stops discovery, probes and automatic reconnect globally. It closes every adapter
-stream and proxy, waits for pending connection handoffs to finish closing, and waits for proxy
-children to exit. CLI and TUI migration use the same exclusivity through their
-direct coordinator. The firmware's target storage format remains authoritative through a proxy.
-The migration worker reconnects indefinitely by stable `Status.id`, independently of the
-session proxy, which never reconnects. A port is only a discovery hint and never authorizes
-using another adapter.
+The native desktop, CLI and TUI run assisted conversion through their in-process Rust
+coordinator. Before starting it, they suspend discovery and reconnects and close adapter sessions.
+The migration worker reconnects indefinitely by stable `Status.id`. A port is only a
+discovery hint and never authorizes using another adapter.
 A response lost during a write requires readback after reconnect before retry.
 
-[`proto/migration.proto`](../../proto/migration.proto) defines subprocess IPC.
+[`proto/migration.proto`](../../proto/migration.proto) defines migration-worker subprocess IPC.
 Each stdin `MigrationControl` and stdout `MigrationEvent` has a four-byte
 unsigned little-endian length prefix followed by 1..65,536 protobuf bytes.
 Receivers validate the length before allocation or decoding. Zero, oversized,
@@ -146,11 +168,8 @@ or restarting the adapter. Success requires reconnecting to the same ID and
 verifying the unchanged firmware target, `Status.ready = true` and the absence of
 `ERROR_CODE_STORAGE_MIGRATION_REQUIRED`.
 
-The desktop stays globally suspended until verified success and child exit, or
-explicit user cancellation and child exit. Failure, EOF, lost stdin, unknown
-event variants and child exit alone never authorize resuming connections. On
-explicit cancellation the child stops issuing file commands, closes its adapter
-and exits; a partial temporary file may remain for cleanup on resume.
+Explicit cancellation stops file commands, closes the adapter and exits. A partial
+temporary file may remain for cleanup on resume.
 
 ## CLI
 
@@ -166,7 +185,7 @@ before using the CLI.
 | --- | --- |
 | `adapter list` / `adapter select PORT` | List attached adapters, or switch to one. |
 | `migrate` / `migrate cancel` | Migrate the selected adapter's saved data, or cancel an active migration in the shell. |
-| `cordial migrate --ipc` | Run the desktop's migration helper using framed protobuf on stdin/stdout. Exit 0 means verified success; cancellation and failure exit 1. |
+| `cordial migrate --ipc` | Run the migration worker using framed protobuf on stdin/stdout. Exit 0 means verified success; cancellation and failure exit 1. |
 | `adapter status` | Identity, readiness, platform, storage format and usage, and each supported transport with whether it is enabled and its limits. Device counts appear once the saved devices are listed. |
 | `adapter set name NAME` / `adapter reset name` | Save the adapter name, or restore the firmware default. Quote names containing spaces. |
 | `adapter set platform linux\|windows\|mac` | Save the host platform. |
@@ -203,11 +222,12 @@ silently between duplicate names. Setting paths name typed fields, such as `keyb
   Saving the bond and the later connection result are reported separately.
 - Ctrl-C, Ctrl-D, end of input, SIGINT and SIGTERM quit the shell, which closes the port: a
   running scan stops and an unsaved pairing is cancelled.
-- When the open adapter's connection drops, as when a save or a device connecting or disconnecting
-  changes the USB allocation, the shell waits up to 15 seconds for the same adapter, found by the
+- After a received `SessionEnding`, the shell waits within the
+  [intentional-disconnect deadline](#intentional-disconnects) for the same adapter, found by the
   adapter ID at the start of its USB serial number. It reopens the adapter on whichever port it
   returns to and reads its status and devices again. Only an adapter that doesn't return in time is
-  reported as lost. Commands cut short by the drop are not sent again. Each reports its result once,
+  reported as lost. Without the event, a dropped adapter is reported as lost immediately.
+  Commands cut short by the drop are not sent again. Each reports its result once,
   even after the adapter is reopened, and a save cut off before the adapter answered reports that
   the adapter couldn't confirm whether the change was saved. `adapter select` or quitting ends the
   wait, and `adapter select` replaces a reopen already in progress.
@@ -272,10 +292,13 @@ cancelling prevents an immediate automatic retry.
   [USB discovery descriptors](transport.md#discovery), and shows an adapter once its first
   `GetStatus` identifies it. A port that fails to open, or whose session ends within 10 seconds
   of opening, is tried again after a wait that doubles with each failure in a row, up to a minute;
-  Refresh Adapters (F5) tries it at once. An adapter that goes away keeps its page, locked, for
-  15 seconds; its devices leave the list at once. A shown device page also stays locked, with its
-  tab, staged changes and save result, until the adapter lists its devices again. The same adapter
-  returning is found by the adapter ID that begins its USB serial number. A device missing from
+  Refresh Adapters (F5) tries it at once. After `SessionEnding`, an
+  adapter that goes away keeps its page, locked, within the
+  [intentional-disconnect deadline](#intentional-disconnects); its devices leave the list at once.
+  A shown device page also stays locked, with its tab, staged changes and save result, until the
+  adapter lists its devices again within that deadline. Without the event, the adapter and its
+  device pages disappear immediately. The same adapter returning is found by the adapter ID that
+  begins its USB serial number. A device missing from
   the new list, or an expired hold, returns the page to Overview. Disconnect, from the adapter's
   page or menu, closes its session; the adapter stays listed while plugged in and is opened again
   only by Connect.
@@ -289,8 +312,9 @@ cancelling prevents an immediate automatic retry.
   and Add Device; and the selected page with its tabs and bottom bar. The Overview counts
   connected and paired devices and connected adapters, and lists what needs attention, the
   connected devices with their batteries, and the adapters. Adapter and device pages have the same
-  tabs and controls as the desktop application's, and the same pages and dialogs. Development
-  firmware adds Files and Enter Bootloader to the adapter's Diagnostics tab. Files browses adapter
+  settings and actions as the desktop application's, with tabs for Details, Settings, Profiles
+  and Diagnostics. Development firmware adds Files and Enter Bootloader to the adapter's
+  Diagnostics tab. Files browses adapter
   directories and downloads a file to a host destination, asking before replacing one. A saved
   record is converted to JSON as `file get` converts it, and its destination is suggested with
   `.json` in place of `.pb`. A download is written to a temporary file and moved into place only
@@ -299,7 +323,7 @@ cancelling prevents an immediate automatic retry.
   critical (5% or less), a connected device whose profiles weren't loaded, an adapter whose
   profile memory is 85% used, and an adapter that needs attention are listed under Needs Attention
   on the Overview, and the most pressing one is shown in red on the status line.
-- Staging: changes stay staged, marked as changed, until Save, as in the desktop application;
+- Staging: changes stay staged, marked as changed, until Save;
   Ctrl-S presses the Save shown on screen. Discard drops the changes the shown Save would send, and
   a failed save keeps them. Valid USB preferences save without a reconnect confirmation dialog.
   Connect, disconnect, rename, forget and creating, copying and deleting profiles act at once.
@@ -315,38 +339,41 @@ cancelling prevents an immediate automatic retry.
 
 ## Desktop application
 
-The desktop application uses the same commands and session rules as the CLI.
+The native GTK4/libadwaita desktop runs as `cordial desktop`, with `--hidden` to start without
+presenting a window. It uses the Rust controller, commands and session rules shared with the TUI.
+Protocol compatibility and storage migration run in-process.
 
 - Discovery: it lists serial ports once at startup, then again after USB hotplug events (with short
   retries while udev sets up a new node) or an explicit refresh. A port must match the [USB
   discovery descriptors](transport.md#discovery) and complete the
   [handshake](transport.md#permanent-handshake) on the current protocol revision, and the first
   `GetStatus` identifies the adapter.
-  The web version lists the ports the user has granted by vendor and product ID. Unidentified
-  ports stay hidden. When an adapter has a readable USB serial number that matches its status ID,
-  an unexpected connection loss marks the adapter unavailable and its devices Disconnected.
+  Unidentified ports stay hidden. When an adapter has a readable USB serial number that matches its status ID,
+  a received `SessionEnding` marks the adapter unavailable and its devices Disconnected.
   The existing adapter and device entries, pages, selected tabs, staged changes and save results
-  remain in place during a 15-second reconnect window.
+  remain in place within the [intentional-disconnect deadline](#intentional-disconnects).
   Configuration controls stay disabled until current data is confirmed. The application retries
-  every 500 milliseconds throughout the window, including after an early connection loss or a
+  every 500 milliseconds while awaiting a replacement session, including after a
   temporary failure to reopen the port. Port enumeration continues while other ports are opening.
   It recognizes the same adapter by the adapter ID at the start of its USB serial number,
   even on a different port, confirms that ID in `GetStatus` after a compatible hello, and updates
   the existing state.
   A candidate without a matching readable USB serial number cannot resume that state.
-  The entries and pages remain in place between the new session's handshake and device listing.
-  A failed listing retains them; a
-  completed listing removes devices that are absent. A per-record read error retains last-known
-  device data as described above. Settings and profile lists remain visible while their reads are
-  pending or fail, but their writes stay disabled until the relevant read succeeds. Failed reads
-  can be retried. An adapter that returns with a radio or storage fault remains listed with its
-  current status and disabled device actions, even beyond the window. Its existing device records
-  remain until it becomes ready and lists them again. When the original window expires, the
-  application removes an adapter whose transport or ready device listing has not recovered, and
-  its devices, and leaves their pages. Without a usable USB serial number, a session loss or
-  disappearance from the port list removes the adapter and its devices immediately, without a
-  reconnect window or automatic retries. This includes Web Serial, which cannot read USB serial
-  numbers. A later hotplug scan or explicit refresh creates a fresh connection, including on the
+  The entries and pages remain in place between the new session's handshake and device listing,
+  within the same absolute deadline. A failure of that session without its own event removes them
+  immediately, even before identification. A failed listing on a live session retains them within
+  the deadline; a completed listing removes devices that are absent. A per-record read error
+  retains last-known device data as described above. Settings and profile lists remain visible while
+  their reads are pending or fail, but their writes stay disabled until the relevant read succeeds. Failed reads
+  can be retried. An adapter that returns with a radio or storage fault shows its current status
+  and disabled device actions. Its retained device records remain only within the deadline.
+  When the original window expires, the application removes unconfirmed retained device records
+  and leaves their pages. It keeps an adapter with a live replacement connection and authoritative
+  status, even if it is not ready or its device listing failed. An adapter whose transport or
+  identification has not recovered is removed with its devices. Without the event or
+  a usable USB serial number, a session loss or disappearance from the port list removes the
+  adapter and its devices immediately, without a
+  reconnect window or automatic retries. A later hotplug scan or explicit refresh creates a fresh connection, including on the
   same port, and does not restore the previous session's state.
 - Protocol revisions: opening sends the delimiter and the empty `ClientHello`, waits for a valid
   `AdapterHello`, and finishes with `GetStatus` within 4 seconds in total. Input does not extend
@@ -354,25 +381,9 @@ The desktop application uses the same commands and session rules as the CLI.
   frame longer than a hello can be. An adapter that
   sends any other frame before its hello, or no hello in time, stays hidden. An adapter whose hello
   names a newer revision is listed as refused with its name, firmware version and serial number
-  where the hello includes them, and receives no other request. For an older revision, the desktop
-  application closes the port and runs the CLI as
-  `cordial --port PORT proxy --protocol N --schema DIGEST`, with its own revision and
-  `OPERATIONAL_SCHEMA_SHA256`. The CLI opens the port and writes one COBS frame of at most 4096
-  decoded bytes holding UTF-8 JSON with `kind` `cordial-proxy-startup`, its own `protocol` and
-  `schema`, a `result` of `ready`, `incompatible-client`, `unsupported-native`, `open-failed` or
-  `handshake-failed`, and `nativeHello`, the adapter's hello as lowercase hex or `null`. After
-  `ready`, its standard input and output carry a session on the current revision, starting with the
-  handshake. The CLI must be ready and finish that handshake within 5 seconds. Its standard error
-  goes to the log. A missing CLI, a CLI with another revision or schema, or one that can't convert
-  for the adapter leaves the adapter refused. Where the direct hello, the hello the CLI reports and
-  the converted session's hello include serial numbers, they must match. The web version has no CLI and refuses an older
-  adapter as well. A refused adapter is opened again only on a refresh, a hotplug event or Connect.
-  The CLI never reopens the port. When it exits for any reason, the session ends as if the
-  adapter were unplugged, and recovery opens the port directly again, so an adapter now on the
-  current revision connects without the CLI. Closing the session ends the CLI's input, then sends
-  `SIGTERM` after 1 second and `SIGKILL` after another, and the port is opened again only after
-  the CLI has exited. A request the exit interrupts is not replayed. Quitting waits for the CLI and
-  every open port to close.
+  where the hello includes them, and receives no other request. An older revision requires an
+  implemented converter. A refused adapter is opened again only on a refresh, a hotplug event or
+  Connect. Quitting closes every open port.
 - Sessions: after a compatible hello, `GetStatus` and the storage gate, it reads the complete
   device list and each device's settings, then
   follows events, and lists the devices again when the adapter becomes ready. When a device
@@ -382,10 +393,11 @@ The desktop application uses the same commands and session rules as the CLI.
   reconnect opens a fresh session and reads status instead of expecting an event from the old
   session.
   Bluetooth radio loss leaves paired devices listed.
-- Disconnect: the user can disconnect an adapter from its context menu. The application closes the
-  port and does not reopen it, recognizing it by the first 16 characters of its USB serial number,
-  until the user chooses Connect or restarts the application. The web version recognizes it by its
-  port instead. This intentional disconnect does not start the reconnect window.
+- Disconnect: the user can disconnect an adapter from Adapter Menu on Details or its sidebar
+  context menu. The application closes the port and does not reopen it, recognizing it by the
+  first 16 characters of its USB serial number,
+  until the user chooses Connect or restarts the application. This intentional disconnect does not
+  start the reconnect window.
 - Pairing: Add Device scans the transports the firmware supports and has enabled while its dialog is
   open, stops the scan before pairing, answers prompts in the dialog, and follows the new device
   until it connects or fails. Closing the dialog, or hiding the window, stops a scan or cancels an
@@ -393,25 +405,109 @@ The desktop application uses the same commands and session rules as the CLI.
   that device after reconnect. Candidates and active pairing prompts from the previous session
   cannot be used in the new session. An interrupted active pairing reports that the adapter could
   not confirm whether the device was paired; it is not replayed.
-- Devices open on the Details tab, with the connection switches and the device's own facts. Settings
-  follows when the device has settings to show, then Profiles when the adapter supports profiles,
-  with the device's layers (an ordered list of profiles, empty for a new device), then Diagnostics:
-  the device's errors, the HID++ protocol and status,
-  link security and identifiers, with Refresh. Changes on Details, Settings and Profiles stay staged
-  across tabs until that tab's Save sends its own changes in one request; Connect, Disconnect and
-  Forget act at once. Device errors stay on Diagnostics.
+  In the native desktop, Add Device is a plus icon at the start of the selected adapter or device's
+  Details header. Profiles and Diagnostics have no Add Device button. It uses that page's adapter
+  and is disabled when the adapter cannot pair. The dialog has no adapter selector. A passive
+  spinner in its header indicates scanning, without searching text or a status row. When scanning
+  stops, Refresh or Retry appears
+  with any scan error. Scanning uses a 520 by 560 content area; pairing uses a 400-wide dialog
+  whose height follows its content, with the scan title hidden. The device icon, step title,
+  messages, codes and answers are centered. Two answers share a row, with the primary answer last.
+  Enter-code prompts offer Reject and Pair; code comparisons offer Codes Differ and Codes Match.
+  A displayed code offers Cancel Pairing. A connected result offers Add Another and Dismiss,
+  and opens the paired device's page automatically after about three seconds. Deliberate pointer
+  movement inside the dialog pauses the countdown until the pointer leaves; keyboard interaction
+  keeps it paused. Dismiss opens the same device page immediately. A saved pairing with a
+  connection warning stays open, as do failures and cancellation results. Failures offer Close and
+  Retry; cancellation offers Close and Refresh. Ctrl+N uses the selected page's
+  adapter. Settings has no pairing target. Each adapter group in the tray ends with Add Device,
+  enabled when that adapter is ready. It brings the window forward and pairs through that adapter.
+- Native navigation: the sidebar starts with Overview and Settings, then each adapter followed by
+  its saved devices. Separators divide adapter groups without heading rows. An Add Device row
+  appears only when one ready adapter is available and no devices have been added. Connect and
+  Refresh Adapters rows remain available when needed. Sidebar battery icons expose the reading
+  through their accessible names, while the device page shows the exact percentage and a
+  full-width battery bar. Charging without a known percentage has a fact row without a bar.
+  Settings opens in the regular content pane from the sidebar, Ctrl+, or the tray. Its sidebar
+  row stays selected, its five controls save immediately and follow external GSettings changes,
+  and a rejected save restores the saved value. In a narrow window, Back returns to the sidebar.
+  Adapters and devices each have one Details page containing their settings
+  and information, with no tab controls. The page title stays visible in its header. Profiles and
+  Diagnostics open from link rows near the bottom as subpages with Back. The minimum window width
+  is 480sp, and the sidebar collapses at 660sp. In a narrow window, Back first returns from a
+  subpage to Details, then from Details to the sidebar. Overview lists adapters first without an
+  Adapters heading, followed by Needs Attention and Connected when populated, without a separate
+  count card. Page actions sit beside their content. Adapter Menu on Details offers Rename followed
+  by Connect or Disconnect. The adapter's Details page has no Status row. Device Menu is a
+  three-dot button in the Details and Diagnostics headers. It offers Refresh followed by Connect
+  or Disconnect; Details omits Refresh
+  when the device has no settings. Profiles has no Device Menu.
+- Native search: the Search icon at the start of the sidebar header and Ctrl+F open a search
+  entry. Search matches every typed word across a result's title and context, ignoring case.
+  Results include Overview, Settings, adapters, devices, Profiles, Diagnostics and individual app,
+  adapter and device settings, and displayed information such as Battery, Firmware and Device ID.
+  Device results name their device and include the adapter when device names repeat. Choosing a
+  setting or information field opens its page, scrolls to its row and focuses it.
+  Advertised VIA and Vial settings open Profiles and focus their profile selectors.
+  Profile names in each adapter's cached library and assigned device layers are searchable.
+  Library results name their adapter; layer results name their device and include its adapter
+  when device names repeat. Choosing a profile opens the corresponding Profiles subpage,
+  scrolls to that exact library or layer row and focuses it. Search uses the loaded profile list
+  without reading profile rules. Information fields appear only when their rows are displayed;
+  Serial Number requires a reported serial number. Diagnostic groups such as Security and
+  Identifiers open Diagnostics and focus their first row. Search matches titles and contexts,
+  rather than field values, message text or menu commands.
+  Result titles and dimmed contexts wrap beside a search result icon. No matches shows a compact
+  search icon with "No Results Found" and "Try a different search", matching GNOME Settings.
+  Enter opens the current query's first result and does nothing for an empty query or no matches.
+  Down moves focus into the results. Escape clears the search and
+  restores navigation. At narrow widths, Ctrl+F brings the sidebar into view. Searching and
+  choosing a result do not change settings.
+- Native lifecycle: closing or hiding the window leaves configuration writes running. Explicit Quit
+  commits the focused numeric field and waits for pending writes in a separate Cordial window
+  labelled "Settings are being applied". If a write fails or its outcome is unknown, Continue
+  Editing returns to the main window and Quit Anyway exits.
+- Devices open on Details, with connection switches, status, battery and the device's own facts.
+  The native page also contains the available settings in their catalog groups and Gamepad Output
+  when supported. Its header shows the device's status without repeating its battery reading,
+  and the content has no separate Status row. The Battery row shows its exact value and meter.
+  Each setting's saved-state menu appears before its title and shows only an icon,
+  with an accessible name such as "Pointer Sensitivity: Saved". Every marker state uses an icon without
+  visible status words.
+  Forget Device is at the end of the scrolling page. Profiles appears when the adapter supports
+  profiles and shows the device's layers, an ordered list of profiles, empty for a new device.
+  Drag a layer onto another row to move it to that position. Each row has a drag handle and Remove.
+  Diagnostics shows the device's errors, the HID++ protocol and status, link security and
+  identifiers, with Refresh. Details switches, settings, Gamepad Output and adding, moving or
+  removing profile layers apply immediately. Numeric fields apply on a step, Enter or leaving
+  the field; typing and redraws do not commit an edit. Controls stay editable and show the chosen
+  values while changes are being applied, without progress or success feedback. Only failures
+  appear beside the action. Connect and Disconnect act at once; Forget asks for confirmation.
+  Device errors stay on Diagnostics.
 - Profile memory: the application notifies once when `Status.errors` includes
   `ERROR_CODE_PROFILE_MEMORY_LOW`, and once when a connected device's `errors` includes
   `ERROR_CODE_PROFILE_MEMORY_EXCEEDED` or `ERROR_CODE_PROFILE_LOAD_FAILED`. Each notification
   resets after its condition clears. Device errors appear on Diagnostics.
-- Adapters open on Details, with Settings, Profiles when the adapter supports them, and Diagnostics.
-  Details shows storage usage from `RESOURCE_TYPE_STORAGE`, and Diagnostics shows the storage
-  format, each only while the adapter reports it.
+- Adapters open on Details. The native page includes Platform and a card for each supported
+  transport, with its enable switch and reported Active Devices and Connections capacities.
+  Settings precede Information, and subpage links follow the information. Rename is in Adapter Menu.
+  Diagnostics has an Adapter Menu for Restart and the maintenance actions the firmware supports.
+  When an adapter is disconnected or needs a storage migration, the centered status page offers
+  Connect or the available migration actions.
+  Capacity bars span the row below its name and usage. Storage and USB interface capacity also
+  have bars when both count and limit are known. New Pairings appears only when storage is full,
+  with a warning; pairing has no capacity bar. Details links to Diagnostics and, when supported,
+  Profiles. Details shows storage usage from `RESOURCE_TYPE_STORAGE`, and Diagnostics shows the
+  storage format, each only while the adapter reports it.
   Profiles lists every profile, each with an icon for each role it changes, and the configuration
-  interfaces, each with its own switch and profile. The profile picker reads the complete list.
-  Changes on Settings and Profiles stay staged across tabs until Save sends them together in one request; a
-  failed save keeps them. Saving needs no reconnect confirmation dialog. Creating,
-  copying and deleting profiles take effect at once.
+  interfaces, each with a native profile selection row and its own enable switch. New Profile
+  sits beside the list; a device's Profiles list has Add Profile beside it. The adapter library
+  and Add Profile picker show the complete list with scrolling.
+  Platform, transport and configuration interface switches apply immediately. Selecting a
+  configuration interface profile applies it immediately. Adding a device layer applies it when
+  Choose is pressed. Controls stay editable while changes are being applied;
+  only failures appear beside the action. Applying a change needs no reconnect confirmation
+  dialog. Creating, copying and deleting profiles retain their confirmation dialogs.
 - Battery: a device's battery is low when a known `battery.level` is at or below the user's
   threshold (20% by default) and `battery.charging` is not true; at most 5% is critical. It notifies
   once on entering low and once on entering critical, and resets only after a reading above the
@@ -425,12 +521,12 @@ The desktop application uses the same commands and session rules as the CLI.
 ## Gamepad outputs
 
 Gamepad Output has the choices Disabled, HID and XInput. A missing saved gamepad
-preference means Disabled. The desktop application and TUI show this control only
-on a paired device's Settings tab. Its roles or kind must identify a gamepad and
-the adapter must advertise an enabled mode, or the device must have a saved
-gamepad choice other than Disabled. Unrelated keyboards and mice have no such
-control unless they have a saved choice to clear. Changes follow the existing
-Save and Discard behavior. The CLI saves at once:
+preference means Disabled. The native desktop shows this control on a paired device's
+main Details page. The TUI shows it on the device's Settings tab.
+Its roles or kind must identify a gamepad and the adapter must advertise an enabled mode,
+or the device must have a saved gamepad choice other than Disabled. Unrelated keyboards and mice have no such
+control unless they have a saved choice to clear. The native desktop saves a choice immediately.
+The TUI uses Save and Discard. The CLI saves at once:
 
 ```sh
 cordial --port PORT device set DEV gamepad-output hid
@@ -464,15 +560,16 @@ when reported for an enabled choice, Gamepad Status and Gamepad Slot.
 or `at most 4` while its size is unknown. See [output states and
 pools](records.md#devices) and [controller mapping limits](hid-forwarding.md#usb-gamepad-outputs).
 
-The desktop application and TUI save valid output preferences without a reconnect confirmation
-or a USB-capacity pre-check. Save sends other staged device settings before Gamepad Output,
-since its save can change USB allocation. If those settings fail to save or their outcome is
-unknown, Gamepad Output stays staged. A received success confirms the saved preference; active
-USB exposure is reported separately. If the response is lost, clients report an unknown outcome
-and may read the device after reconnecting. When the adapter has a usable USB serial number,
-automatic reconnect tracking keeps the device page and its staged state in place while reading
-fresh status in the new session. Neither output mode requires a running Host service or an
-additional configuration interface.
+The native desktop and TUI save valid output preferences without a reconnect
+confirmation or a USB-capacity pre-check. In the TUI, Save sends other
+staged device settings before Gamepad Output, since its save can change USB allocation. If those
+settings fail to save or their outcome is unknown, Gamepad Output stays staged. The native desktop
+applies each committed setting or output choice immediately. A received success confirms the saved
+preference; active USB exposure is reported separately. If the response is lost, clients report an
+unknown outcome and may read the device after reconnecting. When `SessionEnding` authorizes
+retention and the adapter has a usable USB serial number, automatic reconnect tracking keeps the
+device page open while reading fresh status in the new session. The TUI retains staged changes. Neither output mode requires a running Host service or an additional
+configuration interface.
 
 Clients show both USB capacity errors when both appear in `Status.errors`. Required capacity has
 a prominent warning and tray attention. Reserved capacity has a subtle indicator and no large

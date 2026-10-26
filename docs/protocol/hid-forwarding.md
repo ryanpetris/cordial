@@ -226,10 +226,15 @@ candidate is in `0xC0..0xDF`. Both can be present together. Clients show the req
 prominently and mark tray attention; the reserved error has a subtle indicator. Omitted extras in
 `0xE0..0xFE` produce neither error. Disabled interfaces at `0xFF` are not candidates.
 
-The pending command completes before the serial response drain deadline starts. The response
-normally drains before detach, with a short fixed deadline that host traffic cannot extend.
-Detach closes the session, and clients read fresh status after reconnecting. See
-[serial sessions](transport.md#sessions).
+Under the [session ending rules](transport.md#intentional-session-endings), only an
+already-dispatched command may finish; queued requests are discarded. An atomic command in
+progress completes before the transmission drain starts. Any active frame, its response and the
+unsolicited `SessionEnding` event drain before detach, subject to a bounded transmission deadline
+that host traffic cannot extend. Autonomous allocation changes send the event even when no command
+is pending.
+An active listing stops after its encoded piece in progress and ends with `Response.error`
+using `ERROR_CODE_BUSY`, so producing the remaining entries cannot delay `SessionEnding`.
+Detach closes the session, and clients read fresh status after reconnecting.
 
 ## Gamepad output preferences
 

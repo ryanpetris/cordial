@@ -3,7 +3,7 @@ mod fingerprint;
 use std::path::PathBuf;
 
 #[test]
-fn current_schema_matches_the_typescript_generator() {
+fn current_schema_matches_the_recorded_fingerprint() {
     assert_eq!(cordial_protocol::CURRENT_PROTOCOL_VERSION, 1);
     assert_eq!(
         cordial_protocol::OPERATIONAL_SCHEMA_SHA256,

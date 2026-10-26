@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Cordial
+Exec=cordial desktop
+Icon=dev.petris.cordial
+Terminal=false
+Categories=GNOME;GTK;Settings;HardwareSettings;
+StartupNotify=true
+StartupWMClass=dev.petris.cordial
+Keywords=bluetooth;keyboard;mouse;battery;

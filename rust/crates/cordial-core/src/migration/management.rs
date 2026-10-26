@@ -53,18 +53,16 @@ impl Management {
         }
     }
     pub fn session(&mut self, active: bool) {
-        self.serial.session(active);
+        self.serial.session(active && !self.restarting);
         self.listing = None;
         self.reader = None;
-        self.restarting = false;
-        self.drained = false;
     }
     pub fn restarting(&self) -> bool {
         self.restarting
     }
-    /// Only a successful final USB completion, never a timeout or disconnect, permits reset.
+    /// Whether the final frame completed or the serial session closed.
     pub fn reset_ready(&self) -> bool {
-        self.drained
+        self.restarting && (self.drained || !self.serial.open())
     }
     pub fn output_complete(&mut self, token: OutputToken, length: usize) {
         let pending_output = self.serial.open() && self.serial.queued() != 0;
@@ -107,7 +105,9 @@ impl Management {
         }
         if matches!(command, Command::Restart(_)) {
             self.restarting = true;
-            return self.reply(None);
+            self.reply(None);
+            self.serial.end(p::SessionEndingReason::Reboot, 0);
+            return;
         }
         if !self.assisted {
             return self.fail(self.status.errors[0].clone());

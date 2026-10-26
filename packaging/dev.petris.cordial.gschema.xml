@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="dev.petris.cordial" path="/dev/petris/cordial/">
+    <key name="start-at-login" type="b">
+      <default>false</default>
+      <summary>Start at login</summary>
+    </key>
+    <key name="always-show-tray" type="b">
+      <default>false</default>
+      <summary>Always show tray icon</summary>
+    </key>
+    <key name="notify-low-battery" type="b">
+      <default>true</default>
+      <summary>Notify about low batteries</summary>
+    </key>
+    <key name="low-battery-percent" type="i">
+      <range min="5" max="50"/>
+      <default>20</default>
+      <summary>Low battery level</summary>
+    </key>
+    <key name="notify-connections" type="b">
+      <default>false</default>
+      <summary>Notify about connections</summary>
+    </key>
+  </schema>
+</schemalist>

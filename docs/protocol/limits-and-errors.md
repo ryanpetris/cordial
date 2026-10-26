@@ -36,7 +36,7 @@
 HID report-map limits are in [HID forwarding](hid-forwarding.md).
 
 The Rust receive limit applies to the client library, CLI and TUI, including all nested envelopes
-and repeated listing batches. It does not apply to the TypeScript desktop or web clients. See
+and repeated listing batches. See
 [Rust host receive limit](transport.md#rust-host-receive-limit) for buffering and session errors.
 
 ### Bluetooth capacity
