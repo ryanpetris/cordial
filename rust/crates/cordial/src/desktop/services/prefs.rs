@@ -157,7 +157,8 @@ impl Store {
     }
 
     fn autostart(&self) -> PathBuf {
-        self.root.join("autostart/cordial.desktop")
+        self.root
+            .join(format!("autostart/{}.desktop", crate::desktop::APP_ID))
     }
 
     fn transaction(&self) -> gio::Settings {
@@ -747,7 +748,15 @@ mod tests {
     fn writes_and_removes_the_autostart_entry() {
         let root = root("autostart");
         let store = test_store(root.clone());
-        let file = root.join("autostart/cordial.desktop");
+        let file = root.join("autostart/dev.petris.cordial.desktop");
+        let unrelated = root.join("autostart/cordial.desktop");
+        let unrelated_content =
+            b"[Desktop Entry]\nType=Application\nName=Unrelated Application\nExec=unrelated\n";
+        fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        fs::write(&unrelated, unrelated_content).unwrap();
+        store.set_autostart(None).unwrap();
+        assert!(!file.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), unrelated_content);
         store
             .set_autostart(Some(Path::new("/opt/My Apps/cordial")))
             .unwrap();
@@ -755,9 +764,12 @@ mod tests {
         assert!(text.starts_with("[Desktop Entry]\nType=Application\n"));
         assert!(text.contains("\nExec=\"/opt/My Apps/cordial\" desktop --hidden\n"));
         assert!(text.contains(&format!("\nIcon={}\n", crate::desktop::APP_ID)));
+        assert_eq!(fs::read(&unrelated).unwrap(), unrelated_content);
         store.set_autostart(None).unwrap();
         assert!(!file.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), unrelated_content);
         store.set_autostart(None).unwrap();
+        assert_eq!(fs::read(&unrelated).unwrap(), unrelated_content);
         fs::remove_dir_all(root).unwrap();
     }
 }

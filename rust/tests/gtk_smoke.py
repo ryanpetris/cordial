@@ -71,7 +71,7 @@ class Smoke:
     def __init__(self, binary, root, output, bus):
         self.binary, self.root, self.output, self.bus = binary, root, output, bus
         self.config = root / "config"
-        self.autostart = self.config / "autostart/cordial.desktop"
+        self.autostart = self.config / f"autostart/{APP_ID}.desktop"
         self.log = (output / "application.log").open("w")
         self.processes = []
         self.ui = None

@@ -158,7 +158,7 @@ def check(image, output, renderer=None):
             ui.switch("Start at Login", True, page)
             ui.wait("save Start at Login", lambda:
                 saved_login() == "true")
-            autostart = root / "config/autostart/cordial.desktop"
+            autostart = root / f"config/autostart/{APP_ID}.desktop"
             ui.wait("write the autostart entry", autostart.is_file)
             entry = configparser.ConfigParser(interpolation=None)
             entry.read(autostart)

@@ -45,6 +45,8 @@ To update an installed `cordial` package, download its new version and use the s
 command.
 
 Enable Start at Login in Settings to launch Cordial automatically.
+The setting manages `$XDG_CONFIG_HOME/autostart/dev.petris.cordial.desktop`, with
+`XDG_CONFIG_HOME` defaulting to `~/.config`.
 Package installation leaves user configuration unchanged.
 
 ### Other distributions
