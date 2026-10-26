@@ -208,7 +208,8 @@ make package-desktop package-cli package-firmware BOARD=pico_w
 ```
 
 The tag-triggered release workflow reads `GITHUB_REF_NAME`, validates
-`vMAJOR.MINOR.PATCH`, and supplies the numeric version to every build job.
+`vMAJOR.MINOR.PATCH`, and runs `make check-protocol` before starting build jobs.
+It supplies the numeric version and tagged commit timestamp to every build job.
 
 ### Portable archives
 
@@ -270,8 +271,7 @@ Supplied archives and tracked recipes remain unchanged.
 The release workflow validates one tag and supplies the same version to all builds. It checks
 clean installation, reinstallation, package file ownership, native dependencies, schema registration,
 removal and Debian purge in disposable distribution containers, including Namcap and Lintian checks.
-It runs the installed
-Resolute desktop through the native AT-SPI fixture and checks the actual AppImage's desktop launch.
+It checks the actual AppImage's desktop launch.
 Release assets include the unified host archive, AppImage, one native package
 for each distribution, production and debug firmware archives for every board, and checksums.
 Each firmware archive holds its firmware version's package directory.
@@ -287,6 +287,9 @@ Third-party license material is retained in `notices/`. Firmware and native host
 include the project license, generated dependency inventories and license notices.
 
 ## Software checks
+
+The release workflow's `validate` job checks the tag and protocol schemas. Run the
+full software suite and the GTK checks below locally.
 
 ```sh
 make check
@@ -313,6 +316,9 @@ Protocol checks require the native Buf 1.75.0 executable from the
 The release workflow installs and verifies the Linux x86-64 binary. `BUF` can
 select another executable for `make check-protocol` and the protocol fixtures.
 The lint and breaking rules live in `buf.yaml`.
+
+To run only the protocol checks, use `make check-protocol`. It requires GNU Make,
+Python and Git in addition to Buf, and does not compile Rust or native code.
 
 Run the GTK control checks with a display:
 
@@ -570,7 +576,7 @@ The seeded Active Devices rows must each contain a capacity bar. Its bounds must
 line below the name and usage, relative to the row rather than a fixed pixel width.
 The AppImage fixture checks its packaged desktop launch with two simulated adapters using
 extraction when FUSE is unavailable. Both write screenshots and logs.
-The release workflow uploads this evidence on failure.
+The release workflow uploads AppImage evidence on failure.
 
 Native simulation accepts `CORDIAL_SIM_WRITE_DELAY_MS` as an integer from `0` through `2000`.
 The GTK fixture uses `0` for the normal flow, `800` for delayed settings and profile changes,

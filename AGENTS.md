@@ -167,6 +167,13 @@ environment variables, and configuration keys in backticks.
   an unbounded fix. Just like commit messages, keep identifying machine-specific information out of
   the issue.
 
+## Release workflow budget
+
+Keep the release workflow's tests and validation limited to a small, focused set.
+Their combined runtime across all jobs must fit within a two-minute budget.
+Run broader regression suites locally, outside the release workflow. Build,
+packaging, and publishing time does not count toward this budget.
+
 ## Required completion checks
 
 Before any item is considered done, all suites below must pass for the completed changes.
@@ -192,7 +199,7 @@ individual test cases.
 | Arch package fixture | Build `cordial` with `make package-host-arch`, then run `packaging/check-arch.sh` in a clean Arch container. Checks installation, native dependencies, schema registration, package contents, Namcap, reinstallation, and removal. |
 | Debian/Ubuntu package fixtures | Build `cordial` with `make package-host-deb DEB_DISTRIBUTION=...`, then run `packaging/check-deb.sh` in matching clean containers for `trixie` and `resolute`. Checks installation, native dependencies, schema registration, contents, Lintian, reinstallation, removal, and purge. |
 | Installed desktop smoke fixture | Install the Resolute `cordial` package, then run `CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a dbus-run-session -- python3 rust/tests/gtk_smoke.py build/package-smoke`. Also run it with `build/empty-states-smoke --empty-states` for empty device profiles and per-adapter pairing actions, and `build/pairing-reconnect-smoke --pairing-reconnect` for pairing results across announced USB reconnects. Exercises native navigation, profiles, pairing, files, GSettings, narrow layouts, immediate writes, and quit behavior with simulated adapters. |
-| GTK control fixtures | Run the ignored integer-control, pairing-countdown, and rejected-preference tests under Xvfb and a private D-Bus session, as specified in the release workflow. |
+| GTK control fixtures | Run the ignored integer-control, pairing-countdown, and rejected-preference tests under Xvfb and a private D-Bus session, as specified in `docs/building.md`. |
 | AppImage smoke fixture | Run `tools/check_appimage.py` against the packaged AppImage in disposable Resolute and Arch environments. Verify desktop launch, bundled GIO modules, and persistent default-backend GSettings. |
 | Release asset validation | When assembling a release, verify all expected application and board/profile archives and their checksums using the asset checklist in `.github/workflows/release.yml`. Publishing is not a check and still requires authorization. |
 

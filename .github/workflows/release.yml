@@ -10,7 +10,7 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-26.04
-    timeout-minutes: 45
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
       epoch: ${{ steps.version.outputs.epoch }}
@@ -28,38 +28,14 @@ jobs:
           echo "CORDIAL_VERSION=$version" >> "$GITHUB_ENV"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Install build prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git clang libclang-dev pkg-config libgtk-4-dev libadwaita-1-dev libglib2.0-bin python3-pyte xvfb xauth dbus-x11
-      - name: Install Rust check components
-        run: |
-          cd rust
-          rustup component add clippy
       - name: Install Buf
         run: |
           curl --fail --location https://github.com/bufbuild/buf/releases/download/v1.75.0/buf-Linux-x86_64 --output "$RUNNER_TEMP/buf"
           printf '%s  %s\n' fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b "$RUNNER_TEMP/buf" | sha256sum --check
           chmod +x "$RUNNER_TEMP/buf"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      - name: Check Rust and protocol
-        run: make check-rust check-protocol
-      - name: Check GTK integer controls with a display
-        working-directory: rust
-        run: xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib desktop::settings::tests::integer_rows_commit_accepted_numbers -- --ignored --exact
-      - name: Check the pairing countdown with a display
-        working-directory: rust
-        run: xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib desktop::add::tests::countdown_draws_along_the_bottom_edge -- --ignored --exact
-      - name: Check rejected preference edits with a display
-        working-directory: rust
-        run: xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib desktop::services::prefs::tests::dialog_rolls_back_controls_when_gsettings_rejects_saves -- --ignored --exact
-      - name: Build terminal fixture executable
-        working-directory: rust
-        run: cargo build --locked --release -p cordial --bin cordial --target x86_64-unknown-linux-gnu
-      - name: Check build tools, terminal and board presets
-        env:
-          CORDIAL_TEST_BINARY: ${{ github.workspace }}/rust/target/x86_64-unknown-linux-gnu/release/cordial
-        run: make check-tools
+      - name: Check protocol
+        run: make check-protocol
   linux:
     needs: validate
     runs-on: ubuntu-24.04
@@ -182,38 +158,6 @@ jobs:
           path: release/
           compression-level: 0
           if-no-files-found: error
-  desktop-smoke:
-    needs: [validate, debian]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      CORDIAL_VERSION: ${{ needs.validate.outputs.version }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@v8
-        with:
-          name: packages-resolute
-          path: build/native
-      - name: Check installed native desktop in a disposable Resolute container
-        run: |
-          docker run --rm --init -e CORDIAL_VERSION -v "$PWD:/src" -w /src ubuntu:26.04 bash -euxo pipefail -c '
-            apt-get update
-            apt-get install -y --no-install-recommends python3-pyatspi python3-gi gir1.2-adw-1 xvfb xauth dbus-x11 imagemagick adwaita-icon-theme librsvg2-common "./build/native/cordial_$CORDIAL_VERSION-1~resolute_amd64.deb"
-            CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 rust/tests/gtk_smoke.py build/package-smoke
-            CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 rust/tests/gtk_smoke.py build/empty-states-smoke --empty-states
-            CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 rust/tests/gtk_smoke.py build/pairing-reconnect-smoke --pairing-reconnect
-          '
-      - uses: actions/upload-artifact@v7
-        if: failure()
-        with:
-          name: native-desktop-smoke-evidence
-          path: |
-            build/package-smoke/
-            build/empty-states-smoke/
-            build/pairing-reconnect-smoke/
-          if-no-files-found: warn
   firmware:
     needs: validate
     runs-on: ubuntu-24.04
@@ -250,7 +194,7 @@ jobs:
           compression-level: 0
           if-no-files-found: error
   publish:
-    needs: [validate, linux, arch, debian, desktop-smoke, firmware]
+    needs: [validate, linux, arch, debian, firmware]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
