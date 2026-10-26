@@ -139,22 +139,24 @@ environment variables, and configuration keys in backticks.
 
 ## Protocol and compatibility versions
 
-- Before any storage or protocol change, ask the maintainer explicitly whether the change should
-  be breaking or non-breaking. Wait for an explicit answer before making the change. Plan approval
-  or permission to start implementation does not replace that answer.
+- All serial protocol and on-board storage changes must preserve compatibility, either through
+  backward-compatible changes or a protocol or storage migration.
+- Use backward-compatible changes by default, such as additive Protocol Buffer schema changes that
+  preserve existing field numbers, types, and meaning.
+- Break compatibility only when absolutely necessary. Include the corresponding protocol or
+  storage migration so existing clients or saved data have a supported upgrade path.
 - Breaking storage or protocol changes require the next release to increment the minor version
   while the major version is `0`, or the major version when it is `1` or greater.
 - Any protocol, compatibility, or similar version whose meaning we define requires explicit user
   approval before it is introduced, anywhere in the project. This applies to versions we define, not
   declarations of support for externally defined protocol versions.
 - Changing any such version requires explicit user approval.
-- Any change to the serial protocol between the Dongle and the Host software, including
-  `proto/handshake.proto` and `proto/serial/`, framing, and the documented behaviour of its
-  messages, requires explicit maintainer approval before it is made.
-- Any change to the Dongle's on-board storage layout requires explicit maintainer approval before
-  it is made. This includes adding, removing, or renaming files and directories, changing paths,
-  and changing the format, fields, or meaning of file contents, as documented in
-  `docs/storage-format.md` and `proto/storage/`.
+- These compatibility requirements cover the serial protocol between the Dongle and the Host
+  software, including `proto/handshake.proto` and `proto/serial/`, framing, and the documented
+  behaviour of its messages.
+- They also cover the Dongle's on-board storage layout, including files, directories, paths, and
+  the format, fields, and meaning of file contents, as documented in `docs/storage-format.md`
+  and `proto/storage/`.
 - Firmware downgrades are not supported. Saved data written by newer firmware does not need to
   stay readable by older firmware.
 
