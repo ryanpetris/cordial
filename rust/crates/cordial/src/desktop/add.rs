@@ -108,10 +108,12 @@ impl Countdown {
     fn new(dialog: &adw::Dialog) -> Self {
         let bar = gtk::ProgressBar::builder()
             .accessible_role(gtk::AccessibleRole::Presentation)
-            .css_classes(["osd"])
             .valign(gtk::Align::End)
             .visible(false)
             .build();
+        // Replacing the class list would drop the orientation class that the theme sizes the
+        // trough by.
+        bar.add_css_class("countdown");
         let frame = gtk::Overlay::new();
         let content = dialog.child();
         dialog.set_child(Some(&frame));
@@ -702,9 +704,15 @@ impl AddDialog {
             .states
             .get(&pairing.slot)
             .and_then(|st| st.candidate(pairing.candidate))
-            .map_or(words::DisplayKind::Other, |c| {
-                words::display_kind(&c.kinds, &[])
-            });
+            .map(|c| words::display_kind(&c.kinds, &[]))
+            // The pairing's session may have ended across a reconnect; the saved device remains.
+            .or_else(|| {
+                app.devices()
+                    .iter()
+                    .find(|d| d.adapter == pairing.adapter && Some(d.d.id) == pairing.device)
+                    .map(|d| d.kind)
+            })
+            .unwrap_or(words::DisplayKind::Other);
         let icon = device_icon(kind);
         if self.device_icon.icon_name().as_deref() != Some(icon) {
             self.device_icon.set_icon_name(Some(icon));
@@ -765,5 +773,75 @@ impl Modal for AddDialog {
             Some(pairing) => self.update_pairing(app, pairing),
             None => self.update_scan(app, &add),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn part(w: &gtk::Widget, name: &str) -> gtk::Widget {
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            if c.css_name() == name {
+                return c;
+            }
+            child = c.next_sibling();
+        }
+        panic!("{} has no {name} node", w.css_name());
+    }
+
+    #[test]
+    #[ignore = "requires a display"]
+    fn countdown_draws_along_the_bottom_edge() {
+        adw::init().expect("GTK needs a display");
+        crate::desktop::widgets::add_style();
+        let dialog = adw::Dialog::builder()
+            .content_width(400)
+            .child(&gtk::Label::new(Some("Connected")))
+            .build();
+        let countdown = Countdown::new(&dialog);
+        countdown.bar.set_fraction(0.5);
+        countdown.bar.set_visible(true);
+        let window = adw::Window::builder()
+            .default_width(600)
+            .default_height(400)
+            .build();
+        window.present();
+        dialog.present(Some(&window));
+        let bar = countdown.bar.upcast_ref::<gtk::Widget>();
+        let trough = part(bar, "trough");
+        let progress = part(&trough, "progress");
+        // Layout runs on the frame clock's timers, so a timer wakes the loop until the bar has
+        // its size.
+        let tick = || glib::ControlFlow::Continue;
+        let wake = glib::timeout_add_local(Duration::from_millis(10), tick);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !(bar.is_mapped() && progress.height() > 0) {
+            glib::MainContext::default().iteration(true);
+        }
+        wake.remove();
+
+        assert_eq!(
+            (bar.height(), trough.height(), progress.height()),
+            (3, 3, 3)
+        );
+        let frame = bar.parent().unwrap();
+        let edge = bar.compute_bounds(&frame).unwrap();
+        assert_eq!(
+            (edge.x(), edge.width()),
+            (0.0, frame.width() as f32),
+            "the bar spans the dialog"
+        );
+        assert_eq!(
+            edge.y() + edge.height(),
+            frame.height() as f32,
+            "the bar sits on the bottom edge"
+        );
+        assert!(
+            (progress.width() - trough.width() / 2).abs() <= 1,
+            "the fill shows the time left"
+        );
     }
 }

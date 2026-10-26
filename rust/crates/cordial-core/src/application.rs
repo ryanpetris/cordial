@@ -785,8 +785,8 @@ impl Application {
         }
     }
 
-    /// Stops dispatch and queues the final event after any owed response. Atomic commands must
-    /// finish first. Streamed reads finish their encoded piece and fail with BUSY.
+    /// Stops dispatch and queues the final event after any owed response and terminal pairing
+    /// outcome. Atomic commands must finish first. Streamed reads finish with BUSY.
     pub fn prepare_session_ending(&mut self, reason: p::SessionEndingReason) -> bool {
         if self.command_pending() && !self.streaming() {
             return false;
@@ -796,7 +796,12 @@ impl Application {
             _ => 0,
         };
         self.pending = None;
-        self.serial.end(reason, padding);
+        self.serial.end_with_pairing(
+            reason,
+            padding,
+            self.pairing.as_ref().filter(|_| self.pairing_dirty),
+        );
+        self.pairing_dirty = false;
         true
     }
 

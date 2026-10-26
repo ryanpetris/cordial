@@ -401,10 +401,14 @@ Protocol compatibility and storage migration run in-process.
 - Pairing: Add Device scans the transports the firmware supports and has enabled while its dialog is
   open, stops the scan before pairing, answers prompts in the dialog, and follows the new device
   until it connects or fails. Closing the dialog, or hiding the window, stops a scan or cancels an
-  unsaved pairing. A settled pairing result that confirms a saved device can continue following
-  that device after reconnect. Candidates and active pairing prompts from the previous session
-  cannot be used in the new session. An interrupted active pairing reports that the adapter could
-  not confirm whether the device was paired; it is not replayed.
+  unsaved pairing. A received `SessionEnding` retains the pairing dialog with its adapter and
+  device entries within the intentional-disconnect deadline. A matching `PairingDone` from the
+  original session confirms the saved device even if the host processes the session loss first.
+  The dialog follows that device on a replacement session only after matching the adapter's
+  persistent ID. `SessionEnding` alone never confirms pairing success. Candidates and active
+  pairing prompts from the previous session cannot be used in the new session, and the client
+  never replays them. A loss without reconnect authorization, an expired reconnect deadline or
+  explicit adapter disconnect closes the dialog.
   In the native desktop, Add Device is a plus icon at the start of the selected adapter or device's
   Details header. Profiles and Diagnostics have no Add Device button. It uses that page's adapter
   and is disabled when the adapter cannot pair. The dialog has no adapter selector. A passive
@@ -415,7 +419,9 @@ Protocol compatibility and storage migration run in-process.
   messages, codes and answers are centered. Two answers share a row, with the primary answer last.
   Enter-code prompts offer Reject and Pair; code comparisons offer Codes Differ and Codes Match.
   A displayed code offers Cancel Pairing. A connected result offers Add Another and Dismiss,
-  and opens the paired device's page automatically after about three seconds. Deliberate pointer
+  and opens the paired device's page automatically after about three seconds. The countdown starts
+  only when a confirmed saved device is connected; waiting for a replacement session does not
+  start it. Deliberate pointer
   movement inside the dialog pauses the countdown until the pointer leaves; keyboard interaction
   keeps it paused. Dismiss opens the same device page immediately. A saved pairing with a
   connection warning stays open, as do failures and cancellation results. Failures offer Close and

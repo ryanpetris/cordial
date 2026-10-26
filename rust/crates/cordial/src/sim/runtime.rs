@@ -6,6 +6,7 @@ use p::migration::{
     MigrationCancelled, MigrationEvent, MigrationPhase, MigrationProgress, MigrationSuccess,
     migration_event,
 };
+use std::fs::OpenOptions;
 
 /// Independent simulated adapters. Retain this handle to control an interface test's devices.
 #[derive(Clone)]
@@ -32,7 +33,50 @@ pub fn desktop(sink: Sink, count: usize) -> Live {
                 .insert("set_settings", ErrorCode::StorageFailed);
         }
     }
+    let reconnect_ms = std::env::var("CORDIAL_SIM_PAIRING_RECONNECT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|&value| value > 0);
+    if let Some(reconnect_ms) = reconnect_ms
+        && let Some(adapter) = desktop.adapters().first()
+    {
+        let (notify, paired) = mpsc::channel();
+        adapter.0.lock().unwrap().pairing_reconnect = Some(notify);
+        let adapter = Arc::downgrade(&adapter.0);
+        let present = desktop.present.clone();
+        thread::spawn(move || {
+            while paired.recv().is_ok() {
+                let Some(adapter) = adapter.upgrade() else {
+                    return;
+                };
+                {
+                    let mut present = present.lock().unwrap();
+                    let mut sim = adapter.lock().unwrap();
+                    reconnect_trace(&sim, "done");
+                    present[0] = false;
+                    sim.end_session(p::SessionEndingReason::DeviceConnection as i32);
+                    reconnect_trace(&sim, "closed");
+                }
+                thread::sleep(Duration::from_millis(reconnect_ms.clamp(100, 10000)));
+                let mut present = present.lock().unwrap();
+                present[0] = true;
+                reconnect_trace(&adapter.lock().unwrap(), "present");
+            }
+        });
+    }
     desktop.live(sink)
+}
+
+fn reconnect_trace(sim: &Sim, stage: &str) {
+    if let Ok(path) = std::env::var("CORDIAL_SIM_PAIRING_RECONNECT_TRACE")
+        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = writeln!(
+            file,
+            "{stage} {} {} {}",
+            sim.status.id, sim.session, sim.paired.id
+        );
+    }
 }
 
 impl Desktop {
@@ -104,7 +148,12 @@ impl Desktop {
         if !present[index] {
             return Err(io::ErrorKind::NotConnected.into());
         }
-        self.adapters[index].connect(handler)
+        let connection = self.adapters[index].connect(handler)?;
+        let sim = self.adapters[index].0.lock().unwrap();
+        if sim.pairing_reconnect.is_some() {
+            reconnect_trace(&sim, "opened");
+        }
+        Ok(connection)
     }
 
     // The simulated engine exercises worker progress and ownership without changing disk data.

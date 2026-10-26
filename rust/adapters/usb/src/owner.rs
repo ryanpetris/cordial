@@ -330,7 +330,7 @@ impl<'a> Secondary<'a> {
         if app.command_pending() && !app.yield_command() {
             app.proceed(store, radio, now).await;
         } else if self.drain_since.is_some() {
-            // Only the response and final event can produce output during the drain.
+            // Only the response, terminal pairing result and final event produce output here.
         } else if app.serial.ending() {
             app.work(store, radio, now).await;
         } else if app.save(store, now).await {

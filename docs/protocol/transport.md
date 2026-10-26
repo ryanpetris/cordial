@@ -184,7 +184,8 @@ which subsystem is ready. Radio recovery cannot clear an unresolved save.
 The Dongle keeps one pending slot per thing. When a thing changes again before its event is
 written, the event that goes out carries the newer state, and a change event covers every change
 since the previous one; intermediate states can be skipped. An intentional session ending discards
-pending change events, and a drain timeout can discard `SessionEnding`, under the rules below.
+pending change events while preserving a pending terminal pairing result. A drain timeout can
+discard that result or `SessionEnding`, under the rules below.
 Events are written only when no response is waiting, and a client that stops reading holds
 back only the serial port, never HID forwarding. List production shares secondary steps with
 configuration editor packets, connection setup, settings jobs, pairing and deferred saves, even
@@ -224,14 +225,16 @@ Once the ending is committed, the Dongle stops accepting or dispatching new requ
 already-dispatched command may finish; queued or fully received but unexecuted requests are
 discarded. An atomic command already in progress completes before the transmission drain starts;
 streamed responses remain subject to the drain deadline. During the drain, the Dongle finishes any
-frame already in progress and the dispatched command's response, then sends `SessionEnding` as the
-last frame, all subject to that deadline. It never inserts the event into another frame.
+frame already in progress and the dispatched command's response, then sends any pending terminal
+pairing result before `SessionEnding` as the last frame, all subject to that deadline. A terminal
+pairing result is `PairingDone` or a pairing error, including the bond-save outcome. It never
+inserts an event into another frame.
 If a listing is still being produced, the Dongle stops producing entries, finishes the encoded
 piece in progress, appends `Response.error` with `ERROR_CODE_BUSY` through the failed-listing path,
 and finishes that frame before sending `SessionEnding`. It does not finish the remaining listing.
 A whole-file read also ends with `ERROR_CODE_BUSY`. Remaining bytes in its declared payload are
 zero-filled to close the protobuf field; the error makes the entire read invalid.
-Pending coalesced change events are discarded; clients read fresh state in the new session.
+Other pending coalesced change events are discarded; clients read fresh state in the new session.
 Further requests, hellos or state changes cannot starve the final event or extend the deadline.
 A save that changes the actual USB allocation is durable before its response is sent.
 

@@ -1273,6 +1273,89 @@ class Smoke:
         self.step("empty-sidebar", self.empty_sidebar)
         self.quit()
 
+    def run_pairing_reconnect(self):
+        self.pairing_trace = self.root / "pairing-reconnect.txt"
+        self.pairing_trace.touch(mode=0o600)
+        self.env.update(CORDIAL_SIM_PAIRING_RECONNECT_MS="1500",
+                        CORDIAL_SIM_PAIRING_RECONNECT_TRACE=str(self.pairing_trace))
+        self.startup()
+        self.step("pairing-reconnect-automatic", lambda: self.pairing_reconnect(automatic=True))
+        self.step("pairing-reconnect-dismiss", lambda: self.pairing_reconnect(automatic=False))
+        self.quit()
+
+    def pairing_reconnect(self, automatic):
+        adapter = "SIMULATED0000001"
+        candidate, device = ("Example Keys Mini", "11") if automatic else ("Example Pebble", "12")
+
+        def records():
+            return [line.split() for line in self.pairing_trace.read_text().splitlines()]
+
+        session = [row[2] for row in records() if row[:2] == ["opened", adapter]][-1]
+        event = lambda stage: [stage, adapter, session, device] in records()
+        dialog = self.start_pair(candidate, "Example Adapter 1")
+        prompt = "Enter Passkey" if automatic else "Compare Codes"
+        self.ui.expect(prompt, dialog)
+        self.ui.retain("keep the prompt open without a success countdown", lambda:
+            bool(self.ui.matches(prompt, {"label"}, dialog))
+            and not self.ui.matches("Dismiss", BUTTONS, dialog) and not event("done"), duration=3.3)
+        if automatic:
+            self.ui.edit("Code", "123456", dialog)
+        self.ui.click("Pair" if automatic else "Codes Match", root=dialog)
+        message = f"{candidate} is paired and connected."
+        success = []
+
+        def retained():
+            nodes = self.ui.nodes(self.navigation())
+            names = [node.name for node in nodes if visible(node)
+                     and node.getRoleName() == "list item"]
+            connected = bool(self.ui.matches(message, {"label"}, dialog))
+            if connected and not success:
+                success.append(time.monotonic())
+                if not automatic:
+                    self.ui.key("Tab")
+            return (all(names.count(name) == 1 for name in (
+                "Example Adapter 1", "Example Adapter 2", "Example Mouse", "Example Trackball",
+                candidate)) and bool(self.ui.matches("Add Device", {"dialog", "alert"}))
+                and (connected or bool(self.ui.matches("Connecting", {"label"}, dialog))))
+
+        self.ui.wait("close the framed session after PairingDone and SessionEnding", lambda:
+            event("closed"))
+        trace = records()
+        if trace.index(["done", adapter, session, device]) >= trace.index(
+                ["closed", adapter, session, device]):
+            raise AssertionError("The simulated transport closed before PairingDone")
+        self.ui.wait("show the retained dialog, adapter and new device while the port is absent",
+                     lambda: retained() and not event("present"))
+        self.ui.retain("retain the dialog, adapter and new device during the absent port", lambda:
+            retained() and not event("present"), duration=0.4)
+        self.ui.dump(self.stage + "-gap")
+        self.ui.screenshot(self.stage + "-gap")
+
+        self.ui.wait("confirm the paired device is connected", lambda:
+            retained() and self.ui.matches(message, {"label"}, dialog))
+        observed = success[0]
+        self.ui.retain("retain success across the replacement session", lambda:
+            retained() and bool(self.ui.matches(message, {"label"}, dialog)),
+                       duration=max(0.1, (2.6 if automatic else 3.3)
+                                    - (time.monotonic() - observed)))
+        if not automatic:
+            self.enabled("Add Another", root=dialog)
+            self.ui.click("Dismiss", root=dialog)
+        self.ui.wait("dismiss the confirmed pairing result", lambda:
+            not self.ui.matches("Add Device", {"dialog", "alert"}), timeout=5)
+        elapsed = time.monotonic() - observed
+        replacement = self.ui.wait("open a replacement session for the same adapter", lambda:
+            next((row[2] for row in records() if row[:2] == ["opened", adapter]
+                  and int(row[2]) > int(session)), None))
+        if not event("present"):
+            raise AssertionError("The replacement opened before the simulated port returned")
+        self.ui.wait(f"open the reconnected {candidate!r} page", lambda: self.page_header(candidate))
+        self.ui.expect("Example Adapter 1", self.ui.row("Adapter"))
+        (self.output / (self.stage + "-dismissal.json")).write_text(json.dumps({
+            "automatic": automatic, "seconds_after_observation": elapsed,
+            "original_session": session, "replacement_session": replacement,
+        }, indent=2) + "\n")
+
     def forget(self, name, adapter):
         self.ui.wait(f"show the paired {name!r} page", lambda: self.page_header(name))
         row = self.ui.row("Adapter")
@@ -2060,14 +2143,19 @@ class Smoke:
         if self.ui:
             self.ui.x11.close()
         shutil.copyfile(self.trace, self.output / "writes.txt")
+        if hasattr(self, "pairing_trace"):
+            shutil.copyfile(self.pairing_trace, self.output / "pairing-reconnect.txt")
         self.log.close()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--empty-states", action="store_true",
-                        help="Check empty device Profiles and per-adapter Add Device rows.")
+    scenarios = parser.add_mutually_exclusive_group()
+    scenarios.add_argument("--empty-states", action="store_true",
+                           help="Check empty device Profiles and per-adapter Add Device rows.")
+    scenarios.add_argument("--pairing-reconnect", action="store_true",
+                           help="Check pairing results across a framed adapter reconnect.")
     args = parser.parse_args()
     binary = os.environ.get("CORDIAL_TEST_BINARY")
     if not binary or not Path(binary).is_file() or not os.access(binary, os.X_OK):
@@ -2080,6 +2168,8 @@ def main():
         try:
             if args.empty_states:
                 smoke.run_empty_states()
+            elif args.pairing_reconnect:
+                smoke.run_pairing_reconnect()
             else:
                 smoke.run()
         except Exception as error:

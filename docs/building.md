@@ -317,6 +317,8 @@ Run the GTK control checks with a display:
 (cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
   desktop::settings::tests::integer_rows_commit_accepted_numbers -- --ignored --exact)
 (cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
+  desktop::add::tests::countdown_draws_along_the_bottom_edge -- --ignored --exact)
+(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
   desktop::services::prefs::tests::dialog_rolls_back_controls_when_gsettings_rejects_saves -- --ignored --exact)
 ```
 
@@ -510,6 +512,39 @@ instead closes without interaction and opens the new device's page. The observed
 are recorded in `*-dismissal.json`. Rejecting a code comparison shows a failure that stays open
 until Retry; cancelled pairing also stays open. The display-code and cancellation flow runs
 inside a 480-pixel window.
+
+Run the pairing reconnect fixture separately in the same disposable environment:
+
+```sh
+CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s '-screen 0 1280x1024x24' \
+  dbus-run-session -- python3 rust/tests/gtk_smoke.py build/pairing-reconnect-smoke --pairing-reconnect
+```
+
+It pairs through the existing passkey and code comparison controls. Each prompt stays open longer
+than three seconds without a success countdown. After `PairingDone`, the simulated adapter sends
+`SessionEnding` with `DEVICE_CONNECTION`, closes its framed stream, leaves discovery for 1500
+milliseconds and returns with the same adapter ID. The fixture checks the dialog, adapter and new
+device in the native accessibility tree during that gap and checks that a different session opens.
+The connected result dismisses automatically after about three seconds. A second pairing checks
+that keyboard interaction pauses the result and Dismiss opens the new device's page. Screenshots,
+accessibility dumps, dismissal measurements and `pairing-reconnect.txt` capture both flows.
+
+`CORDIAL_SIM_PAIRING_RECONNECT_MS` enables this behavior only in desktop simulation, for the first
+adapter and after successful pairing. Positive integers are clamped to `100` through `10000`
+milliseconds; zero, missing or invalid values leave it disabled. The normal fixture leaves it
+disabled. `CORDIAL_SIM_PAIRING_RECONNECT_TRACE` names a private trace file. With the switch enabled,
+the simulator appends lines in this format:
+
+```text
+<opened|done|closed|present> <adapter-id> <session> <device-id>
+```
+
+`done` follows the encoded `PairingDone`. `closed` follows the final framed `SessionEnding` and
+closure of the adapter's stream writer, which delivers EOF to the client. `present` follows the
+port's return to discovery. `opened` follows construction of a new framed connection, before its
+handshake. The fixture checks the native interface as well as these transport barriers. The trace
+adds no production interface controls or indicators.
+
 The fixture checks the visible header, device menus, settings rows, capacity rows, page menu
 items, profile actions and the Settings pane at 480, 661 and 700 pixels. Settings Back returns to
 the sidebar at 480 pixels. It scrolls rows into view through

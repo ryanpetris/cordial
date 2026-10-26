@@ -828,6 +828,176 @@ fn pairing_saves_the_device_and_forwarding_survives_the_session() {
     assert_eq!(t.app.manager.forward.packet().unwrap().bytes(), &[0; 32]);
 }
 
+/// Completes each submitted byte, including the final event's delimiter.
+fn drain_session_ending(t: &mut Test, mut wire: Vec<u8>) -> Vec<M> {
+    while let Some((token, bytes)) = t.app.serial.output(1) {
+        let byte = bytes[0];
+        assert!(t.app.serial.queued() > 0);
+        assert!(t.app.serial.output(1).is_none());
+        t.app.serial.output_complete(token, 0);
+        let (retry, bytes) = t.app.serial.output(1).unwrap();
+        assert_eq!(bytes, [byte]);
+        wire.push(byte);
+        assert!(t.app.serial.queued() > 0, "submission is not completion");
+        t.app.serial.output_complete(retry, 1);
+    }
+    assert_eq!(t.app.serial.queued(), 0);
+    t.poll();
+    assert!(t.output().is_empty(), "no event follows SessionEnding");
+    let mut decoder = Decoder::new(None);
+    wire.into_iter()
+        .filter_map(|byte| {
+            decoder
+                .push(byte)
+                .map(|frame| p::Message::decode(frame.unwrap()).unwrap().kind.unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn pairing_success_precedes_descriptor_rebuild_for_every_output_stage() {
+    for stage in ["dirty", "queued", "in flight", "partial", "sent"] {
+        let mut t = Test::new(false);
+        let candidate = t.candidate(peer(2), peer(2));
+        t.pair(candidate);
+        t.events();
+        let link = t.radio.connects[0].0;
+        block_on(t.app.begin(
+            p::Request {
+                command: Some(Command::GetStatus(p::GetStatus {})),
+            },
+            &mut t.store,
+            &mut t.radio,
+            t.now,
+        ));
+        t.radio.bonds.push(peer(2));
+        t.event(Event::Bonded {
+            link,
+            identity: peer(2),
+        });
+        for _ in 0..100 {
+            t.poll();
+            if t.app.manager.devices.iter().any(Option::is_some) {
+                break;
+            }
+        }
+        let device = t.app.manager.devices.iter().flatten().next().unwrap().id as u32;
+        assert_eq!(t.saved(device).peer, peer(2));
+        let done = M::Event(p::Event {
+            kind: Some(Ev::Pairing(p::Pairing {
+                candidate,
+                step: Some(p::pairing::Step::Done(p::PairingDone { device })),
+            })),
+        });
+        let mut wire = Vec::new();
+        let mut in_flight = None;
+        if stage != "dirty" {
+            assert!(matches!(t.output().as_slice(), [M::Response(_)]));
+            t.poll();
+            assert!(matches!(
+                t.output().as_slice(),
+                [M::Event(p::Event {
+                    kind: Some(Ev::Adapter(_))
+                })]
+            ));
+            t.poll();
+            assert_eq!(t.app.serial.queued(), 1);
+            match stage {
+                "in flight" | "partial" => {
+                    let (token, bytes) = t.app.serial.output(1).unwrap();
+                    wire.extend_from_slice(bytes);
+                    if stage == "in flight" {
+                        in_flight = Some(token);
+                    } else {
+                        t.app.serial.output_complete(token, 1);
+                    }
+                }
+                "sent" => assert_eq!(t.output(), std::slice::from_ref(&done)),
+                _ => {}
+            }
+        }
+        let before = t.app.manager.usb_allocation().topology;
+        t.event(Event::Connected {
+            link,
+            descriptors: descriptor(),
+            max_output: 255,
+            layout: None,
+        });
+        assert_ne!(t.app.manager.usb_allocation().topology, before);
+        assert_eq!(
+            t.app.usb_change_reason(),
+            p::SessionEndingReason::DeviceConnection
+        );
+        assert!(t.app.prepare_session_ending(t.app.usb_change_reason()));
+        if let Some(token) = in_flight {
+            assert!(t.app.serial.output(1).is_none());
+            t.app.serial.output_complete(token, 1);
+        }
+        let mut messages = drain_session_ending(&mut t, wire);
+        if stage == "dirty" {
+            assert!(matches!(messages.remove(0), M::Response(_)));
+        }
+        let ending = M::Event(p::Event {
+            kind: Some(Ev::SessionEnding(p::SessionEnding {
+                reason: p::SessionEndingReason::DeviceConnection as i32,
+            })),
+        });
+        if stage == "sent" {
+            assert_eq!(messages, [ending], "{stage}");
+        } else {
+            assert_eq!(messages, [done, ending], "{stage}");
+        }
+    }
+}
+
+#[test]
+fn failed_and_cancelled_pairings_precede_session_ending() {
+    for cancelled in [false, true] {
+        let mut t = Test::new(false);
+        let candidate = t.candidate(peer(2), peer(2));
+        t.pair(candidate);
+        t.events();
+        let link = t.radio.connects[0].0;
+        block_on(t.app.begin(
+            p::Request {
+                command: Some(if cancelled {
+                    Command::CancelPairing(p::CancelPairing {})
+                } else {
+                    Command::GetStatus(p::GetStatus {})
+                }),
+            },
+            &mut t.store,
+            &mut t.radio,
+            t.now,
+        ));
+        t.event(Event::Disconnected {
+            link,
+            error: (!cancelled).then_some(ErrorCode::AuthenticationFailed),
+        });
+        for _ in 0..10 {
+            t.poll();
+        }
+        assert!(t.app.manager.devices.iter().all(Option::is_none));
+        assert!(
+            t.app
+                .prepare_session_ending(p::SessionEndingReason::ConfigurationChange)
+        );
+        let messages = drain_session_ending(&mut t, Vec::new());
+        assert!(matches!(messages.as_slice(), [
+            M::Response(_),
+            M::Event(p::Event { kind: Some(Ev::Pairing(p::Pairing {
+                candidate: reported,
+                step: Some(p::pairing::Step::Error(error)),
+            })) }),
+            M::Event(p::Event { kind: Some(Ev::SessionEnding(_)) }),
+        ] if *reported == candidate && error.code == if cancelled {
+            p::ErrorCode::Cancelled as i32
+        } else {
+            p::ErrorCode::AuthFailed as i32
+        }));
+    }
+}
+
 #[test]
 fn prompts_and_pairings_are_checked() {
     let mut t = Test::new(false);
@@ -8672,57 +8842,76 @@ fn deferred_corrupt_record_rescan_retries_unreadable_records() {
 
 #[test]
 fn stalled_listing_allows_pairing_to_save_the_bond_and_reports_it_afterward() {
-    let mut t = Test::new(false);
-    for _ in 0..40 {
-        create(&mut t, "Profile");
-    }
-    let candidate = t.candidate(peer(2), peer(2));
-    t.pair(candidate);
-    t.events();
-    let link = t.radio.connects[0].0;
-    block_on(t.app.begin(
-        p::Request {
-            command: Some(Command::ListProfiles(p::ListProfiles {})),
-        },
-        &mut t.store,
-        &mut t.radio,
-        t.now,
-    ));
-    for _ in 0..100 {
-        block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
-        if !t.app.serial.stream_ready() {
-            break;
+    for ending in [false, true] {
+        let mut t = Test::new(false);
+        for _ in 0..40 {
+            create(&mut t, "Profile");
         }
+        let candidate = t.candidate(peer(2), peer(2));
+        t.pair(candidate);
+        t.events();
+        let link = t.radio.connects[0].0;
+        block_on(t.app.begin(
+            p::Request {
+                command: Some(Command::ListProfiles(p::ListProfiles {})),
+            },
+            &mut t.store,
+            &mut t.radio,
+            t.now,
+        ));
+        for _ in 0..100 {
+            block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+            if !t.app.serial.stream_ready() {
+                break;
+            }
+        }
+        assert!(t.app.streaming() && !t.app.serial.stream_ready());
+        t.radio.bonds.push(peer(2));
+        t.event(Event::Bonded {
+            link,
+            identity: peer(2),
+        });
+        for _ in 0..100 {
+            block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
+        }
+        assert!(t.app.streaming() && !t.app.serial.stream_ready());
+        let device = t
+            .app
+            .manager
+            .devices
+            .iter()
+            .flatten()
+            .find(|d| d.peer == peer(2))
+            .unwrap()
+            .id as u32;
+        assert_eq!(t.saved(device).peer, peer(2));
+        if ending {
+            assert!(
+                t.app
+                    .prepare_session_ending(p::SessionEndingReason::ConfigurationChange)
+            );
+            let messages = drain_session_ending(&mut t, Vec::new());
+            assert!(matches!(messages.as_slice(), [
+            M::Response(p::Response { result: Some(R::Error(error)) }),
+            M::Event(p::Event { kind: Some(Ev::Pairing(p::Pairing {
+                candidate: reported,
+                step: Some(p::pairing::Step::Done(done)),
+            })) }),
+            M::Event(p::Event { kind: Some(Ev::SessionEnding(_)) }),
+        ] if error.code == p::ErrorCode::Busy as i32
+            && *reported == candidate && done.device == device));
+            continue;
+        }
+        assert!(
+            t.output().is_empty(),
+            "pairing events wait for the response delimiter"
+        );
+        assert!(matches!(t.response().result, Some(R::Profiles(list)) if list.entries.len() == 40));
+        assert_eq!(
+            pairing_steps(&t.events()),
+            [p::pairing::Step::Done(p::PairingDone { device })]
+        );
     }
-    assert!(t.app.streaming() && !t.app.serial.stream_ready());
-    t.radio.bonds.push(peer(2));
-    t.event(Event::Bonded {
-        link,
-        identity: peer(2),
-    });
-    for _ in 0..100 {
-        block_on(t.app.proceed(&mut t.store, &mut t.radio, t.now));
-    }
-    assert!(t.app.streaming() && !t.app.serial.stream_ready());
-    let device = t
-        .app
-        .manager
-        .devices
-        .iter()
-        .flatten()
-        .find(|d| d.peer == peer(2))
-        .unwrap()
-        .id as u32;
-    assert_eq!(t.saved(device).peer, peer(2));
-    assert!(
-        t.output().is_empty(),
-        "pairing events wait for the response delimiter"
-    );
-    assert!(matches!(t.response().result, Some(R::Profiles(list)) if list.entries.len() == 40));
-    assert_eq!(
-        pairing_steps(&t.events()),
-        [p::pairing::Step::Done(p::PairingDone { device })]
-    );
 }
 
 #[test]

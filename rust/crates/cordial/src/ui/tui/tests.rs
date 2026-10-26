@@ -2908,12 +2908,13 @@ fn a_new_session_ending_has_its_own_deadline() {
 }
 
 #[test]
-fn a_replacement_that_drops_without_its_own_event_has_no_hold() {
+fn only_an_identified_replacement_loss_discards_the_original_hold() {
     for identified in [false, true] {
         let mut app = App::two(110, 32);
         let id = "00000000000FA001";
         app.m.open(Page::Device(id.into(), 2));
         app.lose_first();
+        let deadline = app.m.held[id].until;
         app.m.update(Msg::Ports(Ok(vec![port("/dev/ttyACM2", id)])));
         let back = *app.m.probes.keys().next().unwrap();
         if identified {
@@ -2924,6 +2925,14 @@ fn a_replacement_that_drops_without_its_own_event_has_no_hold() {
             app.phase(back, Phase::Opened);
         }
         app.phase(back, Phase::Lost(Error::new("gone")));
+        if !identified {
+            assert_eq!(app.m.held[id].until, deadline);
+            assert!(app.m.adapter(id).is_some());
+            assert!(app.m.device(id, 2).is_some());
+            assert_eq!(app.m.shown(), Page::Device(id.into(), 2));
+            app.m.held.get_mut(id).unwrap().until = Instant::now();
+            app.m.tick();
+        }
         assert!(!app.m.held.contains_key(id));
         assert!(app.m.adapter(id).is_none());
         assert!(app.m.device(id, 2).is_none());

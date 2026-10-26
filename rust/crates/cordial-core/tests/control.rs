@@ -534,6 +534,88 @@ fn session_ending_is_last_and_waits_for_its_delimiter_completion() {
 }
 
 #[test]
+fn terminal_pairing_waits_for_owed_response_and_survives_shutdown() {
+    for step in [
+        p::pairing::Step::Done(p::PairingDone { device: 77 }),
+        p::pairing::Step::Error(p::Error {
+            code: p::ErrorCode::Cancelled as i32,
+            ..Default::default()
+        }),
+    ] {
+        for started in [false, true] {
+            let mut session = Session::new();
+            session.session(true);
+            let pairing = p::event::Kind::Pairing(p::Pairing {
+                candidate: 1,
+                step: Some(step.clone()),
+            });
+            session.event(pairing.clone());
+            let mut wire = Vec::new();
+            let in_flight = if started {
+                let (token, bytes) = session.output(1).unwrap();
+                wire.extend_from_slice(bytes);
+                Some(token)
+            } else {
+                None
+            };
+            assert!(session.feed(&status()).1.is_some());
+            session.respond(ok());
+            session.end(p::SessionEndingReason::DeviceConnection, 0);
+            assert_eq!(session.queued(), 3);
+            if let Some(token) = in_flight {
+                session.output_complete(token, 1);
+            }
+            while let Some((token, bytes)) = session.output(1) {
+                wire.extend_from_slice(bytes);
+                assert!(session.queued() > 0);
+                session.output_complete(token, 1);
+            }
+            let mut decoder = Decoder::new(None);
+            let messages: Vec<_> = wire
+                .into_iter()
+                .filter_map(|byte| {
+                    decoder
+                        .push(byte)
+                        .map(|frame| p::Message::decode(frame.unwrap()).unwrap().kind.unwrap())
+                })
+                .collect();
+            let pairing = M::Event(p::Event {
+                kind: Some(pairing),
+            });
+            let mut expected = vec![M::Response(ok()), pairing];
+            if started {
+                expected.swap(0, 1);
+            }
+            expected.push(ending(p::SessionEndingReason::DeviceConnection));
+            assert_eq!(messages, expected);
+            assert_eq!(session.queued(), 0);
+        }
+    }
+}
+
+#[test]
+fn replacing_a_session_discards_its_pending_terminal_pairing() {
+    let mut session = Session::new();
+    session.session(true);
+    session.event(p::event::Kind::Pairing(p::Pairing {
+        candidate: 1,
+        step: Some(p::pairing::Step::Done(p::PairingDone { device: 77 })),
+    }));
+    session.respond(ok());
+    session.end(p::SessionEndingReason::DeviceConnection, 0);
+    let (stale, bytes) = session.output(1).unwrap();
+    let length = bytes.len();
+    assert_eq!(session.queued(), 3);
+    session.session(false);
+    session.session(true);
+    session.output_complete(stale, length);
+    assert_eq!(session.queued(), 0);
+    assert!(session.idle());
+    session.respond(ok());
+    assert_eq!(drain(&mut session, 1), [M::Response(ok())]);
+}
+
+#[test]
 fn ending_finishes_the_event_already_in_flight() {
     let mut session = Session::new();
     session.session(true);

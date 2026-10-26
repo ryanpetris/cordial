@@ -19,6 +19,7 @@ struct Frame {
     offset: usize,
     serial: u64,
     response: bool,
+    terminal_pairing: bool,
     in_flight: bool,
 }
 
@@ -42,6 +43,7 @@ pub struct Session {
     hello: Vec<u8>,
     stopped: bool,
     ending: Option<p::SessionEndingReason>,
+    ending_pairing: Option<Vec<u8>>,
     padding: u32,
 }
 
@@ -68,6 +70,7 @@ impl Session {
             .expect("native protocol version"),
             stopped: false,
             ending: None,
+            ending_pairing: None,
             padding: 0,
         }
     }
@@ -96,6 +99,7 @@ impl Session {
         self.stream = None;
         self.stopped = false;
         self.ending = None;
+        self.ending_pairing = None;
         self.padding = 0;
         self.generation = self.generation.wrapping_add(1);
         ended
@@ -104,9 +108,19 @@ impl Session {
     pub fn open(&self) -> bool {
         self.open
     }
-    /// Stops dispatch and appends the final event after the owed response. A streamed response
-    /// finishes with BUSY. `padding` closes any declared whole-file bytes field before that error.
+    /// Stops dispatch and appends the final event after the owed response and any queued terminal
+    /// pairing outcome. A streamed response finishes with BUSY. `padding` closes any declared
+    /// whole-file bytes field before that error.
     pub fn end(&mut self, reason: p::SessionEndingReason, padding: u32) {
+        self.end_with_pairing(reason, padding, None);
+    }
+    /// Includes the application's terminal pairing snapshot before the final event.
+    pub(crate) fn end_with_pairing(
+        &mut self,
+        reason: p::SessionEndingReason,
+        padding: u32,
+        pairing: Option<&p::Pairing>,
+    ) {
         if self.stopped {
             return;
         }
@@ -116,13 +130,31 @@ impl Session {
         }
         self.ending = Some(reason);
         self.padding = padding;
+        self.ending_pairing = pairing
+            .filter(|pairing| Self::terminal_pairing(pairing))
+            .map(|pairing| {
+                Self::encode(p::Message {
+                    kind: Some(p::message::Kind::Event(p::Event {
+                        kind: Some(p::event::Kind::Pairing(pairing.clone())),
+                    })),
+                })
+            });
         if self
             .output
             .as_ref()
             .is_some_and(|frame| !frame.response && frame.offset == 0 && !frame.in_flight)
         {
-            self.output = None;
+            let frame = self.output.take().unwrap();
+            if frame.terminal_pairing && self.ending_pairing.is_none() {
+                self.ending_pairing = Some(frame.bytes);
+            }
         }
+    }
+    fn terminal_pairing(pairing: &p::Pairing) -> bool {
+        matches!(
+            pairing.step,
+            Some(p::pairing::Step::Done(_) | p::pairing::Step::Error(_))
+        )
     }
     /// Whether intentional shutdown has stopped command dispatch.
     pub fn ending(&self) -> bool {
@@ -141,6 +173,7 @@ impl Session {
     /// Frames waiting to be written, including the one being written.
     pub fn queued(&self) -> usize {
         usize::from(self.ending.is_some())
+            + usize::from(self.ending_pairing.is_some())
             + usize::from(self.output.is_some())
             + usize::from(self.response.is_some())
             + usize::from(
@@ -229,18 +262,23 @@ impl Session {
         if !self.idle() {
             return;
         }
+        let terminal_pairing = matches!(
+            &kind,
+            p::event::Kind::Pairing(pairing) if Self::terminal_pairing(pairing)
+        );
         let bytes = Self::encode(p::Message {
             kind: Some(p::message::Kind::Event(p::Event { kind: Some(kind) })),
         });
-        self.start(bytes, false);
+        self.start(bytes, false, terminal_pairing);
     }
-    fn start(&mut self, bytes: Vec<u8>, response: bool) {
+    fn start(&mut self, bytes: Vec<u8>, response: bool, terminal_pairing: bool) {
         self.serial = self.serial.wrapping_add(1);
         self.output = Some(Frame {
             bytes,
             offset: 0,
             serial: self.serial,
             response,
+            terminal_pairing,
             in_flight: false,
         });
     }
@@ -297,7 +335,13 @@ impl Session {
         if self.output.is_none()
             && let Some(bytes) = self.response.take()
         {
-            self.start(bytes, true);
+            self.start(bytes, true, false);
+        }
+        if self.output.is_none()
+            && self.stream.is_none()
+            && let Some(bytes) = self.ending_pairing.take()
+        {
+            self.start(bytes, false, true);
         }
         if self.output.is_none()
             && self.stream.is_none()
@@ -311,6 +355,7 @@ impl Session {
                         })),
                     })),
                 }),
+                false,
                 false,
             );
         }

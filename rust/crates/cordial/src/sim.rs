@@ -140,6 +140,7 @@ pub struct Sim {
     pub batch_size: usize,
     next_profile: u32,
     pairing: Option<u32>,
+    pairing_reconnect: Option<Sender<()>>,
     out: Option<PipeWriter>,
     /// Counts sessions, so a session that ends after the next one started leaves it alone.
     pub session: u64,
@@ -389,6 +390,7 @@ impl Default for Sim {
             batch_size: 2,
             next_profile: 1,
             pairing: None,
+            pairing_reconnect: None,
             out: None,
             session: 0,
             handles: Arc::default(),
@@ -662,6 +664,9 @@ impl Sim {
             candidate,
             pairing::Step::Done(p::PairingDone { device: device.id }),
         );
+        if let Some(notify) = &self.pairing_reconnect {
+            let _ = notify.send(());
+        }
     }
 
     fn pair_failed(&mut self, code: ErrorCode) {

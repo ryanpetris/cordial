@@ -40,6 +40,9 @@ pub fn add_style() {
     // Pairing shows the device's icon on an accent-tinted disc, with a round badge at its corner
     // filled with the step's result color. The badge's ring in the dialog's color separates it
     // from the disc. Named colors follow the light, dark and high-contrast styles.
+    //
+    // The connected result's countdown is a thin square-ended accent fill over a faint track
+    // in the text color.
     const CSS: &str = "
         row.property.dim-label > box.header > box.title > .title { opacity: 1; }
         .pairing-icon { border-radius: 9999px; background-color: alpha(@accent_color, 0.15); }
@@ -51,6 +54,11 @@ pub fn add_style() {
         .pairing-badge.success { background-color: @success_bg_color; color: @success_fg_color; }
         .pairing-badge.warning { background-color: @warning_bg_color; color: @warning_fg_color; }
         .pairing-badge.error { background-color: @error_bg_color; color: @error_fg_color; }
+        progressbar.countdown > trough, progressbar.countdown > trough > progress {
+            min-height: 3px;
+            border-radius: 0;
+        }
+        progressbar.countdown > trough { background-color: alpha(currentColor, 0.075); }
     ";
     let Some(display) = gtk::gdk::Display::default() else {
         return;

@@ -1,6 +1,8 @@
 //! Add Device: scans with one adapter while the dialog is open, pairs a nearby device, answers
 //! its prompts, and follows the new device until it connects or can't. Closing the dialog stops
-//! the scan and cancels a pairing that hasn't saved its bond.
+//! the scan and cancels a pairing that hasn't saved its bond. A pairing outlives its adapter's
+//! session while the adapter is held, so the bond it saves before an announced USB reconnect is
+//! followed on the adapter's next session.
 use super::{
     Action, App, Dialog, Job, Kind, Menu, Page, SCAN_SECONDS,
     fleet::{Fleet, Slot},
@@ -63,12 +65,13 @@ pub struct AddDevice {
 }
 
 impl AddDevice {
-    pub fn session_ended(&mut self, slot: Slot) {
+    /// Ends the session's scan, and its adapter's pairing unless the adapter is held.
+    pub fn session_ended(&mut self, id: &str, slot: Slot, held: bool) {
         if self.scan.as_ref().is_some_and(|s| s.slot == slot) {
             self.scan = None;
             self.starting = false;
         }
-        if self.pairing.as_ref().is_some_and(|p| p.slot == slot) {
+        if !held && self.pairing.as_ref().is_some_and(|p| p.adapter == id) {
             self.pairing = None;
         }
     }
@@ -107,15 +110,22 @@ impl<F: Fleet> App<F> {
         self.dialog = Some(Dialog::AddDevice);
         self.start_scan(adapter);
     }
+    /// Whether the pairing is running in a session that can still cancel it.
+    fn pairing_live(&self, pairing: &Pairing) -> bool {
+        pairing.phase == Phase::Pairing
+            && self.session_of(&pairing.adapter).map(|s| s.slot) == Some(pairing.slot)
+    }
     /// Whether Add Device can open with this adapter.
     pub fn can_add_to(&self, adapter: &str) -> bool {
         self.ready_adapters().iter().any(|a| a.id == adapter)
     }
-    /// Closes Add Device, stopping its scan and cancelling a pairing that is still running.
+    /// Closes Add Device, stopping its scan and cancelling a pairing that is still running. A
+    /// pairing's result that arrives later is ignored.
     pub(crate) fn close_add(&mut self) {
         if let Some(add) = self.add.take() {
+            self.jobs.retain(|_, j| !matches!(j.kind, Kind::Pair));
             if let Some(pairing) = &add.pairing
-                && pairing.phase == Phase::Pairing
+                && self.pairing_live(pairing)
             {
                 let adapter = pairing.adapter.clone();
                 self.run(&adapter, Kind::CancelPairing, Command::CancelPairing);
@@ -195,7 +205,8 @@ impl<F: Fleet> App<F> {
         }
     }
     /// Follows the dialog: closes it when its adapter can't add a device, starts a scan when
-    /// none belongs to the chosen adapter, and follows the pairing and the new device.
+    /// none belongs to the chosen adapter, and follows the pairing and the new device. A pairing
+    /// keeps the dialog open while its adapter has a session or is held.
     pub(crate) fn sync_add(&mut self) {
         if self.dialog != Some(Dialog::AddDevice) {
             if self.add.is_some() {
@@ -211,7 +222,8 @@ impl<F: Fleet> App<F> {
             return;
         };
         let ready = self.ready_adapters().iter().any(|a| a.id == adapter);
-        let pairing_here = add.pairing.as_ref().is_some_and(|p| p.adapter == adapter);
+        let pairing_here = add.pairing.as_ref().is_some_and(|p| p.adapter == adapter)
+            && (self.session_of(&adapter).is_some() || self.held.contains_key(&adapter));
         if !ready && !pairing_here {
             self.close_add();
             return;
@@ -226,12 +238,14 @@ impl<F: Fleet> App<F> {
             self.start_scan(&adapter);
         }
     }
-    /// Follows the pairing's prompt and the new device's connection.
+    /// Follows the pairing's prompt in its own session, and the new device's connection in the
+    /// adapter's current one.
     pub(crate) fn follow(&mut self, mut pairing: Pairing) {
-        let st = self.states.get(&pairing.slot);
         match pairing.phase {
             Phase::Pairing => {
-                let prompt = st
+                let prompt = self
+                    .states
+                    .get(&pairing.slot)
                     .and_then(|st| st.pairing.as_ref())
                     .filter(|p| p.candidate == pairing.candidate && model::pairing_running(p))
                     .and_then(model::prompt);
@@ -250,7 +264,7 @@ impl<F: Fleet> App<F> {
             Phase::Connecting => {
                 if let Some(d) = pairing
                     .device
-                    .and_then(|id| st.and_then(|st| st.device(id)))
+                    .and_then(|id| self.state_of(&pairing.adapter)?.device(id))
                 {
                     pairing.name = words::device_name(d);
                     match (d.state(), model::inactive(d), model::last_error(d)) {
@@ -329,8 +343,13 @@ impl<F: Fleet> App<F> {
                 if let Some(p) = &add.pairing
                     && p.phase == Phase::Pairing
                 {
-                    let a = p.adapter.clone();
-                    self.run(&a, Kind::CancelPairing, Command::CancelPairing);
+                    if self.pairing_live(p) {
+                        let a = p.adapter.clone();
+                        self.run(&a, Kind::CancelPairing, Command::CancelPairing);
+                    } else {
+                        // The session that ran the pairing has ended, so nothing can cancel it.
+                        self.close_add();
+                    }
                 }
             }
             Action::Accept => self.answer(true),
@@ -453,6 +472,11 @@ impl<F: Fleet> App<F> {
     }
     pub(crate) fn add_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
         let status = self.state_of(&job.adapter).map(|st| st.status.clone());
+        // An error without the adapter's answer, after the pairing's session closed, leaves the
+        // pairing's outcome unknown.
+        let unknown = matches!(result, Err(e) if e.dongle.is_none())
+            && !self.states.get(&job.slot).is_some_and(|st| st.available);
+        let mut close = false;
         let Some(add) = &mut self.add else { return };
         match (&job.kind, result) {
             (Kind::Scan, Ok(_)) => {
@@ -482,10 +506,15 @@ impl<F: Fleet> App<F> {
                 });
             }
             (Kind::Pair, result) => {
-                let Some(pairing) = add.pairing.as_mut().filter(|p| p.slot == job.slot) else {
+                let Some(pairing) = add.pairing.as_mut().filter(|p| {
+                    p.slot == job.slot
+                        && p.phase == Phase::Pairing
+                        && matches!(job.command, Command::Pair(Target::Id(c)) if c == p.candidate)
+                }) else {
                     return;
                 };
                 match result {
+                    Err(_) if unknown => close = true,
                     Ok(Outcome::Paired { subject, device }) => {
                         pairing.device = Some(subject.id);
                         pairing.phase = Phase::Connecting;
@@ -530,6 +559,9 @@ impl<F: Fleet> App<F> {
                 }
             }
             _ => {}
+        }
+        if close {
+            self.close_add();
         }
     }
 }

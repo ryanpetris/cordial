@@ -47,6 +47,9 @@ jobs:
       - name: Check GTK integer controls with a display
         working-directory: rust
         run: xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib desktop::settings::tests::integer_rows_commit_accepted_numbers -- --ignored --exact
+      - name: Check the pairing countdown with a display
+        working-directory: rust
+        run: xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib desktop::add::tests::countdown_draws_along_the_bottom_edge -- --ignored --exact
       - name: Check rejected preference edits with a display
         working-directory: rust
         run: xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib desktop::services::prefs::tests::dialog_rolls_back_controls_when_gsettings_rejects_saves -- --ignored --exact
@@ -200,6 +203,7 @@ jobs:
             apt-get install -y --no-install-recommends python3-pyatspi python3-gi gir1.2-adw-1 xvfb xauth dbus-x11 imagemagick adwaita-icon-theme librsvg2-common "./build/native/cordial_$CORDIAL_VERSION-1~resolute_amd64.deb"
             CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 rust/tests/gtk_smoke.py build/package-smoke
             CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 rust/tests/gtk_smoke.py build/empty-states-smoke --empty-states
+            CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 rust/tests/gtk_smoke.py build/pairing-reconnect-smoke --pairing-reconnect
           '
       - uses: actions/upload-artifact@v7
         if: failure()
@@ -208,6 +212,7 @@ jobs:
           path: |
             build/package-smoke/
             build/empty-states-smoke/
+            build/pairing-reconnect-smoke/
           if-no-files-found: warn
   firmware:
     needs: validate
