@@ -7,7 +7,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT.parent / ".cache/dependencies"
-BTSTACK_REVISION = "e38553977a25fb0b55b383c72c289be0975f422c"
+BTSTACK_REVISION = "51e11ce3692abfe31b4ee3d66cffdeb1ae1626f2"
 PICO_SDK_REVISION = "079c6f39023649b154152db30f1d781e884879bc"
 CYW43_DRIVER_REVISION = "bed438f119cfba03f75957fceb6a5623ef95e6d9"
 CONTROLLER_REVISION = "50c6aac5b9b3b0af18f5a7d61725cc8e4d1f7acb"

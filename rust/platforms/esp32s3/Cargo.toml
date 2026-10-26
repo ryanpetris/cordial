@@ -43,7 +43,7 @@ embassy-sync = "=0.8.0"
 embassy-futures = "=0.1.2"
 
 [build-dependencies]
-embuild = { version = "=0.33.5", features = ["espidf"] }
+embuild = { version = "=0.33.7", features = ["espidf"] }
 
 [package.metadata.esp-idf-sys]
 esp_idf_version = "v6.1"

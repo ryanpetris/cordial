@@ -241,11 +241,11 @@ pub async fn commit<S: RecordStore>(
 /// Bluetooth ah(): test a canonical most-significant-byte-first private address
 /// against a peer IRK. This is also used when native inventory requires local keys.
 pub fn resolves_rpa(irk: &[u8; 16], address: &[u8; 6]) -> bool {
-    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
     if address[0] & 0xc0 != 0x40 {
         return false;
     }
-    let mut block = aes::cipher::generic_array::GenericArray::default();
+    let mut block = aes::Block::default();
     block[13..].copy_from_slice(&address[..3]);
     aes::Aes128::new_from_slice(irk)
         .unwrap()

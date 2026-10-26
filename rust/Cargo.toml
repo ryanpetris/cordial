@@ -15,7 +15,7 @@ cordial-protocol = { path = "crates/cordial-protocol" }
 cordial-core = { path = "crates/cordial-core" }
 cordial-client = { path = "crates/cordial-client", default-features = false }
 serde = { version = "=1.0.229", default-features = false, features = ["derive", "alloc"] }
-serde_json = { version = "=1.0.151", default-features = false, features = ["alloc", "raw_value"] }
+serde_json = { version = "=1.0.154", default-features = false, features = ["alloc", "raw_value"] }
 
 [profile.release]
 lto = true

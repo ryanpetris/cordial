@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, process::Command};
 
-const REVISION: &str = "e38553977a25fb0b55b383c72c289be0975f422c";
+const REVISION: &str = "51e11ce3692abfe31b4ee3d66cffdeb1ae1626f2";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CORDIAL_BTSTACK_SOURCE");

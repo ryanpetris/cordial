@@ -4,6 +4,13 @@ use prost_types::{FileDescriptorProto, FileDescriptorSet};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+fn sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn normalize(
     name: &str,
     files: &BTreeMap<String, FileDescriptorProto>,
@@ -17,7 +24,7 @@ fn normalize(
     file.source_code_info = None;
     for dependency in &mut file.dependency {
         let normalized = normalize(dependency, files, cache);
-        *dependency = format!("{:x}", Sha256::digest(normalized.encode_to_vec()));
+        *dependency = sha256(&normalized.encode_to_vec());
     }
     cache.insert(name.to_owned(), file.clone());
     file
@@ -52,5 +59,5 @@ pub fn fingerprint(descriptors: FileDescriptorSet) -> String {
             .collect(),
     };
     descriptors.file.sort_by_cached_key(Message::encode_to_vec);
-    format!("{:x}", Sha256::digest(descriptors.encode_to_vec()))
+    sha256(&descriptors.encode_to_vec())
 }

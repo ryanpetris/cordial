@@ -3,7 +3,7 @@
 use crate::storage::{self, Error, RecordStore};
 use aes::{
     Aes128,
-    cipher::{BlockEncrypt, KeyInit},
+    cipher::{BlockCipherEncrypt, KeyInit},
 };
 use cordial_protocol::storage as saved;
 pub const KEY: [u8; 9] = [3, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -12,7 +12,7 @@ pub struct Identity(pub [u8; 56]);
 impl Identity {
     fn irk(ir: &[u8]) -> [u8; 16] {
         let cipher = Aes128::new_from_slice(ir).unwrap();
-        let mut block = aes::cipher::generic_array::GenericArray::default();
+        let mut block = aes::Block::default();
         block[15] = 1;
         cipher.encrypt_block(&mut block);
         block.into()
