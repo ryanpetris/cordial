@@ -217,7 +217,7 @@ It supplies the numeric version and tagged commit timestamp to every build job.
 definitions and dependency notices in `build/release/cordial-<version>-linux-amd64.tar.gz`.
 `make package-cli`, `make package-cli-tar` and `make package-desktop-tar` are aliases.
 `make package-desktop` builds this archive and an AppImage at
-`build/release/cordial-desktop-<version>-x86_64.AppImage`. The AppImage bundles GTK, libadwaita,
+`build/release/cordial-<version>-x86_64.AppImage`. The AppImage bundles GTK, libadwaita,
 icons and their redistribution notices. Both formats use the Resolute glibc 2.43 baseline.
 The AppImage bundles GTK, libadwaita, text libraries and the dconf GIO module with its dependencies
 and redistribution notices. It loads GIO modules only from the bundle and uses the host's
@@ -419,7 +419,7 @@ In a disposable Resolute environment, install the matching `cordial` package, pl
 CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s '-screen 0 1280x1024x24' \
   dbus-run-session -- python3 rust/tests/gtk_smoke.py build/package-smoke
 xvfb-run -a -s '-screen 0 1280x1024x24' dbus-run-session -- python3 tools/check_appimage.py \
-  "build/release/cordial-desktop-$CORDIAL_VERSION-x86_64.AppImage" build/appimage-smoke
+  "build/release/cordial-$CORDIAL_VERSION-x86_64.AppImage" build/appimage-smoke
 ```
 
 The installed fixture checks immediate adapter settings, transport and configuration interface

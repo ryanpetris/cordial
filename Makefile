@@ -108,7 +108,7 @@ package-desktop-tar package-cli package-cli-tar: package-host-tar
 package-host-tar: image-host
 	$(call build,host,make local-package-host-tar HOST_TARGET=$(HOST_TARGET),build/release/cordial-*-linux-amd64.tar.gz)
 package-host-appimage: image-host $(if $(HOST_ARCHIVE),,package-host-tar)
-	$(call build,host,python3 rust/tools/build_appimage.py --archive /inputs/$(notdir $(host_archive)),build/release/cordial-desktop-*-x86_64.AppImage,$(host_archive))
+	$(call build,host,python3 rust/tools/build_appimage.py --archive /inputs/$(notdir $(host_archive)),build/release/cordial-*-x86_64.AppImage,$(host_archive))
 local-package-desktop: local-package-host-appimage
 local-package-desktop-tar local-package-cli: local-package-host-tar
 local-package-host-tar: local-host

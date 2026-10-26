@@ -59,14 +59,14 @@ jobs:
             chmod +x build/release/*.AppImage
             lavapipe=(/usr/share/vulkan/icd.d/lvp_icd*.json)
             test -f "${lavapipe[0]}"
-            LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe VK_DRIVER_FILES="${lavapipe[0]}" xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 tools/check_appimage.py "build/release/cordial-desktop-$1-x86_64.AppImage" build/appimage-smoke-resolute
+            LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe VK_DRIVER_FILES="${lavapipe[0]}" xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 tools/check_appimage.py "build/release/cordial-$1-x86_64.AppImage" build/appimage-smoke-resolute
           ' bash "$CORDIAL_VERSION"
       - name: Check packaged AppImage on Arch with Cairo and the default settings backend
         run: |
           docker run --rm --init -v "$PWD:/src" -w /src archlinux:base bash -euxo pipefail -c '
             pacman -Syu --noconfirm --needed libgcc libx11 libxcursor libxdamage libxext libxfixes libxi libxinerama libxrandr libxrender libxcb wayland libglvnd vulkan-icd-loader expat e2fsprogs gmp libgpg-error zlib python-atspi python-gobject xorg-server-xvfb xorg-xauth dbus imagemagick glib2 dconf
             chmod +x build/release/*.AppImage
-            xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 tools/check_appimage.py "build/release/cordial-desktop-$1-x86_64.AppImage" build/appimage-smoke-arch --renderer cairo
+            xvfb-run -a -s "-screen 0 1280x1024x24" dbus-run-session -- python3 tools/check_appimage.py "build/release/cordial-$1-x86_64.AppImage" build/appimage-smoke-arch --renderer cairo
           ' bash "$CORDIAL_VERSION"
       - uses: actions/upload-artifact@v7
         if: failure()
@@ -214,7 +214,7 @@ jobs:
         run: |
           cat SHA256SUMS-* > SHA256SUMS
           sha256sum -c SHA256SUMS
-          test -f "cordial-desktop-$CORDIAL_VERSION-x86_64.AppImage"
+          test -f "cordial-$CORDIAL_VERSION-x86_64.AppImage"
           test -f "cordial-$CORDIAL_VERSION-linux-amd64.tar.gz"
           test -f "cordial-$CORDIAL_VERSION-1-x86_64.pkg.tar.zst"
           for distribution in trixie resolute; do

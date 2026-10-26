@@ -51,7 +51,7 @@ Package installation leaves user configuration unchanged.
 
 ### Other distributions
 
-Download `cordial-desktop-<version>-x86_64.AppImage`, make it executable with `chmod +x`, and
+Download `cordial-<version>-x86_64.AppImage`, make it executable with `chmod +x`, and
 run it to open the desktop app. It also accepts CLI arguments, such as `tui`. If FUSE is
 unavailable, set `APPIMAGE_EXTRACT_AND_RUN=1` when launching it.
 

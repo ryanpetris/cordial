@@ -261,7 +261,7 @@ def build(archive, tool_cache):
             for path in files))
         for path in appdir.rglob("*"):
             os.utime(path, (epoch, epoch), follow_symlinks=False)
-        name = f"cordial-desktop-{version}-x86_64.AppImage"
+        name = f"cordial-{version}-x86_64.AppImage"
         subprocess.run([str(tools / "appimagetool.AppImage"), "--runtime-file",
                         str(tools / "runtime-x86_64"), str(appdir), str(temporary / name)],
                        check=True, env=env)
