@@ -117,6 +117,9 @@ The software checks below use the same local tools.
 The native GTK application requires GTK 4.14 or newer and libadwaita 1.5 or newer.
 Run the built executable with `rust/target/x86_64-unknown-linux-gnu/release/cordial desktop`.
 Direct Cargo runs need the schema setup described under Desktop preferences.
+Direct desktop, CLI and TUI Cargo builds do not require Python. The Make targets, version tools
+and packaging workflow still require Python. Firmware builds also require Python for board
+configuration and BTstack's ATT database compiler.
 The desktop, CLI and TUI share the Rust controller and run protocol compatibility and storage
 migration in-process. They do not launch another `cordial` process.
 

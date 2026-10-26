@@ -314,6 +314,7 @@ dependencies = [
  "embassy-futures",
  "embassy-sync",
  "heapless",
+ "serde_json",
 ]
 
 [[package]]
@@ -325,6 +326,7 @@ dependencies = [
  "heapless",
  "prost",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

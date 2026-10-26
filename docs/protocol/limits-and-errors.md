@@ -48,8 +48,10 @@ connection. Normal connection count includes connecting and closing links until 
 freed. Saved enabled-device count includes devices on a disabled transport and can exceed the
 allowance when saved preferences exceed the firmware's capacity.
 
-The board configuration generates the Rust and C pool sizes through
-`rust/tools/bluetooth_config.py`, using `CORDIAL_CONFIG`. The configured allowances are:
+The shared Rust generator in `rust/tools/bluetooth_config.rs` generates the Rust and C pool sizes
+using `CORDIAL_CONFIG`. Its capacity table is `rust/tools/bluetooth_limits.json`, which also supplies
+ESP SDK configuration and validation. An absent configuration or an absent, unknown or non-string
+`chip` uses the default RP2350 allowances. The configured allowances are:
 
 | Board preset | Normal Classic | Normal BLE | Runtime slots, including pairing | Native Classic bonds | Native BLE bonds |
 | --- | --- | --- | --- | --- | --- |

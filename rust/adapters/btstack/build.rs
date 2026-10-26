@@ -1,5 +1,8 @@
 use std::{env, path::PathBuf, process::Command};
 
+#[path = "../../tools/bluetooth_config.rs"]
+mod bluetooth_config;
+
 const REVISION: &str = "51e11ce3692abfe31b4ee3d66cffdeb1ae1626f2";
 
 fn main() {
@@ -37,20 +40,8 @@ fn main() {
         "BTstack must be unmodified"
     );
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    println!("cargo:rerun-if-env-changed=CORDIAL_CONFIG");
-    if let Some(config) = env::var_os("CORDIAL_CONFIG") {
-        println!("cargo:rerun-if-changed={}", PathBuf::from(config).display());
-    }
-    let capacities = root.join("tools/bluetooth_config.py");
-    println!("cargo:rerun-if-changed={}", capacities.display());
-    assert!(
-        Command::new("python3")
-            .arg(capacities)
-            .arg(&output)
-            .status()
-            .expect("generate Bluetooth capacities")
-            .success()
-    );
+    let config = env::var_os("CORDIAL_CONFIG").map(PathBuf::from);
+    bluetooth_config::generate(&output, config.as_deref()).expect("generate Bluetooth capacities");
     let generated = Command::new("python3")
         .arg("-B")
         .arg(source.join("tool/compile_gatt.py"))
