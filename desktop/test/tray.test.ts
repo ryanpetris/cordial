@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { BatteryAlerts, batteryLevel } from "../src/core/battery.ts";
 import { trayModel } from "../src/main/tray-model.ts";
-import { IMAGE_INTERVAL, trayIcon } from "../src/main/tray.ts";
+import { trayIcon } from "../src/main/tray.ts";
 import { DEFAULT_PREFERENCES, type AdapterEntry, type AppState, type DeviceEntry } from "../src/shared/state.ts";
 import { record } from "./helpers.ts";
 
@@ -98,22 +98,17 @@ describe("trayModel", () => {
 });
 
 describe("trayIcon", () => {
-  beforeEach(() => vi.useFakeTimers({ now: 0 }));
-  afterEach(() => vi.useRealTimers());
-
-  /** A tray icon whose trays record what reaches them, with the time. */
   const setup = () => {
     const events: string[] = [];
-    const record = (what: string) => events.push(`${Date.now()} ${what}`);
     const icon = trayIcon((image) => {
-      record(`create ${image}`);
+      events.push(`create ${image}`);
       let destroyed = false;
       return {
-        setImage: (next: string) => record(destroyed ? `setImage on destroyed tray` : `setImage ${next}`),
-        setToolTip: (text: string) => record(destroyed ? `setToolTip on destroyed tray` : `tooltip ${text}`),
+        setImage: (next: string) => events.push(destroyed ? "setImage on destroyed tray" : `setImage ${next}`),
+        setToolTip: (text: string) => events.push(destroyed ? "setToolTip on destroyed tray" : `tooltip ${text}`),
         destroy: () => {
           destroyed = true;
-          record("destroy");
+          events.push("destroy");
         },
       };
     });
@@ -125,125 +120,57 @@ describe("trayIcon", () => {
   it("creates the tray at once and leaves it alone for unchanged requests", () => {
     const { update, take } = setup();
     update("a");
-    expect(take()).toEqual(["0 create a", "0 tooltip T"]);
+    expect(take()).toEqual(["create a", "tooltip T"]);
     update("a");
-    vi.advanceTimersByTime(5000);
     update("a");
     expect(take()).toEqual([]);
   });
 
-  it("changes the menu and tooltip at once while the image waits", () => {
+  it("applies image and description changes immediately", () => {
     const { update, take } = setup();
     update("a");
     take();
-    vi.advanceTimersByTime(100);
     update("b", "U");
-    expect(take()).toEqual(["100 tooltip U"]);
-    vi.advanceTimersByTime(IMAGE_INTERVAL);
-    expect(take()).toEqual(["1000 setImage b"]);
+    expect(take()).toEqual(["setImage b", "tooltip U"]);
+    update("b", "V");
+    expect(take()).toEqual(["tooltip V"]);
   });
 
-  it("applies the first change after a cooldown at once and the latest of later ones when it ends", () => {
+  it("applies every distinct image immediately, including a return to the previous image", () => {
     const { update, take } = setup();
     update("a");
-    vi.advanceTimersByTime(1500);
     take();
     update("b");
-    expect(take()).toEqual(["1500 setImage b"]);
-    vi.advanceTimersByTime(200);
+    expect(take()).toEqual(["setImage b"]);
     update("c");
-    vi.advanceTimersByTime(200);
-    update("d");
-    expect(take()).toEqual([]);
-    vi.advanceTimersByTime(600);
-    expect(take()).toEqual(["2500 setImage d"]);
-    // The trailing change starts a fresh cooldown.
-    update("e");
-    vi.advanceTimersByTime(999);
-    expect(take()).toEqual([]);
-    vi.advanceTimersByTime(1);
-    expect(take()).toEqual(["3500 setImage e"]);
-  });
-
-  it("drops a waiting change when requests return to the shown image", () => {
-    const { update, take } = setup();
+    expect(take()).toEqual(["setImage c"]);
     update("a");
-    take();
-    vi.advanceTimersByTime(300);
-    update("b");
-    vi.advanceTimersByTime(300);
+    expect(take()).toEqual(["setImage a"]);
     update("a");
-    vi.advanceTimersByTime(5000);
     expect(take()).toEqual([]);
   });
 
-  it("applies a change made after a return to the shown image when the original cooldown ends", () => {
-    const { update, take } = setup();
-    update("a");
-    take();
-    vi.advanceTimersByTime(300);
-    update("b");
-    update("a");
-    vi.advanceTimersByTime(300);
-    update("c");
-    vi.advanceTimersByTime(399);
-    expect(take()).toEqual([]);
-    vi.advanceTimersByTime(1);
-    expect(take()).toEqual(["1000 setImage c"]);
-  });
-
-  it("keeps changing the image at most once a second under continuous requests", () => {
-    const { update, take } = setup();
-    update("i0");
-    take();
-    for (let i = 1; i <= 50; i++) {
-      vi.advanceTimersByTime(100);
-      update(`i${i}`);
-    }
-    vi.advanceTimersByTime(IMAGE_INTERVAL);
-    // Each cooldown ends just before the request made at the same time.
-    expect(take()).toEqual([
-      "1000 setImage i9",
-      "2000 setImage i19",
-      "3000 setImage i29",
-      "4000 setImage i39",
-      "5000 setImage i49",
-      "6000 setImage i50",
-    ]);
-  });
-
-  it("drops a waiting change when hidden and creates the next tray with the latest image", () => {
+  it("destroys the tray when hidden and restores its image and description when shown", () => {
     const { icon, update, take } = setup();
     update("a");
-    vi.advanceTimersByTime(100);
+    take();
+    icon.hide();
+    icon.hide();
+    expect(take()).toEqual(["destroy"]);
+    update("a");
+    expect(take()).toEqual(["create a", "tooltip T"]);
     update("b");
-    icon.hide();
-    vi.advanceTimersByTime(5000);
-    expect(take()).toEqual(["0 create a", "0 tooltip T", "100 destroy"]);
-    icon.hide();
-    update("c");
-    expect(take()).toEqual(["5100 create c", "5100 tooltip T"]);
-    // Creation shows an image, so the next change waits.
-    update("d");
-    vi.advanceTimersByTime(999);
-    expect(take()).toEqual([]);
-    vi.advanceTimersByTime(1);
-    expect(take()).toEqual(["6100 setImage d"]);
+    expect(take()).toEqual(["setImage b"]);
   });
 
   it("follows the theme's image variant only when it changes", () => {
     const { update, take } = setup();
     update("tray-idle-none-dark.png");
-    vi.advanceTimersByTime(2000);
     take();
-    // A theme update that keeps the variant.
     update("tray-idle-none-dark.png");
     expect(take()).toEqual([]);
     update("tray-idle-none-light.png");
-    vi.advanceTimersByTime(100);
-    update("tray-connected-none-light.png");
-    vi.advanceTimersByTime(900);
-    expect(take()).toEqual(["2000 setImage tray-idle-none-light.png", "3000 setImage tray-connected-none-light.png"]);
+    expect(take()).toEqual(["setImage tray-idle-none-light.png"]);
   });
 });
 
