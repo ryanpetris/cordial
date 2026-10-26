@@ -114,7 +114,7 @@ The CLI executable is `rust/target/release/cordial`. The desktop build is in
 
 `make local-desktop`, `make local-web` and `make local-cli` build the desktop
 application, its web version and the CLI with locally installed tools. Install
-Python 3.11.4+, Node.js 24 with npm, Rust through [rustup](https://rustup.rs/), and
+Python 3.11.4+, Node.js 26 with npm, Rust through [rustup](https://rustup.rs/), and
 native build tools. Cargo uses the pinned toolchain in `rust/rust-toolchain.toml`;
 the rustup `cargo` and `rustc` commands must be on `PATH`. On Debian and Ubuntu:
 
@@ -186,9 +186,9 @@ make firmware BOARD=esp32s3 PROFILE=production
 make firmware-all
 ```
 
-The Pico image has Rust and ARM GCC; the ESP32-S3 image adds Rust, espup and
-ldproxy to Espressif's ESP-IDF v6.1 image. Builds fetch the pinned Pico SDK and
-BTstack sources into the dependency cache as needed.
+The Pico image has Rust 1.99.1 and ARM GCC; the ESP32-S3 image adds Espressif's
+Rust 1.97.0.0, espup and ldproxy to its ESP-IDF v6.1 image. Builds fetch the pinned
+Pico SDK and BTstack sources into the dependency cache as needed.
 
 `BOARD` defaults to `pico_w`. `PROFILE` is `production`, `debug` or `development`
 and defaults to `development`, independently of compiler release optimization.
