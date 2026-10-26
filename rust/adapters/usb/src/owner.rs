@@ -101,6 +101,9 @@ impl<'a, S: RecordStore, B: EventSource> Owner<'a, S, B> {
     /// Runs the secondary loop. `interfaces` is the configuration interface set USB started with.
     pub async fn secondary(&self, interfaces: u8, now: fn() -> u64) -> ! {
         let mut secondary = Secondary::new(self.io, interfaces);
+        self.run_secondary(&mut secondary, now).await
+    }
+    pub(crate) async fn run_secondary(&self, secondary: &mut Secondary<'_>, now: fn() -> u64) -> ! {
         loop {
             self.turn.wait().await;
             let mut shared = self.shared.lock().await;
@@ -343,7 +346,7 @@ impl<'a> Secondary<'a> {
             self.input = self.io.serial_rx.try_receive().ok();
         }
         if let Some(packet) = &self.input
-            && (packet.session != self.seen.session || !app.serial.active())
+            && (packet.session != self.seen.session || !app.serial.open())
         {
             self.input = None;
             self.offset = 0;

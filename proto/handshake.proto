@@ -1,0 +1,17 @@
+// Permanent serial handshake, independent of the operational schema revision.
+syntax = "proto3";
+
+package cordial.handshake;
+
+// An optional identification query, encoded as an empty protobuf message.
+message ClientHello {}
+
+// The adapter's reply to ClientHello.
+message AdapterHello {
+  // Required, exactly once and nonzero. The adapter's operational protocol revision.
+  optional uint32 protocol_version = 1;
+  // Optional adapter metadata. Absence does not prevent a session.
+  optional string firmware_version = 2;
+  optional string serial_number = 3;
+  optional string name = 4;
+}

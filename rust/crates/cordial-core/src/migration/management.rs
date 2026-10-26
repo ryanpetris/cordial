@@ -22,7 +22,7 @@ pub struct Management {
 impl Management {
     pub fn new(build: Build, startup: Startup) -> Self {
         Self {
-            serial: Session::new(),
+            serial: Session::with_identity(build.version, &build.adapter_id),
             status: p::Status {
                 id: build.adapter_id,
                 name: build.default_adapter_name.into(),
@@ -67,8 +67,9 @@ impl Management {
         self.drained
     }
     pub fn output_complete(&mut self, token: OutputToken, length: usize) {
+        let pending_output = self.serial.open() && self.serial.queued() != 0;
         self.serial.output_complete(token, length);
-        if self.restarting && self.serial.active() && self.serial.queued() == 0 {
+        if self.restarting && pending_output && self.serial.queued() == 0 {
             self.drained = true;
         }
     }

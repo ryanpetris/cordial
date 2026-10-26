@@ -1,4 +1,18 @@
-import { ErrorCode, ErrorOutcome, IntegrationState, OutputMode, Role, SettingsGroup } from "@cordial/protocol";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import {
+  CURRENT_PROTOCOL_VERSION,
+  ErrorCode,
+  ErrorOutcome,
+  FrameDecoder,
+  IntegrationState,
+  MessageSchema,
+  OutputMode,
+  RequestSchema,
+  Role,
+  SettingsGroup,
+  decodeAdapterHello,
+  encodeFrame,
+} from "@cordial/protocol";
 import { describe, expect, it } from "vitest";
 import { FakeAdapter, device, setting } from "../src/fake/adapter.ts";
 import * as convert from "../src/core/convert.ts";
@@ -346,7 +360,23 @@ describe("AdapterSession", () => {
     const fake = new FakeAdapter();
     fake.write = async () => {};
     const close = vi.spyOn(fake, "close");
-    await expect(AdapterSession.open(fake.open(), { changed: vi.fn(), closed: vi.fn(), event: vi.fn(), log: vi.fn() })).rejects.toThrow("no response");
+    await expect(AdapterSession.open(fake.open(), { changed: vi.fn(), closed: vi.fn(), event: vi.fn(), log: vi.fn() })).rejects.toThrow("the adapter sent no hello");
     expect(close).toHaveBeenCalled();
   }, 10_000);
+
+  it("answers requests without a hello, and a hello at any point", async () => {
+    const fake = new FakeAdapter();
+    const decoder = new FrameDecoder();
+    const frames: Uint8Array[] = [];
+    fake.open().onData((chunk) => frames.push(...decoder.push(chunk).map((f) => (f.ok ? f.bytes : new Uint8Array([0xff])))));
+    const status = encodeFrame(toBinary(RequestSchema, create(RequestSchema, { command: { case: "getStatus", value: {} } })));
+    const hello = encodeFrame(new Uint8Array());
+    await fake.write(new Uint8Array([0, ...status, ...hello, ...status]));
+    await until(() => frames.length === 3);
+    expect(fromBinary(MessageSchema, frames[0]!).kind.value).toMatchObject({ result: { case: "status" } });
+    expect(decodeAdapterHello(frames[1]!)).toMatchObject({ protocolVersion: CURRENT_PROTOCOL_VERSION, serialNumber: fake.id });
+    expect(fromBinary(MessageSchema, frames[2]!).kind.value).toMatchObject({ result: { case: "status" } });
+    expect(fake.hellos).toBe(1);
+    await fake.close();
+  });
 });

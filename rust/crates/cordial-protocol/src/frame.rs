@@ -100,7 +100,7 @@ pub enum FrameError {
     Malformed,
 }
 
-/// Collects received bytes into frames. Empty frames are skipped.
+/// Collects received bytes into frames. Bare delimiters are skipped; encoded empty frames are returned.
 pub struct Decoder {
     buffer: Vec<u8>,
     limit: Option<usize>,

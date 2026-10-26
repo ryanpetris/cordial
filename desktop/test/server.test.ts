@@ -44,6 +44,7 @@ const state = async () => JSON.parse((await call("GET", "/api/state")).body) as 
 
 describe("development server", () => {
   it("serves the state and performs actions", async () => {
+    for (let i = 0; i < 100 && (await state()).adapters.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
     expect((await state()).adapters.map((a) => a.id)).toEqual(["00000000000FA002", "00000000000FA001"]);
     expect(await act({ type: "adapters.refresh" })).toEqual(OK);
     expect((await act({ type: "nope" })).status).toBe(400);

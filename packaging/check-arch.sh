@@ -12,6 +12,7 @@ pacman -R --noconfirm cordial-cli
 pacman -U --noconfirm build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst
 python tools/check_linux_package.py cordial-desktop --version "$CORDIAL_VERSION"
 test ! -e /usr/bin/cordial
+test ! -e /opt/cordial-desktop/cordial
 pacman -U --noconfirm build/packages/cli-arch/cordial-cli-*.pkg.tar.zst
 # Bundled Electron belongs in /opt under the Arch Electron guidelines.
 namcap -e elfpaths build/packages/desktop-arch/cordial-desktop-*.pkg.tar.zst > namcap.log

@@ -118,8 +118,9 @@ export class AdapterSession {
     this.status = null as unknown as AdapterStatus;
   }
 
-  /** Starts a session and reads the adapter's status; rejects if the port isn't a working adapter. */
-  static async open(stream: ByteStream, hooks: SessionHooks): Promise<AdapterSession> {
+  /** Starts a session and reads the adapter's status; rejects if the port isn't a working adapter
+   * on the current protocol. */
+  static async open(stream: ByteStream, hooks: SessionHooks, openTimeoutMs?: number): Promise<AdapterSession> {
     const session = new AdapterSession(hooks);
     const receiver = session.#receiver;
     session.#connection = await Connection.open({
@@ -135,6 +136,7 @@ export class AdapterSession {
         receiver.session.#hooks.closed(error);
       },
       log: (message) => receiver.session.#hooks.log(message),
+      openTimeoutMs,
     });
     // Callbacks during the handshake have already applied the status and any later adapter event.
     if (!session.status) session.#setStatus(session.#connection.status);

@@ -304,6 +304,20 @@ describe("assisted migration", () => {
     }
   });
 
+  it("checks success against the target the firmware reported when the migration started", async () => {
+    const h = await harness();
+    const run = await until(() => h.runs.length === 1).then(() => h.runs[0]!);
+    try {
+      expect(entry(h)!.status!.information.targetStorageFormat).toBe(2);
+      h.a.targetStorageFormat = 3;
+      send(run, { case: "success", value: { adapterId: h.a.id, targetFormat: 3 } });
+      run.handlers.exit(0, null);
+      expect(entry(h)!.migration).toMatchObject({ phase: "failed", message: MIGRATION_TEXT.failed });
+    } finally {
+      await h.c.stop();
+    }
+  });
+
   it.each([
     ["a failure", (run: Run) => { send(run, { case: "failure", value: { reason: "x" } }); run.handlers.exit(0, null); }, MIGRATION_TEXT.failed],
     ["an unconfirmed write", (run: Run) => { send(run, { case: "failure", value: { reason: "x", outcomeUnknown: true } }); run.handlers.exit(1, null); }, MIGRATION_TEXT.unknown],

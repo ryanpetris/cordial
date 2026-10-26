@@ -308,7 +308,7 @@ impl<F: Fleet> Model<F> {
         } else {
             self.adapters
                 .iter()
-                .filter(|a| a.conn == Conn::Disconnected)
+                .filter(|a| a.conn == Conn::Disconnected && a.hello.is_none())
                 .collect()
         };
         if !self.devices.is_empty() || can_add || !connectable.is_empty() {

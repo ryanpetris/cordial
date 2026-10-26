@@ -2,7 +2,7 @@
 
 [Protocol index](README.md)
 
-Field definitions are in [`proto/cordial.proto`](../../proto/cordial.proto). This page explains
+Field definitions are in [`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto). This page explains
 what the records mean and how their values are chosen.
 
 ## Status
@@ -37,8 +37,8 @@ until its outcome is resolved or a restart successfully reloads saved state; rad
 not clear it. Storage readiness and storage space are separate: `STORAGE_FULL` uses reason
 `STORAGE`, follows its own clearing rule and does not make storage unready.
 
-Clients verify the presence and exact support of `target_storage_format` before
-any interaction except `GetStatus` or closing the connection. An absent or zero
+After a compatible permanent hello and `GetStatus`, clients verify the presence and exact support
+of `target_storage_format` before any other command. An absent or zero
 target prevents migration and normal commands, even when information is present
 and the adapter reports readiness. Assisted mode reports `ready = false`
 and `STORAGE_MIGRATION_REQUIRED` with reason `STORAGE`, outcome `NO_EFFECT` and no related

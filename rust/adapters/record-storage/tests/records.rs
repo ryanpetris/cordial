@@ -2542,6 +2542,33 @@ fn management(
         startup,
     )
 }
+fn connect(management: &mut cordial_core::migration::management::Management) {
+    use cordial_protocol::{self as p, frame::Decoder};
+    management.session(true);
+    let mut bytes = Vec::new();
+    p::frame::encode_bytes(
+        &p::handshake::encode_client_hello(&p::ClientHello {}).unwrap(),
+        &mut bytes,
+    );
+    assert_eq!(management.serial.feed(&bytes), (bytes.len(), None));
+    let mut decoder = Decoder::new(Some(p::MAX_HANDSHAKE_BYTES));
+    let mut hello = None;
+    while let Some((token, bytes)) = management.serial.output(63) {
+        let length = bytes.len();
+        for &byte in bytes {
+            if let Some(frame) = decoder.push(byte) {
+                assert!(hello.is_none());
+                hello = Some(p::handshake::decode_adapter_hello(frame.unwrap()).unwrap());
+            }
+        }
+        management.output_complete(token, length);
+    }
+    assert_eq!(
+        hello.unwrap().protocol_version,
+        Some(p::CURRENT_PROTOCOL_VERSION)
+    );
+    assert!(management.serial.open());
+}
 async fn request(
     management: &mut cordial_core::migration::management::Management,
     store: &mut Storage,
@@ -2592,7 +2619,7 @@ fn assisted_production_commands_keep_the_gate_until_restart_ack_drains() {
             .unwrap();
         fs.replace_file("/format.pb", &[8, 1]).unwrap();
         let mut management = management(Startup::Assisted);
-        management.session(true);
+        connect(&mut management);
         let response = request(
             &mut management,
             &mut fs,
@@ -2647,7 +2674,7 @@ fn assisted_production_commands_keep_the_gate_until_restart_ack_drains() {
         assert_eq!(status.errors[0].outcome, p::ErrorOutcome::NoEffect as i32);
         assert!(status.errors[0].related.is_empty());
         management.session(false);
-        management.session(true);
+        connect(&mut management);
         let response = request(&mut management, &mut fs, C::GetStatus(p::GetStatus {})).await;
         let Some(R::Status(status)) = response.result else {
             panic!("status")
@@ -2690,7 +2717,7 @@ fn assisted_production_commands_keep_the_gate_until_restart_ack_drains() {
         assert!(management.reset_ready());
         management.session(false);
         assert!(!management.reset_ready());
-        management.session(true);
+        connect(&mut management);
         assert!(
             request(&mut management, &mut fs, C::Restart(p::Restart {}))
                 .await
@@ -2729,7 +2756,7 @@ fn management_reports_the_committed_root_and_restarts_without_dataset_validation
                 fs.replace_file("/devices/1/device.pb", &[0xff]).unwrap();
                 let before = flash.0.borrow().clone();
                 let mut management = management(startup);
-                management.session(true);
+                connect(&mut management);
                 let response =
                     request(&mut management, &mut fs, C::GetStatus(p::GetStatus {})).await;
                 let Some(R::Status(status)) = response.result else {
@@ -2775,7 +2802,7 @@ fn management_reports_the_committed_root_and_restarts_without_dataset_validation
         for startup in [Startup::Assisted, Startup::Blocked(Error::Io)] {
             let mut fs: Result<Storage, Error> = Err(Error::Io);
             let mut management = management(startup);
-            management.session(true);
+            connect(&mut management);
             management
                 .begin(
                     p::Request {
@@ -2867,7 +2894,7 @@ fn blocked_management_and_invalid_file_arguments_make_no_changes() {
             }),
         ];
         let mut blocked = management(Startup::Blocked(Error::Layout));
-        blocked.session(true);
+        connect(&mut blocked);
         for command in commands {
             let Some(R::Error(error)) = request(&mut blocked, &mut fs, command).await.result else {
                 panic!("blocked")
@@ -3078,7 +3105,7 @@ fn allocation_failure_needs_assistance_only_for_historical_storage() {
             assert_eq!(*flash.0.borrow(), before);
             assert_eq!(fs.startup(), Startup::Assisted);
             let mut status = management(fs.startup());
-            status.session(true);
+            connect(&mut status);
             let response = request(
                 &mut status,
                 &mut fs,
@@ -3117,7 +3144,7 @@ fn assisted_list_files_filters_internal_staging_without_losing_other_entries() {
         fs.replace_file("/.file-write-invalid", b"extension")
             .unwrap();
         let mut management = management(Startup::Assisted);
-        management.session(true);
+        connect(&mut management);
         for _ in 0..2 {
             let response = request(
                 &mut management,

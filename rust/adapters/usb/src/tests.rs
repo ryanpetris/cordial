@@ -163,13 +163,13 @@ fn serial_waits_for_completion_and_rejects_old_session_packets() {
     BusHandler(&io).configured(true);
     io.dtr(true);
     loops.poll(&mut s, 1);
-    assert!(s.app.serial.active());
+    assert!(s.app.serial.open());
+    send_bytes(&io, io.status().session, &client_hello());
     let separator = io.serial_tx.try_receive().ok().unwrap();
     assert_eq!(
         &separator.bytes[..separator.length],
         &[cordial_protocol::frame::DELIMITER]
     );
-    s.app.serial.respond(ok());
     loops.poll(&mut s, 2);
     assert!(io.serial_tx.is_empty());
     io.serial_done
@@ -188,8 +188,8 @@ fn serial_waits_for_completion_and_rejects_old_session_packets() {
     assert_eq!(s.app.serial.queued(), 2);
     io.dtr(false);
     io.dtr(true);
+    send_bytes(&io, packet.session, &client_hello());
     loops.poll(&mut s, 5);
-    s.app.serial.respond(ok());
     io.serial_done
         .try_send(SerialDone {
             session: packet.session,
@@ -199,7 +199,8 @@ fn serial_waits_for_completion_and_rejects_old_session_packets() {
         .ok()
         .unwrap();
     loops.poll(&mut s, 6);
-    assert_eq!(s.app.serial.queued(), 1);
+    assert_eq!(s.app.serial.queued(), 0);
+    assert!(s.app.serial.open());
     assert_eq!(io.serial_tx.len(), 1); // New session's separator, still pending.
 }
 #[test]
@@ -407,7 +408,8 @@ fn dtr_during_dispatch_discards_remaining_old_commands() {
     let mut s = shared(app, ClosingStore { io: &io, writes: 0 });
     BusHandler(&io).configured(true);
     io.dtr(true);
-    loops.poll(&mut s, 1);
+    let mut host = Host::new();
+    negotiate(&mut loops, &mut s, &mut host, &io, 1);
     let request = |platform: cordial_protocol::Platform| {
         let mut bytes = std::vec::Vec::new();
         cordial_protocol::frame::encode(
@@ -877,6 +879,9 @@ struct Host {
     decoder: cordial_protocol::frame::Decoder,
     messages: std::vec::Vec<cordial_protocol::message::Kind>,
     reports: usize,
+    sent_hello: core::cell::Cell<Option<u64>>,
+    received_hello: Option<u64>,
+    secondary: Option<owner::Secondary<'static>>,
 }
 impl Host {
     fn new() -> Self {
@@ -884,10 +889,14 @@ impl Host {
             decoder: cordial_protocol::frame::Decoder::new(None),
             messages: std::vec::Vec::new(),
             reports: 0,
+            sent_hello: core::cell::Cell::new(None),
+            received_hello: None,
+            secondary: None,
         }
     }
     fn serve(&mut self, io: &Io) {
         use prost::Message;
+        self.hello(io);
         if let Ok(tx) = io.hid_tx.try_receive() {
             self.reports += 1;
             io.hid_done
@@ -900,23 +909,46 @@ impl Host {
                 .unwrap();
         }
         if let Ok(tx) = io.serial_tx.try_receive() {
-            for &byte in &tx.bytes[..tx.length] {
+            let current = tx.session == io.status().session;
+            for &byte in &tx.bytes[..if current { tx.length } else { 0 }] {
                 if let Some(frame) = self.decoder.push(byte) {
-                    let message = cordial_protocol::Message::decode(frame.unwrap()).unwrap();
-                    self.messages.push(message.kind.unwrap());
+                    let frame = frame.unwrap();
+                    if self.received_hello != Some(tx.session) {
+                        let Ok(hello) = cordial_protocol::handshake::decode_adapter_hello(frame)
+                        else {
+                            continue;
+                        };
+                        assert_eq!(
+                            hello.protocol_version,
+                            Some(cordial_protocol::CURRENT_PROTOCOL_VERSION)
+                        );
+                        self.received_hello = Some(tx.session);
+                    } else {
+                        let message = cordial_protocol::Message::decode(frame).unwrap();
+                        self.messages.push(message.kind.unwrap());
+                    }
                 }
             }
             io.serial_done
                 .try_send(SerialDone {
                     session: tx.session,
                     token: tx.token,
-                    length: tx.length,
+                    length: if current { tx.length } else { 0 },
                 })
                 .ok()
                 .unwrap();
         }
     }
+    fn hello(&self, io: &Io) {
+        let status = io.status();
+        if !status.serial_open() || self.sent_hello.get() == Some(status.session) {
+            return;
+        }
+        send_bytes(io, status.session, &client_hello());
+        self.sent_hello.set(Some(status.session));
+    }
     fn send(&self, io: &Io, command: cordial_protocol::request::Command) {
+        assert_eq!(self.received_hello, Some(io.status().session));
         let mut bytes = std::vec::Vec::new();
         cordial_protocol::frame::encode(
             &cordial_protocol::Request {
@@ -924,15 +956,7 @@ impl Host {
             },
             &mut bytes,
         );
-        for chunk in bytes.chunks(64) {
-            let mut packet = SerialRx {
-                session: io.status().session,
-                bytes: [0; 64],
-                length: chunk.len(),
-            };
-            packet.bytes[..chunk.len()].copy_from_slice(chunk);
-            io.serial_rx.try_send(packet).ok().unwrap();
-        }
+        send_bytes(io, io.status().session, &bytes);
     }
     fn response(&self) -> Option<&cordial_protocol::Response> {
         self.messages.iter().find_map(|m| match m {
@@ -941,14 +965,58 @@ impl Host {
         })
     }
 }
+pub(super) fn client_hello() -> std::vec::Vec<u8> {
+    let mut bytes = std::vec::Vec::new();
+    cordial_protocol::frame::encode_bytes(
+        &cordial_protocol::handshake::encode_client_hello(&cordial_protocol::ClientHello {})
+            .unwrap(),
+        &mut bytes,
+    );
+    bytes
+}
+
+fn send_bytes(io: &Io, session: u64, bytes: &[u8]) {
+    for chunk in bytes.chunks(64) {
+        let mut packet = SerialRx {
+            session,
+            bytes: [0; 64],
+            length: chunk.len(),
+        };
+        packet.bytes[..chunk.len()].copy_from_slice(chunk);
+        io.serial_rx.try_send(packet).ok().unwrap();
+    }
+}
+
+fn negotiate<S: RecordStore>(
+    loops: &mut Loops<'_>,
+    shared: &mut Shared<S, support::Radio>,
+    host: &mut Host,
+    io: &Io,
+    now: u64,
+) {
+    loops.poll(shared, now);
+    for _ in 0..100 {
+        host.serve(io);
+        loops.poll(shared, now);
+        if host.received_hello == Some(io.status().session) {
+            return;
+        }
+    }
+    panic!("the adapter did not negotiate");
+}
+
 /// Runs both loops, with the host and `drive` taking turns with them, until `drive` returns true.
 fn run(
     owner: &Owner<'static, support::Store, support::Radio>,
-    io: &Io,
+    io: &'static Io,
     host: &mut Host,
     mut drive: impl FnMut(&mut Shared<support::Store, support::Radio>, &mut Host) -> bool,
 ) {
     use embassy_futures::{join::join, select::select, yield_now};
+    let mut secondary = host
+        .secondary
+        .take()
+        .unwrap_or_else(|| owner::Secondary::new(io, 0));
     block_on(async {
         let loops = join(
             owner.priority(
@@ -956,7 +1024,7 @@ fn run(
                 async || yield_now().await,
                 || NOW,
             ),
-            owner.secondary(0, || NOW),
+            owner.run_secondary(&mut secondary, || NOW),
         );
         let driver = async {
             for _ in 0..100_000 {
@@ -971,6 +1039,7 @@ fn run(
         };
         select(loops, driver).await;
     });
+    host.secondary = Some(secondary);
 }
 /// Record reads of `kind` so far.
 fn reads(store: &support::Store, kind: u8) -> usize {
@@ -978,14 +1047,21 @@ fn reads(store: &support::Store, kind: u8) -> usize {
 }
 /// Runs until the session has started, the connection's reports have been sent and background
 /// work has nothing left to read.
-fn settle(owner: &Owner<'static, support::Store, support::Radio>, io: &Io, host: &mut Host) {
+fn settle(
+    owner: &Owner<'static, support::Store, support::Radio>,
+    io: &'static Io,
+    host: &mut Host,
+) {
     let mut quiet = 0;
     let mut last = usize::MAX;
     run(owner, io, host, |shared, host| {
         let total = shared.store.reads.len();
         quiet = if total == last { quiet + 1 } else { 0 };
         last = total;
-        quiet > 50 && host.reports > 0 && shared.app.manager.forward.pending() == 0
+        quiet > 50
+            && host.reports > 0
+            && shared.app.manager.forward.pending() == 0
+            && shared.app.serial.open()
     });
 }
 /// Sends `command` and, each time it reads a record of `kind`, sends an input report from
@@ -993,7 +1069,7 @@ fn settle(owner: &Owner<'static, support::Store, support::Radio>, io: &Io, host:
 /// taken by USB before the next read. Returns the response and the number of records read.
 fn input_goes_first(
     owner: &Owner<'static, support::Store, support::Radio>,
-    io: &Io,
+    io: &'static Io,
     link: LinkId,
     command: cordial_protocol::request::Command,
     kind: u8,
@@ -1124,6 +1200,7 @@ fn continuous_input_leaves_the_secondary_loop_a_step() {
     settle(&owner, io, &mut host);
     host.messages.clear();
     let reports = host.reports;
+    let mut secondary = host.secondary.take().unwrap();
     let mut answered = false;
     block_on(async {
         let loops = join(
@@ -1132,7 +1209,7 @@ fn continuous_input_leaves_the_secondary_loop_a_step() {
                 async || yield_now().await,
                 clock,
             ),
-            owner.secondary(0, clock),
+            owner.run_secondary(&mut secondary, clock),
         );
         let driver = async {
             let mut press = true;
@@ -1205,6 +1282,7 @@ fn a_step_that_writes_is_followed_by_a_rest_as_long_as_it_took() {
             }),
         )
     };
+    let mut secondary = host.secondary.take().unwrap();
     host.messages.clear();
     rename(&host, 0);
     let mut sent = 1;
@@ -1215,7 +1293,7 @@ fn a_step_that_writes_is_followed_by_a_rest_as_long_as_it_took() {
                 async || yield_now().await,
                 clock,
             ),
-            owner.secondary(0, clock),
+            owner.run_secondary(&mut secondary, clock),
         );
         let driver = async {
             for _ in 0..1000 {
@@ -1315,9 +1393,7 @@ fn saved_pool_change_waits_for_successful_persistence_and_physical_response_comp
         let mut host = Host::new();
         BusHandler(&io).configured(true);
         io.dtr(true);
-        loops.poll(&mut shared, 0);
-        host.serve(&io);
-        loops.poll(&mut shared, 1);
+        negotiate(&mut loops, &mut shared, &mut host, &io, 1);
         host.send(
             &io,
             Command::SetDevice(cordial_protocol::SetDevice {
@@ -1456,9 +1532,7 @@ fn allocation_change_during_a_long_command_gives_its_response_a_fresh_drain_dead
         let mut host = Host::new();
         BusHandler(&io).configured(true);
         io.dtr(true);
-        loops.poll(&mut shared, 0);
-        host.serve(&io);
-        loops.poll(&mut shared, 1);
+        negotiate(&mut loops, &mut shared, &mut host, &io, 1);
         host.send(
             &io,
             Command::DeleteProfile(cordial_protocol::DeleteProfile { profile: 1 }),
@@ -1513,7 +1587,7 @@ fn allocation_change_during_a_long_command_gives_its_response_a_fresh_drain_dead
             assert_eq!(host.response(), Some(&ok()));
         }
         assert!(io.reconnect.try_take().unwrap().desktop);
-        assert!(!shared.app.serial.active());
+        assert!(!shared.app.serial.open());
     }
 }
 
@@ -1534,9 +1608,7 @@ fn stalled_response_detaches_at_a_fixed_deadline_despite_new_host_traffic() {
     let mut host = Host::new();
     BusHandler(&io).configured(true);
     io.dtr(true);
-    loops.poll(&mut shared, 0);
-    host.serve(&io);
-    loops.poll(&mut shared, 1);
+    negotiate(&mut loops, &mut shared, &mut host, &io, 1);
     host.send(
         &io,
         Command::SetDevice(cordial_protocol::SetDevice {
@@ -1573,7 +1645,7 @@ fn stalled_response_detaches_at_a_fixed_deadline_despite_new_host_traffic() {
     assert!(host.response().is_none());
     loops.poll(&mut shared, 3 + owner::RESPONSE_DRAIN_MS);
     assert_eq!(io.reconnect.try_take().unwrap().gamepads.xinput_gamepads, 1);
-    assert!(!shared.app.serial.active());
+    assert!(!shared.app.serial.open());
     assert_eq!(shared.app.serial.queued(), 0);
     assert_ne!(io.status().session, session);
     assert_eq!(shared.store.writes.len(), writes);
@@ -1648,6 +1720,7 @@ fn stalled_list_keeps_hid_running_and_reopen_cancels_the_read() {
         .ok()
         .unwrap();
     host = Host::new();
+    negotiate(&mut loops, &mut shared, &mut host, io, NOW + 2000);
     host.send(io, Command::GetStatus(cordial_protocol::GetStatus {}));
     for now in 2001..2100 {
         loops.poll(&mut shared, NOW + now);
@@ -2035,4 +2108,194 @@ fn draining_list_gives_raw_editors_a_turn_before_completion() {
             assert_eq!(rules(&mut shared.store, 1), 1);
         }
     }
+}
+
+fn take_serial(
+    io: &Io,
+    decoder: &mut cordial_protocol::frame::Decoder,
+    frames: &mut std::vec::Vec<std::vec::Vec<u8>>,
+) {
+    if let Ok(tx) = io.serial_tx.try_receive() {
+        for &byte in &tx.bytes[..tx.length] {
+            if let Some(frame) = decoder.push(byte) {
+                frames.push(frame.unwrap().to_vec());
+            }
+        }
+        io.serial_done
+            .try_send(SerialDone {
+                session: tx.session,
+                token: tx.token,
+                length: tx.length,
+            })
+            .ok()
+            .unwrap();
+    }
+}
+
+#[test]
+fn ordinary_commands_and_hid_work_without_hello_and_queries_work_mid_session() {
+    use cordial_core::bluetooth::{Event, InputReport};
+    use cordial_protocol::{self as p, message::Kind, response::Result as R};
+    use prost::Message;
+    let (owner, io, link) = running(2, 0);
+    let mut shared = block_on(owner.lock());
+    let mut loops = Loops::new(io, 0);
+    let mut request = std::vec::Vec::new();
+    p::frame::encode(
+        &p::Request {
+            command: Some(p::request::Command::GetStatus(p::GetStatus {})),
+        },
+        &mut request,
+    );
+    send_bytes(io, io.status().session, &request);
+    let mut decoder = p::frame::Decoder::new(None);
+    let mut frames = std::vec::Vec::new();
+    let mut reports = 0;
+    for now in 0..40 {
+        shared.radio.events.push_back(Event::Input(
+            InputReport::new(link, cordial_core::link::ServiceId(7), 0, &[now % 2]).unwrap(),
+        ));
+        loops.poll(&mut shared, NOW + u64::from(now));
+        take_serial(io, &mut decoder, &mut frames);
+        if let Ok(tx) = io.hid_tx.try_receive() {
+            reports += 1;
+            io.hid_done
+                .try_send(HidDone {
+                    generation: tx.generation,
+                    sequence: tx.sequence,
+                    success: true,
+                })
+                .ok()
+                .unwrap();
+        }
+    }
+    assert!(reports > 30);
+    let status = |bytes: &[u8]| {
+        matches!(
+            p::Message::decode(bytes).unwrap().kind,
+            Some(Kind::Response(p::Response {
+                result: Some(R::Status(_))
+            }))
+        )
+    };
+    assert!(frames.iter().any(|bytes| status(bytes)));
+    assert!(shared.app.serial.open());
+    frames.clear();
+    let mut input = client_hello();
+    input.extend(request);
+    send_bytes(io, io.status().session, &input);
+    for now in 40..60 {
+        loops.poll(&mut shared, NOW + now);
+        take_serial(io, &mut decoder, &mut frames);
+    }
+    let identity = frames
+        .iter()
+        .position(|bytes| p::handshake::decode_adapter_hello(bytes).is_ok())
+        .unwrap();
+    let hello = p::handshake::decode_adapter_hello(&frames[identity]).unwrap();
+    assert_eq!(hello.protocol_version, Some(p::CURRENT_PROTOCOL_VERSION));
+    assert_eq!(hello.firmware_version.as_deref(), Some("test"));
+    assert_eq!(hello.serial_number.as_deref(), Some("adapter"));
+    assert!(frames[identity + 1..].iter().any(|bytes| status(bytes)));
+    assert!(!shared.app.command_pending());
+}
+
+#[test]
+fn suspend_preserves_the_session_and_usb_rebuild_opens_a_fresh_session() {
+    let io = Io::new();
+    let mut loops = Loops::new(&io, 0);
+    let mut shared = shared(application(), support::Store::default());
+    BusHandler(&io).configured(true);
+    io.dtr(true);
+    let mut host = Host::new();
+    negotiate(&mut loops, &mut shared, &mut host, &io, 0);
+    let session = io.status().session;
+    BusHandler(&io).suspended(true);
+    loops.poll(&mut shared, 1);
+    BusHandler(&io).suspended(false);
+    loops.poll(&mut shared, 2);
+    assert_eq!(io.status().session, session);
+    assert!(shared.app.serial.open());
+    io.reset(false);
+    loops.poll(&mut shared, 3);
+    assert!(!shared.app.serial.open());
+    BusHandler(&io).configured(true);
+    io.dtr(true);
+    loops.poll(&mut shared, 4);
+    assert_ne!(io.status().session, session);
+    assert!(shared.app.serial.open());
+    assert_eq!(shared.app.serial.queued(), 0);
+    host = Host::new();
+    negotiate(&mut loops, &mut shared, &mut host, &io, 5);
+}
+
+#[test]
+fn hello_write_retries_and_partial_completions_keep_pipelined_requests_waiting() {
+    let io = Io::new();
+    let mut loops = Loops::new(&io, 0);
+    let mut shared = shared(
+        Application::new(Build {
+            development: false,
+            version: "test",
+            board: "test",
+            default_adapter_name: "Test adapter",
+            adapter_id: "a".repeat(100),
+            profile_memory_budget: None,
+            restart: || panic!("restarted"),
+            bootloader: None,
+        }),
+        support::Store::default(),
+    );
+    BusHandler(&io).configured(true);
+    io.dtr(true);
+    let mut bytes = client_hello();
+    cordial_protocol::frame::encode(
+        &cordial_protocol::Request {
+            command: Some(cordial_protocol::request::Command::GetStatus(
+                cordial_protocol::GetStatus {},
+            )),
+        },
+        &mut bytes,
+    );
+    send_bytes(&io, io.status().session, &bytes);
+    loops.poll(&mut shared, 0);
+    let separator = io.serial_tx.try_receive().unwrap();
+    complete_serial(&io, &separator, separator.length);
+    loops.poll(&mut shared, 1);
+    let first = io.serial_tx.try_receive().unwrap();
+    assert_eq!(first.length, 63);
+    assert!(!first.bytes[..first.length].contains(&0));
+    complete_serial(&io, &first, 0);
+    loops.poll(&mut shared, 2);
+    let retry = io.serial_tx.try_receive().unwrap();
+    assert_eq!(retry.bytes, first.bytes);
+    assert!(shared.app.serial.open());
+    assert!(!shared.app.command_pending());
+    complete_serial(&io, &retry, retry.length);
+    loops.poll(&mut shared, 3);
+    let last = io.serial_tx.try_receive().unwrap();
+    assert_eq!(last.bytes[last.length - 1], 0);
+    assert!(shared.app.serial.open());
+    complete_serial(&io, &last, last.length - 1);
+    loops.poll(&mut shared, 4);
+    let delimiter = io.serial_tx.try_receive().unwrap();
+    assert_eq!(&delimiter.bytes[..delimiter.length], &[0]);
+    assert!(shared.app.serial.open());
+    assert!(!shared.app.command_pending());
+    assert_eq!(shared.app.serial.queued(), 1);
+    complete_serial(&io, &delimiter, 1);
+    loops.poll(&mut shared, 5);
+    assert!(shared.app.serial.open());
+    assert!(io.serial_tx.try_receive().is_ok());
+}
+
+pub(super) fn complete_serial(io: &Io, tx: &SerialTx, sent: usize) {
+    io.serial_done
+        .try_send(SerialDone {
+            session: tx.session,
+            token: tx.token,
+            length: sent,
+        })
+        .ok()
+        .unwrap();
 }

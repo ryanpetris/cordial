@@ -129,9 +129,34 @@ impl Test {
             decoder: Decoder::new(None),
             keys: Vec::new(),
         };
-        t.app.session(true, &mut t.radio);
+        t.connect();
         t.event(Event::Ready);
         t
+    }
+    fn connect(&mut self) {
+        self.app.session(true, &mut self.radio);
+        let mut bytes = Vec::new();
+        frame::encode_bytes(
+            &p::handshake::encode_client_hello(&p::ClientHello {}).unwrap(),
+            &mut bytes,
+        );
+        assert_eq!(self.app.serial.feed(&bytes), (bytes.len(), None));
+        let mut decoder = Decoder::new(Some(p::MAX_HANDSHAKE_BYTES));
+        let mut hello = None;
+        while let Some((token, bytes)) = self.app.serial.output(64) {
+            let bytes = bytes.to_vec();
+            for byte in &bytes {
+                if let Some(frame) = decoder.push(*byte) {
+                    hello = Some(p::handshake::decode_adapter_hello(frame.unwrap()).unwrap());
+                }
+            }
+            self.app.serial.output_complete(token, bytes.len());
+        }
+        let hello = hello.unwrap();
+        assert_eq!(hello.protocol_version, Some(p::CURRENT_PROTOCOL_VERSION));
+        assert!(hello.firmware_version.is_some());
+        assert_eq!(hello.serial_number, Some(self.app.status(&self.radio).id));
+        assert!(self.app.serial.open());
     }
     fn event(&mut self, event: Event) {
         self.now += 1;
@@ -871,7 +896,7 @@ fn ending_the_session_stops_scanning_and_pairing() {
     t.event(Event::Disconnected { link, error: None });
     t.poll();
     assert!(t.radio.bonds.is_empty());
-    t.app.session(true, &mut t.radio);
+    t.connect();
     assert_eq!(
         t.code(Command::StartPairing(p::StartPairing { candidate })),
         p::ErrorCode::NotFound
@@ -2069,7 +2094,7 @@ fn a_pairing_cancelled_by_the_session_ending_reports_nothing_to_the_next_one() {
     t.poll();
     let link = t.radio.connects[0].0;
     t.app.session(false, &mut t.radio);
-    t.app.session(true, &mut t.radio);
+    t.connect();
     t.event(Event::Disconnected { link, error: None });
     t.poll();
     assert!(pairing_steps(&t.events()).is_empty());
@@ -7791,7 +7816,7 @@ fn gamepad_enumeration_reports_capacity_and_device_state_changes() {
     }
     TRACK.set(false);
     assert_eq!(ALLOCS.get(), 0);
-    t.app.session(true, &mut t.radio);
+    t.connect();
     t.app.set_output_enumeration(None);
     assert!(
         t.app
@@ -9670,4 +9695,47 @@ fn committed_enable_reports_complete_when_resident_allocation_fails() {
     );
     assert!(t.app.manager.find(SAVED.into()).is_some());
     assert!(t.radio.bonds.contains(&peer(1)));
+}
+
+#[test]
+fn handshake_identifies_the_adapter_without_ready_storage_or_radio() {
+    for failed in [false, true] {
+        let mut app = Application::new(build(false, None));
+        if failed {
+            app.manager.storage_error = Some(p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                ..Default::default()
+            });
+        }
+        let mut radio = Radio::default();
+        for _ in 0..2 {
+            app.session(true, &mut radio);
+            let mut bytes = Vec::new();
+            frame::encode_bytes(
+                &p::handshake::encode_client_hello(&p::ClientHello {}).unwrap(),
+                &mut bytes,
+            );
+            assert_eq!(app.serial.feed(&bytes), (bytes.len(), None));
+            let mut decoder = Decoder::new(Some(p::MAX_HANDSHAKE_BYTES));
+            let mut received = None;
+            while let Some((token, bytes)) = app.serial.output(7) {
+                let bytes = bytes.to_vec();
+                for byte in &bytes {
+                    if let Some(frame) = decoder.push(*byte) {
+                        received =
+                            Some(p::handshake::decode_adapter_hello(frame.unwrap()).unwrap());
+                    }
+                }
+                app.serial.output_complete(token, bytes.len());
+            }
+            let hello = received.unwrap();
+            assert_eq!(hello.protocol_version, Some(p::CURRENT_PROTOCOL_VERSION));
+            assert_eq!(hello.serial_number, Some(app.status(&radio).id));
+            assert!(hello.firmware_version.is_some());
+            assert!(hello.name.is_none());
+            assert!(app.serial.open());
+            assert!(!app.manager.storage_ready);
+            assert!(!app.manager.radio_ready);
+        }
+    }
 }

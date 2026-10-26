@@ -73,10 +73,27 @@ protobuf `Message`, including nested envelopes and all repeated listing batches.
 desktop and web clients do not apply this limit. See
 [Rust host receive limit](transport.md#rust-host-receive-limit) for overflow and session behavior.
 
+## Protocol selection
+
+Every client connection starts with the permanent hello. Clients send no ordinary requests until
+a valid `AdapterHello` names a revision they implement. Firmware doesn't require the hello and
+never learns the client's revision, so this check is the client's alone. A current adapter
+connects directly. A newer revision requires an application upgrade. Firmware without the
+permanent hello is unsupported.
+
+The native desktop can use a CLI proxy for an older revision only when that helper implements
+conversion to the application's current schema. The helper must match both the application's
+current revision and its exact operational schema fingerprint. Revision `1` has no earlier
+supported revision and no historical converter. The browser cannot launch a CLI helper.
+
+A proxy preserves FIFO responses, event ordering and complete errors. Its death closes the
+desktop session. Recovery starts with a fresh direct connection and hello, so an adapter that
+now reports the current revision connects directly. The proxy never reconnects its physical port.
+
 ## Storage migration
 
-All clients check the exact `Status.information.target_storage_format` before
-any interaction except bootstrap status or closing the connection. A missing,
+After a compatible hello, clients read bootstrap status and check the exact
+`Status.information.target_storage_format` before any other command. A missing,
 zero or unsupported target allows nothing else. The committed
 `storage_format` is shown but never decides whether to migrate. Clients don't
 infer migration success from readiness alone, an empty command response or a
@@ -104,10 +121,13 @@ supported, without waiting for readiness or migration. The adapter refuses it wi
 `ERROR_CODE_BUSY` while a pairing or setup link is open.
 
 The desktop runs assisted conversion in a CLI subprocess. Before starting it,
-the desktop closes every adapter and stops discovery, probes and automatic
-reconnect globally. CLI and TUI migration use the same exclusivity through their
-direct coordinator. Migration reconnects indefinitely by stable `Status.id`;
-a port is only a discovery hint and never authorizes using another adapter.
+the desktop stops discovery, probes and automatic reconnect globally. It closes every adapter
+stream and proxy, waits for pending connection handoffs to finish closing, and waits for proxy
+children to exit. CLI and TUI migration use the same exclusivity through their
+direct coordinator. The firmware's target storage format remains authoritative through a proxy.
+The migration worker reconnects indefinitely by stable `Status.id`, independently of the
+session proxy, which never reconnects. A port is only a discovery hint and never authorizes
+using another adapter.
 A response lost during a write requires readback after reconnect before retry.
 
 [`proto/migration.proto`](../../proto/migration.proto) defines subprocess IPC.
@@ -123,7 +143,7 @@ port hint. Events report progress, waiting for reconnect, committed root
 checkpoints, failure, verified success or explicit cancellation. An intermediate
 checkpoint event reports a root upload and readback, without completing migration
 or restarting the adapter. Success requires reconnecting to the same ID and
-verifying the requested target, `Status.ready = true` and the absence of
+verifying the unchanged firmware target, `Status.ready = true` and the absence of
 `ERROR_CODE_STORAGE_MIGRATION_REQUIRED`.
 
 The desktop stays globally suspended until verified success and child exit, or
@@ -259,6 +279,12 @@ cancelling prevents an immediate automatic retry.
   the new list, or an expired hold, returns the page to Overview. Disconnect, from the adapter's
   page or menu, closes its session; the adapter stays listed while plugged in and is opened again
   only by Connect.
+- Protocol refusals: an adapter on an unsupported revision stays listed under Needs Attention,
+  with the connection error beside Connect. Reported firmware appears on Details and a reported
+  serial number on Diagnostics. No configuration actions are available. Refresh or Connect retries
+  the port. A replug also retries it when a port listing observed its absence. A successful
+  connection uses the ID from `GetStatus`. The shell also stops its reconnect attempts when an
+  adapter reports an unsupported revision and prints the refusal reason.
 - Layout: a sidebar with Overview, the saved devices of every adapter in one list, the adapters,
   and Add Device; and the selected page with its tabs and bottom bar. The Overview counts
   connected and paired devices and connected adapters, and lists what needs attention, the
@@ -293,7 +319,9 @@ The desktop application uses the same commands and session rules as the CLI.
 
 - Discovery: it lists serial ports once at startup, then again after USB hotplug events (with short
   retries while udev sets up a new node) or an explicit refresh. A port must match the [USB
-  discovery descriptors](transport.md#discovery), and the first `GetStatus` identifies the adapter.
+  discovery descriptors](transport.md#discovery) and complete the
+  [handshake](transport.md#permanent-handshake) on the current protocol revision, and the first
+  `GetStatus` identifies the adapter.
   The web version lists the ports the user has granted by vendor and product ID. Unidentified
   ports stay hidden. When an adapter has a readable USB serial number that matches its status ID,
   an unexpected connection loss marks the adapter unavailable and its devices Disconnected.
@@ -303,7 +331,8 @@ The desktop application uses the same commands and session rules as the CLI.
   every 500 milliseconds throughout the window, including after an early connection loss or a
   temporary failure to reopen the port. Port enumeration continues while other ports are opening.
   It recognizes the same adapter by the adapter ID at the start of its USB serial number,
-  even on a different port, confirms that ID in the handshake, and updates the existing state.
+  even on a different port, confirms that ID in `GetStatus` after a compatible hello, and updates
+  the existing state.
   A candidate without a matching readable USB serial number cannot resume that state.
   The entries and pages remain in place between the new session's handshake and device listing.
   A failed listing retains them; a
@@ -319,7 +348,33 @@ The desktop application uses the same commands and session rules as the CLI.
   reconnect window or automatic retries. This includes Web Serial, which cannot read USB serial
   numbers. A later hotplug scan or explicit refresh creates a fresh connection, including on the
   same port, and does not restore the previous session's state.
-- Sessions: after `GetStatus` it reads the complete device list and each device's settings, then
+- Protocol revisions: opening sends the delimiter and the empty `ClientHello`, waits for a valid
+  `AdapterHello`, and finishes with `GetStatus` within 4 seconds in total. Input does not extend
+  that deadline. Responses and events that arrive before the hello are dropped, and so is any
+  frame longer than a hello can be. An adapter that
+  sends any other frame before its hello, or no hello in time, stays hidden. An adapter whose hello
+  names a newer revision is listed as refused with its name, firmware version and serial number
+  where the hello includes them, and receives no other request. For an older revision, the desktop
+  application closes the port and runs the CLI as
+  `cordial --port PORT proxy --protocol N --schema DIGEST`, with its own revision and
+  `OPERATIONAL_SCHEMA_SHA256`. The CLI opens the port and writes one COBS frame of at most 4096
+  decoded bytes holding UTF-8 JSON with `kind` `cordial-proxy-startup`, its own `protocol` and
+  `schema`, a `result` of `ready`, `incompatible-client`, `unsupported-native`, `open-failed` or
+  `handshake-failed`, and `nativeHello`, the adapter's hello as lowercase hex or `null`. After
+  `ready`, its standard input and output carry a session on the current revision, starting with the
+  handshake. The CLI must be ready and finish that handshake within 5 seconds. Its standard error
+  goes to the log. A missing CLI, a CLI with another revision or schema, or one that can't convert
+  for the adapter leaves the adapter refused. Where the direct hello, the hello the CLI reports and
+  the converted session's hello include serial numbers, they must match. The web version has no CLI and refuses an older
+  adapter as well. A refused adapter is opened again only on a refresh, a hotplug event or Connect.
+  The CLI never reopens the port. When it exits for any reason, the session ends as if the
+  adapter were unplugged, and recovery opens the port directly again, so an adapter now on the
+  current revision connects without the CLI. Closing the session ends the CLI's input, then sends
+  `SIGTERM` after 1 second and `SIGKILL` after another, and the port is opened again only after
+  the CLI has exited. A request the exit interrupts is not replayed. Quitting waits for the CLI and
+  every open port to close.
+- Sessions: after a compatible hello, `GetStatus` and the storage gate, it reads the complete
+  device list and each device's settings, then
   follows events, and lists the devices again when the adapter becomes ready. When a device
   listing fails on a connected, ready adapter, the adapter's Diagnostics tab names the failure with
   Retry, which lists the devices again. If the devices haven't been listed since the adapter last

@@ -3,7 +3,8 @@
 // Web Serial doesn't read the USB serial number, so ports are filtered by
 // vendor and product ID and the Dongle's status identifies it. It changes DTR without a break request, so opening cycles
 // DTR low then high: a new session starts even if the port was left open with
-// DTR high. Input from an earlier session is ignored until the first response.
+// DTR high. Each session starts with a delimiter, so the cycle leaves no partial
+// frame ahead of the new session's output.
 // Closing lowers DTR.
 import { USB_PRODUCT_ID, USB_VENDOR_ID } from "@cordial/protocol";
 import type { ByteStream, PortInfo } from "./stream.ts";

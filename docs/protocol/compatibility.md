@@ -2,8 +2,70 @@
 
 [Protocol index](README.md)
 
-Firmware and clients must use matching serial schemas. The rules below govern compatible changes
-within a release series. There is no separate protocol version number.
+The permanent handshake in [`proto/handshake.proto`](../../proto/handshake.proto) identifies the
+adapter's operational serial revision. Clients complete it before sending ordinary requests. The
+current revision is `1`, selected by [`proto/serial/current`](../../proto/serial/current). Its
+schema lives in [`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto), with package
+`cordial.serial.v1`. The shared libraries provide hello encoders and bounded decoders.
+
+The handshake stays independent of operational revisions. `ClientHello` is an empty query that
+carries no host revision. `AdapterHello` has exactly one nonzero `uint32 protocol_version` at tag
+`1`. Its protobuf field is `optional` so decoders preserve presence, but its presence is required
+by the contract. Unknown optional fields
+are skipped. `AdapterHello` uses tags `2`, `3` and `4` for optional `firmware_version`,
+`serial_number` and `name`. It may omit any or all of them. A valid hello with a different revision
+still decodes so the host can report the mismatch.
+
+Compatibility is the host's decision. Firmware always speaks its one native revision, answers the
+hello whenever asked and accepts ordinary requests without it, so it has no compatibility gate and
+never knows the host's revision. A host sends ordinary requests only after a valid `AdapterHello`
+names a revision it implements.
+
+Current applications use only the current operational schema. A matching native revision connects
+directly. A newer native revision is refused and requires an application upgrade. An older native
+revision can use a CLI shim only when that helper actually implements the revision and its
+conversion to the current schema. Revision `1` has no earlier nonzero revision and no historical
+conversion. Firmware without the permanent hello is unsupported; clients never infer a revision
+from a firmware release number or an ordinary response. Helpers expose only their compiled current
+revision to applications; they cannot impersonate an older application-side revision.
+
+A host that implemented several revisions could pick the matching codec after the hello and keep
+using the same open port. The desktop application instead closes the port and hands an older
+adapter to a separate CLI process, which opens the port again.
+
+A CLI helper and the application must agree on both the current protocol revision and the exact
+operational schema fingerprint before exchanging ordinary traffic. Optional hello metadata is
+not a compatibility requirement. See [client implementations](clients.md) for helper selection.
+
+Breaking operational changes get an explicitly approved new revision in `proto/serial/vN/`.
+Retain earlier revision directories as schema history. Default builds generate only the current
+revision and its imports, the handshake and existing storage records. The TypeScript generator
+checks every retained revision's `schema.sha256` and detects stale generated operational files;
+regeneration updates the digests and deletes stale output. Historical revisions remain source
+schemas without generated message exports. The operational revision is independent of application
+release versions and storage versions. The breaking transition to revision `1` requires the next
+release to increment the minor version. Breaking protocol changes increment the release minor
+version while the application major version is `0`, or the major version from `1` onward. The
+development release template remains `0.0.0`.
+
+### Operational schema identity
+
+Rust and TypeScript expose `OPERATIONAL_SCHEMA_SHA256`, a lowercase hexadecimal SHA-256 digest of
+the normalized protobuf `FileDescriptorSet` for the current operational schema and all its imports.
+The handshake and storage are not included. Normalization clears each file's `name` and
+`source_code_info`, recursively replaces dependency filenames with the SHA-256 digest of each
+normalized dependency descriptor, sorts files by lexicographic order of their encoded descriptor
+bytes, then encodes and hashes the descriptor set.
+All other descriptor fields, declaration order and dependency order remain significant. Comments
+and incidental source paths do not affect the digest; operational fields and imported definitions
+do. Both generators use their protobuf descriptor encoders. A shared dependency fixture and the
+current schema's checked-in digest cross-check protox and Buf independently. Cargo rejects
+operational descriptors with custom option extensions because its typed descriptor conversion
+would omit them. Such schemas require lossless normalization support before use.
+
+The digest identifies exact schema content. It is not another compatibility version and is not a
+handshake field. Compatible additive schema changes may change the digest without changing the
+operational revision.
 
 ## Fields
 
@@ -61,14 +123,33 @@ understood are Required.
    other kind is a repeated message with the kind as a field, like `TransportSupport` and
    `Integration`.
 
-`buf breaking` runs against the newest earlier release in the same series with the `WIRE_JSON`
-rule set and fails on anything that breaks rules 1 and 2, including renamed fields, which
-`--json` output exposes. Before 1.0, a new minor version starts a series and may break
-compatibility; from 1.0, only a new major version may. A development build compares against the
-newest release. `buf lint` uses
-its standard rules except `ENUM_ZERO_VALUE_SUFFIX`, because zero values carry the default meaning,
-and `PACKAGE_VERSION_SUFFIX`, because the package has no version. Rules 3 to 8 and the rules below
-are review rules.
+Additive operations and writable fields require a positive advertised capability before a client
+uses them. An absent or unknown capability means unsupported. A matching protocol revision or a
+successful response to an unrecognized field does not prove that firmware supports the operation.
+
+`make check-protocol` runs `buf lint` on every schema and uses `WIRE_JSON` for compatibility
+checks. Stable comparisons also check compiled descriptors to preserve released message and enum
+names within their packages, including nested definitions. Definitions can move between source
+files in the same package. The permanent handshake and operational revisions present in the current
+tree compare against every local release tag, regardless of application version or branch ancestry, except the
+release identified by `CORDIAL_VERSION`. This protects field assignments shared across release
+branches. A revision released by an ancestor must remain present even when another revision becomes
+current. A revision released only on another branch need not be added, but its contract is checked
+if that revision is present. `PROTOCOL_STABLE_BASE` overrides these comparisons with one Git
+revision. The comparison builds released schemas with their imports and protects their dependencies
+too.
+
+Storage and migration IPC compare against the newest earlier release in the same application
+series, selected by `PROTOCOL_BASE`. Before application version `1.0`, a new minor version starts a
+series; from `1.0`, only a new major version does. The first release of a series has no storage or
+migration IPC baseline, but still checks permanent serial contracts. Baseline selection uses ancestor tags
+reachable before `HEAD`; a development build selects the newest of these releases. Selection uses
+existing local tags without fetching. An earlier release's unversioned
+serial schema is not compared with revision `1`.
+
+Buf's standard lint exceptions include `ENUM_ZERO_VALUE_SUFFIX` for meaningful zero defaults,
+`PACKAGE_VERSION_SUFFIX` for permanent handshake and storage packages, and directory rules for the
+schema layout. Rules 3 to 8 and the rules below are review rules.
 
 ## Set commands
 
@@ -206,5 +287,7 @@ writes. See [settings records](records.md#settings) for metadata and event repla
 
 The wire protocol imposes no object or message size limit on settings responses and change events.
 Ranges, choices and saved metadata remain complete. Device and resource constraints still apply,
-such as at most six Pointer Sensor DPI choices. The 1024-byte limit applies only to the complete
-host `Request`, including its command envelope and all entries, before COBS encoding.
+such as at most six Pointer Sensor DPI choices. For ordinary traffic, the 1024-byte limit applies
+to the complete host `Request`, including its command envelope and all entries, before COBS
+encoding. An `AdapterHello` has a separate 1024-byte decoded limit, and a `ClientHello` is always
+empty.

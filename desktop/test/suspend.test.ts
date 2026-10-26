@@ -42,7 +42,7 @@ describe("suspending every adapter", () => {
     h.ports.open = async (path) => streams.wrap(h.deps.ports[path]!.open());
     const release = fake.hold();
     void h.c.manager.rescan();
-    await until(() => fake.received.length === 1);
+    await until(() => fake.hellos === 1);
     await h.c.manager.suspend();
     expect(streams.open()).toBe(0);
     release();
@@ -142,7 +142,7 @@ describe("suspending every adapter", () => {
     await h.c.manager.disconnect(fake.id);
     const release = fake.hold();
     const connecting = h.c.manager.connect(fake.id);
-    await until(() => fake.received.length === 1);
+    await until(() => fake.hellos === 1);
     const suspended = track(h.c.manager.suspend());
     release();
     await until(() => suspended.done);

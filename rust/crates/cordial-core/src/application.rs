@@ -498,7 +498,7 @@ impl Application {
         manager.profile_budget = build.profile_memory_budget.map(|b| b as usize);
         Self {
             manager,
-            serial: Session::new(),
+            serial: Session::with_identity(build.version, &build.adapter_id),
             build,
             candidates: Vec::new(),
             candidate_seq: 0,
@@ -1709,7 +1709,7 @@ impl Application {
         self.profile_dirty.retain(|p| *p != id);
         self.event_retries
             .retain(|(r, _)| *r != EventRead::Profile(id));
-        if self.serial.active() && !self.profile_removed.contains(&id) {
+        if self.serial.open() && !self.profile_removed.contains(&id) {
             self.profile_removed.push_back(id);
         }
     }
@@ -2053,7 +2053,7 @@ impl Application {
                             Err(_) => return Err(Error::StorageFailed),
                         }
                     }
-                    if self.serial.active() {
+                    if self.serial.open() {
                         self.mark(device, DEVICE);
                     }
                 }
@@ -3931,13 +3931,13 @@ impl Application {
                 .close(link, Some(Error::AuthenticationRejected), radio);
             return;
         }
-        let active = self.serial.active();
+        let open = self.serial.open();
         let link_peer = self.manager.connection(link).unwrap().peer;
         let pair = self.pair.as_mut().unwrap();
         if pair.bonding.is_some() {
             return;
         }
-        if pair.cancelling.is_some() || now >= pair.deadline || !active {
+        if pair.cancelling.is_some() || now >= pair.deadline || !open {
             return self.bond_failed(identity, Error::AuthenticationRejected, radio);
         }
         // A Classic bond keeps the address it paired with, and no bond changes transport.
@@ -4421,7 +4421,7 @@ impl Application {
     /// Cleanup waits for its previous events, so neither a long list nor a slow host retains
     /// one removal or changed-device notification per saved record.
     fn cleanup_ready(&self) -> bool {
-        !self.serial.active()
+        !self.serial.open()
             || (self.serial.idle()
                 && self.removed.is_empty()
                 && self.profile_removed.is_empty()
@@ -4724,7 +4724,7 @@ impl Application {
         }
         while let Some(id) = self.manager.removed.pop() {
             self.forget_device(id);
-            if self.serial.active() {
+            if self.serial.open() {
                 self.removed.push_back(id);
             }
             self.adapter_dirty = true;
@@ -5056,7 +5056,7 @@ impl Application {
         if core::mem::take(&mut self.maintenance_turn) && self.maintain(store, radio, now).await {
             return true;
         }
-        if self.serial.active() && self.flush(store, radio, now).await {
+        if self.serial.open() && self.flush(store, radio, now).await {
             self.maintenance_turn = true;
             return true;
         }

@@ -11,6 +11,7 @@
 //! [`rules`] puts profile rules in the form the Dongle saves them.
 //!
 //! The library keeps no state beyond the open connection and writes nothing to stdout or logs.
+pub mod compatibility;
 mod connection;
 mod error;
 pub mod migration;
@@ -19,7 +20,9 @@ pub mod rules;
 #[cfg(feature = "serialport")]
 pub mod serial;
 
-pub use connection::{Connection, DEFAULT_TIMEOUT, Received};
+pub use connection::{
+    Connection, DEFAULT_TIMEOUT, HANDSHAKE_TIMEOUT, MAX_RECEIVED_FRAME_BYTES, Received,
+};
 pub use cordial_protocol as protocol;
 pub use error::Error;
 

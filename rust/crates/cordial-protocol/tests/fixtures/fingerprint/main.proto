@@ -1,0 +1,14 @@
+syntax = "proto3";
+package fingerprint.main;
+
+import public "dependency.proto";
+import "other.proto";
+
+message Envelope {
+  fingerprint.dependency.Record record = 1;
+  fingerprint.dependency.Extra extra = 4;
+  oneof result {
+    uint32 count = 2;
+    string error = 3;
+  }
+}

@@ -1,19 +1,28 @@
-// One session with a Dongle over a ByteStream. Requests go out one at a time
-// and each Response answers the oldest unanswered request; Events arrive in
-// between. Opening sends a delimiter and GetStatus, and everything the Dongle
-// sent before the answer to that first request is ignored.
+// One session with a Dongle over a ByteStream. Opening sends a delimiter and the
+// empty ClientHello query, skips any responses and events the Dongle sends before
+// its AdapterHello, and continues only when that hello is valid and names the
+// current protocol revision; it then reads GetStatus.
+// Requests go out one at a time and each Response answers the oldest
+// unanswered request; Events arrive in between.
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import {
+  ClientHelloSchema,
+  CURRENT_PROTOCOL_VERSION,
   DELIMITER,
   ErrorCode,
   ErrorOutcome,
   ErrorReason,
   ErrorSchema,
   FrameDecoder,
+  HandshakeError,
+  MAX_HANDSHAKE_BYTES,
   MAX_REQUEST_BYTES,
   MessageSchema,
   RequestSchema,
+  decodeAdapterHello,
+  encodeClientHello,
   encodeFrame,
+  type AdapterHello,
   type Device,
   type DeviceList,
   type DeviceListEntry,
@@ -83,6 +92,17 @@ export class UnexpectedResponseError extends Error {
 export const entryId = (e: DeviceListEntry | ProfileListEntry): number | undefined =>
   e.entry.case === "device" || e.entry.case === "profile" ? e.entry.value.id : e.entry.case === "error" ? e.entry.value.id : undefined;
 
+/** The adapter answered the handshake with another protocol revision. The stream is closed. */
+export class ProtocolVersionError extends Error {
+  /** The adapter's hello, with its revision and whatever metadata it sent. */
+  readonly hello: AdapterHello;
+  constructor(hello: AdapterHello) {
+    super(`the adapter uses protocol ${hello.protocolVersion}, not ${CURRENT_PROTOCOL_VERSION}`);
+    this.name = "ProtocolVersionError";
+    this.hello = hello;
+  }
+}
+
 /** The session ended before a request was answered. */
 export class ConnectionClosedError extends Error {
   constructor(message = "connection closed") {
@@ -103,7 +123,7 @@ export interface ConnectionOptions {
   /** The session ended by itself: the port closed or the Dongle broke the protocol. */
   onClose?: (error: Error) => void;
   log?: (message: string) => void;
-  /** How long the first response may stall without incoming bytes. */
+  /** How long opening may take in all, from the hello to the status. */
   openTimeoutMs?: number;
   /** How long any later response may stall without incoming bytes before the session ends. */
   timeoutMs?: number;
@@ -120,18 +140,44 @@ interface Pending {
 const OPEN_TIMEOUT_MS = 4000;
 const TIMEOUT_MS = 10_000;
 
+/** Whether `bytes` have the Message envelope: one or more length-delimited fields 1 or 2, a
+ * response or an event. Only the envelope is checked, since the payload's revision isn't known
+ * before the hello. No valid AdapterHello has this shape. */
+function isMessage(bytes: Uint8Array): boolean {
+  let at = 0;
+  const varint = () => {
+    let value = 0;
+    for (let i = 0; i < 10; i++) {
+      const byte = bytes[at++];
+      if (byte === undefined) return -1;
+      value += (byte & 0x7f) * 2 ** (7 * i);
+      if (byte < 0x80) return value;
+    }
+    return -1;
+  };
+  while (at < bytes.length) {
+    const key = varint();
+    if (key !== 0x0a && key !== 0x12) return false;
+    const length = varint();
+    if (length < 0 || length > bytes.length - at) return false;
+    at += length;
+  }
+  return bytes.length > 0;
+}
+
 export class Connection {
   readonly #stream: ByteStream;
   readonly #options: ConnectionOptions;
-  readonly #decoder = new FrameDecoder();
+  /** Bounded while waiting for the adapter's hello, then unbounded. */
+  #decoder = new FrameDecoder(MAX_HANDSHAKE_BYTES);
+  #hello: AdapterHello | null = null;
+  #greeting: { resolve(): void; reject(error: Error): void } | null = null;
   readonly #queue: Pending[] = [];
   /** The request written and not yet answered. */
   #sent: Pending | null = null;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #status: Status | null = null;
   #closed = false;
-  /** The first response has arrived; earlier input is ignored, later bad input is fatal. */
-  #confirmed = false;
 
   private constructor(stream: ByteStream, options: ConnectionOptions) {
     this.#stream = stream;
@@ -141,14 +187,23 @@ export class Connection {
   }
 
   /**
-   * Starts a session on an open stream and reads the Dongle's status. Rejects,
-   * closing the stream, when nothing there answers as a Dongle.
+   * Starts a session on an open stream: exchanges hellos, then reads the Dongle's status. Rejects,
+   * closing the stream, when nothing there completes the handshake in time, or with
+   * ProtocolVersionError when the adapter uses another protocol revision.
    */
   static async open(stream: ByteStream, options: ConnectionOptions = {}): Promise<Connection> {
     const connection = new Connection(stream, options);
+    const timeoutMs = options.openTimeoutMs ?? OPEN_TIMEOUT_MS;
+    // Input can't extend this deadline, unlike the request timeout.
+    const deadline = setTimeout(() => connection.#fail(new Error(connection.#hello ? "getStatus got no response" : "the adapter sent no hello")), timeoutMs);
     try {
-      // The delimiter ends whatever an earlier client left half-written.
-      const response = await connection.#enqueue({ case: "getStatus", value: {} }, options.openTimeoutMs ?? OPEN_TIMEOUT_MS, true);
+      await new Promise<void>((resolve, reject) => {
+        connection.#greeting = { resolve, reject };
+        // The delimiter ends whatever an earlier client left half-written.
+        const hello = encodeClientHello(create(ClientHelloSchema));
+        stream.write(new Uint8Array([DELIMITER, ...encodeFrame(hello)])).catch((error: Error) => connection.#fail(new Error(`serial write failed: ${error.message}`)));
+      });
+      const response = await connection.#enqueue({ case: "getStatus", value: {} }, timeoutMs);
       if (response.result.case !== "status") throw new Error("the first response is not a status");
       // The session can end after the response and before this continuation runs, before
       // onClose could report it.
@@ -159,7 +214,14 @@ export class Connection {
       connection.#fail(error as Error);
       await stream.close().catch(() => {});
       throw error;
+    } finally {
+      clearTimeout(deadline);
     }
+  }
+
+  /** The adapter's hello, which may omit any of its metadata. */
+  get hello(): AdapterHello {
+    return this.#hello!;
   }
 
   /** The Dongle's status when the session started. */
@@ -178,14 +240,13 @@ export class Connection {
     return this.#enqueue(command, this.#options.timeoutMs ?? TIMEOUT_MS);
   }
 
-  #enqueue(command: Command, timeoutMs: number, first = false): Promise<Response> {
+  #enqueue(command: Command, timeoutMs: number): Promise<Response> {
     if (this.#closed) return Promise.reject(new ConnectionClosedError());
     const request = create(RequestSchema, { command });
     const bytes = toBinary(RequestSchema, request);
     // Never sent, so it had no effect.
     if (bytes.length > MAX_REQUEST_BYTES) return Promise.reject(new CordialError(command.case, { code: ErrorCode.TOO_LONG, outcome: ErrorOutcome.NO_EFFECT }));
-    const encoded = encodeFrame(bytes);
-    const frame = first ? new Uint8Array([DELIMITER, ...encoded]) : encoded;
+    const frame = encodeFrame(bytes);
     return new Promise<Response>((resolve, reject) => {
       this.#queue.push({ request, frame, timeoutMs, resolve, reject });
       this.#next();
@@ -346,39 +407,57 @@ export class Connection {
 
   // ---- Input ----------------------------------------------------------------
 
-  #receive(chunk: Uint8Array) {
+  #receive(chunk: Uint8Array): void {
     if (this.#closed) return;
+    if (!this.#hello) return this.#handshake(chunk);
     if (chunk.length) this.#armTimeout();
     for (const frame of this.#decoder.push(chunk)) {
       if (this.#closed) return;
-      let problem: string | null = null;
+      if (!frame.ok) return this.#fail(new Error(`the Dongle sent a ${frame.error === "too_long" ? "too long" : "malformed"} frame`));
       let message;
-      if (!frame.ok) problem = `the Dongle sent a ${frame.error === "too_long" ? "too long" : "malformed"} frame`;
-      else
-        try {
-          message = fromBinary(MessageSchema, frame.bytes);
-        } catch {
-          problem = "the Dongle sent an undecodable frame";
-        }
-      if (!message) {
-        if (this.#confirmed) return this.#fail(new Error(problem!));
-        this.#options.log?.("ignoring input left from an earlier session");
-        continue;
+      try {
+        message = fromBinary(MessageSchema, frame.bytes);
+      } catch {
+        return this.#fail(new Error("the Dongle sent an undecodable frame"));
       }
       const kind = message.kind;
       if (kind.case === "response") this.#respond(kind.value);
-      // Events can't belong to this session before its first response.
-      else if (kind.case === "event" && this.#confirmed) this.#notify(() => this.#options.onEvent?.(kind.value));
+      else if (kind.case === "event") this.#notify(() => this.#options.onEvent?.(kind.value));
+    }
+  }
+
+  /** Reads frames until the adapter's hello, one frame at a time so the bytes after it go to the
+   * unbounded decoder. Responses and events the Dongle sent before the hello, such as those queued
+   * for an earlier client, are dropped, and so is any frame longer than a hello can be, since it
+   * may be an event. Any other frame fails the handshake. */
+  #handshake(chunk: Uint8Array): void {
+    let start = 0;
+    while (start < chunk.length) {
+      const end = chunk.indexOf(DELIMITER, start);
+      const next = end === -1 ? chunk.length : end + 1;
+      const [frame] = this.#decoder.push(chunk.subarray(start, next));
+      start = next;
+      if (!frame || (!frame.ok && frame.error === "too_long")) continue;
+      let hello: AdapterHello;
+      try {
+        if (!frame.ok) throw new HandshakeError(frame.error);
+        hello = decodeAdapterHello(frame.bytes);
+      } catch (error) {
+        if (frame.ok && isMessage(frame.bytes)) continue;
+        return this.#fail(new Error(`the adapter sent an invalid hello: ${(error as Error).message}`));
+      }
+      if (hello.protocolVersion !== CURRENT_PROTOCOL_VERSION) return this.#fail(new ProtocolVersionError(hello));
+      this.#hello = hello;
+      this.#decoder = new FrameDecoder();
+      this.#greeting?.resolve();
+      this.#greeting = null;
+      return this.#receive(chunk.subarray(next));
     }
   }
 
   #respond(response: Response) {
     const pending = this.#sent;
-    if (!pending) {
-      if (this.#confirmed) this.#fail(new Error("the Dongle sent a response to no request"));
-      return;
-    }
-    this.#confirmed = true;
+    if (!pending) return this.#fail(new Error("the Dongle sent a response to no request"));
     this.#sent = null;
     clearTimeout(this.#timer);
     this.#notify(() => this.#options.onResponse?.(pending.request, response));
@@ -410,6 +489,8 @@ export class Connection {
   #stop(error: Error) {
     this.#closed = true;
     clearTimeout(this.#timer);
+    this.#greeting?.reject(error);
+    this.#greeting = null;
     const closed = error instanceof ConnectionClosedError ? error : new ConnectionClosedError(error.message);
     for (const pending of [...(this.#sent ? [this.#sent] : []), ...this.#queue.splice(0)]) pending.reject(closed);
     this.#sent = null;

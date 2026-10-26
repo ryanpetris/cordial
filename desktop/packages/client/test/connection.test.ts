@@ -1,10 +1,31 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
-import { ErrorCode, ErrorOutcome, ErrorReason, FrameDecoder, MessageSchema, RequestSchema, ResourceType, Transport, UsageRange_Kind, encodeFrame, type Request, type ResponseSchema } from "@cordial/protocol";
+import {
+  AdapterHelloSchema,
+  CURRENT_PROTOCOL_VERSION,
+  ErrorCode,
+  ErrorOutcome,
+  ErrorReason,
+  FrameDecoder,
+  MessageSchema,
+  RequestSchema,
+  ResourceType,
+  Transport,
+  UsageRange_Kind,
+  decodeClientHello,
+  encodeAdapterHello,
+  encodeFrame,
+  type AdapterHelloSchema as AdapterHelloInit,
+  type ClientHello,
+  type Request,
+  type ResponseSchema,
+} from "@cordial/protocol";
 import { describe, expect, it, vi } from "vitest";
-import { Connection, ConnectionClosedError, CordialError, UnexpectedResponseError, type ByteStream } from "../src/index.ts";
+import { Connection, ConnectionClosedError, CordialError, ProtocolVersionError, UnexpectedResponseError, type ByteStream } from "../src/index.ts";
 
-/** A stream whose far end the test plays: it records requests and sends messages. */
+/** A stream whose far end the test plays: it answers each hello, records requests and sends
+ * messages. */
 class Peer implements ByteStream {
+  hellos: ClientHello[] = [];
   requests: Request[] = [];
   written: Uint8Array[] = [];
   closed = false;
@@ -12,6 +33,8 @@ class Peer implements ByteStream {
   #close: ((error: Error | null) => void)[] = [];
   readonly #decoder = new FrameDecoder();
   onRequest: (request: Request) => void = () => {};
+  /** Answers each client hello; by default with the current revision. */
+  onHello: (hello: ClientHello) => void = () => queueMicrotask(() => this.hello({ protocolVersion: CURRENT_PROTOCOL_VERSION }));
 
   onData(listener: (chunk: Uint8Array) => void) {
     this.#data.push(listener);
@@ -23,6 +46,12 @@ class Peer implements ByteStream {
     this.written.push(bytes);
     for (const frame of this.#decoder.push(bytes)) {
       if (!frame.ok) throw new Error(frame.error);
+      if (!frame.bytes.length) {
+        const hello = decodeClientHello(frame.bytes);
+        this.hellos.push(hello);
+        this.onHello(hello);
+        continue;
+      }
       const request = fromBinary(RequestSchema, frame.bytes);
       this.requests.push(request);
       this.onRequest(request);
@@ -36,6 +65,9 @@ class Peer implements ByteStream {
   }
   frame(message: MessageInitShape<typeof MessageSchema>) {
     return encodeFrame(toBinary(MessageSchema, create(MessageSchema, message)));
+  }
+  hello(hello: MessageInitShape<typeof AdapterHelloInit>) {
+    this.raw(encodeFrame(encodeAdapterHello(create(AdapterHelloSchema, hello))));
   }
   send(...messages: MessageInitShape<typeof MessageSchema>[]) {
     const frames = messages.map((m) => [...this.frame(m)]);
@@ -59,19 +91,176 @@ async function open(options = {}) {
 }
 
 describe("Connection", () => {
-  it("starts with a delimiter and ignores everything before the first response", async () => {
+  it("sends a delimiter and the empty hello first and skips empty frames before the adapter's hello", async () => {
     const peer = new Peer();
     const events = vi.fn();
-    peer.onRequest = () =>
+    peer.onHello = () =>
       queueMicrotask(() => {
-        peer.raw(new Uint8Array([0x41, 0x42, 0]));
-        peer.send(removed(99), status);
+        expect(peer.requests).toEqual([]);
+        peer.raw(new Uint8Array([0, 0]));
+        peer.hello({ protocolVersion: CURRENT_PROTOCOL_VERSION, firmwareVersion: "1.2.3", serialNumber: "S1", name: "Desk" });
       });
+    peer.onRequest = () => queueMicrotask(() => peer.send(status));
     const connection = await Connection.open(peer, { onEvent: events });
-    expect(peer.written[0]![0]).toBe(0);
-    expect(peer.requests[0]!.command.case).toBe("getStatus");
+    expect([...peer.written[0]!]).toEqual([0, 1, 0]);
+    expect(peer.hellos).toHaveLength(1);
+    expect(peer.requests.map((r) => r.command.case)).toEqual(["getStatus"]);
+    expect(connection.hello).toMatchObject({ protocolVersion: CURRENT_PROTOCOL_VERSION, firmwareVersion: "1.2.3", serialNumber: "S1", name: "Desk" });
     expect(connection.status.id).toBe("A1");
     expect(events).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["garbage", new Uint8Array([0x41, 0x42, 0])],
+    ["a hello with version zero", encodeFrame(new Uint8Array([8, 0]))],
+    ["a hello with two versions", encodeFrame(new Uint8Array([8, 1, 8, 1]))],
+    ["a hello without a version", encodeFrame(new Uint8Array([0x1a, 1, 0x31]))],
+    ["an empty frame", encodeFrame(new Uint8Array())],
+    ["a response followed by a version", encodeFrame(new Uint8Array([0x0a, 0, 8, 1]))],
+    ["a truncated response", encodeFrame(new Uint8Array([0x0a, 2, 0x08]))],
+  ])("refuses %s in place of the hello even when a valid hello follows", async (_, bytes) => {
+    const peer = new Peer();
+    const closed = vi.fn();
+    peer.onHello = () => queueMicrotask(() => {
+      peer.raw(bytes);
+      peer.hello({ protocolVersion: CURRENT_PROTOCOL_VERSION });
+    });
+    peer.onRequest = () => queueMicrotask(() => peer.send(status));
+    const error = await Connection.open(peer, { onClose: closed }).catch((e: unknown) => e);
+    expect(error).toMatchObject({ message: expect.stringMatching(/^the adapter sent an invalid hello/) });
+    expect(error).not.toBeInstanceOf(ProtocolVersionError);
+    expect(peer.requests).toEqual([]);
+    expect(peer.written).toHaveLength(1);
+    expect(peer.closed).toBe(true);
+    expect(closed).not.toHaveBeenCalled();
+  });
+
+  it("skips responses and events before the adapter's hello, however long", async () => {
+    const peer = new Peer();
+    const events = vi.fn();
+    const long = { kind: { case: "event", value: { kind: { case: "device", value: { id: 1, name: "x".repeat(2000) } } } } } as const;
+    peer.onHello = () => queueMicrotask(() => {
+      peer.send(status, removed(1), long);
+      peer.hello({ protocolVersion: CURRENT_PROTOCOL_VERSION });
+    });
+    peer.onRequest = () => queueMicrotask(() => peer.send(status));
+    const connection = await Connection.open(peer, { onEvent: events });
+    expect(peer.requests.map((r) => r.command.case)).toEqual(["getStatus"]);
+    expect(events).not.toHaveBeenCalled();
+    await connection.close();
+  });
+
+  it("skips oversized frames that arrive in pieces before the adapter's hello", async () => {
+    const peer = new Peer();
+    const events = vi.fn();
+    const long = peer.frame({ kind: { case: "event", value: { kind: { case: "device", value: { id: 1, name: "x".repeat(5000) } } } } });
+    // Bytes past the hello limit are dropped undecoded, so this isn't reported as malformed COBS.
+    const garbage = new Uint8Array([...new Uint8Array(1100).fill(7), 0]);
+    peer.onHello = () => queueMicrotask(() => {
+      for (const frame of [long, garbage]) for (let at = 0; at < frame.length; at += 100) peer.raw(frame.subarray(at, at + 100));
+      peer.hello({ protocolVersion: CURRENT_PROTOCOL_VERSION });
+    });
+    peer.onRequest = () => queueMicrotask(() => peer.send(status));
+    const connection = await Connection.open(peer, { onEvent: events });
+    expect(peer.requests.map((r) => r.command.case)).toEqual(["getStatus"]);
+    expect(events).not.toHaveBeenCalled();
+    await connection.close();
+  });
+
+  it("sends no request when an oversized frame never ends before the deadline", async () => {
+    const peer = new Peer();
+    peer.onHello = () => queueMicrotask(() => {
+      for (let i = 0; i < 10; i++) peer.raw(new Uint8Array(1000).fill(7));
+    });
+    await expect(Connection.open(peer, { openTimeoutMs: 20 })).rejects.toThrow("the adapter sent no hello");
+    expect(peer.requests).toEqual([]);
+    expect(peer.closed).toBe(true);
+  });
+
+  it("sends no request when only responses and events arrive before the deadline", async () => {
+    const peer = new Peer();
+    peer.onHello = () => queueMicrotask(() => peer.send(status, removed(1)));
+    await expect(Connection.open(peer, { openTimeoutMs: 20 })).rejects.toThrow("the adapter sent no hello");
+    expect(peer.requests).toEqual([]);
+    expect(peer.closed).toBe(true);
+  });
+
+  it("opens with a hello that has no metadata", async () => {
+    const { connection } = await open();
+    expect(connection.hello.protocolVersion).toBe(CURRENT_PROTOCOL_VERSION);
+    expect([connection.hello.firmwareVersion, connection.hello.serialNumber, connection.hello.name]).toEqual([undefined, undefined, undefined]);
+    await connection.close();
+  });
+
+  it("decodes frames after the hello without the hello's size limit", async () => {
+    const peer = new Peer();
+    const events = vi.fn();
+    const long = { kind: { case: "event", value: { kind: { case: "device", value: { id: 1, name: "x".repeat(2000) } } } } } as const;
+    peer.onHello = () => queueMicrotask(() => peer.raw(new Uint8Array([
+      ...encodeFrame(encodeAdapterHello(create(AdapterHelloSchema, { protocolVersion: CURRENT_PROTOCOL_VERSION }))),
+      ...peer.frame(long),
+    ])));
+    peer.onRequest = () => queueMicrotask(() => peer.send(status));
+    const connection = await Connection.open(peer, { onEvent: events });
+    expect(events).toHaveBeenCalledOnce();
+    expect(events.mock.calls[0]![0].kind.value.name).toHaveLength(2000);
+    await connection.close();
+  });
+
+  it("keeps a partial frame that follows the hello in the same chunk", async () => {
+    const peer = new Peer();
+    const events = vi.fn();
+    const tail = [...peer.frame(removed(1)), ...peer.frame({ kind: { case: "event", value: { kind: { case: "device", value: { id: 2, name: "x".repeat(2000) } } } } })];
+    const split = tail.length - 500;
+    peer.onHello = () => queueMicrotask(() => {
+      peer.raw(new Uint8Array([...encodeFrame(encodeAdapterHello(create(AdapterHelloSchema, { protocolVersion: CURRENT_PROTOCOL_VERSION }))), ...tail.slice(0, split)]));
+      peer.raw(new Uint8Array(tail.slice(split)));
+    });
+    peer.onRequest = () => queueMicrotask(() => peer.send(status));
+    const connection = await Connection.open(peer, { onEvent: events });
+    expect(events.mock.calls.map(([event]) => event.kind.case)).toEqual(["deviceRemoved", "device"]);
+    expect(events.mock.calls[1]![0].kind.value.name).toHaveLength(2000);
+    await connection.close();
+  });
+
+  it.each([CURRENT_PROTOCOL_VERSION + 1, CURRENT_PROTOCOL_VERSION + 100])("refuses an adapter on protocol %i without sending a request", async (version) => {
+    const peer = new Peer();
+    const closed = vi.fn();
+    peer.onHello = () => queueMicrotask(() => peer.hello({ protocolVersion: version, firmwareVersion: "9.0.0", name: "Desk" }));
+    const error = await Connection.open(peer, { onClose: closed }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ProtocolVersionError);
+    expect((error as ProtocolVersionError).hello).toMatchObject({ protocolVersion: version, firmwareVersion: "9.0.0", name: "Desk" });
+    expect((error as ProtocolVersionError).hello.serialNumber).toBeUndefined();
+    expect(peer.requests).toEqual([]);
+    expect(peer.closed).toBe(true);
+    expect(closed).not.toHaveBeenCalled();
+  });
+
+  it("gives up at the open deadline however much input keeps arriving", async () => {
+    vi.useFakeTimers();
+    try {
+      const peer = new Peer();
+      peer.onHello = () => {};
+      const opening = Connection.open(peer, { openTimeoutMs: 500 }).catch((e: unknown) => e);
+      // Empty frames, then bytes that never end a frame.
+      peer.raw(new Uint8Array([0, 0]));
+      for (let i = 0; i < 10; i++) {
+        peer.raw(new Uint8Array([0x41, 0x42]));
+        await vi.advanceTimersByTimeAsync(60);
+      }
+      expect(await opening).toMatchObject({ message: "the adapter sent no hello" });
+      expect(peer.requests).toEqual([]);
+      expect(peer.closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("includes the status in the open deadline", async () => {
+    const peer = new Peer();
+    await expect(Connection.open(peer, { openTimeoutMs: 20 })).rejects.toThrow("getStatus got no response");
+    expect(peer.requests.map((r) => r.command.case)).toEqual(["getStatus"]);
+    expect(peer.closed).toBe(true);
   });
 
   it("preserves capability kinds, collection-qualified ranges and resource values in status", async () => {
@@ -251,7 +440,8 @@ describe("Connection", () => {
 
   it("fails to open, closing the stream, when nothing answers", async () => {
     const peer = new Peer();
-    await expect(Connection.open(peer, { openTimeoutMs: 20 })).rejects.toThrow("getStatus got no response");
+    peer.onHello = () => {};
+    await expect(Connection.open(peer, { openTimeoutMs: 20 })).rejects.toThrow("the adapter sent no hello");
     expect(peer.closed).toBe(true);
   });
 });

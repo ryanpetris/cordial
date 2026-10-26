@@ -395,12 +395,22 @@ export function AdapterPage({
                 })}
               </Card>
             ) : null}
-            <Card title="Identifiers">
-              <Facts>
-                <Fact label="Adapter ID">{adapter.id}</Fact>
-                {s?.information.storageFormat != null ? <Fact label="Storage Format">{s.information.storageFormat}</Fact> : null}
-              </Facts>
-            </Card>
+            {adapter.refused ? (
+              adapter.refused.serialNumber !== null ? (
+                <Card title="Identifiers">
+                  <Facts>
+                    <Fact label="Serial Number">{adapter.refused.serialNumber}</Fact>
+                  </Facts>
+                </Card>
+              ) : null
+            ) : (
+              <Card title="Identifiers">
+                <Facts>
+                  <Fact label="Adapter ID">{adapter.id}</Fact>
+                  {s?.information.storageFormat != null ? <Fact label="Storage Format">{s.information.storageFormat}</Fact> : null}
+                </Facts>
+              </Card>
+            )}
           </>
         ) : (
           <>
@@ -474,11 +484,11 @@ export function AdapterPage({
               </Card>
             ) : null}
 
-            {s ? (
+            {s || adapter.refused?.firmwareVersion ? (
               <Card title="Information">
                 <Facts>
-                  <Fact label="Firmware">{s.information.firmwareVersion ?? "Unknown"}</Fact>
-                  {s.information.boardName !== null ? <Fact label="Board">{s.information.boardName}</Fact> : null}
+                  <Fact label="Firmware">{s?.information.firmwareVersion ?? adapter.refused?.firmwareVersion ?? "Unknown"}</Fact>
+                  {s?.information.boardName != null ? <Fact label="Board">{s.information.boardName}</Fact> : null}
                   {storage !== null ? <Fact label="Storage">{storage}</Fact> : null}
                 </Facts>
               </Card>

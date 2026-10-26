@@ -391,6 +391,11 @@ pub fn candidate_name(c: &p::Candidate) -> String {
     }
 }
 
+/// A text field an adapter reported, cleaned; None when absent or blank.
+pub fn reported(value: Option<&str>) -> Option<String> {
+    value.map(clean).filter(|v| !v.is_empty())
+}
+
 /// Removes control and format characters, including bidirectional overrides, from untrusted
 /// text, and trims it.
 pub fn clean(s: &str) -> String {

@@ -15,8 +15,11 @@ args = parser.parse_args()
 listing = ["dpkg-query", "-L", args.package] if args.debian else ["pacman", "-Qlq", args.package]
 files = [Path(line) for line in subprocess.check_output(listing, text=True).splitlines()]
 if args.package == "cordial-cli":
+    proto = Path("/usr/share/doc/cordial-cli/proto")
+    revision = int((proto / "serial/current").read_text().strip())
     required = ["/usr/bin/cordial", "/usr/share/doc/cordial-cli/docs/protocol/README.md",
-                "/usr/share/doc/cordial-cli/proto/cordial.proto", "/usr/share/doc/cordial-cli/DEPENDENCIES.md"]
+                str(proto / f"serial/v{revision}/cordial.proto"), str(proto / "handshake.proto"),
+                "/usr/share/doc/cordial-cli/DEPENDENCIES.md"]
     reported = subprocess.check_output(["cordial", "--version"], text=True).strip()
     if args.version and reported != f"cordial {args.version}":
         raise SystemExit(f"Unexpected CLI version: {reported}")

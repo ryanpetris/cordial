@@ -3,7 +3,7 @@
 [Protocol index](README.md)
 
 Each command is one `Request.command` variant; its message in
-[`proto/cordial.proto`](../../proto/cordial.proto) documents its fields. This page describes what
+[`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto) documents its fields. This page describes what
 each command does. A command that needs an unavailable subsystem returns `ERROR_CODE_NOT_READY`.
 Pairing requires both Bluetooth and storage to be ready; aggregate `Status.ready = false` does not
 identify which subsystem is unavailable.
@@ -47,9 +47,9 @@ application filesystem in debug firmware and automatically during required host
 assistance in production. See [file access](development.md#file-access) for path
 validation, bounded reads, atomic writes and availability.
 
-`GetStatus` remains available before storage, identity and radio startup. Hosts
-check `Status.information.target_storage_format` for exact support before any
-interaction except bootstrap status or closing the connection.
+After a compatible permanent hello, `GetStatus` remains available before storage, identity and
+radio startup. Hosts read bootstrap status and check
+`Status.information.target_storage_format` for exact support before any other command.
 `Status.information.storage_format` reports the committed root's format for
 display only.
 

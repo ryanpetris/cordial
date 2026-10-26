@@ -1305,3 +1305,176 @@ fn closed_means_the_port_is_released_even_while_opening() {
     until(&rx, |e| matches!(e, Event::Closed));
     assert_eq!(dongle.handles(), 0);
 }
+
+#[test]
+fn incompatible_opening_retains_metadata_without_requesting_status_or_cached_state() {
+    let dongle = Dongle::with(|sim| {
+        sim.hello.protocol_version = Some(p::CURRENT_PROTOCOL_VERSION + 1);
+        sim.hello.name = Some("Desk".into());
+    });
+    let (controller, events) = setup(&dongle);
+    controller.open("sim".into());
+    let Event::Connection {
+        phase: Phase::Failed { error, open },
+        ..
+    } = until(&events, |event| {
+        matches!(
+            event,
+            Event::Connection {
+                phase: Phase::Failed { .. },
+                ..
+            }
+        )
+    })
+    else {
+        unreachable!()
+    };
+    assert!(!open);
+    assert_eq!(
+        error.native_hello.unwrap().hello.name.as_deref(),
+        Some("Desk")
+    );
+    assert!(dongle.sent().is_empty());
+    assert!(controller.state().is_none());
+    assert!(events.try_iter().all(|event| !matches!(
+        event,
+        Event::Connection {
+            phase: Phase::Lost(_),
+            ..
+        }
+    )));
+}
+
+#[test]
+fn closing_a_negotiating_controller_releases_its_port_without_waiting_for_the_hello_deadline() {
+    let dongle = Dongle::with(|sim| sim.answer_hello = false);
+    let (controller, events) = setup(&dongle);
+    controller.open("sim".into());
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while dongle.0.lock().unwrap().hellos == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let started = std::time::Instant::now();
+    controller.close();
+    until(&events, |event| matches!(event, Event::Closed));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(dongle.sent().is_empty());
+    assert!(controller.state().is_none());
+}
+
+#[test]
+fn closing_a_replacement_waits_for_the_previous_sessions_reader() {
+    use std::{
+        io::{self, Read, Write},
+        sync::Mutex,
+    };
+
+    struct Reader {
+        responses: Receiver<Vec<u8>>,
+        entered: mpsc::Sender<()>,
+        release: Receiver<()>,
+        reads: usize,
+    }
+    impl Read for Reader {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.reads == 3 {
+                self.entered.send(()).unwrap();
+                self.release.recv().unwrap();
+                return Ok(0);
+            }
+            let bytes = self.responses.recv().unwrap();
+            out[..bytes.len()].copy_from_slice(&bytes);
+            self.reads += 1;
+            Ok(bytes.len())
+        }
+    }
+    struct Writer {
+        responses: mpsc::Sender<Vec<u8>>,
+        closing: mpsc::Sender<()>,
+        writes: usize,
+    }
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut response = Vec::new();
+            if self.writes == 0 {
+                p::frame::encode(
+                    &p::AdapterHello {
+                        protocol_version: Some(p::CURRENT_PROTOCOL_VERSION),
+                        ..Default::default()
+                    },
+                    &mut response,
+                );
+            } else {
+                p::frame::encode(
+                    &p::Message {
+                        kind: Some(p::message::Kind::Response(p::Response {
+                            result: Some(if self.writes == 1 {
+                                p::response::Result::Status(common::status(true))
+                            } else {
+                                p::response::Result::Devices(p::DeviceList::default())
+                            }),
+                        })),
+                    },
+                    &mut response,
+                );
+            }
+            self.writes += 1;
+            self.responses.send(response).unwrap();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            self.closing.send(()).unwrap();
+        }
+    }
+
+    let (responses, input) = mpsc::channel();
+    let (entered, reading) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let (closing, shutdown) = mpsc::channel();
+    let reader = Mutex::new(Some(Reader {
+        responses: input,
+        entered,
+        release: held,
+        reads: 0,
+    }));
+    let (send, events) = mpsc::channel();
+    let controller = Controller::with_connector(
+        move |event| {
+            let _ = send.send(event);
+        },
+        move |_, handler| {
+            Ok(cordial_client::Connection::with_handler(
+                reader.lock().unwrap().take().unwrap(),
+                Writer {
+                    responses: responses.clone(),
+                    closing: closing.clone(),
+                    writes: 0,
+                },
+                handler,
+            ))
+        },
+    );
+    controller.open("sim".into());
+    until(&events, |event| {
+        matches!(
+            event,
+            Event::Connection {
+                phase: Phase::Ready,
+                ..
+            }
+        )
+    });
+    reading.recv_timeout(Duration::from_secs(1)).unwrap();
+    controller.open("sim".into());
+    shutdown.recv_timeout(Duration::from_secs(1)).unwrap();
+    controller.close();
+    assert!(events.recv_timeout(Duration::from_millis(100)).is_err());
+    release.send(()).unwrap();
+    until(&events, |event| matches!(event, Event::Closed));
+}

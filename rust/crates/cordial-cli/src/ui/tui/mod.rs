@@ -33,6 +33,7 @@ use crate::{
 };
 use add::AddDevice;
 use cordial_client::{
+    compatibility::NativeHello,
     migration::{Outcome as Migrated, Result as MigrationResult},
     serial::PortInfo,
 };
@@ -44,6 +45,7 @@ use profiles::ProfilePage;
 use settings::Draft;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use world::{AdapterView, DeviceView, Storage};
@@ -403,6 +405,14 @@ pub(super) struct Off {
     error: Option<String>,
 }
 
+/// A port whose adapter refused the connection because Cordial doesn't support its protocol.
+pub(super) struct Refused {
+    hello: Arc<NativeHello>,
+    why: String,
+    /// Refresh or Connect asked for the port to be opened again.
+    retry: bool,
+}
+
 /// One settings save, while it runs and after it fails.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Submission {
@@ -436,6 +446,8 @@ pub(crate) struct Model<F: Fleet> {
     sessions: Vec<Session>,
     held: BTreeMap<String, Held>,
     off: BTreeMap<String, Off>,
+    /// Refused ports, listed until they go away. One is opened again only on Refresh or Connect.
+    refused: BTreeMap<String, Refused>,
     /// Sessions closing, with the port each holds until it has closed.
     closing: HashMap<Slot, String>,
 
@@ -514,6 +526,7 @@ impl<F: Fleet> Model<F> {
             sessions: Vec::new(),
             held: BTreeMap::new(),
             off: BTreeMap::new(),
+            refused: BTreeMap::new(),
             closing: HashMap::new(),
             states: HashMap::new(),
             adapters: Vec::new(),
@@ -858,10 +871,16 @@ impl<F: Fleet> Model<F> {
         self.fleet.list_ports();
     }
 
-    /// Lists the attached adapters now, trying ports that failed again at once.
+    /// Lists the attached adapters now, trying ports that failed or were refused again at once.
+    /// A migration owns the ports, so refused ports aren't tried again for it.
     fn refresh_adapters(&mut self) {
         for retry in self.failed.values_mut() {
             retry.at = Instant::now();
+        }
+        if self.migration.is_none() {
+            for refused in self.refused.values_mut() {
+                refused.retry = true;
+            }
         }
         self.list_due = Instant::now();
         self.discover();
@@ -890,6 +909,8 @@ impl<F: Fleet> Model<F> {
             self.lose(slot);
         }
         self.failed
+            .retain(|port, _| present.contains(port.as_str()));
+        self.refused
             .retain(|port, _| present.contains(port.as_str()));
         for (id, off) in &mut self.off {
             let port = ports
@@ -924,6 +945,12 @@ impl<F: Fleet> Model<F> {
                     .filter(|(_, r)| r.at > now)
                     .map(|(p, _)| p.clone()),
             )
+            .chain(
+                self.refused
+                    .iter()
+                    .filter(|(_, r)| !r.retry)
+                    .map(|(p, _)| p.clone()),
+            )
             .collect();
         for port in &ports {
             let held_off = self
@@ -932,6 +959,9 @@ impl<F: Fleet> Model<F> {
                 .any(|(id, o)| holds(id, o.port.as_deref(), port));
             if busy.contains(&port.port) || held_off {
                 continue;
+            }
+            if let Some(refused) = self.refused.get_mut(&port.port) {
+                refused.retry = false;
             }
             let slot = self.fleet.open(&port.port);
             self.probes.insert(slot, port.port.clone());
@@ -1033,15 +1063,25 @@ impl<F: Fleet> Model<F> {
                     s.unready = Some(words::failure(&error));
                 }
             }
-            Phase::Failed { open: false, .. } => {
+            Phase::Failed { error, open: false } => {
                 if let Some(port) = self.probes.remove(&slot) {
-                    self.fail(port.clone());
-                    self.close_on(slot, port);
+                    self.close_on(slot, port.clone());
+                    match &error.native_hello {
+                        Some(hello) => self.refuse(port, hello.clone(), &error),
+                        None => {
+                            self.refused.remove(&port);
+                            self.fail(port);
+                        }
+                    }
                 } else if let Some(port) = self.port_of(slot)
                     && let Some(id) = self.connecting_off(slot)
                 {
                     self.close_on(slot, port);
-                    let why = words::open_failed(&self.off_name(&id));
+                    let why = if error.native_hello.is_some() {
+                        words::failure(&error)
+                    } else {
+                        words::open_failed(&self.off_name(&id))
+                    };
                     self.connect_failed(&id, &why);
                 }
             }
@@ -1056,6 +1096,7 @@ impl<F: Fleet> Model<F> {
             }
             Phase::Lost(_) => {
                 if let Some(port) = self.probes.remove(&slot) {
+                    self.refused.remove(&port);
                     self.fail(port.clone());
                     self.close_on(slot, port);
                 } else if let Some(port) = self.port_of(slot)
@@ -1080,6 +1121,11 @@ impl<F: Fleet> Model<F> {
             .map(|st| st.status.id.clone())
             .unwrap_or_default();
         if let Some(port) = self.probes.remove(&slot) {
+            self.refused.remove(&port);
+            // A refused adapter's page follows it once it answers.
+            if !id.is_empty() && self.page == Page::Adapter(port.clone()) {
+                self.page = Page::Adapter(id.clone());
+            }
             if id.is_empty() || self.session_of(&id).is_some() {
                 self.fail(port.clone());
                 return self.close_on(slot, port);
@@ -1102,6 +1148,33 @@ impl<F: Fleet> Model<F> {
         };
         self.off.remove(&key);
         self.register(slot, port, id);
+    }
+
+    /// Lists a port whose adapter refused the connection. An adapter held on the port, as its
+    /// USB serial number suggests, is no longer expected back; its page shows the refusal.
+    fn refuse(&mut self, port: String, hello: Arc<NativeHello>, error: &Error) {
+        if let Some(info) = self.ports.iter().find(|p| p.port == port) {
+            let ids: Vec<String> = self
+                .held
+                .keys()
+                .filter(|id| info.is_adapter(id))
+                .cloned()
+                .collect();
+            for id in ids {
+                self.held.remove(&id);
+                if self.page == Page::Adapter(id) {
+                    self.page = Page::Adapter(port.clone());
+                }
+            }
+        }
+        self.refused.insert(
+            port,
+            Refused {
+                hello,
+                why: words::failure(error),
+                retry: false,
+            },
+        );
     }
 
     fn register(&mut self, slot: Slot, port: String, id: String) {
@@ -1234,8 +1307,16 @@ impl<F: Fleet> Model<F> {
         self.close_on(s.slot, s.port);
     }
 
-    /// Opens a disconnected adapter again.
+    /// Opens a disconnected adapter again, or a refused port on the next listing.
     fn connect_adapter(&mut self, id: &str) {
+        if self.refused.contains_key(id) && self.migration.is_some() {
+            return self.toast(text::sentence(migration::BUSY));
+        }
+        if let Some(refused) = self.refused.get_mut(id) {
+            refused.retry = true;
+            self.list_due = Instant::now();
+            return self.discover();
+        }
         let Some(off) = self.off.get(id) else {
             return;
         };

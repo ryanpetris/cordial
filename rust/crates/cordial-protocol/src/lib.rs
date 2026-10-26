@@ -1,7 +1,7 @@
-//! The Cordial serial API: protobuf messages generated from `proto/cordial.proto`, the frame
+//! The Cordial serial API: protobuf messages generated from `proto/serial/v1/cordial.proto`, the frame
 //! encoding used on the USB serial port, and the Dongle's saved records in [`storage`].
 //!
-//! A client sends [`Request`] frames and receives [`Message`] frames, each holding a
+//! The permanent [`handshake`] identifies the operational revision. A client sends [`Request`] frames and receives [`Message`] frames, each holding a
 //! [`Response`] or an [`Event`]. [`frame`] turns messages into frames and back.
 #![cfg_attr(not(feature = "json"), no_std)]
 
@@ -9,9 +9,19 @@ extern crate alloc;
 
 #[allow(clippy::all, clippy::pedantic, missing_docs)]
 mod generated {
-    include!(concat!(env!("OUT_DIR"), "/cordial.rs"));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/",
+        env!("CORDIAL_OPERATIONAL_PACKAGE"),
+        ".rs"
+    ));
     #[cfg(feature = "json")]
-    include!(concat!(env!("OUT_DIR"), "/cordial.serde.rs"));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/",
+        env!("CORDIAL_OPERATIONAL_PACKAGE"),
+        ".serde.rs"
+    ));
 }
 pub use generated::*;
 
@@ -34,6 +44,10 @@ pub mod migration {
 #[cfg(feature = "json")]
 mod error_json;
 pub mod frame;
+pub mod handshake;
+pub use handshake::{AdapterHello, ClientHello, MAX_HANDSHAKE_BYTES};
+
+include!(concat!(env!("OUT_DIR"), "/current.rs"));
 
 /// USB vendor ID of every Dongle (pid.codes).
 pub const USB_VENDOR_ID: u16 = 0x1209;

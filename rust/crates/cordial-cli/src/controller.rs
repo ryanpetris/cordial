@@ -575,6 +575,7 @@ impl Drop for PendingGuard<'_> {
 struct Active {
     generation: SessionId,
     session: Option<Arc<Session>>,
+    opening: Option<Arc<Session>>,
     closing: bool,
 }
 
@@ -612,6 +613,7 @@ impl Controller {
                 active: Mutex::new(Active {
                     generation: 0,
                     session: None,
+                    opening: None,
                     closing: false,
                 }),
                 gate: Mutex::new(()),
@@ -638,7 +640,10 @@ impl Controller {
             let mut active = self.inner.active.lock().unwrap();
             active.generation += 1;
             active.closing = false;
-            (active.generation, active.session.take())
+            let old = active.session.take().or_else(|| active.opening.take());
+            // Close can wait for this port while the replacement worker releases it.
+            active.opening = old.clone();
+            (active.generation, old)
         };
         let inner = self.inner.clone();
         thread::spawn(move || open(&inner, id, port, adapter, old));
@@ -653,14 +658,17 @@ impl Controller {
                 return;
             }
             active.closing = true;
-            (active.generation, active.session.take())
+            (
+                active.generation,
+                active.session.take().or_else(|| active.opening.take()),
+            )
         };
         let inner = self.inner.clone();
         thread::spawn(move || {
-            let _gate = inner.gate.lock().unwrap();
             if let Some(old) = old {
                 old.shutdown();
             }
+            let _gate = inner.gate.lock().unwrap();
             let current = {
                 let active = inner.active.lock().unwrap();
                 active.generation == id && active.closing
@@ -712,7 +720,8 @@ impl Controller {
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        if let Some(session) = self.active.get_mut().unwrap().session.take() {
+        let active = self.active.get_mut().unwrap();
+        if let Some(session) = active.session.take().or_else(|| active.opening.take()) {
             session.shutdown();
         }
     }
@@ -725,9 +734,16 @@ fn open(
     adapter: Option<String>,
     old: Option<Arc<Session>>,
 ) {
-    let gate = inner.gate.lock().unwrap();
     if let Some(old) = old {
         old.shutdown();
+    }
+    let gate = inner.gate.lock().unwrap();
+    {
+        let mut active = inner.active.lock().unwrap();
+        if active.generation != id || active.closing {
+            return;
+        }
+        active.opening = None;
     }
     let report = |phase| {
         (inner.sink)(Event::Connection {
@@ -813,9 +829,35 @@ fn open(
         sink: inner.sink.clone(),
         closing,
     });
-    if let Err(e) = session.connection.status() {
+    {
+        let mut active = inner.active.lock().unwrap();
+        if active.generation != id || active.closing {
+            drop(active);
+            session.shutdown();
+            return;
+        }
+        active.opening = Some(session.clone());
+    }
+    let opened = session.connection.handshake().and_then(|hello| {
+        if hello.compatibility() != cordial_client::compatibility::Compatibility::Current {
+            return Err(cordial_client::Error::Incompatible(hello));
+        }
+        session.connection.status()
+    });
+    if let Err(e) = opened {
+        let report = {
+            let mut active = inner.active.lock().unwrap();
+            let current = active.generation == id && !active.closing;
+            if current {
+                active.opening = None;
+            }
+            current
+        };
         session.shutdown();
-        return failed(Error::from_client(e, "adapter status"));
+        if report {
+            failed(Error::from_client(e, "adapter status"));
+        }
+        return;
     }
     if adapter.is_some_and(|a| !session.state().status.id.eq_ignore_ascii_case(&a)) {
         session.shutdown();
@@ -828,6 +870,7 @@ fn open(
             session.shutdown();
             return;
         }
+        active.opening = None;
         active.session = Some(session.clone());
     }
     drop(gate);

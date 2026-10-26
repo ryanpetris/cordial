@@ -82,6 +82,8 @@ export interface AdapterInformation {
   developmentBuild: boolean | null;
   /** The validated format of the adapter's mounted storage. */
   storageFormat: number | null;
+  /** The storage format the adapter's firmware operates on. */
+  targetStorageFormat: number | null;
 }
 
 /** Facts from the device's current connection; each is null while unknown, including while
@@ -350,10 +352,13 @@ export interface AdapterEntry {
   name: string;
   /** Reconnecting retains the session during automatic transport recovery. */
   connection: "connected" | "connecting" | "reconnecting" | "disconnected";
-  /** Why the last Connect failed. */
+  /** Why the last Connect failed, or why Cordial can't use a refused adapter. */
   connectError: string | null;
   readiness: "waiting" | "ready";
   status: AdapterStatus | null;
+  /** What a refused adapter reported of itself; null for any other adapter. A refused adapter's
+   * `id` is provisional and unique to its port. */
+  refused: { firmwareVersion: string | null; serialNumber: string | null } | null;
   /** Whether the session is still reading its devices for the first time. */
   listing: boolean;
   /** Why the latest device listing on the connected, ready adapter failed, until another

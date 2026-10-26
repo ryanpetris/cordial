@@ -413,7 +413,7 @@ describe("Configuration interface checks", () => {
     platform: "linux",
     ready: true,
     transports: [],
-    information: { firmwareVersion: null, boardName: null, developmentBuild: null, storageFormat: null },
+    information: { firmwareVersion: null, boardName: null, developmentBuild: null, storageFormat: null, targetStorageFormat: null },
     errors: [],
     resources: [],
     profileSupport: { resources: [{ type: "memory", count: 0, limit: 100 }, { type: "layers", count: null, limit: 4 }] },

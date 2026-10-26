@@ -1,6 +1,6 @@
 //! The app's error: a local message, or a Dongle error with the command it answered.
 use cordial_protocol as p;
-use std::{fmt, io};
+use std::{fmt, io, sync::Arc};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -17,6 +17,8 @@ pub struct Error {
     pub dongle: Option<p::Error>,
     /// The command the Dongle answered, for explanations specific to it.
     pub command: Option<&'static str>,
+    /// Native handshake metadata for a compatibility refusal.
+    pub native_hello: Option<Arc<cordial_client::compatibility::NativeHello>>,
 }
 
 impl Error {
@@ -25,6 +27,7 @@ impl Error {
             message: message.into(),
             dongle: None,
             command: None,
+            native_hello: None,
         }
     }
 
@@ -34,6 +37,7 @@ impl Error {
             message: crate::model::code_token(error.code()),
             dongle: Some(error),
             command,
+            native_hello: None,
         }
     }
 
@@ -63,6 +67,21 @@ impl Error {
     pub fn from_client(error: cordial_client::Error, command: &'static str) -> Self {
         use cordial_client::Error as E;
         match error {
+            E::Incompatible(hello) => {
+                let message = E::Incompatible(hello.clone()).to_string();
+                Self {
+                    native_hello: Some(Arc::new(hello)),
+                    ..Self::new(message)
+                }
+            }
+            E::Handshake(error) => Self::new(format!(
+                "the adapter couldn't complete the connection: {}",
+                Self::from_client(Arc::unwrap_or_clone(error), command).message
+            )),
+            E::NotSent(error) => Self::new(format!(
+                "the adapter request wasn't sent: {}",
+                Self::from_client(Arc::unwrap_or_clone(error), command).message
+            )),
             E::Dongle(e) => Self::dongle(e, Some(command)),
             E::UnexpectedResponse => Self::new(UNEXPECTED),
             E::Timeout => Self::new(TIMEOUT),
@@ -101,5 +120,29 @@ impl std::error::Error for Error {}
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
         Self::new(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negotiation_and_unsent_failures_never_report_an_uncertain_write() {
+        for error in [
+            cordial_client::Error::Handshake(Arc::new(cordial_client::Error::Timeout)),
+            cordial_client::Error::NotSent(Arc::new(cordial_client::Error::Closed)),
+        ] {
+            assert!(!Error::from_client(error, "save").unconfirmed());
+        }
+        assert!(Error::from_client(cordial_client::Error::Closed, "save").unconfirmed());
+        let native = cordial_client::compatibility::NativeHello::decode(&[8, 2]).unwrap();
+        let error = Error::from_client(cordial_client::Error::Incompatible(native.clone()), "save");
+        assert_eq!(error.native_hello.as_deref(), Some(&native));
+        assert!(!error.unconfirmed());
+        assert_eq!(
+            crate::ui::text::sentence(&crate::ui::text::error_words(&error)),
+            "This adapter requires a newer version of Cordial. Update Cordial to connect."
+        );
     }
 }

@@ -42,7 +42,7 @@ fn round_trips_every_block_boundary() {
 }
 
 #[test]
-fn skips_empty_frames_and_resynchronizes() {
+fn skips_bare_delimiters_and_resynchronizes() {
     let mut decoder = Decoder::new(None);
     let mut stream = vec![9, 9, 9, 0, 0, 0];
     frame::encode(
@@ -52,7 +52,7 @@ fn skips_empty_frames_and_resynchronizes() {
         &mut stream,
     );
     let decoded = frames(&mut decoder, &stream);
-    // The leftover bytes decode as a malformed frame; empty frames are skipped.
+    // The leftover bytes decode as a malformed frame; bare delimiters are skipped.
     assert_eq!(decoded.len(), 2);
     assert_eq!(decoded[0], Err(FrameError::Malformed));
     let request = Request::decode(decoded[1].as_ref().unwrap().as_slice()).unwrap();

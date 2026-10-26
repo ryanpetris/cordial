@@ -47,6 +47,28 @@ fn management_and_development_recovery_work_before_controller_start() {
     app.session(true, &mut radio);
     use cordial_protocol::{self as p, request::Command, response::Result as R};
     use prost::Message;
+    let mut hello = Vec::new();
+    p::frame::encode_bytes(
+        &p::handshake::encode_client_hello(&p::ClientHello {}).unwrap(),
+        &mut hello,
+    );
+    assert_eq!(app.serial.feed(&hello), (hello.len(), None));
+    let mut decoder = p::frame::Decoder::new(Some(p::MAX_HANDSHAKE_BYTES));
+    let mut received = None;
+    while let Some((token, bytes)) = app.serial.output(64) {
+        for &byte in bytes {
+            if let Some(frame) = decoder.push(byte) {
+                received = Some(p::handshake::decode_adapter_hello(frame.unwrap()).unwrap());
+            }
+        }
+        let length = bytes.len();
+        app.serial.output_complete(token, length);
+    }
+    let hello = received.unwrap();
+    assert_eq!(hello.protocol_version, Some(p::CURRENT_PROTOCOL_VERSION));
+    assert_eq!(hello.firmware_version.as_deref(), Some("test"));
+    assert_eq!(hello.serial_number.as_deref(), Some("adapter"));
+    assert!(app.serial.open());
     for command in [
         Command::GetStatus(p::GetStatus {}),
         Command::EnterBootloader(p::EnterBootloader {}),

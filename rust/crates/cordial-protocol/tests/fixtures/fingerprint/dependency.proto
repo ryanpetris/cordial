@@ -1,0 +1,7 @@
+syntax = "proto3";
+package fingerprint.dependency;
+
+// Dependency semantics form part of the operational identity.
+message Record {
+  optional string label = 1;
+}

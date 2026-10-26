@@ -149,12 +149,12 @@ environment variables, and configuration keys in backticks.
   declarations of support for externally defined protocol versions.
 - Changing any such version requires explicit user approval.
 - Any change to the serial protocol between the Dongle and the Host software, including
-  `proto/cordial.proto`, framing, and the documented behaviour of its messages, requires explicit
-  maintainer approval before it is made.
+  `proto/handshake.proto` and `proto/serial/`, framing, and the documented behaviour of its
+  messages, requires explicit maintainer approval before it is made.
 - Any change to the Dongle's on-board storage layout requires explicit maintainer approval before
   it is made. This includes adding, removing, or renaming files and directories, changing paths,
   and changing the format, fields, or meaning of file contents, as documented in
-  `docs/storage-format.md` and `proto/storage.proto`.
+  `docs/storage-format.md` and `proto/storage/`.
 - Firmware downgrades are not supported. Saved data written by newer firmware does not need to
   stay readable by older firmware.
 
@@ -184,7 +184,7 @@ individual test cases.
 | Desktop type checks | `make check-desktop`: TypeScript checks for the desktop and shared packages. |
 | Desktop and shared client tests | `make check-desktop`: all Vitest fixtures in `desktop/test` and `desktop/packages/*/test`, including desktop state, settings, serial communication, notifications, tray, server, client transports, and framing. |
 | Desktop garbage-collection fixtures | `npm --prefix desktop test -- --execArgv=--expose-gc`: enables the notification and USB watcher lifetime checks that otherwise skip when `global.gc` is unavailable. |
-| Protocol compatibility | `make check-protocol`: Buf lint and Buf breaking checks against `PROTOCOL_BASE` (the newest earlier release in the same series as `CORDIAL_VERSION`) when that base contains the protocol. |
+| Protocol compatibility | `make check-protocol`: Buf lint and breaking checks for the permanent handshake and retained serial revisions against prior released schemas, plus storage compatibility against `PROTOCOL_BASE`, selected from `CORDIAL_VERSION`. |
 | Repository tool fixtures | `make check-tools`: `tools/test_*.py`, covering versions, editor-definition validation, and release archive validation. |
 | Firmware and packaging tool fixtures | `make check-tools`: `rust/tests/test_*.py`, covering board configuration, firmware artifacts, flashing, dependency notices, packaging, native BLE, HID reports, and host terminal behavior. |
 | Linux CLI/TUI terminal fixture | Build the CLI and install `pyte`, then run `CORDIAL_TEST_BINARY="$PWD/rust/target/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py`. The default tool run skips this fixture without these prerequisites. |

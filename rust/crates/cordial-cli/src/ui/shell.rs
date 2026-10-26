@@ -513,7 +513,13 @@ impl<B: Backend> Model<B> {
                 }
             }
             Phase::Ready if self.session == Some(session) => self.preparing = false,
-            Phase::Failed { open: false, .. } | Phase::Other
+            Phase::Failed {
+                open: false,
+                error: Error {
+                    native_hello: None, ..
+                },
+            }
+            | Phase::Other
                 if (self.opening == Some(session) || self.session == Some(session))
                     && self.reconnect.is_some() =>
             {
@@ -540,6 +546,8 @@ impl<B: Backend> Model<B> {
                         "Error: {line}. adapter status, adapter restart, file list, file get and adapter bootloader still work; use adapter select to retry."
                     ));
                 } else {
+                    // An adapter that refused the connection isn't awaited any longer.
+                    self.reconnect = None;
                     self.session = None;
                     self.log(format!("Open failed: {line}"));
                 }
@@ -1802,5 +1810,56 @@ mod tests {
         // Restart runs without readiness or migration.
         app.typed("adapter restart");
         assert_eq!(app.calls(), [Call::Run("Restart".into())]);
+    }
+
+    const NEWER: &str =
+        "Open failed: this adapter requires a newer version of Cordial. Update Cordial to connect";
+
+    fn newer() -> Error {
+        let hello = cordial_client::compatibility::NativeHello {
+            hello: p::AdapterHello {
+                protocol_version: Some(p::CURRENT_PROTOCOL_VERSION + 1),
+                ..Default::default()
+            },
+            bytes: Vec::new(),
+        };
+        Error::from_client(cordial_client::Error::Incompatible(hello), "adapter status")
+    }
+
+    #[test]
+    fn a_selected_adapter_that_refuses_says_why() {
+        let mut app = App::new();
+        app.typed("adapter select /dev/ttyACM1");
+        let session = app.fake.next.get();
+        app.connection(
+            session,
+            Phase::Failed {
+                error: newer(),
+                open: false,
+            },
+        );
+        assert_eq!(app.m.output.last().unwrap(), NEWER);
+        assert_eq!(app.m.session, None);
+    }
+
+    #[test]
+    fn an_adapter_that_returns_refusing_is_no_longer_awaited() {
+        let mut app = App::new();
+        app.lose_usb();
+        app.m.update(Msg::Ports(Ok(vec![adapter("/dev/ttyACM1")])));
+        let session = app.fake.next.get();
+        app.connection(
+            session,
+            Phase::Failed {
+                error: newer(),
+                open: false,
+            },
+        );
+        assert_eq!(app.m.output, [NEWER]);
+        assert!(app.m.reconnect.is_none());
+        app.fake.calls.borrow_mut().clear();
+        app.m.tick();
+        app.m.update(Msg::Ports(Ok(vec![adapter("/dev/ttyACM1")])));
+        assert!(app.calls().is_empty(), "{:?}", app.calls());
     }
 }

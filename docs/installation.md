@@ -8,9 +8,19 @@ Every release ships a `SHA256SUMS` file for verifying them.
 `cordial-desktop` is the desktop tray app. `cordial-cli` is the `cordial` command-line tool and
 TUI. You can install either package or both.
 
-The CLI is optional for normal desktop use. Install it so the desktop app can automatically invoke
-`cordial` when an adapter needs an assisted storage migration. The CLI and TUI use the same
-converter automatically.
+The CLI is optional for direct desktop connections. The desktop app invokes `cordial` for assisted
+storage migration and for older serial revisions that the helper can convert. A protocol helper
+must match the app's current revision and exact operational schema fingerprint. Revision `1` has
+no earlier supported revision or historical protocol converter. The CLI and TUI run storage
+migration automatically when required.
+
+For protocol proxying on Linux, the desktop runs the first of `~/.local/bin/cordial`,
+`/usr/local/bin/cordial` and `/usr/bin/cordial` that exists, or the absolute path in
+`CORDIAL_CLI_PATH` when set. The selected file must be executable and match the current protocol
+revision and operational schema fingerprint. If it doesn't, the app doesn't look further.
+
+For assisted storage migration, the desktop finds the first executable `cordial` on `PATH`.
+`CORDIAL_CLI_PATH` applies only to protocol proxying.
 
 ### Arch Linux
 
@@ -37,7 +47,7 @@ and run the included `cordial-desktop`. For the command-line tool, download
 `cordial-cli-*-linux-amd64.tar.gz`.
 
 For AppImage and portable desktop installations, put the extracted `cordial` executable on `PATH`
-so the desktop app can find it.
+for assisted storage migration. Protocol proxying uses the locations or override listed above.
 
 ### Adapter access
 

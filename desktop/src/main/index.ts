@@ -18,8 +18,10 @@ import { fileURLToPath } from "node:url";
 import { isAction } from "../core/actions.ts";
 import { Controller } from "../core/controller.ts";
 import { listPorts, openSerial } from "@cordial/client/node";
+import type { AdapterHello } from "@cordial/protocol";
 import { hostPlatform, watchHotplug } from "../node/host.ts";
 import { migrationHost } from "../node/migration.ts";
+import { openProxy } from "../node/proxy.ts";
 import { preferencesFrom, type Action, type AppState, type Navigation, type Preferences } from "../shared/state.ts";
 import { canRestart, profileAlertText } from "../shared/text.ts";
 import { trayModel, type TrayModel } from "./tray-model.ts";
@@ -299,7 +301,8 @@ async function quit() {
   const stopping = Promise.all([stopHotplug?.(), controller.stop()]);
   // A running migration is cancelled, and the app waits for the CLI to exit without a time limit.
   await controller.cancelMigration();
-  await Promise.race([stopping, new Promise((r) => setTimeout(r, 1500))]);
+  // Long enough for a Cordial CLI to be killed two seconds after its input ends.
+  await Promise.race([stopping, new Promise((r) => setTimeout(r, 2500))]);
   tray?.destroy();
   app.exit(0);
 }
@@ -326,7 +329,7 @@ void app.whenReady().then(async () => {
   savedAutostart = preferences.startAtLogin;
   const fake = Number(process.env.CORDIAL_DESKTOP_SIMULATE ?? 0);
   const simulated = fake > 0 ? (await import("../fake/ports.ts")).simulatedPorts(fake) : null;
-  const ports = simulated ?? { listPorts, openTransport: openSerial };
+  const ports = simulated ?? { listPorts, openTransport: openSerial, openProxy: (path: string, native: AdapterHello, signal: AbortSignal) => openProxy(path, native, signal, { log }) };
   controller = new Controller({
     ...ports,
     log,

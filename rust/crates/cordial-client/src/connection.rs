@@ -1,4 +1,7 @@
-use crate::{Error, Result};
+use crate::{
+    Error, Result,
+    compatibility::{Compatibility, NativeHello, is_ordinary_message},
+};
 use cordial_protocol::{
     self as p, MAX_REQUEST_BYTES,
     frame::{self, Decoder},
@@ -22,6 +25,9 @@ use std::{
 /// How long a request may wait without incoming bytes unless [`Connection::set_timeout`] changes it.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Absolute deadline for the permanent handshake, independent of incoming progress.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// How long a stalled write may take before the connection is closed.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -29,7 +35,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The largest decoded response or event frame accepted from the Dongle.
-const MAX_RECEIVED_FRAME_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_RECEIVED_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 /// What the reader thread received, passed to a handler in the order it arrived.
 #[derive(Debug)]
@@ -56,6 +62,8 @@ struct State {
     pending: VecDeque<(p::Request, Reply, Option<Observer>)>,
     closed: Option<Error>,
     confirmed: bool,
+    handshake_started: bool,
+    hello: Option<NativeHello>,
     #[cfg(test)]
     confirmation_waiting: Option<mpsc::Sender<()>>,
 }
@@ -65,7 +73,8 @@ struct Shared {
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     state: Mutex<State>,
     confirmation: Condvar,
-    /// Set once the first request is about to be written; nothing before it is read.
+    negotiation: Mutex<()>,
+    /// Set once the first ordinary request is about to be written.
     started: AtomicBool,
     migration_limits: AtomicBool,
     stop: AtomicBool,
@@ -102,8 +111,8 @@ impl Shared {
 ///
 /// Requests may be sent from any thread. Each waits for its own response; responses are matched
 /// to requests in the order the requests were written. A reader thread receives everything the
-/// Dongle sends. Following the session rules, the connection sends a frame delimiter before its
-/// first request and ignores everything it receives before the first response that follows it.
+/// Dongle sends. The permanent handshake completes before any ordinary request is sent.
+/// Its bytes never reach response observers or event handlers.
 /// Only the first request is sent until its response arrives; later requests may be pipelined.
 /// A decoded response or event frame may be at most 32 MiB.
 ///
@@ -148,10 +157,13 @@ impl Connection {
                 pending: VecDeque::new(),
                 closed: None,
                 confirmed: false,
+                handshake_started: false,
+                hello: None,
                 #[cfg(test)]
                 confirmation_waiting: None,
             }),
             confirmation: Condvar::new(),
+            negotiation: Mutex::new(()),
             started: AtomicBool::new(false),
             migration_limits: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -217,7 +229,85 @@ impl Connection {
                 .wait_while(released, |released| !*released)
                 .unwrap(),
         );
+        drop(self.shared.writer.lock().unwrap().take());
         true
+    }
+
+    /// Exchanges the permanent hello once and returns native metadata even on a version mismatch.
+    /// No ordinary traffic is sent. Concurrent probes and requests share this negotiation.
+    pub fn handshake(&self) -> Result<NativeHello> {
+        self.negotiate(None)
+            .map_err(|error| Error::Handshake(Arc::new(error)))
+    }
+
+    fn negotiate(&self, cancelled: Option<&AtomicBool>) -> Result<NativeHello> {
+        let _negotiation = self.shared.negotiation.lock().unwrap();
+        {
+            let state = self.shared.state.lock().unwrap();
+            if let Some(hello) = &state.hello {
+                return Ok(hello.clone());
+            }
+            if let Some(error) = &state.closed {
+                return Err(error.clone());
+            }
+        }
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        {
+            let mut writer = self.shared.writer.lock().unwrap();
+            let mut state = self.shared.state.lock().unwrap();
+            if let Some(error) = &state.closed {
+                return Err(error.clone());
+            }
+            state.handshake_started = true;
+            drop(state);
+            let bytes = p::handshake::encode_client_hello(&p::ClientHello {})
+                .expect("the compiled client hello is valid");
+            let mut frame = vec![frame::DELIMITER];
+            frame::encode_bytes(&bytes, &mut frame);
+            let result = match writer.as_mut() {
+                Some(writer) => write_all(writer.as_mut(), &frame),
+                None => return Err(Error::Closed),
+            };
+            if let Err(error) = result {
+                drop(writer);
+                let error = Error::from(error);
+                self.shared.close(error.clone());
+                return Err(error);
+            }
+        }
+        let mut state = self.shared.state.lock().unwrap();
+        loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                drop(state);
+                self.shared.close(Error::Closed);
+                return Err(Error::Closed);
+            }
+            if let Some(hello) = &state.hello {
+                return Ok(hello.clone());
+            }
+            if let Some(error) = &state.closed {
+                return Err(error.clone());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                drop(state);
+                self.shared.close(Error::Timeout);
+                return Err(Error::Timeout);
+            }
+            state = self
+                .shared
+                .confirmation
+                .wait_timeout(
+                    state,
+                    if cancelled.is_some() {
+                        remaining.min(Duration::from_millis(50))
+                    } else {
+                        remaining
+                    },
+                )
+                .unwrap()
+                .0;
+        }
     }
 
     /// Sends one command and returns the Dongle's response, which may hold an error result.
@@ -263,6 +353,12 @@ impl Connection {
         if bytes.len() > MAX_REQUEST_BYTES {
             return Err(Error::TooLong);
         }
+        let hello = self
+            .negotiate(cancelled)
+            .map_err(|error| Error::Handshake(Arc::new(error)))?;
+        if hello.compatibility() != Compatibility::Current {
+            return Err(Error::Incompatible(hello));
+        }
         let mut frame = Vec::with_capacity(bytes.len() + bytes.len() / 254 + 3);
         let (tx, rx) = mpsc::sync_channel(1);
         {
@@ -270,14 +366,12 @@ impl Connection {
                 let writer = self.shared.writer.lock().unwrap();
                 let mut state = self.shared.state.lock().unwrap();
                 if let Some(error) = &state.closed {
-                    return Err(error.clone());
+                    return Err(Error::NotSent(Arc::new(error.clone())));
                 }
                 if !self.shared.started.load(Ordering::Acquire) || state.confirmed {
                     state.pending.push_back((request, tx, observe));
                     break writer;
                 }
-                // Until a response confirms the session, a rejected opening frame must not
-                // let another request's response answer the first request.
                 drop(writer);
                 #[cfg(test)]
                 if let Some(waiting) = state.confirmation_waiting.take() {
@@ -290,12 +384,10 @@ impl Connection {
                         .unwrap(),
                 );
             };
-            if !self.shared.started.swap(true, Ordering::AcqRel) {
-                frame.push(frame::DELIMITER);
-            }
+            self.shared.started.store(true, Ordering::Release);
             frame::encode_bytes(&bytes, &mut frame);
             let Some(stream) = writer.as_mut() else {
-                return Err(Error::Closed);
+                return Err(Error::NotSent(Arc::new(Error::Closed)));
             };
             if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
                 drop(writer);
@@ -673,8 +765,7 @@ fn write_all(stream: &mut dyn Write, mut bytes: &[u8]) -> io::Result<()> {
 fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Received<'_>)) {
     let mut decoder = Decoder::new(Some(MAX_RECEIVED_FRAME_BYTES));
     let mut buffer = [0; 4096];
-    // Until the first response to this client's first request, frames are leftovers.
-    let mut synced = false;
+    let mut negotiated = false;
     let error = loop {
         if shared.stop.load(Ordering::Acquire) {
             break Error::Closed;
@@ -694,6 +785,37 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
             let Some(frame) = decoder.push(byte) else {
                 continue;
             };
+            if !negotiated {
+                let mut state = shared.state.lock().unwrap();
+                if !state.handshake_started || state.hello.is_some() {
+                    continue;
+                }
+                let hello = match frame {
+                    Ok(bytes) => match NativeHello::decode(bytes) {
+                        Ok(hello) => hello,
+                        Err(_) if is_ordinary_message(bytes) => continue,
+                        Err(_) => {
+                            failed = Some(Error::Protocol);
+                            break;
+                        }
+                    },
+                    Err(_) => {
+                        failed = Some(Error::Protocol);
+                        break;
+                    }
+                };
+                let compatible = hello.compatibility() == Compatibility::Current;
+                state.hello = Some(hello);
+                drop(state);
+                shared.confirmation.notify_all();
+                if !compatible {
+                    // Mismatched peers stay inactive until their owner closes this connection.
+                    continue;
+                }
+                negotiated = true;
+                decoder = Decoder::new(Some(MAX_RECEIVED_FRAME_BYTES));
+                continue;
+            }
             if shared.migration_limits.load(Ordering::Acquire)
                 && let Ok(bytes) = frame.as_ref()
             {
@@ -712,17 +834,6 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
                 }
                 p::Message::decode(frame).ok()
             });
-            if !synced {
-                if shared.started.load(Ordering::Acquire)
-                    && let Some(p::Message {
-                        kind: Some(message::Kind::Response(_)),
-                    }) = &message
-                {
-                    synced = true;
-                } else {
-                    continue;
-                }
-            }
             let Some(message) = message else {
                 failed = Some(Error::Protocol);
                 break;
@@ -787,11 +898,23 @@ mod tests {
         }
     }
 
-    struct Writer(mpsc::Sender<()>);
+    struct Writer(mpsc::Sender<()>, Option<mpsc::Sender<Vec<u8>>>);
 
     impl Write for Writer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.send(()).unwrap();
+            if let Some(responses) = self.1.take() {
+                let mut hello = Vec::new();
+                frame::encode(
+                    &p::AdapterHello {
+                        protocol_version: Some(p::CURRENT_PROTOCOL_VERSION),
+                        ..Default::default()
+                    },
+                    &mut hello,
+                );
+                responses.send(hello).unwrap();
+            } else {
+                self.0.send(()).unwrap();
+            }
             Ok(bytes.len())
         }
 
@@ -803,8 +926,10 @@ mod tests {
     fn connection() -> (Arc<Connection>, mpsc::Sender<Vec<u8>>, Receiver<()>) {
         let (responses, reader) = mpsc::channel();
         let (writer, writes) = mpsc::channel();
-        let (connection, _) = Connection::new(Reader(reader), Writer(writer));
+        let (connection, _) =
+            Connection::new(Reader(reader), Writer(writer, Some(responses.clone())));
         connection.set_timeout(None);
+        connection.handshake().unwrap();
         (Arc::new(connection), responses, writes)
     }
 
@@ -861,12 +986,13 @@ mod tests {
         let waiting = blocked_request(&connection);
 
         connection.close();
-        for result in [opening, waiting] {
-            assert!(matches!(
-                result.recv_timeout(DEADLINE).unwrap(),
-                Err(Error::Closed)
-            ));
-        }
+        assert!(matches!(
+            opening.recv_timeout(DEADLINE).unwrap(),
+            Err(Error::Closed)
+        ));
+        assert!(
+            matches!(waiting.recv_timeout(DEADLINE).unwrap(), Err(Error::NotSent(error)) if matches!(*error, Error::Closed))
+        );
         assert!(writes.try_recv().is_err());
     }
 
@@ -896,6 +1022,113 @@ mod tests {
         assert!(done.recv_timeout(DEADLINE).unwrap());
         close.join().unwrap();
         assert!(*connection.shared.released.lock().unwrap());
+    }
+
+    #[test]
+    fn exclusive_close_waits_for_a_concurrent_writer_release() {
+        struct HeldWriter(mpsc::Sender<()>, Receiver<()>);
+        impl Write for HeldWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Drop for HeldWriter {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv().unwrap();
+            }
+        }
+        let (_responses, reader) = mpsc::channel();
+        let (entered, dropping) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let (connection, _) = Connection::new(Reader(reader), HeldWriter(entered, held));
+        let connection = Arc::new(connection);
+        let first = connection.clone();
+        let closing = thread::spawn(move || first.close());
+        dropping.recv_timeout(DEADLINE).unwrap();
+        let released = connection.shared.released.lock().unwrap();
+        drop(
+            connection
+                .shared
+                .release
+                .wait_while(released, |released| !*released)
+                .unwrap(),
+        );
+        let second = connection.clone();
+        let (finished, done) = mpsc::channel();
+        let exclusive = thread::spawn(move || {
+            finished.send(second.close_and_wait_release()).unwrap();
+        });
+        assert!(done.recv_timeout(Duration::from_millis(100)).is_err());
+        release.send(()).unwrap();
+        assert!(done.recv_timeout(DEADLINE).unwrap());
+        closing.join().unwrap();
+        exclusive.join().unwrap();
+    }
+
+    #[test]
+    fn migration_cancellation_interrupts_negotiation() {
+        let (responses, reader) = mpsc::channel();
+        let (writer, writes) = mpsc::channel();
+        let (connection, _) = Connection::new(Reader(reader), Writer(writer, None));
+        connection.set_timeout(None);
+        let connection = Arc::new(connection);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker = connection.clone();
+        let cancellation = cancelled.clone();
+        let (finished, done) = mpsc::channel();
+        let request = thread::spawn(move || {
+            finished
+                .send(worker.migration_request(Command::GetStatus(p::GetStatus {}), &cancellation))
+                .unwrap();
+        });
+        writes.recv_timeout(DEADLINE).unwrap();
+        cancelled.store(true, Ordering::Release);
+        assert!(matches!(
+            done.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(Error::Handshake(error)) if matches!(*error, Error::Closed)
+        ));
+        request.join().unwrap();
+        assert!(writes.try_recv().is_err());
+        assert!(connection.close_and_wait_release());
+        drop(responses);
+    }
+
+    #[test]
+    fn migration_limits_accept_the_hello_before_the_first_response() {
+        let (responses, reader) = mpsc::channel();
+        let (writer, writes) = mpsc::channel();
+        let (connection, _) =
+            Connection::new(Reader(reader), Writer(writer, Some(responses.clone())));
+        let connection = Arc::new(connection);
+        let worker = connection.clone();
+        let (finished, done) = mpsc::channel();
+        let request = thread::spawn(move || {
+            finished
+                .send(worker.migration_request(
+                    Command::GetStatus(p::GetStatus {}),
+                    &AtomicBool::new(false),
+                ))
+                .unwrap();
+        });
+        writes.recv_timeout(DEADLINE).unwrap();
+        let response = p::Response {
+            result: Some(response::Result::Status(p::Status::default())),
+        };
+        let mut bytes = Vec::new();
+        frame::encode(
+            &p::Message {
+                kind: Some(message::Kind::Response(response.clone())),
+            },
+            &mut bytes,
+        );
+        responses.send(bytes).unwrap();
+        assert_eq!(done.recv_timeout(DEADLINE).unwrap().unwrap(), response);
+        request.join().unwrap();
+        assert!(connection.close_and_wait_release());
     }
 
     #[test]

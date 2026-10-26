@@ -75,7 +75,7 @@ fn unique_ports(mut found: Vec<PortInfo>) -> Vec<PortInfo> {
 
 /// Opens a Dongle's port and starts a session on it. Returns the connection and its events.
 pub fn open(port: &str) -> io::Result<(Connection, Receiver<p::Event>)> {
-    let (reader, writer) = prepare(port)?;
+    let (reader, writer) = open_stream(port)?;
     Ok(Connection::new(reader, writer))
 }
 
@@ -85,13 +85,17 @@ pub fn open_with_handler(
     port: &str,
     handler: impl FnMut(Received<'_>) + Send + 'static,
 ) -> io::Result<Connection> {
-    let (reader, writer) = prepare(port)?;
+    let (reader, writer) = open_stream(port)?;
     Ok(Connection::with_handler(reader, writer, handler))
 }
 
 /// Opens the port and starts a new session: DTR low long enough for the Dongle to see a
 /// session end, stale input discarded, then DTR raised.
-fn prepare(port: &str) -> io::Result<(Reader, Writer)> {
+/// Opens a new DTR session as raw halves. The caller must complete the permanent handshake
+/// before sending ordinary traffic. Reads and writes time out so an owner can stop on EOF.
+pub fn open_stream(
+    port: &str,
+) -> io::Result<(impl Read + Send + 'static, impl Write + Send + 'static)> {
     // serialport takes the operating system's exclusive lock on the port before configuring
     // it, so a second client cannot open the same Dongle.
     let mut serial = serialport::new(port, 115_200)

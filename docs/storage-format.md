@@ -87,10 +87,10 @@ format when it can be determined. Missing, malformed or unreadable roots leave i
 absent and report `Status.errors`. It is not proof that the dataset is valid or
 ready. Optional `target_storage_format` reports the firmware's operating target,
 currently `2`, independently of its release version. Firmware always sets it,
-including when storage is blocked or unreadable. Clients check presence and exact
-target support first. An absent or zero target prevents migration and normal
-commands. The current format is informational and never controls migration,
-source selection, reconnection or success. The migration-required error authorizes
+including when storage is blocked or unreadable. After a compatible permanent hello and bootstrap
+status, clients check presence and exact target support before other commands. An absent or zero
+target prevents migration and normal commands. The current format is informational and never
+controls migration, source selection, reconnection or success. The migration-required error authorizes
 host assistance and the downloaded `/format.pb` selects the source. Without that
 marker, fresh clients report readiness and errors without file access.
 
@@ -276,8 +276,8 @@ conversion, plus the current directory path stack. Directory enumeration reopens
 and skips entries, so large directories still require quadratic metadata reads.
 Many obsolete files also cause repeated scans.
 
-Before any interaction except bootstrap status or closing the connection, the
-host verifies exact support for `Status.information.target_storage_format`, then
+After a compatible permanent hello and bootstrap status, the host verifies exact support for
+`Status.information.target_storage_format` before other commands, then
 requires the exact `STORAGE_MIGRATION_REQUIRED`/`STORAGE`/`NO_EFFECT` marker with no related
 errors and no other status errors. The informational current format may be absent,
 matching or different; none of these values authorizes or blocks migration.
@@ -353,9 +353,10 @@ entire root. Intermediate checkpoints keep file access enabled for the next edge
 After verifying the final root, the host sends `Restart`. Root uploads alone do
 not change assisted mode. Restart acknowledges before resetting the MCU and runs
 ordinary startup recovery without a separate migration completion validator.
-The host reconnects by stable `Status.id`, checks exact target support again,
-and requires the same target, no migration-required marker and `ready = true` for
-success. Normal startup may also report the warnings `STORAGE_FULL`,
+The migration worker reconnects by stable `Status.id`, repeats the permanent hello and checks exact
+target support again. This worker reconnects independently of any desktop session proxy, which
+never reconnects. The worker requires the same target, no migration-required marker and
+`ready = true` for success. Normal startup may also report the warnings `STORAGE_FULL`,
 `PROFILE_MEMORY_LOW`, `USB_REQUIRED_CAPACITY_EXCEEDED` and
 `USB_RESERVED_CAPACITY_EXCEEDED`, each without related errors. Any other error
 stops the worker. Transport reconnection continues until cancellation, with old

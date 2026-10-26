@@ -53,7 +53,7 @@ import {
 import { BatteryAlerts, CRITICAL_PERCENT, type Alert } from "./battery.ts";
 import * as convert from "./convert.ts";
 import { AdapterManager, type ManagerDeps } from "./manager.ts";
-import { STORAGE_FORMAT, type MigrationHost, type MigrationProcess } from "./migration.ts";
+import type { MigrationHost, MigrationProcess } from "./migration.ts";
 import { AdapterSession, failure } from "./session.ts";
 
 export interface ControllerDeps extends Omit<ManagerDeps, "changed" | "event"> {
@@ -249,6 +249,7 @@ export class Controller {
         connectError: null,
         readiness: session.available && status.ready ? "ready" : "waiting",
         status,
+        refused: null,
         listing: session.listing,
         listError: !session.closed && !recovery && status.ready ? session.listError : null,
         attention,
@@ -269,6 +270,7 @@ export class Controller {
         connectError: null,
         readiness: "waiting",
         status: m.status,
+        refused: null,
         listing: false,
         listError: null,
         attention: [],
@@ -288,6 +290,27 @@ export class Controller {
         connectError: d.error,
         readiness: "waiting",
         status: null,
+        refused: null,
+        listing: false,
+        listError: null,
+        attention: [],
+        profilePage: null,
+        pickerPage: null,
+        profileNames: {},
+        profilesAvailable: false,
+        unreadableDevices: [],
+        migration: null,
+      });
+    }
+    for (const r of this.manager.refused.values()) {
+      adapters.push({
+        name: clean(r.hello.name ?? "") || "Adapter",
+        id: r.id,
+        connection: r.connecting ? "connecting" : "disconnected",
+        connectError: r.message,
+        readiness: "waiting",
+        status: null,
+        refused: { firmwareVersion: clean(r.hello.firmwareVersion ?? "") || null, serialNumber: clean(r.hello.serialNumber ?? "") || null },
         listing: false,
         listError: null,
         attention: [],
@@ -502,7 +525,7 @@ export class Controller {
         this.#migrationFailed(m, event.value.outcomeUnknown ? MIGRATION_TEXT.unknown : MIGRATION_TEXT.failed);
         return;
       case "success":
-        if (event.value.adapterId === m.adapterId && event.value.targetFormat === STORAGE_FORMAT) m.succeeded = true;
+        if (event.value.adapterId === m.adapterId && event.value.targetFormat === m.status.information.targetStorageFormat) m.succeeded = true;
         else {
           this.#deps.log(`migration reported success for another adapter or format: ${event.value.adapterId} ${event.value.targetFormat}`);
           this.#migrationFailed(m, MIGRATION_TEXT.failed);

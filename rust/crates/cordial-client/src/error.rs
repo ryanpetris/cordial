@@ -4,6 +4,12 @@ use std::{fmt, io, sync::Arc};
 /// Why a request did not return a result.
 #[derive(Clone, Debug)]
 pub enum Error {
+    /// The connection closed before this request could be written.
+    NotSent(Arc<Error>),
+    /// No ordinary request was sent because negotiation failed.
+    Handshake(Arc<Error>),
+    /// A valid hello identifies a revision without an implemented compatibility path.
+    Incompatible(crate::compatibility::NativeHello),
     /// The Dongle answered with an error.
     Dongle(p::Error),
     /// The response carries a different result from the one the command returns.
@@ -37,6 +43,12 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotSent(error) => write!(f, "the adapter request wasn't sent: {error}"),
+            Self::Handshake(error) => write!(f, "the adapter handshake failed: {error}"),
+            Self::Incompatible(hello) => f.write_str(match hello.compatibility() {
+                crate::compatibility::Compatibility::Newer => "this adapter requires a newer version of Cordial. Update Cordial to connect",
+                _ => "Cordial doesn't support this adapter's protocol. Update the adapter firmware to connect",
+            }),
             Self::Dongle(error) => write!(f, "dongle error {}", error.code().as_str_name()),
             Self::UnexpectedResponse => f.write_str("unexpected response"),
             Self::Timeout => f.write_str("request timed out"),
@@ -52,6 +64,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error.as_ref()),
+            Self::Handshake(error) | Self::NotSent(error) => Some(error.as_ref()),
             _ => None,
         }
     }

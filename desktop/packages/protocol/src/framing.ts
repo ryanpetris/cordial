@@ -50,7 +50,7 @@ export function decodeCobs(bytes: Uint8Array): Uint8Array | null {
 /** A decoded frame, or why the bytes up to a delimiter could not be used. */
 export type Frame = { ok: true; bytes: Uint8Array } | { ok: false; error: "too_long" | "malformed" };
 
-/** Collects received bytes into frames. Empty frames are skipped. */
+/** Collects received bytes into frames. Bare delimiters are skipped; encoded empty frames are returned. */
 export class FrameDecoder {
   readonly #limit: number | null;
   #chunks: Uint8Array[] = [];

@@ -157,8 +157,12 @@ impl<D: Discovery, F: FnMut(ipc::MigrationEvent)> Worker<'_, D, F> {
                 });
                 for port in ports {
                     self.check_cancel()?;
-                    let Ok(connection) = self.discovery.open(&port.port) else {
-                        continue;
+                    let connection = match self.discovery.open(&port.port) {
+                        Ok(connection) => connection,
+                        Err(error @ ClientError::Incompatible(_)) => {
+                            return Err(Error::new(error.to_string()));
+                        }
+                        Err(_) => continue,
                     };
                     self.connection = Some(connection);
                     let status = self.raw(Command::GetStatus(p::GetStatus {}));
@@ -197,6 +201,9 @@ impl<D: Discovery, F: FnMut(ipc::MigrationEvent)> Worker<'_, D, F> {
                             return Err(Error::new("adapter returned an invalid bootstrap status"));
                         }
                         Err(ClientError::Dongle(error)) => return Err(device_error(&error)),
+                        Err(error @ ClientError::Incompatible(_)) => {
+                            return Err(Error::new(error.to_string()));
+                        }
                         Err(_) => {}
                     }
                     self.close();
@@ -225,6 +232,9 @@ impl<D: Discovery, F: FnMut(ipc::MigrationEvent)> Worker<'_, D, F> {
             match self.raw(command.clone()) {
                 Ok(result) => return Ok(result),
                 Err(ClientError::Dongle(error)) => return Err(device_error(&error)),
+                Err(error @ ClientError::Incompatible(_)) => {
+                    return Err(Error::new(error.to_string()));
+                }
                 Err(
                     ClientError::Protocol | ClientError::TooLong | ClientError::UnexpectedResponse,
                 ) => {

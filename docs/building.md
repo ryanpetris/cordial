@@ -146,8 +146,10 @@ URL for a demo with two simulated adapters, which needs no Web Serial. The
 browser has no tray, notifications appear only while the page is open, and
 settings are kept in the browser.
 
-Web Serial can't read USB serial numbers, so the page identifies adapters by the
-protocol handshake alone. A disconnected adapter is remembered by its port.
+Web Serial can't read USB serial numbers. The page asks for the permanent hello
+and reads `GetStatus` only after the protocol revision matches. Hello metadata is
+optional; `GetStatus` supplies the authoritative adapter identity. A disconnected
+adapter is remembered by its port.
 When it is plugged in again, the page briefly opens the new port to identify it,
 then leaves it disconnected until you choose Connect.
 
@@ -239,6 +241,12 @@ First-party manifest versions are `0.0.0`. Builds use `CORDIAL_VERSION` when
 supplied and otherwise use `0.0.0`; firmware adds its profile suffix. The value is
 `MAJOR.MINOR.PATCH`, without leading zeroes or a `v` prefix. Tracked manifests
 and native package recipes remain unchanged.
+
+The serial protocol revision is independent of `CORDIAL_VERSION` and the storage
+format version. The current serial revision is `1`. Clients require its
+handshake, which older firmware lacks, so the next release must increment the minor version; development builds and tracked
+manifest templates remain `0.0.0`. See [protocol compatibility](protocol/compatibility.md)
+for revision matching and schema fingerprints.
 
 ```sh
 export CORDIAL_VERSION=1.2.3
@@ -333,11 +341,17 @@ npm --prefix desktop/packages/protocol run generate
 
 `make check` runs Rust tests and Clippy, native Bluetooth regression checks,
 Python tool tests, desktop type checks and tests, and the protocol checks:
-`buf lint` and `buf breaking` against the newest earlier release in the
-same series as `CORDIAL_VERSION`, or the newest release for a development build
-(`PROTOCOL_BASE` overrides it). A series is one minor version before 1.0 and one major version
-from 1.0; the first release of a series is not compared. Rust code is generated from `proto/` at build time;
-the second command regenerates the checked-in TypeScript messages after a schema changes.
+`buf lint` and `buf breaking`. The permanent handshake and serial revisions present in the current
+tree compare against every local release tag, regardless of application version or branch ancestry,
+except the release identified by `CORDIAL_VERSION`. Revisions released by ancestors must remain
+present; revisions released only on other branches need not be added. `PROTOCOL_STABLE_BASE`
+overrides these comparisons with one Git revision. Storage and migration IPC use the newest earlier
+ancestor release in the same series as `CORDIAL_VERSION`; `PROTOCOL_BASE` overrides it. A series is
+one minor version before 1.0 and one major version from 1.0. A series' first release skips only the
+storage and migration IPC comparisons. Development builds use the newest ancestor release for
+these comparisons. Selection uses local tags without fetching. Rust code is generated from
+`proto/` at build time; the second command regenerates the current TypeScript messages and their
+imports, updates all retained serial schema digests, and removes stale generated output.
 Install Clippy with `(cd rust && rustup component add clippy)` before checking.
 
 The build-cache tests also have a tiny npm workspace fixture that runs in Docker.

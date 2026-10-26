@@ -8,6 +8,7 @@ CLI_TARGET ?= $(shell uname -m)-unknown-linux-musl
 DESKTOP_TARGETS ?= AppImage tar.gz
 BOARD ?= pico_w
 PROFILE ?= development
+PROTOCOL_STABLE_BASE ?=
 PROTOCOL_BASE ?= $(shell $(PYTHON) tools/version.py --protocol-base 2>/dev/null)
 BOARDS := pico_w pico2_w pimoroni_pico_plus2_w waveshare_rp2350b_plus_w esp32s3
 ESP_BOARDS := esp32s3
@@ -178,12 +179,10 @@ check-desktop: desktop/node_modules/.package-lock.json
 check-tools:
 	$(PYTHON) -m unittest discover -s tools -p 'test_*.py'
 	$(PYTHON) -m unittest discover -s rust/tests -p 'test_*.py'
-# Lint covers all schemas; breaking compares serial/IPC and matching storage formats.
+# Check permanent serial contracts across releases and storage/migration IPC within a release series.
 check-protocol: desktop/node_modules/.package-lock.json
 	npm --prefix desktop/packages/protocol run lint
-	if [ -n "$(PROTOCOL_BASE)" ] && git cat-file -e "$(PROTOCOL_BASE):proto/cordial.proto" 2>/dev/null; then
-	  npm --prefix desktop/packages/protocol run breaking -- "$(PROTOCOL_BASE)"
-	fi
+	$(PYTHON) tools/check_protocol.py --base "$(PROTOCOL_BASE)" --stable-base "$(PROTOCOL_STABLE_BASE)"
 version:
 	@$(PYTHON) tools/version.py
 clean:

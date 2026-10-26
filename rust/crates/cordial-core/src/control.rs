@@ -1,5 +1,8 @@
 //! Serial session: request framing, the one outstanding response, and output in frames.
 //!
+//! Each open port accepts ordinary requests and empty identification queries. The adapter
+//! reports its native protocol version without tracking a client version.
+//!
 //! Requests are answered one at a time, in order: the next request is read only after the previous
 //! response has been written. Events are written whenever no response is waiting, one frame at a
 //! time, so a client that stops reading holds back only the serial port, never HID forwarding.
@@ -35,7 +38,8 @@ pub struct Session {
     stream: Option<Encoder>,
     generation: u64,
     serial: u64,
-    active: bool,
+    open: bool,
+    hello: Vec<u8>,
     stopped: bool,
 }
 
@@ -54,24 +58,44 @@ impl Session {
             stream: None,
             generation: 0,
             serial: 0,
-            active: false,
+            open: false,
+            hello: p::handshake::encode_adapter_hello(&p::AdapterHello {
+                protocol_version: Some(p::CURRENT_PROTOCOL_VERSION),
+                ..Default::default()
+            })
+            .expect("native protocol version"),
             stopped: false,
         }
     }
+    /// Includes build metadata available without reading storage. Metadata that exceeds the
+    /// handshake bound is omitted.
+    pub fn with_identity(firmware_version: &str, serial_number: &str) -> Self {
+        let mut session = Self::new();
+        if let Ok(hello) = p::handshake::encode_adapter_hello(&p::AdapterHello {
+            protocol_version: Some(p::CURRENT_PROTOCOL_VERSION),
+            firmware_version: Some(firmware_version.into()),
+            serial_number: Some(serial_number.into()),
+            name: None,
+        }) {
+            session.hello = hello;
+        }
+        session
+    }
     /// Starts (port opened) or ends (port closed) a session, discarding any partial input and
     /// unsent output. Returns whether a previous session ended.
-    pub fn session(&mut self, active: bool) -> bool {
-        let ended = self.active;
-        self.active = active;
-        self.input.reset();
+    pub fn session(&mut self, open: bool) -> bool {
+        let ended = self.open();
+        self.open = open;
+        self.input = Decoder::new(Some(MAX_REQUEST_BYTES));
         self.output = None;
         self.response = None;
         self.stream = None;
         self.generation = self.generation.wrapping_add(1);
         ended
     }
-    pub fn active(&self) -> bool {
-        self.active
+    /// Whether the physical port is open.
+    pub fn open(&self) -> bool {
+        self.open
     }
     /// An accepted restart stops reading further requests.
     pub fn stop_commands(&mut self) {
@@ -85,7 +109,7 @@ impl Session {
     }
     /// Whether the output is free for an event.
     pub fn idle(&self) -> bool {
-        self.active && self.output.is_none() && !self.answering()
+        self.open() && self.output.is_none() && !self.answering()
     }
     /// Frames waiting to be written, including the one being written.
     pub fn queued(&self) -> usize {
@@ -104,7 +128,7 @@ impl Session {
     }
     /// Queues the response to the request just read.
     pub fn respond(&mut self, response: p::Response) {
-        if !self.active {
+        if !self.open() {
             return;
         }
         if self.stream.is_some() {
@@ -117,20 +141,20 @@ impl Session {
     }
     /// Reserves the output for a response produced over several application steps.
     pub fn start_stream(&mut self) {
-        if self.active {
+        if self.open() {
             self.stream = Some(Encoder::new());
         }
     }
 
     /// Whether the producer can supply its next bounded batch.
     pub fn stream_ready(&self) -> bool {
-        self.output.is_none() && self.response.is_none()
+        self.open() && self.output.is_none() && self.response.is_none()
     }
 
     /// Appends an ordinary response envelope to the current logical protobuf message.
     /// The caller waits for `stream_ready` before producing another batch.
     pub fn stream_response(&mut self, response: p::Response, finished: bool) {
-        if !self.active {
+        if !self.open() {
             return;
         }
         assert!(self.stream_ready());
@@ -152,7 +176,7 @@ impl Session {
     /// Appends already encoded protobuf bytes to a single response frame.
     /// File readers use this to split one length-delimited bytes field across bounded reads.
     pub fn stream_bytes(&mut self, bytes: &[u8], finished: bool) {
-        if !self.active {
+        if !self.open() {
             return;
         }
         assert!(self.stream_ready());
@@ -193,15 +217,22 @@ impl Session {
         });
     }
     /// Consumes received bytes until one complete request is read, and returns it with the number
-    /// of bytes consumed. A frame that is not a usable request is answered here. Nothing is read
-    /// while a response is outstanding; zero consumption tells the USB reader to keep its bytes.
+    /// of bytes consumed. An empty decoded frame queues the adapter identity. An unusable
+    /// request is answered here. Nothing is read while a response is outstanding; zero
+    /// consumption tells the USB reader to keep its bytes.
     pub fn feed(&mut self, bytes: &[u8]) -> (usize, Option<p::Request>) {
         let mut consumed = 0;
-        while consumed < bytes.len() && self.active && !self.stopped && !self.answering() {
+        while consumed < bytes.len() && self.open() && !self.stopped && !self.answering() {
             let byte = bytes[consumed];
             consumed += 1;
             let error = match self.input.push(byte) {
                 None => continue,
+                Some(Ok([])) => {
+                    let mut bytes = Vec::new();
+                    frame::encode_bytes(&self.hello, &mut bytes);
+                    self.response = Some(bytes);
+                    continue;
+                }
                 Some(Ok(frame)) => match p::Request::decode(frame) {
                     Ok(request) if request.command.is_some() => return (consumed, Some(request)),
                     Ok(_) => p::ErrorCode::UnknownCommand,
@@ -220,7 +251,7 @@ impl Session {
     /// The next chunk of output, at most `max` bytes. The USB writer copies it before returning
     /// control; only a matching completion advances the output.
     pub fn output(&mut self, max: usize) -> Option<(OutputToken, &[u8])> {
-        if max == 0 || !self.active {
+        if max == 0 || !self.open() {
             return None;
         }
         if self.output.is_none()

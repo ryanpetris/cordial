@@ -8,6 +8,8 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { compareRuleRefs, compareSettingsRefs, ruleRef, settingsRef, type ByteStream } from "@cordial/client";
 import {
+  AdapterHelloSchema,
+  CURRENT_PROTOCOL_VERSION,
   CodeKind,
   ConfigurationInterface,
   DELIMITER,
@@ -47,6 +49,7 @@ import {
   UsageSchema,
   UsageRange_Kind,
   VendorRegistry,
+  encodeAdapterHello,
 } from "@cordial/protocol";
 import { CASES, FIELDS, updateChanges } from "../core/convert.ts";
 import { adapterName } from "../shared/adapter-name.ts";
@@ -521,8 +524,14 @@ export class FakeAdapter implements ByteStream {
   usbReconnects = 0;
   /** Whether the USB device is attached; false briefly while it reconnects. */
   present = true;
-  /** Bytes from an earlier session delivered right after the next open. */
+  /** Bytes delivered right after the next open, before the session's delimiter. */
   staleInput: Uint8Array | null = null;
+  /** The protocol revision the hello reports. */
+  protocolVersion = CURRENT_PROTOCOL_VERSION;
+  /** Whether the hello includes the firmware version, serial number and name. */
+  helloMetadata = true;
+  /** How many client hellos this session received. */
+  hellos = 0;
   /** Called when the USB device is attached again after reconnecting. */
   readonly #hotplug: (() => void)[] = [];
   /** Profiles loaded for each connected device, by device ID. */
@@ -538,6 +547,7 @@ export class FakeAdapter implements ByteStream {
   #close: ((error: Error | null) => void)[] = [];
   #decoder = new FrameDecoder(1024);
   #open = false;
+  #sessionVersion = CURRENT_PROTOCOL_VERSION;
   #starting = false;
   #session = 0;
   #scan: ReturnType<typeof setTimeout>[] | null = null;
@@ -603,6 +613,10 @@ export class FakeAdapter implements ByteStream {
       this.#send(new Uint8Array([...stale, DELIMITER]));
     }
     for (const frame of this.#decoder.push(bytes)) {
+      if (frame.ok && !frame.bytes.length) {
+        this.#greet();
+        continue;
+      }
       if (!frame.ok) {
         this.#reply({ result: { case: "error", value: { code: frame.error === "too_long" ? ErrorCode.TOO_LONG : ErrorCode.BAD_REQUEST } } });
         continue;
@@ -624,14 +638,17 @@ export class FakeAdapter implements ByteStream {
     this.#data = [];
   }
 
-  /** Opens the port: DTR rises and a new session starts with a delimiter. */
-  open() {
+  /** Opens the port: DTR rises and a new session starts with a delimiter. The session's hello
+   * reports `protocolVersion`, as through a converter. */
+  open(protocolVersion = this.protocolVersion) {
     if (!this.present) throw new Error("no such device");
     this.#end();
     this.#open = true;
+    this.#sessionVersion = protocolVersion;
     this.#session++;
     this.received = [];
     this.events = [];
+    this.hellos = 0;
     this.#seenSettings.clear();
     this.#starting = true;
     return this;
@@ -699,6 +716,13 @@ export class FakeAdapter implements ByteStream {
     this.migrationRequired = this.storageFormat !== this.targetStorageFormat;
   }
 
+  /** Answers a client hello, an empty frame, with this adapter's own. */
+  #greet() {
+    this.hellos++;
+    const metadata = this.helloMetadata ? { firmwareVersion: "0.0.0-dev", serialNumber: this.id, name: this.name } : {};
+    this.#output(encodeFrame(encodeAdapterHello(create(AdapterHelloSchema, { protocolVersion: this.#sessionVersion, ...metadata }))));
+  }
+
   // ---- Output -------------------------------------------------------------
 
   #send(bytes: Uint8Array) {
@@ -719,8 +743,12 @@ export class FakeAdapter implements ByteStream {
   /** Queues messages, encoded back to back in one frame, behind earlier ones, after the reply
    * delay. */
   #message(...messages: MessageInit[]) {
+    this.#output(encodeFrame(new Uint8Array(messages.flatMap((m) => [...toBinary(MessageSchema, create(MessageSchema, m))]))));
+  }
+
+  /** Queues a frame behind earlier ones, after the reply delay. */
+  #output(frame: Uint8Array) {
     const session = this.#session;
-    const frame = encodeFrame(new Uint8Array(messages.flatMap((m) => [...toBinary(MessageSchema, create(MessageSchema, m))])));
     const gate = this.#gate;
     this.#outbox = this.#outbox.then(async () => {
       if (gate) await gate;

@@ -605,6 +605,16 @@ export function adapterStatus(a: AdapterEntry): { text: string; warn: boolean } 
   return a.attention.length ? { text: "Needs Attention", warn: true } : { text: "Ready", warn: false };
 }
 
+/** Why Cordial can't use an adapter on another protocol revision: newer than this app, unsupported
+ * by the Cordial CLI, needing a CLI that is missing or incompatible, or needing a CLI in a browser. */
+export const REFUSALS = {
+  newer: "This adapter requires a newer version of Cordial. Update Cordial to connect.",
+  unsupported: "Cordial doesn't support this adapter's protocol. Update the adapter firmware to connect.",
+  missing: "This adapter requires the Cordial CLI. Install it to connect.",
+  incompatible: "The Cordial CLI is incompatible with Cordial. Install a matching CLI version to connect.",
+  browser: "This adapter requires the desktop app or CLI. Use one of them to connect.",
+} as const;
+
 /** Removes control and format characters (including bidirectional
  * overrides) from untrusted text before display. */
 export const clean = (s: string) =>

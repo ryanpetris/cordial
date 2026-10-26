@@ -492,7 +492,7 @@ impl<F: Fleet> Model<F> {
     }
 
     /// Diagnostics: the adapter's errors, why its migration failed, the saved devices it couldn't
-    /// read, and its ID.
+    /// read, and its ID. A refused adapter has no confirmed ID, only the serial number it reported.
     fn adapter_diagnostics(&self, a: &AdapterView, b: &mut Layout) {
         if let Storage::Failed { reason, .. } = &a.storage {
             b.section("Migration");
@@ -526,6 +526,13 @@ impl<F: Fleet> Model<F> {
             );
             b.align_right(row);
         }
+        if let Some(hello) = &a.hello {
+            if let Some(serial) = words::reported(hello.hello.serial_number.as_deref()) {
+                b.section("Identifiers");
+                b.fact("Serial Number", &serial, layout::plain());
+            }
+            return;
+        }
         b.section("Identifiers");
         b.fact("Adapter ID", &a.id, layout::plain());
         if let Some(format) = a.live().and_then(text::storage_format) {
@@ -535,7 +542,16 @@ impl<F: Fleet> Model<F> {
 
     fn adapter_details(&self, a: &AdapterView, b: &mut Layout) {
         let Some(live) = a.live() else {
-            return Self::empty_state(a, b);
+            Self::empty_state(a, b);
+            let firmware = a
+                .hello
+                .as_ref()
+                .and_then(|h| words::reported(h.hello.firmware_version.as_deref()));
+            if let Some(firmware) = firmware {
+                b.section("Information");
+                b.fact("Firmware", &firmware, layout::plain());
+            }
+            return;
         };
         let devices: Vec<_> = self.devices.iter().filter(|d| d.adapter == a.id).collect();
         if !devices.is_empty() {

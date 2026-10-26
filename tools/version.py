@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the application version supplied through CORDIAL_VERSION, and choose the release the
-protocol compatibility checks compare against."""
+"""Validate CORDIAL_VERSION and select release baselines for storage and serial checks."""
 import os
 import re
 import subprocess
@@ -43,10 +42,16 @@ def protocol_base(version, tags):
     return earlier[-1] if earlier else None
 
 
-def released_tags():
-    """Release tags reachable from the commit before HEAD, so a tag on HEAD itself is skipped."""
+def stable_tags(version, tags):
+    """All local release tags except the application release currently being built."""
+    return sorted(t for t in tags if re.fullmatch(rf"v{RELEASE}", t) and t != f"v{version}")
+
+
+def released_tags(root=None, *, ancestors_only=True):
+    """Local tags, restricted to history before HEAD when selecting a storage baseline."""
     out = subprocess.run(
-        ["git", "tag", "--merged", "HEAD^", "--list", "v*"],
+        ["git", "tag", *(["--merged", "HEAD^"] if ancestors_only else []), "--list", "v*"],
+        cwd=root,
         check=True,
         capture_output=True,
         text=True,

@@ -221,6 +221,7 @@ struct State {
     cancel: Arc<AtomicBool>,
     handles: usize,
     opened: Vec<String>,
+    incompatible_on_open: Option<usize>,
     ports: Vec<AdapterPort>,
     status_id: String,
     bootstrap: VecDeque<p::Status>,
@@ -247,6 +248,7 @@ impl State {
             cancel: Arc::new(AtomicBool::new(false)),
             handles: 0,
             opened: vec![],
+            incompatible_on_open: None,
             ports: vec![AdapterPort {
                 port: "fixture-port".into(),
                 adapter_id: ID.into(),
@@ -349,6 +351,15 @@ impl Transport for Session {
     }
     fn request(&mut self, command: Command, _: &AtomicBool) -> cordial_client::Result<p::Response> {
         let mut s = self.state.lock().unwrap();
+        if s.incompatible_on_open == Some(s.opened.len()) {
+            let hello = p::AdapterHello {
+                protocol_version: Some(p::CURRENT_PROTOCOL_VERSION + 1),
+                ..Default::default()
+            };
+            return Err(ClientError::Incompatible(
+                cordial_client::compatibility::NativeHello::decode(&hello.encode_to_vec()).unwrap(),
+            ));
+        }
         let key = key(&command);
         assert!(
             !s.cancel.load(Ordering::Acquire),
@@ -1922,4 +1933,31 @@ fn transform_working_memory_is_bounded_before_calling_the_converter() {
     let (result, _) = run(&s, &g);
     assert!(result.unwrap_err().reason.contains("RAM"));
     assert!(s.lock().unwrap().mutations.is_empty());
+}
+
+#[test]
+fn unsupported_protocol_stops_migration_at_bootstrap_and_after_reconnect() {
+    for open in [1, 2] {
+        let mut state = State::new(fixture());
+        state.incompatible_on_open = Some(open);
+        state.cancel_after_waits = Some(1);
+        if open == 2 {
+            state.faults.push_back(Fault {
+                key: "read:/format.pb:0".into(),
+                after: false,
+                reboot: false,
+                finish_on_device: false,
+            });
+        }
+        let (state, result, events) = standard(state);
+        assert!(result.unwrap_err().reason.contains("Update Cordial"));
+        let state = state.lock().unwrap();
+        assert_eq!(state.opened.len(), open);
+        assert_eq!(state.waits, 0);
+        assert!(state.mutations.is_empty());
+        assert!(matches!(
+            events.last().unwrap().event,
+            Some(ipc::migration_event::Event::Failure(_))
+        ));
+    }
 }

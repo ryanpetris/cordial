@@ -100,6 +100,9 @@ pub enum Plan {
 /// Everything the simulated Dongle knows.
 pub struct Sim {
     pub status: p::Status,
+    pub hello: p::AdapterHello,
+    pub answer_hello: bool,
+    pub hellos: usize,
     /// Saved devices; listed in ascending ID order.
     pub devices: Vec<p::Device>,
     /// Saved devices whose records can't be read, listed with a storage read error.
@@ -347,6 +350,12 @@ impl Default for Sim {
     fn default() -> Self {
         Self {
             status: status(true),
+            hello: p::AdapterHello {
+                protocol_version: Some(p::CURRENT_PROTOCOL_VERSION),
+                ..Default::default()
+            },
+            answer_hello: true,
+            hellos: 0,
             devices: vec![
                 device(1, "Office Mouse", Transport::Ble),
                 p::Device {
@@ -1232,6 +1241,7 @@ impl Dongle {
         let sim = self.0.clone();
         thread::spawn(move || {
             let mut decoder = Decoder::new(Some(MAX_REQUEST_BYTES));
+            let mut negotiated = false;
             let mut buffer = [0; 256];
             loop {
                 let n = match from_client.read(&mut buffer) {
@@ -1246,26 +1256,44 @@ impl Dongle {
                     Err(_) => continue,
                 };
                 for &byte in &buffer[..n] {
-                    if let Some(Ok(frame)) = decoder.push(byte)
-                        && let Ok(request) = p::Request::decode(frame)
-                        && let Some(command) = request.command
-                    {
-                        let mut sim = sim.lock().unwrap();
-                        let Some(delay) = sim.slow.get(kind_name(&command)).copied() else {
-                            sim.answer(command);
+                    if let Some(Ok(frame)) = decoder.push(byte) {
+                        if !negotiated {
+                            assert_eq!(
+                                p::handshake::decode_client_hello(frame).unwrap(),
+                                p::ClientHello {}
+                            );
+                            let mut bytes = Vec::new();
+                            let mut sim = sim.lock().unwrap();
+                            sim.hellos += 1;
+                            frame::encode(&sim.hello, &mut bytes);
+                            if sim.answer_hello
+                                && let Some(out) = sim.out.as_mut()
+                            {
+                                let _ = out.write_all(&bytes);
+                            }
+                            negotiated = true;
                             continue;
-                        };
-                        let (held, replies) = mpsc::channel();
-                        let out = sim.out.replace(PipeWriter(held));
-                        sim.answer(command);
-                        sim.out = out.clone();
-                        if let Some(mut out) = out {
-                            thread::spawn(move || {
-                                thread::sleep(delay);
-                                for bytes in replies.try_iter() {
-                                    let _ = out.write_all(&bytes);
-                                }
-                            });
+                        }
+                        if let Ok(request) = p::Request::decode(frame)
+                            && let Some(command) = request.command
+                        {
+                            let mut sim = sim.lock().unwrap();
+                            let Some(delay) = sim.slow.get(kind_name(&command)).copied() else {
+                                sim.answer(command);
+                                continue;
+                            };
+                            let (held, replies) = mpsc::channel();
+                            let out = sim.out.replace(PipeWriter(held));
+                            sim.answer(command);
+                            sim.out = out.clone();
+                            if let Some(mut out) = out {
+                                thread::spawn(move || {
+                                    thread::sleep(delay);
+                                    for bytes in replies.try_iter() {
+                                        let _ = out.write_all(&bytes);
+                                    }
+                                });
+                            }
                         }
                     }
                 }

@@ -139,7 +139,7 @@ describe("information", () => {
       resources: [{ type: 1, limit: 16 }],
       profileSupport: { resources: [{ type: 5, count: 0, limit: 0 }] },
     }));
-    expect(s.information).toEqual({ firmwareVersion: "1.0.0", boardName: null, developmentBuild: false, storageFormat: null });
+    expect(s.information).toEqual({ firmwareVersion: "1.0.0", boardName: null, developmentBuild: false, storageFormat: null, targetStorageFormat: null });
     expect(s.resources).toEqual([{ type: "interfaces", count: null, limit: 16 }]);
     expect(s.profileSupport!.resources).toEqual([{ type: "memory", count: 0, limit: 0 }]);
   });

@@ -1590,6 +1590,17 @@ fn whole_file_debug_streams_have_bounded_memory_and_late_errors_replace_the_file
             .unwrap();
             let mut serial = Session::new();
             serial.session(true);
+            let mut hello = Vec::new();
+            p::frame::encode_bytes(
+                &p::handshake::encode_client_hello(&p::ClientHello {}).unwrap(),
+                &mut hello,
+            );
+            assert_eq!(serial.feed(&hello), (hello.len(), None));
+            while let Some((token, bytes)) = serial.output(63) {
+                let length = bytes.len();
+                serial.output_complete(token, length);
+            }
+            assert!(serial.open());
             serial.start_stream();
             let mut wire = Vec::new();
             let mut steps = 0;

@@ -23,7 +23,7 @@ describe("framing", () => {
     }
   });
 
-  it("joins pieces, splits several frames and skips empty ones", () => {
+  it("joins pieces, splits several frames and skips bare delimiters", () => {
     const decoder = new FrameDecoder();
     const a = encodeFrame(bytes(1, 2, 3));
     const b = encodeFrame(bytes(0, 4));

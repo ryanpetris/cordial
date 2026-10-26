@@ -41,7 +41,7 @@ for (const signal of ["SIGINT", "SIGTERM"])
   process.on(signal, async () => {
     if (stopping) return;
     stopping = true;
-    await Promise.race([backend.stop(), new Promise((r) => setTimeout(r, 1500))]);
+    await Promise.race([backend.stop(), new Promise((r) => setTimeout(r, 2500))]);
     await server.close();
     process.exit(0);
   });

@@ -316,10 +316,16 @@ describe("Controller", () => {
     await c.stop();
   });
 
-  it("ignores bytes left from an earlier session", async () => {
+  it("ignores empty frames before the hello and sends nothing after any other frame", async () => {
     const a = new FakeAdapter({ adapterId: "AAAA0001" });
     a.staleInput = new Uint8Array([0x41, 0x42, 0x00, 0x03, 0x12, 0x34]);
     const { c, state } = controller({ "/a": a });
+    await c.manager.rescan();
+    await until(() => a.hellos === 1);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(a.received).toEqual([]);
+    expect(state()?.adapters ?? []).toEqual([]);
+    a.staleInput = new Uint8Array([0x00, 0x00]);
     await c.manager.rescan();
     await until(() => loaded(state(), 4));
     await c.stop();

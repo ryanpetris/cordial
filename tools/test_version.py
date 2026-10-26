@@ -3,7 +3,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from version import protocol_base, resolve
+from version import protocol_base, resolve, stable_tags
 
 
 class Versions(unittest.TestCase):
@@ -34,6 +34,13 @@ class ProtocolBase(unittest.TestCase):
         self.assertEqual(protocol_base("1.0.1", self.TAGS), "v1.0.0")
         self.assertIsNone(protocol_base("1.0.0", self.TAGS))
         self.assertIsNone(protocol_base("3.0.0", self.TAGS))
+
+    def test_stable_contracts_include_all_other_application_releases(self):
+        tags = self.TAGS + ["v0.9.0", "v0.9.1", "v0.10.0", "v1.0.0-rc1"]
+        expected = sorted(t for t in self.TAGS if t != "other") + ["v0.10.0", "v0.9.0"]
+        self.assertEqual(stable_tags("0.9.1", tags), sorted(expected))
+        self.assertEqual(stable_tags("0.0.0", self.TAGS), sorted(self.TAGS[:-1]))
+        self.assertEqual(stable_tags("0.9.1", []), [])
 
     def test_a_development_build_compares_against_the_newest_release(self):
         self.assertEqual(protocol_base("0.0.0", self.TAGS), "v2.0.0")

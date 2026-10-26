@@ -2,7 +2,8 @@
 
 The Dongle's USB CDC port carries a protobuf API. A client sends one request and gets one response
 back, in order; the Dongle also sends an event whenever something changes. There are no request
-IDs, no subscriptions, no heartbeats and no revisions. The separate USB HID interfaces carry the
+IDs, no subscriptions and no heartbeats. Clients start every session with the permanent handshake
+to identify the operational serial revision. The separate USB HID interfaces carry the
 keyboard and mouse, and the enabled configuration interfaces.
 
 One host process owns the port at a time. The Dongle stores its bonds, connection policy, settings
@@ -22,18 +23,19 @@ reports what it says, such as battery levels.
 
 ## Definitions
 
-- [`proto/cordial.proto`](../../proto/cordial.proto) defines every message. Its comments say what
-  each field means, which fields are required, and what a missing field means.
+- [`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto) defines the revision `1` operational
+  messages. Its comments say what each field means, which fields are required, and what a missing
+  field means.
+- [`proto/handshake.proto`](../../proto/handshake.proto) defines the permanent opening messages.
 - [`proto/storage/v2/storage.proto`](../../proto/storage/v2/storage.proto) defines the operating saved
   records independently of the serial representation. Historical schemas remain under
   `proto/storage/v1/`. See [storage format](../storage-format.md).
 - [`proto/migration.proto`](../../proto/migration.proto) defines framed desktop/CLI subprocess IPC.
   Its length prefix and bounds are separate from the serial API's COBS frames.
 
-`buf lint` checks all schemas, and `buf breaking` compares them with the newest earlier release
-in the same series. Unversioned historical storage schemas are assigned their matching namespace
-before comparison. Each storage format is compared with itself, while all serial and IPC fields
-retain the `WIRE_JSON` checks. See [Compatibility rules](compatibility.md).
+`buf lint` checks all schemas. `make check-protocol` checks the permanent handshake and retained
+serial revisions against published schemas. Storage and migration IPC use the newest earlier
+release in the same application series. See [Compatibility rules](compatibility.md).
 
 ## Libraries
 

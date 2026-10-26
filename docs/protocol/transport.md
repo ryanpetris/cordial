@@ -18,11 +18,12 @@ keys either. The adapter calculates its allocation from saved preferences before
 The adapter ID is 16 uppercase hexadecimal digits, and the USB serial number always starts with it.
 While Vial is active, the serial is the ID followed by `-vial:f64c2b3c`, which Vial looks for to
 discover the adapter; otherwise it is the ID alone. Firmware derives both from the same hardware
-identity. A connected client takes the adapter's identity from `GetStatus` and never compares it
-with USB metadata. A client that needs to recognize an adapter before opening its port, such as one
-the user disconnected, uses the first 16 characters of the USB serial, compared without regard to
-case. The product string is the firmware's default adapter name, independent of any name the user
-saved.
+identity. After a compatible handshake, a connected client takes the adapter's authoritative
+identity from `GetStatus` and never compares it with USB metadata. Optional hello metadata does
+not replace `GetStatus`. A client that needs to recognize an adapter before opening its port,
+such as one the user disconnected, uses the first 16 characters of the USB serial, compared
+without regard to case. The product string is the firmware's default adapter name, independent of
+any name the user saved.
 
 Pico W uses its flash unique ID, RP2350 boards their chip ID, and ESP32-S3 bits 0..63 of its factory
 `OPTIONAL_UNIQUE_ID` eFuse field read as a little-endian 64-bit integer. The USB identity is
@@ -36,16 +37,19 @@ or the protocol, and opening the port or changing the baud rate never reboots th
 - Each message is protobuf-encoded, then COBS-encoded, then followed by one `0x00` byte. COBS
   output contains no zero byte, so a zero always ends a frame and a receiver that joins mid-stream
   resynchronizes at the next one.
-- Client to Dongle, every frame is a `Request`. Dongle to client, every frame is a `Message` holding
-  either a `Response` or an `Event`.
-- Empty frames (two delimiters in a row) are ignored.
+- A client frame that decodes to zero bytes, encoded as `0x01 0x00`, is a `ClientHello`. Every
+  other client frame is a `Request`, and every `Request` a client sends sets a command, so it
+  encodes to at least one byte. Adapter frames are either an `AdapterHello`, answering a
+  `ClientHello`, or a `Message` holding a `Response` or an `Event`.
+- A delimiter with nothing before it, such as the second of two in a row, ends no frame and is
+  ignored.
 - The complete client `Request`, including its command envelope and all repeated entries, is at
   most 1024 protobuf bytes before COBS encoding. A longer frame is discarded through its delimiter
   and answered with `ERROR_CODE_TOO_LONG`.
-- Dongle frames have no total protocol size limit, including typed settings and saved metadata.
-  The Dongle writes long frames incrementally and never interleaves two frames. Lists use bounded
-  batches inside one frame; see [Listings](compatibility.md#listings). Rust clients apply a local
-  [receive limit](#rust-host-receive-limit).
+- Ordinary Dongle frames have no total protocol size limit, including typed settings and saved
+  metadata. The Dongle writes long frames incrementally and never interleaves two frames. Lists
+  use bounded batches inside one frame; see [Listings](compatibility.md#listings). Rust clients
+  apply a local [receive limit](#rust-host-receive-limit).
 - USB checksums every packet, so frames carry no checksum of their own.
 
 ### Rust host receive limit
@@ -53,36 +57,101 @@ or the protocol, and opening the port or changing the baud rate never reboots th
 The Rust client library, including the CLI and TUI, accepts at most 32 MiB, or 33,554,432 decoded
 protobuf bytes, per received frame. This counts the complete `Message`, including nested envelopes
 and every repeated listing batch. Its COBS receive buffer holds at most 33,686,537 encoded bytes,
-excluding the delimiter. This is a client implementation limit; the wire protocol has no overall
-adapter-to-host cap, and the TypeScript desktop and web clients do not apply this limit.
+excluding the delimiter. This limit also applies while the client waits for the hello, since
+ordinary messages can arrive first; the hello itself has a 1024-byte decoded limit. The wire
+protocol has no overall cap on ordinary adapter-to-host frames, and the TypeScript desktop and web
+clients do not apply the 32 MiB limit.
 
 Once the encoded limit is exceeded, the decoder discards bytes without further buffer growth until
 the next delimiter. It also rejects a frame whose decoded size exceeds the limit. The decoder
-reports an oversized frame only at its delimiter. Before session synchronization, the Rust client
-discards invalid and oversized frames without removing the pending opening request or releasing
-waiting callers. It can synchronize on the next eligible `Response`. After synchronization, it
-closes the session with a protocol error and fails all pending requests to avoid misaligning later
-FIFO responses.
+reports an oversized frame only at its delimiter. An invalid hello, or any frame over the receive
+limit, fails the Rust handshake before any ordinary request is sent. After a compatible hello, an
+invalid or oversized ordinary frame closes the session with a protocol error and fails all pending
+requests to avoid misaligning later FIFO responses.
 
 An endless stream of nonzero bytes therefore keeps frame buffering bounded but does not trigger
-an immediate protocol-error close. Incoming bytes still reset the existing request inactivity
-timer. Buffer allocation capacity and decoded objects can use additional memory; these byte limits
+an immediate protocol-error close. During ordinary traffic, incoming bytes still reset the request
+inactivity timer. The handshake has an absolute deadline that incoming bytes cannot extend.
+Buffer allocation capacity and decoded objects can use additional memory; these byte limits
 are not a bound on total process memory.
 
 Complete valid supported lists and events within the limit keep their normal semantics. Clients
 never apply an oversized frame partially. The cap allows generous room for current firmware
 responses; revisit it when producers or storage limits grow.
 
+## Permanent handshake
+
+The hello tells a host which operational revision the adapter speaks. Clients require it before
+ordinary traffic; the firmware does not.
+
+1. The host writes a delimiter and an empty `ClientHello` frame.
+2. The adapter answers with an `AdapterHello` holding its own operational revision. It may include
+   `firmware_version`, `serial_number` and `name`.
+3. The host sends ordinary requests only after it has a valid `AdapterHello` naming a revision it
+   implements.
+
+To the firmware, `ClientHello` is one more query. It accepts ordinary requests whether or not a
+hello came first, answers a hello at any point in a session and never learns or compares a host
+revision. A hello takes its turn with requests: the `AdapterHello` follows the responses to
+earlier requests and goes out as one complete frame. `ClientHello` has no fields. Nonempty bytes
+are never a `ClientHello`, so they cannot be confused with a `Request`.
+
+Events can go out before the `AdapterHello`, and so can responses to requests an earlier client
+left behind. While it waits for the hello, a host drops every frame with the `Message` envelope:
+one or more length-delimited fields `1` or `2`. It checks only the envelope, because it can't
+decode the payload before it knows the revision. Any other frame that is not a valid
+`AdapterHello` fails the handshake. A frame that fits both, such as an `AdapterHello` without a
+version that carries only `firmware_version`, is dropped and never accepted. The handshake has an
+absolute deadline that incoming frames cannot extend. A host never sends an ordinary request to
+learn the revision and never infers one from the shape of other frames.
+
+Firmware constructs its hello from build and hardware metadata without reading storage. It
+currently omits the name. This does not guarantee a response before initialization finishes;
+startup work holding the application owner lock can delay serial servicing. After a compatible
+handshake, `GetStatus` supplies the authoritative identity and saved adapter name. Only
+`protocol_version` is required; missing firmware version, serial number or name never prevents a
+compatible handshake.
+
+An `AdapterHello` is at most `MAX_HANDSHAKE_BYTES`, currently `1024` decoded protobuf bytes, and a
+`ClientHello` is always empty. Frames before the hello can be ordinary messages of any length, and
+none longer than the hello limit is accepted as a hello. The Rust client keeps its ordinary
+[receive limit](#rust-host-receive-limit) while it waits. The TypeScript desktop and web clients
+buffer at most `MAX_HANDSHAKE_BYTES` decoded bytes of a frame while they wait. They discard a
+longer frame undecoded through its delimiter and keep waiting until the same deadline. After a
+compatible hello they decode the following bytes, including the rest of the same read, without a
+size limit. The adapter hello decoders validate the complete bytes before generated decoding
+and reject missing, zero, duplicate, overflowing, wrong-wire or truncated versions and malformed
+protobuf structure. Field order does not matter. Nested fields do not count as the hello's version.
+Optional future fields are skipped, including opaque length-delimited contents and structurally
+valid groups. Field keys use at most five varint bytes. Groups may nest to depth `100`; a group at
+depth `100` must be empty.
+
+Rust exports `handshake::{ClientHello, AdapterHello, HandshakeError, decode_client_hello,
+decode_adapter_hello, encode_client_hello, encode_adapter_hello, CURRENT_PROTOCOL_VERSION,
+MAX_HANDSHAKE_BYTES}`. Decode helpers take unframed protobuf bytes and return `Result`; encode
+helpers return validated protobuf bytes for `frame::encode_bytes`. `decode_client_hello` accepts
+only empty bytes. Hello types and both constants are also exported at the crate root.
+`OPERATIONAL_SCHEMA_SHA256` is a crate-root constant.
+
+TypeScript exports `ClientHello`, `AdapterHello`, `ClientHelloSchema`, `AdapterHelloSchema`,
+`decodeClientHello`, `decodeAdapterHello`, `encodeClientHello`, `encodeAdapterHello`,
+`HandshakeError`, `HandshakeErrorCode`, `CURRENT_PROTOCOL_VERSION`, `MAX_HANDSHAKE_BYTES` and
+`OPERATIONAL_SCHEMA_SHA256` from `@cordial/protocol`. Decode helpers accept unframed protobuf bytes;
+encode helpers return validated bytes for `encodeFrame`. `decodeClientHello` accepts only empty
+bytes. Validation throws `HandshakeError` with a technical `code` for the host to interpret. No
+user-facing messages belong to the protocol package.
+
 ## Requests and responses
 
-The Dongle answers every request frame with exactly one `Response`, in the order requests arrive.
-It reads the next request only after the previous response has been written, so a client may send
-requests back to back but never needs to match responses to requests.
+The Dongle answers every request frame with exactly one `Response`, and every `ClientHello` with one
+`AdapterHello`, in the order they arrive. It reads the next request only after the previous response
+has been written, so a client may send requests back to back but never needs to match responses to
+requests.
 
 - A frame that does not decode as a `Request` gets `ERROR_CODE_BAD_REQUEST`.
-- A `Request` with no command set gets `ERROR_CODE_UNKNOWN_COMMAND`. That is also what firmware sees
-  for a command added after it was built, because protobuf decodes an unknown `oneof` variant as an
-  unset one.
+- A nonempty `Request` with no command set gets `ERROR_CODE_UNKNOWN_COMMAND`. That is also what
+  firmware sees for a command added after it was built, because protobuf decodes an unknown `oneof`
+  variant as an unset one. An empty frame is a `ClientHello`, not a `Request`.
 - A command with a missing required field, a value of the wrong type or a value out of range gets
   `ERROR_CODE_BAD_ARGS`.
 - A `Response` with no result set means success with nothing to return. Commands that change saved
@@ -105,8 +174,9 @@ ends the session because losing a response would misalign every later request.
 
 ## Events
 
-An event can arrive between any two frames, including between a request and its response; a
-`Message` holding a `Response` always answers the oldest unanswered request.
+An event can arrive between any two adapter frames, including between a request and its response
+and before the `AdapterHello`. A `Message` holding a `Response` always answers the oldest
+unanswered request.
 
 Most events carry the complete current state of one thing: the adapter, a device, a profile, a scan
 candidate, or the pairing. A client replaces what it had with the latest one.
@@ -114,7 +184,8 @@ candidate, or the pairing. A client replaces what it had with the latest one.
 Settings are listed as complete lists of whole domain objects. `settings_changed` carries complete
 objects that changed or appeared, and references to those that went away. A client replaces objects
 by integration, group and optional component index, and ignores removal of an entry it does not
-hold. A completed listing replaces the list before later events apply. There are no revisions.
+hold. A completed listing replaces the list before later events apply. Records and events carry
+no revision counters.
 Profile rules have no change event; a client lists them again when it needs a fresh view, such as
 in a new session.
 
@@ -137,9 +208,9 @@ drain, retaining a bounded rescan cursor rather than every affected ID.
 
 - Opening the port (DTR rising) starts a session. The Dongle discards any partial input and unsent
   output from the previous session and writes a `0x00` delimiter.
-- A client also writes a `0x00` before its first request, so a partial frame left by an earlier
-  client cannot merge with it, and ignores everything up to the first `Response` after its first
-  request.
+- A client writes a `0x00` followed by `ClientHello`, so a partial frame left by an earlier
+  client cannot merge with it. It validates `AdapterHello` before sending any ordinary request.
+  Every new session repeats this exchange, including reconnects after USB reconfiguration.
 - Closing the port (DTR falling), USB reset or USB disconnection ends the session, including the USB
   reconnect that follows a USB allocation change. Clients discard incomplete received frames.
   Ending a session stops a running scan and cancels a pairing that has not saved its bond. A new
@@ -160,4 +231,11 @@ After USB reconnects, a client opens a new session and reads `GetStatus` and the
 It does not wait for an adapter event from the old session. A received success confirms the saved
 preference even if its requested interface is absent from the new allocation. A lost response
 leaves the outcome unknown until the client reads the saved state. Reconfiguration never rolls
-back durable preferences.
+back durable preferences. Clients never replay a write whose outcome is unknown.
+
+A CLI proxy exits when its physical adapter disconnects and never reconnects itself. If the
+application stops reading pending proxy output for three seconds, the helper also exits. Partial
+writes reset this deadline; an idle session with no pending output stays open. If the helper
+exits, the desktop handles it as a disconnected session. Each desktop retry starts with a
+fresh direct hello exchange, so an adapter that now reports the current revision can reconnect
+directly. See [client implementations](clients.md) for proxy selection and client-specific behavior.

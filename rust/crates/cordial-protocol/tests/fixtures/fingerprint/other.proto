@@ -1,0 +1,6 @@
+syntax = "proto3";
+package fingerprint.dependency;
+
+message Extra {
+  uint32 value = 1;
+}

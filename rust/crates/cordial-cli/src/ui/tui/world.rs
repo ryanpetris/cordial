@@ -1,15 +1,16 @@
 //! The adapters and devices as the TUI shows them, built from every session's view the way the
 //! desktop application builds its state: connected adapters, adapters held while they may
-//! return, and adapters the user disconnected while they stay plugged in; and every saved device
-//! of every connected adapter in one list.
+//! return, adapters the user disconnected while they stay plugged in, and ports whose adapter
+//! refused the connection; and every saved device of every connected adapter in one list.
 use super::{
     Model, Page, Tab,
     fleet::Fleet,
     words::{self, Battery, DisplayKind},
 };
 use crate::{model, profiles, view::State};
+use cordial_client::compatibility::NativeHello;
 use cordial_protocol::{self as p, ErrorCode};
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Conn {
@@ -43,6 +44,7 @@ pub enum Storage {
 
 #[derive(Clone, Debug)]
 pub struct AdapterView {
+    /// The adapter's ID, or the port of a refused adapter, which has no confirmed ID.
     pub id: String,
     pub name: String,
     pub conn: Conn,
@@ -59,6 +61,8 @@ pub struct AdapterView {
     /// of, with why, in ID order.
     pub unreadable: Vec<(u32, p::Error)>,
     pub storage: Storage,
+    /// What a refused adapter reported about itself.
+    pub hello: Option<Arc<NativeHello>>,
 }
 
 impl AdapterView {
@@ -90,6 +94,7 @@ impl AdapterView {
             }
         }
         match self.conn {
+            Conn::Disconnected if self.hello.is_some() => ("Needs Attention", true),
             Conn::Disconnected => ("Disconnected", false),
             Conn::Connecting => ("Connecting…", false),
             Conn::Connected if self.failed => ("Needs Attention", true),
@@ -219,6 +224,7 @@ impl<F: Fleet> Model<F> {
                     Vec::new()
                 },
                 storage: s.storage.clone(),
+                hello: None,
             });
         }
         if let Some(m) = &self.migration {
@@ -233,6 +239,7 @@ impl<F: Fleet> Model<F> {
                 connect_error: None,
                 unreadable: Vec::new(),
                 storage: m.storage(),
+                hello: None,
             });
         }
         let migrating = self.migration.as_ref().map(|m| m.id.as_str());
@@ -251,6 +258,7 @@ impl<F: Fleet> Model<F> {
                 connect_error: None,
                 unreadable: Vec::new(),
                 storage: Storage::Normal,
+                hello: None,
             });
         }
         for (id, o) in &self.off {
@@ -272,6 +280,28 @@ impl<F: Fleet> Model<F> {
                 connect_error: o.error.clone(),
                 unreadable: Vec::new(),
                 storage: Storage::Normal,
+                hello: None,
+            });
+        }
+        for (port, r) in &self.refused {
+            let connecting = r.retry || self.probes.values().any(|p| p == port);
+            adapters.push(AdapterView {
+                id: port.clone(),
+                name: words::reported(r.hello.hello.name.as_deref())
+                    .unwrap_or_else(|| "Adapter".into()),
+                conn: if connecting {
+                    Conn::Connecting
+                } else {
+                    Conn::Disconnected
+                },
+                ready: false,
+                status: None,
+                attention: Vec::new(),
+                failed: false,
+                connect_error: (!connecting).then(|| r.why.clone()),
+                unreadable: Vec::new(),
+                storage: Storage::Normal,
+                hello: Some(r.hello.clone()),
             });
         }
         adapters.sort_by(|a, b| order(&a.name, &b.name).then_with(|| a.id.cmp(&b.id)));

@@ -2108,3 +2108,323 @@ fn a_blocked_adapter_shows_its_error_and_offers_restart() {
     assert!(app.ran("Restart"));
     assert!(!app.calls().iter().any(|c| matches!(c, Call::Migrate(..))));
 }
+
+const NEWER: &str = "This adapter requires a newer version of Cordial. Update Cordial to connect.";
+
+/// An adapter's refusal of a newer protocol, with what its hello reports.
+fn newer(f: impl FnOnce(&mut p::AdapterHello)) -> Error {
+    let mut hello = p::AdapterHello {
+        protocol_version: Some(p::CURRENT_PROTOCOL_VERSION + 1),
+        ..Default::default()
+    };
+    f(&mut hello);
+    let hello = cordial_client::compatibility::NativeHello {
+        hello,
+        bytes: Vec::new(),
+    };
+    Error::from_client(cordial_client::Error::Incompatible(hello), "adapter status")
+}
+
+impl App {
+    /// Lists `ports` and refuses the probe of `refused` with `error`.
+    fn refuse(&mut self, ports: Vec<PortInfo>, refused: &str, error: Error) {
+        self.m.update(Msg::Ports(Ok(ports)));
+        let slot = self.probe(refused).unwrap();
+        self.phase(slot, Phase::Failed { error, open: false });
+        self.m.update(Msg::Fleet(slot, Box::new(Event::Closed)));
+        self.fleet.0.borrow_mut().calls.clear();
+    }
+
+    fn probe(&self, port: &str) -> Option<Slot> {
+        self.m
+            .probes
+            .iter()
+            .find(|(_, p)| p.as_str() == port)
+            .map(|(s, _)| *s)
+    }
+
+    fn opened(&self) -> bool {
+        self.calls().iter().any(|c| matches!(c, Call::Open(_)))
+    }
+}
+
+#[test]
+fn a_refused_adapter_stays_listed_with_why_and_without_its_metadata() {
+    let mut app = App::new(140, 32);
+    app.refuse(
+        vec![port("/dev/ttyACM0", "")],
+        "/dev/ttyACM0",
+        newer(|_| {}),
+    );
+    let screen = app.screen();
+    assert!(screen.contains("Adapter"), "{screen}");
+    assert!(screen.contains("Needs Attention"), "{screen}");
+    app.m.open(Page::Adapter("/dev/ttyACM0".into()));
+    assert!(app.shows(NEWER), "{}", app.screen());
+    assert!(app.find("[Connect]").is_some());
+    app.click("Diagnostics");
+    assert!(!app.shows("/dev/ttyACM0"), "the port isn't its ID");
+    assert!(!app.shows("Identifiers"));
+}
+
+#[test]
+fn a_refused_adapter_shows_what_it_reported() {
+    let mut app = App::new(140, 32);
+    app.refuse(
+        vec![port("/dev/ttyACM0", "")],
+        "/dev/ttyACM0",
+        newer(|h| {
+            h.name = Some("Desk".into());
+            h.firmware_version = Some("9.0.0".into());
+            h.serial_number = Some("00000000000FA009".into());
+        }),
+    );
+    app.click("Desk");
+    assert!(app.shows("9.0.0"), "{}", app.screen());
+    assert!(app.shows(NEWER));
+    app.click("Diagnostics");
+    assert!(app.shows("Serial Number"));
+    assert!(app.shows("00000000000FA009"));
+    assert!(!app.shows("Adapter ID"));
+}
+
+#[test]
+fn a_refused_adapter_takes_no_configuration() {
+    let mut app = App::new(140, 32);
+    app.refuse(
+        vec![port("/dev/ttyACM0", "")],
+        "/dev/ttyACM0",
+        newer(|_| {}),
+    );
+    app.m.open(Page::Adapter("/dev/ttyACM0".into()));
+    for tab in ["Settings", "Diagnostics", "Details"] {
+        app.click(tab);
+        assert!(app.find("Rename").is_none(), "{tab}:\n{}", app.screen());
+        assert!(!app.shows("Platform"), "{tab}");
+        app.ctrl('s');
+    }
+    app.m.update(Msg::Key(KeyEvent::new(
+        KeyCode::Char('n'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(app.m.ready_adapters().is_empty());
+    assert!(app.m.jobs.is_empty());
+    assert!(
+        !app.calls().iter().any(|c| matches!(c, Call::Run(..))),
+        "{:?}",
+        app.calls()
+    );
+}
+
+#[test]
+fn a_refused_port_is_tried_again_only_on_refresh_connect_or_its_return() {
+    let ports = || vec![port("/dev/ttyACM0", "")];
+    let mut app = App::new(140, 32);
+    app.refuse(ports(), "/dev/ttyACM0", newer(|_| {}));
+    assert!(!app.m.failed.contains_key("/dev/ttyACM0"));
+    for _ in 0..3 {
+        app.m.update(Msg::Ports(Ok(ports())));
+    }
+    assert!(!app.opened(), "no automatic retry: {:?}", app.calls());
+
+    // Refresh.
+    app.ctrl('r');
+    assert!(app.calls().contains(&Call::List));
+    app.m.update(Msg::Ports(Ok(ports())));
+    assert!(app.opened());
+    assert!(app.shows("Connecting…"));
+    let slot = app.probe("/dev/ttyACM0").unwrap();
+    app.phase(
+        slot,
+        Phase::Failed {
+            error: newer(|_| {}),
+            open: false,
+        },
+    );
+    app.m.update(Msg::Fleet(slot, Box::new(Event::Closed)));
+    app.fleet.0.borrow_mut().calls.clear();
+    app.m.update(Msg::Ports(Ok(ports())));
+    assert!(!app.opened());
+
+    // Connect, from the adapter's page.
+    app.m.open(Page::Adapter("/dev/ttyACM0".into()));
+    app.click("[Connect]");
+    app.m.update(Msg::Ports(Ok(ports())));
+    assert!(app.opened());
+    let slot = app.probe("/dev/ttyACM0").unwrap();
+    app.phase(
+        slot,
+        Phase::Failed {
+            error: newer(|_| {}),
+            open: false,
+        },
+    );
+    app.m.update(Msg::Fleet(slot, Box::new(Event::Closed)));
+    assert!(app.shows(NEWER));
+    app.fleet.0.borrow_mut().calls.clear();
+
+    // Unplugged and plugged in again.
+    app.m.update(Msg::Ports(Ok(Vec::new())));
+    assert!(app.m.refused.is_empty());
+    app.m.update(Msg::Ports(Ok(ports())));
+    assert!(app.opened());
+}
+
+#[test]
+fn a_refused_adapter_that_answers_is_known_by_its_status_id() {
+    let ports = || vec![port("/dev/ttyACM0", "")];
+    let mut app = App::new(140, 32);
+    app.refuse(
+        ports(),
+        "/dev/ttyACM0",
+        newer(|h| h.serial_number = Some("X".into())),
+    );
+    app.m.open(Page::Adapter("/dev/ttyACM0".into()));
+    app.click("[Connect]");
+    app.m.update(Msg::Ports(Ok(ports())));
+    let slot = app.probe("/dev/ttyACM0").unwrap();
+    app.fleet
+        .0
+        .borrow_mut()
+        .states
+        .insert(slot, second_adapter());
+    app.phase(slot, Phase::Opened);
+    app.phase(slot, Phase::Ready);
+    assert!(app.m.refused.is_empty());
+    assert_eq!(app.m.session_of("00000000000FA002").unwrap().slot, slot);
+    assert_eq!(app.m.shown(), Page::Adapter("00000000000FA002".into()));
+    assert!(app.shows("ESP32-S3"));
+    assert!(!app.shows(NEWER));
+}
+
+#[test]
+fn connecting_a_disconnected_adapter_that_refuses_shows_why() {
+    let mut app = App::two(140, 32);
+    app.click("ESP32-S3");
+    app.click("Disconnect");
+    app.m.update(Msg::Fleet(2, Box::new(Event::Closed)));
+    app.fleet.0.borrow_mut().calls.clear();
+    app.click("[Connect]");
+    let slot = app.m.off["00000000000FA002"].connecting.unwrap();
+    app.phase(
+        slot,
+        Phase::Failed {
+            error: newer(|_| {}),
+            open: false,
+        },
+    );
+    app.m.update(Msg::Fleet(slot, Box::new(Event::Closed)));
+    assert!(app.shows(NEWER), "{}", app.screen());
+    assert!(app.shows("ESP32-S3"), "it keeps its name");
+    assert!(
+        app.m.refused.is_empty(),
+        "it stays the adapter the user disconnected"
+    );
+    app.fleet.0.borrow_mut().calls.clear();
+    app.m.update(Msg::Ports(Ok(vec![
+        port("/dev/ttyACM0", "00000000000FA001"),
+        port("/dev/ttyACM1", "00000000000FA002"),
+    ])));
+    assert!(!app.opened(), "not tried again by itself");
+}
+
+#[test]
+fn a_held_adapter_whose_port_refuses_shows_the_refusal() {
+    let mut app = App::two(140, 32);
+    app.click("Pico 2 W");
+    let slot = app.slot("00000000000FA001");
+    app.phase(slot, Phase::Lost(Error::new("gone")));
+    app.m.update(Msg::Fleet(slot, Box::new(Event::Closed)));
+    app.refuse(
+        vec![
+            port("/dev/ttyACM2", "00000000000FA001"),
+            port("/dev/ttyACM1", "00000000000FA002"),
+        ],
+        "/dev/ttyACM2",
+        newer(|_| {}),
+    );
+    assert!(app.m.held.is_empty());
+    assert_eq!(app.m.shown(), Page::Adapter("/dev/ttyACM2".into()));
+    assert!(app.shows(NEWER), "{}", app.screen());
+    assert!(
+        !app.shows("Example Mouse"),
+        "its saved devices aren't shown"
+    );
+}
+
+#[test]
+fn a_refused_port_is_not_tried_again_while_an_adapter_migrates() {
+    let ports = || vec![port("/dev/ttyACM0", ""), port("/dev/ttyACM1", MIGRATING_ID)];
+    let mut app = App::new(140, 32);
+    app.refuse(ports(), "/dev/ttyACM0", newer(|_| {}));
+    let slot = app.probe("/dev/ttyACM1").unwrap();
+    app.fleet
+        .0
+        .borrow_mut()
+        .states
+        .insert(slot, needs_migration());
+    app.phase(slot, Phase::Migrate);
+    closed(&mut app, slot);
+    assert_eq!(
+        app.calls().last(),
+        Some(&Call::Migrate(MIGRATING_ID.into(), "/dev/ttyACM1".into()))
+    );
+    app.fleet.0.borrow_mut().calls.clear();
+
+    app.m.open(Page::Adapter("/dev/ttyACM0".into()));
+    app.click("[Connect]");
+    app.ctrl('r');
+    app.m.list_due = Instant::now();
+    app.m.tick();
+    app.m.update(Msg::Ports(Ok(ports())));
+    assert!(app.calls().is_empty(), "{:?}", app.calls());
+    assert!(app.shows(NEWER), "{}", app.screen());
+
+    // After the migration, the refused port still waits for Refresh or Connect.
+    app.m.update(Msg::Migrated(Ok(Migrated::Success)));
+    app.m.tick();
+    app.m.update(Msg::Ports(Ok(ports())));
+    assert_eq!(opens(&app), 1);
+    assert!(app.probe("/dev/ttyACM0").is_none());
+    app.m.open(Page::Adapter("/dev/ttyACM0".into()));
+    app.click("[Connect]");
+    app.m.update(Msg::Ports(Ok(ports())));
+    assert!(app.probe("/dev/ttyACM0").is_some());
+}
+
+#[test]
+fn a_refused_port_opening_when_a_migration_begins_is_closed_first() {
+    let ports = || vec![port("/dev/ttyACM0", ""), port("/dev/ttyACM1", MIGRATING_ID)];
+    let mut app = App::new(140, 32);
+    app.refuse(ports(), "/dev/ttyACM0", newer(|_| {}));
+    let migrating = app.probe("/dev/ttyACM1").unwrap();
+    app.ctrl('r');
+    app.m.update(Msg::Ports(Ok(ports())));
+    let retry = app.probe("/dev/ttyACM0").unwrap();
+    app.fleet
+        .0
+        .borrow_mut()
+        .states
+        .insert(migrating, needs_migration());
+    app.fleet.0.borrow_mut().calls.clear();
+    app.phase(migrating, Phase::Migrate);
+    let mut calls = app.calls();
+    calls.sort_by_key(|c| format!("{c:?}"));
+    assert_eq!(calls, [Call::Close(migrating), Call::Close(retry)]);
+    closed(&mut app, migrating);
+    assert!(!app.calls().iter().any(|c| matches!(c, Call::Migrate(..))));
+    // The refusal arrives after its session was told to close; the port opens no further.
+    app.phase(
+        retry,
+        Phase::Failed {
+            error: newer(|_| {}),
+            open: false,
+        },
+    );
+    closed(&mut app, retry);
+    assert_eq!(
+        app.calls().last(),
+        Some(&Call::Migrate(MIGRATING_ID.into(), "/dev/ttyACM1".into()))
+    );
+    assert_eq!(opens(&app), 0);
+}

@@ -25,7 +25,8 @@ until hardware reset. Writing an intermediate or final root does not change that
 mode. File commands never run concurrently with an on-device migration or on
 blocked storage. Blocked mode permits `GetStatus` and `Restart`.
 
-Clients check exact `Status.information.target_storage_format` support first.
+After a compatible permanent hello and bootstrap status, clients check exact
+`Status.information.target_storage_format` support before file access or other commands.
 Only `STORAGE_MIGRATION_REQUIRED` with reason `STORAGE`, outcome `NO_EFFECT`, no related
 errors and no other status errors authorizes assisted migration. The marker stays
 present until hardware reset, including after intermediate and final root uploads.

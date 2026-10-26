@@ -69,7 +69,7 @@ activities for its links and scanning. BLE requests a 7.5 ms connection interval
 three details. Full errors describe command responses, adapter and device problems, record reads,
 scans, pairing, integrations, settings and output setup. These scopes remain separate; an
 integration or setting error does not become a device error. The comments in
-[`proto/cordial.proto`](../../proto/cordial.proto) define the codes; the host supplies user-facing
+[`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto) define the codes; the host supplies user-facing
 words without discarding the reported details.
 
 `ErrorReason` supplies context independently of the code:

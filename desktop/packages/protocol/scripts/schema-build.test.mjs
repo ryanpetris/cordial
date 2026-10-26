@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,8 +22,10 @@ test("discovers and checks new generated schemas recursively", () => {
   try {
     cpSync(proto, join(temporary, "proto"), { recursive: true });
     const packageRoot = join(temporary, "desktop/packages/protocol");
-    mkdirSync(join(packageRoot, "scripts"), { recursive: true });
-    for (const path of ["buf.yaml", "buf.gen.yaml", "scripts/generate.mjs"]) {
+    mkdirSync(packageRoot, { recursive: true });
+    symlinkSync(join(root, "../../node_modules"), join(temporary, "desktop/node_modules"), "dir");
+    cpSync(join(root, "scripts"), join(packageRoot, "scripts"), { recursive: true });
+    for (const path of ["buf.yaml", "buf.gen.yaml"]) {
       cpSync(join(root, path), join(packageRoot, path));
     }
     const schema = join(temporary, "proto/storage/v3/extra.proto");
@@ -75,7 +77,7 @@ test("rejects unknown unversioned storage layouts", () => {
 });
 
 for (const [schema, before, after] of [
-  ["cordial.proto", "string id = 1;", "string hardware_id = 1;"],
+  ["serial/v1/cordial.proto", "string id = 1;", "string hardware_id = 1;"],
   ["migration.proto", "string adapter_id = 1;", "string hardware_id = 1;"],
   ["storage/v1/storage.proto", "uint64 next_device = 1;", "uint64 next_device = 9;"],
   ["storage/v2/storage.proto", "uint64 next_device = 2;", "uint64 next_device = 9;"],

@@ -6,7 +6,7 @@
 // compatibility rules.
 syntax = "proto3";
 
-package cordial;
+package cordial.serial.v1;
 
 // ---------------------------------------------------------------------------
 // Envelopes

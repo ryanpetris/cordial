@@ -1349,3 +1349,51 @@ fn restart_runs_without_migration_or_readiness() {
     assert!(!called.load(Ordering::SeqCst));
     assert_eq!(dongle.sent(), ["get_status", "restart"]);
 }
+
+#[test]
+fn an_adapter_that_needs_a_newer_cordial_is_refused_before_any_request() {
+    let dongle = Dongle::with(|sim| {
+        sim.hello.protocol_version = Some(p::CURRENT_PROTOCOL_VERSION + 1);
+    });
+    for (args, input) in [
+        (&["adapter", "set", "name", "Office"][..], &b""[..]),
+        (&["adapter", "status"][..], b""),
+        (&[][..], b"adapter set name Office\n"),
+    ] {
+        let (result, out, _) = script(&dongle, args, false, input);
+        assert_eq!(
+            result.unwrap_err().message,
+            "this adapter requires a newer version of Cordial. Update Cordial to connect",
+            "{args:?}"
+        );
+        assert!(out.is_empty(), "{out}");
+    }
+    assert!(dongle.sent().is_empty());
+}
+
+#[test]
+fn an_adapter_that_refuses_is_never_migrated() {
+    let dongle = Dongle::with(|sim| {
+        needs_migration(sim);
+        sim.hello.protocol_version = Some(p::CURRENT_PROTOCOL_VERSION + 1);
+    });
+    let (worker, called) = engine(&dongle, Duration::ZERO, false);
+    for args in [&["migrate"][..], &["file", "list", "/"]] {
+        let (result, _, _) = migrating(
+            &dongle,
+            args,
+            false,
+            Duration::ZERO,
+            io::empty(),
+            Cancellation::default(),
+            worker.clone(),
+        );
+        assert_eq!(
+            result.unwrap_err().message,
+            "this adapter requires a newer version of Cordial. Update Cordial to connect",
+            "{args:?}"
+        );
+    }
+    assert!(!called.load(Ordering::SeqCst));
+    assert!(dongle.sent().is_empty());
+}

@@ -6,7 +6,9 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { isAction } from "../core/actions.ts";
 import { Controller } from "../core/controller.ts";
 import { listPorts, openSerial } from "@cordial/client/node";
+import type { AdapterHello } from "@cordial/protocol";
 import { hostPlatform, watchHotplug } from "../node/host.ts";
+import { openProxy } from "../node/proxy.ts";
 import { preferencesFrom, type AppState } from "../shared/state.ts";
 import { profileAlertText } from "../shared/text.ts";
 
@@ -53,7 +55,7 @@ export async function startBackend(simulate = 0): Promise<Backend> {
   const clients = new Set<ServerResponse>();
   const send = (res: ServerResponse, state: AppState) => res.write(`data: ${JSON.stringify(state)}\n\n`);
   const simulated = simulate > 0 ? (await import("../fake/ports.ts")).simulatedPorts(simulate) : null;
-  const ports = simulated ?? { listPorts, openTransport: openSerial };
+  const ports = simulated ?? { listPorts, openTransport: openSerial, openProxy: (path: string, native: AdapterHello, signal: AbortSignal) => openProxy(path, native, signal, { log }) };
   const controller = new Controller({
     ...ports,
     log,

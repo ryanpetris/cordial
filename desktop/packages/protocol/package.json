@@ -12,7 +12,7 @@
     "generate": "node scripts/generate.mjs",
     "check:generated": "node scripts/generate.mjs --check && node --test scripts/schema-build.test.mjs",
     "lint": "buf lint ../../../proto --config buf.yaml",
-    "breaking": "node scripts/breaking.mjs"
+    "breaking": "python3 ../../../tools/check_protocol.py --base"
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.16.0"

@@ -21,7 +21,7 @@ const support = (modes: AdapterStatus["outputSupport"][number]["modes"]): Adapte
   errors: [],
   resources: [],
   transports: [],
-  information: { firmwareVersion: null, boardName: null, developmentBuild: null, storageFormat: null },
+  information: { firmwareVersion: null, boardName: null, developmentBuild: null, storageFormat: null, targetStorageFormat: null },
   profileSupport: null,
   interfaces: [],
   outputSupport: [{ role: "gamepad", modes }],

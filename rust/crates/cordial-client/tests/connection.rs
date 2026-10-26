@@ -21,6 +21,24 @@ use std::{
 
 const TEST_DEADLINE: Duration = Duration::from_secs(10);
 
+fn client_hello_frame() -> Vec<u8> {
+    let mut bytes = vec![frame::DELIMITER];
+    frame::encode(&p::ClientHello {}, &mut bytes);
+    bytes
+}
+
+fn adapter_hello_frame() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    frame::encode(
+        &p::AdapterHello {
+            protocol_version: Some(p::CURRENT_PROTOCOL_VERSION),
+            ..Default::default()
+        },
+        &mut bytes,
+    );
+    bytes
+}
+
 const HOST_RECEIVE_LIMIT: usize = 32 * 1024 * 1024;
 
 /// One direction of an in-memory byte stream. Reads time out like a serial port's.
@@ -73,20 +91,26 @@ fn pipe() -> (PipeWriter, PipeReader) {
 
 enum ReadStep {
     WaitForWrites(usize),
-    Repeat { byte: u8, remaining: usize },
     Bytes { bytes: Vec<u8>, offset: usize },
-    Signal(Sender<()>),
     Wait(Receiver<()>),
     Fail(io::ErrorKind),
 }
 
 struct ScriptReader {
+    hello: Arc<AtomicUsize>,
+    hello_sent: bool,
     writes: Arc<AtomicUsize>,
     steps: VecDeque<ReadStep>,
 }
 
 impl Read for ScriptReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if !self.hello_sent && self.hello.load(Ordering::Acquire) != 0 {
+            self.hello_sent = true;
+            let bytes = adapter_hello_frame();
+            out[..bytes.len()].copy_from_slice(&bytes);
+            return Ok(bytes.len());
+        }
         loop {
             let Some(step) = self.steps.front_mut() else {
                 thread::sleep(Duration::from_millis(1));
@@ -99,16 +123,6 @@ impl Read for ScriptReader {
                         return Err(io::ErrorKind::TimedOut.into());
                     }
                     self.steps.pop_front();
-                }
-                ReadStep::Repeat { byte, remaining } => {
-                    if *remaining == 0 {
-                        self.steps.pop_front();
-                        continue;
-                    }
-                    let n = out.len().min(*remaining);
-                    out[..n].fill(*byte);
-                    *remaining -= n;
-                    return Ok(n);
                 }
                 ReadStep::Bytes { bytes, offset } => {
                     if *offset == bytes.len() {
@@ -128,20 +142,20 @@ impl Read for ScriptReader {
                     self.steps.pop_front();
                 }
                 ReadStep::Fail(kind) => return Err((*kind).into()),
-                ReadStep::Signal(signal) => {
-                    signal.send(()).unwrap();
-                    self.steps.pop_front();
-                }
             }
         }
     }
 }
 
-struct CountingWriter(Arc<AtomicUsize>);
+struct CountingWriter(Arc<AtomicUsize>, Arc<AtomicUsize>);
 
 impl Write for CountingWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.fetch_add(1, Ordering::Release);
+        if bytes == client_hello_frame() {
+            self.1.store(1, Ordering::Release);
+        } else {
+            self.0.fetch_add(1, Ordering::Release);
+        }
         Ok(bytes.len())
     }
 
@@ -159,6 +173,9 @@ struct HeldWriter {
 
 impl Write for HeldWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes == client_hello_frame() {
+            return self.inner.write(bytes);
+        }
         self.written.send(bytes.to_vec()).unwrap();
         if let Some(release) = self.release.take() {
             release.recv_timeout(TEST_DEADLINE).unwrap()?;
@@ -198,12 +215,15 @@ fn background<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> R
 
 fn scripted(steps: impl IntoIterator<Item = ReadStep>) -> (ScriptReader, CountingWriter) {
     let writes = Arc::new(AtomicUsize::new(0));
+    let hello = Arc::new(AtomicUsize::new(0));
     (
         ScriptReader {
+            hello: hello.clone(),
+            hello_sent: false,
             writes: writes.clone(),
             steps: steps.into_iter().collect(),
         },
-        CountingWriter(writes),
+        CountingWriter(writes, hello),
     )
 }
 
@@ -300,6 +320,7 @@ fn dongle(
     let mut out_thread = Out(to_client.clone());
     thread::spawn(move || {
         let mut decoder = Decoder::new(Some(MAX_REQUEST_BYTES));
+        let mut negotiated = false;
         let mut buffer = [0; 256];
         loop {
             let n = match from_client.read(&mut buffer) {
@@ -310,7 +331,17 @@ fn dongle(
             log.lock().unwrap().extend_from_slice(&buffer[..n]);
             for &byte in &buffer[..n] {
                 if let Some(frame) = decoder.push(byte) {
-                    let request = p::Request::decode(frame.unwrap()).unwrap();
+                    let frame = frame.unwrap();
+                    if !negotiated {
+                        assert_eq!(
+                            p::handshake::decode_client_hello(frame).unwrap(),
+                            p::ClientHello {}
+                        );
+                        out_thread.raw(&adapter_hello_frame());
+                        negotiated = true;
+                        continue;
+                    }
+                    let request = p::Request::decode(frame).unwrap();
                     answer(request.command.unwrap(), &mut out_thread);
                 }
             }
@@ -380,7 +411,11 @@ fn responses_match_requests_in_order_with_events_between() {
         [2, 3]
     );
     connection.stop_scan().unwrap();
-    // The event before the first response belongs to the leftovers the session ignores.
+    let event = events.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        event.kind,
+        Some(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 1 }))
+    );
     let event = events.recv_timeout(Duration::from_secs(1)).unwrap();
     assert_eq!(event.kind, Some(p::event::Kind::Device(device(2))));
     assert!(events.try_recv().is_err());
@@ -466,7 +501,7 @@ fn the_first_request_follows_a_delimiter_and_leftovers_are_ignored() {
     thread::sleep(Duration::from_millis(50));
     assert_eq!(connection.status().unwrap().name, "A");
     assert_eq!(connection.status().unwrap().name, "A");
-    let mut expected = vec![frame::DELIMITER];
+    let mut expected = client_hello_frame();
     for _ in 0..2 {
         frame::encode(
             &p::Request {
@@ -477,76 +512,6 @@ fn the_first_request_follows_a_delimiter_and_leftovers_are_ignored() {
     }
     assert_eq!(*received.lock().unwrap(), expected);
     assert!(events.try_recv().is_err());
-}
-
-#[test]
-fn rejected_opening_frames_keep_the_next_request_unsent() {
-    for case in 0..3 {
-        let rejected = match case {
-            0 => vec![0xff, 0],
-            1 => vec![2, 0xff, 0],
-            2 => oversized_frame(true),
-            _ => unreachable!(),
-        };
-        let mut leftovers = framed(message::Kind::Event(p::Event::default()));
-        frame::encode(&p::Message::default(), &mut leftovers);
-        leftovers.extend(rejected);
-        let (consumed, rejected) = mpsc::channel();
-        let (reader, writer) = scripted([
-            ReadStep::WaitForWrites(1),
-            bytes(leftovers),
-            ReadStep::Signal(consumed),
-            ReadStep::WaitForWrites(2),
-            bytes(framed(message::Kind::Response(p::Response {
-                result: Some(response::Result::Devices(devices(vec![saved(9)]))),
-            }))),
-        ]);
-        let (writer, writes, release) = hold_writer(writer);
-        let callbacks = Arc::new(AtomicUsize::new(0));
-        let seen = callbacks.clone();
-        let connection = Arc::new(Connection::with_handler(reader, writer, move |received| {
-            if !matches!(received, Received::Closed(_)) {
-                seen.fetch_add(1, Ordering::Relaxed);
-            }
-        }));
-        connection.set_timeout(Some(Duration::from_secs(3)));
-        let opening = {
-            let connection = connection.clone();
-            let seen = callbacks.clone();
-            background(move || {
-                connection.request_with(Command::GetStatus(p::GetStatus {}), move |_| {
-                    seen.fetch_add(1, Ordering::Relaxed);
-                })
-            })
-        };
-        assert_eq!(writes.recv_timeout(TEST_DEADLINE).unwrap()[0], 0);
-        let next = {
-            let connection = connection.clone();
-            background(move || connection.list_devices())
-        };
-        release.send(Ok(())).unwrap();
-        rejected.recv_timeout(TEST_DEADLINE).unwrap();
-        assert!(matches!(
-            writes.recv_timeout(Duration::from_millis(100)),
-            Err(RecvTimeoutError::Timeout)
-        ));
-        assert!(connection.closed().is_none());
-        if case != 0 {
-            connection.close();
-        }
-        for failed in [
-            opening.recv_timeout(TEST_DEADLINE).unwrap().map(|_| ()),
-            next.recv_timeout(TEST_DEADLINE).unwrap().map(|_| ()),
-        ] {
-            if case == 0 {
-                assert!(matches!(failed, Err(Error::Timeout)));
-            } else {
-                assert!(matches!(failed, Err(Error::Closed)));
-            }
-        }
-        assert_eq!(callbacks.load(Ordering::Relaxed), 0);
-        assert!(writes.try_recv().is_err());
-    }
 }
 
 #[test]
@@ -580,7 +545,7 @@ fn any_opening_response_allows_pipelining_before_callbacks_finish() {
             let connection = connection.clone();
             background(move || connection.status())
         };
-        assert_eq!(writes.recv_timeout(TEST_DEADLINE).unwrap()[0], 0);
+        assert_ne!(writes.recv_timeout(TEST_DEADLINE).unwrap()[0], 0);
         let next = {
             let connection = connection.clone();
             background(move || connection.stop_scan())
@@ -647,17 +612,30 @@ fn closing_or_io_failure_wakes_unsent_requests_without_a_timeout() {
                 fail.send(()).unwrap();
             }
         }
-        for failed in [
+        for (index, failed) in [
             opening.recv_timeout(TEST_DEADLINE).unwrap(),
             next.recv_timeout(TEST_DEADLINE).unwrap(),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let failed = if index == 1 {
+                failed.map_err(|error| {
+                    let Error::NotSent(error) = error else {
+                        panic!("unsent request has the wrong error");
+                    };
+                    Arc::unwrap_or_clone(error)
+                })
+            } else {
+                failed
+            };
             match case {
                 0 => assert!(matches!(failed, Err(Error::Closed))),
                 1 => assert!(
-                    matches!(failed, Err(Error::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset)
+                    matches!(failed, Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::ConnectionReset)
                 ),
                 2 => assert!(
-                    matches!(failed, Err(Error::Io(error)) if error.kind() == io::ErrorKind::BrokenPipe)
+                    matches!(failed, Err(Error::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe)
                 ),
                 _ => unreachable!(),
             }
@@ -694,41 +672,12 @@ fn the_opening_observer_can_close_with_a_concurrent_request() {
         opening.recv_timeout(TEST_DEADLINE).unwrap().unwrap(),
         p::Response::default()
     );
-    assert!(matches!(
-        next.recv_timeout(TEST_DEADLINE).unwrap(),
-        Err(Error::Closed)
-    ));
+    match next.recv_timeout(TEST_DEADLINE).unwrap() {
+        Err(Error::Closed) => {}
+        Err(Error::NotSent(error)) => assert!(matches!(*error, Error::Closed)),
+        other => panic!("{other:?}"),
+    }
     assert!(matches!(connection.closed(), Some(Error::Closed)));
-}
-
-#[test]
-fn oversized_frames_before_synchronization_are_ignored() {
-    let (before_done, before_wait) = mpsc::channel();
-    let encoded_overflow = HOST_RECEIVE_LIMIT + HOST_RECEIVE_LIMIT / 254 + 2;
-    let response = framed(message::Kind::Response(p::Response {
-        result: Some(response::Result::Status(status("Ready"))),
-    }));
-    let (reader, writer) = scripted([
-        ReadStep::Repeat {
-            byte: 1,
-            remaining: encoded_overflow,
-        },
-        bytes(vec![frame::DELIMITER]),
-        ReadStep::Signal(before_done),
-        ReadStep::WaitForWrites(1),
-        ReadStep::Repeat {
-            byte: 1,
-            remaining: encoded_overflow,
-        },
-        bytes(vec![frame::DELIMITER]),
-        bytes(response),
-    ]);
-    let (connection, events) = Connection::new(reader, writer);
-
-    before_wait.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert_eq!(connection.status().unwrap().name, "Ready");
-    assert!(connection.closed().is_none());
-    assert!(events.try_recv().is_err());
 }
 
 #[test]
@@ -991,7 +940,9 @@ fn a_timed_out_request_closes_the_connection() {
     assert!(matches!(connection.get_device(1), Err(Error::Timeout)));
     assert!(matches!(connection.closed(), Some(Error::Timeout)));
     release.send(()).unwrap();
-    assert!(matches!(connection.status(), Err(Error::Timeout)));
+    assert!(
+        matches!(connection.status(), Err(Error::NotSent(error)) if matches!(*error, Error::Timeout))
+    );
 }
 
 #[test]
@@ -1027,10 +978,13 @@ fn the_stream_ending_fails_waiting_and_later_requests() {
     };
     thread::sleep(Duration::from_millis(50));
     drop(to_client);
-    assert!(matches!(waiting.join().unwrap(), Err(Error::Closed)));
+    assert!(matches!(waiting.join().unwrap(), Err(Error::Handshake(_))));
     assert!(events.recv_timeout(Duration::from_secs(1)).is_err());
     assert!(matches!(connection.closed(), Some(Error::Closed)));
-    assert!(matches!(connection.list_devices(), Err(Error::Closed)));
+    assert!(matches!(
+        connection.list_devices(),
+        Err(Error::Handshake(_))
+    ));
 }
 
 #[test]
@@ -1045,7 +999,9 @@ fn closing_fails_waiting_requests_and_disconnects_events() {
     thread::sleep(Duration::from_millis(50));
     connection.close();
     assert!(matches!(waiting.join().unwrap(), Err(Error::Closed)));
-    assert!(matches!(connection.status(), Err(Error::Closed)));
+    assert!(
+        matches!(connection.status(), Err(Error::NotSent(error)) if matches!(*error, Error::Closed))
+    );
     assert!(events.recv_timeout(Duration::from_secs(1)).is_err());
     assert!(matches!(connection.closed(), Some(Error::Closed)));
 }
@@ -1061,7 +1017,9 @@ fn an_invalid_frame_after_the_first_response_closes_the_connection() {
     out.raw(&[0xff, 0xff, 0xff, 0]);
     thread::sleep(Duration::from_millis(100));
     assert!(matches!(connection.closed(), Some(Error::Protocol)));
-    assert!(matches!(connection.status(), Err(Error::Protocol)));
+    assert!(
+        matches!(connection.status(), Err(Error::NotSent(error)) if matches!(*error, Error::Protocol))
+    );
 }
 
 #[test]
@@ -1511,4 +1469,294 @@ fn the_request_limit_includes_the_envelope_and_profile_rule_changes_are_not_spli
         Err(Error::TooLong)
     ));
     assert_eq!(*received.lock().unwrap(), accepted);
+}
+
+fn next_frame(reader: &mut impl Read) -> Vec<u8> {
+    let deadline = Instant::now() + TEST_DEADLINE;
+    let mut decoder = Decoder::new(None);
+    loop {
+        assert!(Instant::now() < deadline, "frame did not arrive");
+        let mut byte = [0];
+        match reader.read(&mut byte) {
+            Ok(0) => panic!("stream ended before frame"),
+            Ok(_) => {
+                if let Some(frame) = decoder.push(byte[0]) {
+                    return frame.unwrap().to_vec();
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
+#[test]
+fn concurrent_first_mutation_and_probe_share_one_hello_without_observing_it() {
+    let (mut adapter, reader) = pipe();
+    let (writer, mut requests) = pipe();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let events_seen = seen.clone();
+    let connection = Arc::new(Connection::with_handler(reader, writer, move |received| {
+        if !matches!(received, Received::Closed(_)) {
+            events_seen.fetch_add(1, Ordering::Relaxed);
+        }
+    }));
+    let mutate = {
+        let c = connection.clone();
+        background(move || {
+            c.set_adapter(p::SetAdapter {
+                name: Some("Desk".into()),
+                ..Default::default()
+            })
+        })
+    };
+    assert_eq!(
+        p::handshake::decode_client_hello(&next_frame(&mut requests)).unwrap(),
+        p::ClientHello {}
+    );
+    let probe = {
+        let c = connection.clone();
+        background(move || c.handshake())
+    };
+    let status = {
+        let c = connection.clone();
+        background(move || c.status())
+    };
+    let mut byte = [0];
+    assert_eq!(
+        requests.read(&mut byte).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    adapter.write_all(&adapter_hello_frame()).unwrap();
+    let hello = probe.recv_timeout(TEST_DEADLINE).unwrap().unwrap();
+    assert!(hello.hello.serial_number.is_none());
+    assert_eq!(seen.load(Ordering::Relaxed), 0);
+    assert!(matches!(
+        p::Request::decode(next_frame(&mut requests).as_slice())
+            .unwrap()
+            .command,
+        Some(Command::SetAdapter(_))
+    ));
+    let mut out = Out(adapter);
+    out.respond(None);
+    mutate.recv_timeout(TEST_DEADLINE).unwrap().unwrap();
+    assert!(matches!(
+        p::Request::decode(next_frame(&mut requests).as_slice())
+            .unwrap()
+            .command,
+        Some(Command::GetStatus(_))
+    ));
+    out.respond(Some(response::Result::Status(status_for_identity())));
+    assert_eq!(
+        status.recv_timeout(TEST_DEADLINE).unwrap().unwrap().id,
+        "status-identity"
+    );
+}
+
+fn status_for_identity() -> p::Status {
+    p::Status {
+        id: "status-identity".into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_newer_peer_keeps_original_metadata_and_never_receives_the_first_write() {
+    let (mut adapter, reader) = pipe();
+    let (writer, mut requests) = pipe();
+    let (connection, events) = Connection::new(reader, writer);
+    let connection = Arc::new(connection);
+    let write = {
+        let c = connection.clone();
+        background(move || c.set_adapter(p::SetAdapter::default()))
+    };
+    next_frame(&mut requests);
+    let hello = p::AdapterHello {
+        protocol_version: Some(p::CURRENT_PROTOCOL_VERSION + 1),
+        firmware_version: Some("fixture".into()),
+        name: Some("Desk".into()),
+        ..Default::default()
+    };
+    let mut bytes = p::handshake::encode_adapter_hello(&hello).unwrap();
+    bytes.extend_from_slice(&[0x98, 0x06, 0x01]);
+    let mut framed = Vec::new();
+    frame::encode_bytes(&bytes, &mut framed);
+    adapter.write_all(&framed).unwrap();
+    let Err(Error::Incompatible(native)) = write.recv_timeout(TEST_DEADLINE).unwrap() else {
+        panic!("expected compatibility refusal");
+    };
+    assert_eq!(native.hello, hello);
+    assert_eq!(native.bytes, bytes);
+    assert_eq!(connection.handshake().unwrap(), native);
+    assert!(matches!(
+        connection.stop_scan(),
+        Err(Error::Incompatible(_))
+    ));
+    let mut byte = [0];
+    assert_eq!(
+        requests.read(&mut byte).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn malformed_or_oversized_hello_fails_before_an_ordinary_request() {
+    for bytes in [
+        vec![],
+        vec![8, 0],
+        vec![8, 1, 8, 1],
+        vec![0xff],
+        vec![1; p::MAX_HANDSHAKE_BYTES + 1],
+    ] {
+        let (mut adapter, reader) = pipe();
+        let (writer, mut requests) = pipe();
+        let (connection, _) = Connection::new(reader, writer);
+        let connection = Arc::new(connection);
+        let result = {
+            let c = connection.clone();
+            background(move || c.stop_scan())
+        };
+        next_frame(&mut requests);
+        let mut frame = Vec::new();
+        frame::encode_bytes(&bytes, &mut frame);
+        adapter.write_all(&frame).unwrap();
+        assert!(
+            matches!(result.recv_timeout(TEST_DEADLINE).unwrap(), Err(Error::Handshake(error)) if matches!(*error, Error::Protocol))
+        );
+        assert_eq!(requests.read(&mut [0]).unwrap(), 0);
+    }
+}
+
+#[test]
+fn handshake_has_an_absolute_deadline_despite_a_garbage_trickle_and_no_request_timeout() {
+    let (mut adapter, reader) = pipe();
+    let (writer, mut requests) = pipe();
+    let (connection, _) = Connection::new(reader, writer);
+    connection.set_timeout(None);
+    let connection = Arc::new(connection);
+    let started = Instant::now();
+    let result = {
+        let c = connection.clone();
+        background(move || c.stop_scan())
+    };
+    next_frame(&mut requests);
+    let trickle = thread::spawn(move || {
+        for _ in 0..100 {
+            if adapter.write_all(&[1]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+    assert!(
+        matches!(result.recv_timeout(TEST_DEADLINE).unwrap(), Err(Error::Handshake(error)) if matches!(*error, Error::Timeout))
+    );
+    assert!(started.elapsed() >= cordial_client::HANDSHAKE_TIMEOUT);
+    assert!(started.elapsed() < cordial_client::HANDSHAKE_TIMEOUT + Duration::from_secs(1));
+    trickle.join().unwrap();
+}
+
+#[test]
+fn close_cancels_negotiation_and_releases_the_stream() {
+    let (_adapter, reader) = pipe();
+    let (writer, mut requests) = pipe();
+    let (connection, _) = Connection::new(reader, writer);
+    let connection = Arc::new(connection);
+    let probe = {
+        let c = connection.clone();
+        background(move || c.handshake())
+    };
+    next_frame(&mut requests);
+    let started = Instant::now();
+    connection.close();
+    assert!(
+        matches!(probe.recv_timeout(TEST_DEADLINE).unwrap(), Err(Error::Handshake(error)) if matches!(*error, Error::Closed))
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(requests.read(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+fn discovery_ignores_ordinary_envelopes_until_a_valid_identity_selects_the_codec() {
+    for version in [p::CURRENT_PROTOCOL_VERSION, p::CURRENT_PROTOCOL_VERSION + 1] {
+        let (mut adapter, reader) = pipe();
+        let (writer, mut requests) = pipe();
+        let (connection, events) = Connection::new(reader, writer);
+        let connection = Arc::new(connection);
+        let result = {
+            let connection = connection.clone();
+            background(move || connection.stop_scan())
+        };
+        assert!(next_frame(&mut requests).is_empty());
+        let mut ordinary = vec![];
+        // The payload deliberately cannot be decoded by the current operational codec.
+        prost::encoding::bytes::encode(2, &vec![0xff; 100_000], &mut ordinary);
+        let mut framed = vec![];
+        frame::encode_bytes(&ordinary, &mut framed);
+        adapter.write_all(&framed).unwrap();
+        assert_eq!(
+            requests.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(events.try_recv().is_err());
+        let mut framed = vec![];
+        frame::encode(
+            &p::AdapterHello {
+                protocol_version: Some(version),
+                ..Default::default()
+            },
+            &mut framed,
+        );
+        adapter.write_all(&framed).unwrap();
+        if version == p::CURRENT_PROTOCOL_VERSION {
+            assert!(matches!(
+                p::Request::decode(next_frame(&mut requests).as_slice())
+                    .unwrap()
+                    .command,
+                Some(Command::StopScan(_))
+            ));
+            Out(adapter).respond(None);
+            result.recv_timeout(TEST_DEADLINE).unwrap().unwrap();
+        } else {
+            assert!(matches!(
+                result.recv_timeout(TEST_DEADLINE).unwrap(),
+                Err(Error::Incompatible(_))
+            ));
+            assert_eq!(
+                requests.read(&mut [0]).unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+        }
+    }
+}
+
+#[test]
+fn ordinary_events_do_not_extend_the_identity_deadline() {
+    let (mut adapter, reader) = pipe();
+    let (writer, mut requests) = pipe();
+    let (connection, events) = Connection::new(reader, writer);
+    connection.set_timeout(None);
+    let started = Instant::now();
+    let result = background(move || connection.stop_scan());
+    assert!(next_frame(&mut requests).is_empty());
+    let incoming = thread::spawn(move || {
+        let mut ordinary = vec![];
+        frame::encode_bytes(&[0x12, 1, 0xff], &mut ordinary);
+        for _ in 0..100 {
+            if adapter.write_all(&ordinary).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+    assert!(
+        matches!(result.recv_timeout(TEST_DEADLINE).unwrap(), Err(Error::Handshake(error))
+        if matches!(*error, Error::Timeout))
+    );
+    assert!(started.elapsed() >= cordial_client::HANDSHAKE_TIMEOUT);
+    assert!(started.elapsed() < cordial_client::HANDSHAKE_TIMEOUT + Duration::from_secs(1));
+    assert_eq!(requests.read(&mut [0]).unwrap(), 0);
+    assert!(events.try_recv().is_err());
+    incoming.join().unwrap();
 }
