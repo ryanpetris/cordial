@@ -57,12 +57,15 @@ describe("migration IPC framing", () => {
 });
 
 describe("migration host", () => {
-  it("starts the CLI without a shell and sends framed controls", () => {
+  it("starts the CLI without a shell and sends framed controls", async () => {
     const { spawn, child, process } = start();
     expect(spawn).toHaveBeenCalledWith("/cli", ["migrate", "--ipc"]);
     process.send({ action: { case: "start", value: { adapterId: "000000000000A001", portHint: "/a" } } });
     process.send({ action: { case: "cancel", value: {} } });
-    const frames = new FrameReader().push(child.stdin.read() as Uint8Array);
+    child.stdin.end();
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of child.stdin) chunks.push(chunk);
+    const frames = new FrameReader().push(Buffer.concat(chunks));
     expect(frames.map((f) => fromBinary(MigrationControlSchema, f).action.case)).toEqual(["start", "cancel"]);
     expect(fromBinary(MigrationControlSchema, frames[0]!).action.value).toMatchObject({ adapterId: "000000000000A001", portHint: "/a" });
   });
