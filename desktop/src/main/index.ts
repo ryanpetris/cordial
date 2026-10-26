@@ -25,6 +25,7 @@ import { openProxy } from "../node/proxy.ts";
 import { preferencesFrom, type Action, type AppState, type Navigation, type Preferences } from "../shared/state.ts";
 import { canRestart, profileAlertText } from "../shared/text.ts";
 import { trayModel, type TrayModel } from "./tray-model.ts";
+import { trayIcon } from "./tray.ts";
 import { closeNotifications, showNotification } from "./notifications.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -37,8 +38,11 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 let window: BrowserWindow | null = null;
-let tray: Tray | null = null;
-let trayKey = "";
+const tray = trayIcon((image) => {
+  const created = new Tray(image);
+  created.on("click", () => showWindow());
+  return created;
+});
 let quitting = false;
 let controller: Controller;
 let stopHotplug: (() => Promise<void>) | null = null;
@@ -226,22 +230,12 @@ function trayMenu(model: TrayModel, state: AppState): Menu {
 
 function updateTray(state: AppState) {
   const model = trayModel(state);
-  if (!model.visible) {
-    tray?.destroy();
-    tray = null;
-    trayKey = "";
-    return;
-  }
+  if (!model.visible) return tray.hide();
   const icon = join(icons, `tray-${model.base}-${model.badge}-${trayVariant()}.png`);
-  const key = JSON.stringify([model, icon, state.adapters.map((a) => a.readiness)]);
-  if (tray && key === trayKey) return;
-  trayKey = key;
-  if (!tray) {
-    tray = new Tray(nativeImage.createFromPath(icon));
-    tray.on("click", () => showWindow());
-  } else tray.setImage(nativeImage.createFromPath(icon));
-  tray.setToolTip(model.tooltip);
-  tray.setContextMenu(trayMenu(model, state));
+  tray.update(icon, JSON.stringify([model, state.adapters.map((a) => a.readiness)]), (t) => {
+    t.setToolTip(model.tooltip);
+    t.setContextMenu(trayMenu(model, state));
+  });
 }
 
 // ---- Notifications ---------------------------------------------------------
@@ -303,7 +297,7 @@ async function quit() {
   await controller.cancelMigration();
   // Long enough for a Cordial CLI to be killed two seconds after its input ends.
   await Promise.race([stopping, new Promise((r) => setTimeout(r, 2500))]);
-  tray?.destroy();
+  tray.hide();
   app.exit(0);
 }
 
@@ -374,7 +368,6 @@ void app.whenReady().then(async () => {
   });
   nativeTheme.on("updated", () => {
     window?.setTitleBarOverlay(titleBarOverlay());
-    trayKey = "";
     updateTray(controller.state());
   });
 

@@ -419,7 +419,8 @@ The desktop application uses the same commands and session rules as the CLI.
 - Tray: a StatusNotifierItem icon is shown while at least one adapter is connected (or always, by
   preference). Its outline means no device is connected and filled means at least one is; a badge
   marks low battery or an adapter needing attention. Its menu lists devices, grouped by adapter when
-  several are connected.
+  several are connected. The tooltip and menu update at once. The icon image changes only when it
+  differs from the one shown and at most once a second, showing the latest image when a wait ends.
 
 ## Gamepad outputs
 
