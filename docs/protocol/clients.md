@@ -421,9 +421,6 @@ The desktop application uses the same commands and session rules as the CLI.
   marks low battery or an adapter needing attention. Its menu lists devices, grouped by adapter when
   several are connected. The tooltip and menu update at once. The icon image changes only when it
   differs from the one shown and at most once a second, showing the latest image when a wait ends.
-  As a bounded attempt to recover from startup races in the shell, a shown icon also re-sends its
-  latest image 1, 2, 5, 10, 15, 30 and 60 seconds after the application starts, still at most once a
-  second.
 
 ## Gamepad outputs
 

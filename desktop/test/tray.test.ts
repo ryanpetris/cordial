@@ -101,15 +101,10 @@ describe("trayIcon", () => {
   beforeEach(() => vi.useFakeTimers({ now: 0 }));
   afterEach(() => vi.useRealTimers());
 
-  /**
-   * A tray icon made `elapsed` milliseconds before setup returns, whose trays
-   * record what reaches them with the time since setup returned. Tests of the
-   * cooldown alone start after the startup refreshes.
-   */
-  const setup = (elapsed = 0) => {
+  /** A tray icon whose trays record what reaches them, with the time. */
+  const setup = () => {
     const events: string[] = [];
-    const start = Date.now() + elapsed;
-    const record = (what: string) => events.push(`${Date.now() - start} ${what}`);
+    const record = (what: string) => events.push(`${Date.now()} ${what}`);
     const icon = trayIcon((image) => {
       record(`create ${image}`);
       let destroyed = false;
@@ -124,13 +119,11 @@ describe("trayIcon", () => {
     });
     const update = (image: string, tooltip = "T") => icon.update(image, tooltip, (t) => t.setToolTip(tooltip));
     const take = () => events.splice(0);
-    vi.advanceTimersByTime(elapsed);
     return { icon, update, take };
   };
-  const LATE = 60_000;
 
   it("creates the tray at once and leaves it alone for unchanged requests", () => {
-    const { update, take } = setup(LATE);
+    const { update, take } = setup();
     update("a");
     expect(take()).toEqual(["0 create a", "0 tooltip T"]);
     update("a");
@@ -140,7 +133,7 @@ describe("trayIcon", () => {
   });
 
   it("changes the menu and tooltip at once while the image waits", () => {
-    const { update, take } = setup(LATE);
+    const { update, take } = setup();
     update("a");
     take();
     vi.advanceTimersByTime(100);
@@ -151,7 +144,7 @@ describe("trayIcon", () => {
   });
 
   it("applies the first change after a cooldown at once and the latest of later ones when it ends", () => {
-    const { update, take } = setup(LATE);
+    const { update, take } = setup();
     update("a");
     vi.advanceTimersByTime(1500);
     take();
@@ -173,7 +166,7 @@ describe("trayIcon", () => {
   });
 
   it("drops a waiting change when requests return to the shown image", () => {
-    const { update, take } = setup(LATE);
+    const { update, take } = setup();
     update("a");
     take();
     vi.advanceTimersByTime(300);
@@ -185,7 +178,7 @@ describe("trayIcon", () => {
   });
 
   it("applies a change made after a return to the shown image when the original cooldown ends", () => {
-    const { update, take } = setup(LATE);
+    const { update, take } = setup();
     update("a");
     take();
     vi.advanceTimersByTime(300);
@@ -200,7 +193,7 @@ describe("trayIcon", () => {
   });
 
   it("keeps changing the image at most once a second under continuous requests", () => {
-    const { update, take } = setup(LATE);
+    const { update, take } = setup();
     update("i0");
     take();
     for (let i = 1; i <= 50; i++) {
@@ -220,7 +213,7 @@ describe("trayIcon", () => {
   });
 
   it("drops a waiting change when hidden and creates the next tray with the latest image", () => {
-    const { icon, update, take } = setup(LATE);
+    const { icon, update, take } = setup();
     update("a");
     vi.advanceTimersByTime(100);
     update("b");
@@ -239,7 +232,7 @@ describe("trayIcon", () => {
   });
 
   it("follows the theme's image variant only when it changes", () => {
-    const { update, take } = setup(LATE);
+    const { update, take } = setup();
     update("tray-idle-none-dark.png");
     vi.advanceTimersByTime(2000);
     take();
@@ -251,96 +244,6 @@ describe("trayIcon", () => {
     update("tray-connected-none-light.png");
     vi.advanceTimersByTime(900);
     expect(take()).toEqual(["2000 setImage tray-idle-none-light.png", "3000 setImage tray-connected-none-light.png"]);
-  });
-
-  it("re-sends the image at each startup refresh and not after the first minute", () => {
-    const { update, take } = setup();
-    update("a");
-    vi.advanceTimersByTime(120_000);
-    expect(take()).toEqual([
-      "0 create a",
-      "0 tooltip T",
-      "1000 setImage a",
-      "2000 setImage a",
-      "5000 setImage a",
-      "10000 setImage a",
-      "15000 setImage a",
-      "30000 setImage a",
-      "60000 setImage a",
-    ]);
-  });
-
-  it("skips refreshes while hidden and keeps the launch schedule for a later tray", () => {
-    const { icon, update, take } = setup();
-    vi.advanceTimersByTime(3000);
-    update("a");
-    vi.advanceTimersByTime(1999);
-    expect(take()).toEqual(["3000 create a", "3000 tooltip T"]);
-    vi.advanceTimersByTime(1);
-    expect(take()).toEqual(["5000 setImage a"]);
-    vi.advanceTimersByTime(1000);
-    icon.hide();
-    vi.advanceTimersByTime(6000);
-    update("b");
-    vi.advanceTimersByTime(2999);
-    expect(take()).toEqual(["6000 destroy", "12000 create b", "12000 tooltip T"]);
-    vi.advanceTimersByTime(1);
-    expect(take()).toEqual(["15000 setImage b"]);
-  });
-
-  it("does not refresh a tray first shown after the first minute", () => {
-    const { update, take } = setup(LATE);
-    update("a");
-    vi.advanceTimersByTime(120_000);
-    expect(take()).toEqual(["0 create a", "0 tooltip T"]);
-  });
-
-  it("refreshes with the latest image once when a refresh meets a cooldown", () => {
-    const { update, take } = setup();
-    update("a");
-    vi.advanceTimersByTime(1500);
-    take();
-    update("b");
-    vi.advanceTimersByTime(1000);
-    // The refresh at 2000 and the change waiting since 1500 share one image change.
-    expect(take()).toEqual(["2000 setImage b"]);
-    vi.advanceTimersByTime(2000);
-    update("c");
-    expect(take()).toEqual(["4500 setImage c"]);
-    vi.advanceTimersByTime(700);
-    update("d");
-    vi.advanceTimersByTime(100);
-    update("c");
-    vi.advanceTimersByTime(199);
-    expect(take()).toEqual([]);
-    // The refresh due at 5000 waits for the cooldown, even though the
-    // requests returned to the shown image.
-    vi.advanceTimersByTime(1);
-    expect(take()).toEqual(["5500 setImage c"]);
-  });
-
-  it("drops a waiting refresh when hidden", () => {
-    const { icon, update, take } = setup();
-    update("a");
-    vi.advanceTimersByTime(4500);
-    update("b");
-    vi.advanceTimersByTime(700);
-    icon.hide();
-    vi.advanceTimersByTime(100);
-    update("b");
-    vi.advanceTimersByTime(4699);
-    expect(take()).toEqual([
-      "0 create a",
-      "0 tooltip T",
-      "1000 setImage a",
-      "2000 setImage a",
-      "4500 setImage b",
-      "5200 destroy",
-      "5300 create b",
-      "5300 tooltip T",
-    ]);
-    vi.advanceTimersByTime(1);
-    expect(take()).toEqual(["10000 setImage b"]);
   });
 });
 

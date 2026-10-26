@@ -3,16 +3,8 @@
 // reload and keep showing a stale icon. The image therefore changes only when
 // it differs from the one shown, and at most once a second. The tooltip and
 // menu change at once.
-//
-// Startup races in the shell can also leave a stale icon. As a bounded attempt
-// to recover, a shown tray re-sends its image at fixed times in the first
-// minute after the controller is made, once per launch. This makes a correct
-// icon more likely but cannot guarantee the shell draws it.
 
 export const IMAGE_INTERVAL = 1000;
-
-/** Milliseconds after launch at which a shown tray re-sends its image. */
-const REFRESHES = [1, 2, 5, 10, 15, 30, 60].map((s) => s * 1000);
 
 export interface TrayHandle {
   setImage(image: string): void;
@@ -25,7 +17,6 @@ export function trayIcon<T extends TrayHandle>(create: (image: string) => T) {
   let key: string | null = null;
   let shown = "";
   let wanted = "";
-  let force = false;
   let cooldown: ReturnType<typeof setTimeout> | null = null;
 
   const cool = () => {
@@ -35,22 +26,13 @@ export function trayIcon<T extends TrayHandle>(create: (image: string) => T) {
     }, IMAGE_INTERVAL);
   };
   // Shows the latest requested image. A request that returned to the shown
-  // image during a cooldown leaves nothing to do unless a refresh is due.
+  // image during a cooldown leaves nothing to do.
   const apply = () => {
-    if (!tray || (wanted === shown && !force)) return;
+    if (!tray || wanted === shown) return;
     tray.setImage(wanted);
     shown = wanted;
-    force = false;
     cool();
   };
-  // A hidden tray skips the refresh rather than keeping it for later.
-  for (const at of REFRESHES) {
-    setTimeout(() => {
-      if (!tray) return;
-      force = true;
-      if (!cooldown) apply();
-    }, at);
-  }
 
   return {
     /** Shows `image`, and calls `describe` to set the tooltip and menu when the tray is new or `next` differs from the last key. */
@@ -70,7 +52,6 @@ export function trayIcon<T extends TrayHandle>(create: (image: string) => T) {
     hide() {
       if (cooldown) clearTimeout(cooldown);
       cooldown = null;
-      force = false;
       tray?.destroy();
       tray = null;
       key = null;
