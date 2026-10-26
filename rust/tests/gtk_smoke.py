@@ -1298,6 +1298,7 @@ class Smoke:
         self.ui.retain("keep the prompt open without a success countdown", lambda:
             bool(self.ui.matches(prompt, {"label"}, dialog))
             and not self.ui.matches("Dismiss", BUTTONS, dialog) and not event("done"), duration=3.3)
+        navigation = self.navigation()
         if automatic:
             self.ui.edit("Code", "123456", dialog)
         self.ui.click("Pair" if automatic else "Codes Match", root=dialog)
@@ -1305,17 +1306,18 @@ class Smoke:
         success = []
 
         def retained():
-            nodes = self.ui.nodes(self.navigation())
+            observed = time.monotonic()
+            nodes = self.ui.nodes(navigation)
             names = [node.name for node in nodes if visible(node)
                      and node.getRoleName() == "list item"]
             connected = bool(self.ui.matches(message, {"label"}, dialog))
             if connected and not success:
-                success.append(time.monotonic())
+                success.append(observed)
                 if not automatic:
                     self.ui.key("Tab")
             return (all(names.count(name) == 1 for name in (
                 "Example Adapter 1", "Example Adapter 2", "Example Mouse", "Example Trackball",
-                candidate)) and bool(self.ui.matches("Add Device", {"dialog", "alert"}))
+                candidate)) and bool(self.ui.matches("Add Device", {"dialog", "alert"}, dialog))
                 and (connected or bool(self.ui.matches("Connecting", {"label"}, dialog))))
 
         self.ui.wait("close the framed session after PairingDone and SessionEnding", lambda:
