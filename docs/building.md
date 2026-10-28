@@ -537,6 +537,7 @@ and checks one completed write and the order after Refresh and reconnect in
 `device-profiles-drag-up.json`.
 Deleting an in-use profile checks that the numbered confirmation names the affected device and VIA,
 keeps wrapped lines aligned with their text, and preserves its step rows through completion.
+Once deletion starts, its introduction reads "Changes, in order:" through completion or failure.
 The completed dialog is 420px wide at the normal window size, marks every step Done and stays open
 with only a full-width Close button. After Close, the fixture verifies the remaining layer order,
 disabled VIA and cleared interface profile after reconnect. `profile-delete-confirmation.png`,
@@ -564,7 +565,7 @@ accessibility trees and `empty-profiles-*-bounds.json` record the empty layouts.
 The delayed flow checks rapid numeric edits while a write is pending, editable controls, retained
 values and the absence of apply progress and success indicators. Closing the window lets writes
 continue, and reopening retains the latest value. Explicit Quit commits the focused numeric edit,
-shows a separate Cordial window with "Settings are being applied", and exits after pending writes
+shows a separate Cordial window with "Settings are being applied.", and exits after pending writes
 drain. Process exit is the completion barrier for coalesced edits, which can produce one or two
 jobs. Two fresh simulated sessions reject a settings write after Quit shows pending progress.
 These two sessions use a 2000ms write delay to allow the pending window's accessibility tree to

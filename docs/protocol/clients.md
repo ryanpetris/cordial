@@ -555,7 +555,7 @@ Protocol compatibility and storage migration run in-process.
   does not navigate away from the content page. Searching and choosing a result do not change settings.
 - Native lifecycle: closing or hiding the window leaves configuration writes running. Explicit Quit
   commits the focused numeric field and waits for pending writes in a separate Cordial window
-  labelled "Settings are being applied". If a write fails or its outcome is unknown, Continue
+  labelled "Settings are being applied." If a write fails or its outcome is unknown, Continue
   Editing returns to the main window and Quit Anyway exits.
   An error that confirms the save completed does not block Quit or repeat the write. Production
   treats it as success and logs its detail to standard error. In debug builds its feedback

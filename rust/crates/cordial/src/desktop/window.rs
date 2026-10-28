@@ -451,7 +451,7 @@ impl Window {
         let new = quit.is_none();
         let q = quit.get_or_insert_with(|| Quit::new(&self.ctx));
         spin(&q.spinner, failed.is_none());
-        set_label(&q.text, failed.unwrap_or("Settings are being applied"));
+        set_label(&q.text, failed.unwrap_or("Settings are being applied."));
         q.buttons.set_visible(failed.is_some());
         if new {
             q.dialog.present(None::<&gtk::Widget>);

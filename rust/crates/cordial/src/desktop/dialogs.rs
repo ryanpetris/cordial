@@ -586,6 +586,19 @@ impl Confirm {
         };
         self.show_steps(&view.steps, action);
         self.show_marks(&view.marks);
+        if !view.steps.is_empty() {
+            self.dialog.set_body(
+                if view
+                    .marks
+                    .iter()
+                    .any(|mark| *mark != app_profiles::Mark::Pending)
+                {
+                    "Changes, in order:"
+                } else {
+                    app_profiles::DELETION_INTRO
+                },
+            );
+        }
         if view.stage == Stage::Deleted && !self.dialog.has_response(CLOSE) {
             self.dialog.remove_response(CANCEL);
             self.dialog.remove_response(CONFIRM);
@@ -1015,6 +1028,7 @@ mod tests {
                 "marks keep each change in place at {width}px"
             );
             assert!(c.dialog.heading().unwrap().starts_with("Deleting “"));
+            assert_eq!(c.dialog.body(), "Changes, in order:");
             let pages: Vec<_> = rows
                 .iter()
                 .map(|(_, m)| m.visible_child_name().unwrap())
@@ -1048,12 +1062,14 @@ mod tests {
                 c.show_deletion(&view(Stage::Ask, marks), deletion(&[2]));
                 frames(&c.dialog, 3);
                 assert_eq!(places(), asked);
+                assert_eq!(c.dialog.body(), "Changes, in order:");
             }
 
             c.show_deletion(&view(Stage::Deleted, vec![Mark::Done; 7]), deletion(&[2]));
             frames(&c.dialog, 3);
             assert_eq!(places(), asked);
             assert!(c.dialog.heading().unwrap().starts_with("Deleted “"));
+            assert_eq!(c.dialog.body(), "Changes, in order:");
             assert!(
                 c.dialog.has_response(CLOSE)
                     && !c.dialog.has_response(CANCEL)

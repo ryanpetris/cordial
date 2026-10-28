@@ -475,10 +475,6 @@ impl Settings {
                 let s = submission.filter(|s| !s.running && !s.unknown)?;
                 let what = settings_count(s.fields.len());
                 Some(save_failed(&what, s.error.as_deref()?))
-            })
-            .or_else(|| match model::hidpp_up(&d.d) {
-                model::Up::Error(e) => Some(words::error_text(&e, words::Scope::Apply)),
-                _ => None,
             });
         let note = match note {
             Some(note) => Some(Item::text(note).look(Look::Error)),

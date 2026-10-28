@@ -356,7 +356,7 @@ class Smoke:
     def quiet(self):
         feedback = {"Save", "Discard", "Saved", "Applied", "Success", "Applying", "Saving",
                     "Applying...", "Saving...", "Applying" + ELLIPSIS,
-                    "Saving" + ELLIPSIS, "Settings are being applied"}
+                    "Saving" + ELLIPSIS, "Settings are being applied."}
         for node in self.ui.nodes():
             if visible(node) and node.getState().contains(pyatspi.STATE_SHOWING):
                 if node.getRoleName() in {"animation", "progress bar"} or node.name in feedback:
@@ -1176,8 +1176,10 @@ class Smoke:
     def deletion_steps(self, dialog, expected):
         """Checks that a deletion confirmation lists `expected` in order under its introduction,
         each step's text aligned after its number, with a wrapped step's lines hanging there."""
-        intro = self.ui.find("Deleting this profile makes these changes, in order:", {"label"},
-                             dialog)
+        intro = next(n for n in self.ui.nodes(dialog)
+                     if visible(n) and n.getRoleName() == "label" and n.name in {
+                         "Deleting this profile makes these changes, in order:",
+                         "Changes, in order:"})
         lists = [n for n in self.ui.nodes(dialog) if visible(n) and n.getRoleName() == "list"]
         if len(lists) != 1:
             raise AssertionError(f"The deletion confirmation has {len(lists)} lists of changes")
@@ -2248,7 +2250,7 @@ class Smoke:
             raise AssertionError("Quit did not commit and complete the focused numeric edit")
 
     def quit_pending(self, before=None):
-        status = self.ui.find("Settings are being applied", {"status bar"})
+        status = self.ui.find("Settings are being applied.", {"status bar"})
         if before is not None and len(self.writes(MOUSE_SETTINGS)) != before:
             raise AssertionError("The failed write completed before Quit became pending")
         window = status.parent
@@ -2294,7 +2296,7 @@ class Smoke:
         self.ui.screenshot(self.stage + "-failed")
         if continue_editing:
             self.ui.click("Continue Editing", root=window)
-            for name in ("Continue Editing", "Quit Anyway", "Settings are being applied"):
+            for name in ("Continue Editing", "Quit Anyway", "Settings are being applied."):
                 self.ui.absent(name)
             self.nav("Overview")
             self.nav("Example Mouse")

@@ -304,8 +304,7 @@ impl Shell {
         }
     }
 
-    /// Notifies why a background action failed, unless its device's Details page is on screen
-    /// to show it.
+    /// Notifies why a background action failed unless its feedback is already on screen.
     fn report(&mut self, spot: &Spot) {
         let Spot::DeviceBar(adapter, id) = spot else {
             return;
@@ -316,11 +315,14 @@ impl Shell {
             .as_ref()
             .is_some_and(|w| w.window.is_visible() && !w.settings_shown())
             && self.app.shown() == page
-            && self.app.tab() == Tab::Details
-            && self
-                .app
-                .note(&Spot::DetailsSave(adapter.clone(), *id))
-                .is_none();
+            && match self.app.tab() {
+                Tab::Diagnostics => true,
+                Tab::Details => self
+                    .app
+                    .note(&Spot::DetailsSave(adapter.clone(), *id))
+                    .is_none(),
+                _ => false,
+            };
         if let (false, Some(text)) = (seen, self.app.note(spot)) {
             let text = text.to_owned();
             self.services.action_failed(&text, Some(&page));
