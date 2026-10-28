@@ -15,7 +15,7 @@ pub struct Error {
     /// A complete local message, or the error code's token for a Dongle error.
     pub message: String,
     pub dongle: Option<p::Error>,
-    /// The command the Dongle answered, for explanations specific to it.
+    /// The command that failed, for explanations specific to it.
     pub command: Option<&'static str>,
     /// Native handshake metadata for a compatibility refusal.
     pub native_hello: Option<Arc<cordial_client::compatibility::NativeHello>>,
@@ -66,7 +66,7 @@ impl Error {
 
     pub fn from_client(error: cordial_client::Error, command: &'static str) -> Self {
         use cordial_client::Error as E;
-        match error {
+        let mut error = match error {
             E::Incompatible(hello) => {
                 let message = E::Incompatible(hello.clone()).to_string();
                 Self {
@@ -89,23 +89,33 @@ impl Error {
             E::Io(e) => Self::new(format!("{IO}{e}")),
             E::Protocol => Self::new(PROTOCOL),
             E::Closed => Self::new(CLOSED),
-        }
+        };
+        error.command = Some(command);
+        error
     }
 
     /// Whether a local failure came after the request may have reached the adapter, so a change
     /// it carried may or may not have been saved: the connection closed or failed, the adapter
     /// didn't answer in time, or its answer couldn't be read.
     pub fn unconfirmed(&self) -> bool {
+        let (cause, _) = crate::commands::deletion_failure(self);
         self.dongle.is_none()
             && (matches!(
-                self.message.as_str(),
+                cause.message.as_str(),
                 CLOSED | TIMEOUT | UNEXPECTED | PROTOCOL
-            ) || self.message.starts_with(IO))
+            ) || cause.message.starts_with(IO))
     }
 
     /// The Dongle's error code, when the Dongle refused.
     pub fn code_of(&self) -> Option<p::ErrorCode> {
         self.dongle.as_ref().map(p::Error::code)
+    }
+
+    /// Whether the adapter confirms the command's intended effects completed despite an error.
+    pub fn complete(&self) -> bool {
+        self.dongle
+            .as_ref()
+            .is_some_and(|e| e.outcome == p::ErrorOutcome::Complete as i32)
     }
 }
 

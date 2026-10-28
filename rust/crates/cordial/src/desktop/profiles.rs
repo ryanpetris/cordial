@@ -2,11 +2,11 @@
 //! device's ordered profile layers; and the picker that chooses a profile for a layer. Profile rules are never read or changed here.
 use super::{
     dialogs::{Form, Modal},
-    search::{layer_row, profile_row},
+    search::{interface_row, layer_row, profile_row},
     shell::Ctx,
     widgets::{
-        ADAPTER_ICON, Btn, Item, List, Look, Menu, Status, Tab as TabView, set_label, set_look,
-        set_subtitle, set_title, spin, when,
+        ADAPTER_ICON, Btn, Item, List, Look, Menu, Status, Tab as TabView, Toggle, set_subtitle,
+        set_title, spin, when,
     },
 };
 use crate::{
@@ -30,12 +30,14 @@ fn marks(roles: Vec<cordial_protocol::Role>) -> String {
         .join(", ")
 }
 
+/// An interface's card: its switch, then the profile it uses.
 struct Interface {
-    row: adw::ComboRow,
-    /// The profile IDs behind the row's choices, in order.
+    group: adw::PreferencesGroup,
+    toggle: Toggle,
+    profile: adw::ComboRow,
+    /// The profile IDs behind the profile row's choices, in order.
     ids: Rc<RefCell<Vec<u32>>>,
     labels: Vec<String>,
-    switch: gtk::Switch,
 }
 
 struct ProfileRow {
@@ -49,10 +51,7 @@ pub struct AdapterProfiles {
     /// Why the last change couldn't be saved.
     save: List,
     status: Status,
-    memory_bar: gtk::LevelBar,
-    memory_text: gtk::Label,
-    memory_group: adw::PreferencesGroup,
-    interfaces_group: adw::PreferencesGroup,
+    memory: List,
     interfaces: Vec<(ConfigurationInterface, Interface)>,
     error: List,
     retry: Btn,
@@ -67,21 +66,11 @@ pub struct AdapterProfiles {
 impl AdapterProfiles {
     pub fn new(ctx: &Rc<Ctx>) -> Self {
         let tab = TabView::new();
-        let memory_bar = gtk::LevelBar::builder()
-            .width_request(160)
-            .valign(gtk::Align::Center)
-            .build();
-        let memory_text = gtk::Label::new(None);
-        let memory = adw::ActionRow::builder().title("In Use").build();
-        memory.add_suffix(&memory_bar);
-        memory.add_suffix(&memory_text);
-        let memory_group = adw::PreferencesGroup::builder()
-            .title("Profile Memory")
-            .build();
-        memory_group.add(&memory);
-        let interfaces_group = adw::PreferencesGroup::builder()
-            .title("Configuration Interfaces")
-            .build();
+        let memory = List::new(ctx, "Profile Memory");
+        let interfaces: Vec<_> = profiles::INTERFACES
+            .into_iter()
+            .map(|i| (i, interface(ctx, i)))
+            .collect();
         let error = List::new(ctx, "");
         let retry = Btn::new(ctx, "Retry");
         retry.widget.set_valign(gtk::Align::Center);
@@ -98,25 +87,20 @@ impl AdapterProfiles {
         list.set_header_suffix(Some(&buttons));
         error.group.set_header_suffix(Some(&retry.widget));
         let save = List::new(ctx, "");
-        for group in [
-            &save.group,
-            &memory_group,
-            &interfaces_group,
-            &error.group,
-            &list,
-            &unreadable.group,
-        ] {
+        tab.add(&save.group);
+        tab.add(&memory.group);
+        for (_, r) in &interfaces {
+            tab.add(&r.group);
+        }
+        for group in [&error.group, &list, &unreadable.group] {
             tab.add(group);
         }
         Self {
             tab,
             save,
             status: Status::new(ADAPTER_ICON),
-            memory_bar,
-            memory_text,
-            memory_group,
-            interfaces_group,
-            interfaces: Vec::new(),
+            memory,
+            interfaces,
             error,
             retry,
             list,
@@ -128,7 +112,7 @@ impl AdapterProfiles {
         }
     }
 
-    pub fn update(&mut self, ctx: &Rc<Ctx>, app: &App<Live>, a: &AdapterView) {
+    pub fn update(&mut self, _: &Rc<Ctx>, app: &App<Live>, a: &AdapterView) {
         self.save
             .set(&save_error(app.note(&Spot::AdapterSave(a.id.clone()))));
         let Some(view) = a.view() else {
@@ -137,41 +121,24 @@ impl AdapterProfiles {
             return;
         };
         self.tab.show(None);
-        match words::memory_percent(view) {
-            Some(percent) => {
-                self.memory_group.set_visible(true);
-                self.memory_bar
-                    .set_value(f64::from(percent.min(100)) / 100.0);
-                set_label(&self.memory_text, &format!("{percent}%"));
+        let memory: Vec<Item> = words::memory_percent(view)
+            .map(|percent| {
                 let look = if words::memory_alert(view) {
                     Look::Error
                 } else {
                     Look::Plain
                 };
-                set_look(&self.memory_text, look);
-            }
-            None => self.memory_group.set_visible(false),
-        }
+                Item::fact("In Use", format!("{percent}%"))
+                    .look(look)
+                    .meter(Some(percent), Some(100))
+            })
+            .into_iter()
+            .collect();
+        self.memory.set(&memory);
 
         let editable = app.adapter_editable(a);
         let changes = app.adapter_changes(a);
-        let known: Vec<ConfigurationInterface> = profiles::interfaces(view)
-            .iter()
-            .filter_map(|s| ConfigurationInterface::try_from(s.interface).ok())
-            .filter(|i| profiles::INTERFACES.contains(i))
-            .collect();
         let page = app.shown_page(&a.id, false).unwrap_or_default();
-        if known != self.interfaces.iter().map(|(i, _)| *i).collect::<Vec<_>>() {
-            for (_, r) in self.interfaces.drain(..) {
-                self.interfaces_group.remove(&r.row);
-            }
-            for i in &known {
-                let r = interface_row(ctx, *i);
-                self.interfaces_group.add(&r.row);
-                self.interfaces.push((*i, r));
-            }
-        }
-        self.interfaces_group.set_visible(!known.is_empty());
         let staged_all = profiles::configured(
             view,
             &app.adapter_drafts
@@ -179,10 +146,23 @@ impl AdapterProfiles {
                 .map(|d| d.interfaces.clone())
                 .unwrap_or_default(),
         );
+        // Each supported interface has a card, and the first one shown carries the heading.
+        let mut first = true;
         for (i, r) in &mut self.interfaces {
-            let Some(s) = staged_all.iter().find(|s| s.interface == *i as i32) else {
+            let s = staged_all.iter().find(|s| s.interface == *i as i32);
+            r.group.set_visible(s.is_some());
+            let Some(s) = s else {
                 continue;
             };
+            let title = if first {
+                "Configuration Interfaces"
+            } else {
+                ""
+            };
+            first = false;
+            if r.group.title() != title {
+                r.group.set_title(title);
+            }
             let staged = changes.interfaces.iter().any(|u| u.interface == *i);
             let conflict = staged_all.iter().any(|o| {
                 o.enabled
@@ -197,13 +177,7 @@ impl AdapterProfiles {
                 items.push((0, "None".into()));
             }
             for p in page.all().0 {
-                let name = words::clean(&p.name);
-                let name = if name.is_empty() {
-                    format!("Profile {}", p.id)
-                } else {
-                    name
-                };
-                items.push((p.id, name));
+                items.push((p.id, app.profile_text(&a.id, p.id)));
             }
             if s.profile != 0 && !items.iter().any(|(id, _)| *id == s.profile) {
                 items.push((s.profile, app.profile_text(&a.id, s.profile)));
@@ -211,7 +185,7 @@ impl AdapterProfiles {
             let labels: Vec<String> = items.iter().map(|(_, l)| l.clone()).collect();
             if labels != r.labels {
                 let names: Vec<&str> = labels.iter().map(String::as_str).collect();
-                r.row.set_model(Some(&gtk::StringList::new(&names)));
+                r.profile.set_model(Some(&gtk::StringList::new(&names)));
                 r.labels = labels;
             }
             *r.ids.borrow_mut() = items.iter().map(|(id, _)| *id).collect();
@@ -219,17 +193,15 @@ impl AdapterProfiles {
                 .iter()
                 .position(|(id, _)| *id == s.profile)
                 .map_or(gtk::INVALID_LIST_POSITION, |p| p as u32);
-            if r.row.selected() != selected {
-                r.row.set_selected(selected);
+            if r.profile.selected() != selected {
+                r.profile.set_selected(selected);
             }
-            r.row.set_sensitive(editable);
-            if r.switch.is_active() != s.enabled {
-                r.switch.set_active(s.enabled);
-            }
-            r.switch
-                .set_sensitive(editable && (s.enabled || can_enable));
+            // Turning an interface on needs a profile, so the profile can be chosen while off.
+            r.profile.set_sensitive(editable);
+            r.toggle
+                .show(s.enabled, editable && (s.enabled || can_enable));
             set_subtitle(
-                &r.row,
+                &r.toggle.row,
                 if !staged && s.enabled && !s.active {
                     "Inactive"
                 } else {
@@ -262,20 +234,15 @@ impl AdapterProfiles {
         }
         while self.rows.len() < list.len() {
             let row = adw::ActionRow::new();
-            let menu = Menu::new(&self.ctx);
-            menu.button.set_icon_name("view-more-symbolic");
-            menu.button.add_css_class("flat");
-            menu.button.set_tooltip_text(Some("Profile Menu"));
+            let menu = profile_menu(&self.ctx);
             row.add_suffix(&menu.button);
             self.list.add(&row);
             self.rows.push(ProfileRow { row, menu });
         }
         for (r, profile) in self.rows.iter_mut().zip(&list) {
-            let name = words::clean(&profile.name);
+            let name = app.profile_text(&a.id, profile.id);
             r.row.set_widget_name(&profile_row(profile.id));
-            r.menu
-                .button
-                .update_property(&[gtk::accessible::Property::Label(&name)]);
+            name_menu(&r.menu, &name);
             set_title(&r.row, &name);
             set_subtitle(&r.row, &marks(profiles::roles(profile)));
             r.menu.set(&[
@@ -306,6 +273,22 @@ impl AdapterProfiles {
     }
 }
 
+/// A profile row's menu, named for assistive technologies by its profile at each redraw.
+fn profile_menu(ctx: &Rc<Ctx>) -> Menu {
+    let menu = Menu::new(ctx);
+    menu.button.set_icon_name("view-more-symbolic");
+    menu.button.add_css_class("flat");
+    menu.button.set_tooltip_text(Some("Profile Menu"));
+    menu
+}
+
+fn name_menu(menu: &Menu, name: &str) {
+    menu.button
+        .update_property(&[gtk::accessible::Property::Label(&format!(
+            "{name} Profile Menu"
+        ))]);
+}
+
 /// Why the last change couldn't be saved, as a row.
 fn save_error(note: Option<&str>) -> Vec<Item> {
     note.map(|n| Item::text(n).look(Look::Error))
@@ -313,12 +296,28 @@ fn save_error(note: Option<&str>) -> Vec<Item> {
         .collect()
 }
 
-fn interface_row(ctx: &Rc<Ctx>, i: ConfigurationInterface) -> Interface {
-    let row = adw::ComboRow::builder()
-        .title(profiles::interface_label(i))
+fn interface(ctx: &Rc<Ctx>, i: ConfigurationInterface) -> Interface {
+    let label = profiles::interface_label(i);
+    let toggle = Toggle::new(
+        label,
+        glib::clone!(
+            #[weak]
+            ctx,
+            move |on| ctx.act(Action::InterfaceEnabled(i, on))
+        ),
+    );
+    // The visible title is Profile, and the accessible name says whose profile it is.
+    let profile = adw::ComboRow::builder()
+        .title("Profile")
+        .name(interface_row(i))
         .build();
+    let named = profile.upcast_ref::<gtk::Widget>();
+    named.reset_relation(gtk::AccessibleRelation::LabelledBy);
+    named.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{label} Profile"
+    ))]);
     let ids: Rc<RefCell<Vec<u32>>> = Rc::default();
-    row.connect_selected_notify(glib::clone!(
+    profile.connect_selected_notify(glib::clone!(
         #[weak]
         ctx,
         #[strong]
@@ -329,23 +328,15 @@ fn interface_row(ctx: &Rc<Ctx>, i: ConfigurationInterface) -> Interface {
             }
         }
     ));
-    let switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
-    switch.update_property(
-        &[gtk::accessible::Property::Label(profiles::interface_label(
-            i,
-        ))],
-    );
-    switch.connect_active_notify(glib::clone!(
-        #[weak]
-        ctx,
-        move |s| ctx.act(Action::InterfaceEnabled(i, s.is_active()))
-    ));
-    row.add_suffix(&switch);
+    let group = adw::PreferencesGroup::new();
+    group.add(&toggle.row);
+    group.add(&profile);
     Interface {
-        row,
+        group,
+        toggle,
+        profile,
         ids,
         labels: Vec::new(),
-        switch,
     }
 }
 
@@ -366,8 +357,9 @@ struct LayerRow {
 }
 
 /// A device's Profiles tab: its ordered layers, each change applied as it is made. A layer moves
-/// by dragging its row onto another row's place. Without layers, a status page offers to add one,
-/// as GNOME Settings' Printers page does without printers.
+/// by dragging its row onto another row's place.
+/// Without layers, a status page offers to add one, as GNOME Settings' Printers page does without
+/// printers.
 pub struct Layers {
     pub tab: TabView,
     /// Why the last change couldn't be saved.
@@ -503,6 +495,9 @@ impl Layers {
             r.row.set_widget_name(&layer_row(i));
             set_title(&r.row, &name);
             set_subtitle(&r.row, &marks(app.profile_roles(&d.adapter, *id)));
+            r.remove
+                .widget
+                .update_property(&[gtk::accessible::Property::Label(&format!("Remove {name}"))]);
             r.remove.set(when(editable, Action::LayerRemove(i)));
             *r.place.borrow_mut() = editable.then(|| Place {
                 adapter: d.adapter.clone(),
@@ -523,7 +518,8 @@ impl Layers {
         self.save.set(&save_error(note));
         // A save error shows with the groups.
         let empty = n == 0 && note.is_none();
-        self.tab.show(empty.then(|| self.empty.upcast_ref::<gtk::Widget>()));
+        self.tab
+            .show(empty.then(|| self.empty.upcast_ref::<gtk::Widget>()));
     }
 }
 
@@ -541,7 +537,11 @@ pub struct Picker {
     group: adw::PreferencesGroup,
     first: gtk::CheckButton,
     choices: Vec<Choice>,
+    /// Shown once the adapter lists no profiles to choose, with New Profile.
+    empty: adw::StatusPage,
+    new: Btn,
     spinner: gtk::Spinner,
+    retry: Btn,
     choose: Btn,
     ctx: Rc<Ctx>,
 }
@@ -557,10 +557,23 @@ impl Picker {
         form.dialog.set_content_height(520);
         let group = adw::PreferencesGroup::new();
         form.body.append(&group);
+        let new = Btn::suggested(ctx, "New Profile…");
+        new.widget.add_css_class("pill");
+        new.widget.set_halign(gtk::Align::Center);
+        let empty = adw::StatusPage::builder()
+            .icon_name("view-list-symbolic")
+            .title("No Profiles")
+            .child(&new.widget)
+            .visible(false)
+            .build();
+        empty.add_css_class("compact");
+        form.body.append(&empty);
         let spinner = super::widgets::spinner();
+        let retry = Btn::new(ctx, "Retry");
         let cancel = Btn::new(ctx, "Cancel");
         let choose = Btn::suggested(ctx, "Choose");
         form.start.append(&spinner);
+        form.start.append(&retry.widget);
         form.button(&cancel);
         form.button(&choose);
         cancel.set(Some(Action::Cancel));
@@ -571,7 +584,10 @@ impl Picker {
             group,
             first: gtk::CheckButton::new(),
             choices: Vec::new(),
+            empty,
+            new,
             spinner,
+            retry,
             choose,
             ctx: ctx.clone(),
         }
@@ -627,7 +643,7 @@ impl Modal for Picker {
         for profile in &list {
             items.push((
                 profile.id,
-                words::clean(&profile.name),
+                app.profile_text(&self.adapter, profile.id),
                 marks(profiles::roles(profile)),
             ));
         }
@@ -664,8 +680,144 @@ impl Modal for Picker {
             self.first.set_active(true);
         }
         self.group.set_visible(!items.is_empty());
+        let empty =
+            list.is_empty() && current == 0 && page.listed && !page.reading && page.error.is_none();
+        self.empty.set_visible(empty);
+        let editable = app
+            .adapter(&self.adapter)
+            .is_some_and(|a| a.live().is_some() && app.adapter_editable(a));
+        self.new.set(when(
+            editable && !app.profiles_busy(&self.adapter),
+            Action::PickNewProfile,
+        ));
         self.form.note(page.error.as_deref());
+        self.retry.offer(
+            page.error.is_some(),
+            when(app.picker_retryable(&self.adapter), Action::PickRetry),
+        );
         spin(&self.spinner, page.reading);
         self.choose.set(when(none || chosen != 0, Action::Submit));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::desktop::search::{self, Row, Target};
+    use crate::ui::app::{Page, Tab};
+    use std::{sync::Arc, time::Duration};
+
+    #[test]
+    #[ignore = "requires a display"]
+    fn cleaned_empty_profile_names_use_id_fallbacks() {
+        adw::init().expect("GTK needs a display");
+        let world = crate::sim::Desktop::new(1);
+        {
+            let mut sim = world.adapters()[0].0.lock().unwrap();
+            for (id, name) in [
+                (1, "\u{200b}\u{202e}"),
+                (2, " \t\n "),
+                (3, " Pointer\u{202e} "),
+            ] {
+                sim.profiles.iter_mut().find(|p| p.id == id).unwrap().name = name.into();
+            }
+        }
+        let adapter = world.ports()[0].serial.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(world.live(Arc::new(move |msg| {
+            let _ = tx.send(msg);
+        })));
+        let next = |app: &mut App<Live>| {
+            app.update(
+                rx.recv_timeout(Duration::from_secs(5))
+                    .expect("the simulated adapter answers"),
+            );
+        };
+        while !app.shown_page(&adapter, false).is_some_and(|p| p.listed)
+            || app.device(&adapter, 2).is_none()
+        {
+            next(&mut app);
+        }
+        let (ctx, requests) = Ctx::test();
+        let mut library = AdapterProfiles::new(&ctx);
+        library.update(&ctx, &app, app.adapter(&adapter).unwrap());
+        for (id, name) in [(1, "Profile 1"), (2, "Profile 2"), (3, "Pointer")] {
+            let row = library
+                .rows
+                .iter()
+                .find(|r| r.row.widget_name() == profile_row(id))
+                .unwrap();
+            assert_eq!(row.row.title(), name);
+            assert!(search::find(&search::index(&app), name).iter().any(|h| {
+                h.title == name
+                    && h.target
+                        == Target {
+                            page: Some(Page::Adapter(adapter.clone())),
+                            tab: Tab::Profiles,
+                            row: Some(Row::Name(profile_row(id))),
+                        }
+            }));
+        }
+        for (_, interface) in &library.interfaces {
+            for (id, label) in interface.ids.borrow().iter().zip(&interface.labels) {
+                if *id != 0 {
+                    assert_eq!(*label, app.profile_text(&adapter, *id));
+                }
+            }
+        }
+        app.show(Page::Device(adapter.clone(), 2));
+        app.act(Action::LayerAdd);
+        while !app.shown_page(&adapter, true).is_some_and(|p| p.listed) {
+            next(&mut app);
+        }
+        let purpose = PickFor::Layer(2);
+        let mut picker = Picker::new(&ctx, &adapter, purpose);
+        picker.update(&ctx, &app);
+        for (id, name) in [(1, "Profile 1"), (2, "Profile 2"), (3, "Pointer")] {
+            let choice = picker
+                .choices
+                .iter()
+                .find(|c| *c.id.borrow() == id)
+                .unwrap();
+            assert_eq!(choice.row.title(), name);
+            while requests.try_recv().is_ok() {}
+            choice.check.set_active(true);
+            assert!(
+                matches!(requests.try_recv(), Ok(super::super::shell::Ev::Act(Action::Pick(picked))) if picked == id)
+            );
+        }
+        let mut layers = Layers::new(&ctx);
+        layers.update(&app, app.device(&adapter, 2).unwrap());
+        assert_eq!(layers.rows[0].row.title(), "Profile 1");
+        assert_eq!(
+            layers.rows[0].remove.widget.tooltip_text().as_deref(),
+            Some("Remove")
+        );
+        {
+            use glib::translate::{IntoGlib, ToGlibPtr, from_glib_full};
+            let mismatch: Option<glib::GString> = unsafe {
+                from_glib_full(gtk::ffi::gtk_test_accessible_check_property(
+                    layers.rows[0]
+                        .remove
+                        .widget
+                        .upcast_ref::<gtk::Accessible>()
+                        .to_glib_none()
+                        .0,
+                    gtk::AccessibleProperty::Label.into_glib(),
+                    c"Remove Profile 1".as_ptr(),
+                ))
+            };
+            assert_eq!(mismatch, None);
+        }
+        assert!(
+            app.deletion_steps(&adapter, 1)
+                .last()
+                .unwrap()
+                .contains("Profile 1")
+        );
+        app.quit();
+        while !app.done() {
+            next(&mut app);
+        }
     }
 }

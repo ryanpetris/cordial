@@ -1,5 +1,5 @@
 use crate::{
-    Error, Result,
+    Error, Event, Result,
     compatibility::{Compatibility, NativeHello, is_ordinary_message},
 };
 use cordial_protocol::{
@@ -45,6 +45,10 @@ pub const MAX_RECEIVED_FRAME_BYTES: usize = 32 * 1024 * 1024;
 )]
 pub enum Received<'a> {
     Event(p::Event),
+    /// The bond was saved, but the adapter did not supply its device ID.
+    PairingComplete {
+        candidate: u32,
+    },
     /// A response and the request it answers, passed to the handler before that request
     /// returns it.
     Response(&'a p::Request, &'a p::Response),
@@ -71,6 +75,7 @@ struct State {
 struct Shared {
     /// The writer, held across a whole frame so frames never interleave.
     writer: Mutex<Option<Box<dyn Write + Send>>>,
+    diagnostics: Mutex<Option<crate::diagnostics::Sink>>,
     state: Mutex<State>,
     confirmation: Condvar,
     negotiation: Mutex<()>,
@@ -79,6 +84,7 @@ struct Shared {
     migration_limits: AtomicBool,
     stop: AtomicBool,
     timeout: Mutex<Option<Duration>>,
+    deadline: Mutex<Option<Instant>>,
     last_received: Mutex<Instant>,
     /// Set once the reader thread has dropped the reading half.
     released: Mutex<bool>,
@@ -120,21 +126,25 @@ impl Shared {
 pub struct Connection {
     shared: Arc<Shared>,
     reader: ThreadId,
+    finished: Mutex<Receiver<()>>,
 }
 
 impl Connection {
     /// Starts a connection and returns it with a channel of the Dongle's events. The channel
     /// disconnects when the connection closes.
-    pub fn new<R, W>(reader: R, writer: W) -> (Self, Receiver<p::Event>)
+    pub fn new<R, W>(reader: R, writer: W) -> (Self, Receiver<Event>)
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
         let (tx, rx) = mpsc::channel();
         let connection = Self::with_handler(reader, writer, move |received| {
-            if let Received::Event(event) = received {
-                let _ = tx.send(event);
-            }
+            let event = match received {
+                Received::Event(event) => Event::Protocol(event),
+                Received::PairingComplete { candidate } => Event::PairingComplete { candidate },
+                _ => return,
+            };
+            let _ = tx.send(event);
         });
         (connection, rx)
     }
@@ -153,6 +163,7 @@ impl Connection {
     {
         let shared = Arc::new(Shared {
             writer: Mutex::new(Some(Box::new(writer))),
+            diagnostics: Mutex::new(None),
             state: Mutex::new(State {
                 pending: VecDeque::new(),
                 closed: None,
@@ -168,24 +179,48 @@ impl Connection {
             migration_limits: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             timeout: Mutex::new(Some(DEFAULT_TIMEOUT)),
+            deadline: Mutex::new(None),
             last_received: Mutex::new(Instant::now()),
             released: Mutex::new(false),
             release: Condvar::new(),
         });
         let reader_shared = shared.clone();
+        let (finished, completion) = mpsc::channel::<()>();
         let reader = thread::Builder::new()
             .name("cordial-read".into())
-            .spawn(move || read_loop(&reader_shared, reader, handler))
+            .spawn(move || {
+                read_loop(&reader_shared, reader, handler);
+                drop(finished);
+            })
             .expect("spawn reader thread")
             .thread()
             .id();
-        Self { shared, reader }
+        Self {
+            shared,
+            reader,
+            finished: Mutex::new(completion),
+        }
+    }
+
+    /// Replaces stderr diagnostics with a sink for original wire messages and completed errors.
+    /// Set this before the handshake. The sink runs on the reader thread and must not block.
+    /// It does not change the normalized messages delivered to handlers and request observers.
+    pub fn set_diagnostics(&self, sink: crate::diagnostics::Sink) {
+        *self.shared.diagnostics.lock().unwrap() = Some(sink);
     }
 
     /// Sets how long each request may wait without incoming bytes; `None` waits without limit.
     /// Progressing responses may take longer. A stalled request closes the connection.
     pub fn set_timeout(&self, timeout: Option<Duration>) {
         *self.shared.timeout.lock().unwrap() = timeout;
+    }
+
+    /// Sets an absolute deadline for subsequent requests, including their handshake and replies.
+    /// Incoming bytes do not extend it. Expiry closes the connection; a request that has not
+    /// started writing reports [`Error::NotSent`]. `None` leaves only the inactivity timeout.
+    /// Set this before a bounded sequence of requests and clear it when that sequence finishes.
+    pub fn set_deadline(&self, deadline: Option<Instant>) {
+        *self.shared.deadline.lock().unwrap() = deadline;
     }
 
     pub(crate) fn set_migration_limits(&self) {
@@ -214,9 +249,10 @@ impl Connection {
             .wait_timeout_while(released, RELEASE_TIMEOUT, |released| !*released);
     }
 
-    /// Closes the session and waits until both stream handles are released.
+    /// Closes the session and waits until both stream handles are released and the reader
+    /// handler finishes, including its final [`Received::Closed`] callback.
     /// Returns false when called from the reader handler, which cannot wait for itself.
-    /// Readers must have bounded read timeouts for this call to finish.
+    /// Readers must have bounded read timeouts and handlers must return for this call to finish.
     pub fn close_and_wait_release(&self) -> bool {
         self.shared.close(Error::Closed);
         if thread::current().id() == self.reader {
@@ -230,6 +266,8 @@ impl Connection {
                 .unwrap(),
         );
         drop(self.shared.writer.lock().unwrap().take());
+        // The reader drops its sender after the handler finishes, including during unwinding.
+        let _ = self.finished.lock().unwrap().recv();
         true
     }
 
@@ -251,7 +289,13 @@ impl Connection {
                 return Err(error.clone());
             }
         }
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        let limit = Instant::now() + HANDSHAKE_TIMEOUT;
+        let deadline = self
+            .shared
+            .deadline
+            .lock()
+            .unwrap()
+            .map_or(limit, |d| d.min(limit));
         {
             let mut writer = self.shared.writer.lock().unwrap();
             let mut state = self.shared.state.lock().unwrap();
@@ -265,7 +309,7 @@ impl Connection {
             let mut frame = vec![frame::DELIMITER];
             frame::encode_bytes(&bytes, &mut frame);
             let result = match writer.as_mut() {
-                Some(writer) => write_all(writer.as_mut(), &frame),
+                Some(writer) => write_all(writer.as_mut(), &frame, Some(deadline)),
                 None => return Err(Error::Closed),
             };
             if let Err(error) = result {
@@ -282,17 +326,17 @@ impl Connection {
                 self.shared.close(Error::Closed);
                 return Err(Error::Closed);
             }
-            if let Some(hello) = &state.hello {
-                return Ok(hello.clone());
-            }
-            if let Some(error) = &state.closed {
-                return Err(error.clone());
-            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 drop(state);
                 self.shared.close(Error::Timeout);
                 return Err(Error::Timeout);
+            }
+            if let Some(hello) = &state.hello {
+                return Ok(hello.clone());
+            }
+            if let Some(error) = &state.closed {
+                return Err(error.clone());
             }
             state = self
                 .shared
@@ -346,6 +390,11 @@ impl Connection {
             self.shared.close(Error::Closed);
             return Err(Error::Closed);
         }
+        let deadline = *self.shared.deadline.lock().unwrap();
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            self.shared.close(Error::Timeout);
+            return Err(Error::NotSent(Arc::new(Error::Timeout)));
+        }
         let request = p::Request {
             command: Some(command),
         };
@@ -368,6 +417,12 @@ impl Connection {
                 if let Some(error) = &state.closed {
                     return Err(Error::NotSent(Arc::new(error.clone())));
                 }
+                if deadline.is_some_and(|d| Instant::now() >= d) {
+                    drop(state);
+                    drop(writer);
+                    self.shared.close(Error::Timeout);
+                    return Err(Error::NotSent(Arc::new(Error::Timeout)));
+                }
                 if !self.shared.started.load(Ordering::Acquire) || state.confirmed {
                     state.pending.push_back((request, tx, observe));
                     break writer;
@@ -377,12 +432,21 @@ impl Connection {
                 if let Some(waiting) = state.confirmation_waiting.take() {
                     waiting.send(()).unwrap();
                 }
-                drop(
-                    self.shared
-                        .confirmation
-                        .wait_while(state, |state| !state.confirmed && state.closed.is_none())
-                        .unwrap(),
-                );
+                if let Some(deadline) = deadline {
+                    drop(
+                        self.shared
+                            .confirmation
+                            .wait_timeout(state, deadline.saturating_duration_since(Instant::now()))
+                            .unwrap(),
+                    );
+                } else {
+                    drop(
+                        self.shared
+                            .confirmation
+                            .wait_while(state, |state| !state.confirmed && state.closed.is_none())
+                            .unwrap(),
+                    );
+                }
             };
             self.shared.started.store(true, Ordering::Release);
             frame::encode_bytes(&bytes, &mut frame);
@@ -394,7 +458,7 @@ impl Connection {
                 self.shared.close(Error::Closed);
                 return Err(Error::Closed);
             }
-            if let Err(error) = write_all(stream.as_mut(), &frame) {
+            if let Err(error) = write_all(stream.as_mut(), &frame, deadline) {
                 drop(writer);
                 let error = Error::from(error);
                 self.shared.close(error.clone());
@@ -403,57 +467,57 @@ impl Connection {
         }
         let timeout = *self.shared.timeout.lock().unwrap();
         let started = Instant::now();
-        let reply = if let Some(cancelled) = cancelled {
-            loop {
-                if cancelled.load(Ordering::Acquire) {
-                    self.shared.close(Error::Closed);
-                    break Err(Error::Closed);
+        let reply = loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                self.shared.close(Error::Closed);
+                break Err(Error::Closed);
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                self.shared.close(Error::Timeout);
+                break Err(Error::Timeout);
+            }
+            let mut remaining = timeout.map(|timeout| {
+                timeout.saturating_sub(
+                    (*self.shared.last_received.lock().unwrap())
+                        .max(started)
+                        .elapsed(),
+                )
+            });
+            if let Some(deadline) = deadline {
+                let absolute = deadline.saturating_duration_since(Instant::now());
+                remaining = Some(remaining.map_or(absolute, |idle| idle.min(absolute)));
+            }
+            if cancelled.is_some() {
+                let poll = Duration::from_millis(50);
+                remaining = Some(remaining.map_or(poll, |remaining| remaining.min(poll)));
+            }
+            let received = match remaining {
+                Some(remaining) => rx.recv_timeout(remaining),
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match received {
+                Ok(reply) if deadline.is_none_or(|d| Instant::now() < d) => break Ok(reply),
+                Ok(_) => {
+                    self.shared.close(Error::Timeout);
+                    break Err(Error::Timeout);
                 }
-                match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(reply) => break Ok(reply),
-                    Err(RecvTimeoutError::Timeout) => {
-                        if timeout.is_some_and(|timeout| {
+                Err(RecvTimeoutError::Timeout) => {
+                    if deadline.is_some_and(|d| Instant::now() >= d)
+                        || timeout.is_some_and(|timeout| {
                             (*self.shared.last_received.lock().unwrap())
                                 .max(started)
                                 .elapsed()
                                 >= timeout
-                        }) {
-                            self.shared.close(Error::Timeout);
-                            break Err(Error::Timeout);
-                        }
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        break Err(self.closed().unwrap_or(Error::Closed));
+                        })
+                    {
+                        // A lost response would make every later response answer the wrong request.
+                        self.shared.close(Error::Timeout);
+                        break Err(Error::Timeout);
                     }
                 }
-            }
-        } else {
-            match timeout {
-                Some(timeout) => loop {
-                    let idle = (*self.shared.last_received.lock().unwrap())
-                        .max(started)
-                        .elapsed();
-                    match rx.recv_timeout(timeout.saturating_sub(idle)) {
-                        Ok(reply) => break Ok(reply),
-                        Err(RecvTimeoutError::Timeout) => {
-                            if (*self.shared.last_received.lock().unwrap())
-                                .max(started)
-                                .elapsed()
-                                >= timeout
-                            {
-                                // A lost response would make every later response answer the wrong request.
-                                self.shared.close(Error::Timeout);
-                                break Err(Error::Timeout);
-                            }
-                        }
-                        Err(RecvTimeoutError::Disconnected) => {
-                            break Err(self.closed().unwrap_or(Error::Closed));
-                        }
-                    }
-                },
-                None => rx
-                    .recv()
-                    .map_err(|_| self.closed().unwrap_or(Error::Closed)),
+                Err(RecvTimeoutError::Disconnected) => {
+                    break Err(self.closed().unwrap_or(Error::Closed));
+                }
             }
         };
         reply?
@@ -738,8 +802,13 @@ fn retry(error: &io::Error) -> bool {
     )
 }
 
-fn write_all(stream: &mut dyn Write, mut bytes: &[u8]) -> io::Result<()> {
-    let deadline = Instant::now() + WRITE_TIMEOUT;
+fn write_all(
+    stream: &mut dyn Write,
+    mut bytes: &[u8],
+    deadline: Option<Instant>,
+) -> io::Result<()> {
+    let limit = Instant::now() + WRITE_TIMEOUT;
+    let deadline = deadline.map_or(limit, |d| d.min(limit));
     while !bytes.is_empty() {
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
@@ -838,9 +907,24 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
                 failed = Some(Error::Protocol);
                 break;
             };
+            let diagnostics = shared.diagnostics.lock().unwrap().clone();
+            let log = |error: &p::Error| match &diagnostics {
+                Some(sink) => sink(crate::diagnostics::Diagnostic::Completed(error)),
+                None => crate::diagnostics::completed(error),
+            };
             match message.kind {
-                Some(message::Kind::Event(event)) => handler(Received::Event(event)),
-                Some(message::Kind::Response(response)) => {
+                Some(message::Kind::Event(event)) => {
+                    if let Some(sink) = &diagnostics {
+                        sink(crate::diagnostics::Diagnostic::Event(&event));
+                    }
+                    match crate::outcomes::event(event, &log) {
+                        Event::Protocol(event) => handler(Received::Event(event)),
+                        Event::PairingComplete { candidate } => {
+                            handler(Received::PairingComplete { candidate })
+                        }
+                    }
+                }
+                Some(message::Kind::Response(mut response)) => {
                     let waiting = {
                         let mut state = shared.state.lock().unwrap();
                         let waiting = state.pending.pop_front();
@@ -854,6 +938,15 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
                         break;
                     };
                     shared.confirmation.notify_all();
+                    if let Some(sink) = &diagnostics {
+                        sink(crate::diagnostics::Diagnostic::Response(
+                            &request, &response,
+                        ));
+                    }
+                    if let Err(error) = crate::outcomes::response(&request, &mut response, &log) {
+                        let _ = reply.try_send(Err(error));
+                        continue;
+                    }
                     handler(Received::Response(&request, &response));
                     if let Some(observe) = observe {
                         observe(&response);
@@ -1067,6 +1160,62 @@ mod tests {
         assert!(done.recv_timeout(DEADLINE).unwrap());
         closing.join().unwrap();
         exclusive.join().unwrap();
+    }
+
+    #[test]
+    fn exclusive_close_waits_for_the_final_callback() {
+        let (_responses, reader) = mpsc::channel();
+        let (session, sessions) = mpsc::channel::<Arc<Connection>>();
+        let (entered, handling) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let (events, observed) = mpsc::channel();
+        let connection = Arc::new(Connection::with_handler(
+            Reader(reader),
+            io::sink(),
+            move |received| {
+                assert!(matches!(received, Received::Closed(_)));
+                let connection = sessions.recv_timeout(DEADLINE).unwrap();
+                connection.close();
+                assert!(!connection.close_and_wait_release());
+                entered.send(()).unwrap();
+                held.recv_timeout(DEADLINE).unwrap();
+                events.send("final event").unwrap();
+            },
+        ));
+        session.send(connection.clone()).unwrap();
+        connection.close();
+        handling.recv_timeout(DEADLINE).unwrap();
+        assert!(*connection.shared.released.lock().unwrap());
+
+        let closer = connection.clone();
+        let (started, starting) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let close = thread::spawn(move || {
+            started.send(()).unwrap();
+            assert!(closer.close_and_wait_release());
+            finished.send(observed.try_recv()).unwrap();
+        });
+        starting.recv_timeout(DEADLINE).unwrap();
+        let early = done.recv_timeout(Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert!(matches!(early, Err(RecvTimeoutError::Timeout)));
+        assert_eq!(done.recv_timeout(DEADLINE).unwrap().unwrap(), "final event");
+        close.join().unwrap();
+        assert!(connection.close_and_wait_release());
+    }
+
+    #[test]
+    fn exclusive_close_finishes_when_the_final_callback_panics() {
+        let connection = Connection::with_handler(io::empty(), io::sink(), |received| {
+            assert!(matches!(received, Received::Closed(_)));
+            panic!("callback failed");
+        });
+        let (finished, done) = mpsc::channel();
+        let close = thread::spawn(move || {
+            finished.send(connection.close_and_wait_release()).unwrap();
+        });
+        assert!(done.recv_timeout(DEADLINE).unwrap());
+        close.join().unwrap();
     }
 
     #[test]

@@ -112,6 +112,7 @@ impl View for DevicePage {
 fn page_menu(ctx: &Rc<Ctx>) -> Menu {
     let menu = Menu::new(ctx);
     menu.button.set_icon_name("view-more-symbolic");
+    menu.button.set_tooltip_text(Some("Device Menu"));
     menu.button
         .update_property(&[gtk::accessible::Property::Label("Device Menu")]);
     menu

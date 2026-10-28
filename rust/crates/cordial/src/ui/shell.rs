@@ -467,6 +467,7 @@ impl<B: Backend> Model<B> {
                     self.sync_auth();
                 }
             }
+            Event::Progress { .. } => {}
             Event::Done { ticket, result, .. } => {
                 if let Some(job) = self.jobs.remove(&ticket) {
                     self.finish(job, result);
@@ -544,7 +545,7 @@ impl<B: Backend> Model<B> {
                 if open {
                     // The session stays for diagnosis and recovery.
                     self.log(format!(
-                        "Error: {line}. adapter status, adapter restart, file list, file get and adapter bootloader still work; use adapter select to retry."
+                        "Error: {line}. The adapter still accepts adapter status, adapter restart, file list, file get, file put, file delete and adapter bootloader. Use adapter select to retry."
                     ));
                 } else {
                     // An adapter that refused the connection isn't awaited any longer.
@@ -836,6 +837,7 @@ impl Screen {
 /// The interactive shell for a terminal.
 pub struct Shell {
     port: Option<String>,
+    json: bool,
     tx: SyncSender<Msg>,
     rx: Receiver<Msg>,
     interrupted: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -846,6 +848,7 @@ pub fn shell(options: UiOptions) -> (Shell, Interrupter) {
     (
         Shell {
             port: options.port,
+            json: options.json,
             tx,
             rx,
             interrupted,
@@ -858,9 +861,17 @@ impl Shell {
     /// Runs until quit, exit, Ctrl+C, Ctrl+D, SIGINT or SIGTERM. Closing the adapter's port ends
     /// a running scan and an unsaved pairing.
     pub fn run(self) -> Result<(), UiError> {
+        let output = crate::json::Output::terminal(self.json);
+        let observer = Some(output.observer());
+        let result = self.run_observed(observer);
+        super::finish_output(output, result)
+    }
+
+    fn run_observed(self, observer: Option<crate::json::Observer>) -> Result<(), UiError> {
         let modes = Modes::enter(false)?;
         let input = Input::spawn(self.tx.clone());
-        let mut model = Model::new(Live::new(self.tx.clone()), self.port);
+        let backend = Live::new(self.tx.clone(), observer, self.port.is_some());
+        let mut model = Model::new(backend, self.port);
         let mut out = io::stdout();
         let mut screen = Screen { cursor_row: 0 };
         let mut closing: Option<Instant> = None;
@@ -1125,7 +1136,7 @@ mod tests {
             },
         })));
         assert!(m.output.last().unwrap().ends_with(
-            "adapter status, adapter restart, file list, file get and adapter bootloader still work; use adapter select to retry."
+            "The adapter still accepts adapter status, adapter restart, file list, file get, file put, file delete and adapter bootloader. Use adapter select to retry."
         ));
     }
 

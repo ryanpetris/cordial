@@ -7,6 +7,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 COPY control /tmp/control
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential debhelper devscripts equivs git make python3 \
+        build-essential ca-certificates curl debhelper devscripts equivs git make python3 \
     && mk-build-deps --install --remove --tool 'apt-get -y --no-install-recommends' /tmp/control \
     && rm -rf /var/lib/apt/lists/* /tmp/control
+
+COPY --from=tools install-just.sh /tmp/install-just.sh
+RUN sh /tmp/install-just.sh && rm /tmp/install-just.sh

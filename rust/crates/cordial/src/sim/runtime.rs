@@ -276,6 +276,7 @@ fn connected(id: u32, name: &str, kind: p::Kind, role: Role, level: u32) -> p::D
 }
 
 fn seed(sim: &mut Sim, index: usize) {
+    sim.reconnect_interfaces = true;
     sim.status.id = format!("SIMULATED{:07}", index + 1);
     sim.status.name = format!("Example Adapter {}", index + 1);
     enable_gamepads(&mut sim.status);
@@ -332,6 +333,8 @@ fn seed(sim: &mut Sim, index: usize) {
     travel.roles = vec![Role::Keyboard as i32];
     travel.profiles = Some(p::ProfileLayers::default());
     let mut pad = connected(4, "Example Controller", p::Kind::Gamepad, Role::Gamepad, 64);
+    // A connected device that reports no battery.
+    pad.information.as_mut().unwrap().battery = None;
     pad.integrations.clear();
     pad.output_preferences = vec![p::OutputPreference {
         role: Role::Gamepad as i32,

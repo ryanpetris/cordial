@@ -174,16 +174,27 @@ pub fn value_text(leaf: Leaf, v: Option<&Value>) -> String {
         None => "Unknown".into(),
         Some(Value::Bool(b)) => if *b { "On" } else { "Off" }.into(),
         Some(Value::Integer(0)) if leaf == Leaf::AutoOff => "Never".into(),
+        Some(Value::Integer(FREE_SPIN_OFF)) if leaf == Leaf::FreeSpinThreshold => "Off".into(),
         Some(Value::Integer(n)) => n.to_string(),
         Some(Value::Choice(n)) => catalog::choice_words(leaf, *n),
     }
 }
 
-/// The unit shown beside a value; none when the value reads "Never".
+/// The unit shown beside a value; none while it is unknown or when it reads "Never".
 pub fn display_unit(leaf: Leaf, v: Option<&Value>) -> &'static str {
     match v {
+        None => "",
         Some(Value::Integer(0)) if leaf == Leaf::AutoOff => "",
         _ => catalog::unit(leaf),
+    }
+}
+
+/// A value in words with its unit.
+pub fn unit_text(leaf: Leaf, v: Option<&Value>) -> String {
+    let text = value_text(leaf, v);
+    match display_unit(leaf, v) {
+        "" => text,
+        unit => format!("{text} {unit}"),
     }
 }
 
@@ -388,7 +399,7 @@ impl<F: Fleet> App<F> {
                 let items = settings::choices(&s)
                     .into_iter()
                     .map(|v| {
-                        let label = value_text(s.field.leaf, Some(&v));
+                        let label = unit_text(s.field.leaf, Some(&v));
                         (label, Some(Action::SettingChoice(*k, v)))
                     })
                     .collect();
@@ -763,6 +774,29 @@ impl<F: Fleet> App<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn values_show_their_units() {
+        let int = |n| Some(Value::Integer(n));
+        assert_eq!(unit_text(Leaf::Dpi, int(800).as_ref()), "800 DPI");
+        assert_eq!(unit_text(Leaf::AutoOff, int(30).as_ref()), "30 s");
+        assert_eq!(unit_text(Leaf::AutoOff, int(0).as_ref()), "Never");
+        assert_eq!(unit_text(Leaf::AutoOff, None), "Unknown");
+        assert_eq!(
+            unit_text(Leaf::WheelMode, Some(&Value::Choice(1))),
+            "Free Spin"
+        );
+        assert_eq!(
+            unit_text(Leaf::FreeSpinThreshold, int(FREE_SPIN_OFF).as_ref()),
+            "Off"
+        );
+        assert_eq!(unit_text(Leaf::FreeSpinThreshold, int(30).as_ref()), "30");
+        assert_eq!(
+            unit_text(Leaf::AutoOff, int(FREE_SPIN_OFF).as_ref()),
+            "255 s",
+            "only the free spin threshold reads its off value as Off"
+        );
+    }
 
     #[test]
     pub(crate) fn steps_stay_in_range_at_the_limits() {

@@ -448,17 +448,45 @@ class Desktop:
             self.click(node=node)
         self.wait(f"{title!r} is {on}", lambda: checked() == on)
 
-    def choose(self, title, value, root=None):
+    def choose(self, title, value, root=None, choices=None):
         row = self.row(title, root)
+        buttons = self.matches(title, {"push button", "button", "toggle button"}, row)
+        if buttons:
+            button = self.find(title, {"push button", "button", "toggle button"}, row)
+            self.click(node=button)
+            roles = {"radio menu item", "menu item", "check menu item"}
+            menu = self.find(title, {"menu"}, row)
+            options = self.wait(f"show choices for {title!r}", lambda: [
+                n for n in self.nodes(menu) if visible(n) and n.getRoleName() in roles])
+            named = self.matches(value, roles, menu)
+            if named:
+                option = self.find(value, roles, menu)
+            else:
+                # Some GTK releases expose model menu items without their text labels.
+                if choices is None or len(options) != len(choices):
+                    raise AssertionError(f"Cannot identify the choices for {title!r}")
+                option = options[choices.index(value)]
+            self.click(node=option)
+            self.wait(f"close the choices for {title!r} and show {value!r}", lambda:
+                not self.matches(title, {"menu"}, row)
+                and self.matches(value, {"label"}, row))
+            return
         self.click(node=row)
-        option = self.find(value, {"list item", "radio button", "menu item", "label"}, root=row)
-        while option.getRoleName() == "label" or option.getRoleName() == "panel":
-            option = option.parent
-        if option.getRoleName() not in {"list item", "radio button", "menu item"}:
-            raise AssertionError(f"{value!r} is not a selectable choice for {title!r}")
+        roles = {"list item", "radio button", "menu item", "label"}
         self.key("Home")
-        for _ in range(option.getIndexInParent()):
+
+        def choice():
+            for option in self.matches(value, roles, row):
+                while option.getRoleName() in {"label", "panel"}:
+                    option = option.parent
+                if (option.getRoleName() in {"list item", "radio button", "menu item"}
+                        and option.getState().contains(pyatspi.STATE_FOCUSED)):
+                    return True
+            # GTK realizes popup rows as keyboard navigation brings them into view.
             self.key("Down")
+            return False
+
+        self.wait(f"focus choice {value!r} for {title!r}", choice)
         self.key("Return")
         self.wait(f"close the choices for {title!r} and show {value!r}", lambda:
             row.getState().contains(pyatspi.STATE_FOCUSED)

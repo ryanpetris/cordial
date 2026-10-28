@@ -18,7 +18,6 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     io::Write,
-    path::PathBuf,
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -37,9 +36,6 @@ pub enum Ev {
     ActOn(Page, Action),
     /// The open dialog's text.
     Form(String),
-    /// Downloads the selected file to a destination a file chooser picked, and whether the
-    /// chooser confirmed replacing it.
-    Download(PathBuf, bool),
     /// The window closed; the app keeps running.
     Hide,
     Present(Option<Page>),
@@ -86,6 +82,17 @@ impl Ctx {
     pub fn act_after(&self, action: Action) {
         let _ = self.tx.try_send(Ev::Act(action));
     }
+
+    /// A context for widgets under test, with the requests they send.
+    #[cfg(test)]
+    pub fn test() -> (Rc<Self>, async_channel::Receiver<Ev>) {
+        let (tx, rx) = async_channel::unbounded();
+        let ctx = Self {
+            tx,
+            updating: Cell::new(false),
+        };
+        (Rc::new(ctx), rx)
+    }
 }
 
 /// The running app, as its activation reaches it.
@@ -116,7 +123,12 @@ struct Shell {
 }
 
 /// Starts the model and its tasks on the main loop.
-pub fn start(gtk: &adw::Application, port: Option<String>, simulate: Option<usize>) -> Handle {
+pub fn start(
+    gtk: &adw::Application,
+    port: Option<String>,
+    simulate: Option<usize>,
+    observer: Option<crate::json::Observer>,
+) -> Handle {
     let (backend, messages) = async_channel::bounded::<Msg>(BACKLOG);
     let sink: Sink = Arc::new(move |m| {
         // The window has gone once the receiver closes; nothing waits for the message.
@@ -126,8 +138,13 @@ pub fn start(gtk: &adw::Application, port: Option<String>, simulate: Option<usiz
         Some(count) => crate::sim::desktop(sink, count),
         None => Live::new(sink, port),
     };
+    let live = match observer {
+        Some(observer) => live.observe(observer),
+        None => live,
+    };
     let mut app = App::new(live);
     app.enable_immediate();
+    app.keep_deleted();
     let write_trace = simulate
         .and_then(|_| std::env::var_os("CORDIAL_SIM_WRITE_TRACE"))
         .and_then(|path| {
@@ -344,7 +361,6 @@ impl Shell {
             Ev::Act(action) => self.app.act(action),
             Ev::ActOn(page, action) => self.act_on(page, action),
             Ev::Form(text) => self.app.set_form(&text),
-            Ev::Download(path, overwrite) => self.app.download_to(path, overwrite),
             Ev::Hide => self.app.hide(),
             Ev::Present(page) => {
                 if let Some(page) = page {

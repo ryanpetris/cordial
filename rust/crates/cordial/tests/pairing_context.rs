@@ -230,7 +230,7 @@ fn repeated_add_requests_preserve_the_prompt_and_running_pairing() {
     until(&mut app, &rx, |app| {
         app.add()
             .and_then(|add| add.pairing.as_ref())
-            .is_some_and(|pairing| pairing.phase == Phase::Connected)
+            .is_some_and(|pairing| pairing.phase == Phase::Paired)
     });
     assert!(
         world.adapters()[1]

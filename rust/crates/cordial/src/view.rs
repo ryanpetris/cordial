@@ -40,6 +40,8 @@ pub struct State {
     pub status: p::Status,
     /// Saved devices in ascending ID order.
     pub devices: Vec<p::Device>,
+    /// Devices with a record received since their most recent SetDevice response.
+    pub device_readbacks: BTreeSet<u32>,
     /// Saved devices whose records the Dongle couldn't read when it last listed them, with why. A
     /// device known before keeps its last known record in `devices`.
     pub unreadable: BTreeMap<u32, p::Error>,
@@ -51,6 +53,8 @@ pub struct State {
     pub last_scan: Option<p::ScanDone>,
     /// The latest pairing event.
     pub pairing: Option<p::Pairing>,
+    /// A confirmed bond save whose event omitted the saved device ID.
+    pub paired_candidate: Option<u32>,
     /// Each device's settings objects in listing order, once listed.
     pub settings: BTreeMap<u32, Vec<p::SettingsObject>>,
     /// Profiles by ID, from listings, results and events. Before a listing it holds only the
@@ -99,6 +103,7 @@ impl State {
     }
 
     fn put_device(&mut self, device: p::Device) {
+        self.device_readbacks.insert(device.id);
         self.unreadable.remove(&device.id);
         match self.devices.binary_search_by_key(&device.id, |d| d.id) {
             Ok(i) => self.devices[i] = device,
@@ -107,6 +112,7 @@ impl State {
     }
 
     fn remove_device(&mut self, id: u32) {
+        self.device_readbacks.remove(&id);
         self.devices.retain(|d| d.id != id);
         self.unreadable.remove(&id);
         self.settings.remove(&id);
@@ -223,9 +229,6 @@ impl State {
         if let Some(on) = update.blocked {
             d.blocked = on;
         }
-        if update.enabled.is_some() || update.blocked.is_some() {
-            d.inactive = inactive_after(d).map(|r| r as i32);
-        }
         for i in &update.integrations {
             let Some(on) = i.enabled else { continue };
             match d.integrations.iter_mut().find(|o| o.kind == i.kind) {
@@ -296,7 +299,10 @@ impl State {
                 self.scanning = None;
                 self.last_scan = Some(done.clone());
             }
-            event::Kind::Pairing(pairing) => self.pairing = Some(pairing.clone()),
+            event::Kind::Pairing(pairing) => {
+                self.paired_candidate = None;
+                self.pairing = Some(pairing.clone());
+            }
             event::Kind::Profile(profile) => {
                 self.profiles.insert(profile.id, profile.clone());
             }
@@ -309,7 +315,14 @@ impl State {
     /// Applies the records a response carries. An accepted scan or pairing starts here, so
     /// events before its response still belong to the earlier one.
     pub fn response(&mut self, request: &p::Request, response: &p::Response) {
+        if let Some(Command::SetDevice(update)) = &request.command {
+            self.device_readbacks.remove(&update.device);
+        }
         let accepted = !matches!(response.result, Some(response::Result::Error(_)));
+        // A complete save confirms preferences, but can still report a radio failure.
+        let saved = accepted
+            || matches!(&response.result, Some(response::Result::Error(e))
+                if e.outcome == p::ErrorOutcome::Complete as i32);
         match &request.command {
             Some(Command::StartScan(scan)) if accepted => self.scan_started(
                 scan.transports
@@ -317,13 +330,16 @@ impl State {
                     .filter_map(|t| p::Transport::try_from(*t).ok())
                     .collect(),
             ),
-            Some(Command::StartPairing(_)) if accepted => self.pairing = None,
+            Some(Command::StartPairing(_)) if accepted => {
+                self.pairing = None;
+                self.paired_candidate = None;
+            }
             Some(Command::DeleteProfile(d)) if accepted => {
                 self.profiles.remove(&d.profile);
             }
-            Some(Command::SetAdapter(update)) if accepted => self.adapter_saved(update),
-            Some(Command::SetDevice(update)) if accepted => self.device_saved(update),
-            Some(Command::SetSettings(update)) if accepted => self.settings_saved(update),
+            Some(Command::SetAdapter(update)) if saved => self.adapter_saved(update),
+            Some(Command::SetDevice(update)) if saved => self.device_saved(update),
+            Some(Command::SetSettings(update)) if saved => self.settings_saved(update),
             _ => {}
         }
         match (&request.command, &response.result) {
@@ -355,20 +371,6 @@ impl State {
         self.hidden.clear();
         self.last_scan = None;
         self.scanning = Some(transports);
-    }
-}
-
-/// The inactive reason a saved enabled or blocked change leaves, in the adapter's order: transport
-/// reasons stay, then blocked, then disabled. An accepted enable was given room, so the device is
-/// no longer inactive for capacity.
-fn inactive_after(d: &p::Device) -> Option<p::InactiveReason> {
-    use p::InactiveReason::{Blocked, Capacity, Disabled, TransportDisabled, UnsupportedTransport};
-    match crate::model::inactive(d) {
-        Some(r @ (UnsupportedTransport | TransportDisabled)) => Some(r),
-        _ if d.blocked => Some(Blocked),
-        _ if !d.enabled => Some(Disabled),
-        Some(Capacity) => Some(Capacity),
-        _ => None,
     }
 }
 
@@ -626,6 +628,44 @@ mod tests {
     }
 
     #[test]
+    fn only_complete_errors_confirm_saved_preferences_without_confirming_radio_effects() {
+        for outcome in [
+            p::ErrorOutcome::Complete as i32,
+            p::ErrorOutcome::NoEffect as i32,
+            p::ErrorOutcome::Partial as i32,
+            p::ErrorOutcome::Unknown as i32,
+            p::ErrorOutcome::Unspecified as i32,
+            i32::MAX,
+        ] {
+            let mut st = State::default();
+            st.devices.push(p::Device {
+                blocked: true,
+                inactive: Some(p::InactiveReason::Blocked as i32),
+                state: p::DeviceState::Disconnected as i32,
+                ..device(1)
+            });
+            let (request, response) = answered(
+                Command::SetDevice(p::SetDevice {
+                    device: 1,
+                    blocked: Some(false),
+                    ..Default::default()
+                }),
+                response::Result::Error(p::Error {
+                    code: p::ErrorCode::StorageFailed as i32,
+                    reason: p::ErrorReason::Radio as i32,
+                    outcome,
+                    ..Default::default()
+                }),
+            );
+            st.response(&request, &response);
+            let d = st.device(1).unwrap();
+            assert_eq!(d.blocked, outcome != p::ErrorOutcome::Complete as i32);
+            assert_eq!(d.inactive(), p::InactiveReason::Blocked);
+            assert_eq!(d.state(), p::DeviceState::Disconnected);
+        }
+    }
+
+    #[test]
     fn accepted_set_requests_take_the_values_sent() {
         let mut st = State::default();
         st.status.transports = vec![p::TransportSupport {
@@ -745,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn an_accepted_disable_or_block_leaves_the_inactive_reason() {
+    fn saved_preferences_wait_for_a_device_record_to_change_the_inactive_reason() {
         let mut st = State::default();
         st.devices.push(p::Device {
             id: 1,
@@ -762,13 +802,13 @@ mod tests {
             enabled: Some(false),
             ..Default::default()
         };
-        assert_eq!(set(&mut st, disabled), Some(p::InactiveReason::Disabled));
+        assert_eq!(set(&mut st, disabled), None);
         let blocked = p::SetDevice {
             device: 1,
             blocked: Some(true),
             ..Default::default()
         };
-        assert_eq!(set(&mut st, blocked), Some(p::InactiveReason::Blocked));
+        assert_eq!(set(&mut st, blocked), None);
         let unblocked = p::SetDevice {
             device: 1,
             blocked: Some(false),

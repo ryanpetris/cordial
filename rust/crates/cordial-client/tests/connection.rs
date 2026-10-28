@@ -411,12 +411,12 @@ fn responses_match_requests_in_order_with_events_between() {
         [2, 3]
     );
     connection.stop_scan().unwrap();
-    let event = events.recv_timeout(Duration::from_secs(1)).unwrap();
+    let event = protocol_event(events.recv_timeout(Duration::from_secs(1)).unwrap());
     assert_eq!(
         event.kind,
         Some(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 1 }))
     );
-    let event = events.recv_timeout(Duration::from_secs(1)).unwrap();
+    let event = protocol_event(events.recv_timeout(Duration::from_secs(1)).unwrap());
     assert_eq!(event.kind, Some(p::event::Kind::Device(device(2))));
     assert!(events.try_recv().is_err());
 }
@@ -477,7 +477,7 @@ fn status_and_device_events_preserve_scoped_errors_and_resources() {
     assert_eq!(connection.status().unwrap(), adapter);
     assert_eq!(connection.get_device(2).unwrap(), saved_device);
     assert_eq!(
-        events.recv_timeout(Duration::from_secs(1)).unwrap().kind,
+        protocol_event(events.recv_timeout(Duration::from_secs(1)).unwrap()).kind,
         Some(p::event::Kind::Device(saved_device))
     );
 }
@@ -901,7 +901,7 @@ fn typed_settings_keep_metadata_partial_updates_and_whole_events() {
     assert_eq!(connection.all_settings(1).unwrap(), expected);
     connection.set_settings(1, vec![change]).unwrap();
     assert_eq!(
-        events.recv_timeout(Duration::from_secs(1)).unwrap().kind,
+        protocol_event(events.recv_timeout(Duration::from_secs(1)).unwrap()).kind,
         Some(p::event::Kind::SettingsChanged(event))
     );
 }
@@ -1088,6 +1088,7 @@ fn a_handler_sees_events_and_responses_in_stream_order() {
             Received::Event(e) => format!("event {:?}", e.kind.map(|k| k.as_name())),
             Received::Response(_, r) => format!("response {}", r.result.is_some()),
             Received::Closed(e) => format!("closed {e}"),
+            Received::PairingComplete { .. } => "paired".into(),
         });
     });
     connection.status().unwrap();
@@ -1532,22 +1533,27 @@ fn concurrent_first_mutation_and_probe_share_one_hello_without_observing_it() {
     let hello = probe.recv_timeout(TEST_DEADLINE).unwrap().unwrap();
     assert!(hello.hello.serial_number.is_none());
     assert_eq!(seen.load(Ordering::Relaxed), 0);
-    assert!(matches!(
-        p::Request::decode(next_frame(&mut requests).as_slice())
-            .unwrap()
-            .command,
-        Some(Command::SetAdapter(_))
-    ));
     let mut out = Out(adapter);
-    out.respond(None);
-    mutate.recv_timeout(TEST_DEADLINE).unwrap().unwrap();
-    assert!(matches!(
-        p::Request::decode(next_frame(&mut requests).as_slice())
+    let mut mutations = 0;
+    let mut reads = 0;
+    for _ in 0..2 {
+        match p::Request::decode(next_frame(&mut requests).as_slice())
             .unwrap()
-            .command,
-        Some(Command::GetStatus(_))
-    ));
-    out.respond(Some(response::Result::Status(status_for_identity())));
+            .command
+        {
+            Some(Command::SetAdapter(_)) => {
+                mutations += 1;
+                out.respond(None);
+            }
+            Some(Command::GetStatus(_)) => {
+                reads += 1;
+                out.respond(Some(response::Result::Status(status_for_identity())));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+    assert_eq!((mutations, reads), (1, 1));
+    mutate.recv_timeout(TEST_DEADLINE).unwrap().unwrap();
     assert_eq!(
         status.recv_timeout(TEST_DEADLINE).unwrap().unwrap().id,
         "status-identity"
@@ -1795,9 +1801,457 @@ fn session_ending_waits_for_its_delimiter_and_does_not_answer_a_pending_write() 
     assert!(events.try_recv().is_err());
     release.send(()).unwrap();
     assert_eq!(
-        events.recv_timeout(TEST_DEADLINE).unwrap().kind,
+        protocol_event(events.recv_timeout(TEST_DEADLINE).unwrap()).kind,
         Some(ending)
     );
     assert!(result.recv_timeout(TEST_DEADLINE).unwrap().is_err());
     connection.close();
+}
+
+#[test]
+fn request_deadline_expires_while_events_keep_arriving() {
+    let (started, requests) = mpsc::channel();
+    let (reader, writer, _, mut out) = dongle(
+        |_| {},
+        move |_, _| {
+            started.send(()).unwrap();
+        },
+    );
+    let (connection, events) = Connection::new(reader, writer);
+    let connection = Arc::new(connection);
+    connection.set_timeout(None);
+    connection.set_deadline(Some(Instant::now() + Duration::from_millis(200)));
+    let pending = connection.clone();
+    let result = background(move || pending.status());
+    requests.recv_timeout(TEST_DEADLINE).unwrap();
+    let cutoff = Instant::now() + Duration::from_secs(1);
+    let error = loop {
+        if let Ok(result) = result.try_recv() {
+            break result.unwrap_err();
+        }
+        if connection.closed().is_none() {
+            // The sender may outlive the reader at the deadline.
+            let bytes = framed(message::Kind::Event(p::Event {
+                kind: Some(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 1 })),
+            }));
+            let _ = out.0.write_all(&bytes);
+        }
+        let _ = events.recv_timeout(Duration::from_millis(10));
+        assert!(
+            Instant::now() < cutoff,
+            "incoming events extended the deadline"
+        );
+    };
+    assert!(matches!(error, Error::Timeout));
+    assert!(matches!(connection.closed(), Some(Error::Timeout)));
+    connection.close_and_wait_release();
+}
+
+#[test]
+fn request_deadline_also_bounds_negotiation() {
+    let (_adapter, reader) = pipe();
+    let (writer, _requests) = pipe();
+    let (connection, _) = Connection::new(reader, writer);
+    connection.set_timeout(None);
+    connection.set_deadline(Some(Instant::now() + Duration::from_millis(100)));
+    let started = Instant::now();
+    assert!(matches!(connection.status(), Err(Error::Handshake(error))
+        if matches!(*error, Error::Timeout)));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    connection.close_and_wait_release();
+}
+
+#[test]
+fn an_expired_deadline_never_sends_a_write_and_can_be_cleared_before_expiry() {
+    let (reader, writer, received, _out) = dongle(
+        |_| {},
+        |_, out| {
+            out.respond(Some(response::Result::Status(status("Desk"))));
+        },
+    );
+    let (connection, _) = Connection::new(reader, writer);
+    connection.set_deadline(Some(Instant::now() + Duration::from_secs(10)));
+    connection.status().unwrap();
+    connection.set_deadline(None);
+    connection.status().unwrap();
+    let sent = received.lock().unwrap().len();
+    connection.set_deadline(Some(Instant::now()));
+    assert!(
+        matches!(connection.delete_profile(1), Err(Error::NotSent(error))
+        if matches!(*error, Error::Timeout))
+    );
+    connection.close_and_wait_release();
+    assert_eq!(received.lock().unwrap().len(), sent);
+}
+
+fn protocol_event(event: cordial_client::Event) -> p::Event {
+    match event {
+        cordial_client::Event::Protocol(event) => event,
+        cordial_client::Event::PairingComplete { .. } => panic!("expected a protocol event"),
+    }
+}
+
+fn complete_error() -> p::Error {
+    p::Error {
+        code: p::ErrorCode::StorageFailed as i32,
+        reason: p::ErrorReason::Radio as i32,
+        outcome: p::ErrorOutcome::Complete as i32,
+        related: vec![p::Error {
+            code: p::ErrorCode::StorageFailed as i32,
+            reason: p::ErrorReason::Storage as i32,
+            outcome: p::ErrorOutcome::NoEffect as i32,
+            related: Vec::new(),
+        }],
+    }
+}
+
+#[test]
+fn completed_commands_reach_observers_as_success_only_in_production() {
+    let (reader, writer, _, _) = dongle(
+        |_| {},
+        |_, out| {
+            out.respond(Some(response::Result::Error(complete_error())));
+        },
+    );
+    let (tx, seen) = mpsc::channel();
+    let connection = Connection::with_handler(reader, writer, move |received| {
+        if let Received::Response(_, response) = received {
+            tx.send(response.clone()).unwrap();
+        }
+    });
+    let (tx, observed) = mpsc::channel();
+    let response = connection
+        .request_with(
+            Command::SetDevice(p::SetDevice {
+                device: 1,
+                blocked: Some(false),
+                ..Default::default()
+            }),
+            move |response| tx.send(response.clone()).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(seen.recv_timeout(TEST_DEADLINE).unwrap(), response);
+    assert_eq!(observed.recv_timeout(TEST_DEADLINE).unwrap(), response);
+    assert_eq!(
+        response.result,
+        cfg!(debug_assertions).then(|| response::Result::Error(complete_error()))
+    );
+    let result = connection.set_settings(1, Vec::new());
+    if cfg!(debug_assertions) {
+        assert!(matches!(result, Err(Error::Dongle(e)) if e == complete_error()));
+    } else {
+        result.unwrap();
+    }
+}
+
+#[test]
+fn stalled_diagnostics_do_not_hold_completed_commands_or_shutdown() {
+    let (reader, writer, _, _) = dongle(
+        |_| {},
+        |_, out| out.respond(Some(response::Result::Error(complete_error()))),
+    );
+    let (connection, _) = Connection::new(reader, writer);
+    connection.set_timeout(Some(Duration::from_millis(200)));
+    let stderr = io::stderr();
+    let held = stderr.lock();
+    let (finished, result) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let mut correct = true;
+        for _ in 0..64 {
+            let result = connection.set_settings(1, Vec::new());
+            correct &= if cfg!(debug_assertions) {
+                matches!(result, Err(Error::Dongle(e)) if e == complete_error())
+            } else {
+                result.is_ok()
+            };
+            if !correct {
+                break;
+            }
+        }
+        let released = connection.close_and_wait_release();
+        finished.send((correct, released)).unwrap();
+    });
+    let received = result.recv_timeout(Duration::from_secs(2));
+    drop(held);
+    worker.join().unwrap();
+    assert_eq!(received.unwrap(), (true, true));
+}
+
+#[test]
+fn completed_reads_cannot_supply_missing_records_or_ids() {
+    let (reader, writer, _, _) =
+        dongle(
+            |_| {},
+            |command, out| {
+                out.respond(Some(match command {
+                    Command::ListDevices(_) => response::Result::Devices(devices(vec![
+                        p::device_list_entry::Entry::Error(p::RecordError {
+                            id: 1,
+                            error: Some(complete_error()),
+                        }),
+                    ])),
+                    _ => response::Result::Error(complete_error()),
+                }));
+            },
+        );
+    let (connection, _) = Connection::new(reader, writer);
+    for result in [
+        connection.status().map(drop),
+        connection.create_profile("New").map(drop),
+        connection.connect_device(1).map(drop),
+    ] {
+        if cfg!(debug_assertions) {
+            assert!(matches!(result, Err(Error::Dongle(e)) if e == complete_error()));
+        } else {
+            assert!(matches!(result, Err(Error::UnexpectedResponse)));
+        }
+    }
+    let list = connection.list_devices();
+    if cfg!(debug_assertions) {
+        assert!(list.is_ok());
+    } else {
+        assert!(matches!(list, Err(Error::UnexpectedResponse)));
+    }
+}
+
+#[test]
+fn embedded_completed_errors_respect_their_own_operation_scope() {
+    fn disconnected() -> p::Device {
+        p::Device {
+            id: 1,
+            state: p::DeviceState::Disconnected as i32,
+            inactive: Some(p::InactiveReason::Blocked as i32),
+            errors: vec![complete_error()],
+            integrations: vec![p::Integration {
+                status: Some(p::integration::Status::Error(complete_error())),
+                ..Default::default()
+            }],
+            outputs: vec![p::OutputStatus {
+                status: Some(p::output_status::Status::Error(complete_error())),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+    let retained = [
+        p::ErrorOutcome::Unknown as i32,
+        p::ErrorOutcome::Partial as i32,
+        p::ErrorOutcome::NoEffect as i32,
+        p::ErrorOutcome::Unspecified as i32,
+        i32::MAX,
+    ]
+    .map(|outcome| p::Error {
+        outcome,
+        related: vec![complete_error()],
+        ..Default::default()
+    });
+    let expected = retained.clone();
+    let (reader, writer, _, _) = dongle(
+        |_| {},
+        move |command, out| match command {
+            Command::GetDevice(_) => out.respond(Some(response::Result::Device(disconnected()))),
+            Command::GetStatus(_) => out.respond(Some(response::Result::Status(p::Status {
+                errors: std::iter::once(complete_error())
+                    .chain(retained.clone())
+                    .collect(),
+                ..Default::default()
+            }))),
+            Command::ListSettings(_) => {
+                let objects = vec![p::SettingsObject {
+                    integration: p::IntegrationKind::Hidpp as i32,
+                    group: Some(p::settings_object::Group::PointerSensor(
+                        p::PointerSensorSettings {
+                            index: 0,
+                            dpi: Some(p::IntegerSetting {
+                                value: Some(800),
+                                saved: Some(1200),
+                                status: Some(p::SettingStatus {
+                                    result: Some(
+                                        p::setting_status::Result::Error(complete_error()),
+                                    ),
+                                }),
+                                ..Default::default()
+                            }),
+                        },
+                    )),
+                }];
+                out.respond(Some(response::Result::Settings(p::DeviceSettings {
+                    device: 1,
+                    objects: objects.clone(),
+                })));
+                out.event(p::event::Kind::SettingsChanged(p::SettingsChanged {
+                    device: 1,
+                    changed: objects,
+                    removed: Vec::new(),
+                }));
+                out.event(p::event::Kind::ScanDone(p::ScanDone {
+                    count: 3,
+                    error: Some(complete_error()),
+                }));
+                out.event(p::event::Kind::Device(disconnected()));
+            }
+            _ => unreachable!(),
+        },
+    );
+    let (connection, events) = Connection::new(reader, writer);
+    let status = connection.status().unwrap();
+    let expected = if cfg!(debug_assertions) {
+        std::iter::once(complete_error())
+            .chain(expected)
+            .collect::<Vec<_>>()
+    } else {
+        expected
+            .into_iter()
+            .map(|mut e| {
+                e.related.clear();
+                e
+            })
+            .collect()
+    };
+    assert_eq!(status.errors, expected);
+    let device = connection.get_device(1).unwrap();
+    assert_eq!(
+        device.integrations[0].status,
+        cfg!(debug_assertions).then(|| p::integration::Status::Error(complete_error()))
+    );
+    assert_eq!(
+        device.outputs[0].status,
+        cfg!(debug_assertions).then(|| p::output_status::Status::Error(complete_error()))
+    );
+    assert_eq!(device.outputs[0].slot, None);
+    let objects = connection.list_settings(1).unwrap().objects;
+    let Some(p::settings_object::Group::PointerSensor(sensor)) = &objects[0].group else {
+        panic!("expected sensor")
+    };
+    let dpi = sensor.dpi.as_ref().unwrap();
+    assert_eq!(dpi.saved, Some(1200));
+    assert_eq!(
+        dpi.value,
+        Some(800),
+        "normalization never invents a reading"
+    );
+    assert_eq!(
+        dpi.status.as_ref().unwrap().result,
+        Some(if cfg!(debug_assertions) {
+            p::setting_status::Result::Error(complete_error())
+        } else {
+            p::setting_status::Result::State(p::SettingState::Applied as i32)
+        })
+    );
+    let event = protocol_event(events.recv_timeout(TEST_DEADLINE).unwrap());
+    assert!(matches!(event.kind, Some(p::event::Kind::SettingsChanged(s)) if s.changed == objects));
+    let event = protocol_event(events.recv_timeout(TEST_DEADLINE).unwrap());
+    assert!(
+        matches!(event.kind, Some(p::event::Kind::ScanDone(s)) if s.count == 3 && s.error == cfg!(debug_assertions).then(complete_error))
+    );
+    let event = protocol_event(events.recv_timeout(TEST_DEADLINE).unwrap());
+    let Some(p::event::Kind::Device(d)) = event.kind else {
+        panic!("expected device")
+    };
+    assert_eq!(d, device);
+    assert_eq!(d.state(), p::DeviceState::Disconnected);
+    assert_eq!(d.inactive(), p::InactiveReason::Blocked);
+    assert_eq!(
+        d.errors,
+        if cfg!(debug_assertions) {
+            vec![complete_error()]
+        } else {
+            Vec::new()
+        }
+    );
+}
+
+#[test]
+fn completed_pairing_has_a_host_success_without_a_device_id() {
+    let (reader, writer, _, _) = dongle(
+        |_| {},
+        |_, out| {
+            out.respond(None);
+            out.event(p::event::Kind::Pairing(p::Pairing {
+                candidate: 7,
+                step: Some(p::pairing::Step::Error(complete_error())),
+            }));
+        },
+    );
+    let (connection, events) = Connection::new(reader, writer);
+    connection.start_pairing(7).unwrap();
+    let event = events.recv_timeout(TEST_DEADLINE).unwrap();
+    assert_eq!(
+        event,
+        if cfg!(debug_assertions) {
+            cordial_client::Event::Protocol(p::Event {
+                kind: Some(p::event::Kind::Pairing(p::Pairing {
+                    candidate: 7,
+                    step: Some(p::pairing::Step::Error(complete_error())),
+                })),
+            })
+        } else {
+            cordial_client::Event::PairingComplete { candidate: 7 }
+        }
+    );
+}
+
+#[test]
+fn a_full_stderr_pipe_cannot_hold_commands_or_process_shutdown() {
+    const CHILD: &str = "CORDIAL_BLOCKED_DIAGNOSTICS_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let (reader, writer, _, _) = dongle(
+            |_| {},
+            |_, out| out.respond(Some(response::Result::Error(complete_error()))),
+        );
+        let (connection, _) = Connection::new(reader, writer);
+        for _ in 0..2048 {
+            let result = connection.set_settings(1, Vec::new());
+            if cfg!(debug_assertions) {
+                assert!(matches!(result, Err(Error::Dongle(_))));
+            } else {
+                result.unwrap();
+            }
+        }
+        assert!(connection.close_and_wait_release());
+        let start = Instant::now();
+        let flushed = cordial_client::diagnostics::flush();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(flushed, cfg!(debug_assertions));
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_full_stderr_pipe_cannot_hold_commands_or_process_shutdown",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let end = Instant::now() + TEST_DEADLINE;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= end {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    // Drain only after the child exits. Its diagnostic worker encounters a full OS pipe.
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "{status:?}: {stderr}"
+    );
+    assert_eq!(
+        stderr.contains("Completed adapter operation"),
+        !cfg!(debug_assertions)
+    );
 }

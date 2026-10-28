@@ -38,16 +38,21 @@ pub use term::Tui;
 pub struct UiOptions {
     /// An explicit serial port, opened instead of choosing an adapter.
     pub port: Option<String>,
+    /// Logs complete protocol responses and events to stderr.
+    pub json: bool,
 }
 
 #[derive(Debug)]
 pub enum UiError {
     Terminal(std::io::Error),
+    /// The error has already been sent through the bounded stderr writer.
+    Reported(Box<UiError>),
 }
 impl fmt::Display for UiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             UiError::Terminal(e) => write!(f, "terminal: {e}"),
+            UiError::Reported(error) => error.fmt(f),
         }
     }
 }
@@ -56,6 +61,15 @@ impl From<std::io::Error> for UiError {
     fn from(e: std::io::Error) -> Self {
         UiError::Terminal(e)
     }
+}
+
+fn finish_output(output: crate::json::Output, result: Result<(), UiError>) -> Result<(), UiError> {
+    use std::io::Write;
+    if let Err(error) = &result {
+        let _ = writeln!(output.diagnostics(), "{}", text::safe(&error.to_string()));
+    }
+    output.finish();
+    result.map_err(|error| UiError::Reported(Box::new(error)))
 }
 
 /// Everything an interface reacts to, delivered on one channel.
@@ -116,10 +130,12 @@ pub(crate) struct Live {
 pub(crate) struct Migrator {
     tx: SyncSender<Msg>,
     worker: RefCell<Option<Worker>>,
+    engine: migration::Engine,
 }
 impl Migrator {
-    pub(crate) fn new(tx: SyncSender<Msg>) -> Self {
+    pub(crate) fn new(tx: SyncSender<Msg>, engine: migration::Engine) -> Self {
         Self {
+            engine,
             tx,
             worker: RefCell::new(None),
         }
@@ -129,7 +145,7 @@ impl Migrator {
         let (events, done) = (self.tx.clone(), self.tx.clone());
         let port = (!port.is_empty()).then_some(port);
         let worker = Worker::start(
-            &migration::live(),
+            &self.engine,
             id,
             port,
             move |e| {
@@ -149,17 +165,38 @@ impl Migrator {
     }
 }
 impl Live {
-    pub(crate) fn new(tx: SyncSender<Msg>) -> Self {
+    pub(crate) fn new(
+        tx: SyncSender<Msg>,
+        observer: Option<crate::json::Observer>,
+        explicit: bool,
+    ) -> Self {
+        let connector: Arc<crate::controller::Connector> =
+            Arc::new(|port, handler| serial::open_with_handler(port, handler));
+        let connector = match observer {
+            Some(observer) => crate::json::observe(connector, observer),
+            None => connector,
+        };
+        let engine = migration::with_backend(connector.clone(), serial::ports);
         let sink = tx.clone();
         // The channel is bounded: while the interface stops consuming, the
         // controller's threads wait here and the session's own bounded queue
         // applies its loss policy instead of this process accumulating events.
-        let controller = Controller::new(move |e| {
-            let _ = sink.send(Msg::Controller(Box::new(e)));
-        });
+        let controller = Controller::with_backend(
+            move |e| {
+                let _ = sink.send(Msg::Controller(Box::new(e)));
+            },
+            move |port, handler| connector(port, handler),
+            move || {
+                if explicit {
+                    Ok(Vec::new())
+                } else {
+                    serial::ports()
+                }
+            },
+        );
         Self {
             controller,
-            worker: Migrator::new(tx.clone()),
+            worker: Migrator::new(tx.clone(), engine),
             tx,
         }
     }

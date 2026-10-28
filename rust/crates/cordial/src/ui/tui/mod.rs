@@ -2,7 +2,6 @@
 mod adapter;
 mod add;
 mod device;
-mod files;
 mod keys;
 pub(crate) mod layout;
 mod profiles;
@@ -42,8 +41,6 @@ pub struct Menu {
 pub(crate) struct Model<F: Fleet> {
     app: App<F>,
     form: Field,
-    files_dest: Field,
-    files_editing: bool,
     menu: Option<Menu>,
     pub(crate) width: usize,
     pub(crate) height: usize,
@@ -79,8 +76,6 @@ impl<F: Fleet> Model<F> {
         Self {
             app: App::new(fleet),
             form: Field::new(64),
-            files_dest: Field::default(),
-            files_editing: false,
             menu: None,
             width: 100,
             height: 30,
@@ -123,7 +118,6 @@ pub(super) fn spinner() -> char {
 impl<F: Fleet> Model<F> {
     fn send_form(&mut self) {
         self.app.form.set_value(&self.form.value());
-        self.app.files.dest.set_value(&self.files_dest.value());
         self.app.menu = self.menu.as_ref().map(|m| app::Menu {
             items: m.items.clone(),
         });
@@ -133,9 +127,6 @@ impl<F: Fleet> Model<F> {
         self.form.limit = self.app.form.limit;
         if reset_cursor || self.form.value() != self.app.form.value() {
             self.form.set_value(self.app.form.as_str());
-        }
-        if self.files_dest.value() != self.app.files.dest.value() {
-            self.files_dest.set_value(self.app.files.dest.as_str());
         }
         match &self.app.menu {
             None => self.menu = None,
@@ -156,7 +147,6 @@ impl<F: Fleet> Model<F> {
             Page,
             Tab,
             Option<Dialog>,
-            String,
             String,
             Option<crate::settings::Field>,
         ),
@@ -183,20 +173,17 @@ impl<F: Fleet> Model<F> {
         if (before.0, before.1) != (self.page.clone(), self.tab) {
             self.main_scroll = 0;
         }
-        if dialog_changed || before.3 != self.files.path {
+        if dialog_changed {
             self.dialog_scroll = 0;
         }
-        if dialog_changed || before.4 != self.prompt_key() {
+        if dialog_changed || before.3 != self.prompt_key() {
             self.form_focused = matches!(
                 self.dialog,
                 Some(Dialog::Rename(_) | Dialog::ProfileName(..))
             ) || self.pairing_code_input();
         }
-        if self.dialog.is_none() || self.files.busy() {
-            self.files_editing = false;
-        }
         self.receive_form(
-            dialog_changed || before.4 != self.prompt_key() || before.5 != self.editing,
+            dialog_changed || before.3 != self.prompt_key() || before.4 != self.editing,
         );
     }
 
@@ -207,14 +194,12 @@ impl<F: Fleet> Model<F> {
         Tab,
         Option<Dialog>,
         String,
-        String,
         Option<crate::settings::Field>,
     ) {
         (
             self.page.clone(),
             self.tab,
             self.dialog.clone(),
-            self.files.path.clone(),
             self.prompt_key(),
             self.editing,
         )
@@ -248,15 +233,8 @@ impl<F: Fleet> Model<F> {
         if matches!(action, Action::Tab(_)) {
             self.main_scroll = 0;
         }
-        if action == Action::FilesRefresh && self.files_adapter().is_some() {
-            self.dialog_scroll = 0;
-        }
         if action == Action::Field {
             self.form_focused = true;
-            self.focus = None;
-        }
-        if action == Action::FilesDest && !self.files.busy() {
-            self.files_editing = true;
             self.focus = None;
         }
         self.send_form();
@@ -335,10 +313,7 @@ impl<F: Fleet> Model<F> {
     }
 
     fn paste(&mut self, text: &str) {
-        if self.files_editing {
-            self.files.dest_err.clear();
-            self.files_dest.insert(text);
-        } else if self.form_focused || self.editing.is_some() {
+        if self.form_focused || self.editing.is_some() {
             if matches!(self.dialog, Some(Dialog::AddDevice)) {
                 self.add_form_changed();
             }

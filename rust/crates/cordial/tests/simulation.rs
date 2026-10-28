@@ -151,6 +151,129 @@ fn desktop_factory_routes_independent_adapters_and_closes_their_sessions() {
 }
 
 #[test]
+fn seeded_profile_deletion_reconnects_after_an_active_interface_change() {
+    for interface in [
+        p::ConfigurationInterface::Via,
+        p::ConfigurationInterface::Vial,
+    ] {
+        let world = Desktop::new(1);
+        let adapter = &world.adapters()[0];
+        {
+            let mut sim = adapter.0.lock().unwrap();
+            let assigned = sim
+                .status
+                .configuration_interfaces
+                .iter_mut()
+                .find(|s| s.interface == interface as i32)
+                .unwrap();
+            assigned.enabled = true;
+            assigned.active = true;
+            assigned.profile = 1;
+        }
+        let ports = world.ports();
+        let (sink, rx) = messages();
+        let live = world.live(sink);
+        let slot = live.open_adapter(&ports[0].port, &ports[0].serial);
+        ready(&rx, slot);
+        run(&live, &rx, slot, Command::Profiles);
+        let plan = cordial::profiles::Deletion::of(&live.state(slot).unwrap(), 1);
+        let before = adapter.sent().len();
+        let ticket = live.run(slot, Command::ProfileDeletePlanned(plan));
+        let mut announced = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let message = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("profile deletion completes after the simulated restart");
+            let Msg::Fleet(s, event) = message else {
+                continue;
+            };
+            if s != slot {
+                continue;
+            }
+            match *event {
+                Event::Notice {
+                    notice:
+                        cordial::controller::Notice::Event {
+                            event:
+                                p::Event {
+                                    kind: Some(p::event::Kind::SessionEnding(ending)),
+                                },
+                            ..
+                        },
+                    ..
+                } => {
+                    assert_eq!(ending.reason(), p::SessionEndingReason::ConfigurationChange);
+                    announced = true;
+                }
+                Event::Done {
+                    ticket: t, result, ..
+                } if t == ticket => {
+                    assert!(
+                        matches!(result, Ok(cordial::controller::Outcome::ProfileDeleted(p)) if p.id == 1),
+                        "profile deletion succeeds after reconnect"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(announced);
+        assert_eq!(adapter.sessions(), 2);
+        assert_eq!(world.ports(), ports);
+        assert_eq!(
+            &adapter.sent()[before..],
+            [
+                "set_device",
+                "set_adapter",
+                "get_status",
+                "get_status",
+                "list_devices",
+                "delete_profile"
+            ]
+        );
+        run(&live, &rx, slot, Command::Status);
+        run(&live, &rx, slot, Command::Profiles);
+        let state = live.state(slot).unwrap();
+        assert!(state.ready());
+        assert_eq!(state.status.id, ports[0].serial);
+        assert!(state.profile(1).is_none());
+        let assigned = cordial::profiles::interface(&state.status, interface).unwrap();
+        assert!(!assigned.enabled && !assigned.active && assigned.profile == 0);
+        live.close(slot);
+        until(
+            &rx,
+            |m| matches!(m, Msg::Fleet(s, e) if *s == slot && matches!(**e, Event::Closed)),
+        );
+        assert_eq!(adapter.handles(), 0);
+    }
+}
+
+#[test]
+fn seeded_devices_include_connected_ones_with_and_without_a_battery() {
+    let world = Desktop::new(1);
+    let (sink, rx) = messages();
+    let live = world.live(sink);
+    let slot = live.open(&world.ports()[0].port);
+    ready(&rx, slot);
+    let state = live.state(slot).unwrap();
+    let seen = |name: &str| {
+        let d = state.devices.iter().find(|d| d.name == name).unwrap();
+        (
+            d.state == DeviceState::Connected as i32,
+            d.information
+                .as_ref()
+                .and_then(|i| i.battery.as_ref())
+                .map(|b| b.level),
+        )
+    };
+    assert_eq!(seen("Example Mouse"), (true, Some(Some(72))));
+    assert_eq!(seen("Example Keys Wireless"), (true, Some(Some(54))));
+    assert_eq!(seen("Example Controller"), (true, None));
+    assert_eq!(seen("Travel Keyboard"), (false, None));
+}
+
+#[test]
 fn seeded_settings_save_bool_integer_and_choice_values_over_the_protocol() {
     let world = Desktop::new(1);
     let (sink, rx) = messages();

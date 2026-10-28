@@ -753,8 +753,6 @@ impl<F: Fleet> Model<F> {
             } => self.pick_dialog(adapter, *purpose, *chosen, w),
             Dialog::AddDevice => self.add_dialog(w),
             Dialog::Bootloader(_) => self.bootloader_dialog(w),
-            Dialog::Files(id) => self.files_dialog(id, (self.width.saturating_sub(8)).min(90)),
-            Dialog::Replace(_, target) => self.replace_dialog(target, w),
         })
     }
 

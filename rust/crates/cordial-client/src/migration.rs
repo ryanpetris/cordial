@@ -6,9 +6,9 @@ pub(crate) mod wire;
 mod worker;
 
 pub use graph::{Change, Checkpoint, Edge, Format, Graph, Snapshot, Transformation};
-#[cfg(feature = "serialport")]
-pub use worker::migrate;
 pub use worker::{AdapterPort, Discovery, Transport, migrate_with};
+#[cfg(feature = "serialport")]
+pub use worker::{migrate, migrate_with_backend};
 
 use cordial_protocol as p;
 use std::fmt;

@@ -2,7 +2,7 @@
 //! immutable requests; uncertain requests remain visible but are excluded from later writes.
 use super::{
     AdapterView, App, DeviceView, Fleet, Job, Kind, Slot, Spot, Tab,
-    device::{save_spot, tab_changes},
+    device::{device_pending, save_spot, tab_changes},
     settings::Draft,
     words,
 };
@@ -27,6 +27,7 @@ struct WriteFailure {
     spot: Spot,
     intents: Intents,
     text: String,
+    complete: Option<cordial_protocol::Error>,
 }
 
 #[derive(Default)]
@@ -35,7 +36,7 @@ pub(crate) struct Immediate {
     uncertain_notes: HashMap<Spot, String>,
     /// The session whose failed writes need a fresh connection's readback.
     sessions: HashMap<String, Slot>,
-    /// Unresolved fields retain their failure even if their page is no longer shown.
+    /// Action failures remain visible even if their page is no longer shown.
     errors: Vec<WriteFailure>,
 }
 
@@ -304,8 +305,26 @@ impl<F: Fleet> App<F> {
         }
     }
 
+    /// Whether a new write on the adapter waits: one is running, or a profile change is, such
+    /// as a deletion whose device and interface changes a write could overlap.
     pub(crate) fn immediate_busy(&self, adapter: &str) -> bool {
-        self.immediate.is_some() && self.running(adapter, is_write)
+        self.immediate.is_some()
+            && self.running(adapter, |k| is_write(k) || matches!(k, Kind::Profile))
+    }
+
+    /// Whether a write on the adapter is running, or, with immediate writes, accepted and not yet
+    /// sent. Failed and uncertain writes aren't waiting.
+    pub(crate) fn writes_waiting(&self, adapter: &str) -> bool {
+        if self.running(adapter, is_write) {
+            return true;
+        }
+        if self.immediate.is_none() {
+            return false;
+        }
+        let pending = self.pending_intents();
+        pending.adapters.contains_key(adapter)
+            || pending.devices.keys().any(|(a, _)| a == adapter)
+            || pending.settings.keys().any(|(a, _)| a == adapter)
     }
 
     fn intents(&self) -> Intents {
@@ -337,13 +356,19 @@ impl<F: Fleet> App<F> {
 
     /// The latest unresolved settings failure, including one whose session or page has disappeared.
     pub fn write_error(&self) -> Option<&str> {
-        Some(self.immediate.as_ref()?.errors.last()?.text.as_str())
+        self.immediate
+            .as_ref()?
+            .errors
+            .iter()
+            .rev()
+            .find(|e| e.complete.is_none())
+            .map(|e| e.text.as_str())
     }
 
     /// Acknowledges the failure shown by Quit without retrying its request.
     pub fn acknowledge_write_error(&mut self) {
         if let Some(immediate) = &mut self.immediate {
-            immediate.errors.clear();
+            immediate.errors.retain(|e| e.complete.is_some());
         }
     }
 
@@ -358,8 +383,17 @@ impl<F: Fleet> App<F> {
             .errors
             .iter()
             .rev()
-            .find(|e| &e.spot == spot)
+            .find(|e| &e.spot == spot && e.complete.is_none())
             .map(|e| e.text.as_str())
+            .or_else(|| self.notes.get(spot).map(String::as_str))
+            .or_else(|| {
+                immediate
+                    .errors
+                    .iter()
+                    .rev()
+                    .find(|e| &e.spot == spot)
+                    .map(|e| e.text.as_str())
+            })
     }
 
     fn resolve_write_errors(&mut self, touched: &Intents) {
@@ -385,6 +419,7 @@ impl<F: Fleet> App<F> {
             spot,
             intents,
             text,
+            complete: None,
         });
     }
 
@@ -563,13 +598,59 @@ impl<F: Fleet> App<F> {
         if !is_write(&job.kind) {
             return;
         }
-        let sent = Intents::of_job(job);
-        let Err(error) = result else {
+        let mut sent = Intents::of_job(job);
+        let ended = self.session_of(&job.adapter).map(|s| s.slot) != Some(job.slot);
+        if result.is_ok() || result.as_ref().is_err_and(|e| e.complete()) {
+            if ended {
+                // A confirmed write does not accept newer edits rejected when its session ended.
+                let mut later = self.intents();
+                later.subtract(&sent);
+                sent.forget(&later);
+            }
             self.resolve_write_errors(&sent);
             self.immediate.as_mut().unwrap().uncertain.forget(&sent);
             self.prune_uncertain_notes();
+            let mut remaining = self.intents();
+            remaining.subtract(&sent);
+            self.put_intents(remaining);
+            if let Err(error) = result {
+                let text = words::failure(error);
+                self.notes.insert(write_spot(job), text.clone());
+                // A connected record proves an enable or unblock took effect, but says
+                // nothing about radio work for other preferences.
+                let recoverable = !sent.empty()
+                    && matches!(&job.kind, Kind::DeviceSave { sent, .. }
+                    if (sent.enabled == Some(true) || sent.blocked == Some(false))
+                        && sent.enabled != Some(false)
+                        && sent.blocked != Some(true)
+                        && *sent == DeviceUpdate {
+                            enabled: sent.enabled,
+                            blocked: sent.blocked,
+                            ..Default::default()
+                        })
+                    && error.dongle.as_ref().is_some_and(|e| {
+                        e.reason == cordial_protocol::ErrorReason::Radio as i32
+                            && e.related.is_empty()
+                    });
+                if recoverable {
+                    self.immediate.as_mut().unwrap().errors.push(WriteFailure {
+                        spot: write_spot(job),
+                        intents: sent,
+                        text,
+                        complete: error.dongle.clone(),
+                    });
+                    if let Kind::DeviceSave { device, .. } = &job.kind
+                        && let Some(st) = self.state_of(&job.adapter)
+                        && st.device_readbacks.contains(device)
+                        && let Some(device) = st.device(*device).cloned()
+                    {
+                        self.immediate_device_readback(&job.adapter, &device);
+                    }
+                }
+            }
             return;
-        };
+        }
+        let error = result.as_ref().unwrap_err();
         let uncertain = unknown(error);
         let text = if uncertain && error.dongle.is_none() {
             format!(
@@ -582,6 +663,10 @@ impl<F: Fleet> App<F> {
         self.record_write_error(write_spot(job), sent.clone(), text.clone());
         let immediate = self.immediate.as_mut().unwrap();
         if uncertain {
+            if ended {
+                // Keep newer unsent values excluded from replay after the pending write settles.
+                sent.merge(std::mem::take(&mut immediate.uncertain));
+            }
             immediate.uncertain.merge(sent);
             immediate
                 .uncertain_notes
@@ -601,24 +686,62 @@ impl<F: Fleet> App<F> {
         }
     }
 
+    pub(crate) fn immediate_device_readback(
+        &mut self,
+        id: &str,
+        device: &cordial_protocol::Device,
+    ) {
+        let Some(immediate) = &mut self.immediate else {
+            return;
+        };
+        if !crate::model::connected(device)
+            || device.inactive.is_some()
+            || !device.errors.is_empty()
+        {
+            return;
+        }
+        let key = (id.to_owned(), device.id);
+        immediate.errors.retain(|e| {
+            let recovered = e.complete.as_ref().is_some_and(|error| {
+                error.reason == cordial_protocol::ErrorReason::Radio as i32
+                    && error.related.is_empty()
+            }) && e
+                .intents
+                .devices
+                .get(&key)
+                .is_some_and(|sent| device_pending(sent, device).is_empty());
+            if recovered && self.notes.get(&e.spot) == Some(&e.text) {
+                self.notes.remove(&e.spot);
+            }
+            !recovered
+        });
+    }
+
     pub(crate) fn immediate_disconnect(&mut self, id: &str, slot: Slot) {
         if self.immediate.is_none() {
             return;
         }
         let jobs: Vec<_> = self
             .jobs
-            .iter()
-            .filter(|((s, _), j)| *s == slot && is_write(&j.kind))
-            .map(|(key, j)| (*key, j.clone()))
+            .values()
+            .filter(|j| j.slot == slot && is_write(&j.kind))
+            .cloned()
             .collect();
         let mut pending = self.pending_intents();
         pending.adapters.retain(|a, _| a == id);
         pending.devices.retain(|(a, _), _| a == id);
         pending.settings.retain(|(a, _), _| a == id);
+        // Running writes keep their jobs until the controller delivers their actual outcomes.
+        for job in &jobs {
+            pending.subtract(&Intents::of_job(job));
+        }
         if jobs.is_empty() && pending.empty() {
             return;
         }
-        for (adapter, update) in &pending.adapters {
+        let mut rejected = pending.clone();
+        // A known uncertain write still needs reporting when a newer value was never sent.
+        rejected.forget(&self.immediate.as_ref().unwrap().uncertain);
+        for (adapter, update) in &rejected.adapters {
             let mut intents = Intents::default();
             intents.adapters.insert(adapter.clone(), update.clone());
             self.record_write_error(
@@ -627,7 +750,7 @@ impl<F: Fleet> App<F> {
                 words::ADAPTER_GONE.into(),
             );
         }
-        for ((adapter, device), update) in &pending.devices {
+        for ((adapter, device), update) in &rejected.devices {
             for tab in [Tab::Details, Tab::Profiles, Tab::Settings] {
                 let sent = tab_changes(update, tab);
                 if !sent.is_empty() {
@@ -641,7 +764,7 @@ impl<F: Fleet> App<F> {
                 }
             }
         }
-        for ((adapter, device), drafts) in &pending.settings {
+        for ((adapter, device), drafts) in &rejected.settings {
             let mut intents = Intents::default();
             intents
                 .settings
@@ -651,19 +774,6 @@ impl<F: Fleet> App<F> {
                 intents,
                 words::ADAPTER_GONE.into(),
             );
-        }
-        for (key, job) in jobs {
-            self.jobs.remove(&key);
-            let error = Error::new("the connection to the adapter closed");
-            self.immediate_result(&job, &Err(error));
-            if let Kind::SettingsSave { device, .. } = job.kind {
-                let text = self.write_error().unwrap().to_owned();
-                if let Some(submission) = self.submissions.get_mut(&(id.to_owned(), device)) {
-                    submission.running = false;
-                    submission.unknown = true;
-                    submission.error = Some(text);
-                }
-            }
         }
         // No accepted value is replayed after a disconnected session, including follow-up edits.
         let immediate = self.immediate.as_mut().unwrap();

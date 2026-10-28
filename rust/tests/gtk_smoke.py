@@ -78,6 +78,7 @@ class Smoke:
         self.completed = []
         self.stage = "startup"
         self.frame_origins = set()
+        self.pair_geometry = {}
         self.trace = root / "writes.txt"
         self.trace.touch(mode=0o600)
         self.env = dict(os.environ, CORDIAL_DESKTOP_SIMULATE="2", GDK_BACKEND="x11",
@@ -118,10 +119,6 @@ class Smoke:
         self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
             "org.freedesktop.DBus", "UpdateActivationEnvironment",
             GLib.Variant("(a{ss})", (activation,)), None, Gio.DBusCallFlags.NONE, 3000, None)
-        # The chooser's initial download directory stays inside the fixture.
-        self.downloads = root / "downloads"
-        self.downloads.mkdir()
-        (self.config / "user-dirs.dirs").write_text(f'XDG_DOWNLOAD_DIR="{self.downloads}"\n')
 
     def launch(self, hidden=False):
         process = subprocess.Popen([str(self.binary), "desktop"] + (["--hidden"] if hidden else []),
@@ -160,21 +157,15 @@ class Smoke:
             "status": status, "completed": self.completed, "stage": self.stage, "error": error,
         }, indent=2) + "\n")
 
-    def modal(self, exclude=None):
+    def modal(self):
         def current():
             nodes = self.ui.nodes()
-            dialogs = [n for n in nodes if visible(n) and n != exclude
-                       and n.getRoleName() in {"dialog", "alert", "file chooser"}]
+            dialogs = [n for n in nodes if visible(n)
+                       and n.getRoleName() in {"dialog", "alert"}]
             for node in nodes:
                 if node.getState().contains(pyatspi.STATE_FOCUSED):
                     while node is not None:
                         if node in dialogs:
-                            if node.getRoleName() == "file chooser":
-                                parent = node.parent
-                                while parent is not None:
-                                    if parent in dialogs and parent.getRoleName() == "file chooser":
-                                        node = parent
-                                    parent = parent.parent
                             return node
                         node = node.parent
             return dialogs[-1] if dialogs else None
@@ -315,6 +306,23 @@ class Smoke:
     def enabled(self, name, on=True, root=None):
         self.ui.wait(f"{name!r} enabled={on}", lambda:
             self.ui.find(name, BUTTONS, root).getState().contains(pyatspi.STATE_SENSITIVE) == on)
+
+    def available(self, title, on):
+        self.ui.wait(f"{title!r} row available={on}", lambda:
+            self.ui.row(title).getState().contains(pyatspi.STATE_SENSITIVE) == on)
+
+    def search_focus(self, query, title, control):
+        """Chooses the search result for `title` on Smoke Adapter and waits for `control` to
+        take focus."""
+        self.ui.key("Control_L", "f")
+        self.ui.edit("Search", query)
+        results = self.ui.find("Search Results", {"list"})
+        self.ui.click(node=self.ui.wait(f"find search result {title!r}", lambda: next(
+            (n for n in self.ui.matches(title, {"list item"}, results)
+             if n.description == "Smoke Adapter"), None)))
+        row = self.ui.row(control)
+        self.ui.wait(f"focus {control!r} from search", lambda: any(
+            n.getState().contains(pyatspi.STATE_FOCUSED) for n in walk(row)))
 
     def checked(self, name, on, root=None):
         self.ui.wait(f"read {name!r} checked={on}", lambda: any(
@@ -581,6 +589,10 @@ class Smoke:
         self.device_status("Example Mouse", "Connected")
         self.device_menu("Disconnect")
         self.device_status("Example Mouse", "Disconnected")
+        self.ui.wait("keep the disconnected device's battery in navigation", lambda:
+            self.ui.matches("Battery 72%", {"image"},
+                            self.ui.row("Example Mouse", self.navigation())))
+        self.ui.screenshot("sidebar-disconnected-battery")
         self.device_menu("Connect")
         self.device_status("Example Mouse", "Connected")
         for title, initial in (("Use This Device", True), ("Automatic Connections", True),
@@ -664,16 +676,10 @@ class Smoke:
             if control:
                 root = self.ui.row(group).parent if group else None
                 row = (self.ui.find(control, {"list item"})
-                       if subpage == "Profiles" and control not in {"VIA", "Vial"}
+                       if subpage == "Profiles" and not control.endswith(" Profile")
                        else self.ui.row(control, root))
                 self.ui.wait(f"focus the searched {control!r} control", lambda: any(
                     n.getState().contains(pyatspi.STATE_FOCUSED) for n in walk(row)))
-                if control in {"VIA", "Vial"}:
-                    if row.getRoleName() != "combo box":
-                        raise AssertionError(f"The searched {control!r} row is not a combo box")
-                    self.ui.wait(f"focus the {control!r} profile selector without opening it", lambda:
-                        row.getState().contains(pyatspi.STATE_FOCUSED)
-                        and not row.getState().contains(pyatspi.STATE_EXPANDED))
                 self.fit_node(row, width, height)
                 pane = row.parent
                 while pane is not None and pane.getRoleName() != "scroll pane":
@@ -731,7 +737,7 @@ class Smoke:
                "Example Adapter 2", control="Bluetooth LE")
         for title in ("VIA", "Vial"):
             choose(title + " smoke", title, "Smoke Adapter", "Smoke Adapter",
-                   control=title, subpage="Profiles")
+                   control=title + " Profile", subpage="Profiles")
         for query, adapter in (("typing smoke", "Smoke Adapter"),
                                ("typing adapter 2", "Example Adapter 2")):
             choose(query, "Typing", adapter, adapter, control="Typing",
@@ -782,6 +788,14 @@ class Smoke:
         self.ui.retain("cancel search without writing settings", unchanged)
         self.nav("Example Mouse")
         self.ui.resize(480, 720)
+        self.ui.wait("show the narrow content page", lambda:
+            self.page_header("Example Mouse"))
+        self.ui.key("Control_L", "f")
+        self.ui.retain("keep narrow content visible after Ctrl+F", lambda:
+            self.page_header("Example Mouse"))
+        self.ui.click("Back")
+        self.ui.wait("show the narrow sidebar before searching", lambda:
+            self.selected_navigation("Example Mouse"))
         choose("reverse vertical mouse", "Reverse Vertical Scrolling", "Example Mouse",
                "Example Mouse", control="Reverse Vertical Scrolling", width=480, height=720)
         self.ui.dump("search-control-480")
@@ -814,7 +828,8 @@ class Smoke:
     def settings(self):
         self.nav("Example Mouse")
         self.ui.wait("show the connected device's sidebar status", lambda:
-            self.ui.row("Example Mouse", self.navigation()).description == "Connected")
+            self.ui.row("Example Mouse", self.navigation()).description
+            == "Smoke Adapter, Connected, Battery 72%")
         self.device_status("Example Mouse", "Connected")
         self.ui.expect("72%", self.ui.row("Battery"))
         self.fit_capacity("Battery", 980, 680)
@@ -825,6 +840,7 @@ class Smoke:
         self.marker("Pointer Sensitivity", "Saved")
         self.marker("Pointer Sensitivity 2", "Not Saved")
         self.ui.scroll_into_view(self.ui.row("Pointer Sensitivity"))
+        self.ui.expect("DPI", self.ui.row("Pointer Sensitivity"))
         baseline = self.ui.number("Pointer Sensitivity")
         before = len(self.writes(MOUSE_SETTINGS))
         entry = self.ui.control("Pointer Sensitivity", "queryEditableText")
@@ -833,7 +849,7 @@ class Smoke:
         }, indent=2) + "\n")
         self.ui.focus(entry)
         self.ui.key("Control_L", "a")
-        for digit in "12":
+        for digit in "12x":
             self.ui.key(digit)
         self.ui.wait("receive the partial numeric entry", lambda: text(entry) == "12")
         self.ui.retain("retain a paused numeric edit", lambda:
@@ -865,8 +881,10 @@ class Smoke:
         self.ui.wait("commit a pointer sensitivity step", lambda:
             self.ui.number("Pointer Sensitivity") == 1200)
         self.device_menu("Refresh")
-        self.apply(MOUSE_SETTINGS, lambda: self.ui.choose("Pointer Sensitivity 2", "1600"))
-        self.apply(MOUSE_SETTINGS, lambda: self.ui.choose("Wheel Mode", "Free Spin"))
+        self.apply(MOUSE_SETTINGS, lambda: self.ui.choose("Pointer Sensitivity 2", "1600 DPI",
+            choices=("400 DPI", "800 DPI", "1600 DPI")))
+        self.apply(MOUSE_SETTINGS, lambda: self.ui.choose("Wheel Mode", "Free Spin",
+            choices=("Free Spin", "Stepped")))
         self.apply(MOUSE_SETTINGS, lambda: self.ui.switch("Reverse Vertical Scrolling", True))
         self.nav("Example Trackball")
         self.nav("Example Mouse")
@@ -879,7 +897,7 @@ class Smoke:
         self.ui.wait("retain saved numeric setting", lambda:
             self.ui.number("Pointer Sensitivity") == 1200)
         self.ui.expect("Free Spin", self.ui.row("Wheel Mode"))
-        self.ui.expect("1600", self.ui.row("Pointer Sensitivity 2"))
+        self.ui.expect("1600 DPI", self.ui.row("Pointer Sensitivity 2"))
         self.marker("Pointer Sensitivity 2", "Saved")
         self.checked("Reverse Vertical Scrolling", True)
         self.ui.screenshot("device-settings")
@@ -887,7 +905,8 @@ class Smoke:
         self.ui.expect("Smoke Adapter", self.ui.row("Adapter"))
         self.ui.expect("XInput", self.ui.row("Gamepad Output"))
         for mode in ("HID", "Disabled", "XInput"):
-            self.apply(CONTROLLER_SETTINGS, lambda: self.ui.choose("Gamepad Output", mode))
+            self.apply(CONTROLLER_SETTINGS, lambda: self.ui.choose("Gamepad Output", mode,
+                choices=("Disabled", "HID", "XInput")))
             self.nav("Example Mouse")
             self.nav("Example Controller", occurrence=1)
             self.refresh_device()
@@ -919,8 +938,9 @@ class Smoke:
             self.ui.find(name, {"list item"}, root)
 
     def profile_menu(self, name, choice):
-        self.ui.click(name, root=self.profile_page(name))
-        menu = self.ui.find(name, {"menu"})
+        label = name + " Profile Menu"
+        self.ui.click(label, root=self.profile_page(name))
+        menu = self.ui.find(label, {"menu"})
         self.ui.click(node=self.menu_item(menu, choice + ELLIPSIS,
             ("Copy" + ELLIPSIS, "Delete" + ELLIPSIS)))
         self.ui.expect(choice, self.modal())
@@ -941,13 +961,15 @@ class Smoke:
         connection = "Connect" if choice == "Connect" else "Disconnect"
         choices = (("Rename" + ELLIPSIS, connection)
                    if choice in {"Rename" + ELLIPSIS, "Connect", "Disconnect"} else
-                   ("Restart", "Files" + ELLIPSIS, "Enter Bootloader" + ELLIPSIS))
+                   ("Restart", "Enter Bootloader" + ELLIPSIS))
         self.ui.click(node=self.menu_item(menu, choice, choices))
         self.ui.wait("close Adapter Menu", lambda: not self.ui.matches("Adapter Menu", {"menu"}))
 
     def layer_order(self, names):
         def ordered():
-            if len(self.ui.matches("Remove", BUTTONS)) != len(names):
+            if sorted(n.name for n in self.ui.nodes() if visible(n)
+                      and n.getRoleName() in BUTTONS and n.name.startswith("Remove ")) != sorted(
+                          f"Remove {name}" for name in names):
                 return None
             rows = [self.ui.row(name) for name in names]
             if len(set(rows)) != len(names) or len({row.parent for row in rows}) != 1:
@@ -958,12 +980,7 @@ class Smoke:
             for name, row in zip(names, rows):
                 if not row.getState().contains(pyatspi.STATE_SENSITIVE):
                     raise AssertionError(f"The {name!r} profile row is disabled")
-                self.enabled("Remove", root=row)
-                if self.ui.matches(name, BUTTONS, row):
-                    raise AssertionError(f"The {name!r} profile row exposes a menu button")
-                for action in ("Move Up", "Move Down"):
-                    if self.ui.matches(action, BUTTONS, row):
-                        raise AssertionError(f"A profile row exposes a {action} button")
+                self.enabled(f"Remove {name}", root=row)
             return list(names)
         return self.ui.wait(f"show profile layers in order {names!r}", ordered)
 
@@ -971,6 +988,7 @@ class Smoke:
         self.nav("Smoke Adapter")
         self.subpage("Profiles")
         self.ui.expect("Configuration Interfaces")
+        self.fit_capacity("In Use", 980, 680)
         self.ui.expect("Typing")
         self.all_profiles()
         self.profile_page("Example Profile 11")
@@ -988,31 +1006,46 @@ class Smoke:
         self.ui.click("Copy", root=dialog)
         self.ui.absent("Copy", root=dialog)
         self.profile_menu("Smoke Copy", "Delete")
-        self.ui.click("Delete", root=self.modal())
+        dialog = self.modal()
+        self.ui.click("Delete", root=dialog)
+        self.close_deletion("Smoke Copy", dialog)
         self.ui.absent("Smoke Copy")
-        self.apply(ADAPTER_WRITE, lambda: self.ui.choose("VIA", "Example Profile 11"))
+        # An interface without a profile can't be turned on, but its profile can be chosen.
+        self.ui.expect("Typing", self.ui.row("VIA Profile"))
+        self.available("VIA", True)
+        self.apply(ADAPTER_WRITE, lambda: self.ui.choose("VIA Profile", "None"))
+        self.available("VIA", False)
+        self.available("VIA Profile", True)
+        self.search_focus("via smoke", "VIA", "VIA Profile")
+        self.apply(ADAPTER_WRITE, lambda: self.ui.choose("VIA Profile", "Example Profile 11"))
+        self.available("VIA", True)
         self.reconnect_adapter()
         self.subpage("Profiles")
-        self.ui.expect("Example Profile 11", self.ui.row("VIA"))
-        self.apply(ADAPTER_WRITE, lambda: self.ui.choose("VIA", "Natural Scrolling"))
+        self.ui.expect("Example Profile 11", self.ui.row("VIA Profile"))
+        self.apply(ADAPTER_WRITE, lambda: self.ui.choose("VIA Profile", "Natural Scrolling"))
         self.reconnect_adapter()
         self.subpage("Profiles")
-        self.ui.expect("Natural Scrolling", self.ui.row("VIA"))
+        self.ui.expect("Natural Scrolling", self.ui.row("VIA Profile"))
         self.apply(ADAPTER_WRITE, lambda: self.ui.switch("VIA", True))
         self.checked("VIA", True)
         self.reconnect_adapter()
         self.subpage("Profiles")
         self.checked("VIA", True)
-        self.ui.expect("Natural Scrolling", self.ui.row("VIA"))
+        self.ui.expect("Natural Scrolling", self.ui.row("VIA Profile"))
+        # Vial conflicts with VIA: its profile stays editable while its switch waits for VIA.
+        self.apply(ADAPTER_WRITE, lambda: self.ui.choose("Vial Profile", "Example Profile 11"))
+        self.available("Vial", False)
+        self.search_focus("vial smoke", "Vial", "Vial Profile")
+        self.reconnect_adapter()
+        self.subpage("Profiles")
+        self.available("Vial", False)
         self.apply(ADAPTER_WRITE, lambda: self.ui.switch("VIA", False))
         self.checked("VIA", False)
+        self.available("Vial", True)
         self.reconnect_adapter()
         self.subpage("Profiles")
         self.checked("VIA", False)
-        self.apply(ADAPTER_WRITE, lambda: self.ui.choose("Vial", "Example Profile 11"))
-        self.reconnect_adapter()
-        self.subpage("Profiles")
-        self.ui.expect("Example Profile 11", self.ui.row("Vial"))
+        self.ui.expect("Example Profile 11", self.ui.row("Vial Profile"))
         self.ui.screenshot("adapter-profiles")
         self.nav("Example Mouse")
         self.subpage("Profiles")
@@ -1025,7 +1058,7 @@ class Smoke:
         self.subpage("Profiles")
         self.layer_order(("Natural Scrolling", "Example Profile 11"))
         self.apply(MOUSE_PROFILES, lambda:
-            self.ui.click("Remove", root=self.ui.row("Example Profile 11")))
+            self.ui.click("Remove Example Profile 11", root=self.ui.row("Example Profile 11")))
         self.layer_order(("Natural Scrolling",))
         self.ui.click("Add Profile")
         picker = self.modal()
@@ -1064,15 +1097,30 @@ class Smoke:
             "pointer": pointer, "completed_writes": outcomes,
             "refreshed_order": refreshed, "reconnected_order": reconnected,
         }, indent=2) + "\n")
-        self.apply(MOUSE_PROFILES, lambda:
-            self.ui.drag(self.ui.row("Typing"), self.ui.row("Example Profile 3")))
+        before = len(self.writes(MOUSE_PROFILES))
+        pointer = self.ui.drag(self.ui.row("Example Profile 3"), self.ui.row("Typing"))
+        self.wait_write(MOUSE_PROFILES, before)
+        self.layer_order(("Example Profile 3", "Typing", "Natural Scrolling"))
         self.refresh_device()
         self.subpage("Profiles")
-        self.layer_order(("Example Profile 3", "Typing", "Natural Scrolling"))
+        refreshed = self.layer_order(("Example Profile 3", "Typing", "Natural Scrolling"))
+        self.reconnect_adapter()
+        self.nav("Example Mouse")
+        self.subpage("Profiles")
+        reconnected = self.layer_order(("Example Profile 3", "Typing", "Natural Scrolling"))
+        outcomes = self.writes(MOUSE_PROFILES)[before:]
+        if outcomes != ["ok"]:
+            raise AssertionError(f"One pointer drop must write the final order once: {outcomes}")
+        (self.output / "device-profiles-drag-up.json").write_text(json.dumps({
+            "initial_order": ["Typing", "Example Profile 3", "Natural Scrolling"],
+            "dragged_profile": "Example Profile 3", "target_profile": "Typing",
+            "pointer": pointer, "completed_writes": outcomes,
+            "refreshed_order": refreshed, "reconnected_order": reconnected,
+        }, indent=2) + "\n")
         self.apply(MOUSE_PROFILES, lambda:
-            self.ui.click("Remove", root=self.ui.row("Example Profile 3")))
+            self.ui.click("Remove Example Profile 3", root=self.ui.row("Example Profile 3")))
         self.layer_order(("Typing", "Natural Scrolling"))
-        self.apply(MOUSE_PROFILES, lambda: self.ui.click("Remove", root=self.ui.row("Typing")))
+        self.apply(MOUSE_PROFILES, lambda: self.ui.click("Remove Typing", root=self.ui.row("Typing")))
         self.refresh_device()
         self.subpage("Profiles")
         self.ui.absent("Typing")
@@ -1084,6 +1132,130 @@ class Smoke:
         self.refresh_device()
         self.subpage("Profiles")
         self.ui.expect("Typing")
+        self.delete_used_profile()
+
+    def delete_used_profile(self):
+        self.ui.click("Add Profile")
+        picker = self.modal()
+        self.ui.click(node=self.ui.row("Smoke Profile", picker))
+        self.apply(MOUSE_PROFILES, lambda: self.ui.click("Choose", root=picker))
+        self.layer_order(("Natural Scrolling", "Typing", "Smoke Profile"))
+        self.nav("Smoke Adapter")
+        self.subpage("Profiles")
+        self.apply(ADAPTER_WRITE, lambda: self.ui.choose("VIA Profile", "Smoke Profile"))
+        self.apply(ADAPTER_WRITE, lambda: self.ui.switch("VIA", True))
+        self.profile_menu("Smoke Profile", "Delete")
+        dialog = self.modal()
+        body = "\n".join(n.name for n in self.ui.nodes(dialog)
+                         if visible(n) and n.getRoleName() == "label")
+        expected = ["Remove it from Example Mouse, keeping the other profiles in order",
+                    "Turn off VIA and clear its profile", "Delete \u201cSmoke Profile\u201d"]
+        rows = self.deletion_steps(dialog, expected)
+        self.ui.dump("profile-delete-confirmation")
+        self.ui.screenshot("profile-delete-confirmation")
+        self.ui.click("Delete", root=dialog)
+        completion = self.close_deletion("Smoke Profile", dialog, expected, rows,
+                                         capture="profile-delete-completed")
+        self.ui.absent("Smoke Profile")
+        self.checked("VIA", False)
+        self.ui.expect("None", self.ui.row("VIA Profile"))
+        self.reconnect_adapter()
+        self.subpage("Profiles")
+        self.checked("VIA", False)
+        self.ui.expect("None", self.ui.row("VIA Profile"))
+        self.ui.absent("Smoke Profile")
+        self.nav("Example Mouse")
+        self.refresh_device()
+        self.subpage("Profiles")
+        kept = self.layer_order(("Natural Scrolling", "Typing"))
+        (self.output / "profile-delete-readback.json").write_text(json.dumps({
+            "confirmation": body, "completion": completion, "remaining_layers": kept,
+            "profile_deleted": True, "via_enabled": False, "via_profile": "None",
+        }, indent=2) + "\n")
+
+    def deletion_steps(self, dialog, expected):
+        """Checks that a deletion confirmation lists `expected` in order under its introduction,
+        each step's text aligned after its number, with a wrapped step's lines hanging there."""
+        intro = self.ui.find("Deleting this profile makes these changes, in order:", {"label"},
+                             dialog)
+        lists = [n for n in self.ui.nodes(dialog) if visible(n) and n.getRoleName() == "list"]
+        if len(lists) != 1:
+            raise AssertionError(f"The deletion confirmation has {len(lists)} lists of changes")
+        labels = [next(label for label in self.ui.nodes(item)
+                       if visible(label) and label.getRoleName() == "label")
+                  for item in self.ui.nodes(lists[0])
+                  if visible(item) and item.getRoleName() == "list item"]
+        steps = [label.name for label in labels]
+        if steps != expected:
+            raise AssertionError(f"Unexpected deletion steps: {steps!r}")
+        items = [n for n in self.ui.nodes(lists[0])
+                 if visible(n) and n.getRoleName() == "list item"]
+        if [item.name for item in items] != expected:
+            raise AssertionError("Deletion steps do not expose their text as accessible names")
+        _, iy, _, ih = intro.queryComponent().getExtents(pyatspi.XY_WINDOW)
+        lx, ly, _, _ = lists[0].queryComponent().getExtents(pyatspi.XY_WINDOW)
+        if ly < iy + ih:
+            raise AssertionError("The deletion steps are not below their introduction")
+        # GTK places each step's text, wrapped lines included, in one label beside its number.
+        # AT-SPI character extents aren't usable here, so the labels' bounds show the indent.
+        bounds = [label.queryComponent().getExtents(pyatspi.XY_WINDOW) for label in labels]
+        starts = {x for x, _, _, _ in bounds}
+        if len(starts) != 1 or min(starts) <= lx:
+            raise AssertionError(f"The deletion steps are not aligned after their numbers: "
+                                 f"{sorted(starts)} from {lx}")
+        line = min(h for _, _, _, h in bounds)
+        if not any(h >= 2 * line for _, _, _, h in bounds):
+            raise AssertionError("No deletion step wraps, so its hanging indent is unchecked")
+        return items
+
+    def close_deletion(self, name, dialog, expected=None, rows=None, capture=None):
+        self.ui.expect(f"Deleted \u201c{name}\u201d", dialog)
+
+        def completed():
+            items = [n for n in self.ui.nodes(dialog)
+                     if visible(n) and n.getRoleName() == "list item"]
+            if any(item.description != "Done" for item in items):
+                return None
+            if expected is not None and [item.name for item in items] != expected:
+                raise AssertionError("The completed deletion changed its confirmed steps")
+            if rows is not None and items != rows:
+                raise AssertionError("The completed deletion replaced its step rows")
+            buttons = [n for n in self.ui.nodes(dialog) if visible(n)
+                       and n.getRoleName() in BUTTONS
+                       and n.getState().contains(pyatspi.STATE_SHOWING)]
+            if [button.name for button in buttons] != ["Close"]:
+                return None
+            close = buttons[0]
+            overlay = tuple(dialog.queryComponent().getExtents(pyatspi.XY_WINDOW))
+            card = close.parent
+            while card.parent is not None and card.parent != dialog:
+                if tuple(card.parent.queryComponent().getExtents(pyatspi.XY_WINDOW)) == overlay:
+                    break
+                card = card.parent
+            dx, dy, dw, dh = card.queryComponent().getExtents(pyatspi.XY_WINDOW)
+            reported = self.ui.button_bounds(close)
+            x, y, width, height = reported
+            # GTK reports the response's content size at its unpadded origin. Adwaita's
+            # response area has 24px side and bottom padding and 12px top padding.
+            x, y = x + 24, y + 12
+            ox, oy, ow, oh = overlay
+            if (dw != min(420, ow - 60) or width != dw - 48
+                    or x != dx + 24 or y + height != dy + dh - 24
+                    or dx < ox or dy < oy or dx + dw > ox + ow or dy + dh > oy + oh):
+                return None
+            return {"steps": [item.name for item in items],
+                    "states": [item.description for item in items],
+                    "buttons": ["Close"], "dialog": [dx, dy, dw, dh],
+                    "close": [x, y, width, height], "close_reported": list(reported)}
+
+        result = self.ui.wait("finish every deletion step and show only full-width Close", completed)
+        if capture:
+            self.ui.retain("keeping the completed deletion open until Close", completed)
+            self.ui.dump(capture)
+            self.ui.screenshot(capture)
+        self.ui.click("Close", root=dialog)
+        self.ui.absent(f"Deleted \u201c{name}\u201d")
+        return result
 
     def start_pair(self, candidate, context, narrow=False):
         self.nav(context)
@@ -1116,21 +1288,38 @@ class Smoke:
             raise AssertionError("The scan indicator is not in the dialog header")
         if spinner.getState().contains(pyatspi.STATE_FOCUSABLE):
             raise AssertionError("The scan indicator is interactive")
-        for name in ("Refresh", "Retry"):
-            if any(node.getState().contains(pyatspi.STATE_SHOWING)
-                   for node in self.ui.matches(name, BUTTONS, dialog)):
-                raise AssertionError(f"Add Device shows {name} while scanning")
+        if any(node.getState().contains(pyatspi.STATE_SHOWING)
+               for node in self.ui.matches("Search Again", BUTTONS, dialog)):
+            raise AssertionError("Add Device shows Search Again while scanning")
         self.ui.dump(f"pairing-scan-{context.replace(' ', '-').lower()}")
         self.ui.screenshot(f"pairing-scan-{context.replace(' ', '-').lower()}")
-        self.ui.click("Pair", root=self.ui.row(candidate, dialog))
-        return dialog
+        return self.pair_candidate(dialog, candidate)
+
+    def add_dialog_after(self, previous):
+        return self.ui.wait("show a different native Add Device dialog", lambda: next((
+            node for node in self.ui.matches("Add Device", {"dialog", "alert"})
+            if node != previous and node.getState().contains(pyatspi.STATE_SHOWING)), None))
+
+    def pair_candidate(self, picker, candidate):
+        row = self.ui.row(candidate, picker)
+        self.ui.find("Excellent Signal", {"image"}, row)
+        self.ui.click(f"Pair {candidate}", root=row)
+        return self.add_dialog_after(picker)
+
+    def enter_passkey(self, dialog):
+        entry = self.ui.control("Code", "queryEditableText", dialog)
+        self.ui.focus(entry)
+        self.ui.key("Control_L", "a")
+        for key in "1x23456":
+            self.ui.key(key)
+        self.ui.wait("type the passkey without the letter", lambda: text(entry) == "123456")
 
     def empty_profiles(self):
         self.nav("Example Mouse")
         self.subpage("Profiles")
         self.layer_order(("Natural Scrolling",))
         self.apply(MOUSE_PROFILES, lambda:
-            self.ui.click("Remove", root=self.ui.row("Natural Scrolling")))
+            self.ui.click("Remove Natural Scrolling", root=self.ui.row("Natural Scrolling")))
         self.refresh_device()
         self.subpage("Profiles")
         for width, height in ((980, 680), (480, 720)):
@@ -1182,7 +1371,10 @@ class Smoke:
                 return {"page": (px, py, pw, ph), **bounds}
 
             geometry = self.ui.wait("center the empty Profiles title and Add Profile", layout)
-            self.ui.absent("Remove")
+            self.ui.wait("show no profile removal controls", lambda: not any(
+                visible(n) and n.getRoleName() in BUTTONS
+                and (n.name == "Remove" or n.name.startswith("Remove "))
+                for n in self.ui.nodes()))
             self.ui.dump(f"empty-profiles-{width}")
             self.ui.screenshot(f"empty-profiles-{width}")
             geometry["decorative_icon_check"] = (
@@ -1190,13 +1382,41 @@ class Smoke:
                 "as decoration without an AT-SPI image node.")
             (self.output / f"empty-profiles-{width}-bounds.json").write_text(
                 json.dumps(geometry, indent=2) + "\n")
+        self.ui.resize(980, 680)
+        self.ui.wait("show the expanded sidebar", self.sidebar_visible)
+        self.nav("Example Adapter 1")
+        self.subpage("Profiles")
+        for name in ("Natural Scrolling", "Typing", *(
+                f"Example Profile {i}" for i in range(3, 13))):
+            self.profile_menu(name, "Delete")
+            dialog = self.modal()
+            self.ui.click("Delete", root=dialog)
+            self.close_deletion(name, dialog)
+            self.ui.absent(name)
+        self.nav("Example Mouse")
+        self.subpage("Profiles")
         self.ui.click("Add Profile" + ELLIPSIS)
         picker = self.modal()
-        self.ui.click(node=self.ui.row("Typing", picker))
+        self.ui.expect("No Profiles", picker)
+        choose = self.ui.find("Choose", BUTTONS, picker)
+        if choose.getState().contains(pyatspi.STATE_SENSITIVE):
+            raise AssertionError("Choose is enabled without a profile")
+        self.ui.dump("empty-profile-picker")
+        self.ui.screenshot("empty-profile-picker")
+        self.ui.click("New Profile" + ELLIPSIS, root=picker)
+        dialog = self.ui.find("New Profile", {"dialog", "alert"})
+        self.ui.edit("Name", "Created in Picker", dialog)
+        self.ui.click("Create", root=dialog)
+        picker = self.ui.find("Add Profile", {"dialog", "alert"})
+        row = self.ui.row("Created in Picker", picker)
+        self.ui.wait("select the newly created profile", lambda: any(
+            n.getState().contains(pyatspi.STATE_CHECKED) for n in self.ui.nodes(row)
+            if n.getRoleName() in {"check box", "radio button"}))
+        self.ui.absent("No Profiles", root=picker)
         self.apply(MOUSE_PROFILES, lambda: self.ui.click("Choose", root=picker))
         self.refresh_device()
         self.subpage("Profiles")
-        self.layer_order(("Typing",))
+        self.layer_order(("Created in Picker",))
         self.ui.absent("No Profiles")
         self.ui.resize(980, 680)
         self.ui.wait("show the expanded sidebar", self.sidebar_visible)
@@ -1250,9 +1470,9 @@ class Smoke:
             for node in self.ui.nodes(dialog):
                 if visible(node) and (node.getRoleName() == "combo box" or node.name == "Adapter"):
                     raise AssertionError("Sidebar Add Device exposes an adapter selector")
-            self.ui.click("Pair", root=self.ui.row("Example Numpad", dialog))
+            dialog = self.pair_candidate(dialog, "Example Numpad")
             self.pair_success(dialog, "Example Numpad",
-                              f"empty-sidebar-pair-{adapter[-1]}", automatic=True)
+                              f"empty-sidebar-pair-{adapter[-1]}")
             self.ui.expect(adapter, self.ui.row("Adapter"))
             groups[adapter].append("Example Numpad")
             self.sidebar_groups(groups)
@@ -1279,13 +1499,13 @@ class Smoke:
         self.env.update(CORDIAL_SIM_PAIRING_RECONNECT_MS="1500",
                         CORDIAL_SIM_PAIRING_RECONNECT_TRACE=str(self.pairing_trace))
         self.startup()
-        self.step("pairing-reconnect-automatic", lambda: self.pairing_reconnect(automatic=True))
-        self.step("pairing-reconnect-dismiss", lambda: self.pairing_reconnect(automatic=False))
+        self.step("pairing-reconnect-passkey", lambda: self.pairing_reconnect(enter_code=True))
+        self.step("pairing-reconnect-comparison", lambda: self.pairing_reconnect(enter_code=False))
         self.quit()
 
-    def pairing_reconnect(self, automatic):
+    def pairing_reconnect(self, enter_code):
         adapter = "SIMULATED0000001"
-        candidate, device = ("Example Keys Mini", "11") if automatic else ("Example Pebble", "12")
+        candidate, device = ("Example Keys Mini", "11") if enter_code else ("Example Pebble", "12")
 
         def records():
             return [line.split() for line in self.pairing_trace.read_text().splitlines()]
@@ -1293,16 +1513,18 @@ class Smoke:
         session = [row[2] for row in records() if row[:2] == ["opened", adapter]][-1]
         event = lambda stage: [stage, adapter, session, device] in records()
         dialog = self.start_pair(candidate, "Example Adapter 1")
-        prompt = "Enter Passkey" if automatic else "Compare Codes"
+        prompt = "Enter Passkey" if enter_code else "Compare Codes"
         self.ui.expect(prompt, dialog)
-        self.ui.retain("keep the prompt open without a success countdown", lambda:
+        self.ui.retain("keep the pairing prompt open", lambda:
             bool(self.ui.matches(prompt, {"label"}, dialog))
             and not self.ui.matches("Dismiss", BUTTONS, dialog) and not event("done"), duration=3.3)
+        self.pair_layout(dialog, self.stage + "-prompt",
+                         ("Reject", "Pair") if enter_code else ("Codes Differ", "Codes Match"))
         navigation = self.navigation()
-        if automatic:
-            self.ui.edit("Code", "123456", dialog)
-        self.ui.click("Pair" if automatic else "Codes Match", root=dialog)
-        message = f"{candidate} is paired and connected."
+        if enter_code:
+            self.enter_passkey(dialog)
+        self.ui.click("Pair" if enter_code else "Codes Match", root=dialog)
+        message = f"{candidate} is paired."
         success = []
 
         def retained():
@@ -1310,15 +1532,16 @@ class Smoke:
             nodes = self.ui.nodes(navigation)
             names = [node.name for node in nodes if visible(node)
                      and node.getRoleName() == "list item"]
-            connected = bool(self.ui.matches(message, {"label"}, dialog))
-            if connected and not success:
+            paired = bool(self.ui.matches("Paired", {"label"}, dialog)
+                          and self.ui.matches(message, {"label"}, dialog))
+            if paired and not success:
                 success.append(observed)
-                if not automatic:
+                if not enter_code:
                     self.ui.key("Tab")
             return (all(names.count(name) == 1 for name in (
                 "Example Adapter 1", "Example Adapter 2", "Example Mouse", "Example Trackball",
-                candidate)) and bool(self.ui.matches("Add Device", {"dialog", "alert"}, dialog))
-                and (connected or bool(self.ui.matches("Connecting", {"label"}, dialog))))
+                candidate)) and dialog in self.ui.matches("Add Device", {"dialog", "alert"})
+                and paired)
 
         self.ui.wait("close the framed session after PairingDone and SessionEnding", lambda:
             event("closed"))
@@ -1333,16 +1556,15 @@ class Smoke:
         self.ui.dump(self.stage + "-gap")
         self.ui.screenshot(self.stage + "-gap")
 
-        self.ui.wait("confirm the paired device is connected", lambda:
-            retained() and self.ui.matches(message, {"label"}, dialog))
+        self.ui.wait("show the confirmed pairing result", lambda:
+            retained() and bool(success) and self.ui.matches(message, {"label"}, dialog))
         observed = success[0]
         self.ui.retain("retain success across the replacement session", lambda:
             retained() and bool(self.ui.matches(message, {"label"}, dialog)),
-                       duration=max(0.1, (2.6 if automatic else 3.3)
-                                    - (time.monotonic() - observed)))
-        if not automatic:
-            self.enabled("Add Another", root=dialog)
-            self.ui.click("Dismiss", root=dialog)
+                       duration=max(0.1, 3.3 - (time.monotonic() - observed)))
+        self.enabled("Add Another", root=dialog)
+        self.pair_layout(dialog, self.stage + "-result", ("Add Another", "Dismiss"))
+        self.ui.click("Dismiss", root=dialog)
         self.ui.wait("dismiss the confirmed pairing result", lambda:
             not self.ui.matches("Add Device", {"dialog", "alert"}), timeout=5)
         elapsed = time.monotonic() - observed
@@ -1354,7 +1576,7 @@ class Smoke:
         self.ui.wait(f"open the reconnected {candidate!r} page", lambda: self.page_header(candidate))
         self.ui.expect("Example Adapter 1", self.ui.row("Adapter"))
         (self.output / (self.stage + "-dismissal.json")).write_text(json.dumps({
-            "automatic": automatic, "seconds_after_observation": elapsed,
+            "prompt": prompt, "seconds_after_observation": elapsed,
             "original_session": session, "replacement_session": replacement,
         }, indent=2) + "\n")
 
@@ -1398,7 +1620,9 @@ class Smoke:
                 card = card.parent
             dx, dy, dw, dh = card.queryComponent().getExtents(pyatspi.XY_WINDOW)
             bounds = [self.ui.button_bounds(button) for button in buttons]
-            if not 0 < dw <= 440 or dh <= 0:
+            # Floating sheets reserve 30 pixels on each side of the parent content.
+            expected_width = min(420, overlay[2] - 60)
+            if (dw, dh) != (expected_width, 372):
                 return None
             for button, (x, y, width, height) in zip(buttons, bounds):
                 if (not button.getState().contains(pyatspi.STATE_SHOWING)
@@ -1413,8 +1637,6 @@ class Smoke:
             fx, fy, fw, fh = frame.queryComponent().getExtents(pyatspi.XY_WINDOW)
             if dx < fx or dy < fy or dx + dw > fx + fw or dy + dh > fy + fh:
                 return None
-            # The dialog animates from the scan size. Wait for its answers to fit before
-            # measuring the remaining space or recording evidence.
             if len(bounds) > 2:
                 if any(a[1] + a[3] > b[1] for a, b in zip(bounds, bounds[1:])):
                     return None
@@ -1422,6 +1644,15 @@ class Smoke:
                 if (abs(bounds[0][1] - bounds[1][1]) > 4
                         or bounds[0][0] + bounds[0][2] > bounds[1][0]):
                     return None
+            if (abs(bounds[0][0] - dx - 18) > 1
+                    or abs(bounds[-1][0] + bounds[-1][2] - dx - dw + 18) > 1
+                    or any(abs(y + height - dy - dh + 18) > 1
+                           for _, y, _, height in bounds)):
+                return None
+            if len(bounds) == 2 and (
+                    abs(bounds[0][2] - bounds[1][2]) > 1
+                    or abs(bounds[1][0] - bounds[0][0] - bounds[0][2] - 12) > 1):
+                return None
             intervals = []
             for node in self.ui.nodes(dialog):
                 if (visible(node) and node.getState().contains(pyatspi.STATE_SHOWING)
@@ -1436,46 +1667,61 @@ class Smoke:
             for top, bottom in sorted(intervals):
                 occupied += max(0, bottom - max(end, top))
                 end = max(end, bottom)
-            if dh - occupied > max(180, occupied):
-                return None
             return {"dialog": [dx, dy, dw, dh], "buttons": dict(zip(actions, bounds)),
                     "unused_vertical_space": dh - occupied}
 
-        geometry = self.ui.wait("fit the compact pairing content and all answers", settled)
+        geometry = self.ui.wait("fit the pairing content and all answers", settled)
+        _, dy, dw, dh = geometry["dialog"]
+        bounds = list(geometry["buttons"].values())
+        placement = (dw, dh, min(b[1] for b in bounds) - dy, max(b[3] for b in bounds))
+        previous = self.pair_geometry.setdefault(dialog, placement)
+        if placement != previous:
+            raise AssertionError(f"Pairing size or answer placement changed: {previous} -> {placement}")
         (self.output / f"{name}-bounds.json").write_text(json.dumps(geometry, indent=2) + "\n")
         self.ui.dump(name)
         self.ui.screenshot(name)
 
-    def pair_success(self, dialog, candidate, name, automatic=False):
+    def pair_success(self, dialog, candidate, name, another=False):
         self.ui.find("Dismiss", BUTTONS, dialog)
         observed = time.monotonic()
-        message = f"{candidate} is paired and connected."
+        message = f"{candidate} is paired."
+        self.ui.expect("Paired", dialog)
         self.ui.expect(message, dialog)
         self.ui.find("Add Another", BUTTONS, dialog)
         shown = lambda: bool(self.ui.matches(message, {"label"}, dialog)
                              and self.ui.matches("Dismiss", BUTTONS, dialog))
-        if automatic:
-            self.ui.retain("keep pairing success visible before automatic dismissal", shown,
-                           duration=1.5)
+        self.ui.retain("keep pairing success open until dismissed", shown, duration=3.3)
+        self.pair_layout(dialog, name, ("Add Another", "Dismiss"))
+        self.ui.click("Add Another" if another else "Dismiss", root=dialog)
+        if another:
+            picker = self.add_dialog_after(dialog)
         else:
-            self.ui.key("Tab")
-            self.ui.retain("pause pairing success during keyboard interaction", shown,
-                           duration=3.3)
-            self.pair_layout(dialog, name, ("Add Another", "Dismiss"))
-            self.ui.click("Dismiss", root=dialog)
-        self.ui.wait("close the successful pairing dialog", lambda:
-            not self.ui.matches("Add Device", {"dialog", "alert"}), timeout=5)
-        self.ui.wait(f"open the paired {candidate!r} page", lambda: self.page_header(candidate))
+            self.ui.wait("close the successful pairing dialog", lambda:
+                not self.ui.matches("Add Device", {"dialog", "alert"}), timeout=5)
+            self.ui.wait(f"open the paired {candidate!r} page", lambda: self.page_header(candidate))
         (self.output / f"{name}-dismissal.json").write_text(json.dumps({
-            "automatic": automatic, "seconds_after_observation": time.monotonic() - observed,
+            "seconds_after_observation": time.monotonic() - observed,
+            "action": "Add Another" if another else "Dismiss",
         }, indent=2) + "\n")
+        return picker if another else None
 
     def pairing(self):
         self.nav("Overview")
         self.ui.absent("Add Device")
         dialog = self.start_pair("Example Keys Mini", "Example Adapter 2")
         self.ui.expect("Enter Passkey", dialog)
-        self.ui.edit("Code", "123456", dialog)
+        self.pair_layout(dialog, "pairing-reject-code", ("Reject", "Pair"))
+        self.ui.click("Reject", root=dialog)
+        picker = self.add_dialog_after(dialog)
+        self.ui.expect("Example Keys Mini", picker)
+        self.ui.retain("return to the device picker without a pairing failure", lambda:
+            bool(self.ui.matches("Example Keys Mini", {"label"}, picker))
+            and not self.ui.matches("Pairing Failed"), duration=1.1)
+        self.ui.dump("pairing-rejected-picker")
+        self.ui.screenshot("pairing-rejected-picker")
+        dialog = self.pair_candidate(picker, "Example Keys Mini")
+        self.ui.expect("Enter Passkey", dialog)
+        self.enter_passkey(dialog)
         self.pair_layout(dialog, "pairing-enter-code", ("Reject", "Pair"))
         self.enabled("Pair", root=dialog)
         self.ui.click("Pair", root=dialog)
@@ -1490,10 +1736,11 @@ class Smoke:
         self.ui.expect("Cordial couldn't pair with Example Pebble.", dialog)
         self.ui.retain("keep a pairing failure open", lambda:
             bool(self.ui.matches("Pairing Failed", {"label"}, dialog)
-                 and self.ui.matches("Retry", BUTTONS, dialog)), duration=3.3)
-        self.pair_layout(dialog, "pairing-failed", ("Close", "Retry"))
-        self.ui.click("Retry", root=dialog)
-        self.ui.click("Pair", root=self.ui.row("Example Pebble", dialog))
+                 and self.ui.matches("Search Again", BUTTONS, dialog)), duration=3.3)
+        self.pair_layout(dialog, "pairing-failed", ("Close", "Search Again"))
+        self.ui.click("Search Again", root=dialog)
+        picker = self.add_dialog_after(dialog)
+        dialog = self.pair_candidate(picker, "Example Pebble")
         self.ui.expect("Compare Codes", dialog)
         self.ui.expect("1 2 3 4 5 6", dialog)
         self.ui.click("Codes Match", root=dialog)
@@ -1503,80 +1750,32 @@ class Smoke:
         self.ui.expect("Type This Code", dialog)
         self.ui.expect("1 2 3 4 5 6", dialog)
         self.pair_layout(dialog, "pairing-show-code", ("Cancel Pairing",))
+        cancelled = time.monotonic()
         self.ui.click("Cancel Pairing", root=dialog)
-        self.ui.expect("Pairing Cancelled", dialog)
-        self.ui.retain("keep cancelled pairing open", lambda:
-            bool(self.ui.matches("Pairing Cancelled", {"label"}, dialog)
-                 and self.ui.matches("Refresh", BUTTONS, dialog)), duration=3.3)
-        self.pair_layout(dialog, "pairing-cancelled", ("Close", "Refresh"))
-        self.ui.key("Escape")
-        self.ui.wait("close the pairing dialog", lambda:
-            not self.ui.matches("Add Device", {"dialog", "alert"}))
+        self.ui.wait("close pairing immediately after Cancel Pairing", lambda:
+            not self.ui.matches("Add Device", {"dialog", "alert"}), timeout=1)
+        elapsed = time.monotonic() - cancelled
+        self.ui.retain("keep cancelled pairing closed without a result or error", lambda:
+            not self.ui.matches("Add Device", {"dialog", "alert"})
+            and not self.ui.matches("Pairing Cancelled")
+            and not self.ui.matches("Pairing Failed"), duration=1.1)
+        self.ui.dump("pairing-cancelled")
+        self.ui.screenshot("pairing-cancelled")
+        (self.output / "pairing-cancelled-dismissal.json").write_text(json.dumps({
+            "seconds_after_cancel": elapsed,
+        }, indent=2) + "\n")
         self.ui.resize(980, 680)
         self.ui.wait("show the expanded sidebar", lambda: any(
             n.getState().contains(pyatspi.STATE_SHOWING)
             for n in self.ui.matches("Overview", {"list item"})))
         dialog = self.start_pair("Example Numpad", "Smoke Adapter")
-        self.pair_success(dialog, "Example Numpad", "pairing-automatic-result", automatic=True)
+        picker = self.pair_success(dialog, "Example Numpad", "pairing-automatic-result", another=True)
+        self.ui.expect("Example Keys Mini", picker)
+        self.ui.click("Cancel", root=picker)
+        self.ui.wait("close the device picker", lambda:
+            not self.ui.matches("Add Device", {"dialog", "alert"}))
+        self.nav("Example Numpad")
         self.forget("Example Numpad", "Smoke Adapter")
-
-    def download_dialog(self, target):
-        files = self.modal()
-        self.ui.click("Download" + ELLIPSIS, root=files)
-        # GTK may use the session's native file chooser portal.
-        def portal():
-            try:
-                pid = self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
-                    "org.freedesktop.DBus", "GetConnectionUnixProcessID",
-                    GLib.Variant("(s)", ("org.freedesktop.impl.portal.desktop.gtk",)),
-                    GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 1000, None).unpack()[0]
-                self.ui.external_pids.add(pid)
-            except GLib.Error:
-                pass
-            return any(visible(n) and n != files and n.getRoleName() in {
-                "dialog", "file chooser"} for n in self.ui.nodes())
-        self.ui.wait("open the native file chooser", portal)
-        chooser = self.modal(exclude=files)
-        self.ui.wait("show the file name field", lambda:
-            self.ui.matches("Name:", root=chooser) or self.ui.matches("Name", root=chooser))
-        label = "Name:" if self.ui.matches("Name:", root=chooser) else "Name"
-        self.ui.edit(label, str(target), chooser)
-        self.ui.click("Save", root=chooser)
-        self.ui.wait("confirm replacing the existing file", lambda: self.ui.matches("Replace", BUTTONS))
-        confirmation = self.ui.find("Replace", BUTTONS)
-        while confirmation is not None and confirmation.getRoleName() not in {
-                "dialog", "alert", "file chooser"}:
-            confirmation = confirmation.parent
-        if confirmation is None:
-            raise AssertionError("The Replace button has no accessible confirmation")
-        return chooser, confirmation
-
-    def files(self):
-        self.nav("Smoke Adapter")
-        self.subpage("Diagnostics")
-        self.adapter_menu("Files" + ELLIPSIS)
-        self.ui.click(node=self.ui.row("examples/", self.modal()))
-        self.ui.focus(self.ui.row("sample.txt", self.modal()))
-        self.ui.key("Return")
-        target = self.downloads / "sample.txt"
-        target.write_bytes(b"Keep this file.\n")
-        chooser, confirmation = self.download_dialog(target)
-        self.ui.click("Cancel", root=confirmation)
-        self.ui.absent("Replace")
-        if chooser in self.ui.nodes():
-            self.ui.click("Cancel", root=chooser)
-        self.ui.absent("Name:")
-        if target.read_bytes() != b"Keep this file.\n":
-            raise AssertionError("Cancelling Replace changed the existing download")
-        _, confirmation = self.download_dialog(target)
-        self.ui.click("Replace", root=confirmation)
-        self.ui.wait("download the complete sample", lambda:
-            target.read_bytes() == b"Example device\n")
-        self.ui.expect("Saved", self.modal())
-        self.ui.screenshot("files-saved")
-        self.ui.key("Escape")
-        self.ui.absent("Download" + ELLIPSIS)
-        self.back()
 
     def preferences_page(self, sidebar=False):
         if sidebar:
@@ -1609,9 +1808,19 @@ class Smoke:
         for title in ("Start at Login", "Always Show Tray Icon", "Connections"):
             self.ui.switch(title, True, page)
         self.ui.switch("Low Battery", False, page)
-        self.ui.number("Low Battery Level", 35, page)
+        for level in (3, 60):
+            entry = self.ui.control("Low Battery Level", "queryEditableText", page)
+            self.ui.focus(entry)
+            self.ui.key("Control_L", "a")
+            for digit in str(level):
+                self.ui.key(digit)
+            self.ui.wait(f"type a low battery level of {level}", lambda: text(entry) == str(level))
+            self.ui.key("Return")
+            self.ui.wait(f"save a low battery level of {level}", lambda:
+                saved_preferences(self.config).get("low-battery-percent") == level)
+            self.ui.expect("%", self.ui.row("Low Battery Level", page))
         expected = {"start-at-login": True, "always-show-tray": True,
-                    "notify-low-battery": False, "low-battery-percent": 35,
+                    "notify-low-battery": False, "low-battery-percent": 60,
                     "notify-connections": True}
         self.ui.wait("save isolated GSettings preferences", lambda:
             saved_preferences(self.config) == expected)
@@ -1624,6 +1833,7 @@ class Smoke:
             raise AssertionError(f"Unexpected autostart command: {desktop['Exec']!r}")
         if desktop["Type"] != "Application" or desktop["Terminal"] != "false":
             raise AssertionError("The autostart entry is not a background desktop application")
+        self.ui.screenshot("preferences-unit-placement")
         self.ui.screenshot("preferences-page")
         self.nav("Overview")
         self.ui.absent("Start at Login")
@@ -1634,7 +1844,7 @@ class Smoke:
         if minimum_width != 480:
             raise AssertionError(f"Expected a 480px minimum width, got {minimum_width}")
         height = max(720, minimum_height)
-        tools = ("Restart", "Files" + ELLIPSIS, "Enter Bootloader" + ELLIPSIS)
+        tools = ("Restart", "Enter Bootloader" + ELLIPSIS)
         for width in (480, 661, 700):
             self.ui.resize(width, height)
             self.ui.wait("show the sidebar or collapsed mouse content", lambda:
@@ -1658,6 +1868,9 @@ class Smoke:
                 self.fit_row(title, width, height)
             self.fit_marker("Pointer Sensitivity", "Saved", width, height)
             self.fit_marker("Pointer Sensitivity 2", "Saved", width, height)
+            self.fit_marker("Wheel Mode", "Saved", width, height)
+            self.fit_marker("Reverse Vertical Scrolling", "Saved", width, height)
+            self.fit_marker("Automatic Free Spin", "Not Saved", width, height)
             self.ui.screenshot(f"device-settings-{width}")
             self.page_end()
             self.fit_controls(width, height, ("Forget Device" + ELLIPSIS,))
@@ -1672,7 +1885,7 @@ class Smoke:
             self.layer_order(("Natural Scrolling", "Typing"))
             for title in ("Natural Scrolling", "Typing"):
                 row = self.fit_row(title, width, height)
-                self.fit_controls(width, height, ("Remove",), row)
+                self.fit_controls(width, height, (f"Remove {title}",), row)
             self.ui.screenshot(f"device-profiles-{width}")
             self.ui.click("Add Profile")
             picker = self.modal()
@@ -1720,12 +1933,13 @@ class Smoke:
             self.subpage("Profiles")
             self.fit_header("Profiles", width, height)
             self.all_profiles()
+            self.fit_capacity("In Use", width, height)
             for title in ("Example Profile 11", "Example Profile 12"):
                 self.fit_node(self.profile_page(title), width, height)
             self.fit_controls(width, height, ("New Profile",))
             for title in ("VIA", "Vial"):
-                row = self.fit_row(title, width, height)
-                self.fit_node(self.ui.find(title, {"switch", "check box", "toggle button"}, row), width, height)
+                self.fit_row(title, width, height)
+                self.fit_row(title + " Profile", width, height)
             self.ui.screenshot(f"adapter-profiles-{width}")
             self.back()
             self.subpage("Diagnostics")
@@ -1738,6 +1952,13 @@ class Smoke:
             self.ui.screenshot(f"adapter-diagnostics-{width}")
             self.ui.key("Escape")
             self.ui.absent("Adapter Menu", root=menu)
+            self.adapter_menu("Enter Bootloader" + ELLIPSIS)
+            dialog = self.modal()
+            self.ui.expect("Restart the adapter into USB programming mode?", dialog)
+            self.fit_controls(width, height, ("Cancel", "Enter Bootloader"), dialog)
+            self.ui.screenshot(f"bootloader-confirmation-{width}")
+            self.ui.key("Escape")
+            self.ui.absent("Restart the adapter into USB programming mode?")
             self.back()
             self.expose_navigation("Smoke Adapter")
             page = self.preferences_page(sidebar=True)
@@ -1815,10 +2036,17 @@ class Smoke:
         marker = self.ui.find(f"{title}: {state}", BUTTONS, row)
         self.fit_node(marker, window_width, window_height)
         label = self.ui.find(title, {"label"}, row)
-        mx, _, mw, _ = marker.queryComponent().getExtents(pyatspi.XY_WINDOW)
-        lx, _, _, _ = label.queryComponent().getExtents(pyatspi.XY_WINDOW)
-        if mx + mw > lx:
-            raise AssertionError(f"The {title!r} state marker is not before its title")
+        self.fit_node(label, window_width, window_height)
+        roles = BUTTONS | {"switch", "check box", "spin button", "combo box"}
+        controls = [node for node in walk(row) if visible(node)
+                    and node.getRoleName() in roles and node.name != marker.name]
+        if not controls:
+            raise AssertionError(f"The {title!r} setting has no control before its state marker")
+        mx, _, _, _ = marker.queryComponent().getExtents(pyatspi.XY_WINDOW)
+        for control in controls:
+            cx, _, cw, _ = control.queryComponent().getExtents(pyatspi.XY_WINDOW)
+            if mx < cx + cw:
+                raise AssertionError(f"The {title!r} state marker does not follow its control")
 
     def fit_capacity(self, title, window_width, window_height, root=None):
         row = self.fit_row(title, window_width, window_height, root)
@@ -1881,8 +2109,22 @@ class Smoke:
         node = self.ui.find("Low Battery", {"switch", "check box", "toggle button"}, page)
         if node.getState().contains(pyatspi.STATE_CHECKED):
             raise AssertionError("Low Battery was not restored")
-        if self.ui.number("Low Battery Level", root=page) != 35:
+        if self.ui.number("Low Battery Level", root=page) != 60:
             raise AssertionError("Low Battery Level was not restored")
+        entry = self.ui.control("Low Battery Level", "queryEditableText", page)
+        self.ui.focus(entry)
+        self.ui.key("Control_L", "a")
+        self.ui.key("3")
+        self.ui.key("Return")
+        self.ui.wait("save a low battery level of 3 before relaunch", lambda:
+            saved_preferences(self.config).get("low-battery-percent") == 3)
+        self.quit()
+        self.ui.x11.close()
+        self.ui = Desktop(self.launch(), self.output)
+        self.ui.expect("Example Adapter 1")
+        page = self.preferences_page(sidebar=True)
+        if self.ui.number("Low Battery Level", root=page) != 3:
+            raise AssertionError("A low battery level of 3 was not restored")
         self.ui.switch("Start at Login", False, page)
         self.ui.wait("remove isolated autostart entry", lambda: not self.autostart.exists())
         self.ui.wait("save Start at Login off", lambda:
@@ -2056,7 +2298,7 @@ class Smoke:
                 self.ui.absent(name)
             self.nav("Overview")
             self.nav("Example Mouse")
-            note = "Couldn't Save: The adapter couldn't save the change"
+            note = SETTINGS_WRITE_FAILED
             self.ui.expect(note)
             self.ui.wait("restore the rejected setting's saved value", lambda:
                 self.ui.number("Pointer Sensitivity") == 1000)
@@ -2093,7 +2335,7 @@ class Smoke:
             ("adapters", self.adapters), ("search", self.search_flow), ("details", self.details),
             ("settings", self.settings), ("diagnostics", self.diagnostics),
             ("profiles", self.profiles), ("pairing", self.pairing),
-            ("files", self.files), ("preferences", self.preferences_flow),
+            ("preferences", self.preferences_flow),
             ("narrow", self.narrow), ("close-relaunch", self.close_relaunch),
             ("persistence", self.persistence),
             ("quiet-profiles", self.quiet_profiles),

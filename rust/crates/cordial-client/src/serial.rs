@@ -1,6 +1,6 @@
 //! USB serial ports: listing attached Dongles and opening a session on one.
 use crate::{Connection, Received};
-use cordial_protocol::{self as p, USB_PRODUCT_ID, USB_VENDOR_ID};
+use cordial_protocol::{USB_PRODUCT_ID, USB_VENDOR_ID};
 use std::{
     io::{self, Read, Write},
     sync::mpsc::Receiver,
@@ -63,7 +63,7 @@ fn unique_ports(mut found: Vec<PortInfo>) -> Vec<PortInfo> {
 }
 
 /// Opens a Dongle's port and starts a session on it. Returns the connection and its events.
-pub fn open(port: &str) -> io::Result<(Connection, Receiver<p::Event>)> {
+pub fn open(port: &str) -> io::Result<(Connection, Receiver<crate::Event>)> {
     let (reader, writer) = open_stream(port)?;
     Ok(Connection::new(reader, writer))
 }

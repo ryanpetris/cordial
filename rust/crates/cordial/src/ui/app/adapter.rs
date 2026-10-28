@@ -216,9 +216,6 @@ impl<F: Fleet> App<F> {
                 self.adapter_drafts.remove(id);
                 self.notes.remove(&Spot::AdapterSave(id.to_owned()));
             }
-            Action::Files if a.status.as_ref().is_some_and(model::development) => {
-                self.open_files(id)
-            }
             Action::Restart
                 if restartable(&a) && !self.running(id, |k| matches!(k, Kind::Restart)) =>
             {

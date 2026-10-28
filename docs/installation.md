@@ -12,6 +12,13 @@ Protocol compatibility and storage migration run inside the application.
 
 Launch **Cordial** from the application menu or run `cordial desktop`. Use `cordial tui` for the
 terminal interface. `cordial desktop --hidden` starts without presenting a window.
+`--json` logs every protocol response and event to standard error alongside normal operation.
+The stream includes background reads, migration traffic and complete file contents. For example,
+use `cordial --json tui 2>cordial.jsonl` or `cordial desktop --json 2>cordial.jsonl`.
+The shell and one-shot commands accept the same flag; human command results stay on standard
+output. Quit Cordial before starting a desktop JSON stream. An ordinary desktop launch activates
+the running instance, while a subsequent launch with `--json` exits with an error because the
+stream belongs to the primary process's standard error.
 
 Native packages target Arch Linux, Debian 13 and Ubuntu 26.04 on x86-64, using each
 distribution's GTK and libadwaita libraries. The unified host archive uses the Ubuntu 26.04
@@ -81,8 +88,8 @@ Cordial uses StatusNotifierItem for its tray icon. GNOME needs a supporting exte
 
 Download your board's firmware archive from the latest release and extract it. Each board has a
 production archive, `cordial-firmware-<version>-<code>.tar.gz`, and a debug archive,
-`cordial-firmware-<version>-debug-<code>.tar.gz`. The debug archive adds adapter file access and
-restarting into the bootloader from the app.
+`cordial-firmware-<version>-debug-<code>.tar.gz`. The debug archive adds the CLI's adapter file
+commands and restarting into the bootloader from the app.
 
 | Board | Code |
 | --- | --- |

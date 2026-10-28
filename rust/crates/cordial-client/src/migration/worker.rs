@@ -691,12 +691,19 @@ impl Transport for crate::Connection {
     }
 }
 #[cfg(feature = "serialport")]
-struct SerialDiscovery;
+struct SerialDiscovery<F, P> {
+    connect: F,
+    ports: P,
+}
 #[cfg(feature = "serialport")]
-impl Discovery for SerialDiscovery {
+impl<F, P> Discovery for SerialDiscovery<F, P>
+where
+    F: Fn(&str) -> std::io::Result<crate::Connection>,
+    P: Fn() -> std::io::Result<Vec<crate::serial::PortInfo>>,
+{
     type Connection = crate::Connection;
     fn discover(&mut self) -> std::io::Result<Vec<AdapterPort>> {
-        Ok(crate::serial::ports()?
+        Ok((self.ports)()?
             .into_iter()
             .map(|port| AdapterPort {
                 adapter_id: port.id().into(),
@@ -705,7 +712,7 @@ impl Discovery for SerialDiscovery {
             .collect())
     }
     fn open(&mut self, port: &str) -> crate::Result<Self::Connection> {
-        let connection = crate::serial::open_with_handler(port, |_| {})?;
+        let connection = (self.connect)(port)?;
         connection.set_migration_limits();
         Ok(connection)
     }
@@ -725,8 +732,29 @@ pub fn migrate(
     cancelled: &AtomicBool,
     report: impl FnMut(ipc::MigrationEvent),
 ) -> Result<Outcome> {
+    migrate_with_backend(
+        adapter_id,
+        port_hint,
+        cancelled,
+        report,
+        |port| crate::serial::open_with_handler(port, |_| {}),
+        crate::serial::ports,
+    )
+}
+
+/// Runs the serial migration worker with supplied connections, including their raw handlers.
+/// The caller must release existing connections and suspend discovery as for [`migrate`].
+#[cfg(feature = "serialport")]
+pub fn migrate_with_backend(
+    adapter_id: &str,
+    port_hint: Option<&str>,
+    cancelled: &AtomicBool,
+    report: impl FnMut(ipc::MigrationEvent),
+    connect: impl Fn(&str) -> std::io::Result<crate::Connection>,
+    ports: impl Fn() -> std::io::Result<Vec<crate::serial::PortInfo>>,
+) -> Result<Outcome> {
     migrate_with(
-        &mut SerialDiscovery,
+        &mut SerialDiscovery { connect, ports },
         &Graph::standard(),
         adapter_id,
         port_hint,

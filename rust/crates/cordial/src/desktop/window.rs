@@ -186,7 +186,7 @@ impl Tabs {
 }
 
 fn add_button(ctx: &Rc<Ctx>) -> Btn {
-    let b = Btn::bare_icon(ctx, "list-add-symbolic", "Add Device");
+    let b = Btn::icon(ctx, "list-add-symbolic", "Add Device");
     b.hide();
     b
 }
@@ -208,6 +208,7 @@ pub struct Window {
     quit: RefCell<Option<Quit>>,
     /// The row a search result goes to, shown at the next redraw.
     found: Option<Row>,
+    revealing: Revealing,
 }
 
 impl Window {
@@ -267,37 +268,37 @@ impl Window {
 
         let search = gio::SimpleAction::new("search", None);
         search.connect_activate(glib::clone!(
-            #[weak]
-            split,
             #[weak(rename_to = bar)]
             sidebar.search,
             #[weak(rename_to = entry)]
             sidebar.entry,
             move |_, _| {
-                split.set_show_content(false);
                 bar.set_search_mode(true);
-                if entry.is_mapped() {
-                    entry.grab_focus();
-                    return;
-                }
-                // GTK moves focus off a page hidden while it has focus after the next frame,
-                // unless focus has gone to a widget on screen by then. The entry comes on screen
-                // a frame or more after search opens, so it takes focus once it does.
-                let shown = Rc::new(Cell::new(None));
-                let id = entry.connect_map(glib::clone!(
-                    #[strong]
-                    shown,
-                    move |entry| {
-                        entry.grab_focus();
-                        if let Some(id) = shown.take() {
-                            entry.disconnect(id);
-                        }
-                    }
-                ));
-                shown.set(Some(id));
+                entry.grab_focus();
             }
         ));
         window.add_action(&search);
+        // A search result waiting to be laid out gives way to the user's next key press, click,
+        // scroll or touch. Focus changes can't show that, since GTK and the split view move focus
+        // themselves while the result's page comes on screen.
+        let revealing = Revealing::default();
+        let input = gtk::EventControllerLegacy::new();
+        input.set_propagation_phase(gtk::PropagationPhase::Capture);
+        input.connect_event(glib::clone!(
+            #[strong]
+            revealing,
+            move |_, event| {
+                use gtk::gdk::EventType::{ButtonPress, KeyPress, Scroll, TouchBegin};
+                if matches!(
+                    event.event_type(),
+                    ButtonPress | KeyPress | Scroll | TouchBegin
+                ) {
+                    cancel(&revealing);
+                }
+                glib::Propagation::Proceed
+            }
+        ));
+        window.add_controller(input);
         // Search waits while a dialog covers the window.
         window.connect_visible_dialog_notify(glib::clone!(
             #[weak]
@@ -320,6 +321,7 @@ impl Window {
             dialog: None,
             quit: RefCell::default(),
             found: None,
+            revealing,
         }
     }
 
@@ -403,7 +405,7 @@ impl Window {
                     .downcast_ref::<adw::NavigationView>()
                     .and_then(|nav| nav.visible_page())
                     .map_or_else(|| child.clone(), |page| page.upcast());
-                reveal(&tab, &row);
+                reveal(&tab, &row, &self.revealing);
             }
         }
         let toast = app.toast_text().map(str::to_owned);
@@ -458,7 +460,7 @@ impl Window {
 
     /// Shows the model's dialog over the window, replacing one it no longer has.
     fn update_dialog(&mut self, ctx: &Rc<Ctx>, app: &App<Live>) {
-        let key = app.dialog().and_then(dialogs::key);
+        let key = dialogs::key(app);
         if self.dialog.as_ref().map(Shown::key) != key.as_ref() {
             if let Some(d) = self.dialog.take() {
                 d.dismiss();
@@ -478,8 +480,26 @@ impl Window {
     }
 }
 
-/// Scrolls the first shown row matching `target` into view and focuses it.
-fn reveal(page: &gtk::Widget, target: &Row) {
+/// A search result waiting for a frame that lays it out before it is scrolled to and focused.
+struct Pending {
+    page: gtk::Widget,
+    tick: gtk::TickCallbackId,
+    unmap: glib::SignalHandlerId,
+}
+
+type Revealing = Rc<RefCell<Option<Pending>>>;
+
+/// Drops the search result waiting to be shown, if any.
+fn cancel(revealing: &Revealing) {
+    if let Some(p) = revealing.take() {
+        p.tick.remove();
+        p.page.disconnect(p.unmap);
+    }
+}
+
+/// Scrolls the first shown row matching `target` into view and focuses it, in place of a result
+/// still waiting to be shown.
+fn reveal(page: &gtk::Widget, target: &Row, revealing: &Revealing) {
     /// The first shown widget of type `T` under `w`, `w` included, for which `hit` holds.
     fn first<T: IsA<gtk::Widget>>(w: &gtk::Widget, hit: &dyn Fn(&T) -> bool) -> Option<T> {
         if !w.is_visible() {
@@ -499,6 +519,7 @@ fn reveal(page: &gtk::Widget, target: &Row) {
         }
         None
     }
+    cancel(revealing);
     let row = match target {
         Row::Title(title) => first(page, &|r: &adw::PreferencesRow| r.title() == *title),
         Row::Name(name) => first(page, &|r: &adw::PreferencesRow| r.widget_name() == *name),
@@ -512,24 +533,67 @@ fn reveal(page: &gtk::Widget, target: &Row) {
             })
         }
     };
-    let Some(row) = row else {
+    let Some(mut row) = row else {
         return;
     };
+    // A row inside an expander row shows once the expander opens. One whose expander can't open
+    // isn't shown, so its expander row is shown instead.
+    if let Some(expander) = row
+        .parent()
+        .and_then(|p| p.ancestor(adw::ExpanderRow::static_type()))
+        .and_downcast::<adw::ExpanderRow>()
+    {
+        if expander.enables_expansion() {
+            expander.set_expanded(true);
+        } else {
+            row = expander.upcast();
+        }
+    }
     // A viewport scrolls to where a row is laid out at the time, so a row on a page just put on
-    // screen waits for a frame that has laid it out.
-    row.add_tick_callback(|row, _| {
-        let viewport = row
-            .ancestor(gtk::Viewport::static_type())
-            .and_then(|w| w.downcast::<gtk::Viewport>().ok());
-        if row.height() == 0 || viewport.as_ref().is_some_and(|v| v.height() == 0) {
-            return glib::ControlFlow::Continue;
+    // screen, or in an expander still opening, waits for a frame that has laid it out in place.
+    let tick = row.add_tick_callback(glib::clone!(
+        #[weak]
+        revealing,
+        #[upgrade_or]
+        glib::ControlFlow::Break,
+        move |row, _| {
+            let viewport = row
+                .ancestor(gtk::Viewport::static_type())
+                .and_then(|w| w.downcast::<gtk::Viewport>().ok());
+            let revealer = row
+                .ancestor(gtk::Revealer::static_type())
+                .and_downcast::<gtk::Revealer>();
+            let closed = revealer.as_ref().is_some_and(|r| !r.reveals_child());
+            let opening = revealer.is_some_and(|r| !r.is_child_revealed());
+            let unplaced =
+                opening || row.height() == 0 || viewport.as_ref().is_some_and(|v| v.height() == 0);
+            if !closed && unplaced {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(p) = revealing.take() {
+                p.page.disconnect(p.unmap);
+            }
+            if !closed {
+                if let Some(viewport) = viewport {
+                    viewport.scroll_to(row, None);
+                }
+                row.grab_focus();
+            }
+            glib::ControlFlow::Break
         }
-        if let Some(viewport) = viewport {
-            viewport.scroll_to(row, None);
-        }
-        row.grab_focus();
-        glib::ControlFlow::Break
-    });
+    ));
+    // Leaving the page cancels the wait. A page off screen would otherwise hold the callback until
+    // it comes back, and the row would take focus then.
+    let unmap = page.connect_unmap(glib::clone!(
+        #[weak]
+        revealing,
+        move |_| cancel(&revealing)
+    ));
+    revealing.replace(Some(Pending {
+        page: page.clone(),
+        tick,
+        unmap,
+    }));
 }
 
 /// The window an explicit Quit shows until settings finish applying. When one fails, the user
@@ -590,5 +654,147 @@ impl Quit {
             text,
             buttons,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Iterates the main loop until `done` holds.
+    fn pump(done: &dyn Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(
+                Instant::now() < deadline,
+                "the row was never focused and scrolled into view"
+            );
+            glib::MainContext::default().iteration(false);
+        }
+    }
+
+    /// Whether focus is in `w`.
+    fn focused(window: &gtk::Window, w: &impl IsA<gtk::Widget>) -> bool {
+        GtkWindowExt::focus(window).is_some_and(|f| f.is_ancestor(w) || f == *w.upcast_ref())
+    }
+
+    /// Whether the middle of `w` is within its viewport's visible area.
+    fn in_view(w: &impl IsA<gtk::Widget>) -> bool {
+        let viewport = w.ancestor(gtk::Viewport::static_type()).unwrap();
+        let bounds = w.compute_bounds(&viewport).unwrap();
+        (0.0..viewport.height() as f32).contains(&bounds.center().y())
+    }
+
+    #[test]
+    #[ignore = "requires a display"]
+    fn search_opens_the_expander_row_holding_its_result() {
+        adw::init().expect("GTK needs a display");
+        let page = adw::PreferencesPage::new();
+        let filler = adw::PreferencesGroup::new();
+        let top = adw::ActionRow::builder().title("Row 0").build();
+        filler.add(&top);
+        for i in 1..30 {
+            filler.add(&adw::ActionRow::builder().title(format!("Row {i}")).build());
+        }
+        page.add(&filler);
+        let group = adw::PreferencesGroup::new();
+        let expander = |title: &str, inner: &str, expands: bool| {
+            let row = adw::ExpanderRow::builder()
+                .title(title)
+                .enable_expansion(expands)
+                .build();
+            let inner = adw::SpinRow::builder()
+                .title(inner)
+                .adjustment(&gtk::Adjustment::new(30.0, 1.0, 254.0, 1.0, 10.0, 0.0))
+                .build();
+            row.add_row(&inner);
+            group.add(&row);
+            (row, inner)
+        };
+        let (on, threshold) = expander("Automatic Free Spin", "Threshold", true);
+        let (off, hidden) = expander("Other Switch", "Hidden", false);
+        page.add(&group);
+        let holder = adw::Bin::builder().child(&page).build();
+        let window = gtk::Window::builder()
+            .default_width(480)
+            .default_height(300)
+            .child(&holder)
+            .build();
+        window.present();
+        pump(&|| page.height() > 0);
+        assert!(!on.is_expanded());
+        let revealing = Revealing::default();
+        let reveal = |title: &str| reveal(page.upcast_ref(), &Row::Title(title.into()), &revealing);
+
+        reveal("Threshold");
+        assert!(on.is_expanded(), "the result's expander row opens");
+        pump(&|| focused(&window, &threshold) && in_view(&threshold));
+
+        reveal("Hidden");
+        assert!(
+            !off.is_expanded(),
+            "an expander row that can't open stays closed"
+        );
+        pump(&|| focused(&window, &off) && in_view(&off));
+        assert!(!focused(&window, &hidden));
+
+        let revealer = threshold
+            .ancestor(gtk::Revealer::static_type())
+            .and_downcast::<gtk::Revealer>()
+            .unwrap();
+        let frames = || {
+            let count = Rc::new(Cell::new(0));
+            let seen = count.clone();
+            window.add_tick_callback(move |_, _| {
+                seen.set(seen.get() + 1);
+                if seen.get() < 2 {
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                }
+            });
+            pump(&|| count.get() == 2);
+        };
+        for disable in [false, true] {
+            on.set_expanded(false);
+            pump(&|| !revealer.is_child_revealed());
+            reveal("Threshold");
+            if disable {
+                on.set_enable_expansion(false);
+            } else {
+                on.set_expanded(false);
+            }
+            off.grab_focus();
+            frames();
+            on.set_enable_expansion(true);
+            on.set_expanded(true);
+            pump(&|| revealer.is_child_revealed());
+            frames();
+            assert!(focused(&window, &off), "a cancelled search stole focus");
+        }
+
+        on.set_expanded(false);
+        pump(&|| !revealer.is_child_revealed());
+        reveal("Threshold");
+        reveal("Row 0");
+        pump(&|| focused(&window, &top) && in_view(&top));
+        pump(&|| revealer.is_child_revealed());
+        frames();
+        assert!(focused(&window, &top), "a replaced search stole focus");
+
+        on.set_expanded(false);
+        pump(&|| !revealer.is_child_revealed());
+        reveal("Threshold");
+        holder.set_child(Some(&gtk::Button::with_label("Elsewhere")));
+        frames();
+        holder.set_child(Some(&page));
+        top.grab_focus();
+        pump(&|| revealer.is_child_revealed());
+        frames();
+        assert!(
+            focused(&window, &top),
+            "a search on a page left before its result showed took focus on return"
+        );
     }
 }

@@ -3,7 +3,7 @@
 pub use crate::view::{SessionId, State};
 use crate::{
     error::Error,
-    profiles::InterfaceUpdate,
+    profiles::{Deletion, InterfaceUpdate},
     settings::{self, Field, Setting},
     view::Pending,
 };
@@ -35,6 +35,12 @@ pub enum Event {
         session: SessionId,
         notice: Notice,
     },
+    /// A running profile deletion's changes the adapter has confirmed so far.
+    Progress {
+        session: SessionId,
+        ticket: Ticket,
+        progress: Progress,
+    },
     Done {
         session: SessionId,
         ticket: Ticket,
@@ -42,6 +48,18 @@ pub enum Event {
     },
     /// The controller's session closed after `close`, and its port is released.
     Closed,
+}
+
+/// How far a profile deletion has come, counting its changes in plan order: each device, each
+/// configuration interface, then the deletion itself. The interfaces change in one request, so
+/// they are confirmed together.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Progress {
+    /// Changes the adapter has confirmed.
+    pub done: usize,
+    /// The adapter is restarting its USB configuration, and the next change waits for it to
+    /// reconnect.
+    pub waiting: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -282,7 +300,11 @@ pub enum Command {
     ProfileCreate(String),
     /// Copies a profile under a new name.
     ProfileCopy(Target, String),
+    /// Deletes a profile after removing it from the devices and configuration interfaces that
+    /// the view shows using it.
     ProfileDelete(Target),
+    /// Deletes a profile with the changes a confirmation listed, and no others.
+    ProfileDeletePlanned(Deletion),
     /// Every rule of a profile.
     Rules(Target),
     /// Saves or forgets one rule of a profile.
@@ -300,6 +322,12 @@ pub enum Command {
         overwrite: bool,
         raw: bool,
     },
+    /// Uploads local bytes, replacing the adapter file atomically.
+    FilePut {
+        local: PathBuf,
+        path: String,
+    },
+    FileDelete(String),
 }
 
 impl Command {
@@ -308,7 +336,13 @@ impl Command {
     pub fn direct(&self) -> bool {
         matches!(
             self,
-            Self::Status | Self::Restart | Self::Bootloader | Self::Files(_) | Self::FileGet { .. }
+            Self::Status
+                | Self::Restart
+                | Self::Bootloader
+                | Self::Files(_)
+                | Self::FileGet { .. }
+                | Self::FilePut { .. }
+                | Self::FileDelete(_)
         )
     }
 
@@ -330,9 +364,12 @@ impl Command {
                 | Self::ProfileCreate(_)
                 | Self::ProfileCopy(..)
                 | Self::ProfileDelete(_)
+                | Self::ProfileDeletePlanned(_)
                 | Self::RuleChange(..)
                 | Self::AdapterSave(_)
                 | Self::DeviceSave(..)
+                | Self::FilePut { .. }
+                | Self::FileDelete(_)
         )
     }
 }
@@ -373,6 +410,10 @@ pub enum Outcome {
     Paired {
         subject: Subject,
         device: Option<p::Device>,
+    },
+    /// The bond is saved, but its device ID is not yet known.
+    PairedWithoutDevice {
+        name: String,
     },
     Answered,
     PairingCancelled,
@@ -425,6 +466,11 @@ pub enum Outcome {
         json: bool,
         unconverted: Option<crate::records::Unconverted>,
     },
+    FileUploaded {
+        path: String,
+        bytes: u64,
+    },
+    FileDeleted(String),
 }
 
 /// Opens a connection whose handler receives everything the Dongle sends.
@@ -432,6 +478,11 @@ pub type Connector =
     dyn Fn(&str, Box<dyn FnMut(Received<'_>) + Send>) -> io::Result<Connection> + Send + Sync;
 
 type Sink = Arc<dyn Fn(Event) + Send + Sync>;
+type Handler = Arc<Mutex<Box<dyn FnMut(Received<'_>) + Send>>>;
+type Ports = dyn Fn() -> io::Result<Vec<cordial_client::serial::PortInfo>> + Send + Sync;
+
+/// A profile deletion owns discovery until its configuration reconnect finishes.
+pub const PROFILE_RECONNECT: &str = "profile delete reconnect";
 
 /// The view and what waits on it.
 pub(crate) struct Cell {
@@ -479,18 +530,149 @@ impl Cell {
 
 pub(crate) struct Session {
     pub id: SessionId,
-    pub port: String,
-    pub connection: Connection,
+    connection: Mutex<Arc<Connection>>,
+    connect: Arc<Connector>,
+    ports: Arc<Ports>,
+    handler: Handler,
+    ending: Arc<Mutex<Option<p::SessionEndingReason>>>,
     pub cell: Arc<Cell>,
+    /// File operations share the adapter's upload scratch path.
+    pub files: Mutex<()>,
     sink: Sink,
     closing: Arc<AtomicBool>,
 }
 
 impl Session {
+    pub fn connection(&self) -> Arc<Connection> {
+        self.connection.lock().unwrap().clone()
+    }
+
+    fn reconnecting(&self) -> bool {
+        self.state().pending_for(PROFILE_RECONNECT, 0)
+    }
+
+    pub fn profile_reconnect(&self, profile: u32) -> ReconnectGuard<'_> {
+        ReconnectGuard {
+            pending: Some(self.pending(PROFILE_RECONNECT, profile)),
+            resumed: false,
+        }
+    }
+
+    /// Waits for the announced configuration restart, then reads the same adapter again.
+    pub fn reconnect(&self, wait: &Wait) -> Result<(), Error> {
+        let mut wait = wait.clone();
+        let limit = Instant::now() + Duration::from_secs(10);
+        wait.deadline = Some(wait.deadline.map_or(limit, |d| d.min(limit)));
+        self.cell
+            .wait_for(&wait, |st| st.session_ending.map(|_| ()))?;
+        if *self.ending.lock().unwrap() != Some(p::SessionEndingReason::ConfigurationChange) {
+            return Err(Error::new(
+                "the adapter ended the session for another operation",
+            ));
+        }
+        self.connection().close_and_wait_release();
+        let identity = self.state().status.id;
+        loop {
+            wait.check()?;
+            if self.closing.load(Ordering::Acquire) {
+                return Err(Error::new("the operation was cancelled"));
+            }
+            let port = (self.ports)()
+                .ok()
+                .and_then(|ports| ports.into_iter().find(|p| p.is_adapter(&identity)))
+                .map_or_else(|| self.state().port, |p| p.port);
+            let admitted = Arc::new(AtomicBool::new(false));
+            let (accept, handler) = (admitted.clone(), self.handler.clone());
+            let opened = (self.connect)(
+                &port,
+                Box::new(move |received| {
+                    if accept.load(Ordering::Acquire) {
+                        handler.lock().unwrap()(received);
+                    }
+                }),
+            );
+            let connection = match opened {
+                Ok(connection) => Arc::new(connection),
+                Err(_) => {
+                    // Port discovery retries are bounded by the operation's deadline.
+                    let state = self.cell.state.lock().unwrap();
+                    let _ = self
+                        .cell
+                        .changed
+                        .wait_timeout(state, Duration::from_millis(50))
+                        .unwrap();
+                    continue;
+                }
+            };
+            {
+                let mut active = self.connection.lock().unwrap();
+                if self.closing.load(Ordering::Acquire) {
+                    return Err(Error::new("the operation was cancelled"));
+                }
+                *active = connection.clone();
+            }
+            connection.set_deadline(wait.deadline);
+            let status = match connection.status() {
+                Ok(status) => status,
+                Err(error) => {
+                    connection.close_and_wait_release();
+                    if reconnect_transport_error(&error) {
+                        let state = self.cell.state.lock().unwrap();
+                        let _ = self
+                            .cell
+                            .changed
+                            .wait_timeout(state, Duration::from_millis(50))
+                            .unwrap();
+                        continue;
+                    }
+                    return Err(Error::from_client(error, "adapter status"));
+                }
+            };
+            if identity.is_empty() || !status.id.eq_ignore_ascii_case(&identity) {
+                return Err(Error::new("another adapter answered on the adapter's port"));
+            }
+            if !matches!(
+                crate::migration::gate(&status),
+                crate::migration::Gate::Normal
+            ) {
+                return Err(Error::new(
+                    "the adapter is not ready to finish deleting the profile",
+                ));
+            }
+            wait.check()?;
+            {
+                let _active = self.connection.lock().unwrap();
+                if self.closing.load(Ordering::Acquire) {
+                    return Err(Error::new("the operation was cancelled"));
+                }
+                if let Some(error) = connection.closed() {
+                    return Err(Error::from_client(error, "adapter status"));
+                }
+                self.cell.update(|st| {
+                    st.port = port;
+                    st.status = status;
+                    st.available = true;
+                    st.loaded = false;
+                    st.session_ending = None;
+                });
+                *self.ending.lock().unwrap() = None;
+                admitted.store(true, Ordering::Release);
+            }
+            // Admission follows identity verification; read again to include intervening events.
+            connection
+                .status()
+                .map_err(|e| Error::from_client(e, "adapter status"))?;
+            self.cell
+                .wait_for(&wait, |st| st.status.ready.then_some(()))?;
+            self.load()?;
+            return Ok(());
+        }
+    }
+
     fn phase(&self, phase: Phase) {
         (self.sink)(Event::Connection {
             session: self.id,
-            port: self.port.clone(),
+            port: self.state().port,
             phase,
         });
     }
@@ -509,14 +691,14 @@ impl Session {
     ) -> Result<p::Response, Error> {
         let response = if reported {
             let (sink, session) = (self.sink.clone(), self.id);
-            self.connection.request_with(command, move |response| {
+            self.connection().request_with(command, move |response| {
                 sink(Event::Notice {
                     session,
                     notice: Notice::Response(response.clone()),
                 })
             })
         } else {
-            self.connection.request(command)
+            self.connection().request(command)
         }
         .map_err(|e| Error::from_client(e, name))?;
         if let Some(p::response::Result::Error(e)) = response.result {
@@ -528,12 +710,12 @@ impl Session {
     /// Lists the saved devices, and reads the names of the profiles devices and configuration
     /// interfaces use.
     fn load(&self) -> Result<(), Error> {
-        self.connection
+        self.connection()
             .list_devices()
             .map_err(|e| Error::from_client(e, "device list"))?;
         for id in crate::profiles::unnamed(&self.state()) {
             // A name that can't be read is shown as the profile's ID.
-            let _ = self.connection.get_profile(id);
+            let _ = self.connection().get_profile(id);
         }
         self.cell.update(|st| st.loaded = true);
         Ok(())
@@ -543,7 +725,7 @@ impl Session {
     /// such as a migration, owns it alone.
     fn shutdown(&self) {
         self.closing.store(true, Ordering::Release);
-        self.connection.close_and_wait_release();
+        self.connection().close_and_wait_release();
     }
 
     /// Marks a running command for progress shown beside its target; 0 for none.
@@ -553,6 +735,53 @@ impl Session {
         PendingGuard {
             session: self,
             pending,
+        }
+    }
+}
+
+fn reconnect_transport_error(error: &cordial_client::Error) -> bool {
+    use cordial_client::Error;
+    match error {
+        Error::Handshake(error) | Error::NotSent(error) => reconnect_transport_error(error),
+        Error::Closed | Error::Io(_) | Error::Timeout => true,
+        _ => false,
+    }
+}
+
+pub(crate) struct ReconnectGuard<'a> {
+    pending: Option<PendingGuard<'a>>,
+    resumed: bool,
+}
+
+impl ReconnectGuard<'_> {
+    pub fn reconnect(&mut self, wait: &Wait) -> Result<(), Error> {
+        self.pending.as_ref().unwrap().session.reconnect(wait)?;
+        self.resumed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ReconnectGuard<'_> {
+    fn drop(&mut self) {
+        let pending = self.pending.take().unwrap();
+        let session = pending.session;
+        session.connection().set_deadline(None);
+        if !session.state().available || session.connection().closed().is_some() {
+            // Loss reaches the interface before the deletion's result, including when its
+            // reply waiter wakes before the reader has delivered Closed.
+            session.connection().close_and_wait_release();
+            // A candidate's Closed callback can precede admission and never reach the view.
+            session.cell.update(|st| st.available = false);
+        }
+        drop(pending);
+        if !session.closing.load(Ordering::Acquire) {
+            if !session.state().available {
+                session.phase(Phase::Lost(Error::new(
+                    "the connection to the adapter closed",
+                )));
+            } else if self.resumed {
+                session.phase(Phase::Ready);
+            }
         }
     }
 }
@@ -592,6 +821,7 @@ struct Shared {
     ticket: AtomicU64,
     sink: Sink,
     connect: Arc<Connector>,
+    ports: Arc<Ports>,
 }
 
 #[derive(Clone)]
@@ -614,6 +844,18 @@ impl Controller {
         + Sync
         + 'static,
     ) -> Self {
+        Self::with_backend(sink, connect, cordial_client::serial::ports)
+    }
+
+    /// Uses the same port discovery for reconnects as the owning interface.
+    pub(crate) fn with_backend(
+        sink: impl Fn(Event) + Send + Sync + 'static,
+        connect: impl Fn(&str, Box<dyn FnMut(Received<'_>) + Send>) -> io::Result<Connection>
+        + Send
+        + Sync
+        + 'static,
+        ports: impl Fn() -> io::Result<Vec<cordial_client::serial::PortInfo>> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             inner: Arc::new(Shared {
                 active: Mutex::new(Active {
@@ -626,6 +868,7 @@ impl Controller {
                 ticket: AtomicU64::new(0),
                 sink: Arc::new(sink),
                 connect: Arc::new(connect),
+                ports: Arc::new(ports),
             }),
         }
     }
@@ -694,8 +937,15 @@ impl Controller {
         };
         let sink = self.inner.sink.clone();
         thread::spawn(move || {
+            let report = |progress| {
+                sink(Event::Progress {
+                    session: id,
+                    ticket,
+                    progress,
+                })
+            };
             let result = match session {
-                Some(session) => crate::commands::execute(&session, &command, &options),
+                Some(session) => crate::commands::execute(&session, &command, &options, &report),
                 None => Err(Error::new(
                     "no adapter selected; use adapter list and adapter select PORT",
                 )),
@@ -771,7 +1021,8 @@ fn open(
     let closing = Arc::new(AtomicBool::new(false));
     // The interface registers a session before it handles that session's loss.
     let phases = Arc::new(Mutex::new(OpeningPhases::default()));
-    let handler = {
+    let ending = Arc::new(Mutex::new(None));
+    let handler: Handler = Arc::new(Mutex::new({
         let (cell, sink, closing, port, phases) = (
             cell.clone(),
             inner.sink.clone(),
@@ -779,9 +1030,13 @@ fn open(
             port.clone(),
             phases.clone(),
         );
+        let ending = ending.clone();
         Box::new(move |received: Received<'_>| match received {
             Received::Event(event) => {
                 let Some(kind) = &event.kind else { return };
+                if let p::event::Kind::SessionEnding(event) = kind {
+                    *ending.lock().unwrap() = Some(event.reason());
+                }
                 let (first, changed) = cell.update(|st| {
                     let first = match kind {
                         p::event::Kind::ScanFound(c) => st.candidate(c.id).is_none(),
@@ -811,12 +1066,18 @@ fn open(
                     },
                 });
             }
+            Received::PairingComplete { candidate } => cell.update(|st| {
+                st.pairing = None;
+                st.paired_candidate = Some(candidate);
+            }),
             Received::Response(request, response) => {
                 cell.update(|st| st.response(request, response))
             }
             Received::Closed(error) => {
                 cell.update(|st| st.available = false);
-                if !closing.load(Ordering::Acquire) {
+                if !closing.load(Ordering::Acquire)
+                    && !cell.snapshot().pending_for(PROFILE_RECONNECT, 0)
+                {
                     let error = Error::from_client(error.clone(), "");
                     let mut phases = phases.lock().unwrap();
                     if phases.announced {
@@ -831,16 +1092,24 @@ fn open(
                 }
             }
         })
-    };
-    let connection = match (inner.connect)(&port, handler) {
+    }));
+    let receive = handler.clone();
+    let connection = match (inner.connect)(
+        &port,
+        Box::new(move |received| receive.lock().unwrap()(received)),
+    ) {
         Ok(connection) => connection,
         Err(error) => return failed(Error::new(error.to_string())),
     };
     let session = Arc::new(Session {
         id,
-        port: port.clone(),
-        connection,
+        connection: Mutex::new(Arc::new(connection)),
+        connect: inner.connect.clone(),
+        ports: inner.ports.clone(),
+        handler,
+        ending,
         cell,
+        files: Mutex::new(()),
         sink: inner.sink.clone(),
         closing,
     });
@@ -853,13 +1122,13 @@ fn open(
         }
         active.opening = Some(session.clone());
     }
-    let handshake = session.connection.handshake();
+    let handshake = session.connection().handshake();
     let established = handshake.is_ok();
     let opened = handshake.and_then(|hello| {
         if hello.compatibility() != cordial_client::compatibility::Compatibility::Current {
             return Err(cordial_client::Error::Incompatible(hello));
         }
-        session.connection.status()
+        session.connection().status()
     });
     if let Err(e) = opened {
         let report = {
@@ -923,10 +1192,24 @@ fn open(
     // back, which loads them again.
     let mut waiting = false;
     loop {
+        if session.reconnecting() {
+            let st = session.cell.state.lock().unwrap();
+            let _ = session
+                .cell
+                .changed
+                .wait_timeout_while(st, Duration::from_millis(50), |st| {
+                    st.pending_for(PROFILE_RECONNECT, 0)
+                })
+                .unwrap();
+            if !current() {
+                return;
+            }
+            continue;
+        }
         let ready = session
             .cell
             .wait_for(&Wait::unlimited(), |st| {
-                if !current() {
+                if !current() || st.pending_for(PROFILE_RECONNECT, 0) {
                     return Some(None);
                 }
                 (st.status.ready && !st.loaded)
@@ -936,6 +1219,7 @@ fn open(
             .ok()
             .flatten();
         match ready {
+            None if session.reconnecting() && current() => continue,
             None => return,
             Some(false) => {
                 waiting = true;
@@ -957,5 +1241,95 @@ fn open(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+    use crate::sim::Dongle;
+    use std::sync::mpsc;
+
+    #[test]
+    fn a_connection_closed_between_identity_and_admission_stays_unavailable() {
+        let dongle = Dongle::default();
+        let adapter = dongle.clone();
+        let (tx, events) = mpsc::channel();
+        let (entered, identity) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let gate = Arc::new(Mutex::new(gate));
+        let (seen, delivered) = mpsc::channel();
+        let controller = Controller::with_connector(
+            move |e| {
+                let _ = tx.send(e);
+            },
+            move |_, mut handler| {
+                let replacement = adapter.sessions() == 1;
+                let (entered, gate, seen) = (entered.clone(), gate.clone(), seen.clone());
+                adapter.connect(Box::new(move |received| {
+                    if replacement {
+                        match &received {
+                            Received::Response(_, _) => {
+                                entered.send(()).unwrap();
+                                gate.lock()
+                                    .unwrap()
+                                    .recv_timeout(Duration::from_secs(5))
+                                    .unwrap();
+                            }
+                            Received::Event(_) => {
+                                seen.send(()).unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                    handler(received);
+                }))
+            },
+        );
+        controller.open("sim".into());
+        while !matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Event::Connection {
+                phase: Phase::Ready,
+                ..
+            }
+        ) {}
+        let session = controller
+            .inner
+            .active
+            .lock()
+            .unwrap()
+            .session
+            .clone()
+            .unwrap();
+        let reconnecting = session.clone();
+        let (started, pending) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut guard = reconnecting.profile_reconnect(1);
+            started.send(()).unwrap();
+            guard.reconnect(&Wait::timeout(Duration::from_secs(3)))
+        });
+        pending.recv_timeout(Duration::from_secs(5)).unwrap();
+        dongle.end_session(p::SessionEndingReason::ConfigurationChange as i32);
+        identity.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Admission needs this lock. The following event proves the identity response has
+        // already been queued to the request waiter before the connection closes.
+        let active = session.connection.lock().unwrap();
+        release.send(()).unwrap();
+        dongle.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 999 }));
+        delivered.recv_timeout(Duration::from_secs(5)).unwrap();
+        active.close_and_wait_release();
+        drop(active);
+        assert!(worker.join().unwrap().is_err());
+        assert!(!session.state().available);
+        assert_eq!(dongle.handles(), 0);
+        assert!(events.try_iter().any(|e| matches!(
+            e,
+            Event::Connection {
+                phase: Phase::Lost(_),
+                ..
+            }
+        )));
+        controller.close();
     }
 }

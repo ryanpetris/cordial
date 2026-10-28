@@ -7,8 +7,8 @@ bonds share the filesystem. ESP32-S3 has no NVS partition.
 
 ## Flash allocation
 
-Startup detects physical flash. The firmware reservation is 1 MiB on 2 MiB chips
-and 2 MiB on chips of at least 4 MiB. The linked image end never selects the
+Board configuration fixes the firmware reservation at 1 MiB for Pico W and 2 MiB
+for the other presets. Detected capacity and the linked image end never change the
 filesystem start. Board configuration's `minimum_flash_bytes` describes the image's
 minimum flash capacity, not the storage capacity detected at startup.
 
@@ -126,23 +126,18 @@ growth succeed. A stale, missing or torn guard cannot override a valid filesyste
 A compatible filesystem at the same start grows only when available space after
 reservations exceeds its mounted block count. Equal, smaller and unavailable
 measurements leave its geometry unchanged. This policy is common to all boards
-and does not depend on previous fallback use. Moving its start requires a reset.
+and does not depend on previous fallback use. The filesystem start remains fixed.
 Recovery only writes the current storage range; it never erases the firmware or
 E10 sector.
 
-Pico first mounts candidate filesystems without writing, using LittleFS's CRC
-validation and persisted geometry. RP2350 inspects only the filesystem after the
-2 MiB reservation. RP2040 checks that location first, then the 1 MiB reservation
-only when the current capacity policy permits it. A reliable measurement of at
-least 4 MiB requires the 2 MiB reservation even if valid older metadata remains at
-1 MiB. A valid current filesystem at 2 MiB wins over stale metadata at 1 MiB when
-the measurement is smaller or missing.
+Pico first mounts the filesystem at the board's reservation boundary without
+writing, using LittleFS's CRC validation and persisted geometry.
 
 The persisted filesystem end must fit checked byte arithmetic and Pico's 16 MiB
 address window. On unchanged hardware, valid geometry retains the prior I/O
 extent. Reads and writes are bounded to that extent or a larger measured capacity
 before native consistency recovery, validation of application roots, growth,
-cleanup or guard repair can write. Rejected candidate probes never run consistency
+cleanup or guard repair can write. Rejected mounts never run consistency
 recovery. Later I/O remounts repeat it within the accepted bounds before reading entries.
 With no valid filesystem geometry, formatting uses only measured capacity or the
 board minimum, never the exploratory address window. With valid geometry, a
@@ -155,22 +150,15 @@ formatting. Actual flash I/O failures never trigger format.
 ESP32-S3 applies the same preserving root classification within its addressable
 extent. A later successful measurement can grow the filesystem again.
 
-The selected mount stays open through root validation and growth. With a matching
-guard, startup mounts a current 2 MiB layout once. An RP2040 filesystem at 1 MiB
-needs the preceding failed candidate mount at 2 MiB when that location fits the
-address window. Growth runs on the mounted filesystem. A stale guard requires an
-unmount for direct guard access and a remount for cleanup; guard access does not
+The mount stays open through root validation and growth. With a matching guard,
+startup mounts the filesystem once. Growth runs on the mounted filesystem. A stale
+guard requires an unmount for direct guard access and a remount for cleanup; guard access does not
 borrow the underlying driver while LittleFS owns it.
 
-Moving the Pico storage start from 1 MiB to 2 MiB on chips of at least 4 MiB is a
-breaking storage change and resets saved devices and preferences once. Later
-images can grow within their reserved area without resetting storage. A release
-containing this change needs a new minor version before 1.0 or a new major version
-from 1.0. Firmware downgrades are not supported.
+Firmware downgrades are not supported.
 
 Firmware artifact schema `2` records the minimum chip capacity, stable firmware
-reservation and `detected-tail` storage policy instead of claiming fixed runtime
-geometry. Current inspection and flashing tools reject schema `1` artifacts.
+reservation and `detected-tail` storage policy.
 
 ## Files
 

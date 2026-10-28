@@ -57,6 +57,28 @@ impl<F: Fleet> Model<F> {
             buttons,
         }
     }
+    pub(super) fn bootloader_dialog(&mut self, w: usize) -> DialogView {
+        let mut body = Layout::new(w);
+        body.para(
+            "Restart the adapter into USB programming mode?",
+            layout::bold(),
+        );
+        body.row();
+        body.para(
+            "Keyboard and mouse input stops until the adapter restarts. Saved bonds are kept and no firmware is installed.",
+            layout::plain(),
+        );
+        let mut buttons = Layout::new(w);
+        let mut right = Layout::new(w);
+        right.button("Cancel", Action::Cancel, Tone::Normal);
+        right.button("Enter Bootloader", Action::Confirm, Tone::Danger);
+        buttons.align_right(right);
+        DialogView {
+            title: "Enter Bootloader".into(),
+            body,
+            buttons,
+        }
+    }
     /// The adapter's page.
     pub(super) fn adapter_page(&mut self, id: &str, w: usize) -> PageView {
         let Some(a) = self.adapter(id).cloned() else {
@@ -128,9 +150,6 @@ impl<F: Fleet> Model<F> {
         let development = a.status.as_ref().is_some_and(model::development)
             && a.connected()
             && a.storage == Storage::Normal;
-        if development && self.tab == Tab::Diagnostics {
-            right.button("Files…", Action::Files, Tone::Normal);
-        }
         if self.tab == Tab::Diagnostics && restartable(a) {
             button_if(
                 &mut right,

@@ -42,12 +42,16 @@ pub struct Device {
     pub can_connect: bool,
 }
 
-/// An adapter's devices, followed in the menu by Add Device for that adapter.
+/// An adapter, shown as a submenu of its actions, followed by its devices.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Group {
     pub adapter: String,
-    pub title: Option<String>,
+    pub name: String,
     pub devices: Vec<Device>,
+    /// The adapter is connected, so it offers Disconnect in place of Connect.
+    pub connected: bool,
+    /// Connect or Disconnect can start now.
+    pub can_toggle: bool,
     /// The adapter is connected and ready, so it can add a device.
     pub can_add: bool,
 }
@@ -73,8 +77,10 @@ fn low(d: &DeviceView, threshold: i64) -> bool {
 
 pub fn model(adapters: &[AdapterView], devices: &[DeviceView], p: &Preferences) -> Model {
     let threshold = p.low_battery_percent;
-    // An adapter that is reconnecting keeps its devices listed, as last known.
-    let adapters: Vec<&AdapterView> = adapters
+    // Every adapter gets its submenu, for Connect, but only these keep the tray shown and list
+    // devices. An adapter that is reconnecting keeps its devices listed, as last known.
+    let all = adapters;
+    let adapters: Vec<&AdapterView> = all
         .iter()
         .filter(|a| {
             a.connected()
@@ -94,7 +100,7 @@ pub fn model(adapters: &[AdapterView], devices: &[DeviceView], p: &Preferences) 
         .collect();
     let tray = |d: &DeviceView| {
         let ready = ready.contains(d.adapter.as_str());
-        let mut label = format!("{} — {}", d.name, d.status());
+        let mut label = d.name.clone();
         if let Some(battery) = d.battery.as_ref().and_then(|b| b.text()) {
             label.push_str(" · ");
             label.push_str(&battery);
@@ -124,16 +130,25 @@ pub fn model(adapters: &[AdapterView], devices: &[DeviceView], p: &Preferences) 
         .iter()
         .flat_map(|a| a.attention.iter().map(|r| format!("{}: {r}", a.name)))
         .collect();
-    let groups = adapters
+    // A migration, even a failed one, holds every other adapter closed until it ends.
+    let migrating = all.iter().any(|a| {
+        matches!(
+            a.storage,
+            Storage::Migrating { .. } | Storage::Failed { .. }
+        )
+    });
+    let groups = all
         .iter()
         .map(|a| Group {
             adapter: a.id.clone(),
-            title: (adapters.len() > 1).then(|| a.name.clone()),
+            name: a.name.clone(),
             devices: devices
                 .iter()
                 .filter(|d| d.adapter == a.id)
                 .map(|d| tray(d))
                 .collect(),
+            connected: a.connected(),
+            can_toggle: a.connected() || (a.conn == Conn::Disconnected && !migrating),
             can_add: ready.contains(a.id.as_str()),
         })
         .collect();
@@ -286,6 +301,15 @@ fn text(label: &str) -> MenuItem<Item> {
     item(label, false, Vec::new())
 }
 
+fn submenu(label: &str, submenu: Vec<MenuItem<Item>>) -> MenuItem<Item> {
+    SubMenu {
+        label: mnemonic(label),
+        submenu,
+        ..Default::default()
+    }
+    .into()
+}
+
 impl ksni::Tray for Item {
     fn id(&self) -> String {
         "cordial".into()
@@ -326,9 +350,28 @@ impl ksni::Tray for Item {
             if i > 0 {
                 items.push(MenuItem::Separator);
             }
-            if let Some(title) = &g.title {
-                items.push(text(title));
-            }
+            let id = &g.adapter;
+            let page = Page::Adapter(id.clone());
+            let toggle = if g.connected {
+                ("Disconnect", Action::DisconnectAdapter(id.clone()))
+            } else {
+                ("Connect", Action::ConnectAdapter(id.clone()))
+            };
+            items.push(submenu(
+                &g.name,
+                vec![
+                    item(toggle.0, g.can_toggle, vec![Act(page.clone(), toggle.1)]),
+                    item("Open", true, vec![Present(Some(page))]),
+                    item(
+                        "Add Device",
+                        g.can_add,
+                        vec![
+                            Present(None),
+                            Act(Page::Overview, Action::AddDeviceTo(id.clone())),
+                        ],
+                    ),
+                ],
+            ));
             for d in &g.devices {
                 let page = d.page.clone();
                 let first = if d.connected {
@@ -345,23 +388,8 @@ impl ksni::Tray for Item {
                     )
                 };
                 let open = item("Open", true, vec![Present(Some(page))]);
-                items.push(
-                    SubMenu {
-                        label: mnemonic(&d.label),
-                        submenu: vec![first, open],
-                        ..Default::default()
-                    }
-                    .into(),
-                );
+                items.push(submenu(&d.label, vec![first, open]));
             }
-            items.push(item(
-                "Add Device",
-                g.can_add,
-                vec![
-                    Present(None),
-                    Act(Page::Overview, Action::AddDeviceTo(g.adapter.clone())),
-                ],
-            ));
         }
         items.extend([
             MenuItem::Separator,
@@ -410,7 +438,7 @@ fn work(rx: mpsc::Receiver<Option<Shown>>, emit: Emit) {
         match item.assume_sni_available(true).spawn() {
             Ok(h) => handle = Some(h),
             Err(e) => {
-                eprintln!("showing the tray icon failed: {e}");
+                crate::desktop::diagnostic(format_args!("showing the tray icon failed: {e}"));
                 unavailable = true;
             }
         }
@@ -435,7 +463,7 @@ impl Tray {
             .name("tray".into())
             .spawn(move || work(rx, emit));
         if let Err(e) = &spawned {
-            eprintln!("starting the tray failed: {e}");
+            crate::desktop::diagnostic(format_args!("starting the tray failed: {e}"));
         }
         Self {
             tx: spawned.ok().map(|_| tx),
@@ -485,6 +513,9 @@ mod tests {
     use super::*;
     use crate::desktop::services::alerts::tests::{adapter, battery, device};
     use crate::ui::app::AdapterView;
+    use cordial_protocol::{self as p, ErrorCode, InactiveReason};
+    use ksni::Tray as _;
+    use std::sync::Mutex;
 
     fn tray(adapters: &[AdapterView], devices: &[DeviceView], always: bool) -> Model {
         let p = Preferences {
@@ -501,6 +532,47 @@ mod tests {
             ready: false,
             ..adapter(id)
         }
+    }
+
+    /// The tray's item, recording the events its menu emits.
+    fn item(model: Model) -> (Item, Arc<Mutex<Vec<ServiceEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let item = Item {
+            shown: Shown {
+                model,
+                icon: Arc::new([]),
+            },
+            emit: Arc::new(move |e| sink.lock().unwrap().push(e)),
+        };
+        (item, events)
+    }
+
+    /// Each entry's label and whether it is enabled, with a submenu's entries in brackets.
+    fn labels(menu: &[MenuItem<Item>]) -> Vec<String> {
+        menu.iter()
+            .map(|i| match i {
+                MenuItem::Standard(s) => format!("{} {}", s.label, s.enabled),
+                MenuItem::SubMenu(s) => format!("{} [{}]", s.label, labels(&s.submenu).join(", ")),
+                MenuItem::Separator => "-".into(),
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    /// Activates the entry `entry` of the submenu at `at`, returning what it emitted.
+    fn click(model: Model, at: usize, entry: usize) -> Vec<ServiceEvent> {
+        let (mut item, events) = item(model);
+        let menu = item.menu();
+        let MenuItem::SubMenu(sub) = &menu[at] else {
+            panic!("no submenu at {at}")
+        };
+        let MenuItem::Standard(s) = &sub.submenu[entry] else {
+            panic!("no entry at {entry}")
+        };
+        assert!(s.enabled, "{} is disabled", s.label);
+        (s.activate)(&mut item);
+        events.lock().unwrap().clone()
     }
 
     #[test]
@@ -536,10 +608,7 @@ mod tests {
         );
         let model = tray(&[adapter("A")], &[low], false);
         assert_eq!((model.base, model.badge), (Base::Connected, Badge::Low));
-        assert_eq!(
-            model.groups[0].devices[0].label,
-            "1 — Connected · 20% (low)"
-        );
+        assert_eq!(model.groups[0].devices[0].label, "1 · 20% (low)");
         assert_eq!(model.tooltip, ["1 device connected", "1: battery 20%"]);
     }
 
@@ -559,29 +628,201 @@ mod tests {
     }
 
     #[test]
-    fn groups_devices_by_adapter_only_with_several_adapters() {
-        let one = tray(
+    fn labels_devices_by_name_and_battery_alone() {
+        let mut charged = device("A", 1, DeviceState::Connected);
+        charged.battery = battery(Some(80), Some(false));
+        let mut unread = device("A", 2, DeviceState::Disconnected);
+        unread.read_error = Some(p::Error {
+            code: ErrorCode::NotFound as i32,
+            ..Default::default()
+        });
+        let mut away = device("A", 3, DeviceState::Connected);
+        away.available = false;
+        let mut blocked = device("A", 4, DeviceState::Disconnected);
+        blocked.d.inactive = Some(InactiveReason::Blocked as i32);
+        let mut failed = device("A", 5, DeviceState::Disconnected);
+        failed.d.errors = vec![p::Error {
+            code: ErrorCode::NotFound as i32,
+            ..Default::default()
+        }];
+        let model = tray(
             &[adapter("A")],
-            &[device("A", 1, DeviceState::Disconnected)],
-            false,
-        );
-        assert_eq!(one.groups.len(), 1);
-        assert_eq!(one.groups[0].title, None);
-        assert_eq!(one.groups[0].devices[0].label, "1 — Disconnected");
-        let two = tray(
-            &[adapter("A"), adapter("B")],
             &[
-                device("A", 1, DeviceState::Disconnected),
-                device("B", 1, DeviceState::Disconnected),
+                charged,
+                unread,
+                away,
+                blocked,
+                failed,
+                device("A", 6, DeviceState::Connecting),
+                device("A", 7, DeviceState::Disconnecting),
             ],
             false,
         );
-        let titles: Vec<_> = two
-            .groups
+        let rows: Vec<_> = model.groups[0]
+            .devices
             .iter()
-            .map(|g| (g.title.clone().unwrap(), g.devices.len()))
+            .map(|d| d.label.as_str())
             .collect();
-        assert_eq!(titles, [("Adapter A".into(), 1), ("Adapter B".into(), 1)]);
+        assert_eq!(rows, ["1 · 80%", "2", "3", "4", "5", "6", "7"]);
+    }
+
+    #[test]
+    fn lists_one_adapter_as_a_submenu_above_its_devices() {
+        let mut d = device("A", 1, DeviceState::Disconnected);
+        d.battery = battery(Some(50), Some(false));
+        let model = tray(&[adapter("A")], &[d], false);
+        let (item, _) = item(model.clone());
+        assert_eq!(
+            labels(&item.menu()),
+            [
+                "Adapter A [Disconnect true, Open true, Add Device true]",
+                "1 · 50% [Connect true, Open true]",
+                "-",
+                "Open Cordial true",
+                "-",
+                "Settings true",
+                "Quit true",
+            ]
+        );
+        let a = || Page::Adapter("A".into());
+        assert_eq!(
+            click(model.clone(), 0, 0),
+            [ServiceEvent::Act(
+                a(),
+                Action::DisconnectAdapter("A".into())
+            )]
+        );
+        assert_eq!(
+            click(model.clone(), 0, 1),
+            [ServiceEvent::Present(Some(a()))]
+        );
+        assert_eq!(
+            click(model.clone(), 0, 2),
+            [
+                ServiceEvent::Present(None),
+                ServiceEvent::Act(Page::Overview, Action::AddDeviceTo("A".into())),
+            ]
+        );
+        assert_eq!(
+            click(model, 1, 0),
+            [ServiceEvent::Act(
+                Page::Device("A".into(), 1),
+                Action::Connect
+            )]
+        );
+    }
+
+    #[test]
+    fn gives_each_adapter_its_own_actions() {
+        let waiting = AdapterView {
+            ready: false,
+            ..adapter("C")
+        };
+        let model = tray(
+            &[adapter("A"), disconnected("B"), waiting],
+            &[
+                device("A", 1, DeviceState::Connected),
+                device("C", 1, DeviceState::Connected),
+            ],
+            false,
+        );
+        let (item, _) = item(model.clone());
+        assert_eq!(
+            labels(&item.menu()),
+            [
+                "Adapter A [Disconnect true, Open true, Add Device true]",
+                "1 [Disconnect true, Open true]",
+                "-",
+                "Adapter B [Connect true, Open true, Add Device false]",
+                "-",
+                "Adapter C [Disconnect true, Open true, Add Device false]",
+                "1 [Disconnect false, Open true]",
+                "-",
+                "Open Cordial true",
+                "-",
+                "Settings true",
+                "Quit true",
+            ]
+        );
+        let b = || Page::Adapter("B".into());
+        assert_eq!(
+            click(model.clone(), 3, 0),
+            [ServiceEvent::Act(b(), Action::ConnectAdapter("B".into()))]
+        );
+        assert_eq!(
+            click(model.clone(), 3, 1),
+            [ServiceEvent::Present(Some(b()))]
+        );
+        assert_eq!(
+            click(model, 5, 0),
+            [ServiceEvent::Act(
+                Page::Adapter("C".into()),
+                Action::DisconnectAdapter("C".into())
+            )]
+        );
+    }
+
+    #[test]
+    fn offers_connect_to_a_disconnected_adapter_while_always_shown() {
+        let model = tray(&[disconnected("A")], &[], true);
+        assert!(model.visible);
+        assert_eq!(model.empty, Some("No Adapter Connected"));
+        let (item, _) = item(model.clone());
+        assert_eq!(
+            labels(&item.menu())[..2],
+            [
+                "No Adapter Connected false",
+                "Adapter A [Connect true, Open true, Add Device false]",
+            ]
+        );
+        assert_eq!(
+            click(model, 1, 0),
+            [ServiceEvent::Act(
+                Page::Adapter("A".into()),
+                Action::ConnectAdapter("A".into())
+            )]
+        );
+    }
+
+    #[test]
+    fn holds_connect_while_an_adapter_connects_or_migrates() {
+        let toggles = |model: &Model| -> Vec<(bool, bool)> {
+            model
+                .groups
+                .iter()
+                .map(|g| (g.connected, g.can_toggle))
+                .collect()
+        };
+        let opening = AdapterView {
+            conn: Conn::Connecting,
+            status: None,
+            ..adapter("B")
+        };
+        let model = tray(&[adapter("A"), opening, disconnected("C")], &[], false);
+        assert_eq!(
+            toggles(&model),
+            [(true, true), (false, false), (false, true)]
+        );
+        for storage in [
+            Storage::Migrating {
+                waiting: false,
+                cancelling: false,
+                progress: None,
+            },
+            Storage::Failed {
+                text: String::new(),
+                reason: String::new(),
+            },
+        ] {
+            let migrating = AdapterView {
+                conn: Conn::Connecting,
+                ready: false,
+                storage,
+                ..adapter("A")
+            };
+            let model = tray(&[migrating, disconnected("B")], &[], true);
+            assert_eq!(toggles(&model), [(false, false), (false, false)]);
+        }
     }
 
     #[test]
@@ -641,67 +882,6 @@ mod tests {
             false,
         );
         assert!(!connecting.groups[0].devices[0].can_connect);
-    }
-
-    #[test]
-    fn offers_add_device_under_each_adapter() {
-        use ksni::Tray as _;
-        use std::sync::Mutex;
-        let waiting = AdapterView {
-            ready: false,
-            ..adapter("B")
-        };
-        let model = tray(
-            &[adapter("A"), waiting],
-            &[device("A", 1, DeviceState::Disconnected)],
-            false,
-        );
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let sink = events.clone();
-        let mut item = Item {
-            shown: Shown {
-                model,
-                icon: Arc::new([]),
-            },
-            emit: Arc::new(move |e| sink.lock().unwrap().push(e)),
-        };
-        let menu = item.menu();
-        let labels: Vec<_> = menu
-            .iter()
-            .map(|i| match i {
-                MenuItem::Standard(s) => format!("{} {}", s.label, s.enabled),
-                MenuItem::SubMenu(s) => s.label.clone(),
-                MenuItem::Separator => "-".into(),
-                _ => unreachable!(),
-            })
-            .collect();
-        assert_eq!(
-            labels,
-            [
-                "Adapter A false",
-                "1 — Disconnected",
-                "Add Device true",
-                "-",
-                "Adapter B false",
-                "Add Device false",
-                "-",
-                "Open Cordial true",
-                "-",
-                "Settings true",
-                "Quit true",
-            ]
-        );
-        let MenuItem::Standard(add) = &menu[2] else {
-            unreachable!()
-        };
-        (add.activate)(&mut item);
-        assert_eq!(
-            *events.lock().unwrap(),
-            [
-                ServiceEvent::Present(None),
-                ServiceEvent::Act(Page::Overview, Action::AddDeviceTo("A".into())),
-            ]
-        );
     }
 
     #[test]

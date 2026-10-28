@@ -1,8 +1,8 @@
 //! Foreground, non-terminal command runner. No background service or reconnect loop.
 use crate::{
     controller::{
-        Cancellation, Command, Controller, Event, Notice, Outcome, Phase, RunOptions, SessionId,
-        State, Ticket, Wait,
+        Cancellation, Command, Connector, Controller, Event, Notice, Outcome, Phase, RunOptions,
+        SessionId, State, Ticket, Wait,
     },
     error::Error,
     migration::{self, Engine, Worker},
@@ -16,7 +16,10 @@ use cordial_protocol::{self as p, event, message};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, BufReader, Read, Write},
-    sync::mpsc::{self, Receiver, RecvTimeoutError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -68,6 +71,10 @@ impl Options {
                 }
                 _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
                 _ => {
+                    if arg == "tui" {
+                        options.args.push(arg);
+                        continue;
+                    }
                     options.args.push(arg);
                     options.args.extend(args);
                     break;
@@ -93,7 +100,7 @@ fn write_line(out: &mut dyn Write, line: &str) -> Result<(), Error> {
 }
 
 /// A message as one line of protobuf JSON.
-fn json(kind: message::Kind) -> String {
+pub(crate) fn json(kind: message::Kind) -> String {
     let message = p::Message { kind: Some(kind) };
     text::terminal_json(&serde_json::to_string(&message).unwrap_or_default())
 }
@@ -101,8 +108,8 @@ fn json(kind: message::Kind) -> String {
 pub struct Script {
     pub options: Options,
     pub cancellation: Cancellation,
-    /// Migrates an adapter whose saved data needs it before any command runs.
-    pub engine: Engine,
+    /// Overrides the connector-backed migration engine used before commands run.
+    pub engine: Option<Engine>,
 }
 
 type Handler = Box<dyn FnMut(Received<'_>) + Send>;
@@ -127,6 +134,18 @@ impl Script {
         diagnostics: &mut dyn Write,
         connect: impl Fn(&str, Handler) -> io::Result<Connection> + Send + Sync + 'static,
     ) -> Result<(), Error> {
+        self.with_backend(input, out, diagnostics, connect, serial::ports)
+    }
+
+    /// Runs the foreground loop with supplied connections and port discovery.
+    pub fn with_backend(
+        &self,
+        input: impl Read + Send + 'static,
+        out: &mut dyn Write,
+        diagnostics: &mut dyn Write,
+        connect: impl Fn(&str, Handler) -> io::Result<Connection> + Send + Sync + 'static,
+        ports: impl Fn() -> io::Result<Vec<serial::PortInfo>> + Send + Sync + 'static,
+    ) -> Result<(), Error> {
         let one_shot = !self.options.args.is_empty();
         let first = if one_shot {
             Some(command::parse(&self.options.args).map_err(Error::new)?)
@@ -134,12 +153,12 @@ impl Script {
             None
         };
         if let Some(Line::Help(_) | Line::List) = &first {
-            return self.local(first.as_ref().unwrap(), None, out, diagnostics);
+            return self.local(first.as_ref().unwrap(), None, out);
         }
         let port = match &self.options.port {
             Some(port) => port.clone(),
             None => {
-                let ports = serial::ports()?;
+                let ports = ports()?;
                 if ports.len() != 1 {
                     return Err(Error::new(
                         "select an adapter with --port; use cordial adapter list",
@@ -149,16 +168,49 @@ impl Script {
             }
         };
         let (sink, events) = mpsc::sync_channel(512);
-        let controller = Controller::with_connector(
+        let connector: Arc<Connector> = Arc::new(connect);
+        let connector = if self.options.json {
+            let raw = sink.clone();
+            crate::json::observe(
+                connector,
+                Arc::new(move |diagnostic| {
+                    use cordial_client::diagnostics::Diagnostic;
+                    let kind = match diagnostic {
+                        Diagnostic::Response(_, response) => {
+                            message::Kind::Response(response.clone())
+                        }
+                        Diagnostic::Event(event) => message::Kind::Event(event.clone()),
+                        Diagnostic::Completed(_) => return,
+                    };
+                    let _ = raw.try_send(RunMessage::Raw(kind));
+                }),
+            )
+        } else {
+            connector
+        };
+        let connect = connector.clone();
+        let ports = Arc::new(ports);
+        let reconnect_ports = ports.clone();
+        let explicit = self.options.port.is_some();
+        let controller = Controller::with_backend(
             move |event| {
-                let _ = sink.send(event);
+                let _ = sink.send(RunMessage::Controller(event));
             },
-            connect,
+            move |port, handler| connect(port, handler),
+            move || {
+                if explicit {
+                    Ok(Vec::new())
+                } else {
+                    reconnect_ports()
+                }
+            },
         );
         let mut run = Run {
             script: self,
             controller: &controller,
             events: &events,
+            connector,
+            ports,
             input: Some(Box::new(input)),
             lines: None,
             one_shot,
@@ -176,37 +228,22 @@ impl Script {
         let end = Instant::now() + Duration::from_secs(2);
         while !run.closed && Instant::now() < end {
             match events.recv_timeout(Duration::from_millis(25)) {
-                Ok(Event::Closed) | Err(RecvTimeoutError::Disconnected) => break,
-                Ok(Event::Notice { session, notice })
-                    if self.options.json && session == run.session =>
-                {
-                    let _ = run.notice(&notice, None, out, diagnostics);
+                Ok(RunMessage::Controller(Event::Closed)) | Err(RecvTimeoutError::Disconnected) => {
+                    break;
                 }
+                Ok(RunMessage::Raw(kind)) => write_line(diagnostics, &json(kind))?,
                 _ => {}
             }
         }
         result
     }
 
-    fn local(
-        &self,
-        line: &Line,
-        state: Option<&State>,
-        out: &mut dyn Write,
-        diagnostics: &mut dyn Write,
-    ) -> Result<(), Error> {
+    fn local(&self, line: &Line, state: Option<&State>, out: &mut dyn Write) -> Result<(), Error> {
         match line {
-            Line::Help(topic) => write_line(
-                if self.options.json { diagnostics } else { out },
-                &command::help_on(state, topic.as_deref()),
-            ),
+            Line::Help(topic) => write_line(out, &command::help_on(state, topic.as_deref())),
             Line::List => {
                 let ports = serial::ports()?;
-                let value = if self.options.json {
-                    text::ports_json(&ports)
-                } else {
-                    text::ports(&ports)
-                };
+                let value = text::ports(&ports);
                 write_line(out, &value)
             }
             _ => Ok(()),
@@ -223,10 +260,17 @@ impl Script {
 
 type Lines = Receiver<Result<Option<String>, Error>>;
 
+enum RunMessage {
+    Controller(Event),
+    Raw(message::Kind),
+}
+
 struct Run<'a> {
     script: &'a Script,
     controller: &'a Controller,
-    events: &'a Receiver<Event>,
+    events: &'a Receiver<RunMessage>,
+    connector: Arc<Connector>,
+    ports: Arc<dyn Fn() -> io::Result<Vec<serial::PortInfo>> + Send + Sync>,
     /// Standard input, until the first line is needed.
     input: Option<Box<dyn Read + Send>>,
     lines: Option<Lines>,
@@ -244,28 +288,12 @@ struct Run<'a> {
 }
 
 impl Run<'_> {
-    fn json(&self) -> bool {
-        self.script.options.json
-    }
-
     fn notice(
         &self,
         notice: &Notice,
         state: Option<&State>,
         out: &mut dyn Write,
-        diagnostics: &mut dyn Write,
     ) -> Result<(), Error> {
-        if self.json() {
-            match notice {
-                Notice::Event { event, .. } => {
-                    return write_line(out, &json(message::Kind::Event(event.clone())));
-                }
-                Notice::Response(response) => {
-                    return write_line(out, &json(message::Kind::Response(response.clone())));
-                }
-                Notice::RefreshFailed(_) => {}
-            }
-        }
         // A one-shot scan reports its own summary.
         if let Notice::Event { event, .. } = notice
             && matches!(event.kind, Some(event::Kind::ScanDone(_)))
@@ -278,7 +306,7 @@ impl Run<'_> {
             return Ok(());
         }
         if let Some(line) = text::notice(notice, state) {
-            write_line(if self.json() { diagnostics } else { out }, &line)?;
+            write_line(out, &line)?;
         }
         Ok(())
     }
@@ -453,7 +481,7 @@ impl Run<'_> {
                         } else {
                             "The adapter's saved data doesn't need migration."
                         };
-                        write_line(if self.json() { diagnostics } else { out }, line)?;
+                        write_line(out, line)?;
                         if self.one_shot && self.foreground.is_none() {
                             return Ok(());
                         }
@@ -475,7 +503,7 @@ impl Run<'_> {
                     }
                     Line::Help(_) | Line::List => {
                         let st = self.controller.state();
-                        self.script.local(&line, st.as_ref(), out, diagnostics)?;
+                        self.script.local(&line, st.as_ref(), out)?;
                         if self.one_shot && self.foreground.is_none() {
                             return Ok(());
                         }
@@ -505,9 +533,10 @@ impl Run<'_> {
                 }
             }
             match self.events.recv_timeout(Duration::from_millis(20)) {
-                Ok(Event::Connection {
+                Ok(RunMessage::Raw(kind)) => write_line(diagnostics, &json(kind))?,
+                Ok(RunMessage::Controller(Event::Connection {
                     session: id, phase, ..
-                }) if id == self.session => match phase {
+                })) if id == self.session => match phase {
                     Phase::Opened => opened = true,
                     // A restart doesn't need the saved data migrated.
                     Phase::Migrate if matches!(next, Some(Line::Run(Command::Restart))) => {
@@ -550,21 +579,20 @@ impl Run<'_> {
                         starting.get_or_insert(Instant::now() + STARTUP_LIMIT);
                     }
                 },
-                Ok(Event::Notice {
+                Ok(RunMessage::Controller(Event::Notice {
                     session: id,
                     notice,
-                }) if id == self.session => {
+                })) if id == self.session => {
                     let st = self.controller.state();
-                    self.notice(&notice, st.as_ref(), out, diagnostics)?
+                    self.notice(&notice, st.as_ref(), out)?
                 }
-                Ok(Event::Done {
+                Ok(RunMessage::Controller(Event::Done {
                     session: id,
                     ticket,
                     result,
-                }) if id == self.session => {
+                })) if id == self.session => {
                     if let Some((command, filter)) = self.pending.remove(&ticket) {
                         let state = self.controller.state();
-                        let dest: &mut dyn Write = if self.json() { diagnostics } else { out };
                         match result {
                             Ok(outcome) => {
                                 let line = if matches!(outcome, Outcome::Devices) {
@@ -575,7 +603,7 @@ impl Run<'_> {
                                 } else {
                                     text::outcome(&command, &outcome, state.as_ref())
                                 };
-                                write_line(dest, &line)?;
+                                write_line(out, &line)?;
                             }
                             Err(error) => {
                                 let error = text::failure_text(&command, &error);
@@ -604,6 +632,11 @@ impl Run<'_> {
 
 const MIGRATED: &str = "Migrated the adapter's saved data.";
 
+enum MigrationMessage {
+    Event(p::migration::MigrationEvent),
+    Done(cordial_client::migration::Result<cordial_client::migration::Outcome>),
+}
+
 impl Run<'_> {
     /// Migrates the open adapter and returns the port to open it on again. The session closes
     /// and releases its port first, and the worker runs until it finishes or Ctrl+C cancels it.
@@ -613,7 +646,8 @@ impl Run<'_> {
         self.controller.close();
         loop {
             match self.events.recv() {
-                Ok(Event::Closed) => break,
+                Ok(RunMessage::Controller(Event::Closed)) => break,
+                Ok(RunMessage::Raw(kind)) => write_line(diagnostics, &json(kind))?,
                 Ok(_) => {}
                 Err(_) => return Err(Error::new("control event stream closed")),
             }
@@ -622,27 +656,42 @@ impl Run<'_> {
         // The worker's result is awaited even if diagnostics can't be written.
         let _ = write_line(diagnostics, "Migrating the adapter's saved data…");
         let (tx, rx) = mpsc::channel();
+        let engine = self.script.engine.clone().unwrap_or_else(|| {
+            let connector = self.connector.clone();
+            let ports = self.ports.clone();
+            migration::with_backend(connector, move || ports())
+        });
         let done = tx.clone();
         let worker = Worker::start(
-            &self.script.engine,
+            &engine,
             id.clone(),
             Some(port.clone()),
             move |event| {
-                let _ = tx.send(Ok(event));
+                let _ = tx.send(MigrationMessage::Event(event));
             },
             move |result| {
-                let _ = done.send(Err(result));
+                let _ = done.send(MigrationMessage::Done(result));
             },
         );
         let (mut waiting, mut cancelled) = (false, false);
+        let mut output_error = None;
         let result = loop {
             if !cancelled && self.script.cancellation.cancelled() {
                 cancelled = true;
                 worker.cancel();
             }
+            while let Ok(message) = self.events.try_recv() {
+                if let RunMessage::Raw(kind) = message
+                    && output_error.is_none()
+                    && let Err(error) = write_line(diagnostics, &json(kind))
+                {
+                    output_error = Some(error);
+                    worker.cancel();
+                }
+            }
             use cordial_protocol::migration::migration_event::Event as M;
             match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(Ok(event)) => match event.event {
+                Ok(MigrationMessage::Event(event)) => match event.event {
                     Some(M::Waiting(_)) if !waiting => {
                         waiting = true;
                         let _ = write_line(diagnostics, "Waiting for the adapter…");
@@ -650,19 +699,34 @@ impl Run<'_> {
                     Some(M::Progress(_)) => waiting = false,
                     _ => {}
                 },
-                Ok(Err(result)) => break result,
+                // The worker closes its connection before reporting completion, so all raw
+                // messages, including those received during close, precede this result.
+                Ok(MigrationMessage::Done(result)) => {
+                    while let Ok(message) = self.events.try_recv() {
+                        if let RunMessage::Raw(kind) = message
+                            && output_error.is_none()
+                            && let Err(error) = write_line(diagnostics, &json(kind))
+                        {
+                            output_error = Some(error);
+                        }
+                    }
+                    break result;
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     unreachable!("the worker reports its result")
                 }
             }
         };
+        if let Some(error) = output_error {
+            return Err(error);
+        }
         match result {
             Ok(cordial_client::migration::Outcome::Success) => {
                 if !quiet {
                     write_line(diagnostics, MIGRATED)?;
                 }
-                let found = serial::ports()
+                let found = (self.ports)()
                     .ok()
                     .and_then(|ports| ports.into_iter().find(|p| p.is_adapter(&id)));
                 Ok(found.map_or(port, |p| p.port))
@@ -702,4 +766,491 @@ fn read_lines(input: Box<dyn Read + Send>) -> Lines {
         }
     });
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::Dongle;
+    use std::{fs, io::Cursor, path::PathBuf};
+
+    struct Directory(PathBuf);
+
+    impl Directory {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("cordial-cli-files-{}-{name}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn script(dongle: &Dongle, args: &[&str], json: bool) -> (Result<(), Error>, String, String) {
+        let mut out = Vec::new();
+        let mut diagnostics = Vec::new();
+        let result = Script {
+            options: Options {
+                port: Some("simulated".into()),
+                json,
+                args: args.iter().map(|s| (*s).into()).collect(),
+                ..Default::default()
+            },
+            cancellation: Cancellation::default(),
+            engine: Some(Arc::new(|_, _, _, _| panic!("no migration is expected"))),
+        }
+        .with_connector(
+            Cursor::new(Vec::new()),
+            &mut out,
+            &mut diagnostics,
+            dongle.connector(),
+        );
+        (
+            result,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(diagnostics).unwrap(),
+        )
+    }
+
+    fn responses(out: &str) -> Vec<p::Response> {
+        out.lines()
+            .filter_map(|line| {
+                let message: p::Message = serde_json::from_str(line).unwrap();
+                match message.kind {
+                    Some(message::Kind::Response(response)) => Some(response),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn json_file_download_includes_the_complete_response_contents() {
+        let dir = Directory::new("json");
+        let local = dir.0.join("download.bin");
+        let data: Vec<u8> = (0..1537).map(|n| n as u8).collect();
+        let dongle = Dongle::with(|sim| {
+            sim.data.insert("/data.bin".into(), data.clone());
+        });
+        let (result, out, diagnostics) = script(
+            &dongle,
+            &["file", "get", "/data.bin", local.to_str().unwrap()],
+            true,
+        );
+        result.unwrap();
+        let files: Vec<_> = responses(&diagnostics)
+            .into_iter()
+            .filter_map(|response| match response.result {
+                Some(p::response::Result::File(file)) => Some(file),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            files,
+            [p::FileData {
+                path: "/data.bin".into(),
+                offset: 0,
+                size: data.len() as u64,
+                data: data.clone(),
+            }]
+        );
+        assert_eq!(fs::read(local).unwrap(), data);
+        assert!(out.contains("1537 bytes"), "{out}");
+    }
+
+    #[test]
+    fn file_put_handles_empty_files_and_chunk_boundaries_with_readback() {
+        let dir = Directory::new("put");
+        for size in [0, 512, 513, 1300] {
+            let local = dir.0.join("upload.bin");
+            let data: Vec<u8> = (0..size).map(|n| n as u8).collect();
+            fs::write(&local, &data).unwrap();
+            let dongle = Dongle::with(|sim| {
+                sim.files.insert("/".into(), Vec::new());
+                if size > 512 {
+                    sim.data.insert("/data.bin".into(), vec![9; 1600]);
+                }
+            });
+            let (result, out, diagnostics) = script(
+                &dongle,
+                &["file", "put", local.to_str().unwrap(), "/data.bin"],
+                true,
+            );
+            result.unwrap();
+            assert!(out.contains(&format!("{size} bytes")), "{out}");
+            let sim = dongle.0.lock().unwrap();
+            assert_eq!(sim.data["/data.bin"], data);
+            assert!(!sim.data.contains_key("/.file-upload"));
+            let mut written = Vec::new();
+            let mut read = 0;
+            for command in &sim.log {
+                match command {
+                    p::request::Command::WriteFile(file) => {
+                        assert!(file.data.len() <= 512);
+                        assert_eq!(file.offset, written.len() as u64);
+                        written.extend_from_slice(&file.data);
+                        assert_eq!(
+                            file.path,
+                            if size > 512 {
+                                "/.file-upload"
+                            } else {
+                                "/data.bin"
+                            }
+                        );
+                    }
+                    p::request::Command::ReadFile(file) => {
+                        assert_eq!(file.length, Some(512));
+                        read += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(written, data);
+            let readbacks: Vec<_> = responses(&diagnostics)
+                .into_iter()
+                .filter_map(|response| match response.result {
+                    Some(p::response::Result::File(file)) => Some(file),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(readbacks.len(), read);
+            let uploaded: Vec<_> = readbacks
+                .iter()
+                .filter(|file| file.path == "/data.bin")
+                .flat_map(|file| file.data.iter().copied())
+                .collect();
+            assert_eq!(uploaded, data);
+            assert_eq!(
+                sim.log
+                    .iter()
+                    .any(|c| matches!(c, p::request::Command::MoveFile(_))),
+                size > 512
+            );
+        }
+    }
+
+    #[test]
+    fn file_put_stops_on_write_readback_and_move_errors_without_replacing_the_destination() {
+        let dir = Directory::new("put-error");
+        let local = dir.0.join("upload.bin");
+        fs::write(&local, vec![7; 1200]).unwrap();
+        for command in ["write_file", "read_file", "move_file"] {
+            let dongle = Dongle::with(|sim| {
+                sim.files.insert("/".into(), Vec::new());
+                sim.data.insert("/data.bin".into(), vec![3; 700]);
+                sim.refuse.insert(
+                    command,
+                    p::Error {
+                        code: p::ErrorCode::StorageFailed as i32,
+                        reason: p::ErrorReason::Storage as i32,
+                        outcome: p::ErrorOutcome::Unknown as i32,
+                        ..Default::default()
+                    },
+                );
+            });
+            let (result, out, diagnostics) = script(
+                &dongle,
+                &["file", "put", local.to_str().unwrap(), "/data.bin"],
+                true,
+            );
+            let error = result.unwrap_err();
+            assert!(error.message.contains("couldn't confirm"), "{error}");
+            assert!(!out.contains("Uploaded"));
+            assert!(responses(&diagnostics).iter().any(|response| matches!(
+                &response.result,
+                Some(p::response::Result::Error(error))
+                    if error.outcome() == p::ErrorOutcome::Unknown
+            )));
+            assert_eq!(dongle.0.lock().unwrap().data["/data.bin"], vec![3; 700]);
+            assert_eq!(dongle.sent().last(), Some(&command));
+        }
+    }
+
+    #[test]
+    fn file_put_preserves_existing_scratch_files_and_directories() {
+        let dir = Directory::new("occupied");
+        let local = dir.0.join("upload.bin");
+        fs::write(&local, vec![7; 1200]).unwrap();
+        for (directory, size) in [(false, 0), (false, 600), (true, 0)] {
+            let dongle = Dongle::with(|sim| {
+                sim.files.insert(
+                    "/".into(),
+                    vec![p::FileEntry {
+                        name: ".file-upload".into(),
+                        directory,
+                        size,
+                    }],
+                );
+                sim.data.insert("/data.bin".into(), vec![3; 700]);
+                let path = if directory {
+                    "/.file-upload/keep.bin"
+                } else {
+                    "/.file-upload"
+                };
+                sim.data.insert(path.into(), vec![9; size as usize]);
+            });
+            let before = dongle.0.lock().unwrap().data.clone();
+            let (result, out, diagnostics) = script(
+                &dongle,
+                &["file", "put", local.to_str().unwrap(), "/data.bin"],
+                true,
+            );
+            assert!(
+                result.unwrap_err().message.contains("already exists"),
+                "{diagnostics}"
+            );
+            assert!(!out.contains("Uploaded"));
+            assert_eq!(dongle.0.lock().unwrap().data, before);
+            assert_eq!(dongle.sent().last(), Some(&"list_files"));
+            assert!(!dongle.sent().contains(&"write_file"));
+        }
+    }
+
+    #[test]
+    fn file_put_does_not_write_when_the_scratch_check_fails() {
+        let dir = Directory::new("inventory-error");
+        let local = dir.0.join("upload.bin");
+        fs::write(&local, vec![7; 1200]).unwrap();
+        let dongle = Dongle::with(|sim| {
+            sim.data.insert("/data.bin".into(), vec![3; 700]);
+            sim.refuse.insert(
+                "list_files",
+                p::Error {
+                    code: p::ErrorCode::StorageFailed as i32,
+                    outcome: p::ErrorOutcome::NoEffect as i32,
+                    ..Default::default()
+                },
+            );
+        });
+        let (result, out, _) = script(
+            &dongle,
+            &["file", "put", local.to_str().unwrap(), "/data.bin"],
+            true,
+        );
+        assert!(result.unwrap_err().message.contains("couldn't prepare"));
+        assert!(!out.contains("Uploaded"));
+        assert_eq!(dongle.0.lock().unwrap().data["/data.bin"], vec![3; 700]);
+        assert!(!dongle.sent().contains(&"write_file"));
+    }
+
+    #[test]
+    fn file_put_reports_an_acknowledged_upload_when_readback_fails() {
+        let dir = Directory::new("readback-error");
+        let local = dir.0.join("upload.bin");
+        fs::write(&local, b"data").unwrap();
+        let dongle = Dongle::with(|sim| {
+            sim.refuse.insert(
+                "read_file",
+                p::Error {
+                    code: p::ErrorCode::StorageFailed as i32,
+                    outcome: p::ErrorOutcome::NoEffect as i32,
+                    ..Default::default()
+                },
+            );
+        });
+        let (result, out, _) = script(
+            &dongle,
+            &["file", "put", local.to_str().unwrap(), "/data.bin"],
+            true,
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("acknowledged the upload, but its contents couldn't be verified")
+        );
+        assert!(!out.contains("Uploaded"));
+        assert_eq!(dongle.0.lock().unwrap().data["/data.bin"], b"data");
+        assert_eq!(
+            dongle.sent().iter().filter(|&&c| c == "write_file").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn file_mutations_are_not_retried_after_losing_the_acknowledgement() {
+        let dir = Directory::new("lost-acknowledgement");
+        let local = dir.0.join("upload.bin");
+        for (delayed, size) in [
+            ("write_file", 3),
+            ("write_file", 1200),
+            ("move_file", 1200),
+            ("delete_file", 0),
+        ] {
+            let data = vec![7; size];
+            fs::write(&local, &data).unwrap();
+            let dongle = Dongle::with(|sim| {
+                sim.files.insert("/".into(), Vec::new());
+                sim.data.insert("/data.bin".into(), vec![3; 700]);
+                sim.slow.insert(delayed, Duration::from_secs(1));
+            });
+            let args = if delayed == "delete_file" {
+                vec!["file", "delete", "/data.bin"]
+            } else {
+                vec!["file", "put", local.to_str().unwrap(), "/data.bin"]
+            };
+            let mut out = Vec::new();
+            let mut diagnostics = Vec::new();
+            let connect = dongle.connector();
+            let result = Script {
+                options: Options {
+                    port: Some("simulated".into()),
+                    args: args.into_iter().map(str::to_owned).collect(),
+                    ..Default::default()
+                },
+                cancellation: Cancellation::default(),
+                engine: Some(Arc::new(|_, _, _, _| panic!("no migration is expected"))),
+            }
+            .with_connector(
+                Cursor::new(Vec::new()),
+                &mut out,
+                &mut diagnostics,
+                move |port, handler| {
+                    let connection = connect(port, handler)?;
+                    connection.set_timeout(Some(Duration::from_millis(100)));
+                    Ok(connection)
+                },
+            );
+            let error = result.unwrap_err();
+            assert!(error.message.contains("couldn't confirm"), "{error}");
+            assert!(out.is_empty());
+            assert_eq!(dongle.sent().last(), Some(&delayed));
+            assert_eq!(dongle.sent().iter().filter(|&&c| c == delayed).count(), 1);
+            let sim = dongle.0.lock().unwrap();
+            match (delayed, size) {
+                ("delete_file", _) => assert!(!sim.data.contains_key("/data.bin")),
+                ("write_file", 1200) => {
+                    assert_eq!(sim.data["/data.bin"], vec![3; 700]);
+                    assert_eq!(sim.data["/.file-upload"], data[..512]);
+                }
+                _ => assert_eq!(sim.data["/data.bin"], data),
+            }
+        }
+    }
+
+    #[test]
+    fn file_commands_validate_paths_and_capabilities_before_writing() {
+        let dir = Directory::new("validation");
+        let local = dir.0.join("upload.bin");
+        fs::write(&local, b"data").unwrap();
+        for path in [
+            "/",
+            "relative",
+            "/a/../b",
+            "/a//b",
+            "/a/",
+            "/.file-write-0123456789abcdef",
+        ] {
+            let dongle = Dongle::default();
+            let (result, _, _) = script(
+                &dongle,
+                &["file", "put", local.to_str().unwrap(), path],
+                false,
+            );
+            assert_eq!(result.unwrap_err().message, "invalid adapter file path");
+            let (result, _, _) = script(&dongle, &["file", "delete", path], false);
+            assert_eq!(result.unwrap_err().message, "invalid adapter file path");
+            assert!(!dongle.sent().contains(&"write_file"));
+            assert!(!dongle.sent().contains(&"delete_file"));
+        }
+        let dongle = Dongle::default();
+        let (result, _, _) = script(&dongle, &["file", "delete", "/format.pb"], false);
+        assert_eq!(
+            result.unwrap_err().message,
+            "the adapter's storage format file cannot be deleted"
+        );
+        assert!(!dongle.sent().contains(&"delete_file"));
+        let dongle = Dongle::with(|sim| {
+            sim.status.information.as_mut().unwrap().development_build = Some(false);
+        });
+        for args in [
+            vec!["file", "put", local.to_str().unwrap(), "/data.bin"],
+            vec!["file", "delete", "/data.bin"],
+        ] {
+            let (result, _, _) = script(&dongle, &args, false);
+            assert_eq!(
+                result.unwrap_err().message,
+                "this adapter doesn't offer file access"
+            );
+        }
+        assert!(!dongle.sent().contains(&"write_file"));
+        assert!(!dongle.sent().contains(&"delete_file"));
+        fs::write(&local, vec![7; 600]).unwrap();
+        let dongle = Dongle::default();
+        let (result, _, _) = script(
+            &dongle,
+            &["file", "put", local.to_str().unwrap(), "/.file-upload"],
+            false,
+        );
+        assert_eq!(
+            result.unwrap_err().message,
+            "the upload destination is also the temporary transfer path"
+        );
+        assert!(!dongle.sent().contains(&"write_file"));
+    }
+
+    #[test]
+    fn file_delete_reports_the_acknowledged_result() {
+        let dongle = Dongle::with(|sim| {
+            sim.data.insert("/data.bin".into(), vec![1, 2, 3]);
+        });
+        let (result, out, _) = script(&dongle, &["file", "delete", "/data.bin"], false);
+        result.unwrap();
+        assert_eq!(out, "Deleted /data.bin from the adapter.\n");
+        assert!(!dongle.0.lock().unwrap().data.contains_key("/data.bin"));
+    }
+
+    #[test]
+    fn concurrent_uploads_keep_their_chunks_and_destinations_separate() {
+        let dir = Directory::new("concurrent");
+        let local = [dir.0.join("first.bin"), dir.0.join("second.bin")];
+        fs::write(&local[0], vec![1; 1200]).unwrap();
+        fs::write(&local[1], vec![2; 1500]).unwrap();
+        let dongle = Dongle::with(|sim| {
+            sim.files.insert("/".into(), Vec::new());
+            sim.slow.insert("write_file", Duration::from_millis(5));
+        });
+        let (send, events) = mpsc::channel();
+        let controller =
+            Controller::with_connector(move |event| send.send(event).unwrap(), dongle.connector());
+        controller.open("simulated".into());
+        while !matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Event::Connection {
+                phase: Phase::Ready,
+                ..
+            }
+        ) {}
+        for (local, path) in local.into_iter().zip(["/first.bin", "/second.bin"]) {
+            controller.run(
+                Command::FilePut {
+                    local,
+                    path: path.into(),
+                },
+                RunOptions::default(),
+            );
+        }
+        let mut completed = 0;
+        while completed < 2 {
+            if let Event::Done { result, .. } = events.recv_timeout(Duration::from_secs(5)).unwrap()
+            {
+                result.unwrap();
+                completed += 1;
+            }
+        }
+        controller.close();
+        while !matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Event::Closed
+        ) {}
+        let sim = dongle.0.lock().unwrap();
+        assert_eq!(sim.data["/first.bin"], vec![1; 1200]);
+        assert_eq!(sim.data["/second.bin"], vec![2; 1500]);
+        assert!(!sim.data.contains_key("/.file-upload"));
+    }
 }

@@ -313,8 +313,8 @@ impl<F: NorFlash + 'static> Storage<F> {
             .finish_startup(range, format_end, available_end, identity, marker_matches)
             .await
     }
-    /// Selects a Pico filesystem with read-only probes, then resolves bounded native consistency.
-    /// A current 2 MiB reservation takes precedence over stale 1 MiB metadata.
+    /// Opens a Pico filesystem at the board's fixed firmware reservation, then
+    /// resolves native consistency within its checked geometry.
     /// A measured capacity below the board minimum forbids formatting, but does
     /// not override an existing filesystem with valid geometry and roots.
     pub async fn open_detected(
@@ -326,59 +326,51 @@ impl<F: NorFlash + 'static> Storage<F> {
     ) -> Result<Self, Error> {
         let addressable = u32::try_from(flash.capacity()).map_err(|_| Error::Bounds)?;
         let format_end = available_end.unwrap_or(minimum);
-        let reservation = flash_range(format_end.max(minimum))?.start;
+        let start = flash_range(minimum)?.start;
         if format_end > addressable {
             return Err(Error::Bounds);
         }
-        // RP2350's minimum selects only 2 MiB. RP2040 can also have a current
-        // 1 MiB reservation, unless reliable capacity requires the larger one.
-        for start in [2 * 1024 * 1024, 1024 * 1024] {
-            if start < reservation || start + 3 * BLOCK_BYTES as u32 > addressable {
-                continue;
-            }
-            let range = start..addressable;
-            Self::config(&flash, &range)?;
-            let marker_matches = Self::marker_matches(&mut flash, start, &identity).await?;
-            let mut store = Self::new(flash, &range, random);
-            let geometry = store.mount.probe_geometry();
-            match geometry {
-                Ok(bytes) => {
-                    let end = u32::try_from(bytes)
-                        .ok()
-                        .and_then(|bytes| start.checked_add(BLOCK_BYTES as u32)?.checked_add(bytes))
-                        .filter(|end| *end <= addressable);
-                    if let Some(end) = end {
-                        // Checked geometry retains the filesystem's extent for I/O
-                        // and root recovery. Only a larger measurement expands it.
-                        let io_end = end.max(available_end.unwrap_or(end));
-                        store
-                            .mount
-                            .blocks
-                            .set((io_end - start) as usize / BLOCK_BYTES - 1);
-                        // Consistency recovery can write only inside the accepted extent.
-                        store.mount.recover().map_err(error)?;
-                        return store
-                            .finish_startup(
-                                start..io_end,
-                                (format_end >= minimum).then_some(io_end),
-                                available_end,
-                                identity,
-                                marker_matches,
-                            )
-                            .await;
-                    }
+        let range = start..addressable;
+        Self::config(&flash, &range)?;
+        let marker_matches = Self::marker_matches(&mut flash, start, &identity).await?;
+        let mut store = Self::new(flash, &range, random);
+        let geometry = store.mount.probe_geometry();
+        match geometry {
+            Ok(bytes) => {
+                let end = u32::try_from(bytes)
+                    .ok()
+                    .and_then(|bytes| start.checked_add(BLOCK_BYTES as u32)?.checked_add(bytes))
+                    .filter(|end| *end <= addressable);
+                if let Some(end) = end {
+                    // Checked geometry retains the filesystem's extent for I/O
+                    // and root recovery. Only a larger measurement expands it.
+                    let io_end = end.max(available_end.unwrap_or(end));
+                    store
+                        .mount
+                        .blocks
+                        .set((io_end - start) as usize / BLOCK_BYTES - 1);
+                    // Consistency recovery can write only inside the accepted extent.
+                    store.mount.recover().map_err(error)?;
+                    return store
+                        .finish_startup(
+                            start..io_end,
+                            (format_end >= minimum).then_some(io_end),
+                            available_end,
+                            identity,
+                            marker_matches,
+                        )
+                        .await;
                 }
-                Err(LfsError::CORRUPTION | LfsError::INVALID) => (),
-                Err(e) => return Err(error(e)),
             }
-            flash = store.into_flash();
+            Err(LfsError::CORRUPTION | LfsError::INVALID) => (),
+            Err(e) => return Err(error(e)),
         }
-        // Every eligible mount was invalid. Format only the measured or
-        // minimum region, never the exploratory address window.
+        let flash = store.into_flash();
+        // Format only the measured or minimum region, never the exploratory address window.
         if format_end < minimum {
             return Err(Error::Bounds);
         }
-        let format_range = flash_range(format_end)?;
+        let format_range = start..format_end;
         Self::config(&flash, &format_range)?;
         let mut store = Self::new(flash, &format_range, random);
         store.reformat()?;

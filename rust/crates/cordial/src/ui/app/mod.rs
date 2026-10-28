@@ -11,7 +11,7 @@
 //!
 //! [`App::act`] handles [`Action`] values against the shown page or dialog. Set dialog text with
 //! [`App::set_form`] before submitting it. Native setting controls use [`Action::SettingChoice`]
-//! with typed values. [`App::download_to`] accepts a native file chooser's destination.
+//! with typed values.
 //!
 //! [`App::adapters`], [`App::devices`] and [`App::state_of`] expose the current read model.
 //! The `adapter_changes`, `device_values`, `settings_of`, `shown_value`, `marker` and
@@ -25,7 +25,6 @@ mod actions;
 pub mod adapter;
 pub mod add;
 pub mod device;
-pub mod files;
 pub mod fleet;
 mod immediate;
 mod input;
@@ -170,7 +169,6 @@ pub enum Action {
     ProfileDelete(u32),
     AdapterSave,
     AdapterDiscard,
-    Files,
     Restart,
     Bootloader,
 
@@ -230,7 +228,13 @@ pub enum Action {
     /// Chooses a profile in the profile picker; 0 chooses none.
     Pick(u32),
     PickPage(bool),
+    /// Names a new profile from the profile picker, then returns to it.
+    PickNewProfile,
+    /// Lists the picker's profiles again after its listing failed.
+    PickRetry,
     Confirm,
+    /// Deletes a profile with the changes its confirmation shows, and no others.
+    ProfileDeleteConfirm(crate::profiles::Deletion),
 
     /// Opens the Add Device adapter choices.
     AddAdapter,
@@ -243,13 +247,6 @@ pub enum Action {
     Reject,
     AddAnother,
     Done,
-
-    FilesUp,
-    FilesRefresh,
-    FilesEntry(String),
-    FilesDest,
-    FilesDownload,
-    FilesRetry,
 }
 
 /// What the profile picker chooses a profile for.
@@ -275,9 +272,6 @@ pub enum Dialog {
     },
     AddDevice,
     Bootloader(String),
-    Files(String),
-    /// Replacing an existing local file with a download.
-    Replace(String, files::Target),
 }
 
 /// A small list of actions shown beside the control that opened it.
@@ -342,10 +336,11 @@ pub(crate) enum Kind {
     Profile,
     Scan,
     Pair,
-    Answer,
+    Answer {
+        pairing: (Slot, Ticket),
+        dismiss: bool,
+    },
     CancelPairing,
-    Files,
-    FileGet,
     Restart,
     Bootloader,
 }
@@ -506,6 +501,12 @@ pub struct App<F: Fleet> {
     pub(crate) jobs: HashMap<(Slot, Ticket), Job>,
     pub(crate) toast: Option<(String, Instant)>,
     pub(crate) dialog: Option<Dialog>,
+    /// The profile deletion last confirmed in its dialog.
+    pub(crate) deleting: Option<profiles::Deleting>,
+    /// A deletion's dialog stays open once the profile is deleted.
+    pub(crate) keep_deleted: bool,
+    /// The picker New Profile returns to once the profile it names is created or cancelled.
+    pub(crate) pick_after_new: Option<PickFor>,
     pub(crate) menu: Option<Menu>,
     pub(crate) form: Input,
     /// The integer setting being typed, which holds the form.
@@ -513,7 +514,6 @@ pub struct App<F: Fleet> {
     pub(crate) add: Option<AddDevice>,
     /// Adapters whose scan from a closed Add Device stops once its start is answered.
     pub(crate) scan_stops: HashSet<(Slot, Ticket)>,
-    pub(crate) files: files::Files,
     pub(crate) migration: Option<Migration>,
     /// Adapters whose migration the user cancelled; they migrate again only with Migrate.
     pub(crate) declined: HashSet<String>,
@@ -553,12 +553,14 @@ impl<F: Fleet> App<F> {
             jobs: HashMap::new(),
             toast: None,
             dialog: None,
+            deleting: None,
+            keep_deleted: false,
+            pick_after_new: None,
             menu: None,
             form: Input::new(64),
             editing: None,
             add: None,
             scan_stops: HashSet::new(),
-            files: files::Files::default(),
             migration: None,
             declined: HashSet::new(),
         };
@@ -865,13 +867,28 @@ impl<F: Fleet> App<F> {
             // A failed listing changes nothing and is tried again.
             return;
         };
+        // A controller can finish reconnecting before its Ready event reaches the app.
+        for session in &mut self.sessions {
+            if let Some(st) = self.fleet.state(session.slot)
+                && ports
+                    .iter()
+                    .any(|p| p.port == st.port && p.is_adapter(&session.id))
+            {
+                session.port = st.port;
+            }
+        }
         let present: BTreeSet<&str> = ports.iter().map(|p| p.port.as_str()).collect();
-        let gone: Vec<Slot> = self
-            .sessions
-            .iter()
-            .filter(|s| !present.contains(s.port.as_str()))
-            .map(|s| s.slot)
-            .collect();
+        let gone: Vec<Slot> =
+            self.sessions
+                .iter()
+                .filter(|s| {
+                    !present.contains(s.port.as_str())
+                        && !self.fleet.state(s.slot).is_some_and(|st| {
+                            st.pending_for(crate::controller::PROFILE_RECONNECT, 0)
+                        })
+                })
+                .map(|s| s.slot)
+                .collect();
         for slot in gone {
             self.lose(slot);
         }
@@ -924,7 +941,13 @@ impl<F: Fleet> App<F> {
                 .off
                 .iter()
                 .any(|(id, o)| holds(id, o.port.as_deref(), port));
-            if busy.contains(&port.port) || held_off {
+            let reconnecting = self.sessions.iter().any(|s| {
+                self.fleet.state(s.slot).is_some_and(|st| {
+                    st.pending_for(crate::controller::PROFILE_RECONNECT, 0)
+                        && port.is_adapter(&st.status.id)
+                })
+            });
+            if busy.contains(&port.port) || held_off || reconnecting {
                 continue;
             }
             if let Some(refused) = self.refused.get_mut(&port.port) {
@@ -981,8 +1004,23 @@ impl<F: Fleet> App<F> {
                 self.start_migration();
                 self.retry_waiting();
             }
-            Event::Connection { phase, .. } => self.connection(slot, phase),
+            Event::Connection { phase, port, .. } => {
+                if matches!(phase, Phase::Ready)
+                    && !port.is_empty()
+                    && let Some(session) = self.session_mut(slot)
+                {
+                    session.port = port;
+                }
+                self.connection(slot, phase);
+            }
             Event::Notice { notice, .. } => self.notice(slot, notice),
+            Event::Progress {
+                ticket, progress, ..
+            } => {
+                if let Some(job) = self.jobs.get(&(slot, ticket)).cloned() {
+                    self.deletion_progress(&job, ticket, progress);
+                }
+            }
             Event::Done { ticket, result, .. } => {
                 if let Some(job) = self.jobs.remove(&(slot, ticket)) {
                     if self.scan_stops.remove(&(slot, ticket)) {
@@ -993,7 +1031,7 @@ impl<F: Fleet> App<F> {
                         }
                         return;
                     }
-                    self.finish(job, result);
+                    self.finish(job, ticket, result);
                 }
             }
         }
@@ -1188,6 +1226,7 @@ impl<F: Fleet> App<F> {
         };
         self.immediate_readback(&id, None, slot);
         for d in &st.devices {
+            self.immediate_device_readback(&id, d);
             self.list_settings(&id, d.id);
         }
         if crate::profiles::available(&st.status) {
@@ -1238,8 +1277,8 @@ impl<F: Fleet> App<F> {
         self.close_on(slot, s.port);
     }
 
-    /// Ends session-owned scans and dialogs. Native writes retain their uncertain outcomes
-    /// until a fresh readback; staged terminal forms keep their existing retry behavior.
+    /// Ends session-owned scans and dialogs. Native writes keep their completion jobs; uncertain
+    /// outcomes wait for a fresh readback. Staged terminal forms keep their existing retry behavior.
     pub(crate) fn drop_session(&mut self, id: &str, slot: Slot) {
         if let Some(add) = &mut self.add {
             add.session_ended(id, slot, self.held.contains_key(id));
@@ -1250,22 +1289,22 @@ impl<F: Fleet> App<F> {
         }
         self.scan_stops.retain(|(s, _)| *s != slot);
         self.settings_errors.retain(|(a, _), _| a != id);
-        // Its dialogs close with it; their requests can't finish.
+        // Deletions keep their frozen progress until their completion job reports its outcome.
         let of_adapter = match &self.dialog {
             Some(
-                Dialog::Files(a)
-                | Dialog::Replace(a, _)
-                | Dialog::Bootloader(a)
+                Dialog::Bootloader(a)
                 | Dialog::Rename(a)
                 | Dialog::Forget(a, _)
                 | Dialog::ProfileName(a, _)
-                | Dialog::ProfileDelete(a, _)
                 | Dialog::Pick { adapter: a, .. },
             ) => a == id,
+            Some(Dialog::ProfileDelete(a, _)) => a == id && !self.deletion_kept(id, slot),
             _ => false,
         };
         if of_adapter {
+            self.deletion_lost(id);
             self.dialog = None;
+            self.pick_after_new = None;
             self.menu = None;
         }
     }
@@ -1397,12 +1436,17 @@ impl<F: Fleet> App<F> {
                 result: Some(p::response::Result::Profiles(list)),
                 ..
             }) => return self.profiles_listed(&id, list),
+            Notice::Response(p::Response {
+                result: Some(p::response::Result::Device(device)),
+                ..
+            }) => return self.immediate_device_readback(&id, &device),
             _ => return,
         };
         let Some(kind) = event.kind else { return };
         match kind {
-            p::event::Kind::Device(d) if first => {
-                if self.states.get(&slot).is_some_and(State::ready) {
+            p::event::Kind::Device(d) => {
+                self.immediate_device_readback(&id, &d);
+                if first && self.states.get(&slot).is_some_and(State::ready) {
                     self.list_settings(&id, d.id);
                 }
             }
@@ -1462,14 +1506,23 @@ impl<F: Fleet> App<F> {
         self.jobs.values().any(|j| j.adapter == id && f(&j.kind))
     }
 
-    pub(crate) fn finish(&mut self, job: Job, result: Result<Outcome, Error>) {
-        // A result from a session that has since ended belongs to nothing shown now, except a
-        // device save's: device IDs are never reused, and a save that reconnects USB, such as a
-        // Gamepad Output change, may answer only after its session ended. A pairing's result
+    pub(crate) fn finish(&mut self, job: Job, ticket: Ticket, result: Result<Outcome, Error>) {
+        // Write acknowledgements can arrive after their session ends, including interface and
+        // Gamepad Output changes that reconnect USB. Immediate writes retain their completion
+        // jobs; device IDs are never reused. A pairing's result
         // likewise reports a bond saved before the session ended, and Add Device keeps only the
-        // pairing it belongs to.
+        // pairing it belongs to. A code rejection's acknowledgement also belongs to its original
+        // pairing. A profile deletion keeps its confirmed outcome and reports partial failures.
         let current = self.session_of(&job.adapter).map(|s| s.slot) == Some(job.slot);
-        if !current && !matches!(job.kind, Kind::DeviceSave { .. } | Kind::Pair) {
+        let deletion = matches!(job.command, Command::ProfileDeletePlanned(_));
+        if !current
+            && !deletion
+            && !(self.immediate.is_some() && immediate::is_write(&job.kind))
+            && !matches!(
+                job.kind,
+                Kind::DeviceSave { .. } | Kind::Pair | Kind::Answer { dismiss: true, .. }
+            )
+        {
             return;
         }
         let id = job.adapter.clone();
@@ -1495,16 +1548,15 @@ impl<F: Fleet> App<F> {
                 }
             }
             Kind::SettingsSave { .. } => self.settings_result(&job, &result),
-            Kind::Profile => self.profile_result(&job, &result),
-            Kind::Scan | Kind::Pair | Kind::Answer | Kind::CancelPairing => {
+            Kind::Profile => self.profile_result(&job, ticket, &result),
+            Kind::Scan | Kind::Pair | Kind::Answer { .. } | Kind::CancelPairing => {
                 self.add_result(&job, &result)
             }
-            Kind::Restart => {
+            Kind::Restart | Kind::Bootloader => {
                 if let Err(e) = &result {
                     self.toast(words::failure(e));
                 }
             }
-            Kind::Files | Kind::FileGet | Kind::Bootloader => self.files_result(&job, &result),
         }
         if self.immediate.is_some() {
             self.immediate_result(&job, &result);
@@ -1578,9 +1630,6 @@ impl<F: Fleet> App<F> {
     pub fn add(&self) -> Option<&AddDevice> {
         self.add.as_ref()
     }
-    pub fn files(&self) -> &files::Files {
-        &self.files
-    }
     pub fn form(&self) -> &str {
         self.form.as_str()
     }
@@ -1595,11 +1644,6 @@ impl<F: Fleet> App<F> {
         if self.dialog == Some(Dialog::AddDevice) {
             self.add_form_changed();
         }
-    }
-
-    pub fn set_destination(&mut self, text: &str) {
-        self.files.dest.set_value(text);
-        self.files.dest_err.clear();
     }
 
     /// Whether the active pairing prompt accepts a typed code.
@@ -1664,8 +1708,45 @@ mod ending_tests {
     use crate::sim::Desktop;
     use std::sync::mpsc::{self, Receiver};
 
+    /// Holds cancellation before its controller worker can inspect the pairing state.
+    struct GatedFleet {
+        live: Live,
+        cancel: std::cell::Cell<bool>,
+    }
+
+    impl Fleet for GatedFleet {
+        fn open(&self, port: &str) -> Slot {
+            self.live.open(port)
+        }
+        fn open_adapter(&self, port: &str, id: &str) -> Slot {
+            self.live.open_adapter(port, id)
+        }
+        fn close(&self, slot: Slot) {
+            self.live.close(slot);
+        }
+        fn run(&self, slot: Slot, command: Command) -> Ticket {
+            if self.cancel.get() && matches!(command, Command::CancelPairing) {
+                Ticket::MAX
+            } else {
+                self.live.run(slot, command)
+            }
+        }
+        fn state(&self, slot: Slot) -> Option<State> {
+            self.live.state(slot)
+        }
+        fn list_ports(&self) {
+            self.live.list_ports();
+        }
+        fn migrate(&self, id: &str, port: &str) {
+            self.live.migrate(id, port);
+        }
+        fn cancel_migration(&self) {
+            self.live.cancel_migration();
+        }
+    }
+
     struct Harness {
-        app: App<Live>,
+        app: App<GatedFleet>,
         world: Desktop,
         rx: Receiver<Msg>,
         id: String,
@@ -1679,9 +1760,12 @@ mod ending_tests {
             let world = Desktop::new(1);
             let id = world.ports()[0].serial.clone();
             let (tx, rx) = mpsc::channel();
-            let app = App::new(world.live(Arc::new(move |msg| {
-                let _ = tx.send(msg);
-            })));
+            let app = App::new(GatedFleet {
+                live: world.live(Arc::new(move |msg| {
+                    let _ = tx.send(msg);
+                })),
+                cancel: std::cell::Cell::new(false),
+            });
             let mut h = Self {
                 app,
                 world,
@@ -1716,13 +1800,32 @@ mod ending_tests {
         /// Opens Add Device and starts pairing the candidate that shows a code until
         /// `complete_pairing`.
         fn pair(&mut self) {
+            self.pair_candidate(3);
+        }
+
+        fn pair_candidate(&mut self, candidate: u32) {
             self.app.act(Action::AddDeviceTo(self.id.clone()));
             self.until(|h| {
                 h.app.add().is_some_and(|a| !a.starting)
-                    && h.app.state_of(&h.id).unwrap().candidate(3).is_some()
+                    && h.app
+                        .state_of(&h.id)
+                        .unwrap()
+                        .candidate(candidate)
+                        .is_some()
             });
-            self.app.act(Action::Pair(3));
+            self.app.act(Action::Pair(candidate));
             self.until(|h| h.app.pairing_prompt().is_some());
+        }
+
+        fn enter_code(&mut self, kind: p::CodeKind) {
+            self.pair_candidate(1);
+            self.world.adapters()[0].event(p::event::Kind::Pairing(p::Pairing {
+                candidate: 1,
+                step: Some(p::pairing::Step::EnterCode(p::EnterCode {
+                    kind: kind as i32,
+                })),
+            }));
+            self.until(|h| h.app.pairing_prompt() == Some(crate::model::Prompt::EnterCode(kind)));
         }
 
         /// Keeps the running pairing's result back until `release`.
@@ -1732,6 +1835,16 @@ mod ending_tests {
                 .jobs
                 .iter()
                 .find(|(_, j)| matches!(j.kind, Kind::Pair))
+                .map(|(key, _)| *key);
+            assert!(self.keep.is_some());
+        }
+
+        fn keep_answer_result(&mut self) {
+            self.keep = self
+                .app
+                .jobs
+                .iter()
+                .find(|(_, j)| matches!(j.kind, Kind::Answer { .. }))
                 .map(|(key, _)| *key);
             assert!(self.keep.is_some());
         }
@@ -1757,7 +1870,7 @@ mod ending_tests {
             self.app.tick();
         }
 
-        /// Saves the paired device disconnected, so the pairing waits for it to connect.
+        /// Saves the paired device without connecting it.
         fn pair_disconnected(&mut self) {
             self.world.adapters()[0]
                 .0
@@ -1770,7 +1883,7 @@ mod ending_tests {
                 .state = p::DeviceState::Disconnected as i32;
             self.pair();
             assert!(self.world.adapters()[0].complete_pairing());
-            self.until(|h| h.phase() == Some(add::Phase::Connecting));
+            self.until(|h| h.phase() == Some(add::Phase::Paired));
         }
 
         fn set_paired(&self, f: impl FnOnce(&mut p::Device)) {
@@ -1806,6 +1919,64 @@ mod ending_tests {
             self.app.quit();
             self.until(|h| h.app.done());
             assert_eq!(self.world.adapters()[0].handles(), 0);
+        }
+    }
+
+    #[test]
+    fn deletion_results_belong_to_their_run_and_dialog() {
+        for keep_deleted in [false, true] {
+            let mut h = Harness::new();
+            if keep_deleted {
+                h.app.keep_deleted();
+            }
+            h.app.dialog = Some(Dialog::ProfileDelete(h.id.clone(), 1));
+            let plan = h.app.deletion(&h.id, 1).unwrap();
+            h.app.delete_profile(&h.id, &plan);
+            let (key, job) = h
+                .app
+                .jobs
+                .iter()
+                .find(|(_, j)| matches!(j.command, Command::ProfileDeletePlanned(_)))
+                .map(|(key, job)| (*key, job.clone()))
+                .unwrap();
+            h.keep = Some(key);
+            h.until(|h| !h.kept.is_empty());
+            let running = h.app.deletion_view(&h.id, 1);
+            let dialog = h.app.dialog.clone();
+            let success = Ok(Outcome::ProfileDeleted(p::Profile {
+                id: 1,
+                ..Default::default()
+            }));
+            let failure = Err(Error::new("the connection to the adapter closed"));
+            for (slot, ticket) in [(key.0 + 1, key.1), (key.0, key.1 + 1)] {
+                let stale = Job {
+                    slot,
+                    ..job.clone()
+                };
+                h.app.deletion_progress(
+                    &stale,
+                    ticket,
+                    crate::controller::Progress {
+                        done: 1,
+                        waiting: true,
+                    },
+                );
+                for result in [&success, &failure] {
+                    h.app.profile_result(&stale, ticket, result);
+                    assert_eq!(h.app.deletion_view(&h.id, 1), running);
+                    assert_eq!(h.app.dialog, dialog);
+                    assert!(h.app.note(&Spot::Dialog).is_none());
+                }
+            }
+            h.app.dialog = Some(Dialog::ProfileName(h.id.clone(), None));
+            let replacement = h.app.dialog.clone();
+            h.app.profile_result(&job, key.1, &success);
+            h.app.profile_result(&job, key.1, &failure);
+            assert_eq!(h.app.dialog, replacement);
+            assert!(h.app.note(&Spot::Dialog).is_none());
+            h.release();
+            assert_eq!(h.app.dialog, replacement);
+            h.close();
         }
     }
 
@@ -1873,17 +2044,208 @@ mod ending_tests {
     }
 
     #[test]
+    fn confirmed_pairing_succeeds_without_a_connection() {
+        let mut h = Harness::new();
+        h.pair_disconnected();
+        assert_eq!(h.phase(), Some(add::Phase::Paired));
+        assert_eq!(h.pairing().unwrap().device, Some(13));
+        assert!(h.pairing().unwrap().message.is_none());
+        assert_eq!(
+            h.app.device(&h.id, 13).unwrap().d.state(),
+            p::DeviceState::Disconnected
+        );
+        h.app.act(Action::Done);
+        assert!(h.app.dialog().is_none());
+        assert_eq!(h.app.shown(), Page::Device(h.id.clone(), 13));
+        assert!(!h.world.adapters()[0].sent().contains(&"cancel_pairing"));
+        h.close();
+    }
+
+    #[test]
+    fn submitting_a_pin_waits_for_the_confirmed_pairing_result() {
+        let mut h = Harness::new();
+        h.enter_code(p::CodeKind::Pin);
+        h.keep_pair_result();
+        h.app.set_form("123456");
+        h.app.act(Action::Accept);
+        h.until(|h| {
+            !h.kept.is_empty() && !h.app.running(&h.id, |k| matches!(k, Kind::Answer { .. }))
+        });
+        assert_eq!(h.phase(), Some(add::Phase::Pairing));
+        assert_eq!(h.pairing().unwrap().device, None);
+        h.release();
+        assert_eq!(h.phase(), Some(add::Phase::Paired));
+        h.close();
+    }
+
+    #[test]
+    fn cancelling_pairing_dismisses_before_acknowledgement() {
+        for action in [Action::CancelPairing, Action::Cancel] {
+            let mut h = Harness::new();
+            h.pair();
+            h.app.act(action);
+            assert!(h.app.dialog().is_none());
+            assert!(h.app.add().is_none());
+            assert!(h.app.running(&h.id, |k| matches!(k, Kind::CancelPairing)));
+            h.until(|h| {
+                !h.app
+                    .running(&h.id, |k| matches!(k, Kind::Pair | Kind::CancelPairing))
+            });
+            assert!(h.app.dialog().is_none());
+            assert!(h.app.add().is_none());
+            assert!(h.app.toast_text().is_none());
+            assert!(h.app.note(&Spot::Dialog).is_none());
+            h.close();
+        }
+    }
+
+    #[test]
+    fn reopening_waits_for_the_cancel_worker_after_the_original_pair_finishes() {
+        let mut h = Harness::new();
+        h.pair();
+        h.app.fleet.cancel.set(true);
+        h.app.act(Action::CancelPairing);
+        assert!(h.app.dialog().is_none());
+        assert!(h.world.adapters()[0].complete_pairing());
+        h.until(|h| !h.app.running(&h.id, |k| matches!(k, Kind::Pair)));
+        assert!(h.app.device(&h.id, 13).is_some());
+        let pairing_commands = || {
+            h.world.adapters()[0]
+                .sent()
+                .into_iter()
+                .filter(|command| {
+                    matches!(*command, "start_scan" | "start_pairing" | "cancel_pairing")
+                })
+                .collect::<Vec<_>>()
+        };
+        let sent = pairing_commands();
+        h.app.act(Action::AddDeviceTo(h.id.clone()));
+        h.app.act(Action::Pair(1));
+        h.app.act(Action::ScanAgain);
+        assert!(h.app.scan_waiting(&h.id));
+        assert!(!h.app.add().unwrap().starting);
+        assert!(h.pairing().is_none());
+        assert_eq!(pairing_commands(), sent);
+
+        let slot = h.app.session_of(&h.id).unwrap().slot;
+        let job = h.app.jobs.remove(&(slot, Ticket::MAX)).unwrap();
+        let mut quiet = job.clone();
+        quiet.kind = Kind::Quiet;
+        h.app.jobs.insert((slot, Ticket::MAX - 1), quiet);
+        let ticket = h.app.fleet.live.run(slot, Command::CancelPairing);
+        h.app.jobs.insert((slot, ticket), job);
+        h.until(|h| h.app.add().is_some_and(|a| !a.starting && a.scan.is_some()));
+        assert!(!h.app.scan_waiting(&h.id));
+        assert!(h.app.toast_text().is_none());
+        assert!(!h.world.adapters()[0].sent().contains(&"cancel_pairing"));
+        h.app.act(Action::Pair(1));
+        h.until(|h| h.app.pairing_prompt().is_some());
+        assert_eq!(h.pairing().unwrap().candidate, 1);
+        assert!(h.app.device(&h.id, 13).is_some());
+        h.app.jobs.remove(&(slot, Ticket::MAX - 1));
+        h.app.fleet.cancel.set(false);
+        h.close();
+    }
+
+    #[test]
+    fn closing_after_known_completion_is_silent_and_keeps_the_device() {
+        for action in [Action::CancelPairing, Action::Cancel] {
+            let mut h = Harness::new();
+            h.pair();
+            h.keep_pair_result();
+            assert!(h.world.adapters()[0].complete_pairing());
+            h.until(|h| !h.kept.is_empty());
+            assert_eq!(h.phase(), Some(add::Phase::Pairing));
+            h.app.act(action);
+            assert!(h.app.dialog().is_none());
+            assert!(h.app.add().is_none());
+            h.until(|h| !h.app.running(&h.id, |k| matches!(k, Kind::CancelPairing)));
+            h.release();
+            assert!(h.app.dialog().is_none());
+            assert!(h.app.add().is_none());
+            assert!(h.app.toast_text().is_none());
+            assert!(h.app.note(&Spot::Dialog).is_none());
+            assert!(h.app.device(&h.id, 13).is_some());
+            assert!(!h.world.adapters()[0].sent().contains(&"cancel_pairing"));
+            h.close();
+        }
+    }
+
+    #[test]
+    fn cancellation_refusals_after_close_are_silent_and_keep_the_late_device() {
+        for action in [Action::CancelPairing, Action::Cancel] {
+            for code in [p::ErrorCode::Busy, p::ErrorCode::NoPrompt] {
+                let mut h = Harness::new();
+                h.pair();
+                h.world.adapters()[0].0.lock().unwrap().refuse.insert(
+                    "cancel_pairing",
+                    p::Error {
+                        code: code as i32,
+                        ..Default::default()
+                    },
+                );
+                h.app.act(action.clone());
+                assert!(h.app.dialog().is_none());
+                assert!(h.app.add().is_none());
+                assert!(h.app.running(&h.id, |k| matches!(k, Kind::CancelPairing)));
+                h.keep = h
+                    .app
+                    .jobs
+                    .iter()
+                    .find(|(_, j)| matches!(j.kind, Kind::CancelPairing))
+                    .map(|(key, _)| *key);
+                h.until(|h| !h.kept.is_empty());
+                assert!(matches!(&h.kept[0], Msg::Fleet(_, event)
+                    if matches!(&**event, Event::Done { result: Err(e), .. }
+                        if e.dongle.as_ref().is_some_and(|error| error.code() == code))));
+                h.keep_pair_result();
+                assert!(h.world.adapters()[0].complete_pairing());
+                h.until(|h| h.kept.len() == 2);
+                assert!(h.app.running(&h.id, |k| matches!(k, Kind::CancelPairing)));
+                let mut device = h.app.device(&h.id, 13).unwrap().d.clone();
+                device.state = p::DeviceState::Disconnected as i32;
+                h.world.adapters()[0].event(p::event::Kind::Device(device));
+                h.until(|h| {
+                    h.app
+                        .device(&h.id, 13)
+                        .is_some_and(|d| d.d.state() == p::DeviceState::Disconnected)
+                });
+                h.release();
+                assert!(h.app.dialog().is_none());
+                assert!(h.app.add().is_none());
+                assert!(h.app.toast_text().is_none());
+                assert!(h.app.note(&Spot::Dialog).is_none());
+                assert_eq!(
+                    h.app.device(&h.id, 13).unwrap().d.state(),
+                    p::DeviceState::Disconnected
+                );
+                assert!(!h.world.adapters()[0].sent().contains(&"unpair_device"));
+                assert_eq!(
+                    h.world.adapters()[0]
+                        .sent()
+                        .iter()
+                        .filter(|command| **command == "cancel_pairing")
+                        .count(),
+                    1
+                );
+                h.close();
+            }
+        }
+    }
+
+    #[test]
     fn a_pairing_saved_before_an_announced_end_connects_on_the_replacement() {
         let mut h = Harness::new();
         h.pair_disconnected();
         h.end();
         assert_eq!(h.app.dialog(), Some(&Dialog::AddDevice));
-        assert_eq!(h.phase(), Some(add::Phase::Connecting));
+        assert_eq!(h.phase(), Some(add::Phase::Paired));
         assert!(h.app.adapter(&h.id).is_some());
         assert!(h.app.devices().iter().any(|d| d.d.id == 13));
         h.set_paired(|d| d.state = p::DeviceState::Connected as i32);
         h.reopen();
-        h.until(|h| h.phase() == Some(add::Phase::Connected));
+        h.until(|h| h.app.device(&h.id, 13).is_some_and(|d| d.connected()));
+        assert_eq!(h.phase(), Some(add::Phase::Paired));
         h.app.act(Action::Done);
         assert!(h.app.dialog().is_none());
         assert_eq!(h.app.shown(), Page::Device(h.id.clone(), 13));
@@ -1891,14 +2253,14 @@ mod ending_tests {
     }
 
     #[test]
-    fn a_connected_pairing_stays_connected_across_an_announced_end() {
+    fn a_confirmed_pairing_stays_paired_across_an_announced_end() {
         let mut h = Harness::new();
         h.pair();
         assert!(h.world.adapters()[0].complete_pairing());
-        h.until(|h| h.phase() == Some(add::Phase::Connected));
+        h.until(|h| h.phase() == Some(add::Phase::Paired));
         h.end();
         assert_eq!(h.app.dialog(), Some(&Dialog::AddDevice));
-        assert_eq!(h.phase(), Some(add::Phase::Connected));
+        assert_eq!(h.phase(), Some(add::Phase::Paired));
         assert!(h.app.devices().iter().any(|d| d.d.id == 13));
         h.close();
     }
@@ -1913,10 +2275,11 @@ mod ending_tests {
         assert_eq!(h.app.dialog(), Some(&Dialog::AddDevice));
         assert_eq!(h.phase(), Some(add::Phase::Pairing));
         h.release();
-        assert_eq!(h.phase(), Some(add::Phase::Connecting));
+        assert_eq!(h.phase(), Some(add::Phase::Paired));
         assert_eq!(h.pairing().unwrap().device, Some(13));
         h.reopen();
-        h.until(|h| h.phase() == Some(add::Phase::Connected));
+        h.until(|h| h.app.adapter(&h.id).is_some_and(|a| a.ready));
+        assert_eq!(h.phase(), Some(add::Phase::Paired));
         h.close();
     }
 
@@ -1934,22 +2297,276 @@ mod ending_tests {
     }
 
     #[test]
+    fn completed_pairing_finishes_without_a_device_id_in_production() {
+        let mut h = Harness::new();
+        h.pair();
+        h.world.adapters()[0].event(p::event::Kind::Pairing(p::Pairing {
+            candidate: 3,
+            step: Some(p::pairing::Step::Error(p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                reason: p::ErrorReason::Storage as i32,
+                outcome: p::ErrorOutcome::Complete as i32,
+                related: vec![p::Error {
+                    code: p::ErrorCode::StorageFailed as i32,
+                    outcome: p::ErrorOutcome::NoEffect as i32,
+                    ..Default::default()
+                }],
+            })),
+        }));
+        let expected = if cfg!(debug_assertions) {
+            add::Phase::Failed
+        } else {
+            add::Phase::Paired
+        };
+        h.until(|h| h.phase() == Some(expected));
+        assert!(h.pairing().unwrap().device.is_none());
+        assert_eq!(
+            h.pairing().unwrap().message.is_some(),
+            cfg!(debug_assertions)
+        );
+        assert!(!h.world.adapters()[0].sent().contains(&"cancel_pairing"));
+        h.close();
+    }
+
+    #[test]
     fn a_pairing_error_after_an_announced_end_is_reported() {
         let mut h = Harness::new();
         h.pair();
         h.keep_pair_result();
-        h.app.act(Action::CancelPairing);
-        h.until(|h| {
-            h.app
-                .state_of(&h.id)
-                .unwrap()
-                .pairing
-                .as_ref()
-                .is_some_and(|p| !crate::model::pairing_running(p))
-        });
+        h.world.adapters()[0].event(p::event::Kind::Pairing(p::Pairing {
+            candidate: 3,
+            step: Some(p::pairing::Step::Error(p::Error {
+                code: p::ErrorCode::Cancelled as i32,
+                ..Default::default()
+            })),
+        }));
+        h.until(|h| !h.kept.is_empty());
         h.end();
         h.release();
         assert_eq!(h.phase(), Some(add::Phase::Cancelled));
+        h.close();
+    }
+
+    #[test]
+    fn rejecting_pin_and_passkey_returns_to_selection_and_waits_for_the_pair_job() {
+        for kind in [p::CodeKind::Pin, p::CodeKind::Passkey] {
+            let mut h = Harness::new();
+            h.enter_code(kind);
+            h.keep_pair_result();
+            let (slot, ticket) = h.keep.unwrap();
+            let scans = h.world.adapters()[0]
+                .sent()
+                .iter()
+                .filter(|c| **c == "start_scan")
+                .count();
+            h.app.act(Action::Reject);
+            h.until(|h| h.pairing().is_none());
+            assert_eq!(h.app.dialog(), Some(&Dialog::AddDevice));
+            let add = h.app.add().unwrap();
+            assert_eq!(add.adapter.as_deref(), Some(h.id.as_str()));
+            assert!(add.error.is_none());
+            assert!(add.scan.is_none());
+            assert!(!add.starting);
+            assert!(h.world.adapters()[0].sent().contains(&"reject_prompt"));
+            assert!(!h.world.adapters()[0].sent().contains(&"cancel_pairing"));
+            h.app.act(Action::Pair(1));
+            h.app.act(Action::ScanAgain);
+            assert!(h.pairing().is_none());
+            h.app.act(Action::Cancel);
+            h.app.act(Action::AddDeviceTo(h.id.clone()));
+            assert!(h.pairing().is_none());
+            assert!(!h.app.add().unwrap().starting);
+            assert!(h.app.scan_waiting(&h.id));
+            assert_eq!(
+                h.world.adapters()[0]
+                    .sent()
+                    .iter()
+                    .filter(|c| **c == "start_scan")
+                    .count(),
+                scans
+            );
+            h.release();
+            h.until(|h| h.app.add().is_some_and(|a| !a.starting && a.scan.is_some()));
+            assert!(!h.app.scan_waiting(&h.id));
+            assert!(h.pairing().is_none());
+            assert!(h.app.add().unwrap().error.is_none());
+            h.app.act(Action::Pair(1));
+            h.until(|h| h.app.pairing_prompt().is_some());
+            h.app.update(Msg::Fleet(
+                slot,
+                Box::new(Event::Done {
+                    session: 0,
+                    ticket,
+                    result: Err(Error::code(p::ErrorCode::Rejected, Some("pair start"))),
+                }),
+            ));
+            assert_eq!(h.phase(), Some(add::Phase::Pairing));
+            assert_eq!(h.pairing().unwrap().candidate, 1);
+            assert!(h.pairing().unwrap().prompt_error.is_none());
+            h.close();
+        }
+    }
+
+    #[test]
+    fn rejecting_code_waits_for_acknowledgement_when_the_pair_result_arrives_first() {
+        let mut h = Harness::new();
+        h.enter_code(p::CodeKind::Pin);
+        h.app.act(Action::Reject);
+        h.keep_answer_result();
+        h.until(|h| !h.app.running(&h.id, |k| matches!(k, Kind::Pair)));
+        assert_eq!(h.phase(), Some(add::Phase::Pairing));
+        h.release();
+        assert!(h.pairing().is_none());
+        assert_eq!(h.app.dialog(), Some(&Dialog::AddDevice));
+        h.close();
+    }
+
+    #[test]
+    fn a_refused_code_rejection_keeps_the_prompt_and_actual_pairing_failure() {
+        let mut h = Harness::new();
+        h.enter_code(p::CodeKind::Pin);
+        h.world.adapters()[0].0.lock().unwrap().refuse.insert(
+            "reject_prompt",
+            p::Error {
+                code: p::ErrorCode::Busy as i32,
+                ..Default::default()
+            },
+        );
+        h.app.act(Action::Reject);
+        h.until(|h| h.pairing().is_some_and(|p| p.prompt_error.is_some()));
+        assert_eq!(h.phase(), Some(add::Phase::Pairing));
+        h.world.adapters()[0].event(p::event::Kind::Pairing(p::Pairing {
+            candidate: 1,
+            step: Some(p::pairing::Step::Error(p::Error {
+                code: p::ErrorCode::AuthFailed as i32,
+                ..Default::default()
+            })),
+        }));
+        h.until(|h| h.phase() == Some(add::Phase::Failed));
+        assert!(h.pairing().unwrap().message.is_some());
+        h.close();
+    }
+
+    #[test]
+    fn a_pairing_error_stays_visible_when_its_prompt_disappears() {
+        let mut h = Harness::new();
+        h.enter_code(p::CodeKind::Pin);
+        let mut pairing = h.pairing().unwrap().clone();
+        pairing.prompt_error = Some("The adapter couldn't reject the pairing.".into());
+        h.app.states.get_mut(&pairing.slot).unwrap().pairing = None;
+        h.app.follow(pairing);
+        assert_eq!(
+            h.pairing().unwrap().prompt_error.as_deref(),
+            Some("The adapter couldn't reject the pairing.")
+        );
+        h.close();
+    }
+
+    #[test]
+    fn a_compare_answer_reports_that_its_prompt_is_gone() {
+        for (action, command) in [
+            (Action::Reject, "reject_prompt"),
+            (Action::Accept, "accept_prompt"),
+        ] {
+            let mut h = Harness::new();
+            h.pair_candidate(2);
+            h.world.adapters()[0].0.lock().unwrap().refuse.insert(
+                command,
+                p::Error {
+                    code: p::ErrorCode::NoPrompt as i32,
+                    ..Default::default()
+                },
+            );
+            h.app.act(action);
+            h.until(|h| h.pairing().is_some_and(|p| p.prompt_error.is_some()));
+            assert_eq!(h.phase(), Some(add::Phase::Pairing));
+            let pairing = h.pairing().unwrap().clone();
+            h.app.states.get_mut(&pairing.slot).unwrap().pairing = None;
+            h.app.follow(pairing);
+            assert!(h.pairing().unwrap().prompt_error.is_some());
+            h.close();
+        }
+    }
+
+    #[test]
+    fn codes_differ_keeps_the_pairing_failure_result() {
+        let mut h = Harness::new();
+        h.pair_candidate(2);
+        h.app.act(Action::Reject);
+        h.until(|h| h.phase() == Some(add::Phase::Failed));
+        assert!(h.pairing().unwrap().message.is_some());
+        h.close();
+    }
+
+    #[test]
+    fn a_failed_reject_acknowledgement_preserves_an_earlier_pairing_failure() {
+        let mut h = Harness::new();
+        h.enter_code(p::CodeKind::Passkey);
+        h.world.adapters()[0].0.lock().unwrap().refuse.insert(
+            "reject_prompt",
+            p::Error {
+                code: p::ErrorCode::Busy as i32,
+                ..Default::default()
+            },
+        );
+        h.app.act(Action::Reject);
+        h.keep_answer_result();
+        // The refusal leaves the prompt pending, so the device can still fail pairing.
+        h.until(|h| !h.kept.is_empty());
+        h.world.adapters()[0].event(p::event::Kind::Pairing(p::Pairing {
+            candidate: 1,
+            step: Some(p::pairing::Step::Error(p::Error {
+                code: p::ErrorCode::AuthFailed as i32,
+                ..Default::default()
+            })),
+        }));
+        h.until(|h| !h.app.running(&h.id, |k| matches!(k, Kind::Pair)));
+        assert_eq!(h.phase(), Some(add::Phase::Pairing));
+        h.release();
+        assert_eq!(h.phase(), Some(add::Phase::Failed));
+        assert!(h.pairing().unwrap().message.is_some());
+        h.close();
+    }
+
+    #[test]
+    fn rejection_does_not_send_an_old_prompt_to_a_replacement_session() {
+        let mut h = Harness::new();
+        h.enter_code(p::CodeKind::Pin);
+        h.keep_pair_result();
+        h.end();
+        h.reopen();
+        h.until(|h| h.app.adapter(&h.id).is_some_and(|a| a.ready));
+        h.app.act(Action::Reject);
+        assert!(!h.world.adapters()[0].sent().contains(&"reject_prompt"));
+        assert!(h.pairing().unwrap().prompt_error.is_some());
+        assert_eq!(h.phase(), Some(add::Phase::Pairing));
+        h.release();
+        assert!(h.app.dialog().is_none());
+        h.close();
+    }
+
+    #[test]
+    fn a_reject_acknowledgement_after_reconnect_dismisses_its_original_pairing() {
+        let mut h = Harness::new();
+        h.enter_code(p::CodeKind::Pin);
+        h.app.act(Action::Reject);
+        h.keep_answer_result();
+        h.until(|h| !h.app.running(&h.id, |k| matches!(k, Kind::Pair)));
+        h.end();
+        h.reopen();
+        h.until(|h| h.app.adapter(&h.id).is_some_and(|a| a.ready));
+        h.release();
+        assert!(h.pairing().is_none());
+        assert_eq!(h.app.dialog(), Some(&Dialog::AddDevice));
+        assert!(h.app.add().unwrap().error.is_none());
+        assert_eq!(
+            h.world.adapters()[0]
+                .sent()
+                .iter()
+                .filter(|c| **c == "reject_prompt")
+                .count(),
+            1
+        );
         h.close();
     }
 
@@ -2017,7 +2634,7 @@ mod ending_tests {
     }
 
     #[test]
-    fn a_replacement_that_cannot_connect_the_device_reports_it_saved() {
+    fn a_replacement_that_cannot_connect_keeps_the_confirmed_pairing() {
         let cases: [fn(&mut p::Device); 2] = [
             |d| {
                 d.enabled = false;
@@ -2038,8 +2655,9 @@ mod ending_tests {
             h.end();
             h.set_paired(change);
             h.reopen();
-            h.until(|h| h.phase() == Some(add::Phase::Saved));
-            assert!(h.pairing().unwrap().message.is_some());
+            h.until(|h| h.app.adapter(&h.id).is_some_and(|a| a.ready));
+            assert_eq!(h.phase(), Some(add::Phase::Paired));
+            assert!(h.pairing().unwrap().message.is_none());
             h.close();
         }
     }

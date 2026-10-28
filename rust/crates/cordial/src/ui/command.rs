@@ -134,7 +134,7 @@ const SPECS: &[Spec] = &[
     spec("profile show", "PROFILE", "Show a profile's name and roles"),
     spec("profile create", "NAME", "Create an empty profile"),
     spec("profile copy", "PROFILE NAME", "Copy on the adapter"),
-    spec("profile delete", "PROFILE", "Delete an unused profile"),
+    spec("profile delete", "PROFILE", "Detach and delete a profile"),
     spec("profile rule list", "PROFILE", "Show every rule"),
     spec(
         "profile rule remap",
@@ -187,6 +187,12 @@ const SPECS: &[Spec] = &[
         "[--raw] PATH LOCAL_FILE",
         "Download an adapter file, a saved record as JSON unless --raw; an existing local file is never replaced",
     ),
+    spec(
+        "file put",
+        "LOCAL_FILE PATH",
+        "Upload a file to the adapter",
+    ),
+    spec("file delete", "PATH", "Delete an adapter file"),
     spec("migrate", "", "Migrate the adapter's saved data"),
     spec("migrate cancel", "", "Stop migrating"),
     spec("help", "[COMMAND]", "Show this help"),
@@ -251,13 +257,15 @@ shown or changed.",
     ),
 ];
 
-/// Commands that inspect or recover an adapter, or read its files, while it
+/// Commands that inspect or recover an adapter, or access its files, while it
 /// is still starting or failed to, so they run without waiting for readiness.
 pub const DIRECT: &[&str] = &[
     "adapter status",
     "adapter restart",
     "file list",
     "file get",
+    "file put",
+    "file delete",
     "adapter bootloader",
 ];
 
@@ -515,7 +523,8 @@ fn offered(words: &str, st: &State) -> bool {
     }
     match words {
         SCAN | "scan stop" => !scan_words(Some(st)).is_empty(),
-        "adapter bootloader" | "feature list" | "file list" | "file get" => development,
+        "adapter bootloader" | "feature list" | "file list" | "file get" | "file put"
+        | "file delete" => development,
         TRANSPORT_SET => !transport_words(Some(st)).is_empty(),
         _ => true,
     }
@@ -841,6 +850,11 @@ pub fn parse(args: &[String]) -> Result<Line, String> {
         )),
         ("feature list", 1) => Line::Run(Command::Features(target(0)?)),
         ("file list", 1) => Line::Run(Command::Files(arg(0))),
+        ("file put", 2) if !words[0].is_empty() => Line::Run(Command::FilePut {
+            local: PathBuf::from(words[0]),
+            path: arg(1),
+        }),
+        ("file delete", 1) => Line::Run(Command::FileDelete(arg(0))),
         ("file get", 2 | 3) => {
             let mut rest = words.to_vec();
             let raw = take_flag(&mut rest, "raw");
@@ -1532,6 +1546,27 @@ pub(crate) mod tests {
         ] {
             assert!(parse(&words(line)).is_err(), "{line}");
         }
+        assert_eq!(
+            run("file put 'local file.bin' /data.bin"),
+            Command::FilePut {
+                local: "local file.bin".into(),
+                path: "/data.bin".into(),
+            }
+        );
+        assert_eq!(
+            run("file delete /data.bin"),
+            Command::FileDelete("/data.bin".into())
+        );
+        for line in [
+            "file put",
+            "file put local.bin",
+            "file put '' /data.bin",
+            "file put a /b c",
+            "file delete",
+            "file delete /a /b",
+        ] {
+            assert!(parse(&words(line)).is_err(), "{line}");
+        }
         assert!(matches!(
             parse(&words("device list enabled")).unwrap(),
             Line::Devices(Filter::Enabled)
@@ -1766,9 +1801,12 @@ pub(crate) mod tests {
     fn development_commands_are_offered_only_by_development_firmware() {
         let mut st = state();
         assert!(help(Some(&st)).contains("file list"));
+        assert!(help(Some(&st)).contains("file put"));
+        assert!(help(Some(&st)).contains("file delete"));
         st.status.information = None;
         let shown = help(Some(&st));
         assert!(!shown.contains("file list") && !shown.contains("adapter bootloader"));
+        assert!(!shown.contains("file put") && !shown.contains("file delete"));
         assert!(
             shown.contains("except adapter status and adapter restart."),
             "{shown}"

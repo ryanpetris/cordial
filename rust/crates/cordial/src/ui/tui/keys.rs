@@ -142,9 +142,7 @@ impl<F: Fleet> Model<F> {
             return;
         }
         self.focus = self.target(self.px, self.py);
-        if self.focus == Some(Action::Field) && self.form_focused
-            || self.focus == Some(Action::FilesDest) && self.files_editing
-        {
+        if self.focus == Some(Action::Field) && self.form_focused {
             self.focus = None;
         }
     }
@@ -353,17 +351,6 @@ impl<F: Fleet> Model<F> {
                 }
                 _ => {
                     self.form.key(&k);
-                }
-            }
-            return;
-        }
-        if self.files_editing {
-            match key.as_str() {
-                "enter" => self.action(Action::FilesDownload),
-                "esc" | "tab" | "shift+tab" => self.files_editing = false,
-                _ => {
-                    self.files.dest_err.clear();
-                    self.files_dest.key(&k);
                 }
             }
             return;

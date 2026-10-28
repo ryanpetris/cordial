@@ -39,6 +39,24 @@ pub(crate) const DETAILS: [&str; 6] = [
     "Software",
 ];
 
+/// A failed save as sentences naming the adapter and what it couldn't save, then the reason
+/// when the reason doesn't already say so.
+pub fn save_failed(what: &str, reason: &str) -> String {
+    if reason.starts_with("The adapter couldn't save") {
+        reason.to_owned()
+    } else {
+        format!("The adapter couldn't save {what}. {reason}")
+    }
+}
+
+/// The settings a save sent, counted: "1 setting" or "{n} settings".
+pub fn settings_count(n: usize) -> String {
+    match n {
+        1 => "1 setting".to_owned(),
+        n => format!("{n} settings"),
+    }
+}
+
 /// The device's identity facts with these labels, in the labels' order.
 pub(crate) fn facts(d: &p::Device, labels: &[&str]) -> Vec<(&'static str, String)> {
     let all = text::identity(d.information.as_ref());
@@ -346,7 +364,13 @@ impl<F: Fleet> App<F> {
     pub(crate) fn device_result(&mut self, job: &Job, result: &Result<Outcome, Error>) {
         let adapter = job.adapter.clone();
         match (&job.kind, result) {
-            (Kind::DeviceSave { device, sent, .. }, Ok(_)) => {
+            (Kind::DeviceSave { device, sent, tab }, result)
+                if result.is_ok() || result.as_ref().is_err_and(|e| e.complete()) =>
+            {
+                if let Err(e) = result {
+                    self.notes
+                        .insert(save_spot(*tab, adapter.clone(), *device), words::failure(e));
+                }
                 let key = (adapter, *device);
                 if let Some(draft) = self.device_drafts.get_mut(&key) {
                     if draft.enabled == sent.enabled {

@@ -256,6 +256,7 @@ pub fn apply_state(s: &Setting) -> String {
         Some(Err(e)) if model::unsupported(e) && model::plain(e) => {
             "unsupported by the device now".into()
         }
+        Some(Err(e)) if e.outcome == p::ErrorOutcome::Complete as i32 => hidpp_error_words(e),
         Some(Err(e)) => format!("failed: {}", hidpp_error_words(e)),
     }
 }
@@ -589,5 +590,25 @@ pub(crate) mod tests {
             setting_line(&d, &s),
             "  pointer_sensor.1.dpi  Pointer Sensitivity 2: last observed on device: 1600 DPI (stale); saved on adapter: 800, applied"
         );
+    }
+
+    #[test]
+    fn completed_application_feedback_does_not_claim_failure() {
+        let mut setting = one(settings::tests::sensor(0, ranged(Some(800), 200, 4000, 50)));
+        for outcome in [p::ErrorOutcome::Complete, p::ErrorOutcome::NoEffect] {
+            setting.status = Some(Err(p::Error {
+                code: p::ErrorCode::Internal as i32,
+                outcome: outcome as i32,
+                ..Default::default()
+            }));
+            let text = apply_state(&setting);
+            assert_eq!(
+                text.starts_with("failed:"),
+                outcome != p::ErrorOutcome::Complete
+            );
+            if outcome == p::ErrorOutcome::Complete {
+                assert!(text.starts_with("the change took effect"));
+            }
+        }
     }
 }

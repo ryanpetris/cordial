@@ -32,7 +32,7 @@ pub fn level(b: &Battery, threshold: i64) -> Option<Level> {
         return Some(Level::Ok);
     }
     Some(match b.percent? {
-        p if p <= CRITICAL_PERCENT => Level::Critical,
+        p if p <= CRITICAL_PERCENT.min(threshold) => Level::Critical,
         p if p <= threshold => Level::Low,
         _ => Level::Ok,
     })
@@ -211,6 +211,10 @@ pub(super) mod tests {
         assert_eq!(level(&b(Some(20), None), 20), Some(Level::Low));
         assert_eq!(level(&b(Some(25), None), 30), Some(Level::Low));
         assert_eq!(level(&b(Some(5), Some(false)), 20), Some(Level::Critical));
+        assert_eq!(level(&b(Some(5), Some(false)), 3), Some(Level::Ok));
+        assert_eq!(level(&b(Some(4), Some(false)), 3), Some(Level::Ok));
+        assert_eq!(level(&b(Some(3), Some(false)), 3), Some(Level::Critical));
+        assert_eq!(level(&b(Some(100), Some(false)), 100), Some(Level::Low));
         let stale = Battery {
             fresh: false,
             ..b(Some(3), None)

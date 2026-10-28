@@ -15,3 +15,6 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | CARGO_HOME=/opt/cargo sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
     && CARGO_HOME=/opt/cargo rustup toolchain install 1.99.1 --profile minimal \
     && chmod -R a+rX,go-w /opt/rustup
+
+COPY install-just.sh /tmp/install-just.sh
+RUN sh /tmp/install-just.sh && rm /tmp/install-just.sh

@@ -2,12 +2,12 @@
 //! arrive as events.
 use crate::{
     controller::{
-        AdapterUpdate, Command, DeviceUpdate, Outcome, Pick, RunOptions, Session, Subject, Target,
-        Toggle, Wait,
+        AdapterUpdate, Command, DeviceUpdate, Outcome, Pick, Progress, RunOptions, Session,
+        Subject, Target, Toggle, Wait,
     },
     error::Error,
     model::{self, Prompt},
-    profiles::{self, InterfaceUpdate},
+    profiles::{self, Deletion, InterfaceUpdate},
     records,
     settings::{self, Field, Setting},
     storage,
@@ -25,11 +25,17 @@ pub(crate) const STARTING: &str =
 
 pub(crate) const NO_PROFILES: &str = "this adapter doesn't support profiles";
 
+/// How a profile deletion's error starts once some of its changes took effect.
+pub(crate) const DELETE_INCOMPLETE: &str = "the profile deletion is incomplete";
+
 /// The longest adapter name, in UTF-8 bytes.
 const NAME_BYTES: usize = 64;
 
 /// The longest scan the adapter runs.
 pub const MAX_SCAN_SECONDS: u32 = 60;
+
+const FILE_CHUNK_BYTES: usize = p::STORAGE_MIGRATION_CHUNK_BYTES;
+const UPLOAD_TEMP: &str = "/.file-upload";
 
 /// The name the adapter saves for `value`: trimmed, 1 to 64 bytes and without control
 /// characters, or `None` when the adapter refuses it.
@@ -95,6 +101,7 @@ fn uses_profiles(command: &Command) -> bool {
         | Command::ProfileCreate(_)
         | Command::ProfileCopy(..)
         | Command::ProfileDelete(_)
+        | Command::ProfileDeletePlanned(_)
         | Command::Rules(_)
         | Command::RuleChange(..) => true,
         Command::AdapterSave(update) => !update.interfaces.is_empty(),
@@ -107,7 +114,12 @@ fn uses_profiles(command: &Command) -> bool {
 pub fn unsupported(st: &State, command: &Command) -> Option<String> {
     let development = model::development(&st.status);
     match command {
-        Command::Files(_) | Command::FileGet { .. } if !development => {
+        Command::Files(_)
+        | Command::FileGet { .. }
+        | Command::FilePut { .. }
+        | Command::FileDelete(_)
+            if !development =>
+        {
             Some("this adapter doesn't offer file access".into())
         }
         Command::Bootloader | Command::Features(_) if !development => {
@@ -134,10 +146,12 @@ pub fn unsupported(st: &State, command: &Command) -> Option<String> {
     }
 }
 
+/// Runs `command`; a profile deletion reports its progress to `report` as it goes.
 pub(crate) fn execute(
     session: &Session,
     command: &Command,
     options: &RunOptions,
+    report: &dyn Fn(Progress),
 ) -> Result<Outcome, Error> {
     let st = session.state();
     if !st.available {
@@ -155,6 +169,15 @@ pub(crate) fn execute(
     if let Some(reason) = unsupported(&st, command) {
         return Err(Error::new(reason));
     }
+    // Concurrent uploads must not mix chunks in the shared scratch file, and other file
+    // operations must not change it before an upload is verified and moved.
+    let _files = match command {
+        Command::Files(_)
+        | Command::FileGet { .. }
+        | Command::FilePut { .. }
+        | Command::FileDelete(_) => Some(session.files.lock().unwrap()),
+        _ => None,
+    };
     match command {
         Command::Status => {
             let r = session.call(C::GetStatus(p::GetStatus {}), "adapter status", true)?;
@@ -303,14 +326,13 @@ pub(crate) fn execute(
         } => {
             let expected = records::destination(path, local, *raw);
             storage::check_destination(&expected, *overwrite)?;
-            // The response isn't reported, so file contents are never printed.
             let r = session.call(
                 C::ReadFile(p::ReadFile {
                     path: path.clone(),
                     ..Default::default()
                 }),
                 "file get",
-                false,
+                true,
             )?;
             // A read without a length returns the whole file.
             let Some(response::Result::File(file)) = r.result else {
@@ -346,6 +368,73 @@ pub(crate) fn execute(
                 json: !*raw && unconverted.is_none(),
                 unconverted,
             })
+        }
+        Command::FilePut { local, path } => {
+            file_path(path)?;
+            let data = std::fs::read(local)
+                .map_err(|e| Error::new(format!("couldn't read the local file: {e}")))?;
+            u32::try_from(data.len())
+                .map_err(|_| Error::new("the local file is too large for the adapter"))?;
+            let staged = data.len() > FILE_CHUNK_BYTES;
+            if staged && path == UPLOAD_TEMP {
+                return Err(Error::new(
+                    "the upload destination is also the temporary transfer path",
+                ));
+            }
+            let destination = if staged { UPLOAD_TEMP } else { path };
+            options.wait.check()?;
+            if staged {
+                check_upload_path(session).map_err(|e| {
+                    Error::new(format!(
+                        "couldn't prepare the adapter for upload: {}",
+                        text::error_line(&e)
+                    ))
+                })?;
+            }
+            if data.is_empty() {
+                write_file(session, destination, 0, &[])?;
+            } else {
+                for (index, chunk) in data.chunks(FILE_CHUNK_BYTES).enumerate() {
+                    options.wait.check()?;
+                    write_file(session, destination, index * FILE_CHUNK_BYTES, chunk)?;
+                }
+            }
+            if staged {
+                verify_file(session, destination, &data, &options.wait)?;
+                options.wait.check()?;
+                file_mutation(
+                    session,
+                    C::MoveFile(p::MoveFile {
+                        source: UPLOAD_TEMP.into(),
+                        destination: path.clone(),
+                    }),
+                    "file put",
+                )?;
+            }
+            verify_file(session, path, &data, &options.wait).map_err(|e| {
+                Error::new(format!(
+                    "the adapter acknowledged the upload, but its contents couldn't be verified: {}",
+                    text::error_line(&e)
+                ))
+            })?;
+            Ok(Outcome::FileUploaded {
+                path: path.clone(),
+                bytes: data.len() as u64,
+            })
+        }
+        Command::FileDelete(path) => {
+            file_path(path)?;
+            if path == "/format.pb" {
+                return Err(Error::new(
+                    "the adapter's storage format file cannot be deleted",
+                ));
+            }
+            file_mutation(
+                session,
+                C::DeleteFile(p::DeleteFile { path: path.clone() }),
+                "file delete",
+            )?;
+            Ok(Outcome::FileDeleted(path.clone()))
         }
         Command::Profiles => Ok(Outcome::Profiles(list_profiles(session, true)?)),
         Command::ProfileShow(target) => {
@@ -390,26 +479,27 @@ pub(crate) fn execute(
         Command::ProfileDelete(target) => {
             // An ID is deleted as given, even when the profile's name can't be read.
             let profile = match target {
-                Target::Id(id) => st.profile(*id).cloned().unwrap_or_else(|| p::Profile {
-                    id: *id,
-                    name: id.to_string(),
-                    ..Default::default()
-                }),
+                Target::Id(id) => known_profile(&st, *id),
                 Target::Name(_) => resolve_profile(session, &st, target)?,
             };
-            if let Some(reason) = profiles::in_use(&st, profile.id) {
-                return Err(Error::new(reason));
-            }
-            let _pending = session.pending("profile delete", profile.id);
-            session
-                .call(
-                    C::DeleteProfile(p::DeleteProfile {
-                        profile: profile.id,
-                    }),
-                    "profile delete",
-                    true,
-                )
-                .map_err(|e| missing(e, target))?;
+            delete_profile(
+                session,
+                &Deletion::of(&st, profile.id),
+                target,
+                &options.wait,
+                report,
+            )?;
+            Ok(Outcome::ProfileDeleted(profile))
+        }
+        Command::ProfileDeletePlanned(plan) => {
+            let profile = known_profile(&st, plan.profile);
+            delete_profile(
+                session,
+                plan,
+                &Target::Id(plan.profile),
+                &options.wait,
+                report,
+            )?;
             Ok(Outcome::ProfileDeleted(profile))
         }
         Command::Rules(target) => {
@@ -506,6 +596,109 @@ fn transport_refusal(session: &Session, transports: &[p::Transport], error: Erro
 
 fn unexpected() -> Error {
     Error::new(crate::error::UNEXPECTED)
+}
+
+fn file_path(path: &str) -> Result<(), Error> {
+    let internal = path.strip_prefix("/.file-write-").is_some_and(|suffix| {
+        suffix.len() == 16
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    });
+    if !path.starts_with('/')
+        || path.len() > 192
+        || path.ends_with('/')
+        || path.contains("//")
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path.split('/').any(|part| part == "." || part == "..")
+        || internal
+    {
+        return Err(Error::new("invalid adapter file path"));
+    }
+    Ok(())
+}
+
+fn file_mutation(session: &Session, command: C, name: &'static str) -> Result<(), Error> {
+    match session.call(command, name, true)?.result {
+        None => Ok(()),
+        _ => Err(unexpected()),
+    }
+}
+
+fn check_upload_path(session: &Session) -> Result<(), Error> {
+    let response = session.call(
+        C::ListFiles(p::ListFiles { path: "/".into() }),
+        "file put",
+        true,
+    )?;
+    let Some(response::Result::Files(list)) = response.result else {
+        return Err(unexpected());
+    };
+    if list
+        .entries
+        .iter()
+        .any(|entry| entry.name == UPLOAD_TEMP[1..])
+    {
+        return Err(Error::new(format!(
+            "{UPLOAD_TEMP} already exists on the adapter"
+        )));
+    }
+    Ok(())
+}
+
+fn write_file(session: &Session, path: &str, offset: usize, data: &[u8]) -> Result<(), Error> {
+    file_mutation(
+        session,
+        C::WriteFile(p::WriteFile {
+            path: path.into(),
+            offset: offset as u64,
+            data: data.into(),
+        }),
+        "file put",
+    )
+}
+
+fn verify_file(session: &Session, path: &str, data: &[u8], wait: &Wait) -> Result<(), Error> {
+    let mut offset = 0;
+    loop {
+        wait.check()?;
+        let response = session.call(
+            C::ReadFile(p::ReadFile {
+                path: path.into(),
+                offset: offset as u64,
+                length: Some(FILE_CHUNK_BYTES as u32),
+            }),
+            "file put",
+            true,
+        )?;
+        let end = (offset + FILE_CHUNK_BYTES).min(data.len());
+        verify_chunk(response, path, offset, data.len(), &data[offset..end])?;
+        if end == data.len() {
+            return Ok(());
+        }
+        offset = end;
+    }
+}
+
+fn verify_chunk(
+    response: p::Response,
+    path: &str,
+    offset: usize,
+    size: usize,
+    expected: &[u8],
+) -> Result<(), Error> {
+    match response.result {
+        Some(response::Result::File(file))
+            if file.path == path
+                && file.offset == offset as u64
+                && file.size == size as u64
+                && file.data == expected =>
+        {
+            Ok(())
+        }
+        _ => Err(unexpected()),
+    }
 }
 
 fn list_profiles(session: &Session, reported: bool) -> Result<p::ProfileList, Error> {
@@ -617,6 +810,168 @@ fn unique_name(all: &[p::Profile], name: &str, target: &Target) -> Result<u32, E
     }
 }
 
+/// A profile as the view names it, or its ID while its name isn't known.
+fn known_profile(st: &State, id: u32) -> p::Profile {
+    st.profile(id).cloned().unwrap_or_else(|| p::Profile {
+        id,
+        name: id.to_string(),
+        ..Default::default()
+    })
+}
+
+/// Makes `plan`'s changes in order, then deletes its profile. Each change is made only while its
+/// target is still as the plan saw it, and nothing beyond the plan is changed. The first change
+/// that can't be made stops the rest, and changes already made stay; the adapter refuses to
+/// delete a profile still in use. Each change is reported once the adapter accepts it.
+fn delete_profile(
+    session: &Session,
+    plan: &Deletion,
+    target: &Target,
+    wait: &Wait,
+    report: &dyn Fn(Progress),
+) -> Result<(), Error> {
+    let _pending = session.pending("profile delete", plan.profile);
+    let mut changed = false;
+    for (i, detach) in plan.devices.iter().enumerate() {
+        let st = session.state();
+        let Some(d) = st
+            .device(detach.device)
+            .filter(|d| profiles::layers(d) == detach.layers.as_slice())
+            .cloned()
+        else {
+            return Err(incomplete(
+                changed,
+                Error::new(format!(
+                    "{}'s profiles changed before Cordial could update them",
+                    detach.name
+                )),
+            ));
+        };
+        let update = DeviceUpdate {
+            layers: Some(plan.kept(detach)),
+            ..Default::default()
+        };
+        save_device(
+            session,
+            &st,
+            &d,
+            subject(&d),
+            &update,
+            "device set profiles",
+        )
+        .map_err(|e| incomplete(changed, e))?;
+        changed = true;
+        report(Progress {
+            done: i + 1,
+            waiting: false,
+        });
+    }
+    let mut reconnect = None;
+    if !plan.interfaces.is_empty() {
+        let st = session.state();
+        if let Some(u) = plan.interfaces.iter().find(|u| {
+            profiles::interface(&st.status, u.interface)
+                .is_none_or(|s| s.profile != plan.profile || s.enabled != u.enabled)
+        }) {
+            return Err(incomplete(
+                changed,
+                Error::new(format!(
+                    "{} changed before Cordial could update it",
+                    profiles::interface_label(u.interface)
+                )),
+            ));
+        }
+        let update = AdapterUpdate {
+            interfaces: plan.interface_updates(),
+            ..Default::default()
+        };
+        let restarts = plan
+            .interfaces
+            .iter()
+            .any(|u| profiles::interface(&st.status, u.interface).is_some_and(|s| s.active));
+        if restarts {
+            reconnect = Some(session.profile_reconnect(plan.profile));
+        }
+        save_adapter(session, &st, &update, "adapter interface")
+            .map_err(|e| incomplete(changed, e))?;
+        changed = true;
+        let done = plan.devices.len() + plan.interfaces.len();
+        report(Progress {
+            done,
+            waiting: restarts,
+        });
+        if let Some(reconnect) = &mut reconnect {
+            reconnect
+                .reconnect(wait)
+                .map_err(|e| incomplete(changed, e))?;
+            report(Progress {
+                done,
+                waiting: false,
+            });
+        } else {
+            session
+                .call(C::GetStatus(p::GetStatus {}), "adapter status", true)
+                .map_err(|e| incomplete(changed, e))?;
+        }
+        if plan.interfaces.iter().any(|u| {
+            profiles::interface(&session.state().status, u.interface)
+                .is_none_or(|s| s.enabled || s.active || s.profile != 0)
+        }) {
+            return Err(incomplete(
+                changed,
+                Error::new(
+                    "the adapter's interface settings changed before the profile could be deleted",
+                ),
+            ));
+        }
+    }
+    if let Some(reason) = profiles::in_use(&session.state(), plan.profile) {
+        return Err(incomplete(changed, Error::new(reason)));
+    }
+    wait.check().map_err(|e| incomplete(changed, e))?;
+    session
+        .call(
+            C::DeleteProfile(p::DeleteProfile {
+                profile: plan.profile,
+            }),
+            "profile delete",
+            true,
+        )
+        .map_err(|e| incomplete(changed, missing(e, target)))?;
+    drop(reconnect);
+    Ok(())
+}
+
+/// A profile deletion's failure, marked incomplete once some of its changes took effect. The
+/// adapter's error stays as it is.
+fn incomplete(changed: bool, error: Error) -> Error {
+    if !changed {
+        return error;
+    }
+    Error {
+        message: format!("{DELETE_INCOMPLETE}: {}", error.message),
+        ..error
+    }
+}
+
+/// A profile deletion's failure as its cause, and whether some of its changes took effect.
+pub(crate) fn deletion_failure(error: &Error) -> (Error, bool) {
+    match error
+        .message
+        .strip_prefix(DELETE_INCOMPLETE)
+        .and_then(|m| m.strip_prefix(": "))
+    {
+        Some(cause) => (
+            Error {
+                message: cause.to_owned(),
+                ..error.clone()
+            },
+            true,
+        ),
+        None => (error.clone(), false),
+    }
+}
+
 /// Saves `update` in one SetAdapter request.
 fn save_adapter(
     session: &Session,
@@ -705,7 +1060,7 @@ fn scan(
             })
         }
         Err(error) => {
-            let _ = session.connection.stop_scan();
+            let _ = session.connection().stop_scan();
             Err(error)
         }
     }
@@ -774,12 +1129,15 @@ fn pair(session: &Session, target: &Target, options: &RunOptions) -> Result<Outc
         )
         .map_err(|e| transport_refusal(session, &[transport], e))?;
     let ended = session.cell.wait_for(&options.wait, |st| {
+        if st.paired_candidate == Some(candidate.id) {
+            return Some(Ok(None));
+        }
         let p = st
             .pairing
             .as_ref()
             .filter(|p| p.candidate == candidate.id)?;
         match &p.step {
-            Some(pairing::Step::Done(done)) => Some(Ok(done.device)),
+            Some(pairing::Step::Done(done)) => Some(Ok(Some(done.device))),
             Some(pairing::Step::Error(e)) => Some(Err(e.clone())),
             _ => None,
         }
@@ -794,9 +1152,14 @@ fn pair(session: &Session, target: &Target, options: &RunOptions) -> Result<Outc
             ));
         }
         Err(error) => {
-            let _ = session.connection.cancel_pairing();
+            let _ = session.connection().cancel_pairing();
             return Err(error);
         }
+    };
+    let Some(device) = device else {
+        return Ok(Outcome::PairedWithoutDevice {
+            name: candidate.name.clone(),
+        });
     };
     // The saved record follows the pairing's end as a device event.
     let record = session
@@ -1244,4 +1607,110 @@ fn save(
         forget,
         settings: session.state().settings_of(subject.id),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_deletion_steps_preserve_transport_uncertainty_and_the_failing_command() {
+        use cordial_client::Error as E;
+        for cause in [
+            E::Timeout,
+            E::Closed,
+            E::Protocol,
+            E::UnexpectedResponse,
+            E::Io(std::sync::Arc::new(std::io::Error::other(
+                "connection failed",
+            ))),
+        ] {
+            let error = incomplete(true, Error::from_client(cause, "profile delete"));
+            assert!(error.unconfirmed(), "{error}");
+            assert_eq!(error.command, Some("profile delete"));
+            assert!(deletion_failure(&error).1);
+        }
+        let error = incomplete(
+            true,
+            Error::code(p::ErrorCode::InUse, Some("profile delete")),
+        );
+        assert!(!error.unconfirmed());
+    }
+
+    #[test]
+    fn upload_readback_requires_matching_metadata_length_and_bytes() {
+        let file = p::FileData {
+            path: "/data.bin".into(),
+            offset: 512,
+            size: 515,
+            data: vec![1, 2, 3],
+        };
+        let check = |file| {
+            verify_chunk(
+                p::Response {
+                    result: Some(response::Result::File(file)),
+                },
+                "/data.bin",
+                512,
+                515,
+                &[1, 2, 3],
+            )
+        };
+        check(file.clone()).unwrap();
+        for invalid in [
+            p::FileData {
+                path: "/other.bin".into(),
+                ..file.clone()
+            },
+            p::FileData {
+                offset: 0,
+                ..file.clone()
+            },
+            p::FileData {
+                size: 516,
+                ..file.clone()
+            },
+            p::FileData {
+                data: vec![1, 2],
+                ..file.clone()
+            },
+            p::FileData {
+                data: vec![1, 2, 3, 4],
+                ..file.clone()
+            },
+            p::FileData {
+                data: vec![1, 2, 4],
+                ..file.clone()
+            },
+        ] {
+            let error = check(invalid).unwrap_err();
+            assert_eq!(error.message, crate::error::UNEXPECTED);
+            assert!(error.unconfirmed());
+        }
+        assert!(verify_chunk(p::Response::default(), "/data.bin", 0, 0, &[]).is_err());
+    }
+
+    #[test]
+    fn adapter_file_paths_use_the_protocol_byte_limit_and_reserved_names() {
+        for valid in [
+            "/a",
+            "/devices/1/device.pb",
+            "/.file-upload",
+            "/.file-write-not-internal",
+        ] {
+            file_path(valid).unwrap();
+        }
+        file_path(&format!("/{}", "a".repeat(191))).unwrap();
+        assert!(file_path(&format!("/{}", "a".repeat(192))).is_err());
+        for invalid in [
+            "/a\\b",
+            "/a\n",
+            "/./a",
+            "/a/..",
+            "",
+            "/.file-write-0123456789abcdef",
+        ] {
+            assert!(file_path(invalid).is_err(), "{invalid:?}");
+        }
+    }
 }

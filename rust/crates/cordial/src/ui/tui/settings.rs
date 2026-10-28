@@ -86,12 +86,7 @@ impl<F: Fleet> Model<F> {
         let choices = settings::choices(s);
         let kind = settings::kind(s);
         if kind == Type::Choice && choices.is_empty() {
-            let unit = display_unit(leaf, s.value.as_ref());
-            let mut text = value_text(leaf, s.value.as_ref());
-            if !unit.is_empty() {
-                text = format!("{text} {unit}");
-            }
-            c.label(&text, stale);
+            c.label(&unit_text(leaf, s.value.as_ref()), stale);
             return c;
         }
         if kind == Type::Bool {
@@ -103,11 +98,15 @@ impl<F: Fleet> Model<F> {
             return layout::switch(on, Action::SettingBool(key, next), !busy);
         }
         if is_free_spin(s) {
-            let on = !matches!(shown, Some(Value::Integer(FREE_SPIN_OFF)));
-            return layout::switch(Some(on), Action::FreeSpin(key, !on), !busy);
+            let on = match &shown {
+                Some(Value::Integer(n)) => Some(*n != FREE_SPIN_OFF),
+                _ => None,
+            };
+            let next = on.is_none_or(|on| !on);
+            return layout::switch(on, Action::FreeSpin(key, next), !busy);
         }
         if !choices.is_empty() {
-            let labels: Vec<String> = choices.iter().map(|v| value_text(leaf, Some(v))).collect();
+            let labels: Vec<String> = choices.iter().map(|v| unit_text(leaf, Some(v))).collect();
             let short = choices.len() <= 3
                 && labels.iter().map(|l| l.chars().count()).sum::<usize>() <= 24
                 && shown.as_ref().is_some_and(|v| choices.contains(v));
@@ -147,7 +146,7 @@ impl<F: Fleet> Model<F> {
                 c.width = layout::line_width(&c.lines[0]);
                 return c;
             }
-            let text = format!("{} ▾", value_text(leaf, shown.as_ref()));
+            let text = format!("{} ▾", unit_text(leaf, shown.as_ref()));
             if busy {
                 c.disabled(&text);
             } else {
@@ -283,7 +282,7 @@ impl<F: Fleet> Model<F> {
                 group.append(mark);
                 b.labelled(label, group);
                 if is_free_spin(s)
-                    && !matches!(self.shown_value(d, s), Some(Value::Integer(FREE_SPIN_OFF)))
+                    && matches!(self.shown_value(d, s), Some(Value::Integer(n)) if n != FREE_SPIN_OFF)
                 {
                     let mut c = Layout::new(w);
                     self.stepper(&mut c, d, s, busy);
@@ -297,9 +296,9 @@ impl<F: Fleet> Model<F> {
                     && let Some(e) = &sub.error
                 {
                     let text = if sub.unknown {
-                        words::reason(e).to_owned()
+                        e.clone()
                     } else {
-                        format!("Couldn't Save: {}", words::reason(e))
+                        app::device::save_failed("this setting", e)
                     };
                     notes.push((text, err()));
                 }
@@ -310,7 +309,7 @@ impl<F: Fleet> Model<F> {
                 if s.saved.is_some() && s.status == Some(Ok(SettingState::ChangedOnDevice)) && fresh
                 {
                     notes.push((
-                        format!("Device: {}", value_text(s.field.leaf, s.value.as_ref())),
+                        format!("Device: {}", unit_text(s.field.leaf, s.value.as_ref())),
                         dim(),
                     ));
                 }
@@ -338,11 +337,7 @@ impl<F: Fleet> Model<F> {
                 .iter()
                 .filter(|(f, _)| catalog::category(f.leaf) == category)
             {
-                let mut text = value_text(field.leaf, Some(value));
-                let unit = display_unit(field.leaf, Some(value));
-                if !unit.is_empty() {
-                    text = format!("{text} {unit}");
-                }
+                let text = unit_text(field.leaf, Some(value));
                 b.labelled(styled(catalog::label(field), Style::new()), {
                     let mut r = Layout::new(w);
                     r.label(&text, look);
@@ -369,10 +364,11 @@ impl<F: Fleet> Model<F> {
             .get(&Spot::SettingsNote(key.0.clone(), key.1))
             .cloned()
             .or_else(|| {
-                submission
-                    .as_ref()
-                    .filter(|s| !s.running && s.error.is_some() && !s.unknown)
-                    .map(|s| format!("Couldn't Save {}", s.fields.len()))
+                let s = submission.as_ref().filter(|s| !s.running && !s.unknown)?;
+                Some(app::device::save_failed(
+                    &app::device::settings_count(s.fields.len()),
+                    s.error.as_deref()?,
+                ))
             })
             .or_else(|| match model::hidpp_up(&d.d) {
                 model::Up::Error(e) => Some(words::error_text(&e, words::Scope::Apply)),

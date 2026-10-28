@@ -2,7 +2,6 @@
 //!
 //! Linux preferences use GSettings. The configuration directory holds the XDG autostart entry.
 use super::{Emit, ServiceEvent};
-use crate::ui::app::words::CRITICAL_PERCENT;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use std::{
@@ -20,15 +19,16 @@ pub const TITLES: [&str; 5] = [
     "Connections",
 ];
 
-/// The highest low battery level the user can choose.
-const MOST_PERCENT: i64 = 50;
+/// The low battery levels the user can choose.
+const LEAST_PERCENT: i64 = 1;
+const MOST_PERCENT: i64 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Preferences {
     pub start_at_login: bool,
     pub always_show_tray: bool,
     pub notify_low_battery: bool,
-    /// At most this charged is low, from 5 to 50.
+    /// At most this charged is low, from 1 to 100.
     pub low_battery_percent: i64,
     pub notify_connections: bool,
 }
@@ -43,10 +43,6 @@ impl Default for Preferences {
             notify_connections: false,
         }
     }
-}
-
-fn level(n: f64) -> i64 {
-    (n.round() as i64).clamp(CRITICAL_PERCENT, MOST_PERCENT)
 }
 
 const SCHEMA_DIRECTORY: &str = "share/glib-2.0/schemas";
@@ -176,10 +172,10 @@ impl Store {
 
     /// Saves changed values together. Schema ranges reject invalid battery levels.
     pub fn set(&self, p: Preferences) -> io::Result<()> {
-        if !(CRITICAL_PERCENT..=MOST_PERCENT).contains(&p.low_battery_percent) {
+        if !(LEAST_PERCENT..=MOST_PERCENT).contains(&p.low_battery_percent) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "the low battery level must be between 5 and 50",
+                format!("the low battery level must be between {LEAST_PERCENT} and {MOST_PERCENT}"),
             ));
         }
         let transaction = self.transaction();
@@ -259,7 +255,7 @@ pub fn sync_autostart(store: &Store) {
         store.set_autostart(None)
     };
     if let Err(e) = synced {
-        eprintln!("updating autostart failed: {e}");
+        crate::desktop::diagnostic(format_args!("updating autostart failed: {e}"));
     }
 }
 
@@ -290,7 +286,7 @@ pub fn page(store: &Rc<Store>, emit: &Emit) -> adw::ToastOverlay {
             let saved = store.set(p);
             if let Err(e) = &saved {
                 sync_autostart(&store);
-                eprintln!("saving preferences failed: {e}");
+                crate::desktop::diagnostic(format_args!("saving preferences failed: {e}"));
                 toast("Cordial couldn't save the setting.");
             }
             emit(ServiceEvent::Changed);
@@ -322,7 +318,7 @@ pub fn page(store: &Rc<Store>, emit: &Emit) -> adw::ToastOverlay {
                     }
                 }
                 Err(e) => {
-                    eprintln!("updating autostart failed: {e}");
+                    crate::desktop::diagnostic(format_args!("updating autostart failed: {e}"));
                     toast("Cordial couldn't change Start at Login.");
                     row.set_active(!on);
                 }
@@ -349,38 +345,35 @@ pub fn page(store: &Rc<Store>, emit: &Emit) -> adw::ToastOverlay {
         &change,
         |p, on| p.notify_low_battery = on,
     );
-    let percent = adw::SpinRow::with_range(CRITICAL_PERCENT as f64, MOST_PERCENT as f64, 5.0);
-    percent.set_title("Low Battery Level");
-    // AT-SPI leaves out the presentation role libadwaita 1.6 and later give a spin row, together
-    // with its spin button, so the row takes the list item role other rows have and its title
-    // names the spin button.
-    let widget = percent.upcast_ref::<gtk::Widget>();
-    widget.set_accessible_role(gtk::AccessibleRole::ListItem);
-    widget.update_property(&[gtk::accessible::Property::Label("Low Battery Level")]);
-    // A numeric row refuses the percent sign its text shows.
-    percent.set_numeric(false);
-    percent.set_value(p.low_battery_percent as f64);
-    percent.connect_output(|row| {
-        row.set_text(&format!("{}%", row.value()));
-        true
-    });
-    // Text that isn't a number keeps the level. libadwaita 1.5.0 and 1.5.1 lose the value a spin
-    // row's input handler returns, so the row leaves the plain number for GTK to read.
-    percent.connect_input(|row| {
-        let text = row.text();
-        let typed = text.trim().trim_end_matches('%').trim().parse::<f64>();
-        let level = typed.ok().filter(|v| v.is_finite()).unwrap_or(row.value());
-        let plain = level.to_string();
-        if text != plain {
-            row.set_text(&plain);
-        }
-        None
-    });
+    // A numeric row takes only digits. Typed text changes the level only when it is a number
+    // in range, so the row never clamps what was typed.
+    let percent = adw::SpinRow::builder()
+        .title("Low Battery Level")
+        .adjustment(&gtk::Adjustment::new(
+            p.low_battery_percent as f64,
+            LEAST_PERCENT as f64,
+            MOST_PERCENT as f64,
+            5.0,
+            10.0,
+            0.0,
+        ))
+        .numeric(true)
+        .digits(0)
+        .update_policy(gtk::SpinButtonUpdatePolicy::IfValid)
+        // AT-SPI leaves out the presentation role libadwaita 1.6 and later give a spin row,
+        // together with its spin button, so the row takes the list item role other rows have
+        // and its title names the spin button.
+        .accessible_role(gtk::AccessibleRole::ListItem)
+        .build();
+    percent
+        .upcast_ref::<gtk::Widget>()
+        .update_property(&[gtk::accessible::Property::Label("Low Battery Level")]);
+    percent.add_suffix(&gtk::Label::new(Some("%")));
     percent.connect_value_notify({
         let change = change.clone();
         let store = store.clone();
         move |row| {
-            let n = level(row.value());
+            let n = row.value() as i64;
             if !change(&|p| p.low_battery_percent = n) {
                 row.set_value(store.get().low_battery_percent as f64);
             }
@@ -484,6 +477,26 @@ mod tests {
         gio::Settings::new_full(&schema, Some(backend), None)
     }
 
+    /// The row titled `title` in `w`.
+    fn find(w: &gtk::Widget, title: &str) -> adw::PreferencesRow {
+        fn search(w: &gtk::Widget, title: &str) -> Option<adw::PreferencesRow> {
+            if let Ok(row) = w.clone().downcast::<adw::PreferencesRow>()
+                && row.title() == title
+            {
+                return Some(row);
+            }
+            let mut child = w.first_child();
+            while let Some(c) = child {
+                if let Some(row) = search(&c, title) {
+                    return Some(row);
+                }
+                child = c.next_sibling();
+            }
+            None
+        }
+        search(w, title).unwrap_or_else(|| panic!("{title} is missing"))
+    }
+
     fn test_store(root: PathBuf) -> Store {
         let settings = settings(&root, &gio::memory_settings_backend_new());
         Store { root, settings }
@@ -531,15 +544,25 @@ mod tests {
                 external.set_boolean("notify-connections", true).unwrap();
                 assert!(store.get().notify_connections);
                 assert!(changed.load(std::sync::atomic::Ordering::Relaxed));
-                assert!(
-                    store
-                        .set(Preferences {
-                            low_battery_percent: 51,
-                            ..p
-                        })
-                        .is_err()
-                );
-                assert_eq!(store.get().low_battery_percent, 30);
+                for level in [1, 3, 60, 100] {
+                    let p = Preferences {
+                        low_battery_percent: level,
+                        ..p
+                    };
+                    store.set(p).unwrap();
+                    assert_eq!(store.get(), p);
+                }
+                for level in [0, 101] {
+                    assert!(
+                        store
+                            .set(Preferences {
+                                low_battery_percent: level,
+                                ..p
+                            })
+                            .is_err()
+                    );
+                    assert_eq!(store.get().low_battery_percent, 100);
+                }
                 store.disconnect(id);
                 fs::remove_dir_all(root).unwrap();
             })
@@ -585,22 +608,6 @@ mod tests {
     #[test]
     #[ignore = "requires a display"]
     fn dialog_rolls_back_controls_when_gsettings_rejects_saves() {
-        fn find(w: &gtk::Widget, title: &str) -> Option<adw::PreferencesRow> {
-            if let Ok(row) = w.clone().downcast::<adw::PreferencesRow>()
-                && row.title() == title
-            {
-                return Some(row);
-            }
-            let mut child = w.first_child();
-            while let Some(c) = child {
-                if let Some(row) = find(&c, title) {
-                    return Some(row);
-                }
-                child = c.next_sibling();
-            }
-            None
-        }
-
         adw::init().expect("GTK needs a display");
         let root = root("dialog-readonly");
         let store = Rc::new(Store {
@@ -616,7 +623,7 @@ mod tests {
         while glib::MainContext::default().iteration(false) {}
         assert!(!store.autostart().exists());
         for title in TITLES {
-            assert!(find(dialog.upcast_ref(), title).is_some(), "{title}");
+            find(dialog.upcast_ref(), title);
         }
 
         for (title, active) in [
@@ -626,7 +633,6 @@ mod tests {
             ("Connections", saved.notify_connections),
         ] {
             let row = find(dialog.upcast_ref(), title)
-                .unwrap()
                 .downcast::<adw::SwitchRow>()
                 .unwrap();
             assert_eq!(row.is_active(), active, "{title}");
@@ -638,14 +644,54 @@ mod tests {
         assert!(!store.autostart().exists());
 
         let row = find(dialog.upcast_ref(), "Low Battery Level")
-            .unwrap()
             .downcast::<adw::SpinRow>()
             .unwrap();
         assert_eq!(row.value(), saved.low_battery_percent as f64);
-        row.set_text("35%");
+        row.set_text("35");
         row.update();
         assert_eq!(row.value(), saved.low_battery_percent as f64);
         assert_eq!(store.get(), saved);
+        window.close();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a display"]
+    fn low_battery_level_takes_typed_levels_in_range() {
+        adw::init().expect("GTK needs a display");
+        let root = root("dialog-level");
+        let store = Rc::new(test_store(root.clone()));
+        let emit: Emit = std::sync::Arc::new(|_| {});
+        let dialog = page(&store, &emit);
+        let window = adw::Window::builder().content(&dialog).build();
+        window.present();
+        while glib::MainContext::default().iteration(false) {}
+        let row = find(dialog.upcast_ref(), "Low Battery Level")
+            .downcast::<adw::SpinRow>()
+            .unwrap();
+        assert!(row.is_numeric());
+        assert!(!row.snaps_to_ticks());
+        // Typing replaces the row's text through its editable, as a keyboard does.
+        let typed = |text: &str| {
+            row.select_region(0, -1);
+            row.delete_selection();
+            let mut at = 0;
+            row.insert_text(text, &mut at);
+            row.update();
+        };
+        for level in [1, 3, 60, 100] {
+            typed(&level.to_string());
+            assert_eq!(row.value(), level as f64);
+            assert_eq!(row.text(), level.to_string());
+            assert_eq!(store.get().low_battery_percent, level);
+        }
+        // Text out of range, or with anything but digits, leaves the level as it was.
+        for text in ["0", "101", "4.5", "42%", "x"] {
+            typed(text);
+            assert_eq!(row.value(), 100.0, "{text}");
+            assert_eq!(row.text(), "100", "{text}");
+            assert_eq!(store.get().low_battery_percent, 100, "{text}");
+        }
         window.close();
         fs::remove_dir_all(root).unwrap();
     }
@@ -658,6 +704,7 @@ mod tests {
         let backend = || gio::keyfile_settings_backend_new(file.to_str().unwrap(), "/", None);
         let expected = Preferences {
             notify_connections: true,
+            low_battery_percent: 3,
             ..Preferences::default()
         };
         {

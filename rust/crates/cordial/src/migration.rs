@@ -108,6 +108,23 @@ pub fn live() -> Engine {
     Arc::new(|id, port, cancelled, report| migration::migrate(id, port, cancelled, report))
 }
 
+/// Uses supplied connections and their raw observers for every migration session.
+pub fn with_backend(
+    connector: Arc<crate::controller::Connector>,
+    ports: impl Fn() -> io::Result<Vec<cordial_client::serial::PortInfo>> + Send + Sync + 'static,
+) -> Engine {
+    Arc::new(move |id, port, cancelled, report| {
+        migration::migrate_with_backend(
+            id,
+            port,
+            cancelled,
+            report,
+            |port| connector(port, Box::new(|_| {})),
+            &ports,
+        )
+    })
+}
+
 /// A failure as the user reads it: whether the outcome is known, then the worker's reason.
 pub fn failure_text(e: &migration::Error) -> String {
     let what = if e.outcome_unknown { UNKNOWN } else { FAILED };

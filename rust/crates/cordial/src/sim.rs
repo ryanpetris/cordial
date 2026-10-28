@@ -131,6 +131,8 @@ pub struct Sim {
     pub refuse: BTreeMap<&'static str, p::Error>,
     /// Listings that fail after their first Message, or settings writes rejected before saving, once.
     pub fail_late: BTreeMap<&'static str, ErrorCode>,
+    /// Active configuration interface changes announce and close the USB session.
+    pub reconnect_interfaces: bool,
     /// Commands that take effect at once but whose replies delay subsequent requests as well.
     pub slow: BTreeMap<&'static str, Duration>,
     /// Saved profiles and their rules; used only when the status has profile support.
@@ -391,6 +393,7 @@ impl Default for Sim {
             next_profile: 1,
             pairing: None,
             pairing_reconnect: None,
+            reconnect_interfaces: false,
             out: None,
             session: 0,
             handles: Arc::default(),
@@ -812,9 +815,21 @@ impl Sim {
                         self.set_transport(transport, on);
                     }
                 }
+                let reconnect = self.reconnect_interfaces
+                    && self
+                        .status
+                        .configuration_interfaces
+                        .iter()
+                        .zip(&before.configuration_interfaces)
+                        .any(|(saved, before)| {
+                            saved.active != before.active
+                                || (saved.active && saved.profile != before.profile)
+                        });
                 let status = self.status.clone();
                 self.respond(None);
-                if status != before {
+                if reconnect {
+                    self.end_session(p::SessionEndingReason::ConfigurationChange as i32);
+                } else if status != before {
                     self.event(p::event::Kind::Adapter(status));
                 }
             }
@@ -1216,6 +1231,9 @@ impl Sim {
             Command::WriteFile(w) => {
                 let data = self.data.entry(w.path).or_default();
                 let start = w.offset as usize;
+                if start == 0 {
+                    data.clear();
+                }
                 data.resize(data.len().max(start + w.data.len()), 0);
                 data[start..start + w.data.len()].copy_from_slice(&w.data);
                 self.respond(None)
@@ -1227,10 +1245,10 @@ impl Sim {
                 }
                 None => self.respond(error(ErrorCode::NotFound)),
             },
-            Command::DeleteFile(d) => match self.data.remove(&d.path) {
-                Some(_) => self.respond(None),
-                None => self.respond(error(ErrorCode::NotFound)),
-            },
+            Command::DeleteFile(d) => {
+                self.data.remove(&d.path);
+                self.respond(None)
+            }
         }
     }
 }
@@ -1489,5 +1507,96 @@ impl Dongle {
     ) -> impl Fn(&str, Handler) -> io::Result<Connection> + Send + Sync + 'static + use<> {
         let dongle = self.clone();
         move |_, handler| dongle.connect(handler)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(sim: &mut Sim, command: Command) -> p::Response {
+        let (writer, reader) = pipe();
+        sim.out = Some(writer);
+        sim.answer(command);
+        let bytes = reader.rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut decoder = Decoder::new(Some(MAX_REQUEST_BYTES));
+        for byte in bytes {
+            if let Some(frame) = decoder.push(byte) {
+                let message = p::Message::decode(frame.unwrap()).unwrap();
+                if let Some(message::Kind::Response(response)) = message.kind {
+                    return response;
+                }
+            }
+        }
+        panic!("the simulator did not send a response");
+    }
+
+    #[test]
+    fn file_replacement_truncates_before_appending_and_moving() {
+        let mut sim = Sim::default();
+        sim.data
+            .insert("/.file-upload".into(), b"previous upload".to_vec());
+        sim.data
+            .insert("/sample.txt".into(), b"previous contents".to_vec());
+        for (offset, data) in [(0, b"new".as_slice()), (3, b" data".as_slice())] {
+            assert_eq!(
+                answer(
+                    &mut sim,
+                    Command::WriteFile(p::WriteFile {
+                        path: "/.file-upload".into(),
+                        offset,
+                        data: data.into(),
+                    })
+                )
+                .result,
+                None
+            );
+        }
+        assert_eq!(sim.data["/.file-upload"], b"new data");
+        assert_eq!(
+            answer(
+                &mut sim,
+                Command::MoveFile(p::MoveFile {
+                    source: "/.file-upload".into(),
+                    destination: "/sample.txt".into(),
+                })
+            )
+            .result,
+            None
+        );
+        assert_eq!(sim.data["/sample.txt"], b"new data");
+        assert!(!sim.data.contains_key("/.file-upload"));
+        assert_eq!(
+            answer(
+                &mut sim,
+                Command::WriteFile(p::WriteFile {
+                    path: "/sample.txt".into(),
+                    offset: 0,
+                    data: Vec::new(),
+                })
+            )
+            .result,
+            None
+        );
+        assert!(sim.data["/sample.txt"].is_empty());
+    }
+
+    #[test]
+    fn deleting_a_missing_file_succeeds() {
+        let mut sim = Sim::default();
+        sim.data.insert("/sample.txt".into(), b"contents".to_vec());
+        for _ in 0..2 {
+            assert_eq!(
+                answer(
+                    &mut sim,
+                    Command::DeleteFile(p::DeleteFile {
+                        path: "/sample.txt".into(),
+                    })
+                )
+                .result,
+                None
+            );
+            assert!(!sim.data.contains_key("/sample.txt"));
+        }
     }
 }

@@ -3,7 +3,7 @@
 FROM archlinux:base-devel
 
 COPY PKGBUILD /tmp/PKGBUILD
-RUN pacman -Syu --noconfirm --needed git python \
+RUN pacman -Syu --noconfirm --needed ca-certificates curl git python \
     && bash -c 'CORDIAL_ARCHIVE_SHA256=SKIP source /tmp/PKGBUILD && pacman -S --noconfirm --needed "${depends[@]}" "${makedepends[@]}"' \
     && pacman -Scc --noconfirm \
     && rm /tmp/PKGBUILD \
@@ -12,3 +12,6 @@ RUN pacman -Syu --noconfirm --needed git python \
 RUN printf '%s\n' '#!/bin/sh' 'set -e' 'chown -R builder /src /out' 'exec runuser -u builder -- "$@"' \
         > /opt/cordial-run \
     && chmod 755 /opt/cordial-run
+
+COPY --from=tools install-just.sh /tmp/install-just.sh
+RUN sh /tmp/install-just.sh && rm /tmp/install-just.sh

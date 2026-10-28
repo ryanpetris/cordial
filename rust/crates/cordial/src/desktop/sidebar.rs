@@ -1,6 +1,7 @@
 //! The sidebar: the Overview and Settings, then each adapter followed by its saved devices, each
-//! on one line with its state shown by its icon. Separators set the adapters apart. An adapter's
-//! row has a context menu to connect, disconnect or rename it.
+//! on one line, dimmed while disconnected. Separators set the adapters apart. An adapter's
+//! row has a context menu, opened by a secondary click, a long press, the Menu key or
+//! Shift+F10, to connect, disconnect or rename it.
 //!
 //! Search opens from the header's start, or with Ctrl+F or typing while the sidebar has focus,
 //! and its results take the list's place while it has text. A result opens its page and shows
@@ -13,7 +14,7 @@ use super::{
 use crate::ui::app::{
     Action, App, Live, Page,
     words::Battery,
-    world::{Conn, DeviceView},
+    world::{AdapterView, Conn, DeviceView, Storage},
 };
 use adw::prelude::*;
 use gtk::glib;
@@ -33,33 +34,21 @@ enum Key {
     Refresh,
 }
 
-/// How a device or adapter row's icon shows its state.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum State {
-    /// Connected, ready, or a row without a state.
-    On,
-    /// Between states, such as connecting, starting or migrating.
-    Busy,
-    /// Disconnected or inactive.
-    Off,
-    /// Disabled or blocked, so it doesn't reconnect.
-    Unavailable,
-    /// A read failure or adapter condition needs attention.
-    Attention,
+/// Whether a device or adapter status word is a passing state, such as connecting or starting.
+fn busy(status: &str) -> bool {
+    matches!(
+        status,
+        "Connecting…" | "Disconnecting…" | "Starting…" | "Migrating…"
+    )
 }
 
-/// The state for a device or adapter status word.
-fn state(status: &str, attention: bool) -> State {
-    match status {
-        _ if attention => State::Attention,
-        "Couldn't Read" => State::Attention,
-        "Disconnected" | "Inactive" => State::Off,
-        "Disabled" | "Blocked" => State::Unavailable,
-        "Connecting…" | "Disconnecting…" | "Starting…" | "Migrating…" | "Waiting for Adapter" => {
-            State::Busy
-        }
-        _ => State::On,
-    }
+/// Whether an adapter is between states. A connecting adapter that still has its last status is
+/// one that went away after announcing a restart and waits for it, while one opened by Connect
+/// has none yet.
+fn adapter_busy(a: &AdapterView) -> bool {
+    let restarting =
+        a.conn == Conn::Connecting && a.status.is_some() && a.storage == Storage::Normal;
+    busy(a.status_text().0) && !restarting
 }
 
 /// What activating a row does.
@@ -76,9 +65,13 @@ struct Spec {
     title: String,
     /// The row's description for assistive technologies, such as its status or adapter name.
     status: String,
-    state: State,
-    /// A battery glyph and the reading it stands for.
+    /// The icon and title are dimmed, for a disconnected device or adapter.
+    dim: bool,
+    /// A spinner shows the row is between states.
+    busy: bool,
+    /// A battery glyph and the reading it stands for, kept while the device's record has one.
     battery: Option<(Glyph, String)>,
+    /// The battery glyph's look.
     look: Look,
     /// The row follows a separator.
     group: bool,
@@ -91,7 +84,6 @@ struct Row {
     icon: gtk::Image,
     title: gtk::Label,
     spinner: gtk::Spinner,
-    badge: gtk::Image,
     battery: gtk::DrawingArea,
     glyph: Rc<Cell<Glyph>>,
     menu: Option<(Menu, gtk::PopoverMenu)>,
@@ -405,10 +397,6 @@ impl Sidebar {
             .build();
         let spinner = widgets::spinner();
         spinner.set_accessible_role(gtk::AccessibleRole::Presentation);
-        let badge = gtk::Image::builder()
-            .accessible_role(gtk::AccessibleRole::Presentation)
-            .visible(false)
-            .build();
         let glyph: Rc<Cell<Glyph>> = Rc::default();
         let battery = battery_glyph(&glyph);
         // The insets of GNOME Settings' sidebar rows.
@@ -421,11 +409,7 @@ impl Sidebar {
             .build();
         content.append(&icon);
         content.append(&title);
-        for indicator in [
-            spinner.upcast_ref::<gtk::Widget>(),
-            badge.upcast_ref(),
-            battery.upcast_ref(),
-        ] {
+        for indicator in [spinner.upcast_ref::<gtk::Widget>(), battery.upcast_ref()] {
             let slot = gtk::CenterBox::builder()
                 .width_request(22)
                 .center_widget(indicator)
@@ -461,6 +445,24 @@ impl Sidebar {
                 move |_, _, _| popover.popup()
             ));
             row.add_controller(press);
+            let keys = gtk::EventControllerKey::new();
+            keys.connect_key_pressed(glib::clone!(
+                #[weak]
+                popover,
+                #[upgrade_or]
+                glib::Propagation::Proceed,
+                move |_, key, _, state| {
+                    let shift_f10 = key == gtk::gdk::Key::F10
+                        && state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+                    if key != gtk::gdk::Key::Menu && !shift_f10 {
+                        return glib::Propagation::Proceed;
+                    }
+                    popover.set_pointing_to(None);
+                    popover.popup();
+                    glib::Propagation::Stop
+                }
+            ));
+            row.add_controller(keys);
             (menu, popover)
         });
         Row {
@@ -468,7 +470,6 @@ impl Sidebar {
             icon,
             title,
             spinner,
-            badge,
             battery,
             glyph,
             menu,
@@ -518,20 +519,10 @@ fn result_row(h: &Hit) -> gtk::ListBoxRow {
 fn show(row: &mut Row, spec: &Spec) {
     row.icon.set_icon_name(Some(spec.icon));
     set_label(&row.title, &spec.title);
-    let (look, badge) = match spec.state {
-        State::On => (Look::Plain, None),
-        State::Busy => (Look::Dim, None),
-        State::Off => (Look::Dim, Some("network-offline-symbolic")),
-        State::Unavailable => (Look::Dim, Some("action-unavailable-symbolic")),
-        State::Attention => (Look::Warning, Some("dialog-warning-symbolic")),
-    };
+    let look = if spec.dim { Look::Dim } else { Look::Plain };
     set_look(&row.icon, look);
-    widgets::spin(&row.spinner, spec.state == State::Busy);
-    row.badge.set_visible(badge.is_some());
-    if let Some(name) = badge {
-        row.badge.set_icon_name(Some(name));
-        set_look(&row.badge, look);
-    }
+    set_look(&row.title, look);
+    widgets::spin(&row.spinner, spec.busy);
     row.battery.set_visible(spec.battery.is_some());
     if let Some((glyph, label)) = &spec.battery {
         if row.glyph.replace(*glyph) != *glyph {
@@ -636,39 +627,50 @@ fn rounded(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     cr.close_path();
 }
 
-fn specs(app: &App<Live>) -> Vec<Spec> {
-    let spec = |key: Key, icon, title: &str, go: Option<Go>| Spec {
+fn spec(key: Key, icon: &'static str, title: &str, go: Option<Go>) -> Spec {
+    Spec {
         key,
         icon,
         title: title.to_owned(),
         status: String::new(),
-        state: State::On,
+        dim: false,
+        busy: false,
         battery: None,
         look: Look::Plain,
         group: false,
         go,
         menu: Vec::new(),
+    }
+}
+
+fn device(d: &DeviceView, adapter: &str) -> Spec {
+    let mut s = spec(
+        Key::Page(d.page()),
+        widgets::device_icon(d.kind),
+        &d.name,
+        Some(Go::Act(Action::Open(d.page()))),
+    );
+    s.status = if adapter.is_empty() {
+        d.status().to_owned()
+    } else {
+        format!("{adapter}, {}", d.status())
     };
-    let act = |action| Some(Go::Act(action));
-    let device = |d: &DeviceView| {
-        let mut s = spec(
-            Key::Page(d.page()),
-            widgets::device_icon(d.kind),
-            &d.name,
-            act(Action::Open(d.page())),
-        );
-        s.status = d.status().to_owned();
-        s.state = state(&s.status, false);
-        if let Some(b) = &d.battery {
-            s.battery = battery(b);
-            s.look = match () {
-                _ if b.low() => Look::Error,
-                _ if b.stale() => Look::Dim,
-                _ => Look::Plain,
-            };
+    s.dim = !d.connected();
+    s.busy = busy(d.status());
+    if let Some(b) = &d.battery {
+        s.battery = battery(b);
+        if let Some((_, reading)) = &s.battery {
+            s.status.push_str(&format!(", {reading}"));
         }
-        s
-    };
+        if b.low() {
+            s.look = Look::Error;
+        }
+    }
+    s
+}
+
+fn specs(app: &App<Live>) -> Vec<Spec> {
+    let act = |action| Some(Go::Act(action));
     let mut out = vec![
         spec(
             Key::Overview,
@@ -692,9 +694,9 @@ fn specs(app: &App<Live>) -> Vec<Spec> {
             &a.name,
             act(Action::Open(page)),
         );
-        let (status, attention) = a.status_text();
-        s.status = status.to_owned();
-        s.state = state(status, attention);
+        s.status = a.status_text().0.to_owned();
+        s.dim = !a.connected();
+        s.busy = adapter_busy(a);
         s.group = true;
         let toggle = if a.connected() {
             (
@@ -711,7 +713,7 @@ fn specs(app: &App<Live>) -> Vec<Spec> {
         s.menu = vec![
             toggle,
             (
-                "Rename".to_owned(),
+                "Rename…".to_owned(),
                 a.live().map(|_| Action::RenameAdapter(a.id.clone())),
             ),
         ];
@@ -721,7 +723,7 @@ fn specs(app: &App<Live>) -> Vec<Spec> {
             app.devices()
                 .iter()
                 .filter(|d| d.adapter == a.id)
-                .map(device),
+                .map(|d| device(d, &a.name)),
         );
         // A device is added from its adapter's page, or from here while the adapter has none.
         // The row's description names the adapter.
@@ -750,7 +752,7 @@ fn specs(app: &App<Live>) -> Vec<Spec> {
         .devices()
         .iter()
         .filter(|d| app.adapter(&d.adapter).is_none())
-        .map(device)
+        .map(|d| device(d, ""))
         .peekable();
     if let Some(first) = stray.peek_mut() {
         first.group = true;
@@ -779,4 +781,173 @@ fn main_menu() -> gtk::gio::Menu {
     menu.append_section(None, &adapters);
     menu.append_section(None, &app);
     menu
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cordial_protocol::{self as p, DeviceState};
+
+    fn adapter(conn: Conn, status: Option<p::Status>) -> AdapterView {
+        AdapterView {
+            id: "A".into(),
+            name: "Adapter".into(),
+            conn,
+            ready: conn == Conn::Connected,
+            status,
+            attention: Vec::new(),
+            failed: false,
+            connect_error: None,
+            unreadable: Vec::new(),
+            storage: Storage::Normal,
+            hello: None,
+        }
+    }
+
+    fn ready() -> Option<p::Status> {
+        Some(p::Status {
+            ready: true,
+            ..Default::default()
+        })
+    }
+
+    /// Whether an adapter's row is dimmed and spinning.
+    fn adapter_look(a: &AdapterView) -> (bool, bool) {
+        (!a.connected(), adapter_busy(a))
+    }
+
+    /// A device as the adapter's listing reports it, with a battery reading when `level` is set.
+    fn device(state: DeviceState, level: Option<u32>, available: bool) -> DeviceView {
+        let d = p::Device {
+            id: 1,
+            state: state as i32,
+            enabled: true,
+            information: level.map(|level| p::DeviceInformation {
+                battery: Some(p::BatteryInformation {
+                    level: Some(level),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        DeviceView {
+            adapter: "A".into(),
+            available,
+            battery: Battery::of(&d, available),
+            name: "Mouse".into(),
+            kind: crate::ui::app::words::DisplayKind::Mouse,
+            read_error: None,
+            d,
+        }
+    }
+
+    #[test]
+    fn connected_devices_look_normal_and_disconnected_ones_dim() {
+        for level in [Some(80), None] {
+            let on = super::device(&device(DeviceState::Connected, level, true), "Adapter");
+            assert!(!on.dim && !on.busy);
+            assert_eq!(on.battery.is_some(), level.is_some());
+            // Disconnected, and listed by an adapter that has since gone away.
+            for available in [true, false] {
+                let off = super::device(
+                    &device(DeviceState::Disconnected, level, available),
+                    "Adapter",
+                );
+                assert!(off.dim && !off.busy);
+            }
+        }
+        let connecting = super::device(&device(DeviceState::Connecting, None, true), "Adapter");
+        assert!(connecting.dim && connecting.busy);
+    }
+
+    #[test]
+    fn keeps_the_last_battery_reading_until_the_adapter_reports_none() {
+        for available in [true, false] {
+            let s = super::device(
+                &device(DeviceState::Disconnected, Some(10), available),
+                "Adapter",
+            );
+            assert_eq!(s.battery.unwrap().1, "Battery 10%");
+            assert_eq!(s.look, Look::Plain);
+        }
+        let current = super::device(&device(DeviceState::Connected, Some(10), true), "Adapter");
+        assert_eq!(current.look, Look::Error);
+        let cleared = super::device(&device(DeviceState::Disconnected, None, true), "Adapter");
+        assert!(cleared.battery.is_none());
+    }
+
+    #[test]
+    fn device_descriptions_include_the_adapter_status_and_retained_battery() {
+        for (state, available, status) in [
+            (DeviceState::Connected, true, "Connected"),
+            (DeviceState::Disconnected, true, "Disconnected"),
+            (DeviceState::Connected, false, "Disconnected"),
+            (DeviceState::Connecting, true, "Connecting…"),
+        ] {
+            let d = device(state, Some(80), available);
+            let s = super::device(&d, "Desk Adapter");
+            assert_eq!(s.status, format!("Desk Adapter, {status}, Battery 80%"));
+            assert_eq!(s.busy, busy(status));
+            assert_eq!(s.dim, !d.connected());
+        }
+        let mut d = device(DeviceState::Connected, Some(80), true);
+        d.battery.as_mut().unwrap().charging = Some(true);
+        assert_eq!(
+            super::device(&d, "Desk Adapter").status,
+            "Desk Adapter, Connected, Battery 80%, Charging"
+        );
+        d.battery = None;
+        assert_eq!(
+            super::device(&d, "Desk Adapter").status,
+            "Desk Adapter, Connected"
+        );
+        assert_eq!(super::device(&d, "").status, "Connected");
+    }
+
+    #[test]
+    fn adapters_dim_while_away_and_spin_only_while_connecting() {
+        assert_eq!(
+            adapter_look(&adapter(Conn::Connected, ready())),
+            (false, false)
+        );
+        let mut starting = adapter(Conn::Connected, None);
+        starting.ready = false;
+        assert_eq!(adapter_look(&starting), (false, true));
+        assert_eq!(
+            adapter_look(&adapter(Conn::Disconnected, None)),
+            (true, false)
+        );
+        // Held after announcing a restart, with its last status.
+        assert_eq!(
+            adapter_look(&adapter(Conn::Connecting, ready())),
+            (true, false)
+        );
+        let mut migrating = adapter(Conn::Connecting, ready());
+        migrating.storage = Storage::Migrating {
+            waiting: true,
+            cancelling: false,
+            progress: None,
+        };
+        assert_eq!(adapter_look(&migrating), (true, false));
+        // Connect opened it and it hasn't answered yet.
+        assert_eq!(adapter_look(&adapter(Conn::Connecting, None)), (true, true));
+        migrating.storage = Storage::Migrating {
+            waiting: false,
+            cancelling: false,
+            progress: None,
+        };
+        assert_eq!(adapter_look(&migrating), (true, true));
+    }
+
+    #[test]
+    fn rows_without_a_connection_look_normal_and_devices_still_open() {
+        let overview = spec(Key::Overview, "go-home-symbolic", "Overview", None);
+        assert!(!overview.dim && !overview.busy);
+        for state in [DeviceState::Connected, DeviceState::Disconnected] {
+            let d = device(state, Some(50), false);
+            let s = super::device(&d, "Adapter");
+            assert!(matches!(&s.go, Some(Go::Act(Action::Open(p))) if *p == d.page()));
+        }
+    }
 }

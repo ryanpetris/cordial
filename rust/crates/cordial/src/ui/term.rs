@@ -151,6 +151,7 @@ pub(crate) fn channel() -> (SyncSender<Msg>, Receiver<Msg>, Interrupter, Arc<Ato
 /// session, releasing the serial port and restoring the terminal.
 pub struct Tui {
     port: Option<String>,
+    json: bool,
     tx: SyncSender<Msg>,
     rx: Receiver<Msg>,
     interrupted: Arc<AtomicBool>,
@@ -162,6 +163,7 @@ impl Tui {
         (
             Self {
                 port: options.port,
+                json: options.json,
                 tx,
                 rx,
                 interrupted,
@@ -171,6 +173,13 @@ impl Tui {
     }
 
     pub fn run(self) -> Result<(), UiError> {
+        let output = crate::json::Output::terminal(self.json);
+        let observer = Some(output.observer());
+        let result = self.run_observed(observer);
+        super::finish_output(output, result)
+    }
+
+    fn run_observed(self, observer: Option<crate::json::Observer>) -> Result<(), UiError> {
         let modes = Modes::enter(true)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         let input = Input::spawn(self.tx.clone());
@@ -183,6 +192,10 @@ impl Tui {
             },
             self.port.clone(),
         );
+        let fleet = match observer {
+            Some(observer) => fleet.observe(observer),
+            None => fleet,
+        };
         let mut model = tui::Model::new(fleet);
         let mut closing: Option<Instant> = None;
         loop {

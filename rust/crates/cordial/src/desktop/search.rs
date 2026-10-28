@@ -38,6 +38,11 @@ pub fn profile_row(id: u32) -> String {
     format!("profile-{id}")
 }
 
+/// The widget name of the profile row of an adapter's configuration interface.
+pub fn interface_row(i: ConfigurationInterface) -> String {
+    format!("interface-{}", i as i32)
+}
+
 /// The widget name of an adapter's group for a transport.
 pub fn transport_group(t: Transport) -> String {
     format!("transport-{}", t as i32)
@@ -99,7 +104,7 @@ pub fn index(app: &App<Live>) -> Vec<Hit> {
             row: Some(Row::Group(title.to_owned())),
         },
     };
-    // A profile's row, found by name since profiles can share a name.
+    // A row on the Profiles tab, found by its widget name since profiles can share a name.
     let profile = |title: String, context: &str, page: Option<Page>, row: String| Hit {
         icon: PROFILES_ICON,
         title,
@@ -315,25 +320,26 @@ pub fn index(app: &App<Live>) -> Vec<Hit> {
                 false,
             ));
             // The Profiles tab shows the configuration interfaces and the listed profiles while
-            // the adapter is ready.
+            // the adapter is ready. An interface goes to its profile row, which can be changed
+            // while the interface's switch can't.
             for s in a.view().map(profiles::interfaces).unwrap_or_default() {
                 if let Ok(i) = ConfigurationInterface::try_from(s.interface) {
-                    out.push(hit(
-                        PROFILES_ICON,
-                        profiles::interface_label(i),
+                    out.push(profile(
+                        profiles::interface_label(i).to_owned(),
                         &a.name,
                         page.clone(),
-                        Tab::Profiles,
-                        true,
+                        interface_row(i),
                     ));
                 }
             }
             let list = a.view().and(app.shown_page(&a.id, false));
             for p in list.iter().flat_map(|l| l.all().0) {
-                let name = words::clean(&p.name);
-                if !name.is_empty() {
-                    out.push(profile(name, &a.name, page.clone(), profile_row(p.id)));
-                }
+                out.push(profile(
+                    app.profile_text(&a.id, p.id),
+                    &a.name,
+                    page.clone(),
+                    profile_row(p.id),
+                ));
             }
         }
         out.push(hit(
@@ -502,7 +508,7 @@ mod tests {
                     &Target {
                         page: Some(Page::Adapter(id.to_owned())),
                         tab: Tab::Profiles,
-                        row: Some(Row::Title("Vial".into())),
+                        row: Some(Row::Name(interface_row(ConfigurationInterface::Vial))),
                     }
                 ))
             );

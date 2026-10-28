@@ -14,7 +14,10 @@ use cordial_protocol::{
     self as p, ConfigurationInterface, DeviceState, ErrorCode, SettingState, Transport,
 };
 use std::{
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver},
+    },
     time::Duration,
 };
 
@@ -591,7 +594,7 @@ fn profiles_are_listed_in_one_response_and_found_by_unique_name() {
 }
 
 #[test]
-fn layers_are_saved_in_order_and_profiles_in_use_stay() {
+fn deleting_a_profile_detaches_it_and_keeps_the_other_layers() {
     let dongle = with_profiles();
     let (c, rx) = ready(&dongle);
     let outcome = run(
@@ -614,25 +617,17 @@ fn layers_are_saved_in_order_and_profiles_in_use_stay() {
     .unwrap_err();
     assert_eq!(error.message, "a device can use at most 3 profiles");
     assert_eq!(dongle.sent().len(), before);
-    // A profile in a device's layers isn't deleted.
     eventually(&c, &rx, |st| {
         profiles::layers(st.device(1).unwrap()) == [3, 2]
-    });
-    let error = run(&c, &rx, Command::ProfileDelete(id(2))).unwrap_err();
-    assert_eq!(
-        error.message,
-        "Office Mouse is using this profile. Remove it from Office Mouse's profiles first"
-    );
-    run(&c, &rx, Command::Layers(name("Office Mouse"), Vec::new())).unwrap();
-    eventually(&c, &rx, |st| {
-        profiles::layers(st.device(1).unwrap()).is_empty()
     });
     let Outcome::ProfileDeleted(gone) = run(&c, &rx, Command::ProfileDelete(id(2))).unwrap() else {
         panic!()
     };
     assert_eq!(gone.id, 2);
-    eventually(&c, &rx, |st| st.profile(2).is_none());
-    // The adapter's own refusal is reported as is.
+    eventually(&c, &rx, |st| {
+        st.profile(2).is_none() && profiles::layers(st.device(1).unwrap()) == [3]
+    });
+    // A final refusal keeps the profile and the completed device change.
     dongle
         .0
         .lock()
@@ -641,6 +636,39 @@ fn layers_are_saved_in_order_and_profiles_in_use_stay() {
         .insert("delete_profile", refusal(ErrorCode::InUse));
     let error = run(&c, &rx, Command::ProfileDelete(id(3))).unwrap_err();
     assert_eq!(error.code_of(), Some(ErrorCode::InUse));
+    assert!(
+        error
+            .message
+            .starts_with("the profile deletion is incomplete:")
+    );
+    eventually(&c, &rx, |st| {
+        st.profile(3).is_some() && profiles::layers(st.device(1).unwrap()).is_empty()
+    });
+}
+
+#[test]
+fn planned_profile_deletion_stops_when_a_devices_layers_change() {
+    let dongle = with_profiles();
+    let (c, rx) = ready(&dongle);
+    run(&c, &rx, Command::Layers(id(1), vec![id(3), id(2)])).unwrap();
+    eventually(&c, &rx, |st| {
+        profiles::layers(st.device(1).unwrap()) == [3, 2]
+    });
+    let plan = profiles::Deletion::of(&c.state().unwrap(), 2);
+    run(&c, &rx, Command::Layers(id(1), vec![id(2), id(3)])).unwrap();
+    eventually(&c, &rx, |st| {
+        profiles::layers(st.device(1).unwrap()) == [2, 3]
+    });
+    let sent = dongle.sent().len();
+    let error = run(&c, &rx, Command::ProfileDeletePlanned(plan)).unwrap_err();
+    assert_eq!(
+        error.message,
+        "Office Mouse's profiles changed before Cordial could update them"
+    );
+    assert_eq!(dongle.sent().len(), sent);
+    let st = c.state().unwrap();
+    assert!(st.profile(2).is_some());
+    assert_eq!(profiles::layers(st.device(1).unwrap()), [2, 3]);
 }
 
 #[test]
@@ -679,13 +707,20 @@ fn interfaces_need_a_profile_and_respect_conflicts() {
         error.message,
         "VIA and Vial can't both be on. Turn one off first"
     );
-    // An enabled interface keeps its profile; a selected profile isn't deleted.
+    dongle.0.lock().unwrap().reconnect_interfaces = true;
+    // An enabled interface requires a profile until deletion turns it off.
     assert!(run(&c, &rx, via(None, Some(Pick::Clear))).is_err());
-    let error = run(&c, &rx, Command::ProfileDelete(id(2))).unwrap_err();
-    assert!(
-        error.message.starts_with("VIA is using this profile"),
-        "{error:?}"
-    );
+    let Outcome::ProfileDeleted(gone) = run(&c, &rx, Command::ProfileDelete(id(2))).unwrap() else {
+        panic!()
+    };
+    assert_eq!(gone.id, 2);
+    eventually(&c, &rx, |st| {
+        st.profile(2).is_none()
+            && profiles::interface(&st.status, ConfigurationInterface::Via)
+                .is_some_and(|s| !s.enabled && s.profile == 0)
+    });
+    dongle.0.lock().unwrap().reconnect_interfaces = false;
+    run(&c, &rx, via(Some(true), Some(Pick::Profile(id(3))))).unwrap();
     // Several changes go out in one request, applied in order.
     let update = AdapterUpdate {
         interfaces: vec![
@@ -1662,4 +1697,681 @@ fn an_open_adapter_without_an_id_still_reports_its_loss() {
     assert!(state.session_ending.is_none());
     controller.close();
     until(&events, |event| matches!(event, Event::Closed));
+}
+
+fn reconnecting_profile(interface: ConfigurationInterface) -> Dongle {
+    let dongle = with_profiles();
+    {
+        let mut sim = dongle.0.lock().unwrap();
+        sim.reconnect_interfaces = true;
+        let assigned = sim
+            .status
+            .configuration_interfaces
+            .iter_mut()
+            .find(|s| s.interface == interface as i32)
+            .unwrap();
+        assigned.enabled = true;
+        assigned.active = true;
+        assigned.profile = 2;
+    }
+    dongle
+}
+
+#[test]
+fn profile_deletion_reads_back_after_the_configuration_reconnect() {
+    for interface in [ConfigurationInterface::Via, ConfigurationInterface::Vial] {
+        let dongle = reconnecting_profile(interface);
+        let (c, rx) = ready(&dongle);
+        let plan = profiles::Deletion::of(&c.state().unwrap(), 2);
+        let before = dongle.sent().len();
+        assert!(matches!(
+            run(&c, &rx, Command::ProfileDeletePlanned(plan)).unwrap(),
+            Outcome::ProfileDeleted(_)
+        ));
+        assert_eq!(
+            &dongle.sent()[before..],
+            [
+                "set_adapter",
+                "get_status",
+                "get_status",
+                "list_devices",
+                "delete_profile"
+            ]
+        );
+        assert_eq!(dongle.sessions(), 2);
+        assert!(c.state().unwrap().ready());
+        assert!(
+            !c.state()
+                .unwrap()
+                .pending_for(cordial::controller::PROFILE_RECONNECT, 0)
+        );
+        assert!(dongle.0.lock().unwrap().profiles.iter().all(|p| p.id != 2));
+        run(&c, &rx, Command::Status).unwrap();
+    }
+}
+
+#[test]
+fn profile_deletion_retries_a_dying_reconnect_candidate() {
+    for negotiated in [false, true] {
+        let dongle = reconnecting_profile(ConfigurationInterface::Via);
+        let dying = Dongle::default();
+        let candidate = dying.clone();
+        let adapter = dongle.clone();
+        let (tx, rx) = mpsc::channel();
+        let c = Controller::with_connector(
+            move |event| {
+                let _ = tx.send(event);
+            },
+            move |_, handler| {
+                if adapter.sessions() == 1 && candidate.sessions() == 0 {
+                    let connection = candidate.connect(handler)?;
+                    if negotiated {
+                        connection.handshake().unwrap();
+                    }
+                    candidate.unplug();
+                    return Ok(connection);
+                }
+                assert_eq!(
+                    candidate.handles(),
+                    0,
+                    "release the rejected candidate first"
+                );
+                adapter.connect(handler)
+            },
+        );
+        c.open("sim".into());
+        until(&rx, |event| {
+            matches!(
+                event,
+                Event::Connection {
+                    phase: Phase::Ready,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            run(&c, &rx, Command::ProfileDelete(id(2))).unwrap(),
+            Outcome::ProfileDeleted(_)
+        ));
+        assert_eq!(dying.sessions(), 1);
+        assert!(dying.sent().iter().all(|command| *command == "get_status"));
+        assert_eq!(dongle.sessions(), 2);
+        assert!(c.state().unwrap().ready());
+        c.close();
+        until(&rx, |event| matches!(event, Event::Closed));
+        assert_eq!(dongle.handles(), 0);
+        assert_eq!(dying.handles(), 0);
+    }
+}
+
+#[test]
+fn profile_deletion_does_not_retry_invalid_reconnect_candidates() {
+    for failure in [
+        "protocol",
+        "incompatible",
+        "migration",
+        "refusal",
+        "identity",
+    ] {
+        let dongle = reconnecting_profile(ConfigurationInterface::Vial);
+        let rejected = Dongle::with(|sim| match failure {
+            "protocol" => sim.hello.protocol_version = None,
+            "incompatible" => sim.hello.protocol_version = Some(p::CURRENT_PROTOCOL_VERSION + 1),
+            "migration" => {
+                sim.status.ready = false;
+                sim.status.errors = vec![refusal(ErrorCode::StorageMigrationRequired)];
+            }
+            "refusal" => {
+                sim.refuse
+                    .insert("get_status", refusal(ErrorCode::StorageFailed));
+            }
+            "identity" => sim.status.id = "OTHER".into(),
+            _ => unreachable!(),
+        });
+        let adapter = dongle.clone();
+        let candidate = rejected.clone();
+        let (tx, rx) = mpsc::channel();
+        let c = Controller::with_connector(
+            move |event| {
+                let _ = tx.send(event);
+            },
+            move |_, handler| {
+                if adapter.sessions() == 1 && candidate.sessions() == 0 {
+                    candidate.connect(handler)
+                } else {
+                    adapter.connect(handler)
+                }
+            },
+        );
+        c.open("sim".into());
+        until(&rx, |event| {
+            matches!(
+                event,
+                Event::Connection {
+                    phase: Phase::Ready,
+                    ..
+                }
+            )
+        });
+        let error = run(&c, &rx, Command::ProfileDelete(id(2))).unwrap_err();
+        assert!(error.message.contains("incomplete"), "{failure}: {error:?}");
+        assert!(!error.message.contains("timed out"), "{failure}: {error:?}");
+        assert_eq!(dongle.sessions(), 1, "{failure}");
+        assert_eq!(rejected.sessions(), 1, "{failure}");
+        assert!(
+            rejected
+                .sent()
+                .iter()
+                .all(|command| *command == "get_status")
+        );
+        assert!(!dongle.sent().contains(&"delete_profile"));
+        assert_eq!(rejected.handles(), 0, "{failure}");
+        c.close();
+        until(&rx, |event| matches!(event, Event::Closed));
+        assert_eq!(dongle.handles(), 0);
+    }
+}
+
+#[test]
+fn a_refused_configuration_change_does_not_announce_another_ready_session() {
+    let dongle = reconnecting_profile(ConfigurationInterface::Via);
+    dongle
+        .0
+        .lock()
+        .unwrap()
+        .refuse
+        .insert("set_adapter", refusal(ErrorCode::StorageFailed));
+    let (c, rx) = ready(&dongle);
+    let ticket = c.run(Command::ProfileDelete(id(2)), RunOptions::default());
+    let result = until(&rx, |event| {
+        assert!(
+            !matches!(
+                event,
+                Event::Connection {
+                    phase: Phase::Ready,
+                    ..
+                }
+            ),
+            "a refused change must not start another round of background reads"
+        );
+        matches!(event, Event::Done { ticket: t, .. } if *t == ticket)
+    });
+    assert!(matches!(result, Event::Done { result: Err(_), .. }));
+    assert!(c.state().unwrap().ready());
+    assert_eq!(dongle.sessions(), 1);
+    assert!(!dongle.sent().contains(&"delete_profile"));
+    dongle.0.lock().unwrap().refuse.clear();
+    assert!(matches!(
+        run(&c, &rx, Command::ProfileDelete(id(2))).unwrap(),
+        Outcome::ProfileDeleted(_)
+    ));
+    assert_eq!(dongle.sessions(), 2);
+}
+
+#[test]
+fn a_profile_deletion_reports_each_change_once_the_adapter_accepts_it() {
+    for refused in [None, Some("set_adapter")] {
+        let dongle = reconnecting_profile(ConfigurationInterface::Via);
+        {
+            let mut sim = dongle.0.lock().unwrap();
+            sim.devices[0].profiles = Some(p::ProfileLayers { profiles: vec![2] });
+            if let Some(command) = refused {
+                sim.refuse
+                    .insert(command, refusal(ErrorCode::StorageFailed));
+            }
+        }
+        // The sink runs on the deletion's thread, so the requests seen are those sent before
+        // each report.
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let (seen, adapter) = (reports.clone(), dongle.clone());
+        let (tx, rx) = mpsc::channel();
+        let c = Controller::with_connector(
+            move |e| {
+                if let Event::Progress { progress, .. } = &e {
+                    seen.lock().unwrap().push((*progress, adapter.sent()));
+                }
+                let _ = tx.send(e);
+            },
+            dongle.connector(),
+        );
+        c.open("sim".into());
+        until(&rx, |e| {
+            matches!(
+                e,
+                Event::Connection {
+                    phase: Phase::Ready,
+                    ..
+                }
+            )
+        });
+        let plan = profiles::Deletion::of(&c.state().unwrap(), 2);
+        assert_eq!((plan.devices.len(), plan.interfaces.len()), (1, 1));
+        let before = dongle.sent().len();
+        let result = run(&c, &rx, Command::ProfileDeletePlanned(plan));
+        let reports: Vec<_> = reports
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, sent)| (p.done, p.waiting, sent[before..].to_vec()))
+            .collect();
+        let accepted = (1, false, vec!["set_device"]);
+        if refused.is_some() {
+            assert!(result.is_err());
+            assert_eq!(reports, [accepted], "a refused change is never reported");
+            continue;
+        }
+        assert!(result.is_ok());
+        assert_eq!(
+            reports,
+            [
+                accepted,
+                (2, true, vec!["set_device", "set_adapter"]),
+                (
+                    2,
+                    false,
+                    vec![
+                        "set_device",
+                        "set_adapter",
+                        "get_status",
+                        "get_status",
+                        "list_devices"
+                    ]
+                ),
+            ]
+        );
+    }
+}
+
+#[test]
+fn profile_deletion_rechecks_identity_and_users_after_reconnect() {
+    for change in ["identity", "device", "interface"] {
+        let dongle = reconnecting_profile(ConfigurationInterface::Via);
+        let adapter = dongle.clone();
+        let (tx, rx) = mpsc::channel();
+        let c = Controller::with_connector(
+            move |e| {
+                let _ = tx.send(e);
+            },
+            move |_, handler| {
+                if adapter.sessions() == 1 {
+                    let mut sim = adapter.0.lock().unwrap();
+                    match change {
+                        "identity" => sim.status.id = "OTHER".into(),
+                        "device" => {
+                            sim.devices[0].profiles = Some(p::ProfileLayers { profiles: vec![2] })
+                        }
+                        "interface" => sim.status.configuration_interfaces[0].profile = 1,
+                        _ => unreachable!(),
+                    }
+                }
+                adapter.connect(handler)
+            },
+        );
+        c.open("sim".into());
+        until(&rx, |e| {
+            matches!(
+                e,
+                Event::Connection {
+                    phase: Phase::Ready,
+                    ..
+                }
+            )
+        });
+        let result = run(&c, &rx, Command::ProfileDelete(id(2))).unwrap_err();
+        assert!(
+            result
+                .message
+                .starts_with("the profile deletion is incomplete:"),
+            "{result:?}"
+        );
+        assert!(!dongle.sent().contains(&"delete_profile"));
+        assert_eq!(
+            dongle
+                .sent()
+                .iter()
+                .filter(|c| **c == "set_adapter")
+                .count(),
+            1
+        );
+        if change == "identity" {
+            assert_eq!(dongle.sent().last(), Some(&"get_status"));
+            assert_eq!(c.state().unwrap().status.id, "ADAPTER01");
+        }
+    }
+}
+
+#[test]
+fn profile_deletion_reconnect_stops_at_its_deadline_or_user_close() {
+    for close in [false, true] {
+        let dongle = reconnecting_profile(ConfigurationInterface::Vial);
+        let adapter = dongle.clone();
+        let (tx, rx) = mpsc::channel();
+        let (attempted, attempts) = mpsc::channel();
+        let c = Controller::with_connector(
+            move |e| {
+                let _ = tx.send(e);
+            },
+            move |_, handler| {
+                if adapter.sessions() == 0 {
+                    return adapter.connect(handler);
+                }
+                let _ = attempted.send(());
+                Err(std::io::ErrorKind::NotFound.into())
+            },
+        );
+        c.open("sim".into());
+        until(&rx, |e| {
+            matches!(
+                e,
+                Event::Connection {
+                    phase: Phase::Ready,
+                    ..
+                }
+            )
+        });
+        let ticket = c.run(
+            Command::ProfileDelete(id(2)),
+            RunOptions {
+                wait: Wait::timeout(Duration::from_millis(300)),
+                ..Default::default()
+            },
+        );
+        attempts.recv_timeout(Duration::from_secs(2)).unwrap();
+        if close {
+            c.close();
+        }
+        let Event::Done { result, .. } = until(
+            &rx,
+            |e| matches!(e, Event::Done { ticket: t, .. } if *t == ticket),
+        ) else {
+            panic!()
+        };
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("the profile deletion is incomplete:"),
+            "{error:?}"
+        );
+        assert!(!dongle.sent().contains(&"delete_profile"));
+        assert_eq!(dongle.handles(), 0);
+    }
+}
+
+#[test]
+fn profile_deletion_requires_the_configuration_restart_announcement() {
+    let dongle = reconnecting_profile(ConfigurationInterface::Via);
+    dongle.0.lock().unwrap().reconnect_interfaces = false;
+    let (c, rx) = ready(&dongle);
+    let error = run_with(
+        &c,
+        &rx,
+        Command::ProfileDelete(id(2)),
+        RunOptions {
+            wait: Wait::timeout(Duration::from_millis(100)),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.message.contains("incomplete"), "{error:?}");
+    assert!(!dongle.sent().contains(&"delete_profile"));
+    assert_eq!(dongle.sessions(), 1);
+}
+
+#[test]
+fn closing_during_reconnect_identity_read_releases_the_candidate_connection() {
+    let dongle = reconnecting_profile(ConfigurationInterface::Via);
+    let adapter = dongle.clone();
+    let (tx, rx) = mpsc::channel();
+    let c = Controller::with_connector(
+        move |e| {
+            let _ = tx.send(e);
+        },
+        move |_, handler| {
+            if adapter.sessions() == 1 {
+                adapter
+                    .0
+                    .lock()
+                    .unwrap()
+                    .slow
+                    .insert("get_status", Duration::from_secs(5));
+            }
+            adapter.connect(handler)
+        },
+    );
+    c.open("sim".into());
+    until(&rx, |e| {
+        matches!(
+            e,
+            Event::Connection {
+                phase: Phase::Ready,
+                ..
+            }
+        )
+    });
+    c.run(Command::ProfileDelete(id(2)), RunOptions::default());
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while dongle.sent().iter().filter(|c| **c == "get_status").count() != 2 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    c.close();
+    until(&rx, |e| matches!(e, Event::Closed));
+    assert_eq!(dongle.handles(), 0);
+    assert!(!dongle.sent().contains(&"delete_profile"));
+    assert!(c.state().is_none());
+}
+
+#[test]
+fn profile_deletion_does_not_resume_an_unrelated_announced_restart() {
+    let dongle = reconnecting_profile(ConfigurationInterface::Via);
+    let adapter = dongle.clone();
+    let (tx, rx) = mpsc::channel();
+    let c = Controller::with_connector(
+        move |e| {
+            let _ = tx.send(e);
+        },
+        move |_, mut handler| {
+            adapter.connect(Box::new(move |received| match received {
+                cordial_client::Received::Event(mut event) => {
+                    if let Some(p::event::Kind::SessionEnding(ending)) = &mut event.kind {
+                        ending.reason = p::SessionEndingReason::Reboot as i32;
+                    }
+                    handler(cordial_client::Received::Event(event));
+                }
+                other => handler(other),
+            }))
+        },
+    );
+    c.open("sim".into());
+    until(&rx, |e| {
+        matches!(
+            e,
+            Event::Connection {
+                phase: Phase::Ready,
+                ..
+            }
+        )
+    });
+    let error = run(&c, &rx, Command::ProfileDelete(id(2))).unwrap_err();
+    assert!(error.message.contains("another operation"), "{error:?}");
+    assert_eq!(dongle.sessions(), 1);
+    assert!(!dongle.sent().contains(&"delete_profile"));
+}
+
+#[test]
+fn profile_reconnect_events_cannot_extend_the_operation_deadline() {
+    let dongle = reconnecting_profile(ConfigurationInterface::Via);
+    let adapter = dongle.clone();
+    let (tx, rx) = mpsc::channel();
+    let c = Controller::with_connector(
+        move |e| {
+            let _ = tx.send(e);
+        },
+        move |_, handler| {
+            if adapter.sessions() == 1 {
+                adapter
+                    .0
+                    .lock()
+                    .unwrap()
+                    .slow
+                    .insert("get_status", Duration::from_secs(3));
+            }
+            adapter.connect(handler)
+        },
+    );
+    c.open("sim".into());
+    until(&rx, |e| {
+        matches!(
+            e,
+            Event::Connection {
+                phase: Phase::Ready,
+                ..
+            }
+        )
+    });
+    let wait = Wait::timeout(Duration::from_millis(300));
+    let deadline = wait.deadline.unwrap();
+    let ticket = c.run(
+        Command::ProfileDelete(id(2)),
+        RunOptions {
+            wait,
+            ..Default::default()
+        },
+    );
+    let cutoff = deadline + Duration::from_millis(700);
+    let mut result = None;
+    while std::time::Instant::now() < cutoff {
+        dongle.event(p::event::Kind::DeviceRemoved(p::DeviceRemoved { id: 999 }));
+        if let Ok(Event::Done {
+            ticket: t,
+            result: done,
+            ..
+        }) = rx.recv_timeout(Duration::from_millis(10))
+            && t == ticket
+        {
+            result = Some(done);
+            break;
+        }
+    }
+    c.close();
+    until(&rx, |e| matches!(e, Event::Closed));
+    assert_eq!(dongle.handles(), 0);
+    assert!(!dongle.sent().contains(&"delete_profile"));
+    let error = result
+        .expect("events kept the status read alive beyond the operation deadline")
+        .unwrap_err();
+    assert!(error.message.contains("incomplete"), "{error:?}");
+}
+
+#[test]
+fn profile_reconnect_readbacks_share_one_absolute_deadline() {
+    for delayed in ["get_status", "list_devices"] {
+        let dongle = reconnecting_profile(ConfigurationInterface::Via);
+        let adapter = dongle.clone();
+        let (tx, rx) = mpsc::channel();
+        let c = Controller::with_connector(
+            move |e| {
+                let _ = tx.send(e);
+            },
+            move |_, handler| {
+                if adapter.sessions() == 1 {
+                    let mut sim = adapter.0.lock().unwrap();
+                    sim.slow.insert("get_status", Duration::from_millis(180));
+                    if delayed == "list_devices" {
+                        sim.slow.insert("get_status", Duration::from_millis(100));
+                        sim.slow.insert("list_devices", Duration::from_millis(180));
+                    }
+                }
+                adapter.connect(handler)
+            },
+        );
+        c.open("sim".into());
+        until(&rx, |e| {
+            matches!(
+                e,
+                Event::Connection {
+                    phase: Phase::Ready,
+                    ..
+                }
+            )
+        });
+        let result = run_with(
+            &c,
+            &rx,
+            Command::ProfileDelete(id(2)),
+            RunOptions {
+                wait: Wait::timeout(Duration::from_millis(300)),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !dongle.sent().contains(&"delete_profile"),
+            "{delayed}: {result:?}"
+        );
+        assert!(result.unwrap_err().message.contains("incomplete"));
+        assert_eq!(dongle.sent().last(), Some(&delayed));
+        c.close();
+        until(&rx, |e| matches!(e, Event::Closed));
+        assert_eq!(dongle.handles(), 0);
+    }
+}
+
+#[test]
+fn profile_deletion_checks_its_deadline_after_the_final_progress_report() {
+    let dongle = reconnecting_profile(ConfigurationInterface::Via);
+    let (tx, rx) = mpsc::channel();
+    let (entered, gated) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
+    let c = Controller::with_connector(
+        move |e| {
+            if matches!(&e, Event::Progress { progress, .. } if !progress.waiting) {
+                entered.send(()).unwrap();
+                gate.lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            let _ = tx.send(e);
+        },
+        dongle.connector(),
+    );
+    c.open("sim".into());
+    until(&rx, |e| {
+        matches!(
+            e,
+            Event::Connection {
+                phase: Phase::Ready,
+                ..
+            }
+        )
+    });
+    let wait = Wait::timeout(Duration::from_millis(300));
+    let deadline = wait.deadline.unwrap();
+    let ticket = c.run(
+        Command::ProfileDelete(id(2)),
+        RunOptions {
+            wait,
+            ..Default::default()
+        },
+    );
+    gated.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(dongle.sent().last(), Some(&"list_devices"));
+    assert!(
+        gated
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .is_err()
+    );
+    release.send(()).unwrap();
+    let result = until(
+        &rx,
+        |e| matches!(e, Event::Done { ticket: t, .. } if *t == ticket),
+    );
+    assert!(
+        matches!(result, Event::Done { result: Err(ref e), .. } if e.message.contains("incomplete"))
+    );
+    assert!(!dongle.sent().contains(&"delete_profile"));
+    c.close();
+    until(&rx, |e| matches!(e, Event::Closed));
 }

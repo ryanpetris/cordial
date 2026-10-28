@@ -121,6 +121,7 @@ fn show_state(status: &Status, a: &AdapterView) {
 fn page_menu(ctx: &Rc<Ctx>) -> Menu {
     let menu = Menu::new(ctx);
     menu.button.set_icon_name("view-more-symbolic");
+    menu.button.set_tooltip_text(Some("Adapter Menu"));
     menu.button
         .update_property(&[gtk::accessible::Property::Label("Adapter Menu")]);
     menu
@@ -402,6 +403,19 @@ impl Settings {
             .title(format!("This computer runs {host_platform}."))
             .button_label(format!("Switch to {host_platform}"))
             .build();
+        let sync_accessibility = |host: &adw::Banner| {
+            host.upcast_ref::<gtk::Widget>()
+                .update_state(&[gtk::accessible::State::Hidden(!host.is_revealed())]);
+        };
+        sync_accessibility(&host);
+        host.connect_revealed_notify(sync_accessibility);
+        // GTK resets the hidden state after emitting map, so restore it before painting.
+        host.connect_map(move |host| {
+            host.add_tick_callback(move |host, _| {
+                sync_accessibility(host);
+                glib::ControlFlow::Break
+            });
+        });
         host.connect_button_clicked(glib::clone!(
             #[weak]
             ctx,
@@ -506,7 +520,7 @@ struct Diagnostics {
     retry: Btn,
     ids: List,
     buttons: Migration,
-    /// Restart and, on development firmware, Files and Enter Bootloader.
+    /// Restart and, on development firmware, Enter Bootloader.
     menu: Menu,
 }
 
@@ -547,7 +561,6 @@ impl Diagnostics {
             ));
         }
         if development {
-            tools.push(("Files…".to_owned(), Some(Action::Files)));
             tools.push(("Enter Bootloader…".to_owned(), Some(Action::Bootloader)));
         }
         self.menu.set(&tools);
@@ -606,4 +619,51 @@ pub fn identifiers(a: &AdapterView) -> Vec<Item> {
         }
     }
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glib::translate::{IntoGlib, ToGlibPtr, from_glib_full};
+
+    #[test]
+    #[ignore = "requires a display"]
+    fn platform_banner_accessibility_follows_revelation() {
+        adw::init().expect("GTK needs a display");
+        let (ctx, _) = Ctx::test();
+        let tab = TabView::new();
+        let settings = Settings::new(&ctx, &tab, Vec::new());
+        let window = adw::Window::builder().content(&tab.widget).build();
+        for _ in 0..2 {
+            window.present();
+            assert!(settings.host.is_mapped());
+            for revealed in [false, true, false] {
+                settings.host.set_revealed(revealed);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    let mismatch: Option<glib::GString> = unsafe {
+                        from_glib_full(gtk::ffi::gtk_test_accessible_check_state(
+                            settings
+                                .host
+                                .upcast_ref::<gtk::Widget>()
+                                .upcast_ref::<gtk::Accessible>()
+                                .to_glib_none()
+                                .0,
+                            gtk::AccessibleState::Hidden.into_glib(),
+                            (!revealed).into_glib(),
+                        ))
+                    };
+                    if mismatch.is_none() {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "{mismatch:?}");
+                    glib::MainContext::default().iteration(false);
+                }
+                assert!(settings.host.is_visible());
+                assert_eq!(settings.host.is_revealed(), revealed);
+            }
+            window.set_visible(false);
+        }
+        window.close();
+    }
 }

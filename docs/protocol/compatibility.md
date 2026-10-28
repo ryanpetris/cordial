@@ -89,8 +89,9 @@ understood are Required.
   `OUTPUT_STATE_UNKNOWN` reports an unknown state.
 - `Error` carries code, reason, outcome and related errors in every failure scope. Conversions
   preserve the complete error recursively, including unknown numeric details when retained by the
-  decoder. A code alone never establishes an outcome. Missing outcome evidence uses `UNSPECIFIED`,
-  even when the code commonly describes a refusal; `NO_EFFECT` requires evidence of no effects or
+  decoder. The production host client then normalizes `COMPLETE` according to the
+  [client policy](clients.md). A code alone never establishes an outcome. Missing outcome evidence
+  uses `UNSPECIFIED`, even when the code commonly describes a refusal; `NO_EFFECT` requires evidence of no effects or
   results in the documented scope. See [Errors](limits-and-errors.md#errors) for outcome meanings
   and complete-error ordering and deduplication.
 
@@ -118,7 +119,7 @@ Additive operations and writable fields require a positive advertised capability
 uses them. An absent or unknown capability means unsupported. A matching protocol revision or a
 successful response to an unrecognized field does not prove that firmware supports the operation.
 
-`make check-protocol` runs `buf lint` on every schema and uses `WIRE_JSON` for compatibility
+`just check-protocol` runs `buf lint` on every schema and uses `WIRE_JSON` for compatibility
 checks. Stable comparisons also check compiled descriptors to preserve released message and enum
 names within their packages, including nested definitions. Definitions can move between source
 files in the same package. The permanent handshake and operational revisions present in the current

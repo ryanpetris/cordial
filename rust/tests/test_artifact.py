@@ -86,12 +86,6 @@ class Artifact(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "overlaps"):
                 artifact.uf2(payload.ljust(limit + 1, b"\xff"))
 
-    def test_fixed_geometry_artifact_schema_is_rejected(self):
-        value = artifact.manifest(firmware_config.load(ROOT / "boards/pico_w.json", "debug"))
-        value["schema"] = 1
-        with self.assertRaisesRegex(ValueError, "Unsupported"):
-            artifact.inspect(artifact.MAGIC + json.dumps(value).encode() + b"\0")
-
     def test_pico_presets_pack_every_profile_and_preserve_reserved_bounds(self):
         for board in ('pico_w', 'pico2_w', 'pimoroni_pico_plus2_w', 'waveshare_rp2350b_plus_w'):
             for profile in artifact.PROFILES:

@@ -7,7 +7,10 @@ use crate::{
     model::{self, Prompt, Up},
     profiles,
     settings::{self, Field, Leaf, Value},
-    ui::catalog,
+    ui::{
+        app::words::{self, Scope},
+        catalog,
+    },
 };
 use cordial_client::serial::PortInfo;
 use cordial_protocol::{
@@ -264,6 +267,7 @@ pub fn output_state_words(o: &p::OutputStatus) -> String {
         Ok(OutputState::Pending) => "Setting Up".into(),
         Ok(OutputState::Active) => "Active".into(),
         Err(e) if model::unsupported(e) && model::plain(e) => "Unsupported".into(),
+        Err(e) if e.outcome == ErrorOutcome::Complete as i32 => sentence(&hidpp_error_words(e)),
         Err(e) => format!("Failed: {}", hidpp_error_words(e)),
     }
 }
@@ -433,9 +437,11 @@ pub fn hidpp_words(code: ErrorCode) -> String {
 
 /// Explains an integration, setting or output failure with its details.
 pub fn hidpp_error_words(e: &p::Error) -> String {
-    detailed(
+    described(
         e,
         reason_words(e).map_or_else(|| hidpp_words(e.code()), str::to_owned),
+        Scope::Apply,
+        related_line,
     )
 }
 
@@ -459,7 +465,9 @@ fn code_text(code: ErrorCode, command: Option<&str>) -> String {
             Some("the adapter doesn't know that setting for the device, or the device isn't saved")
         }
         (NotFound, Some("pair start")) => general_text(CandidateExpired),
-        (NotFound, Some("file list" | "file get")) => Some("the adapter has no file at that path"),
+        (NotFound, Some("file list" | "file get" | "file put" | "file delete")) => {
+            Some("the adapter has no file at that path")
+        }
         (
             NotFound,
             Some(
@@ -520,6 +528,9 @@ fn reason_words(e: &p::Error) -> Option<&'static str> {
             (C::Internal, R::ScanCandidates) => {
                 "the adapter couldn't keep track of every device it found"
             }
+            (C::StorageFailed | C::Internal | C::Unknown, R::Radio) => {
+                "the adapter reported a Bluetooth error"
+            }
             _ => return None,
         },
     )
@@ -545,54 +556,87 @@ fn context_words(e: &p::Error) -> Option<&'static str> {
     }
     Some(match reason {
         R::Unknown => return None,
-        R::EnabledDevices => "involves enabled devices",
-        R::Connections => "involves the adapter's connections",
-        R::ScanCandidates => "involves the devices found while scanning",
-        R::Storage => "involves the adapter's storage",
-        R::ProfileMemory => "involves profile memory",
-        R::Radio => "involves the adapter's Bluetooth radio",
-        R::OutputBackend => "involves the adapter's USB output",
-        R::InputLayout => "involves the device's input layout",
+        R::EnabledDevices => "the adapter reported an error with enabled devices",
+        R::Connections => "the adapter reported an error with its connections",
+        R::ScanCandidates => "the adapter reported an error with the devices found while searching",
+        R::Storage => "the adapter reported an error with its storage",
+        R::ProfileMemory => "the adapter reported an error with profile memory",
+        R::Radio => "the adapter reported a Bluetooth error",
+        R::OutputBackend => "the adapter reported an error with its USB output",
+        R::InputLayout => "the adapter reported an error with this device's input layout",
     })
 }
 
-/// What is known of a failed operation's effects; nothing when the adapter gave no outcome, gave
-/// one this app doesn't know, or confirmed there were none.
-fn outcome_words(e: &p::Error) -> Option<&'static str> {
-    match ErrorOutcome::try_from(e.outcome).ok()? {
-        ErrorOutcome::Unknown => Some(
-            "outcome unknown: the adapter couldn't confirm what took effect; check the current state before trying again",
-        ),
-        ErrorOutcome::Partial => Some("it partly completed"),
-        ErrorOutcome::Complete => Some("its intended effects completed"),
-        ErrorOutcome::Unspecified | ErrorOutcome::NoEffect => None,
-    }
+/// A shared message as a lowercase CLI clause without its final period.
+fn message_clause(message: &str) -> String {
+    words::reason(message)
+        .split(". ")
+        .map(|part| {
+            let mut chars = part.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_lowercase().chain(chars).collect::<String>()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
-/// An explanation followed by what the error's reason concerns, its outcome and each related
-/// failure. A related failure's own details stay inside its parentheses.
+/// An outcome followed by the failure's explanation and each related failure.
+/// A related failure's own details stay inside its parentheses.
 fn detailed(e: &p::Error, explanation: String) -> String {
-    described(e, explanation, related_line)
+    described(e, explanation, Scope::Other, related_line)
 }
 
 /// `detailed`, with each related failure as `related` words it.
-fn described(e: &p::Error, explanation: String, related: fn(&p::Error) -> String) -> String {
-    let mut parts = vec![explanation];
-    parts.extend(context_words(e).map(str::to_owned));
-    parts.extend(outcome_words(e).map(str::to_owned));
-    parts.extend(e.related.iter().map(|r| format!("also ({})", related(r))));
+fn described(
+    e: &p::Error,
+    explanation: String,
+    scope: Scope,
+    related: fn(&p::Error, Scope) -> String,
+) -> String {
+    let mut parts: Vec<String> = words::outcome_text(e, scope)
+        .map(message_clause)
+        .into_iter()
+        .collect();
+    if !words::outcome_covers_failure(e, scope) {
+        parts.push(explanation);
+        let radio_named = e.reason == ErrorReason::Radio as i32
+            && e.outcome == ErrorOutcome::Complete as i32
+            && matches!(scope, Scope::Save | Scope::Pair);
+        if !radio_named {
+            parts.extend(context_words(e).map(str::to_owned));
+        }
+    }
+    let related_scope = if scope == Scope::Pair
+        && matches!(
+            ErrorOutcome::try_from(e.outcome),
+            Ok(ErrorOutcome::Complete | ErrorOutcome::Unknown | ErrorOutcome::Partial)
+        ) {
+        Scope::Related
+    } else {
+        scope.related()
+    };
+    parts.extend(
+        e.related
+            .iter()
+            .map(|r| format!("also ({})", related(r, related_scope))),
+    );
     parts.join("; ")
 }
 
 /// Explains an adapter error and its related failures in words alone, without any codes.
 pub fn plain_text(e: &p::Error) -> String {
+    plain_in(e, Scope::Other)
+}
+
+fn plain_in(e: &p::Error, scope: Scope) -> String {
     let explanation = match known_code(e) {
         None | Some(ErrorCode::Unknown) => {
             "the adapter reported an error this version of Cordial doesn't recognize".into()
         }
         Some(code) => reason_words(e).map_or_else(|| code_text(code, None), str::to_owned),
     };
-    described(e, explanation, plain_text)
+    described(e, explanation, scope, plain_in)
 }
 
 /// Why a blocked adapter can't be migrated, in words alone.
@@ -604,9 +648,13 @@ pub fn blocked_line(e: &Error) -> String {
 
 /// A related failure with its code. It concerns a step other than the command's own, such as a
 /// failed pairing's cleanup, so it takes the general wording and its outcome stays its own.
-fn related_line(r: &p::Error) -> String {
+fn related_line(r: &p::Error, scope: Scope) -> String {
     let explanation = reason_words(r).map_or_else(|| code_text(r.code(), None), str::to_owned);
-    format!("{}: {}", code_token(r), detailed(r, explanation))
+    format!(
+        "{}: {}",
+        code_token(r),
+        described(r, explanation, scope, related_line)
+    )
 }
 
 /// A protocol enum value as the CLI spells it, or its number when this app doesn't know it.
@@ -692,26 +740,58 @@ pub fn enabled_word(on: bool) -> &'static str {
 
 /// Explains an adapter error without its code, with its outcome and related failures.
 pub fn wire_text(e: &p::Error, command: Option<&str>) -> String {
-    if known_code(e) == Some(ErrorCode::StorageFailed) && e.outcome == ErrorOutcome::Unknown as i32
-    {
-        let unknown = p::Error {
-            outcome: ErrorOutcome::Unspecified as i32,
-            ..e.clone()
-        };
-        let what = if command == Some("pair start") {
-            "it saved the device"
-        } else {
-            "the change was saved"
-        };
-        return detailed(
-            &unknown,
-            format!(
-                "save status unknown: the adapter couldn't confirm whether {what}; check the current state before trying again"
-            ),
-        );
-    }
+    let scope = match command {
+        Some("pair start") => Scope::Pair,
+        Some(
+            "adapter name"
+            | "adapter platform"
+            | "adapter transport"
+            | "adapter interface"
+            | "adapter settings"
+            | "device set"
+            | "device set enabled"
+            | "device set trusted"
+            | "device set blocked"
+            | "device set hidpp"
+            | "device set profiles"
+            | "device set gamepad-output"
+            | "device unpair"
+            | "setting set"
+            | "setting forget"
+            | "profile create"
+            | "profile copy"
+            | "profile delete"
+            | "profile rule"
+            | "file put"
+            | "file delete",
+        ) => Scope::Save,
+        Some(
+            "adapter status" | "device list" | "device get" | "setting list" | "setting get"
+            | "feature list" | "profile list" | "profile show" | "profile rule list" | "file list"
+            | "file get" | "scan start",
+        ) => Scope::Read,
+        _ => Scope::Other,
+    };
     let explanation = reason_words(e).map_or_else(|| code_text(e.code(), command), str::to_owned);
-    detailed(e, explanation)
+    let explanation = if known_code(e) == Some(ErrorCode::StorageFailed)
+        && e.reason == ErrorReason::Radio as i32
+        && e.outcome == ErrorOutcome::NoEffect as i32
+    {
+        match scope {
+            Scope::Save => {
+                "the adapter couldn't save the change. The adapter reported a Bluetooth error"
+                    .into()
+            }
+            Scope::Pair => {
+                "the adapter couldn't save the device. The adapter reported a Bluetooth error"
+                    .into()
+            }
+            _ => explanation,
+        }
+    } else {
+        explanation
+    };
+    described(e, explanation, scope, related_line)
 }
 
 /// An adapter error with its code before the explanation, as the shell and
@@ -791,6 +871,9 @@ pub fn up_words(up: &Up) -> String {
         Up::Starting => "Setting Up".into(),
         Up::Active => "Active".into(),
         Up::Unsupported(e) if model::plain(e) => "Unsupported".into(),
+        Up::Unsupported(e) | Up::Error(e) if e.outcome == ErrorOutcome::Complete as i32 => {
+            sentence(&hidpp_error_words(e))
+        }
         Up::Unsupported(e) | Up::Error(e) => format!("Failed: {}", hidpp_error_words(e)),
     }
 }
@@ -1343,7 +1426,7 @@ pub fn label(subject: &Subject) -> String {
 }
 
 /// A byte count for people: exact below 1 KiB.
-pub fn bytes(n: u64) -> String {
+fn bytes(n: u64) -> String {
     match n {
         0..1024 => format!("{n} B"),
         1024..1_048_576 => format!("{:.1} KiB", n as f64 / 1024.0),
@@ -1408,6 +1491,10 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
         Outcome::Files { entries, .. } => {
             entries.iter().map(file_line).collect::<Vec<_>>().join("\n")
         }
+        Outcome::FileUploaded { path, bytes } => {
+            format!("Uploaded {} to the adapter ({bytes} bytes).", safe(path))
+        }
+        Outcome::FileDeleted(path) => format!("Deleted {} from the adapter.", safe(path)),
         Outcome::FileSaved {
             path,
             local,
@@ -1448,6 +1535,9 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
             } else {
                 "Discovery is already off.".into()
             }
+        }
+        Outcome::PairedWithoutDevice { name } => {
+            format!("Paired and saved {}.", self::name(Some(name)))
         }
         Outcome::Paired { subject, device } => {
             match device
@@ -1707,10 +1797,40 @@ pub fn paired_disabled(subject: &Subject, reason: InactiveReason, transport: Tra
 /// A failed command's error line for the shell and scripts. The caller adds the `Error: `
 /// prefix where the shell uses one. A save cut off by the connection's end may have been stored.
 pub fn failure_text(command: &Command, error: &Error) -> String {
+    if matches!(
+        command,
+        Command::ProfileDelete(_) | Command::ProfileDeletePlanned(_)
+    ) && error.unconfirmed()
+    {
+        return deletion_uncertain(error);
+    }
     if command.saves() && error.unconfirmed() {
         return "the adapter couldn't confirm whether the change was saved".into();
     }
     safe(&error_line(error))
+}
+
+/// Names the unconfirmed deletion step and whether earlier changes completed.
+pub(crate) fn deletion_uncertain(error: &Error) -> String {
+    let (_, incomplete) = crate::commands::deletion_failure(error);
+    let result = match error.command {
+        Some("device set profiles") => {
+            "the adapter couldn't confirm whether the device's profiles were updated. Profile deletion did not proceed"
+        }
+        Some("adapter interface") => {
+            "the adapter couldn't confirm whether its configuration interfaces were updated. Profile deletion did not proceed"
+        }
+        Some("profile delete") => "the adapter couldn't confirm whether the profile was deleted",
+        _ => {
+            "the adapter couldn't finish preparing the profile deletion. Profile deletion did not proceed"
+        }
+    };
+    let completed = if incomplete {
+        ". Earlier changes were saved"
+    } else {
+        ""
+    };
+    format!("{result}{completed}. Check the current settings before trying again")
 }
 
 /// A notice for the shell and scripts, or None when it has nothing to show:
@@ -2020,7 +2140,7 @@ mod tests {
         );
         assert_eq!(
             wire_line(&e, None),
-            "timeout: this device didn't respond in time; involves the adapter's connections; outcome unknown: the adapter couldn't confirm what took effect; check the current state before trying again; also (storage_failed: the adapter couldn't read or write its saved data)"
+            "timeout: the operation's outcome is unknown; this device didn't respond in time; the adapter reported an error with its connections; also (storage_failed: the adapter couldn't read or write its saved data)"
         );
         // A related failure's outcome stays with it.
         let pairing = p::Error {
@@ -2036,7 +2156,7 @@ mod tests {
         };
         assert_eq!(
             wire_line(&pairing, Some("pair start")),
-            "auth_failed: Bluetooth authentication with this device failed; also (internal: the adapter hit an unexpected failure; involves the adapter's Bluetooth radio; outcome unknown: the adapter couldn't confirm what took effect; check the current state before trying again)"
+            "auth_failed: Bluetooth authentication with this device failed; also (internal: pairing failed; the adapter couldn't confirm whether it removed the incomplete pairing; the adapter reported a Bluetooth error)"
         );
         // A related failure's outcome doesn't become the command's own.
         let cleanup = p::Error {
@@ -2051,7 +2171,7 @@ mod tests {
         };
         assert_eq!(
             wire_line(&cleanup, Some("pair start")),
-            "auth_failed: Bluetooth authentication with this device failed; also (storage_failed: the adapter couldn't read or write its saved data; outcome unknown: the adapter couldn't confirm what took effect; check the current state before trying again)"
+            "auth_failed: Bluetooth authentication with this device failed; also (storage_failed: pairing failed; the adapter couldn't confirm whether it removed the incomplete pairing; the adapter couldn't read or write its saved data)"
         );
         // A reason gives context without replacing what the code means.
         let starting = p::Error {
@@ -2079,12 +2199,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            wire_text(&unknown, None),
-            "save status unknown: the adapter couldn't confirm whether the change was saved; check the current state before trying again"
+            wire_text(&unknown, Some("setting set")),
+            "the adapter couldn't confirm whether the change was saved; check the current settings before trying again"
         );
         assert_eq!(
             wire_text(&unknown, Some("pair start")),
-            "save status unknown: the adapter couldn't confirm whether it saved the device; check the current state before trying again"
+            "the adapter couldn't confirm whether it saved the device; check its saved devices before pairing again; the adapter couldn't read or write its saved data"
         );
         // Details this build doesn't know keep their numbers, and their explanation adds nothing.
         let newer = p::Error {
@@ -2102,6 +2222,160 @@ mod tests {
             wire_line(&newer, None).starts_with("99: the adapter reported error"),
             "{}",
             wire_line(&newer, None)
+        );
+    }
+
+    #[test]
+    fn confirmed_saves_and_pairings_keep_their_codes_and_radio_failure() {
+        let radio = p::Error {
+            code: ErrorCode::StorageFailed as i32,
+            reason: ErrorReason::Radio as i32,
+            outcome: ErrorOutcome::Complete as i32,
+            ..Default::default()
+        };
+        assert_eq!(error_token(&radio), "storage_failed:radio:complete");
+        assert_eq!(
+            wire_line(&radio, Some("device set enabled")),
+            "storage_failed: the change was saved, but the adapter reported a Bluetooth error"
+        );
+        assert_eq!(
+            wire_line(&radio, Some("pair start")),
+            "storage_failed: the device was paired, but the adapter reported a Bluetooth error"
+        );
+        let applied = p::Error {
+            code: ErrorCode::Internal as i32,
+            reason: ErrorReason::Unknown as i32,
+            ..radio.clone()
+        };
+        assert_eq!(
+            hidpp_error_words(&applied),
+            "the change took effect, but the adapter reported an error"
+        );
+        assert_eq!(
+            up_words(&Up::Error(applied.clone())),
+            "The change took effect, but the adapter reported an error."
+        );
+        assert_eq!(
+            output_state_words(&p::OutputStatus {
+                status: Some(output_status::Status::Error(applied.clone())),
+                ..Default::default()
+            }),
+            "The change took effect, but the adapter reported an error."
+        );
+        let related = p::Error {
+            related: vec![p::Error {
+                code: ErrorCode::StorageFull as i32,
+                outcome: ErrorOutcome::NoEffect as i32,
+                ..Default::default()
+            }],
+            ..radio
+        };
+        assert_eq!(
+            error_token(&related),
+            "storage_failed:radio:complete(storage_full:no_effect)"
+        );
+        assert_eq!(
+            wire_line(&related, Some("device set enabled")),
+            "storage_failed: the change was saved, but the adapter reported a Bluetooth error; also (storage_full: the adapter's storage is full)"
+        );
+        let paired = p::Error {
+            related: vec![p::Error {
+                code: ErrorCode::StorageFailed as i32,
+                outcome: ErrorOutcome::Unknown as i32,
+                ..Default::default()
+            }],
+            ..related
+        };
+        assert_eq!(
+            wire_line(&paired, Some("pair start")),
+            "storage_failed: the device was paired, but the adapter reported a Bluetooth error; also (storage_failed: a related operation's outcome is unknown; the adapter couldn't read or write its saved data)"
+        );
+        let concrete = p::Error {
+            code: ErrorCode::Timeout as i32,
+            ..applied
+        };
+        assert_eq!(
+            wire_text(&concrete, Some("setting set")),
+            "the change was saved, but the adapter reported an error; this device didn't respond in time"
+        );
+    }
+
+    #[test]
+    fn device_get_reports_read_outcomes() {
+        for (outcome, expected) in [
+            (
+                ErrorOutcome::Unknown,
+                "the adapter couldn't confirm whether the results are complete",
+            ),
+            (
+                ErrorOutcome::Partial,
+                "the adapter returned only some of the results",
+            ),
+        ] {
+            let error = p::Error {
+                code: ErrorCode::StorageFailed as i32,
+                outcome: outcome as i32,
+                ..Default::default()
+            };
+            assert!(wire_line(&error, Some("device get")).contains(expected));
+        }
+    }
+
+    #[test]
+    fn partial_saves_and_unconfirmed_reads_keep_distinct_outcomes() {
+        let partial = p::Error {
+            code: ErrorCode::StorageFailed as i32,
+            reason: ErrorReason::Storage as i32,
+            outcome: ErrorOutcome::Partial as i32,
+            ..Default::default()
+        };
+        assert_eq!(
+            wire_text(&partial, Some("setting set")),
+            "the adapter confirmed only part of the change; check the current settings before trying again"
+        );
+        assert_eq!(
+            wire_text(&partial, Some("setting list")),
+            "the adapter returned only some of the results; the adapter couldn't read or write its saved data"
+        );
+        let unknown = p::Error {
+            outcome: ErrorOutcome::Unknown as i32,
+            ..partial
+        };
+        assert_eq!(
+            wire_text(&unknown, Some("setting set")),
+            "the adapter couldn't confirm whether the change was saved; check the current settings before trying again"
+        );
+        assert_eq!(
+            wire_text(&unknown, Some("setting list")),
+            "the adapter couldn't confirm whether the results are complete; the adapter couldn't read or write its saved data"
+        );
+        assert_eq!(
+            wire_text(&unknown, None),
+            "the operation's outcome is unknown; the adapter couldn't read or write its saved data"
+        );
+        let refused = p::Error {
+            reason: ErrorReason::Radio as i32,
+            outcome: ErrorOutcome::NoEffect as i32,
+            ..unknown
+        };
+        assert_eq!(
+            wire_text(&refused, Some("setting set")),
+            "the adapter couldn't save the change. The adapter reported a Bluetooth error"
+        );
+        assert_eq!(
+            wire_text(&refused, Some("pair start")),
+            "the adapter couldn't save the device. The adapter reported a Bluetooth error"
+        );
+        let future = p::Error {
+            code: 99,
+            reason: 98,
+            outcome: ErrorOutcome::Complete as i32,
+            ..Default::default()
+        };
+        assert_eq!(error_token(&future), "99:98:complete");
+        assert!(
+            wire_line(&future, Some("setting set"))
+                .starts_with("99: the change was saved, but the adapter reported an error;")
         );
     }
 

@@ -237,21 +237,25 @@ impl<F: Fleet> Model<F> {
     }
     pub(super) fn profile_delete_dialog(&mut self, adapter: &str, id: u32, w: usize) -> DialogView {
         let mut body = Layout::new(w);
+        let steps = self.deletion_steps(adapter, id);
+        if !steps.is_empty() {
+            body.para(crate::ui::app::profiles::DELETION_INTRO, Style::new());
+            for step in &steps {
+                body.para(&format!("• {step}"), Style::new());
+            }
+        }
         if let Some(e) = self.notes.get(&Spot::Dialog) {
             body.para(e, err());
         }
         let busy = self.profiles_busy(adapter);
-        let ready = self.adapter(adapter).and_then(AdapterView::live).is_some();
+        let ready = self.deletion_ready(adapter, id);
         let mut buttons = Layout::new(w);
         let mut right = Layout::new(w);
         button_if(&mut right, "Cancel", Action::Cancel, Tone::Normal, !busy);
-        button_if(
-            &mut right,
-            "Delete",
-            Action::Confirm,
-            Tone::Danger,
-            !busy && ready,
-        );
+        match self.deletion(adapter, id).filter(|_| !busy && ready) {
+            Some(plan) => right.button("Delete", Action::ProfileDeleteConfirm(plan), Tone::Danger),
+            None => right.disabled("Delete"),
+        }
         buttons.align_right(right);
         DialogView {
             title: format!("Delete “{}”?", self.profile_text(adapter, id)),
@@ -321,11 +325,34 @@ impl<F: Fleet> Model<F> {
         }
         if let Some(e) = &page.error {
             body.para(e, err());
+        } else if list.is_empty() && current == 0 && page.listed && !page.reading {
+            body.para("No Profiles", dim());
+            let editable = self
+                .adapter(adapter)
+                .is_some_and(|a| a.live().is_some() && self.adapter_editable(a));
+            let mut row = Layout::new(w);
+            button_if(
+                &mut row,
+                "New Profile",
+                Action::PickNewProfile,
+                Tone::Primary,
+                editable && !self.profiles_busy(adapter),
+            );
+            body.add(row);
         }
         let mut buttons = Layout::new(w);
         let loading = page.reading;
         if loading {
             buttons.label(&format!("{}", super::spinner()), layout::accent());
+        }
+        if page.error.is_some() {
+            button_if(
+                &mut buttons,
+                "Retry",
+                Action::PickRetry,
+                Tone::Normal,
+                self.picker_retryable(adapter),
+            );
         }
         if page.previous() {
             button_if(

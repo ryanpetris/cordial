@@ -33,7 +33,7 @@ reports what it says, such as battery levels.
 - [`proto/migration.proto`](../../proto/migration.proto) defines framed migration-worker subprocess IPC.
   Its length prefix and bounds are separate from the serial API's COBS frames.
 
-`buf lint` checks all schemas. `make check-protocol` checks the permanent handshake and retained
+`buf lint` checks all schemas. `just check-protocol` checks the permanent handshake and retained
 serial revisions against published schemas. Storage and migration IPC use the newest earlier
 release in the same application series. See [Compatibility rules](compatibility.md).
 

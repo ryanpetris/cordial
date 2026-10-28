@@ -32,7 +32,39 @@ impl From<Tone> for Look {
 
 const LOOKS: [&str; 5] = ["dim-label", "error", "warning", "success", "accent"];
 
-/// Adds the app's style rules to the display.
+/// The bands that join a setting's row to the row of its dependent number, as style classes and
+/// colors in the order a page gives them out. Teal and pink are GNOME's teal and pink accent
+/// colors, which have no named color.
+pub const BANDS: [(&str, &str); 6] = [
+    ("band-blue", "@blue_3"),
+    ("band-purple", "@purple_3"),
+    ("band-teal", "#2190a4"),
+    ("band-orange", "@orange_3"),
+    ("band-green", "@green_4"),
+    ("band-pink", "#d56199"),
+];
+
+/// The bands' style rules, with separators of the `separator` color. A band is 3 pixels of the
+/// row's background at the list's left edge, clipped by the list's rounded corners. The row's
+/// separator is a border image whose first 3 pixels are the band's, so the band runs unbroken
+/// through its rows and into the next band.
+fn bands(separator: &str) -> String {
+    BANDS
+        .iter()
+        .map(|(class, color)| {
+            format!(
+                "row.{class} {{
+                    background-image: linear-gradient(to right, {color} 3px, transparent 3px);
+                    border-image: linear-gradient(to right, {color} 3px, {separator} 3px)
+                        0 0 1 0 / 0 0 1 0;
+                }}"
+            )
+        })
+        .collect()
+}
+
+/// Adds the app's style rules to the display. Separators of the high-contrast style are in the
+/// text color at half strength, as the style's own.
 pub fn add_style() {
     // A dimmed fact already fades its name with the row, so the name skips the property style's
     // own dimming and stays as readable as other facts' names.
@@ -40,9 +72,6 @@ pub fn add_style() {
     // Pairing shows the device's icon on an accent-tinted disc, with a round badge at its corner
     // filled with the step's result color. The badge's ring in the dialog's color separates it
     // from the disc. Named colors follow the light, dark and high-contrast styles.
-    //
-    // The connected result's countdown is a thin square-ended accent fill over a faint track
-    // in the text color.
     const CSS: &str = "
         row.property.dim-label > box.header > box.title > .title { opacity: 1; }
         .pairing-icon { border-radius: 9999px; background-color: alpha(@accent_color, 0.15); }
@@ -52,24 +81,34 @@ pub fn add_style() {
             box-shadow: 0 0 0 3px @dialog_bg_color;
         }
         .pairing-badge.success { background-color: @success_bg_color; color: @success_fg_color; }
-        .pairing-badge.warning { background-color: @warning_bg_color; color: @warning_fg_color; }
         .pairing-badge.error { background-color: @error_bg_color; color: @error_fg_color; }
-        progressbar.countdown > trough, progressbar.countdown > trough > progress {
-            min-height: 3px;
-            border-radius: 0;
-        }
-        progressbar.countdown > trough { background-color: alpha(currentColor, 0.075); }
     ";
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(CSS);
+    provider.load_from_string(&format!("{CSS}{}", bands("@card_shade_color")));
     gtk::style_context_add_provider_for_display(
         &display,
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+    let high_contrast = gtk::CssProvider::new();
+    high_contrast.load_from_string(&bands("alpha(currentColor, 0.5)"));
+    let follow = move |style: &adw::StyleManager| {
+        if style.is_high_contrast() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &high_contrast,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        } else {
+            gtk::style_context_remove_provider_for_display(&display, &high_contrast);
+        }
+    };
+    let style = adw::StyleManager::default();
+    follow(&style);
+    style.connect_high_contrast_notify(follow);
 }
 
 pub fn set_look(w: &impl IsA<gtk::Widget>, look: Look) {
@@ -217,12 +256,6 @@ impl Btn {
 
     pub fn hide(&self) {
         self.offer(false, None);
-    }
-
-    pub fn set_label(&self, text: &str) {
-        if self.widget.label().as_deref() != Some(text) {
-            self.widget.set_label(text);
-        }
     }
 }
 
@@ -536,14 +569,19 @@ impl List {
 
     fn new_row(&self) -> ListRow {
         let row = adw::ActionRow::builder().title_lines(0).build();
-        let icon = gtk::Image::new();
+        let icon = gtk::Image::builder()
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build();
         let value = gtk::Label::builder()
             .wrap_mode(gtk::pango::WrapMode::WordChar)
             .xalign(1.0)
             .justify(gtk::Justification::Right)
             .max_width_chars(36)
             .build();
-        let chevron = gtk::Image::from_icon_name("go-next-symbolic");
+        let chevron = gtk::Image::builder()
+            .icon_name("go-next-symbolic")
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build();
         let link: Rc<RefCell<Vec<Action>>> = Rc::default();
         row.connect_activated(glib::clone!(
             #[weak(rename_to = ctx)]

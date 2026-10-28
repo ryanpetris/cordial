@@ -121,6 +121,329 @@ impl Harness {
 }
 
 #[test]
+fn completed_device_save_keeps_radio_feedback_without_blocking_quit_or_retrying() {
+    for outcome in [
+        p::ErrorOutcome::Complete,
+        p::ErrorOutcome::NoEffect,
+        p::ErrorOutcome::Partial,
+        p::ErrorOutcome::Unknown,
+        p::ErrorOutcome::Unspecified,
+    ] {
+        let mut h = Harness::new();
+        let adapter = h.world.adapters()[0].clone();
+        let mut device = h.app.device(&h.adapter, 1).unwrap().d.clone();
+        device.blocked = true;
+        device.state = p::DeviceState::Disconnected as i32;
+        device.inactive = Some(p::InactiveReason::Blocked as i32);
+        adapter.event(p::event::Kind::Device(device.clone()));
+        h.until(|a| a.devices().iter().any(|d| d.d.id == 1 && d.d.blocked));
+        adapter.0.lock().unwrap().refuse.insert(
+            "set_device",
+            p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                reason: p::ErrorReason::Radio as i32,
+                outcome: outcome as i32,
+                ..Default::default()
+            },
+        );
+        h.app.act(Action::Tab(Tab::Details));
+        h.app.act(Action::DeviceToggle(Toggle::Blocked, false));
+        h.app.apply_pending();
+        h.until(|a| !a.writes_pending());
+        let spot = Spot::DetailsSave(h.adapter.clone(), 1);
+        let note = h.app.note(&spot).map(str::to_owned);
+        assert_eq!(
+            note.as_deref(),
+            if outcome == p::ErrorOutcome::Complete && !cfg!(debug_assertions) {
+                None
+            } else {
+                Some(match outcome {
+                    p::ErrorOutcome::Complete => {
+                        "The change was saved, but the adapter reported a Bluetooth error."
+                    }
+                    p::ErrorOutcome::Unknown => {
+                        "The adapter couldn't confirm whether the change was saved. Check the current settings before trying again. The adapter reported a Bluetooth error."
+                    }
+                    p::ErrorOutcome::Partial => {
+                        "The adapter confirmed only part of the change. Check the current settings before trying again. The adapter reported a Bluetooth error."
+                    }
+                    p::ErrorOutcome::NoEffect => {
+                        "The adapter couldn't save the change. The adapter reported a Bluetooth error."
+                    }
+                    _ => "The adapter reported a Bluetooth error.",
+                })
+            }
+        );
+        let complete = outcome == p::ErrorOutcome::Complete;
+        assert_eq!(h.app.write_error().is_none(), complete, "{outcome:?}");
+        let d = h.app.device(&h.adapter, 1).unwrap();
+        assert_eq!(d.d.blocked, !complete, "{outcome:?}");
+        assert!(!d.connected(), "saving must not confirm a radio connection");
+        assert_eq!(d.d.inactive(), p::InactiveReason::Blocked);
+        assert_eq!(
+            h.app.device_changes(d).blocked,
+            match outcome {
+                p::ErrorOutcome::Complete | p::ErrorOutcome::NoEffect => None,
+                _ => Some(false),
+            },
+            "{outcome:?}"
+        );
+        h.app.apply_pending();
+        assert!(!h.app.writes_pending());
+        assert_eq!(
+            adapter
+                .sent()
+                .iter()
+                .filter(|&&c| c == "set_device")
+                .count(),
+            1
+        );
+
+        // A saved preference readback does not confirm recovery of the radio.
+        device.blocked = false;
+        device.name = "Saved Preference Readback".into();
+        adapter.event(p::event::Kind::Device(device.clone()));
+        h.until(|a| {
+            a.devices()
+                .iter()
+                .any(|d| d.name == "Saved Preference Readback")
+        });
+        assert_eq!(h.app.note(&spot), note.as_deref());
+        assert_eq!(h.app.write_error().is_none(), complete);
+
+        device.state = p::DeviceState::Connected as i32;
+        device.inactive = None;
+        device.errors.push(p::Error {
+            code: p::ErrorCode::StorageFailed as i32,
+            reason: p::ErrorReason::Radio as i32,
+            ..Default::default()
+        });
+        device.name = "Connection With Error".into();
+        adapter.event(p::event::Kind::Device(device.clone()));
+        h.until(|a| {
+            a.devices()
+                .iter()
+                .any(|d| d.name == "Connection With Error")
+        });
+        assert_eq!(h.app.note(&spot), note.as_deref());
+
+        device.state = p::DeviceState::Disconnected as i32;
+        device.name = "Awaiting Connection".into();
+        adapter.event(p::event::Kind::Device(device.clone()));
+        h.until(|a| a.devices().iter().any(|d| d.name == "Awaiting Connection"));
+        device.state = p::DeviceState::Connected as i32;
+        device.errors.clear();
+        device.name = "Recovered Connection".into();
+        adapter.0.lock().unwrap().devices[0] = device;
+        h.app.act(Action::DiagnosticsRefresh);
+        h.until(|a| {
+            a.devices()
+                .iter()
+                .any(|d| d.name == "Recovered Connection" && !a.device_busy(d))
+        });
+        if complete {
+            assert!(h.app.note(&spot).is_none());
+            assert!(h.app.write_error().is_none());
+        } else {
+            assert_eq!(h.app.note(&spot), note.as_deref());
+            assert_eq!(h.app.write_error(), note.as_deref());
+        }
+        assert!(!h.app.writes_pending());
+        assert_eq!(
+            adapter
+                .sent()
+                .iter()
+                .filter(|&&c| c == "set_device")
+                .count(),
+            1
+        );
+        h.close();
+    }
+}
+
+#[test]
+fn completed_settings_and_adapter_saves_preserve_an_unrelated_quit_failure() {
+    let mut h = Harness::new();
+    h.refuse("set_device", p::ErrorCode::Busy, p::ErrorOutcome::NoEffect);
+    h.app.act(Action::Tab(Tab::Details));
+    h.app.act(Action::DeviceToggle(Toggle::Trusted, false));
+    h.app.apply_pending();
+    h.until(|a| !a.writes_pending());
+    let failure = h.app.write_error().unwrap().to_owned();
+    h.app.act(Action::Tab(Tab::Settings));
+    h.refuse(
+        "set_settings",
+        p::ErrorCode::StorageFailed,
+        p::ErrorOutcome::Complete,
+    );
+    h.dpi(1200);
+    h.app.apply_pending();
+    h.until(|a| !a.writes_pending());
+    let d = h.app.device(&h.adapter, 1).unwrap();
+    assert!(h.app.drafts_of(d).is_none());
+    assert!(!h.app.submitting(d));
+    assert_eq!(h.shown_dpi(), Some(Value::Integer(1200)));
+    assert_eq!(h.app.write_error(), Some(failure.as_str()));
+    assert_eq!(
+        h.app
+            .note(&Spot::SettingsNote(h.adapter.clone(), 1))
+            .is_some(),
+        cfg!(debug_assertions)
+    );
+
+    h.app.show(Page::Adapter(h.adapter.clone()));
+    assert!(
+        h.app
+            .note(&Spot::SettingsNote(h.adapter.clone(), 1))
+            .is_none()
+    );
+    h.refuse(
+        "set_adapter",
+        p::ErrorCode::StorageFailed,
+        p::ErrorOutcome::Complete,
+    );
+    h.app.act(Action::Show(Page::Adapter(h.adapter.clone())));
+    h.app.act(Action::Platform(p::Platform::Windows));
+    h.app.apply_pending();
+    h.until(|a| !a.writes_pending());
+    let a = h.app.adapter(&h.adapter).unwrap();
+    assert!(h.app.adapter_changes(a).is_empty());
+    assert_eq!(a.status.as_ref().unwrap().platform(), p::Platform::Windows);
+    assert_eq!(h.app.write_error(), Some(failure.as_str()));
+    assert_eq!(
+        h.app.note(&Spot::AdapterSave(h.adapter.clone())).is_some(),
+        cfg!(debug_assertions)
+    );
+    h.app.apply_pending();
+    assert!(!h.app.writes_pending());
+    assert_eq!(h.settings_writes().len(), 1);
+    assert_eq!(h.adapter_writes().len(), 1);
+    h.app.acknowledge_write_error();
+    assert!(h.app.write_error().is_none());
+    assert_eq!(
+        h.app.note(&Spot::AdapterSave(h.adapter.clone())).is_some(),
+        cfg!(debug_assertions)
+    );
+    h.app.show(Page::Device(h.adapter.clone(), 1));
+    assert!(h.app.note(&Spot::AdapterSave(h.adapter.clone())).is_none());
+    h.close();
+}
+
+#[test]
+fn complete_save_preserves_a_newer_edit_and_trust_feedback_clears_on_navigation() {
+    for reason in [p::ErrorReason::Radio, p::ErrorReason::Storage] {
+        let mut h = Harness::new();
+        let adapter = h.world.adapters()[0].clone();
+        h.delay("set_device");
+        adapter.0.lock().unwrap().refuse.insert(
+            "set_device",
+            p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                reason: reason as i32,
+                outcome: p::ErrorOutcome::Complete as i32,
+                ..Default::default()
+            },
+        );
+        h.app.act(Action::Tab(Tab::Details));
+        h.app.act(Action::DeviceToggle(Toggle::Trusted, false));
+        h.app.apply_pending();
+        h.app.act(Action::DeviceToggle(Toggle::Trusted, true));
+        h.until(|a| {
+            let d = a.devices().iter().find(|d| d.d.id == 1).unwrap();
+            !a.device_saving(d, Tab::Details)
+        });
+        let d = h.app.device(&h.adapter, 1).unwrap();
+        assert!(!d.d.trusted);
+        assert_eq!(h.app.device_changes(d).trusted, Some(true));
+        assert!(h.app.writes_pending());
+        assert!(h.app.write_error().is_none());
+        h.app.apply_pending();
+        h.until(|a| !a.writes_pending());
+        let d = h.app.device(&h.adapter, 1).unwrap();
+        assert!(d.d.trusted);
+        assert!(h.app.device_changes(d).is_empty());
+        let mut readback = d.d.clone();
+        let spot = Spot::DetailsSave(h.adapter.clone(), 1);
+        assert_eq!(h.app.note(&spot).is_some(), cfg!(debug_assertions));
+        readback.state = p::DeviceState::Connected as i32;
+        readback.inactive = None;
+        readback.errors.clear();
+        readback.name = "Fresh Connected Record".into();
+        adapter.event(p::event::Kind::Device(readback));
+        h.until(|a| {
+            a.devices()
+                .iter()
+                .any(|d| d.name == "Fresh Connected Record")
+        });
+        assert_eq!(h.app.note(&spot).is_some(), cfg!(debug_assertions));
+        h.app.show(Page::Adapter(h.adapter.clone()));
+        assert!(h.app.note(&spot).is_none());
+        assert!(h.app.write_error().is_none());
+        assert_eq!(
+            adapter
+                .sent()
+                .iter()
+                .filter(|&&c| c == "set_device")
+                .count(),
+            2
+        );
+        h.close();
+    }
+}
+
+#[test]
+fn fresh_connection_readback_resolves_a_completed_radio_failure() {
+    let mut h = Harness::new();
+    let adapter = h.world.adapters()[0].clone();
+    h.blocked_device();
+    adapter.0.lock().unwrap().refuse.insert(
+        "set_device",
+        p::Error {
+            code: p::ErrorCode::StorageFailed as i32,
+            reason: p::ErrorReason::Radio as i32,
+            outcome: p::ErrorOutcome::Complete as i32,
+            ..Default::default()
+        },
+    );
+    h.app.act(Action::Tab(Tab::Details));
+    h.app.act(Action::DeviceToggle(Toggle::Blocked, false));
+    h.app.apply_pending();
+    h.until(|a| !a.writes_pending());
+    let spot = Spot::DetailsSave(h.adapter.clone(), 1);
+    assert_eq!(
+        h.app.note(&spot),
+        cfg!(debug_assertions)
+            .then_some("The change was saved, but the adapter reported a Bluetooth error.")
+    );
+    assert!(h.app.write_error().is_none());
+    {
+        let mut sim = adapter.0.lock().unwrap();
+        let d = &mut sim.devices[0];
+        d.blocked = false;
+        d.state = p::DeviceState::Connected as i32;
+        d.inactive = None;
+        d.errors.clear();
+    }
+    assert!(h.world.set_present(0, false));
+    h.app.update(Msg::Ports(Ok(h.world.ports())));
+    h.until(|_| adapter.handles() == 0);
+    assert!(h.world.set_present(0, true));
+    h.app.act(Action::RefreshAdapters);
+    h.until(|a| a.devices().iter().any(|d| d.d.id == 1 && d.available) && a.note(&spot).is_none());
+    assert!(h.app.write_error().is_none());
+    assert!(!h.app.writes_pending());
+    assert_eq!(
+        adapter
+            .sent()
+            .iter()
+            .filter(|&&c| c == "set_device")
+            .count(),
+        1
+    );
+    h.close();
+}
+
+#[test]
 fn newer_values_stay_visible_and_coalesce_while_the_first_write_runs() {
     let mut h = Harness::new();
     h.delay("set_settings");
@@ -328,16 +651,17 @@ fn detach_preserves_unknown_error_and_reconnect_does_not_replay_accepted_edits()
     h.dpi(1200);
     h.app.apply_pending();
     h.dpi(1800);
+    let adapter = h.world.adapters()[0].clone();
+    h.until(|_| adapter.sent().contains(&"set_settings"));
     assert!(h.world.set_present(0, false));
     h.app.update(Msg::Ports(Ok(h.world.ports())));
-    h.until(|a| a.adapters().iter().all(|a| !a.connected()));
+    h.until(|a| a.adapters().iter().all(|a| !a.connected()) && !a.writes_pending());
     let error = h.app.write_error().unwrap().to_owned();
     assert!(error.contains("couldn't confirm whether the change was saved"));
     assert!(!h.app.writes_pending());
     let submission = h.app.submission(&h.adapter, 1).unwrap();
     assert!(submission.unknown);
     assert_eq!(submission.error.as_deref(), Some(error.as_str()));
-    let adapter = h.world.adapters()[0].clone();
     h.until(|_| adapter.handles() == 0);
     let before = h.settings_writes().len();
     assert!(h.world.set_present(0, true));
@@ -894,4 +1218,549 @@ fn a_dropped_layer_saves_the_final_order_once_and_a_stale_move_does_nothing() {
     assert_eq!(layers(&h.app), Some(vec![2, 3, 1]));
     assert!(h.app.write_error().is_none());
     h.close();
+}
+
+#[test]
+fn adapter_write_completion_survives_either_order_with_session_loss() {
+    use cordial::controller::{Event, Phase};
+
+    for (acknowledged, newer) in [(true, false), (false, false), (true, true), (false, true)] {
+        for lost_first in [true, false] {
+            let mut h = Harness::new();
+            h.app.show(Page::Adapter(h.adapter.clone()));
+            let adapter = h.world.adapters()[0].clone();
+            if !acknowledged {
+                adapter
+                    .0
+                    .lock()
+                    .unwrap()
+                    .slow
+                    .insert("set_adapter", Duration::from_secs(3));
+            }
+            h.app.act(Action::InterfaceEnabled(
+                p::ConfigurationInterface::Via,
+                true,
+            ));
+            h.app.apply_pending();
+            if newer {
+                h.app.act(Action::InterfaceEnabled(
+                    p::ConfigurationInterface::Via,
+                    false,
+                ));
+            }
+            if !acknowledged {
+                h.until(|_| adapter.sent().contains(&"set_adapter"));
+                adapter.end_session(p::SessionEndingReason::ConfigurationChange as i32);
+            }
+            let (mut done, mut lost) = (None, None);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while done.is_none() || lost.is_none() {
+                let message =
+                    h.rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .unwrap();
+                match &message {
+                    Msg::Fleet(_, e)
+                        if matches!(
+                            &**e,
+                            Event::Done {
+                                result: Ok(cordial::controller::Outcome::AdapterSaved(_)),
+                                ..
+                            }
+                        ) =>
+                    {
+                        done = Some(message)
+                    }
+                    Msg::Fleet(_, e)
+                        if !acknowledged
+                            && matches!(&**e, Event::Done {
+                        result: Err(error), ..
+                    } if error.command == Some("adapter settings")) =>
+                    {
+                        done = Some(message)
+                    }
+                    Msg::Fleet(_, e)
+                        if matches!(
+                            &**e,
+                            Event::Connection {
+                                phase: Phase::Lost(_),
+                                ..
+                            }
+                        ) =>
+                    {
+                        lost = Some(message)
+                    }
+                    _ => h.app.update(message),
+                }
+            }
+            let (first, second) = if lost_first {
+                (lost.unwrap(), done.unwrap())
+            } else {
+                (done.unwrap(), lost.unwrap())
+            };
+            h.app.update(first);
+            if lost_first {
+                assert!(
+                    h.app.writes_pending(),
+                    "the write must keep its completion job"
+                );
+                if !newer {
+                    assert!(
+                        h.app.write_error().is_none(),
+                        "loss cannot replace a pending acknowledgement"
+                    );
+                }
+            }
+            h.app.update(second);
+            assert!(!h.app.writes_pending());
+            if acknowledged && !newer {
+                assert!(h.app.write_error().is_none());
+                assert!(h.app.note(&Spot::AdapterSave(h.adapter.clone())).is_none());
+            } else if acknowledged {
+                assert_eq!(
+                    h.app.write_error(),
+                    Some("This adapter is no longer available.")
+                );
+            } else {
+                assert!(
+                    h.app
+                        .write_error()
+                        .unwrap()
+                        .contains("couldn't confirm whether the change was saved")
+                );
+            }
+            h.app.apply_pending();
+            assert!(
+                !h.app.writes_pending(),
+                "a late result must not replay the newer value"
+            );
+            assert_eq!(h.adapter_writes().len(), 1);
+            h.close();
+        }
+    }
+}
+
+impl Harness {
+    fn blocked_device(&mut self) -> p::Device {
+        let mut device = self.app.device(&self.adapter, 1).unwrap().d.clone();
+        device.blocked = true;
+        device.state = p::DeviceState::Disconnected as i32;
+        device.inactive = Some(p::InactiveReason::Blocked as i32);
+        self.world.adapters()[0].event(p::event::Kind::Device(device.clone()));
+        let message = self.receive(|event| {
+            matches!(event,
+            cordial::controller::Event::Notice {
+                notice: cordial::controller::Notice::Event { event, .. }, ..
+            } if matches!(&event.kind, Some(p::event::Kind::Device(d)) if d.blocked))
+        });
+        self.app.update(message);
+        device
+    }
+
+    fn receive(&mut self, wanted: impl Fn(&cordial::controller::Event) -> bool) -> Msg {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let msg = self
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            if matches!(&msg, Msg::Fleet(_, event) if wanted(event)) {
+                return msg;
+            }
+            self.app.update(msg);
+        }
+    }
+}
+
+#[test]
+fn radio_recovery_requires_a_device_record_after_the_save_response() {
+    use cordial::controller::{Event, Notice};
+
+    for readback_before_response in [true, false] {
+        for readback_before_done in [true, false] {
+            if readback_before_response && !readback_before_done {
+                continue;
+            }
+            let mut h = Harness::new();
+            let adapter = h.world.adapters()[0].clone();
+            let mut device = h.blocked_device();
+            device.blocked = false;
+            device.state = p::DeviceState::Connected as i32;
+            device.inactive = None;
+            device.errors.clear();
+            device.name = "Connection Readback".into();
+            let mut sim = adapter.0.lock().unwrap();
+            sim.refuse.insert(
+                "set_device",
+                p::Error {
+                    code: p::ErrorCode::StorageFailed as i32,
+                    reason: p::ErrorReason::Radio as i32,
+                    outcome: p::ErrorOutcome::Complete as i32,
+                    ..Default::default()
+                },
+            );
+            h.app.act(Action::Tab(Tab::Details));
+            h.app.act(Action::DeviceToggle(Toggle::Blocked, false));
+            h.app.apply_pending();
+            let readback = |event: &Event| {
+                matches!(event, Event::Notice {
+                notice: Notice::Event { event, .. }, ..
+            } if matches!(&event.kind, Some(p::event::Kind::Device(d)) if d.name == "Connection Readback"))
+            };
+            if readback_before_response {
+                sim.event(p::event::Kind::Device(device.clone()));
+                let msg = h.receive(readback);
+                h.app.update(msg);
+            }
+            drop(sim);
+            let done = h.receive(|event| {
+                matches!(event, Event::Done { result, .. }
+                if completed_result(result))
+            });
+            if !readback_before_response && readback_before_done {
+                adapter.event(p::event::Kind::Device(device.clone()));
+                let msg = h.receive(readback);
+                h.app.update(msg);
+            }
+            h.app.update(done);
+            let spot = Spot::DetailsSave(h.adapter.clone(), 1);
+            assert_eq!(
+                h.app.note(&spot).is_none(),
+                !cfg!(debug_assertions) || !readback_before_response && readback_before_done
+            );
+            assert!(h.app.write_error().is_none());
+            assert!(!h.app.writes_pending());
+            if readback_before_response || !readback_before_done {
+                adapter.event(p::event::Kind::Device(device));
+                let msg = h.receive(readback);
+                h.app.update(msg);
+                assert!(h.app.note(&spot).is_none());
+            }
+            h.app.apply_pending();
+            assert_eq!(
+                adapter
+                    .sent()
+                    .iter()
+                    .filter(|&&c| c == "set_device")
+                    .count(),
+                1
+            );
+            h.close();
+        }
+    }
+}
+
+#[test]
+fn completed_device_save_never_hides_a_newer_edit_rejected_by_session_loss() {
+    use cordial::controller::{Event, Phase};
+
+    for (toggle, newer, same_field) in [
+        (Toggle::Trusted, Toggle::Trusted, true),
+        (Toggle::Blocked, Toggle::Blocked, true),
+        (Toggle::Blocked, Toggle::Trusted, false),
+    ] {
+        for lost_first in [true, false] {
+            let mut h = Harness::new();
+            let adapter = h.world.adapters()[0].clone();
+            if matches!(toggle, Toggle::Blocked) {
+                h.blocked_device();
+            }
+            adapter.0.lock().unwrap().refuse.insert(
+                "set_device",
+                p::Error {
+                    code: p::ErrorCode::StorageFailed as i32,
+                    reason: p::ErrorReason::Radio as i32,
+                    outcome: p::ErrorOutcome::Complete as i32,
+                    ..Default::default()
+                },
+            );
+            h.app.act(Action::Tab(Tab::Details));
+            h.app.act(Action::DeviceToggle(toggle, false));
+            h.app.apply_pending();
+            h.app.act(Action::DeviceToggle(newer, same_field));
+            let done = h.receive(|event| {
+                matches!(event, Event::Done { result, .. }
+                if completed_result(result))
+            });
+            adapter.end_session(p::SessionEndingReason::ConfigurationChange as i32);
+            let lost = h.receive(|event| {
+                matches!(
+                    event,
+                    Event::Connection {
+                        phase: Phase::Lost(_),
+                        ..
+                    }
+                )
+            });
+            let (first, second) = if lost_first {
+                (lost, done)
+            } else {
+                (done, lost)
+            };
+            h.app.update(first);
+            h.app.update(second);
+            let spot = Spot::DetailsSave(h.adapter.clone(), 1);
+            let failure = h.app.write_error().unwrap().to_owned();
+            assert_eq!(failure, "This adapter is no longer available.");
+            assert_eq!(h.app.note(&spot), Some(failure.as_str()));
+            assert!(!h.app.writes_pending());
+            h.app.apply_pending();
+            assert_eq!(
+                adapter
+                    .sent()
+                    .iter()
+                    .filter(|&&c| c == "set_device")
+                    .count(),
+                1
+            );
+            h.app.show(Page::Adapter(h.adapter.clone()));
+            assert_eq!(h.app.write_error(), Some(failure.as_str()));
+            assert_eq!(h.app.note(&spot), Some(failure.as_str()));
+            h.app.acknowledge_write_error();
+            assert_eq!(
+                h.app.note(&spot).is_none(),
+                !cfg!(debug_assertions) || same_field
+            );
+            h.close();
+        }
+    }
+}
+
+#[test]
+fn late_completed_save_uses_replacement_session_recovery() {
+    use cordial::controller::Event;
+
+    for recovered in [true, false] {
+        let mut h = Harness::new();
+        let adapter = h.world.adapters()[0].clone();
+        h.blocked_device();
+        adapter.0.lock().unwrap().refuse.insert(
+            "set_device",
+            p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                reason: p::ErrorReason::Radio as i32,
+                outcome: p::ErrorOutcome::Complete as i32,
+                ..Default::default()
+            },
+        );
+        h.app.act(Action::Tab(Tab::Details));
+        h.app.act(Action::DeviceToggle(Toggle::Blocked, false));
+        h.app.apply_pending();
+        let done = h.receive(
+            |event| matches!(event, Event::Done { result, .. } if completed_result(result)),
+        );
+        {
+            let mut sim = adapter.0.lock().unwrap();
+            let device = &mut sim.devices[0];
+            device.blocked = !recovered;
+            device.state = p::DeviceState::Connected as i32;
+            device.inactive = None;
+            device.errors.clear();
+        }
+        assert!(h.world.set_present(0, false));
+        h.app.update(Msg::Ports(Ok(h.world.ports())));
+        h.until(|_| adapter.handles() == 0);
+        assert!(h.world.set_present(0, true));
+        h.app.act(Action::RefreshAdapters);
+        h.until(|a| a.devices().iter().any(|d| d.d.id == 1 && d.available));
+        h.app.update(done);
+        let spot = Spot::DetailsSave(h.adapter.clone(), 1);
+        assert_eq!(
+            h.app.note(&spot).is_none(),
+            !cfg!(debug_assertions) || recovered
+        );
+        assert!(h.app.write_error().is_none());
+        assert!(!h.app.writes_pending());
+        assert_eq!(
+            adapter
+                .sent()
+                .iter()
+                .filter(|&&c| c == "set_device")
+                .count(),
+            1
+        );
+        h.close();
+    }
+}
+
+#[test]
+fn completed_radio_feedback_for_other_preferences_clears_only_on_navigation() {
+    use cordial::controller::{Event, Notice};
+
+    for (device, tab, action) in [
+        (
+            1,
+            Tab::Details,
+            Action::DeviceToggle(Toggle::Trusted, false),
+        ),
+        (1, Tab::Details, Action::DeviceToggle(Toggle::Hidpp, false)),
+        (4, Tab::Settings, Action::GamepadOutput(p::OutputMode::Hid)),
+        (1, Tab::Profiles, Action::LayerRemove(0)),
+    ] {
+        let mut h = Harness::new();
+        let adapter = h.world.adapters()[0].clone();
+        adapter.0.lock().unwrap().refuse.insert(
+            "set_device",
+            p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                reason: p::ErrorReason::Radio as i32,
+                outcome: p::ErrorOutcome::Complete as i32,
+                ..Default::default()
+            },
+        );
+        h.app.show(Page::Device(h.adapter.clone(), device));
+        h.app.act(Action::Tab(tab));
+        h.app.act(action);
+        h.app.apply_pending();
+        h.until(|a| !a.writes_pending());
+        let spot = match tab {
+            Tab::Details => Spot::DetailsSave(h.adapter.clone(), device),
+            Tab::Settings => Spot::SettingsNote(h.adapter.clone(), device),
+            _ => Spot::LayersSave(h.adapter.clone(), device),
+        };
+        let note = h.app.note(&spot).map(str::to_owned);
+        assert_eq!(note.is_some(), cfg!(debug_assertions));
+        let mut reported = h.app.device(&h.adapter, device).unwrap().d.clone();
+        reported.state = p::DeviceState::Connected as i32;
+        reported.inactive = None;
+        reported.errors.clear();
+        reported.name = "Unrelated Device Update".into();
+        adapter.event(p::event::Kind::Device(reported));
+        let msg = h.receive(|event| matches!(event, Event::Notice {
+            notice: Notice::Event { event, .. }, ..
+        } if matches!(&event.kind, Some(p::event::Kind::Device(d)) if d.name == "Unrelated Device Update")));
+        h.app.update(msg);
+        assert_eq!(h.app.note(&spot), note.as_deref());
+        assert!(h.app.write_error().is_none());
+        h.app.show(Page::Adapter(h.adapter.clone()));
+        assert!(h.app.note(&spot).is_none());
+        h.app.apply_pending();
+        assert_eq!(
+            adapter
+                .sent()
+                .iter()
+                .filter(|&&c| c == "set_device")
+                .count(),
+            1
+        );
+        h.close();
+    }
+}
+
+#[test]
+fn newer_completed_save_note_precedes_an_unrecovered_radio_warning() {
+    use cordial::controller::Event;
+
+    let mut h = Harness::new();
+    let adapter = h.world.adapters()[0].clone();
+    h.blocked_device();
+    adapter.0.lock().unwrap().refuse.insert(
+        "set_device",
+        p::Error {
+            code: p::ErrorCode::StorageFailed as i32,
+            reason: p::ErrorReason::Radio as i32,
+            outcome: p::ErrorOutcome::Complete as i32,
+            ..Default::default()
+        },
+    );
+    h.app.act(Action::Tab(Tab::Details));
+    h.app.act(Action::DeviceToggle(Toggle::Blocked, false));
+    h.app.apply_pending();
+    h.until(|a| !a.writes_pending());
+    let spot = Spot::DetailsSave(h.adapter.clone(), 1);
+    let radio = h.app.note(&spot).map(str::to_owned);
+    assert_eq!(radio.is_some(), cfg!(debug_assertions));
+    adapter
+        .0
+        .lock()
+        .unwrap()
+        .refuse
+        .get_mut("set_device")
+        .unwrap()
+        .reason = p::ErrorReason::Storage as i32;
+    h.app.act(Action::DeviceToggle(Toggle::Trusted, false));
+    h.app.apply_pending();
+    let done =
+        h.receive(|event| matches!(event, Event::Done { result, .. } if completed_result(result)));
+    let Msg::Fleet(_, event) = &done else {
+        panic!("expected completion")
+    };
+    let Event::Done { result, .. } = &**event else {
+        panic!("expected completion")
+    };
+    let expected = if cfg!(debug_assertions) {
+        Some(cordial::ui::app::words::failure(
+            result.as_ref().unwrap_err(),
+        ))
+    } else {
+        assert!(result.is_ok());
+        None
+    };
+    h.app.update(done);
+    assert_eq!(h.app.note(&spot), expected.as_deref());
+    if cfg!(debug_assertions) {
+        assert_ne!(expected, radio);
+    }
+    assert!(h.app.write_error().is_none());
+    h.app.show(Page::Adapter(h.adapter.clone()));
+    h.app.show(Page::Device(h.adapter.clone(), 1));
+    h.app.act(Action::Tab(Tab::Details));
+    assert_eq!(h.app.note(&spot), radio.as_deref());
+    h.close();
+}
+
+#[test]
+fn completed_connection_feedback_with_other_failures_is_ephemeral() {
+    use cordial::controller::{Event, Notice};
+
+    for (reason, related) in [
+        (p::ErrorReason::Storage, false),
+        (p::ErrorReason::Radio, true),
+    ] {
+        let mut h = Harness::new();
+        let adapter = h.world.adapters()[0].clone();
+        let mut device = h.blocked_device();
+        adapter.0.lock().unwrap().refuse.insert(
+            "set_device",
+            p::Error {
+                code: p::ErrorCode::StorageFailed as i32,
+                reason: reason as i32,
+                outcome: p::ErrorOutcome::Complete as i32,
+                related: if related {
+                    vec![p::Error::default()]
+                } else {
+                    Vec::new()
+                },
+            },
+        );
+        h.app.act(Action::Tab(Tab::Details));
+        h.app.act(Action::DeviceToggle(Toggle::Blocked, false));
+        h.app.apply_pending();
+        h.until(|a| !a.writes_pending());
+        let spot = Spot::DetailsSave(h.adapter.clone(), 1);
+        let note = h.app.note(&spot).map(str::to_owned);
+        assert_eq!(note.is_some(), cfg!(debug_assertions));
+        device.blocked = false;
+        device.state = p::DeviceState::Connected as i32;
+        device.inactive = None;
+        device.errors.clear();
+        device.name = "Healthy Device Update".into();
+        adapter.event(p::event::Kind::Device(device));
+        let msg = h.receive(|event| matches!(event, Event::Notice {
+            notice: Notice::Event { event, .. }, ..
+        } if matches!(&event.kind, Some(p::event::Kind::Device(d)) if d.name == "Healthy Device Update")));
+        h.app.update(msg);
+        assert_eq!(h.app.note(&spot), note.as_deref());
+        assert!(h.app.write_error().is_none());
+        h.app.show(Page::Adapter(h.adapter.clone()));
+        assert!(h.app.note(&spot).is_none());
+        h.close();
+    }
+}
+
+fn completed_result(result: &Result<cordial::controller::Outcome, cordial::error::Error>) -> bool {
+    if cfg!(debug_assertions) {
+        result.as_ref().is_err_and(|error| error.complete())
+    } else {
+        matches!(result, Ok(cordial::controller::Outcome::Device { .. }))
+    }
 }

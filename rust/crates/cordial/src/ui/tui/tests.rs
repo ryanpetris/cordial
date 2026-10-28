@@ -1395,6 +1395,36 @@ fn the_picker_follows_events_after_its_listing_and_keeps_its_own_page() {
 }
 
 #[test]
+fn a_failed_picker_listing_is_retried_keeping_the_choice() {
+    let mut app = App::two(110, 40);
+    app.click("Pico 2 W");
+    app.click("Profiles");
+    app.list_profiles(false, profile_list(3));
+    app.m
+        .action(Action::InterfacePick(ConfigurationInterface::Via));
+    app.finish_profiles(true, Err(Error::new("the adapter is busy")));
+    app.m.action(Action::Pick(2));
+    app.fleet.0.borrow_mut().calls.clear();
+    app.click("[Retry]");
+    assert!(app.ran("Profiles"));
+    assert!(!app.shows("[Retry]"), "{}", app.screen());
+    app.list_profiles(true, profile_list(3));
+    assert!(app.shows("(•) P02"), "{}", app.screen());
+    assert!(!app.shows("[Retry]"));
+    // It waits while a profile change runs.
+    app.key(KeyCode::Esc);
+    app.click("[+ New Profile]");
+    app.type_text("New");
+    app.key(KeyCode::Enter);
+    assert!(app.m.profiles_busy("00000000000FA001"));
+    app.m
+        .action(Action::InterfacePick(ConfigurationInterface::Via));
+    app.finish_profiles(true, Err(Error::new("the adapter is busy")));
+    assert!(app.shows("[Retry]"), "{}", app.screen());
+    assert!(app.find("[Retry]").is_none());
+}
+
+#[test]
 fn add_device_scans_pairs_and_stops_on_close() {
     let mut app = App::two(110, 32);
     app.ctrl('n');
@@ -1415,6 +1445,30 @@ fn add_device_scans_pairs_and_stops_on_close() {
     app.key(KeyCode::Esc);
     assert!(app.ran("CancelPairing"));
     assert_eq!(app.m.dialog, None);
+}
+
+#[test]
+fn add_device_searches_again_after_a_failure_or_cancelled_pairing() {
+    let mut app = App::two(110, 32);
+    app.ctrl('n');
+    app.finish(Err(Error::new("the adapter is busy")));
+    assert!(app.find("[Search Again]").is_some(), "{}", app.screen());
+    assert!(!app.shows("Retry") && !app.shows("Refresh"));
+    app.fleet.0.borrow_mut().calls.clear();
+    app.click("[Search Again]");
+    assert!(app.ran("Scan {"));
+    for phase in [app::add::Phase::Failed, app::add::Phase::Cancelled] {
+        let mut st = first_adapter();
+        st.candidates = vec![fixture::candidate(9, "Example Pebble")];
+        let mut app = App::new(110, 32);
+        app.attach(vec![("/dev/ttyACM0", st)]);
+        app.m.action(Action::AddDevice);
+        app.m.action(Action::Pair(9));
+        app.m.add.as_mut().unwrap().pairing.as_mut().unwrap().phase = phase;
+        assert!(!app.shows("Retry") && !app.shows("Refresh"));
+        app.click("[Search Again]");
+        assert!(app.m.add.as_ref().unwrap().pairing.is_none(), "{phase:?}");
+    }
 }
 
 #[test]
@@ -1539,146 +1593,6 @@ fn a_connect_whose_port_went_away_fails_instead_of_hanging() {
 }
 
 #[test]
-fn invalid_file_entry_names_cannot_be_selected_navigated_or_downloaded() {
-    let names = [
-        "",
-        ".",
-        "..",
-        "../.profile",
-        "/export.txt",
-        "dir/file",
-        "./file",
-        "file/",
-        "file/.",
-        "dir//file",
-        "bad\0name",
-    ];
-    for directory in [false, true] {
-        let mut app = App::two(110, 40);
-        app.m.open_files("00000000000FA001");
-        let entries: Vec<_> = names
-            .iter()
-            .map(|name| p::FileEntry {
-                name: (*name).into(),
-                directory,
-                size: 4,
-            })
-            .collect();
-        app.finish(Ok(Outcome::Files {
-            path: "/".into(),
-            entries: entries.clone(),
-        }));
-        assert_eq!(app.m.files.entries, entries);
-        assert_eq!(app.m.files.rows().len(), names.len());
-        app.m.files_dest.set_value("exports/previous.txt");
-        app.fleet.0.borrow_mut().calls.clear();
-        for name in names {
-            app.m.files.selected = None;
-            app.m.action(Action::FilesEntry(name.into()));
-            assert!(app.m.files.selected.is_none(), "{name:?}");
-            assert_eq!(app.m.files.path, "/", "{name:?}");
-            assert_eq!(app.m.files.dest.value(), "exports/previous.txt");
-            assert!(app.m.files.entry(name).is_none(), "{name:?}");
-
-            app.m.files.selected = Some(name.into());
-            app.m.action(Action::FilesDownload);
-            app.m.download_to("chosen.txt".into(), true);
-            assert!(app.m.files.download.is_none(), "{name:?}");
-            assert!(app.calls().is_empty(), "{name:?}: {:?}", app.calls());
-        }
-    }
-}
-
-#[test]
-fn file_selection_keeps_the_save_directory_and_native_download_destination() {
-    let mut app = App::two(110, 40);
-    app.m.open_files("00000000000FA001");
-    app.finish(Ok(Outcome::Files {
-        path: "/".into(),
-        entries: vec![p::FileEntry {
-            name: "saved data".into(),
-            directory: true,
-            size: 0,
-        }],
-    }));
-    app.m.files_dest.set_value("exports/");
-    app.m.action(Action::FilesEntry("saved data".into()));
-    assert_eq!(app.m.files.path, "/saved data");
-    assert!(app.ran(r#"Files("/saved data")"#));
-    let names = [".hidden", "notes with spaces.txt", "r\u{e9}sum\u{e9}.txt"];
-    app.finish(Ok(Outcome::Files {
-        path: "/saved data".into(),
-        entries: names
-            .iter()
-            .map(|name| p::FileEntry {
-                name: (*name).into(),
-                directory: false,
-                size: 4,
-            })
-            .collect(),
-    }));
-    for name in names {
-        app.m.action(Action::FilesEntry(name.into()));
-        assert_eq!(app.m.files.selected.as_deref(), Some(name));
-        assert_eq!(app.m.files.dest.value(), format!("exports/{name}"));
-    }
-    app.m
-        .action(Action::FilesEntry("notes with spaces.txt".into()));
-    app.m.download_to("chosen/other.txt".into(), true);
-    assert!(app.ran(
-        r#"FileGet { path: "/saved data/notes with spaces.txt", local: "chosen/other.txt", overwrite: true, raw: false }"#
-    ));
-    app.finish(Ok(Outcome::FileSaved {
-        path: "/saved data/notes with spaces.txt".into(),
-        local: "chosen/other.txt".into(),
-        bytes: 4,
-        json: false,
-        unconverted: None,
-    }));
-    app.m.action(Action::FilesUp);
-    assert_eq!(app.m.files.path, "/");
-    assert!(app.m.files.selected.is_none());
-    assert_eq!(app.m.files.dest.value(), "exports/notes with spaces.txt");
-}
-
-#[test]
-fn file_downloads_save_records_as_json() {
-    let mut app = App::two(110, 40);
-    app.m.open_files("00000000000FA001");
-    app.finish(Ok(Outcome::Files {
-        path: "/".into(),
-        entries: vec![p::FileEntry {
-            name: "sequence.pb".into(),
-            directory: false,
-            size: 4,
-        }],
-    }));
-    app.click("sequence.pb");
-    assert_eq!(app.m.files.dest.value(), "sequence.json");
-    app.click("Download");
-    assert!(
-        app.ran(r#"FileGet { path: "/sequence.pb", local: "sequence.json", overwrite: false, raw: false }"#),
-        "{:?}",
-        app.calls()
-    );
-    // A file that doesn't decode is saved as it is, under its own name.
-    app.finish(Ok(Outcome::FileSaved {
-        path: "/sequence.pb".into(),
-        local: "sequence.pb".into(),
-        bytes: 4,
-        json: false,
-        unconverted: Some(crate::records::Unconverted::Undecodable),
-    }));
-    let screen = app.screen();
-    assert!(
-        screen.contains("Saved without converting to JSON: the file doesn't decode as its record."),
-        "{screen}"
-    );
-    let to = screen.lines().find(|l| l.contains(" To ")).unwrap();
-    assert!(to.contains("sequence.pb") && !to.contains("json"), "{to}");
-}
-
-#[test]
 fn usb_capacity_errors_show_independently() {
     let mut st = first_adapter();
     st.status.resources = vec![p::ResourceCapacity {
@@ -1773,7 +1687,11 @@ fn a_settings_save_failure_says_couldnt_save_only_with_no_effect() {
         };
         app.finish(Err(Error::dongle(error, Some("setting set"))));
         let screen = app.screen();
-        assert_eq!(screen.contains("Couldn't Save"), refused, "{screen}");
+        assert_eq!(
+            screen.contains("The adapter couldn't save"),
+            refused,
+            "{screen}"
+        );
         assert!(
             screen.contains("This device didn't respond in time"),
             "{screen}"
@@ -1809,7 +1727,7 @@ fn a_settings_save_failure_after_sending_is_unconfirmed() {
         app.finish(Err(error));
         let screen = app.screen();
         assert_eq!(
-            screen.contains("Couldn't Save"),
+            screen.contains("The adapter couldn't save"),
             refused,
             "{message}: {screen}"
         );
@@ -1845,7 +1763,7 @@ fn a_device_record_the_adapter_couldnt_read_is_only_last_known() {
     let screen = app.screen();
     assert!(screen.contains("Device 9  Couldn't Read"), "{screen}");
     assert!(
-        screen.contains("The adapter couldn't read or write its saved data."),
+        screen.contains("The adapter couldn't confirm whether the change was saved."),
         "{screen}"
     );
     app.click("Retry");
@@ -2714,10 +2632,12 @@ fn add_device_done_reveals_its_sidebar_selection() {
     app.m.action(Action::Pair(9));
     let pairing = app.m.add.as_mut().unwrap().pairing.as_mut().unwrap();
     pairing.device = Some(41);
-    pairing.phase = app::add::Phase::Connected;
+    pairing.phase = app::add::Phase::Paired;
     app.render();
+    assert!(app.shows("✓ Zebra Keyboard is paired."), "{}", app.screen());
+    assert!(app.find("[Add Another]").is_some() && app.find("[Dismiss]").is_some());
     assert!(!app.m.reveal);
-    app.m.action(Action::Done);
+    app.click("[Dismiss]");
     app.render();
     assert_eq!(app.m.shown(), page);
     assert!(
@@ -2783,29 +2703,6 @@ fn an_ignored_setting_choice_keeps_its_menu_position() {
     assert!(app.m.hits.iter().any(|h| h.action == action));
     app.m.action(action);
     assert_eq!(app.m.menu.as_ref(), Some(&menu));
-}
-
-#[test]
-fn refreshing_files_resets_the_dialog_scroll_on_the_same_path() {
-    let mut app = App::two(110, 16);
-    app.m.open_files("00000000000FA001");
-    app.finish(Ok(Outcome::Files {
-        path: "/".into(),
-        entries: (0..30)
-            .map(|i| p::FileEntry {
-                name: format!("file{i:02}"),
-                directory: false,
-                size: 4,
-            })
-            .collect(),
-    }));
-    app.m.dialog_scroll = 10;
-    app.render();
-    assert_eq!(app.m.dialog_scroll, 10);
-    app.m.action(Action::FilesRefresh);
-    assert_eq!(app.m.files.path, "/");
-    assert_eq!(app.m.dialog_scroll, 0);
-    assert!(app.ran("Files(\"/\")"));
 }
 
 #[test]
@@ -2992,4 +2889,166 @@ fn the_original_deadline_expires_old_devices_but_keeps_a_live_faulted_adapter() 
     app.m.open(Page::Adapter(id.into()));
     app.m.tick();
     assert_eq!(app.m.shown(), Page::Adapter(id.into()));
+}
+
+#[test]
+fn deleting_a_profile_in_use_lists_its_changes_before_sending_them() {
+    let mut st = first_adapter();
+    st.profiles.insert(
+        1,
+        p::Profile {
+            id: 1,
+            name: "P01".into(),
+            roles: Vec::new(),
+        },
+    );
+    st.devices[1].profiles = Some(p::ProfileLayers {
+        profiles: vec![2, 1],
+    });
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Pico 2 W");
+    app.click("Profiles");
+    app.list_profiles(false, profile_list(2));
+    app.m.action(Action::ProfileDelete(1));
+    for text in [
+        "Deleting this profile makes these changes, in order:",
+        "• Remove it from Example Mouse",
+        "• Delete “P01”",
+    ] {
+        assert!(app.shows(text), "{text}\n{}", app.screen());
+    }
+    app.click("[Delete]");
+    assert!(app.ran("ProfileDeletePlanned"));
+}
+
+#[test]
+fn staged_changes_that_use_a_profile_keep_it_from_being_deleted() {
+    let id = "00000000000FA001";
+    let mut st = first_adapter();
+    for n in [1, 2] {
+        st.profiles.insert(
+            n,
+            p::Profile {
+                id: n,
+                name: format!("P{n:02}"),
+                roles: Vec::new(),
+            },
+        );
+    }
+    st.devices[1].profiles = Some(p::ProfileLayers {
+        profiles: vec![2, 1],
+    });
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Example Mouse");
+    app.click("Profiles");
+    app.m.action(Action::LayerDown(0));
+    app.click("Pico 2 W");
+    app.click("Profiles");
+    app.list_profiles(false, profile_list(2));
+    app.m.action(Action::ProfileDelete(1));
+    assert!(app.shows("Delete “P01”") && app.find("[Delete]").is_none());
+    app.m.action(Action::Cancel);
+    app.click("Example Mouse");
+    app.m.action(Action::LayersDiscard);
+    app.click("Pico 2 W");
+    assert!(app.m.deletion_ready(id, 1));
+    app.m
+        .action(Action::InterfaceProfile(ConfigurationInterface::Via, 1));
+    assert!(!app.m.deletion_ready(id, 1) && app.m.deletion_ready(id, 2));
+    app.m.action(Action::AdapterDiscard);
+    app.m.action(Action::ProfileDelete(1));
+    app.click("[Delete]");
+    assert!(app.ran("ProfileDeletePlanned"));
+}
+
+#[test]
+fn only_a_staged_interface_profile_keeps_a_profile_from_being_deleted() {
+    let id = "00000000000FA001";
+    let mut st = first_adapter();
+    st.profiles.insert(
+        1,
+        p::Profile {
+            id: 1,
+            name: "P01".into(),
+            roles: Vec::new(),
+        },
+    );
+    st.status.configuration_interfaces[0].profile = 1;
+    let mut app = App::new(110, 40);
+    app.attach(vec![("/dev/ttyACM0", st)]);
+    app.click("Pico 2 W");
+    app.click("Profiles");
+    // Turning VIA on keeps its saved profile unnamed, and saving it doesn't set the profile.
+    app.m
+        .action(Action::InterfaceEnabled(ConfigurationInterface::Via, true));
+    assert!(app.m.deletion_ready(id, 1));
+    app.m
+        .action(Action::InterfaceProfile(ConfigurationInterface::Vial, 1));
+    assert!(!app.m.deletion_ready(id, 1));
+    app.m
+        .action(Action::InterfaceProfile(ConfigurationInterface::Vial, 2));
+    assert!(app.m.deletion_ready(id, 1));
+}
+
+#[test]
+fn an_unknown_free_spin_threshold_shows_unknown_without_its_threshold() {
+    use crate::settings::tests::object;
+    for (value, switch, threshold) in [
+        (None, "[?] Unknown", false),
+        (Some(255), "[ ] Off", false),
+        (Some(10), "[✓] On", true),
+    ] {
+        let mut st = first_adapter();
+        st.settings.insert(
+            2,
+            vec![object(p::settings_object::Group::Wheel(p::WheelSettings {
+                free_spin_threshold: Some(ranged(value, 1, 255, 1)),
+                ..Default::default()
+            }))],
+        );
+        let mut app = App::new(110, 40);
+        app.attach(vec![("/dev/ttyACM0", st)]);
+        app.click("Example Mouse");
+        app.click("Settings");
+        let screen = app.screen();
+        let row = screen
+            .lines()
+            .find(|l| l.contains("Automatic Free Spin") && !l.contains("Threshold"))
+            .unwrap_or_else(|| panic!("{screen}"));
+        assert!(row.contains(switch), "{screen}");
+        assert_eq!(
+            screen.contains("Automatic Free Spin Threshold"),
+            threshold,
+            "{screen}"
+        );
+    }
+}
+
+#[test]
+fn new_profile_from_an_empty_picker_with_none_returns_to_it_when_cancelled() {
+    let mut app = App::two(110, 40);
+    app.click("Pico 2 W");
+    app.click("Profiles");
+    app.m
+        .action(Action::InterfacePick(ConfigurationInterface::Via));
+    app.list_profiles(true, profile_list(0));
+    assert!(app.shows("None"), "{}", app.screen());
+    app.click("[New Profile]");
+    assert_eq!(
+        app.m.dialog,
+        Some(Dialog::ProfileName("00000000000FA001".into(), None))
+    );
+    app.key(KeyCode::Esc);
+    assert_eq!(
+        app.m.dialog,
+        Some(Dialog::Pick {
+            adapter: "00000000000FA001".into(),
+            purpose: PickFor::Interface(ConfigurationInterface::Via),
+            chosen: 0,
+        })
+    );
+    app.key(KeyCode::Esc);
+    assert_eq!(app.m.dialog, None);
 }

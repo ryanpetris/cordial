@@ -69,12 +69,26 @@ impl<F: Fleet> App<F> {
                 }
                 return;
             }
+            Action::PickNewProfile => return self.pick_new_profile(),
+            Action::PickRetry => {
+                if let Some(Dialog::Pick { adapter, .. }) = self.dialog.clone()
+                    && self.picker_retryable(&adapter)
+                {
+                    self.read_page(&adapter, true, false);
+                }
+                return;
+            }
+            Action::ProfileDeleteConfirm(plan) => {
+                if let Some(Dialog::ProfileDelete(a, id)) = self.dialog.clone()
+                    && id == plan.profile
+                {
+                    self.delete_profile(&a, plan);
+                }
+                return;
+            }
             _ => {}
         }
         if self.dialog == Some(Dialog::AddDevice) && self.add_action(&action) {
-            return;
-        }
-        if self.files_action(&action) {
             return;
         }
         match self.shown() {
@@ -118,14 +132,19 @@ impl<F: Fleet> App<F> {
                 self.close_add();
                 return;
             }
-            Some(Dialog::Replace(a, _)) => {
-                self.dialog = Some(Dialog::Files(a));
-                return;
-            }
             _ => false,
         };
         if !busy {
-            self.dialog = None;
+            // New Profile opened from the picker returns to it. The picker offers New Profile
+            // only while it lists no profiles, so nothing else was chosen.
+            self.dialog = match (self.pick_after_new.take(), self.dialog.take()) {
+                (Some(purpose), Some(Dialog::ProfileName(adapter, None))) => Some(Dialog::Pick {
+                    adapter,
+                    purpose,
+                    chosen: 0,
+                }),
+                _ => None,
+            };
             self.notes.remove(&Spot::Dialog);
         }
     }
@@ -161,12 +180,10 @@ impl<F: Fleet> App<F> {
         };
         match dialog {
             Dialog::Forget(a, id) => self.forget_confirm(&a, id),
-            Dialog::ProfileDelete(a, id) => self.delete_profile(&a, id),
             Dialog::Bootloader(a) => {
                 self.dialog = None;
                 self.run(&a, Kind::Bootloader, Command::Bootloader);
             }
-            Dialog::Replace(a, target) => self.confirm_replace(&a, target),
             _ => {}
         }
     }

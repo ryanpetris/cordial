@@ -85,8 +85,26 @@ Saved enablement requests an editor interface; active exposure depends on
 interface cannot fit. USB reconnects only when the actual allocation changes. It computes that
 allocation before startup and saves, then exposes what fits. After a reconnect, clients read fresh
 status in a new serial session.
-Selecting a profile for an interface does not apply it to any device, and deleting a profile is
-refused while it is in a device's layers or selected by an interface.
+Selecting a profile for an interface does not apply it to any device. Cordial deletes a profile by
+first removing it from each affected device's layers, keeping the other layers in order, then
+turning off and clearing every configuration interface that selects it. The desktop app and TUI
+list these changes in order for confirmation; the CLI uses the dependencies present when its
+command starts. Deletion waits while unsaved layer or interface changes would use the profile. If
+the listed changes differ when confirmed, Cordial asks for confirmation again.
+If a dependency changes or an operation fails, deletion stops and completed changes remain.
+The adapter's `DeleteProfile` command refuses a profile that is still in use.
+
+For a profile that is in use, the desktop deletion dialog shows numbered steps and keeps the
+confirmed plan in place while it runs. Completed steps get checkmarks, the active step gets a
+spinner, and pending steps keep their numbers. If turning off an active interface reconnects the
+adapter, Cordial waits for the same adapter and reads its current device and interface settings
+before continuing. A newly assigned device or interface stops deletion. Failed and unconfirmed
+steps have distinct markers while the remaining plan is unchanged. New steps keep their numbers;
+the failure message remains visible. Retrying uses only the remaining current plan, and a changed
+remaining plan needs confirmation after it is displayed. A connection lost before the final
+deletion is confirmed leaves its outcome unknown.
+Cordial does not automatically repeat it. After success, the heading names the deleted profile and
+every step has a checkmark. The dialog stays open with only a full-width Close button until closed.
 
 ## External editors
 

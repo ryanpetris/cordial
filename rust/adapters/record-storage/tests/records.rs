@@ -1797,41 +1797,11 @@ fn interrupted_first_identity_initialization_resumes_safely() {
 }
 
 #[test]
-fn moved_filesystem_start_resets_bonds_within_the_current_owned_range() {
-    use cordial_core::identity::Identity;
-    use cordial_record_storage::flash_range;
-    block_on(async {
-        let flash = Flash::sized(4 * 1024 * 1024);
-        let mut fs =
-            Storage::open_or_recover(flash.clone(), 1024 * 1024..4 * 1024 * 1024, [1; 32], random)
-                .await
-                .unwrap();
-        Identity::initialize(&mut fs, [1; 6], || 7).await.unwrap();
-        fs.replace_file("/devices/1/device.pb", b"saved bond")
-            .unwrap();
-        drop(fs);
-        let firmware = flash.0.borrow()[..2 * 1024 * 1024].to_vec();
-        let mut fs = Storage::open_or_recover(
-            flash.clone(),
-            flash_range(4 * 1024 * 1024).unwrap(),
-            [1; 32],
-            random,
-        )
-        .await
-        .unwrap();
-        assert_eq!(Identity::load(&mut fs).await.unwrap(), None);
-        assert_eq!(fs.file_size("/devices/1/device.pb").unwrap(), None);
-        assert_eq!(fs.total_bytes().unwrap(), 2 * 1024 * 1024 - 4096);
-        assert_eq!(&flash.0.borrow()[..2 * 1024 * 1024], firmware);
-    });
-}
-
-#[test]
 fn pico_cold_boot_retains_geometry_records_and_current_reservation() {
     use cordial_core::identity::Identity;
     const MIB: u32 = 1024 * 1024;
     block_on(async {
-        for minimum in [2 * MIB, 4 * MIB] {
+        for (minimum, start) in [(2 * MIB, MIB), (4 * MIB, 2 * MIB)] {
             let flash = Flash::sized(16 * MIB as usize);
             let mut fs =
                 Storage::open_detected(flash.clone(), minimum, Some(8 * MIB), [1; 32], random)
@@ -1847,7 +1817,7 @@ fn pico_cold_boot_retains_geometry_records_and_current_reservation() {
                     Storage::open_detected(flash.clone(), minimum, measured, [1; 32], random)
                         .await
                         .unwrap();
-                assert_eq!(fs.total_bytes().unwrap(), 6 * MIB as usize - 4096);
+                assert_eq!(fs.total_bytes().unwrap(), (8 * MIB - start) as usize - 4096);
                 assert_eq!(
                     Identity::load(&mut fs).await.unwrap(),
                     Some(identity.clone())
@@ -1865,7 +1835,10 @@ fn pico_cold_boot_retains_geometry_records_and_current_reservation() {
                 Storage::open_detected(flash.clone(), minimum, Some(16 * MIB), [1; 32], random)
                     .await
                     .unwrap();
-            assert_eq!(fs.total_bytes().unwrap(), 14 * MIB as usize - 4096);
+            assert_eq!(
+                fs.total_bytes().unwrap(),
+                (16 * MIB - start) as usize - 4096
+            );
             assert_eq!(Identity::load(&mut fs).await.unwrap(), Some(identity));
         }
     });
@@ -1888,6 +1861,24 @@ fn pico_fresh_format_uses_only_the_minimum_region_without_detection() {
                     .iter()
                     .all(|b| *b == 0x42)
             );
+            fs.replace_file("/saved.bin", &[42; 9000]).unwrap();
+            drop(fs);
+            let firmware = flash.0.borrow()[..start as usize].to_vec();
+            let mut fs =
+                Storage::open_detected(flash.clone(), minimum, Some(16 * MIB), [1; 32], random)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                fs.total_bytes().unwrap(),
+                (16 * MIB - start) as usize - 4096
+            );
+            let mut bytes = [0; 9000];
+            assert_eq!(
+                fs.read_file("/saved.bin", 0, &mut bytes).unwrap(),
+                bytes.len()
+            );
+            assert_eq!(bytes, [42; 9000]);
+            assert_eq!(flash.0.borrow()[..start as usize], firmware);
         }
     });
 }
@@ -1982,37 +1973,6 @@ fn pico_detected_undersized_chips_never_format_even_when_addresses_wrap() {
                 assert!(matches!(result, Err(Error::Bounds)));
                 assert_eq!(*flash.0.borrow(), before);
             }
-        }
-    });
-}
-
-#[test]
-fn pico_current_two_mib_filesystem_wins_over_stale_one_mib_filesystem() {
-    const MIB: u32 = 1024 * 1024;
-    block_on(async {
-        let flash = Flash::sized(16 * MIB as usize);
-        let mut fs = Storage::open_or_recover(flash.clone(), MIB..2 * MIB, [1; 32], random)
-            .await
-            .unwrap();
-        fs.replace_file("/old.bin", &[1; 100]).unwrap();
-        drop(fs);
-        let old = flash.0.borrow()[MIB as usize..2 * MIB as usize].to_vec();
-        let mut fs = Storage::open_detected(flash.clone(), 2 * MIB, Some(8 * MIB), [1; 32], random)
-            .await
-            .unwrap();
-        assert_eq!(fs.file_size("/old.bin").unwrap(), None);
-        assert_eq!(flash.0.borrow()[MIB as usize..2 * MIB as usize], old);
-        fs.replace_file("/current.bin", &[2; 100]).unwrap();
-        drop(fs);
-        for measured in [None, Some(2 * MIB), Some(4 * MIB)] {
-            let before = flash.0.borrow().clone();
-            let mut fs = Storage::open_detected(flash.clone(), 2 * MIB, measured, [1; 32], random)
-                .await
-                .unwrap();
-            assert_eq!(fs.total_bytes().unwrap(), 6 * MIB as usize - 4096);
-            assert_eq!(fs.file_size("/current.bin").unwrap(), Some(100));
-            assert_eq!(fs.file_size("/old.bin").unwrap(), None);
-            assert_eq!(*flash.0.borrow(), before);
         }
     });
 }

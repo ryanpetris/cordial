@@ -201,6 +201,85 @@ pub fn in_use(st: &State, id: u32) -> Option<String> {
         })
 }
 
+/// A device whose layers list a profile being deleted, with its name and layers as seen.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Detach {
+    pub device: u32,
+    pub name: String,
+    pub layers: Vec<u32>,
+}
+
+/// A configuration interface that uses a profile being deleted, and whether it was on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Unassign {
+    pub interface: ConfigurationInterface,
+    pub enabled: bool,
+}
+
+/// The changes deleting a profile makes, in order: each device that lists it keeps its other
+/// layers in order, the configuration interfaces that use it are turned off and cleared, and then
+/// the profile is deleted. Each change is made only while its target is still as seen here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Deletion {
+    pub profile: u32,
+    pub devices: Vec<Detach>,
+    pub interfaces: Vec<Unassign>,
+}
+
+impl Deletion {
+    /// What deleting `profile` changes, from the view.
+    pub fn of(st: &State, profile: u32) -> Self {
+        let devices = st
+            .devices
+            .iter()
+            .filter(|d| layers(d).contains(&profile))
+            .map(|d| Detach {
+                device: d.id,
+                name: crate::ui::text::display_name(Some(&d.name)),
+                layers: layers(d).to_vec(),
+            })
+            .collect();
+        let interfaces = st
+            .status
+            .configuration_interfaces
+            .iter()
+            .filter(|s| s.profile == profile)
+            .filter_map(|s| {
+                Some(Unassign {
+                    interface: ConfigurationInterface::try_from(s.interface).ok()?,
+                    enabled: s.enabled,
+                })
+            })
+            .collect();
+        Self {
+            profile,
+            devices,
+            interfaces,
+        }
+    }
+
+    /// The layers a device keeps: its others, in order.
+    pub fn kept(&self, d: &Detach) -> Vec<u32> {
+        d.layers
+            .iter()
+            .copied()
+            .filter(|id| *id != self.profile)
+            .collect()
+    }
+
+    /// Turns off and clears every interface that uses the profile, in one adapter update.
+    pub fn interface_updates(&self) -> Vec<InterfaceUpdate> {
+        self.interfaces
+            .iter()
+            .map(|u| InterfaceUpdate {
+                interface: u.interface,
+                enabled: Some(false),
+                profile: Some(0),
+            })
+            .collect()
+    }
+}
+
 /// Profiles that devices and configuration interfaces use whose names aren't known yet.
 pub fn unnamed(st: &State) -> Vec<u32> {
     if !available(&st.status) {
@@ -878,6 +957,51 @@ mod tests {
         }
         assert_eq!(in_use(&st, 3), None);
         assert_eq!(unnamed(&st), [1, 2, 5]);
+    }
+
+    #[test]
+    fn a_deletion_lists_every_user_and_keeps_the_other_layers_in_order() {
+        let mut st = State::default();
+        st.status.profile_support = Some(support());
+        st.status.configuration_interfaces = vec![
+            interface_support(ConfigurationInterface::Via, true, 5, &[]),
+            interface_support(ConfigurationInterface::Vial, false, 2, &[]),
+        ];
+        let device = |id, name: &str, layers: Vec<u32>| p::Device {
+            id,
+            name: name.into(),
+            profiles: Some(p::ProfileLayers { profiles: layers }),
+            ..Default::default()
+        };
+        st.devices = vec![
+            device(1, "Mouse", vec![2, 5, 3]),
+            device(2, "Pad", vec![3]),
+            device(3, "", vec![5]),
+        ];
+        let plan = Deletion::of(&st, 5);
+        let names: Vec<&str> = plan.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Mouse", "(unnamed)"]);
+        assert_eq!(plan.kept(&plan.devices[0]), [2, 3]);
+        assert!(plan.kept(&plan.devices[1]).is_empty());
+        assert_eq!(
+            plan.interfaces,
+            [Unassign {
+                interface: ConfigurationInterface::Via,
+                enabled: true
+            }]
+        );
+        assert_eq!(
+            plan.interface_updates(),
+            [InterfaceUpdate {
+                interface: ConfigurationInterface::Via,
+                enabled: Some(false),
+                profile: Some(0),
+            }]
+        );
+        // The plan's interface changes are accepted as they stand.
+        assert!(interface_refusal(&st.status, &plan.interface_updates()).is_none());
+        let unused = Deletion::of(&st, 9);
+        assert!(unused.devices.is_empty() && unused.interfaces.is_empty());
     }
 
     #[test]

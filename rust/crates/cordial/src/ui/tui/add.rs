@@ -60,7 +60,9 @@ impl<F: Fleet> Model<F> {
         }
         let scan = add.scan.as_ref().filter(|s| s.adapter == adapter);
         let st = scan.and_then(|s| self.states.get(&s.slot));
-        let scanning = add.starting || st.is_some_and(|st| st.scanning.is_some());
+        let scanning = add.starting
+            || self.scan_waiting(&adapter)
+            || st.is_some_and(|st| st.scanning.is_some());
         // A scan that ended in a failure keeps the candidates it found.
         let ended = st
             .filter(|st| st.scanning.is_none())
@@ -73,23 +75,14 @@ impl<F: Fleet> Model<F> {
             .or(ended);
         if scanning {
             body.line(busy("Searching…"));
-        } else if let Some(e) = &error {
-            let retry = scan.is_some_and(|s| s.error.is_some()) || add.scan_failed;
-            let mut r = Layout::new(w);
-            button_if(
-                &mut r,
-                if retry { "Retry" } else { "Refresh" },
-                Action::ScanAgain,
-                Tone::Normal,
-                !add.starting,
-            );
-            body.hang(styled("! ", err()), e, err());
-            body.add(r);
         } else {
+            if let Some(e) = &error {
+                body.hang(styled("! ", err()), e, err());
+            }
             let mut r = Layout::new(w);
             button_if(
                 &mut r,
-                "Refresh",
+                "Search Again",
                 Action::ScanAgain,
                 Tone::Normal,
                 !add.starting,
@@ -191,9 +184,6 @@ impl<F: Fleet> Model<F> {
                             format!("  {}", words::spaced(&code)),
                             layout::title(),
                         ));
-                        if let Some(e) = &pairing.prompt_error {
-                            body.para(e, err());
-                        }
                         right.button("Codes Differ", Action::Reject, Tone::Normal);
                         right.button("Codes Match", Action::Accept, Tone::Primary);
                     }
@@ -207,35 +197,23 @@ impl<F: Fleet> Model<F> {
                         body.row();
                         let line = self.field_line(w.min(24));
                         body.control(line, Action::Field);
-                        if let Some(e) = &pairing.prompt_error {
-                            body.para(e, err());
-                        }
                         let valid = code_ok(kind, &self.form.value());
                         right.button("Reject", Action::Reject, Tone::Normal);
                         button_if(&mut right, "Pair", Action::Accept, Tone::Primary, valid);
                     }
                 }
+                if let Some(e) = &pairing.prompt_error {
+                    body.para(e, err());
+                }
                 right.button("Cancel Pairing", Action::CancelPairing, Tone::Normal);
             }
-            Phase::Connecting => body.line(busy(&format!("Paired. Connecting to {name}…"))),
-            Phase::Connected => {
-                body.line(Line::from(vec![
-                    span("✓ ", ok()),
-                    span(format!("{name} is paired and connected."), Style::new()),
-                ]));
-                right.button("Add Another", Action::AddAnother, Tone::Normal);
-                right.button("Done", Action::Done, Tone::Primary);
-            }
-            Phase::Saved => {
+            Phase::Paired => {
                 body.line(Line::from(vec![
                     span("✓ ", ok()),
                     span(format!("{name} is paired."), Style::new()),
                 ]));
-                if let Some(m) = &pairing.message {
-                    body.para(m, dim());
-                }
                 right.button("Add Another", Action::AddAnother, Tone::Normal);
-                right.button("Done", Action::Done, Tone::Primary);
+                right.button("Dismiss", Action::Done, Tone::Primary);
             }
             Phase::Failed => {
                 body.line(Line::from(vec![
@@ -245,14 +223,14 @@ impl<F: Fleet> Model<F> {
                 if let Some(m) = &pairing.message {
                     body.para(m, dim());
                 }
-                right.button("Retry", Action::ScanAgain, Tone::Normal);
+                right.button("Search Again", Action::ScanAgain, Tone::Normal);
                 right.button("Close", Action::Cancel, Tone::Primary);
             }
             Phase::Cancelled => {
                 if let Some(m) = &pairing.message {
                     body.para(m, dim());
                 }
-                right.button("Refresh", Action::ScanAgain, Tone::Normal);
+                right.button("Search Again", Action::ScanAgain, Tone::Normal);
                 right.button("Close", Action::Cancel, Tone::Primary);
             }
         }

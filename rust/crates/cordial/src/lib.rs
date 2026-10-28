@@ -5,6 +5,7 @@ pub mod controller;
 #[cfg(feature = "desktop")]
 pub mod desktop;
 pub mod error;
+pub mod json;
 pub mod migration;
 pub mod model;
 pub mod profiles;

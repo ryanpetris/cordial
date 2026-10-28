@@ -70,7 +70,7 @@ fn migrating(
             args: args.iter().map(|s| (*s).to_owned()).collect(),
         },
         cancellation,
-        engine,
+        engine: Some(engine),
     }
     .with_connector(input, &mut out, &mut diagnostics, dongle.connector());
     (
@@ -192,7 +192,8 @@ fn scripts_run_direct_commands_before_the_adapter_is_ready() {
 fn json_prints_responses_and_events_in_the_order_they_arrived() {
     for _ in 0..50 {
         let dongle = Dongle::default();
-        let (result, out, _) = script(&dongle, &["scan", "start", "ble", "5"], true, b"");
+        let (result, human, out) = script(&dongle, &["scan", "start", "ble", "5"], true, b"");
+        assert!(human.contains("Discovery finished"), "{human}");
         result.unwrap();
         let lines: Vec<Value> = out
             .lines()
@@ -232,6 +233,20 @@ fn flag_parser_rejects_nonfinite_and_preserves_quoted_os_arguments() {
 }
 
 #[test]
+fn tui_accepts_json_on_either_side_and_preserves_command_arguments() {
+    for args in [["--json", "tui"], ["tui", "--json"]] {
+        let options = Options::parse(args.map(str::to_owned)).unwrap();
+        assert!(options.json);
+        assert_eq!(options.args, ["tui"]);
+    }
+    assert!(Options::parse(["tui", "--json=1"].map(str::to_owned)).is_err());
+    let options =
+        Options::parse(["file", "get", "--raw", "/data.bin", "--json"].map(str::to_owned)).unwrap();
+    assert!(!options.json);
+    assert_eq!(options.args.last().unwrap(), "--json");
+}
+
+#[test]
 fn one_shot_status_skips_readiness_and_json_prints_protobuf_messages() {
     let dongle = Dongle::with(|sim| {
         let mut status = common::status(false);
@@ -254,13 +269,15 @@ fn one_shot_status_skips_readiness_and_json_prints_protobuf_messages() {
     assert!(!out.contains("Saved Devices"), "{out}");
     assert!(!dongle.sent().contains(&"list_devices"));
 
-    let (result, out, _) = script(&dongle, &["adapter", "status"], true, b"");
+    let (result, human, out) = script(&dongle, &["adapter", "status"], true, b"");
+    assert!(human.contains("Adapter ADAPTER01"), "{human}");
     result.unwrap();
     let lines: Vec<Value> = out
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(lines.len(), 1, "{out}");
+    assert_eq!(lines.len(), 2, "{out}");
+    assert_eq!(lines[0], lines[1]);
     assert_eq!(lines[0]["response"]["status"]["name"], "Desk");
     assert_eq!(lines[0]["response"]["status"]["id"], "ADAPTER01");
     let status = &lines[0]["response"]["status"];
@@ -339,7 +356,7 @@ fn a_failed_scan_keeps_its_candidates_and_reports_every_error() {
     result.unwrap();
     assert!(
         out.contains(
-            "Discovery finished: 1 candidate. Error: internal: the adapter hit an unexpected failure; involves the adapter's Bluetooth radio; it partly completed; also (no_capacity: the adapter had no room to list every device it found; it partly completed)"
+            "Discovery finished: 1 candidate. Error: internal: the adapter returned only some of the results; the adapter reported a Bluetooth error; also (no_capacity: the adapter couldn't list every device it found; the adapter had no room to list every device it found)"
         ),
         "{out}"
     );
@@ -373,7 +390,7 @@ fn a_failed_pairing_reports_an_unknown_bond_and_its_cleanup_failure() {
     );
     assert_eq!(
         result.unwrap_err().message,
-        "auth_failed: Bluetooth authentication with this device failed; outcome unknown: the adapter couldn't confirm what took effect; check the current state before trying again; also (storage_failed: the adapter couldn't read or write its saved data)"
+        "auth_failed: the adapter couldn't confirm whether it saved the device; check its saved devices before pairing again; Bluetooth authentication with this device failed; also (storage_failed: the adapter couldn't read or write its saved data)"
     );
     // Nothing is tried again.
     assert_eq!(
@@ -458,8 +475,11 @@ fn file_get_writes_the_file_and_never_replaces_one() {
     let (result, out, diagnostics) =
         script(&dongle, &["file", "get", "/a.bin", local_arg], true, b"");
     result.unwrap();
-    assert!(!out.contains("AQID") && !out.contains("\"file\""), "{out}");
-    assert!(diagnostics.contains("(3 bytes)"), "{diagnostics}");
+    assert!(
+        diagnostics.contains(r#"{"response":{"file":{"path":"/a.bin","size":"3","data":"AQID"}}}"#),
+        "{out}"
+    );
+    assert!(out.contains("(3 bytes)"), "{out}");
     assert_eq!(fs::read(&local).unwrap(), [1, 2, 3]);
     fs::remove_dir_all(&dir).unwrap();
 }
@@ -733,7 +753,7 @@ fn a_refusal_with_more_to_report_on_a_disabled_transport_keeps_its_details() {
     let (result, _, _) = script(&dongle, &["device", "connect", "Old Keyboard"], false, b"");
     assert_eq!(
         result.unwrap_err().message,
-        "unsupported: the adapter or device doesn't support this; it partly completed"
+        "unsupported: the operation only partly completed; the adapter or device doesn't support this"
     );
 }
 
@@ -838,19 +858,21 @@ profile show 2\n",
 }
 
 #[test]
-fn json_prints_a_listing_as_one_response() {
+fn json_includes_background_and_requested_listings_once() {
     let dongle = Dongle::with(|sim| {
         sim.devices
             .push(common::device(5, "Pad", p::Transport::Ble));
     });
-    let (result, out, _) = script(&dongle, &["device", "list"], true, b"");
+    let (result, human, out) = script(&dongle, &["device", "list"], true, b"");
+    assert!(human.contains("Pad"), "{human}");
     result.unwrap();
     let listings: Vec<Value> = out
         .lines()
         .map(|l| serde_json::from_str::<Value>(l).unwrap())
         .filter(|v| !v["response"]["devices"].is_null())
         .collect();
-    assert_eq!(listings.len(), 1, "{out}");
+    assert_eq!(listings.len(), 2, "{out}");
+    assert_eq!(listings[0], listings[1]);
     let entries = listings[0]["response"]["devices"]["entries"]
         .as_array()
         .unwrap();
@@ -858,53 +880,138 @@ fn json_prints_a_listing_as_one_response() {
 }
 
 #[test]
-fn deleting_a_profile_in_use_is_refused_before_sending() {
+fn deleting_a_profile_in_use_removes_it_from_its_users_first() {
     let dongle = Dongle::with(|sim| {
         with_profiles(sim);
         let work = sim.add_profile("Work", Vec::new());
         let games = sim.add_profile("Games", Vec::new());
-        sim.status.configuration_interfaces[1].profile = games;
+        sim.status.configuration_interfaces[1].profile = work;
+        sim.devices[0].profiles = Some(p::ProfileLayers {
+            profiles: vec![games, work],
+        });
+    });
+    let (result, out, _) = script(&dongle, &["profile", "delete", "Work"], false, b"");
+    result.unwrap();
+    assert!(out.contains("Deleted profile Work."), "{out}");
+    let sim = dongle.0.lock().unwrap();
+    assert_eq!(
+        sim.devices[0].profiles,
+        Some(p::ProfileLayers { profiles: vec![2] })
+    );
+    let vial = &sim.status.configuration_interfaces[1];
+    assert!(!vial.enabled && vial.profile == 0);
+    assert_eq!(sim.profiles.len(), 1);
+}
+
+#[test]
+fn a_profile_deletion_that_stops_part_way_says_it_is_incomplete() {
+    let dongle = Dongle::with(|sim| {
+        with_profiles(sim);
+        let work = sim.add_profile("Work", Vec::new());
+        sim.status.configuration_interfaces[0].profile = work;
         sim.devices[0].profiles = Some(p::ProfileLayers {
             profiles: vec![work],
         });
+        sim.refuse
+            .insert("set_adapter", refusal(ErrorCode::StorageFailed));
     });
     let (result, _, _) = script(&dongle, &["profile", "delete", "Work"], false, b"");
-    assert_eq!(
-        result.unwrap_err().message,
-        "Office Mouse is using this profile. Remove it from Office Mouse's profiles first"
+    let error = result.unwrap_err();
+    assert!(
+        error
+            .message
+            .starts_with("the profile deletion is incomplete: storage_failed: "),
+        "{error}"
     );
-    let (result, _, _) = script(&dongle, &["profile", "delete", "2"], false, b"");
-    assert_eq!(
-        result.unwrap_err().message,
-        "Vial is using this profile. Pick a different profile for Vial first"
+    // The device keeps the change that was made; nothing after the failure was sent.
+    assert!(
+        dongle.0.lock().unwrap().devices[0]
+            .profiles
+            .as_ref()
+            .unwrap()
+            .profiles
+            .is_empty()
     );
     assert!(!dongle.sent().contains(&"delete_profile"));
-    // An enabled interface can't lose its profile; a disabled one can.
-    let (result, _, _) = script(
-        &dongle,
-        &[],
-        false,
-        b"adapter set interface vial on\nadapter reset interface vial profile\n",
-    );
-    assert_eq!(
-        result.unwrap_err().message,
-        "choose a profile for Vial before turning it on"
-    );
-    let (result, out, _) = script(
-        &dongle,
-        &[],
-        false,
-        b"adapter set interface vial off\nadapter reset interface vial profile\n\
-device set 1 profiles none\nprofile delete Games\nprofile delete 1\n",
-    );
-    result.unwrap();
-    for line in [
-        "Vial off, profile none.",
-        "Profiles of Office Mouse set to none.",
-        "Deleted profile Games.",
-        "Deleted profile Work.",
+    // A deletion that changed nothing reports the adapter's refusal as it is.
+    let dongle = Dongle::with(|sim| {
+        with_profiles(sim);
+        sim.add_profile("Work", Vec::new());
+        sim.refuse
+            .insert("delete_profile", refusal(ErrorCode::InUse));
+    });
+    let (result, _, _) = script(&dongle, &["profile", "delete", "1"], false, b"");
+    let error = result.unwrap_err();
+    assert!(error.message.starts_with("in_use: "), "{error}");
+    assert!(!dongle.sent().contains(&"set_device"));
+}
+
+#[test]
+fn an_uncertain_profile_deletion_names_the_step_and_keeps_completed_changes() {
+    for (command, expected, completed) in [
+        (
+            "set_device",
+            "whether the device's profiles were updated",
+            false,
+        ),
+        (
+            "set_adapter",
+            "whether its configuration interfaces were updated",
+            true,
+        ),
+        ("delete_profile", "whether the profile was deleted", true),
     ] {
-        assert!(out.contains(line), "{line}\n{out}");
+        let dongle = Dongle::with(|sim| {
+            with_profiles(sim);
+            let work = sim.add_profile("Work", Vec::new());
+            sim.status.configuration_interfaces[0].profile = work;
+            sim.devices[0].profiles = Some(p::ProfileLayers {
+                profiles: vec![work],
+            });
+            sim.slow.insert(command, Duration::from_millis(500));
+        });
+        let unplugged = dongle.clone();
+        let unplug = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !unplugged.sent().contains(&command) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the deletion never reached {command}"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            unplugged.unplug();
+        });
+        let (result, _, _) = script(&dongle, &["profile", "delete", "Work"], false, b"");
+        unplug.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(error.message.contains(expected), "{error}");
+        assert_eq!(
+            error.message.contains("Earlier changes were saved."),
+            completed,
+            "{error}"
+        );
+        let deleted = command == "delete_profile";
+        assert_eq!(dongle.sent().contains(&"delete_profile"), deleted);
+        if !deleted {
+            assert!(
+                error.message.contains("Profile deletion did not proceed."),
+                "{error}"
+            );
+            assert!(!error.message.contains("was deleted"), "{error}");
+        }
+        let sim = dongle.0.lock().unwrap();
+        assert_eq!(sim.profiles.is_empty(), deleted);
+        if completed {
+            assert!(
+                sim.devices[0]
+                    .profiles
+                    .as_ref()
+                    .unwrap()
+                    .profiles
+                    .is_empty()
+            );
+        }
     }
 }
 
@@ -1087,6 +1194,147 @@ fn a_failed_migration_ends_the_script_without_reopening() {
     assert_eq!(dongle.sessions(), 1);
 }
 
+#[test]
+fn json_migration_prints_wire_records_without_handler_only_events() {
+    use cordial_client::Received;
+    use std::sync::Mutex;
+
+    let data: Vec<u8> = (0..1537).map(|n| n as u8).collect();
+    let dongle = Dongle::with(|sim| {
+        needs_migration(sim);
+        sim.files.insert(
+            "/".into(),
+            vec![p::FileEntry {
+                name: "format.pb".into(),
+                size: data.len() as u64,
+                directory: false,
+            }],
+        );
+        sim.data.insert("/format.pb".into(), data.clone());
+    });
+    let expected = Arc::new(Mutex::new(Vec::new()));
+    let observed = expected.clone();
+    let connect = dongle.connector();
+    let adapter = dongle.clone();
+    let mut out = Vec::new();
+    let mut diagnostics = Vec::new();
+    let result = Script {
+        options: Options {
+            port: Some("simulated".into()),
+            json: true,
+            args: vec!["migrate".into()],
+            ..Default::default()
+        },
+        cancellation: Cancellation::default(),
+        engine: None,
+    }
+    .with_backend(
+        io::empty(),
+        &mut out,
+        &mut diagnostics,
+        move |port, mut handler| {
+            let migration = adapter.sessions() > 0;
+            let observed = observed.clone();
+            connect(
+                port,
+                Box::new(move |received| {
+                    let kind = match &received {
+                        Received::Response(_, response) => {
+                            Some(p::message::Kind::Response((*response).clone()))
+                        }
+                        Received::Event(event) => Some(p::message::Kind::Event(event.clone())),
+                        Received::Closed(_) if migration => {
+                            let event = p::Event {
+                                kind: Some(p::event::Kind::ScanDone(Default::default())),
+                            };
+                            handler(Received::Event(event));
+                            None
+                        }
+                        Received::Closed(_) | Received::PairingComplete { .. } => None,
+                    };
+                    if let Some(kind) = kind {
+                        observed.lock().unwrap().push(kind);
+                    }
+                    handler(received);
+                }),
+            )
+        },
+        || {
+            Ok(vec![cordial_client::serial::PortInfo {
+                port: "simulated".into(),
+                serial: "ADAPTER01".into(),
+            }])
+        },
+    );
+    // Invalid storage contents stop the worker after downloading the complete file.
+    assert!(result.unwrap_err().message.contains("migrate"));
+    let human = String::from_utf8(out).unwrap();
+    assert!(!human.contains("{\"response\":"));
+    let out = String::from_utf8(diagnostics).unwrap();
+    let messages: Vec<p::message::Kind> = out
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .map(|line| {
+            serde_json::from_str::<p::Message>(line)
+                .unwrap()
+                .kind
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(messages, *expected.lock().unwrap(), "{out}");
+    assert!(matches!(&messages[0], p::message::Kind::Response(response)
+        if matches!(&response.result, Some(p::response::Result::Status(status)) if status.id == "ADAPTER01")));
+    assert!(matches!(&messages[2], p::message::Kind::Response(response)
+        if matches!(&response.result, Some(p::response::Result::Files(files)) if files.entries[0].name == "format.pb")));
+    let mut downloaded = Vec::new();
+    for message in &messages[3..] {
+        let p::message::Kind::Response(response) = message else {
+            panic!("expected response")
+        };
+        let Some(p::response::Result::File(file)) = &response.result else {
+            panic!("expected file data")
+        };
+        assert_eq!(file.offset, downloaded.len() as u64);
+        assert_eq!(file.size, data.len() as u64);
+        assert_eq!(file.path, "/format.pb");
+        downloaded.extend_from_slice(&file.data);
+    }
+    assert_eq!(downloaded, data);
+    assert_eq!(messages.len(), dongle.sent().len());
+    assert!(matches!(
+        messages.last(),
+        Some(p::message::Kind::Response(_))
+    ));
+    assert!(out.contains("Migrating the adapter's saved data"));
+    assert_eq!(dongle.handles(), 0);
+}
+
+#[test]
+fn json_migration_preserves_an_injected_engine() {
+    let dongle = Dongle::with(needs_migration);
+    let (engine, called) = engine(&dongle, Duration::ZERO, true);
+    let (result, out, diagnostics) = migrating(
+        &dongle,
+        &["migrate"],
+        true,
+        Duration::ZERO,
+        io::empty(),
+        Cancellation::default(),
+        engine,
+    );
+    assert!(called.load(Ordering::SeqCst));
+    assert!(
+        result
+            .unwrap_err()
+            .message
+            .contains("the adapter refused a write")
+    );
+    assert!(out.is_empty(), "{out}");
+    assert!(diagnostics.contains("Migrating the adapter's saved data"));
+    assert_eq!(dongle.sent(), ["get_status"]);
+    assert_eq!(dongle.handles(), 0);
+}
+
 /// Runs a script whose connector opens `connect(port, opens so far)`, with an engine that
 /// migrates each adapter the dongles name and records the IDs it migrated.
 fn adapters(
@@ -1120,7 +1368,7 @@ fn adapters(
             args: args.iter().map(|s| (*s).to_owned()).collect(),
         },
         cancellation: Cancellation::default(),
-        engine,
+        engine: Some(engine),
     }
     .with_connector(
         Cursor::new(input),
@@ -1396,4 +1644,166 @@ fn an_adapter_that_refuses_is_never_migrated() {
     }
     assert!(!called.load(Ordering::SeqCst));
     assert!(dongle.sent().is_empty());
+}
+
+#[test]
+fn scripts_delete_enabled_interface_profiles_and_keep_the_reconnected_session() {
+    use std::sync::{Mutex, atomic::AtomicUsize};
+
+    for (interface, explicit) in [(0, false), (0, true), (1, false), (1, true)] {
+        let dongle = Dongle::with(|sim| {
+            with_profiles(sim);
+            let profile = sim.add_profile("Delete Me", Vec::new());
+            sim.reconnect_interfaces = true;
+            let assigned = &mut sim.status.configuration_interfaces[interface];
+            assigned.enabled = true;
+            assigned.active = true;
+            assigned.profile = profile;
+        });
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let opened = calls.clone();
+        let adapter = dongle.clone();
+        let listed = Arc::new(AtomicUsize::new(0));
+        let discovery_calls = listed.clone();
+        let mut out = Vec::new();
+        let mut diagnostics = Vec::new();
+        let result = Script {
+            options: Options {
+                port: explicit.then(|| "selected-alias".into()),
+                json: true,
+                timeout: Duration::ZERO,
+                args: Vec::new(),
+            },
+            cancellation: Cancellation::default(),
+            engine: None,
+        }
+        .with_backend(
+            Cursor::new(b"profile delete 1\nprofile list\nadapter status\n"),
+            &mut out,
+            &mut diagnostics,
+            move |port, handler| {
+                opened.lock().unwrap().push(port.to_owned());
+                adapter.connect(handler)
+            },
+            move || {
+                let first = listed.fetch_add(1, Ordering::Relaxed) == 0;
+                Ok(vec![cordial_client::serial::PortInfo {
+                    port: if first { "first-port" } else { "returned-port" }.into(),
+                    serial: "ADAPTER01".into(),
+                }])
+            },
+        );
+        result.unwrap();
+        assert_eq!(
+            discovery_calls.load(Ordering::Relaxed),
+            if explicit { 0 } else { 2 }
+        );
+        let out = String::from_utf8(out).unwrap();
+        let diagnostics = String::from_utf8(diagnostics).unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            if explicit {
+                ["selected-alias", "selected-alias"]
+            } else {
+                ["first-port", "returned-port"]
+            }
+        );
+        assert!(out.contains("Deleted profile Delete Me."), "{out}");
+        assert!(out.contains("VIA: off, profile none"), "{out}");
+        assert!(out.contains("Vial: off, profile none"), "{out}");
+        assert!(diagnostics.contains("SESSION_ENDING_REASON_CONFIGURATION_CHANGE"));
+        assert_eq!(dongle.sessions(), 2);
+        assert!(dongle.0.lock().unwrap().profiles.is_empty());
+    }
+}
+
+#[test]
+fn completed_operations_have_build_specific_cli_results_and_stderr() {
+    const CHILD: &str = "CORDIAL_COMPLETE_OUTCOME_CHILD";
+    if let Ok(operation) = std::env::var(CHILD) {
+        let dongle = Dongle::with(|sim| {
+            let error = p::Error {
+                code: ErrorCode::StorageFailed as i32,
+                reason: p::ErrorReason::Radio as i32,
+                outcome: p::ErrorOutcome::Complete as i32,
+                related: vec![p::Error {
+                    code: ErrorCode::StorageFailed as i32,
+                    reason: p::ErrorReason::Storage as i32,
+                    outcome: p::ErrorOutcome::NoEffect as i32,
+                    related: Vec::new(),
+                }],
+            };
+            if operation == "pair" {
+                sim.plan = Plan::EnterCode("012345".into());
+                sim.pairing_error = Some(error);
+            } else {
+                sim.refuse.insert("set_device", error);
+            }
+        });
+        let args: &[&str] = if operation == "pair" {
+            &["pair", "start", "New Keyboard"]
+        } else {
+            &["device", "set", "1", "trusted", "off"]
+        };
+        let (result, out, diagnostics) = script(&dongle, args, false, b"999999\n");
+        assert!(cordial_client::diagnostics::flush());
+        print!("{out}");
+        eprint!("{diagnostics}");
+        assert_eq!(
+            dongle
+                .sent()
+                .iter()
+                .filter(|c| **c
+                    == if operation == "pair" {
+                        "start_pairing"
+                    } else {
+                        "set_device"
+                    })
+                .count(),
+            1
+        );
+        if let Err(error) = result {
+            eprintln!("{}", error.message);
+            std::process::exit(1);
+        }
+        return;
+    }
+    for operation in ["pair", "save"] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "completed_operations_have_build_specific_cli_results_and_stderr",
+                "--nocapture",
+            ])
+            .env(CHILD, operation)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if cfg!(debug_assertions) { 1 } else { 0 }),
+            "{stdout}\n{stderr}"
+        );
+        assert!(!stdout.contains("Completed adapter operation"));
+        assert!(!stderr.contains("012345"));
+        assert!(!stderr.contains("999999"));
+        if cfg!(debug_assertions) {
+            assert!(stderr.contains("storage_failed"), "{stderr}");
+        } else {
+            assert!(
+                stderr.contains("Completed adapter operation: Error"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("related: [Error"), "{stderr}");
+            assert!(!stdout.contains("Bluetooth error"));
+            if operation == "pair" {
+                assert!(
+                    stdout.contains("Paired and saved New Keyboard."),
+                    "{stdout}"
+                );
+                assert!(!stdout.contains("#0"));
+            }
+        }
+    }
 }

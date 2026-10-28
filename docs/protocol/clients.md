@@ -29,12 +29,49 @@ All three keep their view of the Dongle the same way:
 - Failed changes: only after an error, including a storage failure whose outcome is unknown, may a
   client query again to learn the current state, and only when it needs that state.
 
-Clients preserve full `Error` messages through decoding, library errors and state updates,
-including reason, outcome and related errors recursively. A familiar code does not justify
-discarding details or inferring an outcome. Missing details confirm neither an unchanged value
-nor success and never authorize retry. Related cleanup failures do not replace a primary failure
-or its outcome; a pairing error with `COMPLETE` confirms the bond save while still reporting the
-later failure. See [Errors](limits-and-errors.md#errors).
+The Rust client applies the host build's error policy before delivering responses or events to
+response observers, state updates or command callers. With debug assertions enabled, it preserves full
+`Error` messages, including reason, outcome and related errors recursively. Without debug
+assertions, `ERROR_OUTCOME_COMPLETE` confirms success in the containing operation's scope. The
+client queues the original error tree for standard error and removes it from the delivered result.
+Completed-operation text diagnostics contain only error enums, never request contents, passkeys
+or bond data. A separate diagnostic sink receives original wire responses and events before
+normalization. It does not supply state updates or command results. The adapter's firmware build
+does not select this policy.
+
+Diagnostic delivery never waits for standard error on the serial reader. The default library sink
+uses one worker and a 256-entry queue, dropping excess diagnostics when the queue is full. Library
+callers use `cordial_client::diagnostics::flush()` before process exit to drain accepted diagnostics
+with a two-second deadline, or install a nonblocking sink with `Connection::set_diagnostics` before
+the handshake. Closing a connection does not wait for diagnostic output.
+
+A completed save confirms saved preferences, not a Bluetooth connection or application of a
+setting. Device records determine connection and inactive state. Completed integration and output
+errors are cleared without assigning Active or inventing an output slot. A completed `SettingStatus`
+instead confirms application and becomes `APPLIED`, without inventing an actual reading. A
+completed pairing becomes a host-only success when its event omits the saved device ID. The
+interface shows Paired immediately, without selecting a device; ordinary device events supply
+records as they arrive. The CLI succeeds without printing an invented device ID. A completed
+scan clears its error and keeps the reported candidate count.
+
+A completed error cannot supply omitted read data, a created profile ID or a missing record in
+a listing. Such responses fail with the client's unexpected-response error; clients never
+construct empty status or device records to make them succeed. Current firmware does not emit
+completed errors for these shapes.
+
+The primary outcome describes the requested operation. Related failures retain their own
+scope, such as cleanup after pairing, and cannot invalidate a confirmed bond save. Production
+logs that complete tree without turning the successful pairing into a failed command. Independent
+noncomplete errors in the same record remain visible. A completed related error is removed from
+a noncomplete primary error; the primary failure remains. Unknown, partial, no-effect, missing
+and unrecognized outcomes retain their handling and never authorize an automatic retry.
+
+Human-readable error feedback leads with the known outcome in the operation's scope: a saved
+change, an applied change, pairing, a read, or pairing cleanup. In debug builds a confirmed save
+with a Bluetooth error reports both without claiming the device connected or applied the change.
+Unknown and partial saves ask the user to check the current settings before trying again.
+Specific causes and related failures remain in that feedback. See
+[Errors](limits-and-errors.md#errors).
 
 A device listing's `RecordError` retains any previously known device as last-known data. It does
 not confirm its connection or preferences. Fresh records and events replace that data; actual
@@ -205,6 +242,8 @@ before using the CLI.
 | `setting set DEV KEY VALUE` / `setting forget DEV KEY` | Save or forget a setting. |
 | `feature list DEV` | Development firmware: the device's integration features. |
 | `file list PATH` / `file get [--raw] PATH DEST` | Development firmware: browse or download adapter files. A saved record is converted to JSON unless `--raw` is given; see [downloaded records](#downloaded-records). |
+| `file put LOCAL_FILE PATH` | Development firmware: upload a local file's bytes, replacing the adapter file and verifying the result. |
+| `file delete PATH` | Development firmware: delete an adapter file. Deleting a missing file succeeds. |
 | `help` / `help COMMAND` / `quit` / `exit` | Local help and clean shutdown. |
 
 `DEV` is a device ID shown in output, or an unambiguous name; completion offers both. A number is
@@ -245,9 +284,26 @@ silently between duplicate names. Setting paths name typed fields, such as `keyb
   An unready adapter without a validated target storage format accepts only status requests.
   Debug file access and bootloader commands remain available during a radio failure when the
   adapter reports its validated storage format.
-- Output is human-readable and rendered safely for the terminal. `--json` instead prints every
-  response and event as one line of protobuf JSON with the schema's field names. File contents
-  are never printed: the response of `file get` is not shown.
+- Output is human-readable and rendered safely for the terminal. `--json` also logs every original
+  wire response and event to standard error as one line of protobuf JSON with the schema's field
+  names. It includes background reads, migration traffic and complete file contents. The stream
+  retains original error trees, including completed pairing errors and responses rejected because
+  they omit required data. Completed errors produce no additional text diagnostic in this mode.
+  Host-only completion notifications and events injected by handlers are not protocol records.
+  Commands, piped scripts, the interactive shell, the TUI and the desktop app support it. Human command results
+  stay on standard output, and diagnostics keep their usual destination. Use
+  `cordial --json tui 2>cordial.jsonl` or `cordial tui --json 2>cordial.jsonl` to keep the terminal
+  usable while recording the stream. Desktop accepts `--json` before or after `desktop` too.
+  Its stream belongs to the primary process's standard error. Ordinary desktop launches activate
+  the running instance. A subsequent launch with `--json` exits with an error asking the user to
+  quit Cordial first.
+
+The applications queue standard-error diagnostics with a 256-entry limit. Logging is best-effort:
+a full queue drops excess entries, and a failed writer stops logging. Neither changes a command's
+result or interrupts an interface. The TUI and interactive shell defer output addressed to a
+terminal until they restore terminal ownership; redirected standard error streams immediately.
+Shutdown drains accepted output for at most two seconds, then discards any remaining diagnostics.
+Redirect stderr to capture a long terminal session without the deferred queue's limit.
 
 Example interactive workflow:
 
@@ -276,6 +332,21 @@ duplicate or unsupported format, one that doesn't decode, or one holding an enum
 value this version of Cordial has no name for is saved unconverted under its
 original name, with `.pb` in place of a destination's `.json`, and the result
 says why. `--raw` saves the bytes unconverted under the destination name as given.
+
+### Uploaded files
+
+`file put LOCAL_FILE PATH` uploads the local bytes without converting them. Files of at most
+512 bytes use one atomic write. Larger files use consecutive writes to `/.file-upload`, a complete
+readback, an atomic move over the destination, and a destination readback. Each upload replaces
+the whole destination, including when the local file is empty. The command reports success only
+after readback matches. An error does not trigger an automatic retry.
+
+Large uploads stop if `/.file-upload` already exists or its absence cannot be confirmed. A failed
+upload can leave this staging file behind. Use `file delete /.file-upload` to clear it before
+trying another large upload.
+
+`file delete PATH` deletes one file and succeeds if it is already absent. The adapter's
+`/format.pb` file cannot be deleted.
 
 ## TUI
 
@@ -313,12 +384,9 @@ cancelling prevents an immediate automatic retry.
   connected and paired devices and connected adapters, and lists what needs attention, the
   connected devices with their batteries, and the adapters. Adapter and device pages have the same
   settings and actions as the desktop application's, with tabs for Details, Settings, Profiles
-  and Diagnostics. Development firmware adds Files and Enter Bootloader to the adapter's
-  Diagnostics tab. Files browses adapter
-  directories and downloads a file to a host destination, asking before replacing one. A saved
-  record is converted to JSON as `file get` converts it, and its destination is suggested with
-  `.json` in place of `.pb`. A download is written to a temporary file and moved into place only
-  when complete, with a no-replace rename, so a failure leaves the destination unchanged.
+  and Diagnostics. Development firmware adds Enter Bootloader to the adapter's Diagnostics tab.
+  Adapter files are managed through the CLI commands `file list`, `file get`, `file put` and
+  `file delete`.
 - Attention: while the TUI runs, a device whose battery is low (20% or less and not charging) or
   critical (5% or less), a connected device whose profiles weren't loaded, an adapter whose
   profile memory is 85% used, and an adapter that needs attention are listed under Needs Attention
@@ -333,9 +401,9 @@ cancelling prevents an immediate automatic retry.
   highlighted control. Mouse movement and Tab share one highlight; hover alone never activates
   anything, and a click in a dialog never reaches the controls underneath it.
 - Resizing keeps form input and recomputes click targets. Text labels accompany every color. `tui`
-  is refused with `--json` or without an interactive terminal. Ctrl-C and SIGINT quit from
-  anywhere, close every session, which stops a scan and cancels an unsaved pairing, and restore the
-  terminal; quitting never disconnects saved devices.
+  requires interactive standard input and standard output; standard error can be redirected.
+  Ctrl-C and SIGINT quit from anywhere and restore the terminal. Closing each session stops its
+  scan and cancels an unsaved pairing. Quitting never disconnects saved devices.
 
 ## Desktop application
 
@@ -399,9 +467,14 @@ Protocol compatibility and storage migration run in-process.
   until the user chooses Connect or restarts the application. This intentional disconnect does not
   start the reconnect window.
 - Pairing: Add Device scans the transports the firmware supports and has enabled while its dialog is
-  open, stops the scan before pairing, answers prompts in the dialog, and follows the new device
-  until it connects or fails. Closing the dialog, or hiding the window, stops a scan or cancels an
-  unsaved pairing. A received `SessionEnding` retains the pairing dialog with its adapter and
+  open, stops the scan before pairing, answers prompts in the dialog, and shows Paired as soon as
+  the adapter confirms pairing, regardless of the device's connection state. Acknowledging a PIN
+  answer alone does not confirm pairing. In the desktop app and TUI, Search Again starts a new
+  scan once scanning stops, beside any scan error, and after a failed or cancelled pairing. Closing the
+  dialog, or hiding the window, stops a scan or cancels an unsaved pairing. Cancel Pairing closes
+  the dialog immediately and silently requests cancellation. Late pairing or cancellation results
+  cannot reopen it or show errors; device updates still populate the sidebar.
+  A received `SessionEnding` retains the pairing dialog with its adapter and
   device entries within the intentional-disconnect deadline. A matching `PairingDone` from the
   original session confirms the saved device even if the host processes the session loss first.
   The dialog follows that device on a replacement session only after matching the adapter's
@@ -413,30 +486,41 @@ Protocol compatibility and storage migration run in-process.
   Details header. Profiles and Diagnostics have no Add Device button. It uses that page's adapter
   and is disabled when the adapter cannot pair. The dialog has no adapter selector. A passive
   spinner in its header indicates scanning, without searching text or a status row. When scanning
-  stops, Refresh or Retry appears
-  with any scan error. Scanning uses a 520 by 560 content area; pairing uses a 400-wide dialog
-  whose height follows its content, with the scan title hidden. The device icon, step title,
-  messages, codes and answers are centered. Two answers share a row, with the primary answer last.
-  Enter-code prompts offer Reject and Pair; code comparisons offer Codes Differ and Codes Match.
-  A displayed code offers Cancel Pairing. A connected result offers Add Another and Dismiss,
-  and opens the paired device's page automatically after about three seconds. The countdown starts
-  only when a confirmed saved device is connected; waiting for a replacement session does not
-  start it. Deliberate pointer
-  movement inside the dialog pauses the countdown until the pointer leaves; keyboard interaction
-  keeps it paused. Dismiss opens the same device page immediately. A saved pairing with a
-  connection warning stays open, as do failures and cancellation results. Failures offer Close and
-  Retry; cancellation offers Close and Refresh. Ctrl+N uses the selected page's
-  adapter. Settings has no pairing target. Each adapter group in the tray ends with Add Device,
-  enabled when that adapter is ready. It brings the window forward and pairs through that adapter.
+  stops, Search Again appears beside any scan error. Candidate signal icons name their strength.
+  The device picker and pairing use distinct native dialogs with independent sizes. Scanning uses
+  a 520 by 560 content area; pairing uses a 420 by 372 content area, with the scan title hidden.
+  Pairing keeps its size through progress, prompts and results. Long content scrolls above the
+  answers, which stay at the bottom.
+  The device icon, step title, messages and codes are centered 23 pixels above the center of the
+  space above the answers, accounting for the header. Long device names are truncated.
+  Answers fill the available width. Two answers share a row, with the primary answer last.
+  Enter-code prompts offer Reject and Pair. An acknowledged rejection returns to the device
+  picker without showing Pairing Failed. Code comparisons offer Codes Differ and Codes Match;
+  Codes Differ retains the failure result.
+  A displayed code offers Cancel Pairing. A Paired result stays open with Add Another and
+  Dismiss. Add Another starts a new search; Dismiss opens the paired device's page.
+  Failures and external cancellation offer Close and Search Again.
+  Ctrl+N uses the selected page's adapter. Settings has no pairing target. Each adapter group in
+  the tray has a submenu with Connect or Disconnect, Open and Add Device. Add Device is enabled
+  when that adapter is ready. It brings the window forward and pairs through that adapter.
 - Native navigation: the sidebar starts with Overview and Settings, then each adapter followed by
   its saved devices. Separators divide adapter groups without heading rows. An Add Device row
   appears only when one ready adapter is available and no devices have been added. Connect and
-  Refresh Adapters rows remain available when needed. Sidebar battery icons expose the reading
-  through their accessible names, while the device page shows the exact percentage and a
-  full-width battery bar. Charging without a known percentage has a fact row without a bar.
+  Refresh Adapters rows remain available when needed. Connected devices and adapters use normal
+  colors; disconnected rows have subdued icons and names. A device keeps its last battery reading
+  in the sidebar while disconnected or while its adapter is away, until the adapter reports none;
+  readings don't expire with age. An adapter waiting for an announced restart is subdued without
+  a spinner, as is an adapter waiting to return during migration. Connecting, starting and active
+  migration show a spinner. The battery is the only
+  trailing icon. Overview, Settings and action rows keep their normal colors. Sidebar battery
+  icons expose the reading through their accessible names, while the device page shows the exact
+  percentage and a full-width battery bar. Charging without a known percentage has a fact row without a bar.
+  Adapter sidebar menus open with a secondary click, a long press, Menu or Shift+F10 and offer
+  Rename followed by Connect or Disconnect.
   Settings opens in the regular content pane from the sidebar, Ctrl+, or the tray. Its sidebar
   row stays selected, its five controls save immediately and follow external GSettings changes,
-  and a rejected save restores the saved value. In a narrow window, Back returns to the sidebar.
+  and a rejected save restores the saved value. Low Battery Level accepts numbers from 1 through
+  100, with a separate percent unit. In a narrow window, Back returns to the sidebar.
   Adapters and devices each have one Details page containing their settings
   and information, with no tab controls. The page title stays visible in its header. Profiles and
   Diagnostics open from link rows near the bottom as subpages with Back. The minimum window width
@@ -467,22 +551,39 @@ Protocol compatibility and storage migration run in-process.
   search icon with "No Results Found" and "Try a different search", matching GNOME Settings.
   Enter opens the current query's first result and does nothing for an empty query or no matches.
   Down moves focus into the results. Escape clears the search and
-  restores navigation. At narrow widths, Ctrl+F brings the sidebar into view. Searching and
-  choosing a result do not change settings.
+  restores navigation. At narrow widths, use Back to show the sidebar before searching. Ctrl+F
+  does not navigate away from the content page. Searching and choosing a result do not change settings.
 - Native lifecycle: closing or hiding the window leaves configuration writes running. Explicit Quit
   commits the focused numeric field and waits for pending writes in a separate Cordial window
   labelled "Settings are being applied". If a write fails or its outcome is unknown, Continue
   Editing returns to the main window and Quit Anyway exits.
+  An error that confirms the save completed does not block Quit or repeat the write. Production
+  treats it as success and logs its detail to standard error. In debug builds its feedback
+  stays beside the action. For an enable or unblock save, a matching healthy connected-device
+  readback received after the save response clears radio feedback. Other completed-save notes
+  clear on navigation. A newer failed change keeps its failure feedback.
 - Devices open on Details, with connection switches, status, battery and the device's own facts.
   The native page also contains the available settings in their catalog groups and Gamepad Output
   when supported. Its header shows the device's status without repeating its battery reading,
   and the content has no separate Status row. The Battery row shows its exact value and meter.
-  Each setting's saved-state menu appears before its title and shows only an icon,
-  with an accessible name such as "Pointer Sensitivity: Saved". Every marker state uses an icon without
-  visible status words.
+  Each setting's saved-state menu follows its control on the right with a symbolic icon, menu
+  arrow and tooltip, and an accessible name such as "Pointer Sensitivity: Saved".
+  Marker states have no visible status words. Boolean settings use
+  switches. An unknown boolean value offers Off and On buttons until a value is chosen.
+  Choice settings and Gamepad Output show Unknown while their current value is unknown.
+  Their menu buttons list only supported choices. Unknown is a display value, never an option.
+  Numeric fields take numbers only, with units beside the field, and stay empty while the value
+  is unknown. Automatic Free Spin and Automatic Power-Off show their numeric fields in sibling
+  rows below their switches only while on. A continuous 3-pixel colored band on the left joins
+  each pair. Bands follow build order through blue, purple, teal, orange, green and pink, then
+  repeat. Each numeric row reserves the saved-state menu's width so its controls align with the
+  switch.
   Forget Device is at the end of the scrolling page. Profiles appears when the adapter supports
   profiles and shows the device's layers, an ordered list of profiles, empty for a new device.
-  Drag a layer onto another row to move it to that position. Each row has a drag handle and Remove.
+  Drag a layer onto another row to move it to that position. Each row also has a drag handle and
+  Remove. Each removal button has an accessible name such as "Remove Typing" while its tooltip
+  remains "Remove". Profile menus in the adapter library have accessible names such as
+  "Typing Profile Menu". A profile whose name is empty after display cleanup uses "Profile {id}".
   Diagnostics shows the device's errors, the HID++ protocol and status, link security and
   identifiers, with Refresh. Details switches, settings, Gamepad Output and adding, moving or
   removing profile layers apply immediately. Numeric fields apply on a step, Enter or leaving
@@ -493,7 +594,8 @@ Protocol compatibility and storage migration run in-process.
 - Profile memory: the application notifies once when `Status.errors` includes
   `ERROR_CODE_PROFILE_MEMORY_LOW`, and once when a connected device's `errors` includes
   `ERROR_CODE_PROFILE_MEMORY_EXCEEDED` or `ERROR_CODE_PROFILE_LOAD_FAILED`. Each notification
-  resets after its condition clears. Device errors appear on Diagnostics.
+  resets after its condition clears. Device errors appear on Diagnostics. The adapter's Profiles
+  page shows the percentage In Use with a full-width meter under Profile Memory.
 - Adapters open on Details. The native page includes Platform and a card for each supported
   transport, with its enable switch and reported Active Devices and Connections capacities.
   Settings precede Information, and subpage links follow the information. Rename is in Adapter Menu.
@@ -506,22 +608,49 @@ Protocol compatibility and storage migration run in-process.
   Profiles. Details shows storage usage from `RESOURCE_TYPE_STORAGE`, and Diagnostics shows the
   storage format, each only while the adapter reports it.
   Profiles lists every profile, each with an icon for each role it changes, and the configuration
-  interfaces, each with a native profile selection row and its own enable switch. New Profile
+  interfaces, each in its own card with an enable switch above a Profile selection row. The
+  profile can be chosen while the interface is off, and None is offered only then. The switch
+  is available once the interface has a profile and no conflicting interface is on. New Profile
   sits beside the list; a device's Profiles list has Add Profile beside it. The adapter library
   and Add Profile picker show the complete list with scrolling.
+  A picker whose listing failed shows the error with Retry, which lists the profiles again and
+  keeps the chosen profile. An empty picker shows No Profiles and New Profile. Creating a profile
+  there reopens the picker with the new profile selected. Cancelling creation returns to the picker.
   Platform, transport and configuration interface switches apply immediately. Selecting a
   configuration interface profile applies it immediately. Adding a device layer applies it when
   Choose is pressed. Controls stay editable while changes are being applied;
   only failures appear beside the action. Applying a change needs no reconnect confirmation
-  dialog. Creating, copying and deleting profiles retain their confirmation dialogs.
+  dialog. Creating and copying profiles open name dialogs. Deleting a profile asks for confirmation
+  and lists its changes in numbered order under the confirmation's introduction, with wrapped
+  lines aligned to the change's text. The desktop keeps the confirmed steps in place while the
+  deletion runs. A checkmark marks each confirmed change, a spinner marks the active step, and
+  pending steps keep their numbers. It removes the profile from those
+  devices while keeping their other layers in order, turns off and clears the listed interfaces,
+  then deletes the profile. If turning off an active interface reconnects the adapter, Cordial
+  shows its waiting state until the same adapter returns, then reads its current device and
+  interface settings.
+  Deletion continues only after the listed interfaces are off with no assigned profile and no
+  device or interface uses the profile. Unsaved layer or interface changes that would use the
+  profile block deletion. If the displayed plan changes before confirmation, Cordial asks again.
+  Changes stop at the first failure or changed dependency. Completed changes remain marked, and
+  failed or unconfirmed steps have distinct markers. Retrying applies only the remaining current
+  plan. A changed remaining plan must be displayed and confirmed before it can run. A lost
+  connection before the final deletion is confirmed reports an unknown outcome. Cordial does
+  not automatically repeat an unconfirmed deletion. On success, the desktop heading names the
+  deleted profile, all steps show checkmarks, and only a full-width Close button remains. The
+  dialog stays open until closed.
 - Battery: a device's battery is low when a known `battery.level` is at or below the user's
-  threshold (20% by default) and `battery.charging` is not true; at most 5% is critical. It notifies
+  threshold (20% by default) and `battery.charging` is not true. A low battery at 5% or less is
+  critical, so neither alert occurs above the chosen threshold. It notifies
   once on entering low and once on entering critical, and resets only after a reading above the
   threshold or while charging.
 - Tray: a StatusNotifierItem icon is shown while at least one adapter is connected (or always, by
   preference). Its outline means no device is connected and filled means at least one is; a badge
-  marks low battery or an adapter needing attention. Its menu lists devices, grouped by adapter when
-  several are connected. The tooltip and menu update at once. The icon image changes only when it
+  marks low battery or an adapter needing attention. Its menu has a submenu for each adapter with
+  Connect or Disconnect, Open and Add Device, followed by that adapter's devices. Device rows show
+  the name and battery reading without connection or error status text. Known disconnected adapters
+  remain in the menu when the tray is visible, so their Connect action is available. The tooltip and
+  menu update at once. The icon image changes only when it
   differs from the one shown, and applies immediately.
 
 ## Gamepad outputs
@@ -606,7 +735,7 @@ apply, quoted as needed, or `none` for an empty list; a profile named `none` is 
 | `profile show PROFILE` | Show a profile's name and roles. |
 | `profile create NAME` | Create an empty profile. |
 | `profile copy PROFILE NAME` | Copy on the adapter. |
-| `profile delete PROFILE` | Delete an unused profile. |
+| `profile delete PROFILE` | Remove a profile from its devices and configuration interfaces, then delete it. |
 | `adapter set interface INTERFACE on\|off [PROFILE]` | Enable or disable a configuration interface such as `via` or `vial`, optionally selecting its profile in the same request. |
 | `adapter set interface INTERFACE profile PROFILE` | Select the profile a configuration interface edits. |
 | `adapter reset interface INTERFACE profile` | Clear a disabled interface's profile. |

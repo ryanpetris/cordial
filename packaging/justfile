@@ -1,0 +1,56 @@
+set shell := ['bash', '-eu', '-o', 'pipefail', '-c']
+set working-directory := '..'
+
+export PYTHON := env('PYTHON', 'python3')
+export CORDIAL_VERSION := env('CORDIAL_VERSION', '0.0.0')
+export CORDIAL_HOMEPAGE := env('CORDIAL_HOMEPAGE', 'https://github.com/ryanpetris/cordial')
+export DEB_DISTRIBUTION := env('DEB_DISTRIBUTION', `if [ -r /etc/os-release ]; then . /etc/os-release; fi; echo "${VERSION_CODENAME:-unstable}"`)
+export DEB_REVISION := env('DEB_REVISION', '1~' + DEB_DISTRIBUTION)
+export HOST_ARCHIVE := env('HOST_ARCHIVE', '')
+SOURCE_DATE_EPOCH := env('SOURCE_DATE_EPOCH', '')
+
+arch: (_package 'arch')
+deb: (_package 'deb')
+
+[positional-arguments]
+[private]
+_package kind:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    kind="$1"
+    case "$kind" in
+      arch) command -v makepkg >/dev/null; command -v fakeroot >/dev/null ;;
+      deb) command -v dpkg-buildpackage >/dev/null; command -v dch >/dev/null ;;
+    esac
+    test "$(uname -sm)" = 'Linux x86_64' || { echo 'Distribution packages require Linux x86-64' >&2; exit 1; }
+    version=$("$PYTHON" tools/version.py)
+    export CORDIAL_VERSION="$version"
+    archive="$HOST_ARCHIVE"
+    if [ -z "$archive" ]; then archive="build/release/cordial-$version-linux-amd64.tar.gz"; fi
+    epoch=$("$PYTHON" tools/check_release_archive.py "$archive" host "$version")
+    epoch_override={{ quote(SOURCE_DATE_EPOCH) }}
+    export SOURCE_DATE_EPOCH=${epoch_override:-$epoch}
+    output="$PWD/build/packages/host-$kind"
+    if [ "$kind" = deb ]; then output="$output/$DEB_DISTRIBUTION"; fi
+    mkdir -p "$output"
+    case "$kind" in
+      arch)
+        cp packaging/arch/PKGBUILD "$output/"
+        filename="cordial-$version-linux-amd64.tar.gz"
+        test "$archive" -ef "$output/$filename" || cp -- "$archive" "$output/$filename"
+        export CORDIAL_ARCHIVE_SHA256=$(sha256sum "$output/$filename" | cut -d' ' -f1)
+        cd "$output"
+        makepkg --force --cleanbuild --nosign "PKGDEST=$output" PKGEXT=.pkg.tar.zst
+        ;;
+      deb)
+        source="$output/cordial-$version"
+        rm -rf -- "$source"
+        mkdir -p "$source"
+        tar --no-same-owner -C "$source" --strip-components=1 -xzf "$archive"
+        cp -R packaging/debian "$source/debian"
+        cd "$source"
+        cp LICENSE debian/copyright
+        DEBEMAIL="$(dpkg-parsechangelog -S Maintainer)" dch --no-auto-nmu --preserve --force-bad-version --newversion "$version-$DEB_REVISION" --distribution "$DEB_DISTRIBUTION" "Cordial $version."
+        dpkg-buildpackage --build=binary --no-sign
+        ;;
+    esac

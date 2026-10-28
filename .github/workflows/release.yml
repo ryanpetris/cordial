@@ -19,6 +19,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - name: Install just
+        run: |
+          sh docker/install-just.sh "$RUNNER_TEMP/cordial-bin"
+          echo "$RUNNER_TEMP/cordial-bin" >> "$GITHUB_PATH"
       - name: Validate release tag
         id: version
         run: |
@@ -35,7 +39,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/buf"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Check protocol
-        run: make check-protocol
+        run: just check-protocol
   linux:
     needs: validate
     runs-on: ubuntu-24.04
@@ -47,8 +51,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Install just
+        run: |
+          sh docker/install-just.sh "$RUNNER_TEMP/cordial-bin"
+          echo "$RUNNER_TEMP/cordial-bin" >> "$GITHUB_PATH"
       - name: Build portable applications
-        run: make package-desktop package-cli
+        run: just package-host-appimage package-host-tar
       - name: Check unified host archive
         run: python3 tools/check_release_archive.py "build/release/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz" host "$CORDIAL_VERSION"
       - name: Check packaged AppImage on Resolute with the default renderer and software Mesa
@@ -100,6 +108,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Install just
+        run: |
+          sh docker/install-just.sh "$RUNNER_TEMP/cordial-bin"
+          echo "$RUNNER_TEMP/cordial-bin" >> "$GITHUB_PATH"
       - uses: actions/download-artifact@v8
         with:
           name: packages-linux
@@ -107,7 +119,7 @@ jobs:
       - name: Build native package
         run: |
           (cd build/portable && sha256sum -c SHA256SUMS-linux)
-          make package-host-arch HOST_ARCHIVE="build/portable/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz"
+          just HOST_ARCHIVE="build/portable/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz" package-host-arch
       - name: Check installation, reinstall and removal
         run: docker run --rm -v "$PWD:$PWD" -w "$PWD" -e CORDIAL_VERSION archlinux:base-devel packaging/check-arch.sh
       - uses: actions/upload-artifact@v7
@@ -137,6 +149,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Install just
+        run: |
+          sh docker/install-just.sh "$RUNNER_TEMP/cordial-bin"
+          echo "$RUNNER_TEMP/cordial-bin" >> "$GITHUB_PATH"
       - uses: actions/download-artifact@v8
         if: matrix.distribution == 'resolute'
         with:
@@ -144,12 +160,12 @@ jobs:
           path: build/portable
       - name: Build native Debian executable and package
         if: matrix.distribution == 'trixie'
-        run: make package-host-deb DEB_DISTRIBUTION=trixie
+        run: just DEB_DISTRIBUTION=trixie package-host-deb
       - name: Package the Resolute release executable
         if: matrix.distribution == 'resolute'
         run: |
           (cd build/portable && sha256sum -c SHA256SUMS-linux)
-          make package-host-deb DEB_DISTRIBUTION=resolute HOST_ARCHIVE="build/portable/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz"
+          just DEB_DISTRIBUTION=resolute HOST_ARCHIVE="build/portable/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz" package-host-deb
       - name: Check installation, reinstall, removal and purge
         run: docker run --rm -v "$PWD:$PWD" -w "$PWD" -e CORDIAL_VERSION -e DEB_DISTRIBUTION '${{ matrix.image }}' packaging/check-deb.sh
       - uses: actions/upload-artifact@v7
@@ -174,10 +190,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Install just
+        run: |
+          sh docker/install-just.sh "$RUNNER_TEMP/cordial-bin"
+          echo "$RUNNER_TEMP/cordial-bin" >> "$GITHUB_PATH"
       - name: Check firmware
-        run: make check-firmware BOARD='${{ matrix.board }}' PROFILE='${{ matrix.profile }}'
+        run: just BOARD='${{ matrix.board }}' PROFILE='${{ matrix.profile }}' check-firmware
       - name: Build firmware
-        run: make package-firmware BOARD='${{ matrix.board }}' PROFILE='${{ matrix.profile }}'
+        run: just BOARD='${{ matrix.board }}' PROFILE='${{ matrix.profile }}' firmware
       - name: Archive complete firmware package
         env:
           BOARD: ${{ matrix.board }}
