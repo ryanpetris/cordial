@@ -3,8 +3,8 @@
 The Dongle's USB CDC port carries a protobuf API. A client sends one request and gets one response
 back, in order; the Dongle also sends an event whenever something changes. There are no request
 IDs, no subscriptions and no heartbeats. Clients start every session with the permanent handshake
-to identify the operational serial revision. The separate USB HID interfaces carry the
-keyboard and mouse, and the enabled configuration interfaces.
+to identify the operational serial revision. Separate USB interfaces carry keyboard and mouse
+input, enabled HID or XInput gamepad outputs, and enabled HID configuration traffic.
 
 One host process owns the port at a time. The Dongle stores its bonds, connection policy, settings
 and profiles itself and works without any host software once set up; the host only configures it and

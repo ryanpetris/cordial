@@ -5,12 +5,12 @@
 <h1 align="center">Cordial</h1>
 
 <p align="center">
-  <strong>Your Bluetooth keyboard and mouse, as plain USB.</strong>
+  <strong>Your Bluetooth keyboard, mouse and gamepad, as plain USB.</strong>
 </p>
 
 <p align="center">
   Cordial turns a small, inexpensive microcontroller board into an adapter that pairs
-  with your Bluetooth keyboards and mice and presents them to the computer as ordinary
+  with your Bluetooth keyboards, mice and gamepads and presents them to the computer as ordinary
   USB devices. No host Bluetooth, no drivers, no software running in the background.
 </p>
 
@@ -32,7 +32,7 @@
 
 ## Features
 
-- The computer sees a standard USB keyboard and mouse. It needs no Bluetooth radio, no pairing and
+- The computer receives input over USB. It needs no Bluetooth radio, no pairing and
   no drivers.
 - Pairings and preferences live on the adapter. Move it to another computer and your devices come
   with it.
