@@ -228,7 +228,7 @@ macro_rules! enum_setting {
     }};
 }
 
-/// Complete objects in integration, group and component order. Metadata is never truncated.
+/// Complete objects in integration, group, and component order. Metadata is never truncated.
 pub fn settings(catalog: &Catalog) -> Result<Vec<p::SettingsObject>, p::Error> {
     let mut objects = Vec::new();
     while let Some(object) = next_settings(catalog, objects.last().map(object_ref).as_ref())? {

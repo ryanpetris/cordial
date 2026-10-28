@@ -25,7 +25,7 @@
 #define MAX_NR_HCI_CONNECTIONS CORDIAL_ACTIVE_CONNECTIONS
 #define MAX_NR_HID_HOST_CONNECTIONS (CORDIAL_CLASSIC_CONNECTIONS + 1)
 #define MAX_NR_GATT_CLIENTS (CORDIAL_BLE_CONNECTIONS + 1)
-/* Classic HID uses control, interrupt and SDP channels. BLE uses fixed ATT/SMP bearers. */
+/* Classic HID uses control, interrupt, and SDP channels. BLE uses fixed ATT/SMP bearers. */
 #define MAX_NR_L2CAP_CHANNELS (3 * (CORDIAL_CLASSIC_CONNECTIONS + 1))
 #define MAX_NR_L2CAP_SERVICES 3
 #define MAX_NR_SM_LOOKUP_ENTRIES (CORDIAL_BLE_CONNECTIONS + 1)

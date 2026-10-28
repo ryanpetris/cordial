@@ -1,4 +1,4 @@
-//! The firmware's model of devices, settings and Bluetooth state.
+//! The firmware's model of devices, settings, and Bluetooth state.
 pub mod errors;
 pub mod hidpp;
 pub mod identifiers;

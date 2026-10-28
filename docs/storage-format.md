@@ -37,7 +37,7 @@ geometry and application roots. With a below-minimum measurement, missing or
 invalid filesystems and invalid roots return a bounds error without writes.
 
 ESP32-S3 images require at least 4 MiB and reserve 2 MiB for bootloader, partition
-table, PHY data and application. Unsupported discovery, no response and timeouts
+table, PHY data, and application. Unsupported discovery, no response, and timeouts
 permit fallback after a successful raw flash read. An output populated by a failed
 probe is discarded, including failures in the SDK's operation-end hook.
 Uninitialized drivers and raw I/O errors stop storage initialization.
@@ -66,7 +66,7 @@ because a driver can read SFDP while checking its addressing support.
 ## Startup recovery
 
 Startup classifies the committed `/format.pb` before application recovery, ordinary
-record cleanup, topology, identity or radio initialization. The operating format
+record cleanup, topology, identity, or radio initialization. The operating format
 is `2`, reported independently of the firmware release. A genuinely empty filesystem may provision
 normally. A missing root with any committed data, an unknown or newer format, or
 malformed or ambiguous migration input blocks startup. None of these cases authorizes
@@ -75,7 +75,7 @@ reading entries, and startup deletes internal `/.file-write-<16 lowercase hex di
 even on blocked storage. These are the only exceptions to preserving blocked storage.
 Driver I/O errors stop initialization without a format retry loop.
 
-Format `1` migrates to `2`, preserving identity, bonds, preferences, profiles and
+Format `1` migrates to `2`, preserving identity, bonds, preferences, profiles, and
 allocated IDs. Firmware classifies the source and runs eligible on-device
 migrations internally, initially `1 -> 2`. Hosts only request bootstrap status or
 close the connection while firmware migrates. A known older format that has no
@@ -83,20 +83,20 @@ on-device path or cannot fit within the on-device resource budget needs host
 assistance to preserve saved data.
 
 `Status.information.storage_format` is optional and reports the committed root's
-format when it can be determined. Missing, malformed or unreadable roots leave it
+format when it can be determined. Missing, malformed, or unreadable roots leave it
 absent and report `Status.errors`. It is not proof that the dataset is valid or
 ready. Optional `target_storage_format` reports the firmware's operating target,
 currently `2`, independently of its release version. Firmware always sets it,
 including when storage is blocked or unreadable. After a compatible permanent hello and bootstrap
 status, clients check presence and exact target support before other commands. An absent or zero
 target prevents migration and normal commands. The current format is informational and never
-controls migration, source selection, reconnection or success. The migration-required error authorizes
+controls migration, source selection, reconnection, or success. The migration-required error authorizes
 host assistance and the downloaded `/format.pb` selects the source. Without that
 marker, fresh clients report readiness and errors without file access.
 
-Firmware selects normal, assisted or blocked operation at boot. Assisted mode
+Firmware selects normal, assisted, or blocked operation at boot. Assisted mode
 reports `ready = false` and `STORAGE_MIGRATION_REQUIRED` with reason `STORAGE`, outcome
-`NO_EFFECT` and no related errors. This exact marker authorizes migration only
+`NO_EFFECT`, and no related errors. This exact marker authorizes migration only
 when no other status errors are present. Mode and marker stay latched through
 intermediate and final root uploads until a hardware reset. Root telemetry failures
 report `STORAGE_FAILED`, which blocks host conversion regardless of outcome.
@@ -122,9 +122,9 @@ recovery, including its current-format repair and cleanup rules.
 
 The guard's 32-byte layout hash describes the backend and record layout,
 independently of capacity. It is repaired only after filesystem validation and
-growth succeed. A stale, missing or torn guard cannot override a valid filesystem.
+growth succeed. A stale, missing, or torn guard cannot override a valid filesystem.
 A compatible filesystem at the same start grows only when available space after
-reservations exceeds its mounted block count. Equal, smaller and unavailable
+reservations exceeds its mounted block count. Equal, smaller, and unavailable
 measurements leave its geometry unchanged. This policy is common to all boards
 and does not depend on previous fallback use. The filesystem start remains fixed.
 Recovery only writes the current storage range; it never erases the firmware or
@@ -137,7 +137,7 @@ The persisted filesystem end must fit checked byte arithmetic and Pico's 16 MiB
 address window. On unchanged hardware, valid geometry retains the prior I/O
 extent. Reads and writes are bounded to that extent or a larger measured capacity
 before native consistency recovery, validation of application roots, growth,
-cleanup or guard repair can write. Rejected mounts never run consistency
+cleanup, or guard repair can write. Rejected mounts never run consistency
 recovery. Later I/O remounts repeat it within the accepted bounds before reading entries.
 With no valid filesystem geometry, formatting uses only measured capacity or the
 board minimum, never the exploratory address window. With valid geometry, a
@@ -158,15 +158,15 @@ borrow the underlying driver while LittleFS owns it.
 Firmware downgrades are not supported.
 
 Firmware artifact schema `2` records the minimum chip capacity, stable firmware
-reservation and `detected-tail` storage policy.
+reservation, and `detected-tail` storage policy.
 
 ## Files
 
 | Path | Message | Contents |
 | --- | --- | --- |
 | `/format.pb` | `Format` | `format: 2` and `initialized`, recording whether roots have been committed |
-| `/identity.pb` | `Identity` | Bluetooth address, IR, ER and derived IRK |
-| `/adapter.pb` | `Adapter` | Adapter preferences; without the file, use Linux, the image's default name, BLE alone and no configuration interface |
+| `/identity.pb` | `Identity` | Bluetooth address, IR, ER, and derived IRK |
+| `/adapter.pb` | `Adapter` | Adapter preferences; without the file, use Linux, the image's default name, BLE alone, and no configuration interface |
 | `/sequence.pb` | `Sequence` | The next device and profile IDs |
 | `/devices/<id>/device.pb` | `Device` | `policy` and complete portable `bond` in one message; this file commits the device's existence |
 | `/devices/<id>/settings.pb` | `Settings` | Explicitly saved physical-device preferences, with their integration |
@@ -182,10 +182,10 @@ sequences; `/devices/1/device.pb` and `/profiles/1/profile.pb` can both exist.
 ## File format versions
 
 All nine file messages have a required `uint32 format = 1` field with the same
-value, `2`. The field's name, number and type are permanent, so readers can
+value, `2`. The field's name, number, and type are permanent, so readers can
 extract the version independently before interpreting the payload with the
 current schema. Protobuf fields may appear in any order; `format` need not be
-the first encoded field. A missing, zero, malformed, duplicate or unsupported
+the first encoded field. A missing, zero, malformed, duplicate, or unsupported
 `format` makes the record invalid. An empty file holds no record and reads as
 missing.
 
@@ -221,19 +221,19 @@ rules](protocol/compatibility.md#fields): the firmware checks each Required fiel
 plain field as its zero value, and gives `optional` and message fields presence. Later firmware adds
 fields whose zero value or absence keeps the earlier meaning, so records gain fields without a new
 format version. The firmware ignores unknown fields; it leaves out entries of repeated fields
-whose transport, integration, configuration interface or role is unknown or unspecified, and reads
+whose transport, integration, configuration interface, or role is unknown or unspecified, and reads
 an unknown host platform as Linux. Otherwise a record whose Required field is missing or out of
 range is undecodable.
 
 Enumerated values are protobuf enums: platforms, transports, integrations, roles, setting scopes,
-report types and configuration interfaces. A setting is saved by its name. HID usages are numbers,
-with the usage page in the high 16 bits and the usage ID in the low 16. Keys, addresses and report
+report types, and configuration interfaces. A setting is saved by its name. HID usages are numbers,
+with the usage page in the high 16 bits and the usage ID in the low 16. Keys, addresses, and report
 maps are bytes.
 
 Writers always set `format`, so every saved record is nonempty. This does not
 replace payload requirements: identity keys, both next IDs of the sequence, a
 device's policy and bond, at least one saved setting, the report maps of a layout,
-a profile's name and at least one rule remain required. Adapter writers still
+a profile's name, and at least one rule remain required. Adapter writers still
 include an entry for every transport. Forgetting the last setting or rule deletes
 its file rather than saving a message containing only `format`.
 
@@ -258,7 +258,7 @@ ambiguous. Well-defined unknown fields inside nested payloads remain intact.
 Malformed or ambiguous records stop the migration before writes.
 
 On-device startup validates the source once, replaces files with readback, validates
-the target and commits the root last. Replacements retain the inventory cursor;
+the target, and commits the root last. Replacements retain the inventory cursor;
 deletions restart it because directory indices shift. Memory holds one file and its
 conversion, plus the current directory path stack. Directory enumeration reopens
 and skips entries, so large directories still require quadratic metadata reads.
@@ -268,11 +268,11 @@ After a compatible permanent hello and bootstrap status, the host verifies exact
 `Status.information.target_storage_format` before other commands, then
 requires the exact `STORAGE_MIGRATION_REQUIRED`/`STORAGE`/`NO_EFFECT` marker with no related
 errors and no other status errors. The informational current format may be absent,
-matching or different; none of these values authorizes or blocks migration.
+matching, or different; none of these values authorizes or blocks migration.
 The host recursively
 inventories files with `ListFiles`, downloads every dataset file into RAM with
 bounded `ReadFile` calls, determines the source from
-`/format.pb` and validates mixed files. It then chooses a supported directed
+`/format.pb`, and validates mixed files. It then chooses a supported directed
 forward graph path to the target and completes the conversion in RAM before
 writing anything. Edges may skip numbers; format numbers need not be contiguous.
 Each edge declares an immediate checkpoint or permission to defer it, safe
@@ -284,9 +284,9 @@ incrementally. The recursive dataset inventory includes every committed file,
 including `/format.pb`, and excludes `/.file-upload`. Before downloading or
 allocating, a host checks at most 16,384 files and a checked total of at most
 64 MiB of input, independent of adapter capacity. Conversion budgets input,
-output and working allocations together within 256 MiB. These host safety
+output, and working allocations together within 256 MiB. These host safety
 limits do not change serial payload limits. Unsupported sizes stop before
-writes. No host filesystem data, backups or disk spill are allowed.
+writes. No host filesystem data, backups, or disk spill are allowed.
 
 Every read response must match the requested path and offset exactly. The expected
 size is the inventory size for download and the uploaded size for readback. After
@@ -296,9 +296,9 @@ content. Equal sizes do not select a candidate. Size stays constant throughout a
 Its data length must equal
 `min(request.length, size - offset)`. Offset must not exceed size, zero bytes
 are allowed only at EOF, and short positive chunks are rejected. Clients reject
-mismatch, overflow or excess data before retaining or converting bytes.
+mismatch, overflow, or excess data before retaining or converting bytes.
 
-File access uses ordinary `ListFiles`, `ReadFile`, `WriteFile`, `MoveFile` and
+File access uses ordinary `ListFiles`, `ReadFile`, `WriteFile`, `MoveFile`, and
 `DeleteFile` commands. Debug firmware enables them during normal operation;
 production firmware enables them only in assisted mode, which remains latched
 until hardware reset even after the root declares the target. They never run
@@ -313,7 +313,7 @@ that fits within 512 bytes can be replaced directly at offset zero.
 
 For every new file, the storage layer writes to a randomly named internal
 temporary file, then atomically moves it to the requested path. This applies to
-all callers, including normal record saves, provisioning and migration. Before migration,
+all callers, including normal record saves, provisioning, and migration. Before migration,
 startup deletes leftover files matching the internal temporary naming pattern
 without recovering their contents, even when classification blocks startup.
 `ListFiles` excludes these internal files.
@@ -327,7 +327,7 @@ ordinary file commands and excluded only from the migration dataset. There is
 no persisted migration journal. After interruption, the host checks the
 destination before restarting or discarding a temporary file. Startup removes
 an abandoned temporary file only for current storage, an eligible on-device
-migration or assisted mode. Blocked startup preserves the host temporary
+migration, or assisted mode. Blocked startup preserves the host temporary
 file; the internal creation files follow their separate cleanup rule above.
 The temporary file alone counts as an empty filesystem.
 
@@ -341,10 +341,10 @@ entire root. Intermediate checkpoints keep file access enabled for the next edge
 After verifying the final root, the host sends `Restart`. Root uploads alone do
 not change assisted mode. Restart acknowledges before resetting the MCU and runs
 ordinary startup recovery without a separate migration completion validator.
-The migration worker reconnects by stable `Status.id`, repeats the permanent hello and checks exact
-target support again. This worker reconnects independently of normal host sessions. The worker requires the same target, no migration-required marker and
+The migration worker reconnects by stable `Status.id`, repeats the permanent hello, and checks exact
+target support again. This worker reconnects independently of normal host sessions. The worker requires the same target, no migration-required marker, and
 `ready = true` for success. Normal startup may also report the warnings `STORAGE_FULL`,
-`PROFILE_MEMORY_LOW`, `USB_REQUIRED_CAPACITY_EXCEEDED` and
+`PROFILE_MEMORY_LOW`, `USB_REQUIRED_CAPACITY_EXCEEDED`, and
 `USB_RESERVED_CAPACITY_EXCEEDED`, each without related errors. Any other error
 stops the worker. Transport reconnection continues until cancellation, with old
 handles released before reopening.
@@ -373,39 +373,39 @@ transport, as `transport` and `enabled`; a transport without an entry uses its d
 and Classic disabled, and writers list every transport.
 
 `configuration_interfaces` lists the saved preferences of each configuration interface that has any,
-as `interface`, `enabled` and an optional `profile` ID. An interface without an entry is disabled
+as `interface`, `enabled`, and an optional `profile` ID. An interface without an entry is disabled
 with no profile, and writers omit such entries. An enabled interface has a profile. Every adapter
 preference update rewrites the file once and commits before runtime state changes.
 
 ## Devices
 
-A device policy contains its ID, peer address/type/transport, name, trusted, blocked and
-preferred-enabled flags, `integrations`, `roles`, `profiles` and `output_preferences`. A new
+A device policy contains its ID, peer address/type/transport, name, trusted, blocked, and
+preferred-enabled flags, `integrations`, `roles`, `profiles`, and `output_preferences`. A new
 device's policy also sets `setup_pending` until its first-connection setup completes; a policy
 without it has completed setup. Connection state, effective enablement, discovery, battery
-readings and transient errors are not persisted.
+readings, and transient errors are not persisted.
 
 - `integrations` lists each integration the device has a saved preference for, as `integration`
   and `enabled`. The implemented integration is HID++.
 - `roles` lists the input roles the device's HID descriptor produces: keyboard, mouse, consumer
-  control, system control and gamepad. It is rewritten when a connection reads a descriptor with
+  control, system control, and gamepad. It is rewritten when a connection reads a descriptor with
   different roles, once input pauses (see [when files are written](#when-files-are-written)), and
   is empty until the first descriptor is read.
 - `output_preferences` lists saved output choices as `role` and `mode`, with at most one entry per
-  role. Only gamepad is configurable. Its modes are Disabled, HID and XInput; a missing entry means
+  role. Only gamepad is configurable. Its modes are Disabled, HID, and XInput; a missing entry means
   Disabled. Writers retain a settled Disabled choice while `setup_pending` is true so reconnects
   and restarts preserve it while other setup steps finish. Otherwise they omit Disabled entries.
   Unknown roles or modes are ignored, and duplicate known roles make the record undecodable.
   Missing entries do not change keyboard or mouse behavior.
   Preferences survive renewing an existing bond. Unpairing deletes them. Each gamepad mode's
-  configured USB candidates include paired records selecting it, including disabled, blocked and
+  configured USB candidates include paired records selecting it, including disabled, blocked, and
   nonresident devices and devices whose transport is disabled. Connection state changes allocation
   priority; the [USB allocator](protocol/hid-forwarding.md#usb-allocation) selects what fits.
 - `profiles` is the device's layers: the profile IDs it applies, in order. A new device has none,
   and an empty list passes everything through.
 
 First-connection setup chooses HID when the validated descriptor has supported gamepad controls,
-the firmware supports HID output and fewer than four saved devices select HID. Otherwise it settles
+the firmware supports HID output, and fewer than four saved devices select HID. Otherwise it settles
 on Disabled. A saved or explicit choice wins. Setup does not run again after completion, including
 when capacity becomes available or firmware gains HID support. The choice takes effect after its
 policy save succeeds; a failed save leaves setup pending for a later connection to retry.
@@ -415,17 +415,17 @@ choice settle.
 The bond holds the canonical native-independent identity and security keys: its owner, which is
 the device ID, its identity, which equals the policy's peer, and the keys of the identity's
 transport. Classic stores link key and key type. BLE stores local and peer security fields,
-including LTK, IRK, CSRK, RAND, EDIV, flags, key size and signing counter. Keys are bytes fields of
+including LTK, IRK, CSRK, RAND, EDIV, flags, key size, and signing counter. Keys are bytes fields of
 their exact length. A saved bond is complete. The binary canonical bond encoding is used only at
 native Bluetooth adapter boundaries.
 
-Each physical-device preference contains `integration`, `metadata` and a numeric `value`.
+Each physical-device preference contains `integration`, `metadata`, and a numeric `value`.
 Metadata contains the setting's name as `key`, such as `backlight.level`, feature ID, feature
-revision, scope, choices and optional min/max/step range, which is enough to list the setting while
+revision, scope, choices, and optional min/max/step range, which is enough to list the setting while
 the device is disconnected. One settings file is rewritten for a setting change. Forgetting the
 last setting deletes the file.
 
-Typed serial settings map to these persisted names. Storage names, numeric values and metadata
+Typed serial settings map to these persisted names. Storage names, numeric values, and metadata
 are independent of the serial domain and field names.
 
 | Serial field | Persisted `metadata.key` |
@@ -454,15 +454,15 @@ Stored wheel mode 1 means free spin and 2 means stepped. The serial enum names a
 
 The HID layout file holds each HID service's raw report map as bytes in `maps`. A BLE layout also
 lists its report characteristics in `reports`: owning service index, report type, report ID, value
-handle, properties and the CCCD handle, zero when the characteristic has none. When the device
+handle, properties, and the CCCD handle, zero when the characteristic has none. When the device
 exposes a GATT Database Hash, `database_hash` holds its 16 bytes. Saving a layout writes the report
 maps straight from the layout into the file's buffer. The file is written when a connection
 discovers the device, including at pairing, and when a connected device's HID layout changes, once
 input pauses, but not while storage is not ready. It is written only when free space covers the
-32 KiB maintenance reserve, the 16 KiB reserved for pairing another device and the file itself, and
+32 KiB maintenance reserve, the 16 KiB reserved for pairing another device, and the file itself, and
 it is removed again when writing it leaves less than both reserves. A layout that cannot be saved
 removes the saved file instead. Later connections supply it to the Bluetooth backend so input starts
-without rediscovery. The file is optional: a missing, undecodable or unusable file means the next
+without rediscovery. The file is optional: a missing, undecodable, or unusable file means the next
 connection discovers the device. An undecodable or unusable file is removed when it is read, and the
 file is removed when a connection ends because the device's HID layout could not be used. Re-pairing
 removes it, and deleting the device removes it with the preferences. Layout files are read by device
@@ -479,14 +479,14 @@ file means no rules. Each nested `Rule` requires an `input` usage at field 1 and
 its application `collection` at field 2. Both are packed `uint32` usages, with the
 usage page in the high 16 bits and the usage ID in the low 16. Missing or zero input or collection
 makes the record undecodable; no collection is inferred. The required `effect` is one of `remap`
-at field 3, `scale` at field 4 or `axis` at field 5:
+at field 3, `scale` at field 4, or `axis` at field 5:
 
 - `remap` holds a list of `outputs`, each a `usage` with the `collection` of the report that carries
   it. An empty list disables the input.
 - `scale` holds a `numerator` and a `denominator`.
 - `axis` holds a packed `destination` usage at field 1 and an `invert` boolean at field 2. It
   routes an absolute Game Pad axis within the input's Game Pad collection; inversion reverses the
-  normalized axis range. It has no deadzones, curves or sensitivity settings.
+  normalized axis range. It has no deadzones, curves, or sensitivity settings.
 
 The list is sorted by input usage, then collection, with at most one rule for each pair, so a
 loaded profile can be searched without sorting; a file that is not is undecodable. Packed usage
@@ -514,15 +514,15 @@ startup.
 
 Files are protobuf encodings without framing, encoded into a buffer of exactly the record's length.
 There is no 512-byte record ceiling and no configured number of saved
-devices, profiles or saved settings. Setting choices use the u16 domain. Native
+devices, profiles, or saved settings. Setting choices use the u16 domain. Native
 connection/bond-table and wire-frame bounds still apply. Allocation and storage exhaustion are
 resource errors.
 
 ## When files are written
 
 Commands write the files they change before they respond, so a successful response means the
-change is on flash: adapter preferences, device policies and settings, profile creation, copying,
-deletion and `SetProfileRules`, and unpairing. A pairing saves its bond before the device is
+change is on flash: adapter preferences; device policies and settings; profile creation, copying,
+deletion, and `SetProfileRules`; and unpairing. A pairing saves its bond before the device is
 admitted.
 
 Other files are written once keyboard and mouse input pauses. The Dongle keeps a set of dirty
@@ -537,7 +537,7 @@ keep their own timing. A profile's `rules.pb` is written before its roles summar
 writes of everything waiting described below, the secondary loop writes one record per step,
 resting after each step that wrote.
 
-Discovered layouts, first-connection setup and the removal of lost records also wait for input to
+Discovered layouts, first-connection setup, and the removal of lost records also wait for input to
 pause, at most 2 s from when they first wait, but never run while a connection waits for its first
 input.
 
@@ -549,9 +549,9 @@ until they are, and every user of the profile, including a device that connects 
 the edited rules.
 
 Everything waiting is written at once, in one step and whatever input is doing: before USB
-enumerates again, before the bootloader is entered and when a configuration editor's profile is
+enumerates again, before the bootloader is entered, and when a configuration editor's profile is
 released, including when the editor moves to another profile. Dirty records, but
-not layouts, are also written before free space is counted to admit a new profile, a pairing or a
+not layouts, are also written before free space is counted to admit a new profile, a pairing, or a
 new setting, so admission counts them; a layout never takes the room admission keeps. Edits are lost
 if power is removed before they reach flash.
 
@@ -567,7 +567,7 @@ resolved. Edits there is no memory to list are written straight from the editor'
 timing, with their own backoff, and when everything waiting is written; an editor whose edits cannot
 be written or listed refuses to move to another profile until they are. Any other flash failure, and
 running out of memory for the file's buffer, is retried without being reported and does not make
-storage not ready, so the profile can still be changed, overwritten or deleted; a command that
+storage not ready, so the profile can still be changed, overwritten, or deleted; a command that
 writes the profile's rules reports its own failure, and overwriting or deleting the profile ends the
 retries. Other dirty records are retried with their own backoff without being reported, as when they
 are saved with a command. A command whose change matches edits not yet written writes them before it
@@ -575,7 +575,7 @@ responds.
 
 ## Commit and recovery
 
-A file is saved in place: it is opened truncated, written and closed. LittleFS keeps an existing
+A file is saved in place: it is opened truncated, written, and closed. LittleFS keeps an existing
 file's old contents until the close commits the new contents in one metadata commit, so an
 interrupted save leaves either the old or the new contents, including the format
 and payload together. Creating a file commits it empty before its contents are
@@ -595,7 +595,7 @@ commits the sequence with the following ID before the device or profile with the
 published, and once every 32-bit ID has been used, allocation reports a full store. IDs are never reused, including after
 deletion; failed pairing may leave gaps.
 Provisional pairing exists only in RAM. Re-pairing finds the saved device by
-reading device policies, retains its ID, policy and preference files, then
+reading device policies, retains its ID, policy, and preference files, then
 replaces policy and bond together and removes the saved layout. Separate stored
 bond IDs and pending-pairing records do not exist.
 
@@ -632,7 +632,7 @@ RAM holds only what accepting connections and translating input need:
 - the identity and adapter preferences;
 - for each enabled device on an enabled transport that the Bluetooth stack has room for, a
   reconnection entry: ID, peer address, address type and transport, trust and HID++ preferences, its
-  profile layers, disconnect pause, backoff and last connection error. The native bond table holds
+  profile layers, disconnect pause, backoff, and last connection error. The native bond table holds
   its keys. The advertised `DEVICES.limit` bounds resident entries per transport, and `LAYERS.limit`
   bounds their layers;
 - for each connected device, its policy, HID forwarding state, readings and errors, and the
@@ -644,7 +644,7 @@ RAM holds only what accepting connections and translating input need:
 
 Nothing is resident for a disabled device, for a disconnected device beyond its reconnection entry,
 or for a profile no connection or configuration interface uses and whose edits are written. Device
-and profile listings, `GetDevice`, `GetProfile`, settings lists and every profile command read the
+and profile listings, `GetDevice`, `GetProfile`, settings lists, and every profile command read the
 files they need for each request. Saved device preferences are read when an integration applies
 them, when a reading is compared with them, and when a client lists them.
 
@@ -652,16 +652,16 @@ For change events, the serial session tracks which settings the client may hold 
 for devices with a connection, from the session's listings and events. A device's entry stays until
 the events that follow the end of its connection have been written, so listing disabled or
 disconnected devices keeps nothing. A settings event for a device that is not tracked reports each
-changed setting it has and removes each changed setting it no longer has. A device, settings or
+changed setting it has and removes each changed setting it no longer has. A device, settings, or
 profile event whose record read fails stays pending and backs off on its own with the connection
 backoff before it reads again; only its own success ends the backoff. Other events, and events that
 need no read, such as those of a connection that holds its policy, go ahead meanwhile. An event
 whose record is gone is dropped, since the record's removal event follows.
 
-Startup reads each device policy once, keeps a reconnection entry and loads the bond for each
+Startup reads each device policy once, keeps a reconnection entry, and loads the bond for each
 enabled device on an enabled transport that the stack has room for, in ascending ID order, and
 keeps nothing for the rest. Enabling a transport or a device reads the policies it needs again.
-Preference, layout and profile files are not read at startup; only the profile directory names are
+Preference, layout, and profile files are not read at startup; only the profile directory names are
 listed.
 
 When a connection starts, the Dongle reads the device's HID layout file and the `rules.pb` of each
@@ -670,17 +670,17 @@ profile another connected device or configuration interface already uses is shar
 again. The device's policy and saved preferences are read after its first input, or one second after
 the link connects when the device sends no input before then, and its `device` and
 `settings_changed` events, which read its policy, wait for the same. Only a report that reaches the
-input forwarder counts as input: keyboard rollover reports, HID++ responses and vendor reports of
+input forwarder counts as input: keyboard rollover reports, HID++ responses, and vendor reports of
 other services do not. Background work (reading policies and preferences, saving first-connection
 setup and discovered layouts, finishing unpairs, filling the stack, lost-record cleanup, syncing the
-stack's bonds, repairing profile roles and retrying failed storage work) waits until every
+stack's bonds, repairing profile roles, and retrying failed storage work) waits until every
 connection has forwarded input or waited one second for it. A pairing in progress does not wait.
 Commands and other devices' events can read records meanwhile, one at a time as described below.
 Failed background storage work is retried with the connection backoff and does not hold up other
 background work. Everything loaded for a connection is released when it ends; a profile is released
 when its last connection or configuration interface lets it go and its edits are written. A
 configuration interface releases its profile after five seconds without a packet, when its profile
-changes or when it is disabled, and writes its edits then.
+changes, or when it is disabled, and writes its edits then.
 
 A device or profile listing walks the record directory in ascending ID order and reads records one
 at a time. A directory whose record file is missing is left out when its record is read. Settings
@@ -696,32 +696,32 @@ from bond sync and resident admission, so those operations can progress while it
 Closing the session discards its events; cleanup continues without them.
 
 The adapter serializes bounded batches as ordinary list responses, concatenates their protobuf
-bytes and feeds one incremental COBS encoder. Each listing is one logical response in one frame.
+bytes, and feeds one incremental COBS encoder. Each listing is one logical response in one frame.
 Requests wait until that response finishes, and changes during it remain pending for subsequent
 events. File reads use a 512-byte working buffer and return the requested range in one response.
 An unbounded debug read returns the whole file. See
 [list streaming](protocol/compatibility.md#listings).
 
-Filesystem operations are synchronous. Two loops on one executor share the application, its storage
+Filesystem operations are synchronous. Two loops on one executor share the application, its storage,
 and the Bluetooth stack, one at a time:
 
 - The priority loop does what input needs right now: it polls the radio and handles every radio
   event, including the Bluetooth stack's own bond reads and connection setup with its layout and
   profile reads. Loading every record when the radio starts is a radio event too. When a pairing's
-  bond is ready, it only notes the bond. It translates input, hands reports to USB and sends
+  bond is ready, it only notes the bond. It translates input, hands reports to USB, and sends
   keyboard indicator output to devices.
-- The secondary loop does everything else: serial requests, events and output, configuration editor
-  packets, and background storage work, including deciding when USB enumerates again. It finishes a
+- The secondary loop does everything else: serial requests, events, and output; configuration editor
+  packets; and background storage work, including deciding when USB enumerates again. It finishes a
   pairing: it reads device policies one per step to find a re-paired device, then saves the bond and
   admits the link. Before each step it waits for a pass of the priority loop that left no radio
   event unhandled and no input report waiting for a host that is reading reports, or, while input
   keeps arriving, for a pass 5 ms after its last step ended, so continuous input cannot hold up
-  serial requests, configuration editors and background work indefinitely. Each step reads or
+  serial requests, configuration editors, and background work indefinitely. Each step reads or
   writes about one record: a command or background task that touches many records takes one step
-  per record, and a read, change and save of one record happens within one step. List production
-  alternates with turns for deferred saves, editor packets and background work, even when every
+  per record, and a read, change, and save of one record happens within one step. List production
+  alternates with turns for deferred saves, editor packets, and background work, even when every
   listed record is missing or corrupt. While list output is blocked, each secondary step can
-  advance that same work, including pairing, connection hydration and saved settings jobs. The
+  advance that same work, including pairing, connection hydration, and saved settings jobs. The
   response reserves the serial output until its delimiter, so events wait. Other commands finish
   before another request or background step runs. Requests go before new background work, and
   events and background work take turns. A dirty record that is due is written before the next
@@ -731,17 +731,17 @@ and the Bluetooth stack, one at a time:
 Input therefore waits for at most one step of the secondary loop at a time. A
 command whose session ends while it runs finishes, and its response is discarded with the rest of
 that session's output. LittleFS stays mounted between operations, because a mount reads every
-metadata pair. A failed write, or a read error other than a missing, too-long or wrong-type path,
+metadata pair. A failed write, or a read error other than a missing, too-long, or wrong-type path,
 drops the mount so the next operation mounts again from flash. Free space comes from a traversal of
 every metadata pair and file; the result is reused until the next write attempt. A check that admits
-new data, such as pairing, creating a profile, adding a setting or saving a layout, counts again
+new data, such as pairing, creating a profile, adding a setting, or saving a layout, counts again
 when a write came after the last count. Saving a layout also counts after its write, to remove it
 when it took the room kept for pairing. Otherwise the storage-full status is counted again by a
 background step after other work. The interface provides no asynchronous-latency guarantee.
 
 ## File access
 
-`ListFiles`, `ReadFile`, `WriteFile`, `MoveFile` and `DeleteFile` provide file
+`ListFiles`, `ReadFile`, `WriteFile`, `MoveFile`, and `DeleteFile` provide file
 access in debug firmware and during required host assistance in production.
 See [file commands](protocol/development.md#file-access). Downloads may contain
 Bluetooth secrets. The CLI keeps payloads out of event logs and uses private

@@ -1,7 +1,7 @@
 //! Host services of the desktop app: saved preferences and the Settings page, Start at Login,
-//! notifications and the tray icon.
+//! notifications, and the tray icon.
 //!
-//! Services never touch the app model from a callback. Notification clicks, tray menu items and
+//! Services never touch the app model from a callback. Notification clicks, tray menu items, and
 //! changes on the Settings page call [`Emit`] with a [`ServiceEvent`] for the app to handle.
 mod alerts;
 mod prefs;
@@ -139,7 +139,7 @@ impl Services {
         prefs::page(&self.store, &self.emit).upcast()
     }
 
-    /// Removes the tray icon, the notifications and the notification action.
+    /// Removes the tray icon, the notifications, and the notification action.
     pub fn shutdown(&mut self) {
         if std::mem::replace(&mut self.stopped, true) {
             return;

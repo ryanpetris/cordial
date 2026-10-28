@@ -25,7 +25,7 @@ pub enum DeviceKind {
     Gamepad,
 }
 
-/// How pairing authenticates: the user enters, confirms or reads a code.
+/// How pairing authenticates: the user enters, confirms, or reads a code.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PromptMethod {
     ConfirmPasskey,

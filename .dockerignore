@@ -1,4 +1,4 @@
-# Builds copy the checkout without its build outputs, caches or installed dependencies.
+# Builds copy the checkout without its build outputs, caches, or installed dependencies.
 .git
 **/__pycache__
 **/.embuild

@@ -6,7 +6,7 @@ use cordial_core::{
     settings::Catalog,
 };
 
-// Standard gamepad with six unsigned axes, 16 buttons and an eight-way nullable hat.
+// Standard gamepad with six unsigned axes, 16 buttons, and an eight-way nullable hat.
 const GAMEPAD: &[u8] = &[
     0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x09, 0x01, 0xa1, 0x00, 0x19, 0x30, 0x29, 0x35, 0x15, 0x00,
     0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x06, 0x81, 0x02, 0xc0, 0x05, 0x09, 0x19, 0x01, 0x29, 0x10,
@@ -898,7 +898,7 @@ fn public_descriptors_select_only_verified_control_geometry() {
         assert_eq!(map.gamepad(&state).axes_declared, axes);
         assert_eq!(map.gamepad(&state).axes_valid, 0);
     }
-    // Changing the report ID, range, usage, width, button set or offset rejects
+    // Changing the report ID, range, usage, width, button set, or offset rejects
     // the fixed convention even when the same number of axes/buttons remains.
     for (descriptor, pattern, replacement) in [
         (descriptors::DS4_BASIC, &[0x85, 1][..], &[0x85, 9][..]),

@@ -355,7 +355,7 @@ pub struct Settings {
     rows: Vec<Row>,
     readings: Vec<(Field, gtk::Label)>,
     figures: Vec<(&'static str, gtk::Label)>,
-    /// Why the settings couldn't be read, saved or applied, with Retry for a failed read.
+    /// Why the settings couldn't be read, saved, or applied, with Retry for a failed read.
     error: List,
     reload: Btn,
     /// Retry in each category's header, offered while one of its saved values failed to apply.
@@ -464,7 +464,7 @@ impl Settings {
         self.update_error(app, d);
     }
 
-    /// Shows why the settings couldn't be read, saved or applied.
+    /// Shows why the settings couldn't be read, saved, or applied.
     fn update_error(&mut self, app: &App<Live>, d: &DeviceView) {
         let key = (d.adapter.clone(), d.d.id);
         let submission = app.submission(&key.0, key.1);
@@ -705,7 +705,7 @@ fn number_text(v: Option<i64>) -> String {
 }
 
 /// A spin row for an integer that takes only digits, with its unit beside it, and shows nothing
-/// while the value is unknown. Stepping, Enter and leaving the row commit it, passing a new value
+/// while the value is unknown. Stepping, Enter, and leaving the row commit it, passing a new value
 /// to `apply`. Text that isn't a number in range puts back the row's value.
 fn number_row(
     field: Field,

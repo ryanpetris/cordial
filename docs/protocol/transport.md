@@ -1,18 +1,18 @@
-# USB discovery, framing and sessions
+# USB discovery, framing, and sessions
 
 [Protocol index](README.md)
 
 ## Discovery
 
 Automatic discovery selects USB devices by VID/PID `1209:c0d1` alone, read from the descriptors
-before the serial port is opened. Manufacturer, product and interface strings are not discovery
+before the serial port is opened. Manufacturer, product, and interface strings are not discovery
 keys. An explicitly selected port bypasses this filter.
 
 CDC occupies interfaces 0 and 1. The allocator adds the shared keyboard/mouse HID interface when
 configured devices require it, one interface per selected HID gamepad or XInput channel, and any
 selected configuration interface. An enabled editor can be absent when higher-priority interfaces
 use the available resources. See [USB allocation](hid-forwarding.md#usb-allocation). VIA and Vial use
-Raw HID with usage page `0xff60`, usage `0x61` and 32-byte reports. Endpoint numbers are not discovery
+Raw HID with usage page `0xff60`, usage `0x61`, and 32-byte reports. Endpoint numbers are not discovery
 keys either. The adapter calculates its allocation from saved preferences before starting USB.
 
 The adapter ID is 16 uppercase hexadecimal digits, and the USB serial number always starts with it.
@@ -85,12 +85,12 @@ ordinary traffic; the firmware does not.
 
 1. The host writes a delimiter and an empty `ClientHello` frame.
 2. The adapter answers with an `AdapterHello` holding its own operational revision. It may include
-   `firmware_version`, `serial_number` and `name`.
+   `firmware_version`, `serial_number`, and `name`.
 3. The host sends ordinary requests only after it has a valid `AdapterHello` naming a revision it
    implements.
 
 To the firmware, `ClientHello` is one more query. It accepts ordinary requests whether or not a
-hello came first, answers a hello at any point in a session and never learns or compares a host
+hello came first, answers a hello at any point in a session, and never learns or compares a host
 revision. A hello takes its turn with requests: the `AdapterHello` follows the responses to
 earlier requests and goes out as one complete frame. `ClientHello` has no fields. Nonempty bytes
 are never a `ClientHello`, so they cannot be confused with a `Request`.
@@ -108,14 +108,14 @@ Firmware constructs its hello from build and hardware metadata without reading s
 currently omits the name. This does not guarantee a response before initialization finishes;
 startup work holding the application owner lock can delay serial servicing. After a compatible
 handshake, `GetStatus` supplies the authoritative identity and saved adapter name. Only
-`protocol_version` is required; missing firmware version, serial number or name never prevents a
+`protocol_version` is required; missing firmware version, serial number, or name never prevents a
 compatible handshake.
 
 An `AdapterHello` is at most `MAX_HANDSHAKE_BYTES`, currently `1024` decoded protobuf bytes, and a
 `ClientHello` is always empty. Frames before the hello can be ordinary messages of any length, and
 none longer than the hello limit is accepted as a hello. The Rust client keeps its ordinary
 [receive limit](#rust-host-receive-limit) while it waits. The adapter hello decoders validate the complete bytes before generated decoding
-and reject missing, zero, duplicate, overflowing, wrong-wire or truncated versions and malformed
+and reject missing, zero, duplicate, overflowing, wrong-wire, or truncated versions and malformed
 protobuf structure. Field order does not matter. Nested fields do not count as the hello's version.
 Optional future fields are skipped, including opaque length-delimited contents and structurally
 valid groups. Field keys use at most five varint bytes. Groups may nest to depth `100`; a group at
@@ -139,20 +139,20 @@ requests.
 - A nonempty `Request` with no command set gets `ERROR_CODE_UNKNOWN_COMMAND`. That is also what
   firmware sees for a command added after it was built, because protobuf decodes an unknown `oneof`
   variant as an unset one. An empty frame is a `ClientHello`, not a `Request`.
-- A command with a missing required field, a value of the wrong type or a value out of range gets
+- A command with a missing required field, a value of the wrong type, or a value out of range gets
   `ERROR_CODE_BAD_ARGS`.
 - A `Response` with no result set means success with nothing to return. Commands that change saved
-  preferences, such as `SetAdapter`, `SetDevice`, `SetSettings` and `SetProfileRules`, respond this
+  preferences, such as `SetAdapter`, `SetDevice`, `SetSettings`, and `SetProfileRules`, respond this
   way once the change is durably saved.
 
-A failed request returns a complete `Response.error`, including its reason, outcome and related
+A failed request returns a complete `Response.error`, including its reason, outcome, and related
 errors. Neither a code nor missing outcome details proves that nothing happened. A listing's
 per-record `RecordError` is an entry, not a second response; a failure to continue the listing
 replaces the partial list with `Response.error` in the same frame. See
 [Listings](compatibility.md#listings) and [Errors](limits-and-errors.md#errors).
 
 Every command returns promptly. A command responds once it is accepted and any saved value is
-written; Bluetooth work that takes longer, such as connecting, pairing, scanning or disconnecting,
+written; Bluetooth work that takes longer, such as connecting, pairing, scanning, or disconnecting,
 reports its progress through events.
 
 Host request timeouts measure inactivity between incoming bytes rather than a fixed response
@@ -170,7 +170,7 @@ candidate, or the pairing. A client replaces what it had with the latest one.
 
 Settings are listed as complete lists of whole domain objects. `settings_changed` carries complete
 objects that changed or appeared, and references to those that went away. A client replaces objects
-by integration, group and optional component index, and ignores removal of an entry it does not
+by integration, group, and optional component index, and ignores removal of an entry it does not
 hold. A completed listing replaces the list before later events apply. Records and events carry
 no revision counters.
 Profile rules have no change event; a client lists them again when it needs a fresh view, such as
@@ -188,7 +188,7 @@ pending change events while preserving a pending terminal pairing result. A drai
 discard that result or `SessionEnding`, under the rules below.
 Events are written only when no response is waiting, and a client that stops reading holds
 back only the serial port, never HID forwarding. List production shares secondary steps with
-configuration editor packets, connection setup, settings jobs, pairing and deferred saves, even
+configuration editor packets, connection setup, settings jobs, pairing, and deferred saves, even
 when the host keeps reading or records yield no list entries. This work also runs while serial output
 is blocked. Cleanup of corrupt saved records waits for its removal and reference-change events to
 drain, retaining a bounded rescan cursor rather than every affected ID.
@@ -200,10 +200,10 @@ drain, retaining a bounded rescan cursor rather than every affected ID.
 - A client writes a `0x00` followed by `ClientHello`, so a partial frame left by an earlier
   client cannot merge with it. It validates `AdapterHello` before sending any ordinary request.
   Every new session repeats this exchange, including reconnects after USB reconfiguration.
-- Closing the port (DTR falling), USB reset or USB disconnection ends the session, including the USB
+- Closing the port (DTR falling), USB reset, or USB disconnection ends the session, including the USB
   reconnect that follows a USB allocation change. Clients discard incomplete received frames.
   Ending a session stops a running scan and cancels a pairing that has not saved its bond. A new
-  session starts with no events waiting and no scan candidates. Saved devices, connections, automatic reconnection and HID forwarding carry on
+  session starts with no events waiting and no scan candidates. Saved devices, connections, automatic reconnection, and HID forwarding carry on
   without a client.
 
 The Rust host clients cycle DTR low then high when opening a port and lower DTR
@@ -213,10 +213,10 @@ when they close it.
 
 With an open serial session, the Dongle sends `Event.session_ending` before intentionally
 disconnecting USB or resetting. The controller populates its structured `reason` with the trigger:
-`REBOOT`, `CONFIGURATION_CHANGE`, `DEVICE_CONNECTION`, `DEVICE_DISCONNECTION` or `BOOTLOADER`.
+`REBOOT`, `CONFIGURATION_CHANGE`, `DEVICE_CONNECTION`, `DEVICE_DISCONNECTION`, or `BOOTLOADER`.
 These describe why the session ends, rather than how USB disconnects. This includes autonomous
 allocation changes when a Bluetooth device connects or disconnects. No pending request, user
-action or request correlation is needed. Clients do not display the reason. The controller uses
+action, or request correlation is needed. Clients do not display the reason. The controller uses
 `UNKNOWN` for an unclassified trigger. An unspecified or unknown future reason retains the event's
 reconnect semantics.
 With no active session, the Dongle reconfigures or restarts without an event or serial drain.
@@ -235,7 +235,7 @@ and finishes that frame before sending `SessionEnding`. It does not finish the r
 A whole-file read also ends with `ERROR_CODE_BUSY`. Remaining bytes in its declared payload are
 zero-filled to close the protobuf field; the error makes the entire read invalid.
 Other pending coalesced change events are discarded; clients read fresh state in the new session.
-Further requests, hellos or state changes cannot starve the final event or extend the deadline.
+Further requests, hellos, or state changes cannot starve the final event or extend the deadline.
 A save that changes the actual USB allocation is durable before its response is sent.
 
 The Dongle waits for successful transport completion through the event's final `0x00` delimiter
@@ -254,7 +254,7 @@ received `SessionEnding` authorizes reconnect waiting for that adapter and sessi
 including `BOOTLOADER` and unspecified or unknown future reasons, have the same bounded wait.
 A disconnect without the event removes the adapter immediately, even after a command that might
 reconfigure or restart it. This deliberately gives ordinary sessions no reconnect hold with older
-firmware that sends no event. There is no interaction, capability or version fallback. The storage
+firmware that sends no event. There is no interaction, capability, or version fallback. The storage
 migration worker's separate reconnect-until-cancelled policy is unchanged.
 See [client retention and deadlines](clients.md#intentional-disconnects).
 

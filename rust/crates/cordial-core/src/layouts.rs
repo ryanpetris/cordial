@@ -1,6 +1,6 @@
 //! Saved HID layouts. Each bonded device's file is an optional cache that lets
 //! a later connection admit input without rediscovering the device. A missing,
-//! unreadable or unusable file means the backend discovers the device instead.
+//! unreadable, or unusable file means the backend discovers the device instead.
 use crate::bluetooth::{DatabaseHash, Layout, LayoutReport, ReportMap, ReportType};
 use crate::model::identifiers::Transport;
 use crate::storage::{self, Error, RecordKey, RecordStore, record_key};

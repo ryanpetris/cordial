@@ -818,7 +818,7 @@ fn raw_requests_wait_until_the_previous_reply_can_be_retained() {
 }
 
 /// Both loops, on loaded storage with device 77 connected and forwarding input, profiles 1 to
-/// `profiles` and saved devices 1 to `devices` that are disabled.
+/// `profiles`, and saved devices 1 to `devices` that are disabled.
 fn running(
     profiles: u64,
     devices: u64,
@@ -1046,7 +1046,7 @@ fn run(
 fn reads(store: &support::Store, kind: u8) -> usize {
     store.reads.iter().filter(|key| key[0] == kind).count()
 }
-/// Runs until the session has started, the connection's reports have been sent and background
+/// Runs until the session has started, the connection's reports have been sent, and background
 /// work has nothing left to read.
 fn settle(
     owner: &Owner<'static, support::Store, support::Radio>,

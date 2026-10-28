@@ -15,7 +15,7 @@ def normalize(config, profile):
         raise ValueError("ESP32-S3 uses its internal radio and a 40 MHz crystal")
     backend = config["bluetooth_backend"]
     if backend not in BACKENDS or config["usb_backend"] != "embassy" or config["storage_backend"] != "littlefs":
-        raise ValueError("ESP32-S3 requires a selected Bluetooth host, embassy USB and LittleFS")
+        raise ValueError("ESP32-S3 requires a selected Bluetooth host, embassy USB, and LittleFS")
     flash = integer(config["minimum_flash_bytes"], 4194304, 134217728, "minimum_flash_bytes")
     if flash & (flash - 1):
         raise ValueError("ESP32-S3 flash capacity must be a power of two")

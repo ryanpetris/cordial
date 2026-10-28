@@ -1,5 +1,5 @@
 //! Presentation of settings and the readings beside them. The adapter sends typed settings
-//! objects and information; names, grouping, choice wording and value parsing belong to the host.
+//! objects and information; names, grouping, choice wording, and value parsing belong to the host.
 //! Fields of integrations this build doesn't know are never shown.
 use crate::{
     controller::{SettingInput, State, Subject},

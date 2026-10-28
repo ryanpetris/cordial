@@ -1,4 +1,4 @@
-"""Check local runners, source freshness and the Docker build/export contract."""
+"""Check local runners, source freshness, and the Docker build/export contract."""
 import importlib.util
 import hashlib
 import io

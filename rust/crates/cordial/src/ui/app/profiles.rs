@@ -1,6 +1,6 @@
 //! Profiles: an adapter's profile memory, its configuration interfaces, each with a switch and a
 //! profile staged until Save, and the listed profiles a page at a time, each labelled with its
-//! roles, with creating, copying and deleting them at once. The picker of a profile for an
+//! roles, with creating, copying, and deleting them at once. The picker of a profile for an
 //! interface or a device's layers lists and pages on its own. Profile rules are never read or
 //! changed here.
 use super::{

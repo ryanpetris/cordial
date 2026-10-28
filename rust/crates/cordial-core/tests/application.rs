@@ -3410,7 +3410,7 @@ fn scans_leave_out_disabled_transports() {
 }
 
 // ---------------------------------------------------------------------------
-// Device residency, listings and saved records
+// Device residency, listings, and saved records
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -4842,7 +4842,7 @@ fn editors_expose_controls_and_mouse_buttons_and_reset_the_profile() {
         assert_eq!(reply[0], 4);
         u16::from_be_bytes([reply[4], reply[5]])
     };
-    // System Power, Media Select, mouse button 1 and button 6, which VIA's table cannot name.
+    // System Power, Media Select, mouse button 1, and button 6, which VIA's table cannot name.
     assert_eq!(read(&mut t, Interface::Via, 11, 0), 0xa5);
     assert_eq!(read(&mut t, Interface::Via, 11, 3), 0xaf);
     assert_eq!(read(&mut t, Interface::Via, 12, 3), 0xf4);
@@ -5357,7 +5357,7 @@ fn rules_saved_without_their_roles_summary_take_effect_and_the_summary_is_repair
             .0
             == 0
     );
-    // The repair waits for input to pause, fails too and backs off.
+    // The repair waits for input to pause, fails too, and backs off.
     for _ in 0..5 {
         t.poll();
     }

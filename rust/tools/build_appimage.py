@@ -166,11 +166,11 @@ def native_notices(appdir, documentation):
         stream.write(
             "\n## AppImage native libraries\n\n"
             "The native entries in `dependencies.json` identify the bundled Debian packages, "
-            "their source versions and the corresponding source download pages. "
+            "their source versions, and the corresponding source download pages. "
             "`notices/native/` contains their redistribution notices and referenced common licences. "
             "The shared libraries remain separate files under `usr/lib/` in the extracted AppImage. "
             "`notices/native/appimage-runtime/` contains the runtime and static dependency "
-            "licence texts, source revisions and build provenance.\n")
+            "licence texts, source revisions, and build provenance.\n")
 
 
 def runtime_notices(documentation, inventory):

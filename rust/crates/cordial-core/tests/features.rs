@@ -744,7 +744,7 @@ fn background_cancellation_keeps_completed_reads_and_disconnect_is_not_a_setting
             let p = d.packet().unwrap();
             if p[1] == 6 {
                 break;
-            } // Earlier name, battery and Fn reads completed.
+            } // Earlier name, battery, and Fn reads completed.
             d.respond(p);
         }
         assert!(d.info(cordial_core::model::info::InfoKey::Name).fresh);

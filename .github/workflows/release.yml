@@ -120,7 +120,7 @@ jobs:
         run: |
           (cd build/portable && sha256sum -c SHA256SUMS-linux)
           just HOST_ARCHIVE="build/portable/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz" package-host-arch
-      - name: Check installation, reinstall and removal
+      - name: Check installation, reinstall, and removal
         run: docker run --rm -v "$PWD:$PWD" -w "$PWD" -e CORDIAL_VERSION archlinux:base-devel packaging/check-arch.sh
       - uses: actions/upload-artifact@v7
         with:
@@ -166,7 +166,7 @@ jobs:
         run: |
           (cd build/portable && sha256sum -c SHA256SUMS-linux)
           just DEB_DISTRIBUTION=resolute HOST_ARCHIVE="build/portable/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz" package-host-deb
-      - name: Check installation, reinstall, removal and purge
+      - name: Check installation, reinstall, removal, and purge
         run: docker run --rm -v "$PWD:$PWD" -w "$PWD" -e CORDIAL_VERSION -e DEB_DISTRIBUTION '${{ matrix.image }}' packaging/check-deb.sh
       - uses: actions/upload-artifact@v7
         with:

@@ -1,4 +1,4 @@
-//! The foreground session with one adapter, shared by the shell, scripts and the TUI. It keeps
+//! The foreground session with one adapter, shared by the shell, scripts, and the TUI. It keeps
 //! the view current from the Dongle's events and runs each command on its own thread.
 pub use crate::view::{SessionId, State};
 use crate::{
@@ -162,7 +162,7 @@ pub enum Toggle {
     Hidpp,
 }
 
-/// A device, candidate or profile as a command names it: an ID, or a name to look up.
+/// A device, candidate, or profile as a command names it: an ID, or a name to look up.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Target {
     Id(u32),
@@ -331,7 +331,7 @@ pub enum Command {
 }
 
 impl Command {
-    /// Runs without adapter readiness: inspection, file access and recovery work while
+    /// Runs without adapter readiness: inspection, file access, and recovery work while
     /// Bluetooth or storage is unavailable.
     pub fn direct(&self) -> bool {
         matches!(
@@ -438,7 +438,7 @@ pub enum Outcome {
     },
     /// Every saved profile.
     Profiles(p::ProfileList),
-    /// A created, copied, shown or looked up profile.
+    /// A created, copied, shown, or looked up profile.
     Profile(p::Profile),
     ProfileDeleted(p::Profile),
     /// A profile and its rules: every rule as listed, or the input's rule as a change saved it,

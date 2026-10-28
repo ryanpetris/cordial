@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Runs a script against the simulated Dongle and returns its result, output and
+/// Runs a script against the simulated Dongle and returns its result, output, and
 /// diagnostics.
 fn script(
     dongle: &Dongle,

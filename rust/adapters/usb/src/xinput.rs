@@ -173,7 +173,7 @@ impl Input {
     }
 
     /// OR explicit Generic Desktop controls with numbered buttons and the hat.
-    /// D-pad bits are Up, Down, Right and Left; opposite directions remain held.
+    /// D-pad bits are Up, Down, Right, and Left; opposite directions remain held.
     pub fn with_controls(mut self, dpad: u8, start: bool, select: bool) -> Self {
         self.0[0] |= (dpad & 3)
             | ((dpad & 4) << 1)

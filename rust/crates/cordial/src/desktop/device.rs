@@ -1,7 +1,7 @@
-//! A saved device's page: its battery, connection switches, settings and details, with Profiles
-//! and Diagnostics opening from it. Switches, settings and Profiles layers apply each change as it
-//! is made; Forget asks first. Refresh, Connect and Disconnect are in the page's menu. Warnings,
-//! identifiers and connection errors belong to Diagnostics.
+//! A saved device's page: its battery, connection switches, settings, and details, with Profiles
+//! and Diagnostics opening from it. Switches, settings, and Profiles layers apply each change as it
+//! is made; Forget asks first. Refresh, Connect, and Disconnect are in the page's menu. Warnings,
+//! identifiers, and connection errors belong to Diagnostics.
 use super::{
     profiles::Layers,
     settings::Settings,

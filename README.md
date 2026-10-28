@@ -5,12 +5,12 @@
 <h1 align="center">Cordial</h1>
 
 <p align="center">
-  <strong>Your Bluetooth keyboard, mouse and gamepad, as plain USB.</strong>
+  <strong>Your Bluetooth keyboard, mouse, and gamepad, as plain USB.</strong>
 </p>
 
 <p align="center">
   Cordial turns a small, inexpensive microcontroller board into an adapter that pairs
-  with your Bluetooth keyboards, mice and gamepads and presents them to the computer as ordinary
+  with your Bluetooth keyboards, mice, and gamepads and presents them to the computer as ordinary
   USB devices. No host Bluetooth, no drivers, no software running in the background.
 </p>
 
@@ -32,19 +32,19 @@
 
 ## Features
 
-- The computer receives input over USB. It needs no Bluetooth radio, no pairing and
+- The computer receives input over USB. It needs no Bluetooth radio, no pairing, and
   no drivers.
 - Pairings and preferences live on the adapter. Move it to another computer and your devices come
   with it.
 - Input forwarding happens on the adapter. The app is for setup and status; quit it and your
   keyboard carries on.
 - Bluetooth connections survive host sleep, and nothing you typed meanwhile is replayed on wake.
-- On Logitech HID++ keyboards and mice, special keys are translated for Linux, Windows or macOS.
-  Backlight, DPI, SmartShift and scroll direction are adjustable, and battery level is reported.
+- On Logitech HID++ keyboards and mice, special keys are translated for Linux, Windows, or macOS.
+  Backlight, DPI, SmartShift, and scroll direction are adjustable, and battery level is reported.
 - RP2040 and RP2350 boards can forward controllers as HID or XInput [gamepads](docs/gamepads.md).
-- [Input profiles](docs/input-profiles.md) remap keys, mouse buttons and controller inputs on the
+- [Input profiles](docs/input-profiles.md) remap keys, mouse buttons, and controller inputs on the
   adapter. Edit key and mouse rules with VIA or Vial, and any rule with the CLI.
-- The native GTK4/libadwaita desktop app shows adapter and device status, settings and profiles.
+- The native GTK4/libadwaita desktop app shows adapter and device status, settings, and profiles.
   The same `cordial` executable provides an interactive shell, one-shot commands with JSON output,
   and a full-screen TUI.
 
@@ -69,7 +69,7 @@ works with any computer.
 
 Download the package for your distribution from the
 [latest release](https://github.com/ryanpetris/cordial/releases/latest). The `cordial` package
-includes the GNOME application, CLI and TUI.
+includes the GNOME application, CLI, and TUI.
 
 On Arch Linux:
 

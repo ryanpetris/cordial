@@ -1,4 +1,4 @@
-//! Adapter sessions and injectable connection, discovery and migration backends.
+//! Adapter sessions and injectable connection, discovery, and migration backends.
 use crate::{
     controller::{Command, Controller, RunOptions, State, Ticket},
     migration::{self, Engine, Worker},
@@ -79,7 +79,7 @@ impl Live {
         self
     }
 
-    /// Uses supplied connections, port discovery and migration for simulation or tests.
+    /// Uses supplied connections, port discovery, and migration for simulation or tests.
     pub fn with_backend(
         mut self,
         connector: Arc<crate::controller::Connector>,

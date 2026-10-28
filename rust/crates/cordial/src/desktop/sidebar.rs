@@ -1,7 +1,7 @@
 //! The sidebar: the Overview and Settings, then each adapter followed by its saved devices, each
 //! on one line, dimmed while disconnected. Separators set the adapters apart. An adapter's
-//! row has a context menu, opened by a secondary click, a long press, the Menu key or
-//! Shift+F10, to connect, disconnect or rename it.
+//! row has a context menu, opened by a secondary click, a long press, the Menu key, or
+//! Shift+F10, to connect, disconnect, or rename it.
 //!
 //! Search opens from the header's start, or with Ctrl+F or typing while the sidebar has focus,
 //! and its results take the list's place while it has text. A result opens its page and shows

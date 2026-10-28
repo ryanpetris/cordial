@@ -32,29 +32,29 @@ show the Dongle's error without refreshing when it refuses anyway.
 | Command | Result | Behavior |
 | --- | --- | --- |
 | `GetStatus` | `Status` | Refreshes the storage readings first. |
-| `SetAdapter` | none | Partial update of the name, host platform, enabled transports and configuration interfaces, saved together. A name is 1..64 UTF-8 bytes without control characters, trimmed; `""` restores the firmware default. Transport updates apply in order; one for a transport the firmware does not support returns `ERROR_CODE_UNSUPPORTED` and changes nothing. Any transport may be disabled, including all of them. An unchanged value writes nothing. A platform change reconfigures special-key translation on every connected device with HID++ on and re-applies its saved settings. Disabling a transport closes its links, fails a pairing over it that has not saved its bond with `ERROR_CODE_UNSUPPORTED`, drops it from a running scan (ending the scan when no transport is left), stops reconnecting its devices and declines their connections, and makes its saved devices inactive with `INACTIVE_REASON_TRANSPORT_DISABLED`. Enabling it makes them eligible again: after the response, the Dongle reads their saved records in the background, and a `device` event reports each device that becomes resident. Configuration interface changes are described under [Profiles](#profiles). |
+| `SetAdapter` | none | Partial update of the name, host platform, enabled transports, and configuration interfaces, saved together. A name is 1..64 UTF-8 bytes without control characters, trimmed; `""` restores the firmware default. Transport updates apply in order; one for a transport the firmware does not support returns `ERROR_CODE_UNSUPPORTED` and changes nothing. Any transport may be disabled, including all of them. An unchanged value writes nothing. A platform change reconfigures special-key translation on every connected device with HID++ on and re-applies its saved settings. Disabling a transport closes its links, fails a pairing over it that has not saved its bond with `ERROR_CODE_UNSUPPORTED`, drops it from a running scan (ending the scan when no transport is left), stops reconnecting its devices and declines their connections, and makes its saved devices inactive with `INACTIVE_REASON_TRANSPORT_DISABLED`. Enabling it makes them eligible again: after the response, the Dongle reads their saved records in the background, and a `device` event reports each device that becomes resident. Configuration interface changes are described under [Profiles](#profiles). |
 | `Restart` | none | Available in every mode, including assisted and blocked storage. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. Under the [session ending rules](transport.md#intentional-session-endings), the Dongle sends its empty response followed by `SessionEnding` with reason `REBOOT`, drains both within the backend's deadline, then performs a full hardware reset. It doesn't validate or convert files. |
 | `EnterBootloader` | none | Development firmware only. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. Under the [session ending rules](transport.md#intentional-session-endings), the Dongle stops accepting requests, sends its response followed by `SessionEnding` with reason `BOOTLOADER`, and drains both within the backend's deadline. It releases held input and reboots into ROM programming mode (BOOTSEL on Pico, download mode on ESP32-S3). Saved data is untouched. |
 
 An `adapter` event follows any change to the name, platform, enabled transports, configuration
-interfaces, readiness or adapter information. Best-effort storage recounts also report changes
+interfaces, readiness, or adapter information. Best-effort storage recounts also report changes
 to storage byte counts or their presence.
 
 ## File access and storage migration
 
-`ListFiles`, `ReadFile`, `WriteFile`, `MoveFile` and `DeleteFile` operate on the
+`ListFiles`, `ReadFile`, `WriteFile`, `MoveFile`, and `DeleteFile` operate on the
 application filesystem in debug firmware and automatically during required host
 assistance in production. See [file access](development.md#file-access) for path
-validation, bounded reads, atomic writes and availability.
+validation, bounded reads, atomic writes, and availability.
 
-After a compatible permanent hello, `GetStatus` remains available before storage, identity and
+After a compatible permanent hello, `GetStatus` remains available before storage, identity, and
 radio startup. Hosts read bootstrap status and check
 `Status.information.target_storage_format` for exact support before any other command.
 `Status.information.storage_format` reports the committed root's format for
 display only.
 
 Assisted mode reports `ERROR_CODE_STORAGE_MIGRATION_REQUIRED` with reason `STORAGE` and
-outcome `NO_EFFECT` in `Status.errors`, enables the shared file commands and
+outcome `NO_EFFECT` in `Status.errors`, enables the shared file commands, and
 disables ordinary commands. Firmware selects the mode at boot and keeps it until
 the next restart, even after `/format.pb` reaches the target format. Any other
 status error, or related errors on the marker, blocks host conversion. Without
@@ -62,11 +62,11 @@ the marker, clients never start a migration and treat readiness and errors as
 usual.
 
 The host downloads the whole dataset, converts it when it isn't already in the
-target format, uploads `/format.pb` last and verifies it by reading it back. An
+target format, uploads `/format.pb` last, and verifies it by reading it back. An
 intermediate checkpoint is an ordinary root upload and readback, followed by the
 next conversion step. After the final root, the host sends `Restart`. It then
 reconnects to the same stable `Status.id` and requires the same supported target,
-`ready = true` and no `ERROR_CODE_STORAGE_MIGRATION_REQUIRED`. See
+`ready = true`, and no `ERROR_CODE_STORAGE_MIGRATION_REQUIRED`. See
 [preserving migration](../storage-format.md#preserving-migration).
 
 ## Discovery and pairing
@@ -80,7 +80,7 @@ reconnects to the same stable `Status.id` and requires the same supported target
 | `RejectPrompt` | none | Rejects the open prompt; pairing fails with `ERROR_CODE_REJECTED`. |
 | `CancelPairing` | none | Cancels a pairing that has not saved its bond. |
 
-Candidates arrive as `scan_found` events, again whenever a candidate's name, kinds or signal
+Candidates arrive as `scan_found` events, again whenever a candidate's name, kinds, or signal
 changes, and the scan ends with a `scan_done` event. `ScanDone.count` is the number retained.
 At most 32 candidates are kept; dropping candidates reports `NO_CAPACITY` with reason
 `SCAN_CANDIDATES` in `ScanDone.error`. Exhausting candidate IDs reports `INTERNAL` with the same
@@ -93,7 +93,7 @@ of HID support. An enabled saved BLE device advertising its identity alone is no
 
 `StartPairing` refuses a blocked saved device, a transport the firmware cannot pair or has
 disabled, a full flash (`ERROR_CODE_NO_CAPACITY` with `ERROR_REASON_STORAGE`, also reported as
-`ERROR_CODE_STORAGE_FULL` in `Status.errors`) and a full connection table
+`ERROR_CODE_STORAGE_FULL` in `Status.errors`), and a full connection table
 (`ERROR_REASON_CONNECTIONS`). A saved device is recognized from the candidate's address when the
 address is its identity or the stack can resolve it; a disabled device advertising a private
 address is recognized only once pairing reveals its
@@ -101,7 +101,7 @@ identity, and a blocked one then fails with `ERROR_CODE_BLOCKED` without changin
 closes the selected device's own link and any setup link first, and never an unrelated working
 device.
 
-Progress arrives as `pairing` events: `connecting`, then `enter_code`, `confirm_code` or
+Progress arrives as `pairing` events: `connecting`, then `enter_code`, `confirm_code`, or
 `show_code` when the method needs the user, then `done` with the saved device ID or `error` with
 a full `Error`. Just Works pairing goes straight from `connecting` to `done`. A prompt expires after
 30 seconds and the whole pairing after 120.
@@ -111,8 +111,8 @@ unchanged. In a pairing error, `NO_EFFECT` confirms unchanged saved bonds, `UNKN
 cannot be confirmed, and `COMPLETE` confirms the bond save despite a later failure. The other
 generic outcomes retain their meanings; these values are not exhaustive. Cleanup failures remain
 in `related` with their own cleanup outcomes and never replace uncertain bond-save evidence.
-Cancellation, session end and restart do not undo a bond already saved. Pairing a device that is
-already saved renews its bond in place, keeping its ID, name and preferences, including whether it
+Cancellation, session end, and restart do not undo a bond already saved. Pairing a device that is
+already saved renews its bond in place, keeping its ID, name, and preferences, including whether it
 is enabled; a disabled device connects once it is enabled.
 
 A newly paired device is saved trusted and unblocked, with no integration enabled; its first
@@ -126,7 +126,7 @@ its own; there is no separate connect step.
 | --- | --- | --- |
 | `ListDevices` | `DeviceList` | All saved devices in ascending ID order. A record read failure is an `error` entry carrying `RecordError { id, error }`; the listing continues past it. |
 | `GetDevice` | `Device` | One saved device. |
-| `SetDevice` | none | Partial update of `enabled`, `trusted`, `blocked`, integration preferences, output preferences and profile layers, saved in one write. Integration and output updates apply in order. Turning `enabled` off or `blocked` on closes the device's link. |
+| `SetDevice` | none | Partial update of `enabled`, `trusted`, `blocked`, integration preferences, output preferences, and profile layers, saved in one write. Integration and output updates apply in order. Turning `enabled` off or `blocked` on closes the device's link. |
 | `ConnectDevice` | `Device` | Clears a disconnect pause and starts connecting, or joins an attempt already running. Refused for a disabled or blocked device and while a pairing runs. |
 | `DisconnectDevice` | `Device` | Closes the link and pauses automatic reconnection until `ConnectDevice` or a restart. |
 | `UnpairDevice` | none | Pauses and disconnects the device, then deletes its bond and settings once the link is gone; `device_removed` follows. |
@@ -137,10 +137,10 @@ response `Error`. After acceptance, connection progress and failure arrive in `E
 `Device.state` and `Device.errors`; a connection attempt times out after 30
 seconds and records `ERROR_CODE_TIMEOUT` without pausing automatic reconnection.
 
-### Enabled, trusted and blocked
+### Enabled, trusted, and blocked
 
 Enabled is the saved preference that lets a device connect. Eligible devices are loaded into the
-Bluetooth stack's bond table to reconnect, recognize incoming connections and encrypt their links;
+Bluetooth stack's bond table to reconnect, recognize incoming connections, and encrypt their links;
 a disabled device stays saved but cannot connect. Each transport reports its allowance as
 `DEVICES.limit` in `TransportSupport.resources`, with one additional native bond entry kept free
 for pairing. The table holds every enabled, unblocked
@@ -177,7 +177,7 @@ client.
 
 ### Lost records
 
-Every saved device has a bond. If a device's saved record turns out to be missing, undecodable or
+Every saved device has a bond. If a device's saved record turns out to be missing, undecodable, or
 holding a bond that does not belong to it, at startup or when the Dongle next reads it, the Dongle
 deletes the device and its settings as an unpair would and sends `device_removed`; the user pairs it
 again as a new device.
@@ -199,14 +199,14 @@ with outcome `UNKNOWN` does not confirm which policy is durable. An empty list c
 Clients gate these writes on advertised support because older firmware ignores unknown fields.
 
 A missing Gamepad preference means Disabled. Saving HID or XInput contributes configured candidates
-for that mode even while the device is disconnected, disabled or blocked. The `SLOTS.limit` in
+for that mode even while the device is disconnected, disabled, or blocked. The `SLOTS.limit` in
 `OutputModeSupport.resources` limits USB allocation, not how many paired devices may save the
 choice. Valid preferences save even when their requested interfaces cannot fit. Pairing, unpairing,
-connection and profile changes all use the same allocator; USB reconnects only when its actual
+connection, and profile changes all use the same allocator; USB reconnects only when its actual
 allocation changes. Connected-device requirements can preempt lower-priority interfaces.
 See [live output states and pool rules](records.md#devices) and
 [USB gamepad behavior](hid-forwarding.md#usb-gamepad-outputs). Client controls,
-CLI commands and human-readable slot numbering are described in
+CLI commands, and human-readable slot numbering are described in
 [Gamepad outputs](clients.md#gamepad-outputs).
 
 ## Settings
@@ -265,12 +265,12 @@ client's behalf. Every rule and `ProfileRuleRef` requires both an `input` usage 
 collection, so the same usage in Mouse and Game Pad collections identifies different inputs.
 A rule is refused with `ERROR_CODE_BAD_ARGS`, and nothing is saved, when its input and collection
 are outside `ProfileSupport.ranges` of kind `KIND_REMAP_INPUT` for a remap, `KIND_SCALE_INPUT`
-for a scale or `KIND_AXIS_INPUT` for an axis rule, when a remap has an output outside ranges of
+for a scale, or `KIND_AXIS_INPUT` for an axis rule, when a remap has an output outside ranges of
 kind `KIND_REMAP_OUTPUT` or more outputs than `OUTPUTS.limit` in `ProfileSupport.resources`, or
 when a scale has a zero numerator or denominator. An axis rule's `destination` must be within ranges of kind
 `KIND_AXIS_OUTPUT` in the input's Game Pad collection. Unknown and unspecified kinds grant no
 capability. Axis rules apply only to absolute Game Pad axes; `invert` reverses the normalized
-axis range. They add no deadzones, curves or sensitivity settings. A save that would make the
+axis range. They add no deadzones, curves, or sensitivity settings. A save that would make the
 profile larger than `MEMORY.limit` in `ProfileSupport.resources` returns `ERROR_CODE_NO_CAPACITY` with
 `ERROR_REASON_PROFILE_MEMORY`, since it could never be loaded. The Dongle applies every rule it
 accepts to every device that uses the profile, whatever kind of device it is. The number of saved
@@ -297,7 +297,7 @@ ratio equal to 1, or maps an axis to itself without inversion changes nothing. S
 the rule for that input and collection, through the serial API and through a configuration
 interface alike. An input keeps the application collection of its report. Game Pad inputs use
 Game Pad (`01:05`), independently of Mouse (`01:02`), Keyboard (`01:06`), Consumer Control
-(`0c:01`) and System Control (`01:80`) inputs with the same usage.
+(`0c:01`), and System Control (`01:80`) inputs with the same usage.
 
 These limits apply to saves. A saved profile that a later firmware's limits no longer allow is kept
 as saved. A rule whose input or output the firmware does not support has no effect. Only the first
@@ -333,8 +333,8 @@ is enabled.
 When a device's connection starts, the Dongle takes the device's layers from its resident
 reconnection entry and loads every profile in them before the device's first input is forwarded. A
 profile already loaded for another connected device or a configuration interface is shared and costs
-nothing more. Loading profiles waits only for their flash reads, never for HID++ setup, a client or
-USB. Commands, events and background storage work read or write about one record at a time, and a
+nothing more. Loading profiles waits only for their flash reads, never for HID++ setup, a client, or
+USB. Commands, events, and background storage work read or write about one record at a time, and a
 step that writes may count free space again. Each step waits until radio events have been handled
 and pending input has been sent to a host that is reading it, so loading a starting connection's
 profiles waits for at most one such step already in progress. A command that

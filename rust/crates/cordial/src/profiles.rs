@@ -455,7 +455,7 @@ fn output_words(o: &profile_rule::Output) -> String {
 }
 
 /// A rule as the CLI spells it, in the form `profile rule` takes: `INPUT remap OUTPUTS`,
-/// `INPUT scale N/D` or `INPUT axis AXIS [invert]`.
+/// `INPUT scale N/D`, or `INPUT axis AXIS [invert]`.
 pub fn rule_words(rule: &p::ProfileRule) -> String {
     let input = input_words(&rule_ref(rule));
     let effect = match &rule.effect {
@@ -599,7 +599,7 @@ pub fn rule_refusal(support: &p::ProfileSupport, rule: &p::ProfileRule) -> Optio
                 )
             })
         }
-        None => Some("a rule needs a remap, a scale or an axis".into()),
+        None => Some("a rule needs a remap, a scale, or an axis".into()),
     }
 }
 

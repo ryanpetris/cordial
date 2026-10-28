@@ -1,5 +1,5 @@
-//! A saved device's page: Details, Settings, Profiles and Diagnostics. The Details switches and
-//! the Profiles layers each stage their changes until their own Save; Connect, Disconnect and
+//! A saved device's page: Details, Settings, Profiles, and Diagnostics. The Details switches and
+//! the Profiles layers each stage their changes until their own Save; Connect, Disconnect, and
 //! Forget act at once.
 use super::{
     Action, App, Dialog, Job, Kind, PickFor, Spot, Tab, Toggle, fleet::Fleet, words,

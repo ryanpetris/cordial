@@ -869,7 +869,7 @@ fn record_ids_page_record_directories_in_ascending_numeric_order() {
     });
 }
 
-/// Counts reads, fails every access while `fail` is set and fails writes and
+/// Counts reads, fails every access while `fail` is set, and fails writes and
 /// erases while `fail_writes` is set.
 struct ProbeFlash {
     flash: Flash,

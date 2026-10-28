@@ -1,15 +1,15 @@
 // The records the Dongle saves in its LittleFS filesystem. Each file holds one message, encoded as
 // protobuf without framing or length prefix; docs/storage-format.md names the message of each path.
-// Every file has exactly one nonzero uint32 format field at tag 1. Its number, type and meaning
+// Every file has exactly one nonzero uint32 format field at tag 1. Its number, type, and meaning
 // remain stable across formats, so readers check it before interpreting the remaining fields.
 //
 // Fields follow the kinds in docs/protocol/compatibility.md. A field marked Required must be set
 // for the record to be valid, and the firmware checks it. A plain field reads its zero value as its
 // default. An `optional` scalar or a message field has explicit presence. Later firmware adds
 // fields whose zero value or absence means what earlier firmware did, and never changes the number,
-// type or meaning of an existing field within a format. Breaking changes use a new format.
+// type, or meaning of an existing field within a format. Breaking changes use a new format.
 // Firmware ignores unknown fields, and leaves out entries of repeated fields whose transport,
-// integration, configuration interface or role is unknown or unspecified. An unknown host platform
+// integration, configuration interface, or role is unknown or unspecified. An unknown host platform
 // reads as Linux.
 syntax = "proto3";
 
@@ -39,7 +39,7 @@ message Identity {
 }
 
 // /adapter.pb: the adapter's preferences. Without the file, the adapter uses the image's default
-// name, Linux, BLE alone and no configuration interface.
+// name, Linux, BLE alone, and no configuration interface.
 message Adapter {
   // Required. The storage format of this file.
   uint32 format = 1;
@@ -297,7 +297,7 @@ enum ReportType {
   REPORT_TYPE_FEATURE = 3;
 }
 
-// One HID Report characteristic. Service, type and ID are unique within a layout.
+// One HID Report characteristic. Service, type, and ID are unique within a layout.
 message Report {
   // The index of the owning service in `Layout.maps`.
   uint32 service = 1;
@@ -330,7 +330,7 @@ message Rules {
   // Required. The storage format of this file.
   uint32 format = 1;
   // Required: at least one. Sorted by input, then collection, with at most one rule for each
-  // input and collection together, so rules can be searched, read or skipped one at a time.
+  // input and collection together, so rules can be searched, read, or skipped one at a time.
   repeated Rule rules = 2;
 }
 

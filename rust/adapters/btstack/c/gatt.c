@@ -1,6 +1,6 @@
 // HID over GATT through public GATT client APIs: one discovery of the HID
-// services, their report maps and Report characteristics, CCCD writes,
-// notification routing, and service-aware report reads and writes.
+// services, their report maps, and Report characteristics; CCCD writes;
+// notification routing; and service-aware report reads and writes.
 #include "profiles_internal.h"
 #include <string.h>
 
@@ -8,7 +8,7 @@ enum { QUERY_IDLE, QUERY_DISCOVER, QUERY_SUBSCRIBE, QUERY_READ, QUERY_WRITE, QUE
 enum { STAGE_HASH, STAGE_SERVICES, STAGE_CHARACTERISTICS, STAGE_MAP, STAGE_DESCRIPTORS, STAGE_REFERENCE, STAGE_LAYOUT };
 // An error response, including the host's Invalid PDU for a truncated one,
 // as opposed to the host's own statuses for a disconnect, missing bond,
-// mismatch or timeout.
+// mismatch, or timeout.
 static bool device_error(uint8_t status) {
     return status && status != ATT_ERROR_HCI_DISCONNECT_RECEIVED && status != ATT_ERROR_BONDING_INFORMATION_MISSING
         && status != ATT_ERROR_DATA_MISMATCH && status != ATT_ERROR_TIMEOUT;
@@ -235,7 +235,7 @@ void cordial_gatt_poll(cordial_connection *l) {
     if (!l->ready || l->closing || l->peer.transport != CORDIAL_BLE) return;
     if (l->query || l->writing || l->reading || l->info.pending) return;
     if (owner == l && step_due) { step_due = false; step(l); return; }
-    // Verify a supplied layout once its CCCDs, early input and the first
+    // Verify a supplied layout once its CCCDs, early input, and the first
     // information pass are done, or at once when one of its CCCD writes failed.
     if (l->cached && l->setup == SETUP_IDLE && !owner && !cordial_early_pending(l->handle) &&
         (l->resubscribe || cordial_info_settled(l)))

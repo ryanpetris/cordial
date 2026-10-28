@@ -1,5 +1,5 @@
 //! Readers for the protocol's records: enum fields as their known values, resources and errors,
-//! integration status and the pairing step.
+//! integration status, and the pairing step.
 use cordial_protocol::{
     self as p, CodeKind, DeviceState, ErrorCode, InactiveReason, IntegrationKind, IntegrationState,
     Kind, OutputMode, Platform, ResourceType, Role, Transport, integration, pairing,
@@ -187,7 +187,7 @@ pub fn storage_full(st: &p::Status) -> bool {
     has_error(st, ErrorCode::StorageFull)
 }
 
-/// Development firmware, which answers the file, feature and bootloader commands.
+/// Development firmware, which answers the file, feature, and bootloader commands.
 pub fn development(st: &p::Status) -> bool {
     st.information
         .as_ref()

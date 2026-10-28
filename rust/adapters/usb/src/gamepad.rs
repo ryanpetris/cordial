@@ -59,7 +59,7 @@ impl Report {
     }
 
     /// Add explicit Generic Desktop controls without conflating them with
-    /// numbered buttons or the hat. D-pad bits are Up, Down, Right and Left.
+    /// numbered buttons or the hat. D-pad bits are Up, Down, Right, and Left.
     pub fn with_controls(mut self, dpad: u8, start: bool, select: bool) -> Self {
         self.0[17] = (dpad & 0x0f) | (u8::from(start) << 4) | (u8::from(select) << 5);
         self

@@ -64,5 +64,5 @@ pub const STORAGE_MIGRATION_PATH_BYTES: usize = 192;
 pub const STORAGE_MIGRATION_MAX_FILES: usize = 16_384;
 /// Maximum checked total input bytes accepted by a host, independent of adapter capacity.
 pub const STORAGE_MIGRATION_MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
-/// Host RAM budget for migration input, output and working allocations together.
+/// Host RAM budget for migration input, output, and working allocations together.
 pub const STORAGE_MIGRATION_MAX_MEMORY_BYTES: usize = 256 * 1024 * 1024;

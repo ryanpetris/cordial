@@ -6,10 +6,10 @@ physical switch layout of the connected keyboard, and using it requires no Host 
 configuration.
 
 A profile is a named set of rules on HID usages, the numbers USB and Bluetooth devices use to
-identify each key, button, axis and media control. It is not tied to keyboards, mice or any other
+identify each key, button, axis, and media control. It is not tied to keyboards, mice, or any other
 kind of device: the adapter applies whichever rules match the input a device produces.
 
-- A remap rule makes an on/off input, such as a key, mouse button, media key or Game Pad button,
+- A remap rule makes an on/off input, such as a key, mouse button, media key, or Game Pad button,
   hold a fixed set of outputs instead, or disables it. Outputs can belong to different application
   collections, such as a Game Pad button holding a mouse button or a keyboard key with modifiers.
 - A scale rule multiplies a relative value, such as pointer motion or a scroll wheel, by a ratio.
@@ -25,12 +25,12 @@ usage. A profile has at most one rule for each input usage and collection togeth
 A new profile is empty: every input passes through unchanged until a rule applies to it. The
 adapter reports which usages and collections each rule type can name, which outputs it can produce,
 and how much memory loaded profiles can use. It derives the profile's roles from its rules' input
-collections, so clients can label it as keyboard, mouse, media, system control or gamepad, or several.
+collections, so clients can label it as keyboard, mouse, media, system control, or gamepad, or several.
 Outputs do not add roles. A Game Pad button remapped to a Mouse output gives the profile the gamepad
 role.
 
-Remaps cover Game Pad buttons, Start, Select and directional controls. Axis rules cover the advertised
-absolute Game Pad axes. Clients match `ProfileSupport.ranges` by capability kind, collection and
+Remaps cover Game Pad buttons, Start, Select, and directional controls. Axis rules cover the advertised
+absolute Game Pad axes. Clients match `ProfileSupport.ranges` by capability kind, collection, and
 usage to determine what the adapter accepts. `UsageRange.Kind` distinguishes remap inputs and
 outputs, scale inputs, and axis inputs and outputs. Unknown and unspecified kinds grant no
 capability. The same usage and collection may appear separately under several kinds. A remap output may omit its collection only when exactly one advertised output
@@ -46,7 +46,7 @@ device's original controller inputs, not builtin-normalized inputs.
 
 HID and XInput share the same profiles and mapped HID state. XInput applies only a fixed conversion
 of the canonical HID buttons and axes. Builtins exist only in firmware and are never stored,
-listed or reported as user profiles.
+listed, or reported as user profiles.
 
 ## Layers and editing
 
@@ -121,15 +121,15 @@ Both editors use the [Raw HID control report behavior](protocol/hid-forwarding.m
 Commands receive replies on interrupt IN; control reads return a snapshot without consuming a reply.
 
 The virtual keyboard presents Keyboard/Keypad usages 0x04..0xa4, the eight modifiers 0xe0..0xe7,
-seven media controls (Next Track, Previous Track, Stop, Play/Pause, Mute, Volume Up and Volume
-Down), the System Power Down, Sleep and Wake Up controls, the other 16 Consumer controls QMK's
+seven media controls (Next Track, Previous Track, Stop, Play/Pause, Mute, Volume Up, and Volume
+Down), the System Power Down, Sleep, and Wake Up controls, the other 16 Consumer controls QMK's
 basic keycodes name (Media Select, Eject, Mail, Calculator, My Computer, the seven browser
-controls, Fast Forward, Rewind, Brightness Up and Brightness Down), and mouse buttons 1..16. The
+controls, Fast Forward, Rewind, Brightness Up, and Brightness Down), and mouse buttons 1..16. The
 familiar main block is followed by additional usage selectors. Its 14 by 16 matrix is stable and
 identifies input usage and collection pairs, not Bluetooth keyboard switch locations. Keyboard
 positions use Keyboard collection `01:06`, mouse buttons use Mouse `01:02`, media controls use
 Consumer Control `0c:01`, and system controls use System Control `01:80`. Its last 13 positions select
-nothing, read as disabled and ignore writes. The editor shows the selected profile's own remap
+nothing, read as disabled, and ignore writes. The editor shows the selected profile's own remap
 rules, not the result of a device's layers. Rules for other inputs, including all Game Pad rules,
 and scale or axis rules stay in the profile but are not exposed by this editor geometry. Ordinary
 writes preserve unrelated rules. An input without a rule reads as its own usage, or as transparent
@@ -143,7 +143,7 @@ keycodes and Vial protocol 6 its current ones. Supported actions are disabled in
 keyboard usage, one of the System or Consumer controls above, a mouse button, and QMK's
 representable left-side or right-side modifier combination with a keyboard key. VIA names mouse
 buttons 1..5 and Vial buttons 1..8. Cordial's rules also support other consumer controls, mouse
-buttons 9..16 as outputs and other combinations of held outputs, including a modifier with a
+buttons 9..16 as outputs, and other combinations of held outputs, including a modifier with a
 control or mouse button; a rule the selected external editor cannot represent keeps working on
 the adapter but cannot be read through that editor. Reading such a rule makes the editor's keymap
 read fail: a buffer read containing it returns 0xff for the entire chunk. The rule stays saved

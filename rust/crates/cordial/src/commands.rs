@@ -21,7 +21,7 @@ use cordial_protocol::{
 use std::time::Duration;
 
 pub(crate) const STARTING: &str =
-    "the adapter is still starting; status, restart, files and bootloader work meanwhile";
+    "the adapter is still starting; status, restart, files, and bootloader work meanwhile";
 
 pub(crate) const NO_PROFILES: &str = "this adapter doesn't support profiles";
 
@@ -37,7 +37,7 @@ pub const MAX_SCAN_SECONDS: u32 = 60;
 const FILE_CHUNK_BYTES: usize = p::STORAGE_MIGRATION_CHUNK_BYTES;
 const UPLOAD_TEMP: &str = "/.file-upload";
 
-/// The name the adapter saves for `value`: trimmed, 1 to 64 bytes and without control
+/// The name the adapter saves for `value`: trimmed, 1 to 64 bytes, and without control
 /// characters, or `None` when the adapter refuses it.
 pub fn adapter_name(value: &str) -> Option<&str> {
     if value.chars().any(char::is_control) {

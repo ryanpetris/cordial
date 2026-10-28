@@ -1488,7 +1488,7 @@ fn otg_reconfiguration_discards_unread_packets_before_accepting_retries() {
                     Poll::Ready(Err(EndpointError::Disabled))
                 );
             }
-            // HALT, repeated clear and dropping a stalled read cannot bypass cleanup.
+            // HALT, repeated clear, and dropping a stalled read cannot bypass cleanup.
             for _ in 0..2 {
                 exchange(
                     &host,

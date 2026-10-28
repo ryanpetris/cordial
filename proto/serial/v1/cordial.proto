@@ -1,8 +1,8 @@
 // The Cordial serial API. A client sends one Request per frame and receives one Response for each,
 // in order; the Dongle also sends an Event whenever a device, its settings, a profile, the adapter,
-// a scan or a pairing changes. Each frame is one logical protobuf message, COBS-encoded and
+// a scan, or a pairing changes. Each frame is one logical protobuf message, COBS-encoded and
 // followed by a zero byte. Requests fit in 1024 protobuf bytes before COBS encoding. Responses
-// and events have no protocol size limit. docs/protocol describes framing, sessions and the
+// and events have no protocol size limit. docs/protocol describes framing, sessions, and the
 // compatibility rules.
 syntax = "proto3";
 
@@ -120,7 +120,7 @@ message Response {
 // again when it needs a fresh view, such as in a new session.
 message Event {
   oneof kind {
-    // An adapter preference, readiness, information, error list or resource count changed.
+    // An adapter preference, readiness, information, error list, or resource count changed.
     Status adapter = 1;
     // Anything in a device record changed, including a newly paired device.
     Device device = 2;
@@ -128,7 +128,7 @@ message Event {
     DeviceRemoved device_removed = 3;
     // A scan found a candidate, or a candidate's name or signal changed.
     Candidate scan_found = 4;
-    // A scan ended, by timeout, StopScan or failure.
+    // A scan ended, by timeout, StopScan, or failure.
     ScanDone scan_done = 5;
     // The pairing changed state.
     Pairing pairing = 6;
@@ -136,7 +136,7 @@ message Event {
     Profile profile = 7;
     // A profile has been deleted.
     ProfileRemoved profile_removed = 8;
-    // Some of a device's settings changed, appeared or went away.
+    // Some of a device's settings changed, appeared, or went away.
     SettingsChanged settings_changed = 9;
     // The Dongle intentionally ends this session, independently of any request.
     SessionEnding session_ending = 10;
@@ -208,7 +208,7 @@ message ConfigurationInterfaceUpdate {
 message TransportUpdate {
   // Required.
   Transport transport = 1;
-  // Whether the Dongle uses this transport: scans, connects and accepts connections on it.
+  // Whether the Dongle uses this transport: scans, connects, and accepts connections on it.
   optional bool enabled = 2;
 }
 
@@ -224,7 +224,7 @@ message Status {
   string name = 2;
   // Saved host platform used for special-key translation.
   Platform platform = 3;
-  // Bluetooth and storage are usable. Always false while storage migration is required, active
+  // Bluetooth and storage are usable. Always false while storage migration is required, active,
   // or blocked, including intermediate checkpoints. False otherwise makes no subsystem claim.
   // Commands that need an unready subsystem return ERROR_CODE_NOT_READY; pairing requires both.
   bool ready = 4;
@@ -256,7 +256,7 @@ message Status {
   // configured keyboard/mouse and the first configured HID/XInput slots 0x81..0x83; additional configured disconnected HID and
   // XInput slots 0xC2/0xC3; an enabled editor without a connected user of its profile 0xC4;
   // unconfigured HID/XInput slots up to the compiled maxima 0xE2/0xE3. Each slot uses the lowest
-  // applicable value. Configured users are saved devices whose roles, output preferences or
+  // applicable value. Configured users are saved devices whose roles, output preferences, or
   // profile outputs use the interface, regardless of connection state. Keyboard/mouse is absent
   // without configured users. An editor uses 0x44 only when enabled and a connected device uses
   // the editor's selected profile. An editor with enabled = false has priority 0xFF and is excluded.
@@ -305,7 +305,7 @@ message TransportSupport {
   // Required.
   Transport transport = 1;
   // The transport is enabled on the Dongle. A disabled transport's devices are inactive, and the
-  // Dongle does not scan, connect or accept connections on it. Classic starts disabled and BLE
+  // Dongle does not scan, connect, or accept connections on it. Classic starts disabled and BLE
   // enabled. The Dongle always sets it. Missing means enabled.
   optional bool enabled = 2;
   // Resource usage for this transport, at most one entry per type. Missing types are unknown,
@@ -590,12 +590,12 @@ message Device {
   bool paused = 9;
   // Missing when the Dongle will use this device. Otherwise why not.
   optional InactiveReason inactive = 10;
-  // Complete set of connection, unpair and profile problems, ordered and deduplicated as described
+  // Complete set of connection, unpair, and profile problems, ordered and deduplicated as described
   // by Error. Integration and setting failures stay on their respective records. At most one
   // connection or unpair failure is present; a new failure replaces it. It clears after a successful
-  // connection, disabling the device or restarting the Dongle.
+  // connection, disabling the device, or restarting the Dongle.
   // Profile errors apply only while connected and clear when profiles load or the device
-  // disconnects. Outcomes describe the failed connection attempt, unpair or profile load.
+  // disconnects. Outcomes describe the failed connection attempt, unpair, or profile load.
   // An unresolved unpair reports UNKNOWN; related errors describe restoring the native bond.
   // Empty clears all device errors. Changes arrive in Event.device.
   repeated Error errors = 11;
@@ -624,11 +624,11 @@ enum Role {
   ROLE_UNKNOWN = 0;
   // Keys and modifiers.
   ROLE_KEYBOARD = 1;
-  // Pointer movement, buttons and wheels.
+  // Pointer movement, buttons, and wheels.
   ROLE_MOUSE = 2;
   // Media and volume keys.
   ROLE_CONSUMER_CONTROL = 3;
-  // Power, sleep and wake keys.
+  // Power, sleep, and wake keys.
   ROLE_SYSTEM_CONTROL = 4;
   ROLE_GAMEPAD = 5;
 }
@@ -732,7 +732,7 @@ message Security {
 }
 
 // A protocol the Dongle speaks with a device on top of standard HID, providing special-key
-// translation, settings and features.
+// translation, settings, and features.
 enum IntegrationKind {
   INTEGRATION_KIND_UNSPECIFIED = 0;
   // Logitech HID++.
@@ -774,7 +774,7 @@ enum IntegrationState {
   INTEGRATION_STATE_OFF = 0;
   // Turned on, and the device is not connected.
   INTEGRATION_STATE_DISCONNECTED = 1;
-  // Connected; detecting the integration, reading its settings and applying saved values.
+  // Connected; detecting the integration, reading its settings, and applying saved values.
   INTEGRATION_STATE_STARTING = 2;
   // Up: its settings have been read and saved values are applied. Special-key translation runs
   // wherever the device supports it and is never reported.
@@ -802,7 +802,7 @@ message AdapterInformation {
 }
 
 // Read-only facts, never saved to flash. All readings belong to the current connection and
-// clear on disconnect. A missing scalar means unknown, not false, zero or an empty string.
+// clear on disconnect. A missing scalar means unknown, not false, zero, or an empty string.
 // Text is at most 64 UTF-8 bytes without control characters. A reported enum value that cannot
 // be interpreted uses its UNKNOWN member; it never implies a known mode.
 //
@@ -861,7 +861,7 @@ enum VendorRegistry {
 // battery, otherwise the lowest known level; charging must describe that same battery.
 message BatteryInformation {
   // Percent, 0..100. Coarse readings map full to 100, high/good to 75, medium to 50, low to 20,
-  // critical to 5 and empty to 0. A level never implies a charging state.
+  // critical to 5, and empty to 0. A level never implies a charging state.
   optional uint32 level = 1;
   optional bool charging = 2;
 }
@@ -1028,7 +1028,7 @@ enum SettingsGroup {
 // saved values. A confirmed storage failure leaves the previous preferences unchanged.
 //
 // Validation uses the advertised limits, retained with saved preferences while disconnected.
-// Unknown integrations, groups, fields and sensor indices cannot be saved. Read-only fields
+// Unknown integrations, groups, fields, and sensor indices cannot be saved. Read-only fields
 // cannot be saved. A value outside the advertised limits returns ERROR_CODE_BAD_ARGS; saving
 // an unavailable field returns ERROR_CODE_NOT_FOUND and a read-only field ERROR_CODE_UNSUPPORTED.
 // Forgetting a known field with no saved preference succeeds, including when it is read-only.
@@ -1037,7 +1037,7 @@ enum SettingsGroup {
 // It stays PENDING until confirmed by readback or the device's documented confirmation.
 // After responding, the Dongle re-applies all saved settings of each named integration. The
 // same apply runs when an integration starts or the adapter platform changes. It reads first,
-// skips equal values, writes differences and confirms them. Fields sharing a
+// skips equal values, writes differences, and confirms them. Fields sharing a
 // device setter are written together, preserving unsaved fields. A failed setter does not undo
 // other setters or integrations. Failures belong to each affected field's SettingStatus,
 // separately from Integration.error; saved preferences survive for the next apply attempt.
@@ -1409,7 +1409,7 @@ message UsageRange {
   enum Kind {
     // Unknown and unspecified kinds grant no capability.
     KIND_UNSPECIFIED = 0;
-    // On/off controls such as keys, buttons and media keys a remap rule can name.
+    // On/off controls such as keys, buttons, and media keys a remap rule can name.
     KIND_REMAP_INPUT = 1;
     // Outputs a remap can produce in the Dongle's USB report for the collection.
     KIND_REMAP_OUTPUT = 2;
@@ -1582,7 +1582,7 @@ message ProfileRules {
 // What one input does while the profile is applied. A profile has at most one rule for each
 // input usage and application collection together.
 message ProfileRule {
-  // Required. Within ProfileSupport.ranges of kind KIND_REMAP_INPUT, KIND_SCALE_INPUT or
+  // Required. Within ProfileSupport.ranges of kind KIND_REMAP_INPUT, KIND_SCALE_INPUT, or
   // KIND_AXIS_INPUT for the effect, together with collection.
   Usage input = 1;
   // Required. The input's HID application collection. Never inferred from the input usage.
@@ -1624,7 +1624,7 @@ message ProfileRule {
   }
 
   // Routes an absolute Game Pad axis to another absolute axis in the same Game Pad application
-  // collection. Inversion reverses the normalized axis range. No deadzones, curves or sensitivity.
+  // collection. Inversion reverses the normalized axis range. No deadzones, curves, or sensitivity.
   message Axis {
     // Required. Within ProfileSupport.ranges of kind KIND_AXIS_OUTPUT for the input's collection.
     Usage destination = 1;
@@ -1677,8 +1677,8 @@ message HidppFeature {
 // end that state, even at the target format. After startup enters normal operation, production
 // firmware disables file access automatically. No prepare command is needed. File operations
 // never run concurrently with an on-device migration or on blocked storage.
-// Paths are canonical absolute UTF-8 paths of at most 192 bytes, without empty, dot or
-// dot-dot components, control characters or a trailing slash. The directory root / is valid for
+// Paths are canonical absolute UTF-8 paths of at most 192 bytes, without empty, dot, or
+// dot-dot components, control characters, or a trailing slash. The directory root / is valid for
 // ListFiles.
 // Mutations return normal empty Response success, durable before acknowledgement. Failures use
 // Response.error and Error.outcome. After an uncertain write or disconnect, clients use ListFiles
@@ -1715,7 +1715,7 @@ message ReadFile {
   optional uint32 length = 3;
 }
 
-// Path and offset match the request. Clients check size, length and arithmetic bounds before
+// Path and offset match the request. Clients check size, length, and arithmetic bounds before
 // using the bytes. The size stays constant for a whole download or readback.
 message FileData {
   // Must equal the requested path.
@@ -1774,11 +1774,11 @@ message RecordError {
   Error error = 2;
 }
 
-// A failure in the operation or record that contains it. Every code may carry a reason, outcome
+// A failure in the operation or record that contains it. Every code may carry a reason, outcome,
 // and related errors; their specific meanings are documented by the containing operation.
-// Missing or unknown details never imply success, unchanged data or permission to retry.
+// Missing or unknown details never imply success, unchanged data, or permission to retry.
 // An unknown code is a generic failure; unknown reasons and outcomes provide no further detail.
-// Error lists are ordered lexicographically by numeric code, reason, outcome and then related
+// Error lists are ordered lexicographically by numeric code, reason, outcome, and then related
 // errors recursively. A shorter related list sorts first when it is a prefix of another. Only
 // identical complete errors are duplicates; equal codes with different details stay distinct.
 message Error {
@@ -1805,12 +1805,12 @@ enum ErrorCode {
   ERROR_CODE_BAD_ARGS = 3;         // Missing Required field, wrong value type, or out of range.
   ERROR_CODE_TOO_LONG = 4;         // The Request exceeded 1024 protobuf bytes before COBS encoding.
   ERROR_CODE_NOT_READY = 5;        // A required subsystem is not ready. See Status.ready.
-  ERROR_CODE_NOT_FOUND = 6;        // No such device, candidate, profile, setting or file.
+  ERROR_CODE_NOT_FOUND = 6;        // No such device, candidate, profile, setting, or file.
   ERROR_CODE_NOT_CONNECTED = 7;    // The command needs a connected device.
   ERROR_CODE_BUSY = 8;             // A pairing is running, or the device is doing something that conflicts.
   ERROR_CODE_DISABLED = 9;
   ERROR_CODE_BLOCKED = 10;
-  ERROR_CODE_UNSUPPORTED = 11;     // Transport, interface, setting or value not supported.
+  ERROR_CODE_UNSUPPORTED = 11;     // Transport, interface, setting, or value not supported.
   ERROR_CODE_NO_CAPACITY = 12;     // See Error.reason.
   ERROR_CODE_NO_PROMPT = 13;       // AcceptPrompt or RejectPrompt with no open prompt.
   ERROR_CODE_STORAGE_FAILED = 14;  // Reading or writing saved data failed. See Error.outcome.
@@ -1867,7 +1867,7 @@ enum ErrorReason {
   ERROR_REASON_CONNECTIONS = 2;
   // Scan candidate retention or candidate ID allocation.
   ERROR_REASON_SCAN_CANDIDATES = 3;
-  // Reading, writing or allocating persistent storage.
+  // Reading, writing, or allocating persistent storage.
   ERROR_REASON_STORAGE = 4;
   // Memory for a profile or the shared loaded-profile budget.
   ERROR_REASON_PROFILE_MEMORY = 5;

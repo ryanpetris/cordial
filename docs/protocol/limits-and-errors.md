@@ -19,7 +19,7 @@
 | Loaded profiles | Each profile in a connected device's layers, plus each enabled configuration interface's profile while a Host editor uses it; shared by ID, within the memory budget |
 | Profiles per layer list | `LAYERS.limit` in `ProfileSupport.resources`; loaded layers also share the profile memory budget |
 | Lists | One complete response frame, streamed with bounded adapter memory |
-| Rule inputs | `ProfileSupport.ranges` of kind `KIND_REMAP_INPUT`, `KIND_SCALE_INPUT` or `KIND_AXIS_INPUT`, matching both usage and collection |
+| Rule inputs | `ProfileSupport.ranges` of kind `KIND_REMAP_INPUT`, `KIND_SCALE_INPUT`, or `KIND_AXIS_INPUT`, matching both usage and collection |
 | Remap outputs | `ProfileSupport.ranges` of kind `KIND_REMAP_OUTPUT`, and at most `OUTPUTS.limit` in `ProfileSupport.resources` per remap and per held input |
 | Absolute axis outputs | `ProfileSupport.ranges` of kind `KIND_AXIS_OUTPUT`, in the input's Game Pad collection |
 | Loaded profile memory | `MEMORY.limit` in `ProfileSupport.resources`, in bytes, shared by every loaded profile; a device whose layers do not fit loads none of them |
@@ -30,12 +30,12 @@
 | Bounded file read | `length` of 1..512 bytes; required during assisted production access |
 | File write | At most 512 data bytes per request, also within the complete request limit |
 | Host migration input | At most 16,384 dataset files and a checked total of 64 MiB before download or allocation |
-| Host migration memory | 256 MiB for input, output and working allocations together; no disk spill |
+| Host migration memory | 256 MiB for input, output, and working allocations together; no disk spill |
 | Desktop/CLI migration IPC | 1..65,536 protobuf bytes after a four-byte little-endian length prefix |
 
 HID report-map limits are in [HID forwarding](hid-forwarding.md).
 
-The Rust receive limit applies to the client library, CLI and TUI, including all nested envelopes
+The Rust receive limit applies to the client library, CLI, and TUI, including all nested envelopes
 and repeated listing batches. See
 [Rust host receive limit](transport.md#rust-host-receive-limit) for buffering and session errors.
 
@@ -50,7 +50,7 @@ allowance when saved preferences exceed the firmware's capacity.
 
 The shared Rust generator in `rust/tools/bluetooth_config.rs` generates the Rust and C pool sizes
 using `CORDIAL_CONFIG`. Its capacity table is `rust/tools/bluetooth_limits.json`, which also supplies
-ESP SDK configuration and validation. An absent configuration or an absent, unknown or non-string
+ESP SDK configuration and validation. An absent configuration or an absent, unknown, or non-string
 `chip` uses the default RP2350 allowances. The configured allowances are:
 
 | Board preset | Normal Classic | Normal BLE | Runtime slots, including pairing | Native Classic bonds | Native BLE bonds |
@@ -67,9 +67,9 @@ activities for its links and scanning. BLE requests a 7.5 ms connection interval
 
 ## Errors
 
-`Error` contains `code`, `reason`, `outcome` and repeated `related` errors. Every code can carry all
+`Error` contains `code`, `reason`, `outcome`, and repeated `related` errors. Every code can carry all
 three details. Full errors describe command responses, adapter and device problems, record reads,
-scans, pairing, integrations, settings and output setup. These scopes remain separate; an
+scans, pairing, integrations, settings, and output setup. These scopes remain separate; an
 integration or setting error does not become a device error. The comments in
 [`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto) define the codes; the host supplies user-facing
 words without discarding the reported details.
@@ -82,7 +82,7 @@ words without discarding the reported details.
 | `ENABLED_DEVICES` | Enabled-device admission, including the transport's `DEVICES` allowance. |
 | `CONNECTIONS` | Connection slots, including the transport's `CONNECTIONS` allowance. |
 | `SCAN_CANDIDATES` | Retaining scan candidates or allocating their IDs. |
-| `STORAGE` | Reading, writing or allocating persistent storage. |
+| `STORAGE` | Reading, writing, or allocating persistent storage. |
 | `PROFILE_MEMORY` | A profile's memory or the shared loaded-profile budget. |
 | `RADIO` | Bluetooth radio initialization or operation. |
 | `OUTPUT_BACKEND` | The selected USB output backend. |
@@ -100,19 +100,19 @@ scope, such as bond saving for pairing or applying a setting to the device.
 | `PARTIAL` | Some effects or results are confirmed, but the operation did not complete fully. Remaining effects are not confirmed absent. |
 | `COMPLETE` | The intended effects or results are confirmed despite a failure elsewhere in the operation, such as later cleanup. |
 
-Missing details never imply success, unchanged data or permission to retry. An error code alone
+Missing details never imply success, unchanged data, or permission to retry. An error code alone
 proves no outcome. Error conversions and clients preserve the complete error recursively.
 Conversions use `UNSPECIFIED` when they have no outcome evidence. They use `NO_EFFECT`
 only when evidence confirms that no effects or results occurred in the documented scope.
 
 `related` preserves additional failures without replacing the primary failure or its outcome.
 Each related error retains its own context and outcome scope. Error lists, including related
-lists, are ordered lexicographically by numeric code, reason, outcome and then related errors
+lists, are ordered lexicographically by numeric code, reason, outcome, and then related errors
 recursively. A shorter related list sorts first when it is a prefix of another. Only identical
 complete errors are duplicates; equal codes with different details stay distinct. Adapter and
 device error lists are complete replacements.
 
-A save whose durability cannot be resolved reports `STORAGE_FAILED`, reason `STORAGE` and outcome
+A save whose durability cannot be resolved reports `STORAGE_FAILED`, reason `STORAGE`, and outcome
 `UNKNOWN`. Storage stays not ready until the outcome is resolved or a restart successfully reloads
 saved state. Radio recovery cannot clear it. `STORAGE_FULL` also uses reason `STORAGE` and does not
 make storage unready; a confirmed no-effect failure leaves the previous value intact. A lost
@@ -140,13 +140,13 @@ refuses, the client shows the error and does nothing else, since events bring it
 | A setting value out of range: `BAD_ARGS` | The field's advertised range or choices |
 | Profile commands on a board without profile support: `UNKNOWN_COMMAND` | `Status.profile_support` |
 | Device layers on a board without profile support: `UNSUPPORTED` | `Status.profile_support` |
-| A missing rule input or collection, an input or output out of range, too many outputs, or a zero scale: `BAD_ARGS` | `ProfileSupport.ranges`, matching kind, usage and collection, and `OUTPUTS.limit` in `ProfileSupport.resources` |
+| A missing rule input or collection, an input or output out of range, too many outputs, or a zero scale: `BAD_ARGS` | `ProfileSupport.ranges`, matching kind, usage, and collection, and `OUTPUTS.limit` in `ProfileSupport.resources` |
 | A profile larger than the memory budget: `NO_CAPACITY`, `ERROR_REASON_PROFILE_MEMORY` | None; the size of a saved profile is the Dongle's |
 | Too many layers: `BAD_ARGS` | `LAYERS.limit` in `ProfileSupport.resources` |
 | An enabled configuration interface without a profile: `BAD_ARGS` | The resulting `enabled` and `profile` of each interface |
 | Enabling conflicting configuration interfaces: `UNSUPPORTED` | `ConfigurationInterfaceSupport.conflicts` |
 | Deleting a profile that is still used: `IN_USE` | Every configuration interface's `profile` and every saved device's `profiles` |
-| A profile name empty, too long or with control characters: `BAD_ARGS` | The name itself |
+| A profile name empty, too long, or with control characters: `BAD_ARGS` | The name itself |
 | An adapter name too long or with control characters: `BAD_ARGS` | The name itself |
 
 USB capacity is reported after allocation, independently of command errors. A missing required

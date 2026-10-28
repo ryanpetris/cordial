@@ -73,7 +73,7 @@ struct State {
     reject_hash: bool,
     /// The Database Hash value is delivered truncated.
     short_hash: bool,
-    /// Number of upcoming accept-list, scan, offer and disconnect submissions
+    /// Number of upcoming accept-list, scan, offer, and disconnect submissions
     /// the host cannot queue.
     full: usize,
 }
@@ -1028,7 +1028,7 @@ fn hid_requests(state: &Rc<RefCell<State>>) -> usize {
         .filter(|e| **e == ("services", 0x1812))
         .count()
 }
-/// Polls long enough for setup, information and verification to finish,
+/// Polls long enough for setup, information, and verification to finish,
 /// returning every profile event in order.
 fn drain(b: &mut Backend<Mock>) -> Vec<Event> {
     let mut events = Vec::new();
@@ -1649,7 +1649,7 @@ fn disabled_ble_declines_every_connection_until_enabled() {
     ));
     assert_eq!(b.incoming(5, Some(LINK), None), Err(Error::NotConnected));
 
-    // Connections, scans and offers are declined while disabled.
+    // Connections, scans, and offers are declined while disabled.
     let other = LinkId {
         slot: 1,
         generation: 2,

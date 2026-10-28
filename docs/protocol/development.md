@@ -9,7 +9,7 @@ Development firmware, built with the `debug` or `development` profile, reports
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListFeatures` | `FeatureList` | The device's complete integration feature tables, by integration and then index. For HID++, each entry has the feature index, ID, version and flags, and whether the Dongle supports it; hidden and engineering features are listed as unsupported. |
+| `ListFeatures` | `FeatureList` | The device's complete integration feature tables, by integration and then index. For HID++, each entry has the feature index, ID, version, and flags, and whether the Dongle supports it; hidden and engineering features are listed as unsupported. |
 | `EnterBootloader` | none | See [Commands](commands.md#adapter). |
 
 After `EnterBootloader`, the host expects the Dongle to reappear in USB programming mode: UF2 or
@@ -28,10 +28,10 @@ blocked storage. Blocked mode permits `GetStatus` and `Restart`.
 After a compatible permanent hello and bootstrap status, clients check exact
 `Status.information.target_storage_format` support before file access or other commands.
 Only `STORAGE_MIGRATION_REQUIRED` with reason `STORAGE`, outcome `NO_EFFECT`, no related
-errors and no other status errors authorizes assisted migration. The marker stays
+errors, and no other status errors authorizes assisted migration. The marker stays
 present until hardware reset, including after intermediate and final root uploads.
 The informational `storage_format` does not control migration, source selection,
-reconnection or success. The source comes from the downloaded `/format.pb`.
+reconnection, or success. The source comes from the downloaded `/format.pb`.
 Without the marker, a fresh client reports readiness and errors without file access.
 Root telemetry failures report `STORAGE_FAILED` and block migration.
 There is no prepare handshake or
@@ -46,8 +46,8 @@ upload session; each command opens and closes its files. See
 | `MoveFile` | none | Atomically moves a file over a destination file. After interruption, either source and previous destination remain, or the destination contains the complete source and the source is absent. Directories are unsupported; identical paths have no effect. |
 | `DeleteFile` | none | Deletes one file. A missing file succeeds. `/` and `/format.pb` are forbidden. |
 
-Paths are canonical absolute UTF-8 paths of at most 192 bytes, with no empty, `.` or `..`
-components, control characters or trailing slash. `/` is valid for `ListFiles`. Paths can name
+Paths are canonical absolute UTF-8 paths of at most 192 bytes, with no empty, `.`, or `..`
+components, control characters, or trailing slash. `/` is valid for `ListFiles`. Paths can name
 identity and bond files. There is no raw flash access. The complete encoded request, including its
 envelope, must still fit 1024 protobuf bytes.
 
@@ -78,7 +78,7 @@ File access works while Bluetooth is unavailable and follows the shared
 
 ## Restart
 
-`Restart` is available in production and debug firmware, in normal, assisted and
+`Restart` is available in production and debug firmware, in normal, assisted, and
 blocked modes. It is refused with `ERROR_CODE_BUSY` while a pairing or setup link is
 open. Under the [session ending rules](transport.md#intentional-session-endings), it
 sends an empty success response followed by `SessionEnding` with reason `REBOOT` and drains
@@ -88,17 +88,17 @@ root nor performs a target check or strict dataset validation.
 
 A migration worker validates and converts files in RAM, verifies replacements,
 and removes obsolete and temporary files before uploading each checkpoint root
-last. It reads back the final root, sends `Restart` and reconnects by stable
+last. It reads back the final root, sends `Restart`, and reconnects by stable
 adapter ID. Every reconnect checks exact target support and requires the same
 target. Success requires the marker to be absent and `ready = true`, with no errors
 other than the normal warnings `STORAGE_FULL`, `PROFILE_MEMORY_LOW`,
-`USB_REQUIRED_CAPACITY_EXCEEDED` and `USB_RESERVED_CAPACITY_EXCEEDED`, each without
+`USB_REQUIRED_CAPACITY_EXCEEDED`, and `USB_RESERVED_CAPACITY_EXCEEDED`, each without
 related errors.
 When a final root acknowledgement is lost and the marker persists, the active
 worker checks the durable root against its RAM snapshot before restarting. It
 does not rewrite a root whose proposed contents are already durable. If a physical
 reset has already restored normal readiness without the marker, status suffices.
-An active worker seeing no marker, `ready = false` and nothing but those warnings
+An active worker seeing no marker, `ready = false`, and nothing but those warnings
 waits with status checks only. A persistent marker after a lost restart acknowledgement
 permits retrying `Restart`. Other errors stop the worker.
 

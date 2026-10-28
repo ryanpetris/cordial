@@ -1,4 +1,4 @@
-// Optional BAS, DIS and GAP reads never determine HID connection readiness.
+// Optional BAS, DIS, and GAP reads never determine HID connection readiness.
 #include "profiles_internal.h"
 #include <string.h>
 enum { INFO_IDLE, INFO_SERVICES, INFO_CHARACTERISTICS, INFO_READ, INFO_DESCRIPTORS, INFO_SUBSCRIBE };

@@ -1,5 +1,5 @@
-//! An adapter's page: Details, Settings, Profiles and Diagnostics. Settings and Profiles stage
-//! their changes until Save sends them together in one request; renaming, connecting and
+//! An adapter's page: Details, Settings, Profiles, and Diagnostics. Settings and Profiles stage
+//! their changes until Save sends them together in one request; renaming, connecting, and
 //! disconnecting act at once.
 use super::{
     Action, App, Dialog, Job, Kind, Spot,
@@ -16,7 +16,7 @@ use crate::{
 };
 use cordial_protocol::{self as p, ConfigurationInterface, Platform};
 
-/// Whether the adapter takes a restart: connected, with a storage target this version supports and
+/// Whether the adapter takes a restart: connected, with a storage target this version supports, and
 /// no migration in hand.
 pub fn restartable(a: &AdapterView) -> bool {
     a.connected()

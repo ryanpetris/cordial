@@ -267,7 +267,7 @@ impl<D: Discovery, F: FnMut(ipc::MigrationEvent)> Worker<'_, D, F> {
         let (source, stages) = self.graph.plan(&snapshot, self.target.unwrap())?;
         self.source = source;
         let mut durable = snapshot.entries;
-        // Every transformation, recovery proof, allocation bound and path is settled before here.
+        // Every transformation, recovery proof, allocation bound, and path is settled before here.
         for stage in stages {
             self.checkpoint = stage.target;
             for change in stage.changes {
@@ -356,7 +356,7 @@ impl<D: Discovery, F: FnMut(ipc::MigrationEvent)> Worker<'_, D, F> {
                         return Err(Error::new("the upload scratch path is a directory"));
                     }
                     // Scratch may duplicate a large source file. It is not dataset input and
-                    // is never downloaded, decoded or included in the input-byte budget.
+                    // is never downloaded, decoded, or included in the input-byte budget.
                     continue;
                 }
                 let size = usize::try_from(entry.size).map_err(|_| graph::limit())?;

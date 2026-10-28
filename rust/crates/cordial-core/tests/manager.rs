@@ -1165,7 +1165,7 @@ fn a_lost_device_with_failed_cleanup_cannot_become_resident_again() {
 
 fn pad_descriptor() -> Vec<cordial_core::bluetooth::Descriptor> {
     use cordial_core::{bluetooth::Descriptor, hid::Map};
-    // Eight buttons, one unsigned axis and a nullable hat.
+    // Eight buttons, one unsigned axis, and a nullable hat.
     let bytes = [
         5, 1, 9, 5, 0xa1, 1, 5, 9, 0x19, 1, 0x29, 8, 0x15, 0, 0x25, 1, 0x75, 1, 0x95, 8, 0x81, 2,
         5, 1, 9, 0x30, 0x15, 0, 0x26, 255, 0, 0x75, 8, 0x95, 1, 0x81, 2, 9, 0x39, 0x15, 1, 0x25, 8,

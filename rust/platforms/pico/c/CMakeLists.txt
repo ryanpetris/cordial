@@ -3,7 +3,7 @@ include(${PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 project(cordial_radio C CXX ASM)
 pico_sdk_init()
 
-# Rust owns startup, clocks, interrupts, USB and scheduling. The SDK supplies
+# Rust owns startup, clocks, interrupts, USB, and scheduling. The SDK supplies
 # flash commands and radio bus helpers without its BTstack or IP stack.
 add_library(cordial_flash STATIC flash.c)
 target_link_libraries(cordial_flash PRIVATE hardware_flash hardware_sync)

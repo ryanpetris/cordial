@@ -2,7 +2,7 @@
 //! that migrates one, and `cordial migrate --ipc` for the desktop app.
 //!
 //! The client library's worker does the whole migration. While it runs it owns every adapter
-//! connection: callers close all their sessions, wait for their ports to be released and open
+//! connection: callers close all their sessions, wait for their ports to be released, and open
 //! nothing until the worker reports verified success or explicit cancellation and has exited. A
 //! failure leaves that ownership in place until the user cancels.
 use crate::{controller::Command, error::Error};

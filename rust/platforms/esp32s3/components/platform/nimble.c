@@ -185,7 +185,7 @@ static bool bonds(const ble_addr_t *absent) {
 }
 // Only failures showing that the peer rejected the stored keys, or wants to
 // pair again, report AUTH: authentication failure, a missing key, a MIC
-// failure or a failed pairing exchange. A link that drops or fails while
+// failure, or a failed pairing exchange. A link that drops or fails while
 // encryption starts reports CONNECTION, so reconnects continue.
 static uint8_t security_error(int status) {
     if (status==BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL) || status==BLE_HS_HCI_ERR(BLE_ERR_PINKEY_MISSING)
@@ -430,7 +430,7 @@ static int read_callback(uint16_t conn,const struct ble_gatt_error *error,struct
     uint8_t data[512];uint16_t length=OS_MBUF_PKTLEN(attr->om);
     if (length>sizeof(data) || os_mbuf_copydata(attr->om,0,length,data)) { l->read_request=0;complete(request,BLE_HS_EMSGSIZE);return BLE_HS_EMSGSIZE; }
     // Report Map reads can be longer than individual HID reports. Owners
-    // validate the assembled descriptor, report or information value.
+    // validate the assembled descriptor, report, or information value.
     if (attr->offset!=l->read_length || length>2048-l->read_length) {
         l->read_request=0;complete(request,BLE_HS_EMSGSIZE);return BLE_HS_EMSGSIZE;
     }

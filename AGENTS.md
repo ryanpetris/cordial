@@ -4,14 +4,14 @@
 
 - Dongle: The embedded system running the Cordial software, such as a Raspberry Pi Pico 2 or an
   ESP32-S3
-- Device: A keyboard, mouse or gamepad connected via Bluetooth to the Dongle
-- Host: The computer that uses the emulated USB keyboard, mouse or gamepad and runs the client
+- Device: A keyboard, mouse, or gamepad connected via Bluetooth to the Dongle
+- Host: The computer that uses the emulated USB keyboard, mouse, or gamepad and runs the client
   software.
 
 ## Scope
 
 Cordial is software that runs on a Dongle to connect to and translate Bluetooth Classic, BLE, and
-Logitech HID++ Devices into USB keyboard, mouse and gamepad input. Gamepad outputs support HID and
+Logitech HID++ Devices into USB keyboard, mouse, and gamepad input. Gamepad outputs support HID and
 XInput on supported boards; see [Gamepad outputs](docs/gamepads.md) for availability and limits.
 
 The Host software does not provide any functionality other than configuration of the Dongle as
@@ -105,17 +105,17 @@ Messages:
   inserted into other text, such as "Failed: {reason}", have no final period. CLI error reasons are
   lowercase clauses that follow "Error:" or a colon, such as "the request was too large for the
   adapter".
-- Use the same words for the same thing in the desktop app, CLI and TUI, including labels such as
-  "Logitech Features", "Pointer Speed {n}" and status words such as "Setting Up" and "Unsupported".
+- Use the same words for the same thing in the desktop app, CLI, and TUI, including labels such as
+  "Logitech Features", "Pointer Speed {n}", and status words such as "Setting Up" and "Unsupported".
 
-Labels, buttons and status:
+Labels, buttons, and status:
 
 - Use short Title Case noun or verb phrases without a final period.
 - Hide a section or row with nothing to show rather than showing "None".
 
 Placement:
 
-- Device warnings, protocol details, link security, identifiers and a device's last connection error
+- Device warnings, protocol details, link security, identifiers, and a device's last connection error
   belong on the device's Diagnostics tab, never as banners or on the Details or Settings tabs.
 - The result of an action the user just took appears next to that action, such as in the page's
   bottom bar, and clears when it no longer applies.
@@ -226,7 +226,7 @@ independent review before it is considered done.
 4. Re-verify any finding that changes behaviour with the relevant software checks and, when needed,
    hardware checks before committing it.
 
-Write briefs that name the mechanism, the measurements and the constraints, and that ask for
+Write briefs that name the mechanism, the measurements, and the constraints, and that ask for
 concrete failure scenarios.
 
 ### Rules

@@ -1,7 +1,7 @@
 //! Startup classification and restartable installation on a mounted store.
 use super::*;
 
-/// Storage gate applied before cleanup, identity, topology or radio initialization.
+/// Storage gate applied before cleanup, identity, topology, or radio initialization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Startup {
     Normal,
@@ -19,7 +19,7 @@ pub async fn classify<S: RecordStore>(store: &mut S) -> Result<Root, Error> {
 
 impl<S: RecordStore> Inventory<'_, S> {
     /// Validates an older source once and retains host assistance after an incomplete install.
-    /// Unidentified, unsupported and malformed sources never grant assisted writes.
+    /// Unidentified, unsupported, and malformed sources never grant assisted writes.
     pub async fn migrate(&mut self) -> Startup {
         let root = match self
             .read("/format.pb")

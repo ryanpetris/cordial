@@ -133,7 +133,7 @@ def record(cargo, platform, features, target, env, output, sdk=None):
         "crates": entries, "native": native}, indent=2) + "\n")
     (output / "DEPENDENCIES.md").write_text(
         "# Dependency inventory\n\n"
-        "`dependencies.json` records selected crate versions, features, licence declarations, authors and source revisions. "
+        "`dependencies.json` records selected crate versions, features, licence declarations, authors, and source revisions. "
         "`notices/` preserves licence and notice files supplied by those crate archives and the native SDK. "
         "Some published archives omit their licence texts; their declarations and upstream repositories remain in the inventory. "
         "The SDK notice collection also includes optional components and build tools; use the linker map to determine linked components. "

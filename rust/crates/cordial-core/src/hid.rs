@@ -152,7 +152,7 @@ pub struct Gamepad {
     pub consumers: [u16; 8],
     /// Nested System Main Menu control used by the compact Xbox report.
     pub menu: bool,
-    /// X, Y, Z, Rx, Ry, Rz, Brake and Accelerator, scaled to 0 through 65,535.
+    /// X, Y, Z, Rx, Ry, Rz, Brake, and Accelerator, scaled to 0 through 65,535.
     pub axes: [u16; 8],
     /// Descriptor declarations, independent of received or null samples.
     pub axes_declared: u8,
@@ -164,7 +164,7 @@ pub struct Gamepad {
     pub hat: Option<u8>,
     /// Distinguishes an observed hat, including neutral, from an absent hat.
     pub hat_valid: bool,
-    /// Explicit D-pad Up, Down, Right and Left usages, in bits 0 through 3.
+    /// Explicit D-pad Up, Down, Right, and Left usages, in bits 0 through 3.
     pub dpad: u8,
     /// Explicit Generic Desktop Start control.
     pub start: bool,
@@ -173,7 +173,7 @@ pub struct Gamepad {
 }
 impl Gamepad {
     // Retain the first eight distinct active Consumer usages in field,
-    // report and service order. Rebuilding from stored reports releases absent
+    // report, and service order. Rebuilding from stored reports releases absent
     // controls and lets previously omitted controls use the available slots.
     fn consumer(&mut self, usage: u16) {
         if usage != 0
@@ -241,13 +241,13 @@ impl Span {
 }
 #[derive(Clone, Copy, Debug, Default)]
 struct Field {
-    // Packs a 12-bit offset, 12-bit count-minus-one, history bit and 3-bit application.
+    // Packs a 12-bit offset, 12-bit count-minus-one, history bit, and 3-bit application.
     // Bounds are checked while compiling the descriptor.
     location: u32,
     span: u8,
     spans: u8,
     report: u8,
-    // Retains main-item flags for variable, relative and null handling.
+    // Retains main-item flags for variable, relative, and null handling.
     flags: u8,
     minimum: i32,
     maximum: u32,

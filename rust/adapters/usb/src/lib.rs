@@ -262,7 +262,7 @@ const fn idle_reports() -> [[u8; 68]; 10] {
 
 /// USB tasks exchange bounded owned packets with the application owner.
 pub struct Io {
-    // Input HID, CDC TX/RX, Raw HID, four gamepad writers and four receiver IN/OUT pairs.
+    // Input HID, CDC TX/RX, Raw HID, four gamepad writers, and four receiver IN/OUT pairs.
     status: Watch<CS, Status, STATUS_RECEIVERS>,
     reports: Mutex<CS, RefCell<[[u8; 68]; 10]>>,
     hid_idle: Mutex<CS, core::cell::Cell<[u32; 10]>>,
@@ -530,7 +530,7 @@ impl<'d, D: Driver<'d>> Usb<'d, D> {
         io.set_topology(topology);
         io.control
             .lock(|state| *state.borrow_mut() = serial::ControlState::new());
-        // Raw HID follows CDC's two interfaces, desktop HID and the gamepad interfaces.
+        // Raw HID follows CDC's two interfaces, desktop HID, and the gamepad interfaces.
         let raw_start = 2
             + u8::from(topology.desktop)
             + topology.gamepads.hid_gamepads

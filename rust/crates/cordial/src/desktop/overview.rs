@@ -1,4 +1,4 @@
-//! The Overview: the adapters, what needs attention and the connected devices.
+//! The Overview: the adapters, what needs attention, and the connected devices.
 use super::{
     shell::Ctx,
     widgets::{self, ADAPTER_ICON, Item, List, Look, Tab as TabView},

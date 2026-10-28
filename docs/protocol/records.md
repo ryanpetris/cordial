@@ -8,17 +8,17 @@ what the records mean and how their values are chosen.
 ## Status
 
 `Status` identifies the Dongle and reports its readiness, saved host platform, supported transports,
-output backends, profiles and configuration interfaces. The adapter ID is 16 uppercase hexadecimal
+output backends, profiles, and configuration interfaces. The adapter ID is 16 uppercase hexadecimal
 digits and begins the USB serial number. Classic starts disabled and BLE enabled. A disabled
-transport does not scan, connect or accept connections. Until saved adapter settings load, the host
+transport does not scan, connect, or accept connections. Until saved adapter settings load, the host
 platform reads as Linux and the transport defaults apply.
 
 `Status.information` holds optional `firmware_version`, `board_name`,
-`development_build`, `storage_format` and `target_storage_format`, each with
+`development_build`, `storage_format`, and `target_storage_format`, each with
 independent presence. Firmware always sets `target_storage_format`, including
 when storage is blocked or unreadable. Production firmware reports
 `development_build = false`. The current `storage_format` is the version declared
-by the committed `/format.pb`, omitted when the root is missing, malformed or unreadable. It does
+by the committed `/format.pb`, omitted when the root is missing, malformed, or unreadable. It does
 not prove dataset validity or readiness. `target_storage_format` is the operating
 format required by the firmware, currently `2`, independently of release version.
 A radio failure does not make a known root format unknown.
@@ -35,16 +35,16 @@ report `STORAGE_FAILED` with reason `STORAGE`. Each source error clears independ
 subsystem recovers. An unresolved save reports outcome `UNKNOWN` and keeps storage not ready
 until its outcome is resolved or a restart successfully reloads saved state; radio recovery does
 not clear it. Storage readiness and storage space are separate: `STORAGE_FULL` uses reason
-`STORAGE`, follows its own clearing rule and does not make storage unready.
+`STORAGE`, follows its own clearing rule, and does not make storage unready.
 
 After a compatible permanent hello and `GetStatus`, clients verify the presence and exact support
 of `target_storage_format` before any other command. An absent or zero
 target prevents migration and normal commands, even when information is present
 and the adapter reports readiness. Assisted mode reports `ready = false`
-and `STORAGE_MIGRATION_REQUIRED` with reason `STORAGE`, outcome `NO_EFFECT` and no related
+and `STORAGE_MIGRATION_REQUIRED` with reason `STORAGE`, outcome `NO_EFFECT`, and no related
 errors. This exact error authorizes assisted migration only when there are no
 other errors. `STORAGE_FAILED` blocks it regardless of outcome. The informational
-`storage_format` never selects migration, its source, reconnect behavior or success.
+`storage_format` never selects migration, its source, reconnect behavior, or success.
 The downloaded `/format.pb` selects the source and the host validates the complete
 dataset before writes. Without the marker, a fresh client reports readiness and
 errors without file access, even when the informational formats differ or are absent.
@@ -58,8 +58,8 @@ Blocked mode allows `GetStatus` and `Restart`. General
 `Restart` acknowledges before resetting the MCU and reruns ordinary startup
 without a target or strict dataset validator. An active migration worker confirms
 success after reconnecting by stable ID only when the target is unchanged, the
-marker is absent and `ready = true`, with no errors other than the normal warnings
-`STORAGE_FULL`, `PROFILE_MEMORY_LOW`, `USB_REQUIRED_CAPACITY_EXCEEDED` and
+marker is absent, and `ready = true`, with no errors other than the normal warnings
+`STORAGE_FULL`, `PROFILE_MEMORY_LOW`, `USB_REQUIRED_CAPACITY_EXCEEDED`, and
 `USB_RESERVED_CAPACITY_EXCEEDED`, each without related errors. While normal startup
 is unready with nothing but those warnings, an active worker continues status checks
 without file access. See [storage migration](commands.md#file-access-and-storage-migration).
@@ -85,7 +85,7 @@ what is counted and its units:
 
 Storage usage is the mounted filesystem size minus its best-effort free-space estimate. It includes
 filesystem overhead, does not subtract pairing or maintenance reserves, and is not an exact sum of
-file lengths. The total excludes firmware, guard regions and the RP2350 E10 reservation. It uses
+file lengths. The total excludes firmware, guard regions, and the RP2350 E10 reservation. It uses
 the mounted filesystem's actual block count, which can be smaller than the detected flash allows.
 A failed free-space measurement omits `count` while a known `limit` remains available. `GetStatus`
 refreshes these readings. Existing recounts after storage mutations or generation changes can send
@@ -99,7 +99,7 @@ The allowances are independent per transport, so Classic enablement does not low
 One additional pairing connection is reserved overall, outside both transport allowances. See
 [Bluetooth capacity](limits-and-errors.md#bluetooth-capacity) for the configured board limits.
 
-`Status.profile_support.ranges` describes supported rule inputs and outputs by kind, collection
+`Status.profile_support.ranges` describes supported rule inputs and outputs by kind, collection,
 and usage. A board without profile support, such as Pico W, omits `profile_support` and reports
 no configuration interfaces. Each `ConfigurationInterfaceSupport` separates the saved `enabled`
 preference from `active`, which says whether USB currently exposes it. Its profile stays selected
@@ -116,18 +116,18 @@ allocation even when `INTERFACES.count` is below `INTERFACES.limit`. See
 ## Profiles
 
 A profile is a named set of rules on HID usages. Its ID is a positive integer from a sequence
-separate from device IDs, stays the same for the profile's life and is never reused. Its name is a
+separate from device IDs, stays the same for the profile's life, and is never reused. Its name is a
 label, not an identity; names need not be unique.
 
-Each rule requires an input usage, its application collection and an effect. A profile has at
+Each rule requires an input usage, its application collection, and an effect. A profile has at
 most one rule for each input usage and collection together:
 
-- A remap makes an on/off input, such as a key, button, media key or power key, hold a fixed set
+- A remap makes an on/off input, such as a key, button, media key, or power key, hold a fixed set
   of outputs instead, such as a key with modifiers, a sleep key, or nothing at all.
 - A scale multiplies a relative value, such as pointer motion or a wheel, by a ratio; a negative
   ratio inverts it.
 - An axis rule routes an absolute Game Pad axis to `destination` in the same Game Pad collection.
-  Its `invert` flag reverses the normalized range. It has no deadzones, curves or sensitivity.
+  Its `invert` flag reverses the normalized range. It has no deadzones, curves, or sensitivity.
 
 An input without a rule passes through unchanged, so a new profile changes nothing.
 
@@ -137,14 +137,14 @@ one that remaps B to A makes C produce A. Scales multiply, and a disabled input 
 profile. An empty list passes everything through.
 
 `Profile.roles` summarizes what a profile's rules change, so a client can show it as a keyboard,
-mouse, media, system control or gamepad profile, or several, without reading its rules. Each rule
+mouse, media, system control, or gamepad profile, or several, without reading its rules. Each rule
 adds one role, from its explicit input collection; outputs do not count. A rule matching no row
 adds none.
 
 | Rule input | Collection | Role |
 | --- | --- | --- |
 | Keyboard/Keypad usages (`07:xx`) | Keyboard (`01:06`) | Keyboard |
-| Button usages (`09:xx`), Generic Desktop X, Y or Wheel (`01:30`, `01:31`, `01:38`) or Consumer AC Pan (`0c:238`) | Mouse (`01:02`) | Mouse |
+| Button usages (`09:xx`), Generic Desktop X, Y, or Wheel (`01:30`, `01:31`, `01:38`), or Consumer AC Pan (`0c:238`) | Mouse (`01:02`) | Mouse |
 | Other Consumer usages (`0c:xx`) | Consumer Control (`0c:01`) | Consumer control |
 | Other Generic Desktop usages (`01:xx`) | System Control (`01:80`) | System control |
 | Supported Game Pad controls and absolute axes | Game Pad (`01:05`) | Gamepad |
@@ -156,7 +156,7 @@ ordered by input usage page, input usage, collection usage page, then collection
 ## Devices
 
 A saved device has a positive integer ID, such as `77`, that stays the same across scans,
-address changes the Bluetooth stack resolves, reconnects, sessions and restarts, and across
+address changes the Bluetooth stack resolves, reconnects, sessions, and restarts, and across
 renewing its bond by pairing it again. An unpair removes it, and an ID is never reused. A
 peripheral paired over both Classic and BLE has two records. Names are labels, not identities.
 
@@ -166,21 +166,21 @@ peripheral paired over both Classic and BLE has two records. Names are labels, n
   saved roles when known, where a keyboard role gives keyboard, a mouse role mouse, a gamepad role
   gamepad, and other roles alone other; otherwise from information the device reports on the
   current connection.
-- `state` is `connected` only once security, HID report setup and input forwarding are all ready,
+- `state` is `connected` only once security, HID report setup, and input forwarding are all ready,
   not merely when a radio link exists.
 - `inactive` says why the Dongle will not use the device, in this order: its transport is not
   supported by this firmware, its transport is disabled on the Dongle, it is blocked, the device is
   disabled, or the stack's bond table is full.
-- `errors` is the complete set of connection, unpair and profile problems as full `Error` messages,
+- `errors` is the complete set of connection, unpair, and profile problems as full `Error` messages,
   ordered and deduplicated by complete error. Outcomes describe the failed connection attempt,
-  unpair or profile load. An unresolved unpair reports `UNKNOWN`; related errors describe restoring
+  unpair, or profile load. An unresolved unpair reports `UNKNOWN`; related errors describe restoring
   the native bond. At most one connection or unpair failure is present; a new one replaces it.
-  A successful connection, disabling the device or restarting the Dongle clears it. Integration and
+  A successful connection, disabling the device, or restarting the Dongle clears it. Integration and
   setting failures stay on their own records.
 - `security` describes the live link while connected; each property is missing when the stack cannot
   report it, which does not mean false. Values describe the negotiated link and key, never the
   requested policy; for example, Secure Connections Just Works reports `encrypted`,
-  `secure_connections` and a 16-byte key but not `authenticated`.
+  `secure_connections`, and a 16-byte key but not `authenticated`.
 - `roles` lists the kinds of input the HID descriptor produces: keyboard, mouse, consumer controls
   such as media and volume keys, system controls such as power and sleep, and gamepads. They are
   saved when the descriptor is read, so they are known while the device is disconnected.
@@ -200,13 +200,13 @@ Profile read-error placeholders do not require preserving a cached profile. An u
 is removed as lost and omitted, as described under [Lost records](commands.md#lost-records).
 
 `Device.output_preferences` holds saved output choices as `role` and `mode`. Only Gamepad is
-configurable, with Disabled, HID and XInput choices. A missing gamepad choice means Disabled.
+configurable, with Disabled, HID, and XInput choices. A missing gamepad choice means Disabled.
 Keyboard and mouse behavior does not depend on this list. Saved choices survive renewing an
 existing bond. Unpairing deletes them.
 
 During first-connection setup, a newly paired device with validated gamepad controls automatically
 selects HID if the firmware supports it and the saved HID pool has room. Disconnected, disabled,
-blocked and nonresident saved HID choices count toward its four-slot limit. Otherwise setup settles
+blocked, and nonresident saved HID choices count toward its four-slot limit. Otherwise setup settles
 on Disabled. Explicit choices take precedence. Setup saves the choice before applying it and retries
 a failed save on a later connection. Completed setup never automatically enables output later.
 Gamepad selection does not finish pending HID++ detection. See the
@@ -229,11 +229,11 @@ Only Active carries `slot`, a zero-based temporary slot within its role and mode
 Windows XInput user index. An unavailable selected backend reports `error` with code `UNSUPPORTED`
 and reason `OUTPUT_BACKEND`; a connected layout without supported gamepad controls uses the same
 code with reason `INPUT_LAYOUT`. Outcomes describe output setup. Connection setup, unavailable
-storage and USB setup report Pending; Pending alone is not an error. USB capacity errors belong
+storage, and USB setup report Pending; Pending alone is not an error. USB capacity errors belong
 to `Status.errors`. Disabled or blocked devices have no assignment. Active requires a supported
-layout, an assigned slot and a ready USB backend.
+layout, an assigned slot, and a ready USB backend.
 
-USB allocation considers saved roles, output preferences and profile outputs, together with live
+USB allocation considers saved roles, output preferences, and profile outputs, together with live
 connections. Each gamepad mode has up to four independently enumerated slots where supported.
 Configured disconnected slots have lower priority than connected-device outputs. Unconfigured
 extra slots use spare resources and yield when a higher-priority interface needs them. Saving a
@@ -242,14 +242,14 @@ preference is allowed even when the corresponding interface cannot fit. See
 
 Runtime assignments use the lowest free slot in the selected mode's actual enumerated pool.
 Surviving assignments keep their slots when other devices connect or disconnect. Closing a link,
-changing its mode, replacing its layout or losing storage readiness releases its controls. A mode
+changing its mode, replacing its layout, or losing storage readiness releases its controls. A mode
 change can move an assignment without rebuilding USB when the actual allocation stays the same.
 
 The USB owner supplies `outputs::Enumeration` through `Application::set_output_enumeration`, with
 an actual `Plan`, a generation that changes when endpoints are rebuilt, and USB readiness. No
 capacity is assumed before that call. `Application::gamepad_outputs` reconciles connections and
 returns fixed arrays of four HID and four XInput `SlotSnapshot` values. Each has an optional
-`LinkId` occupant, a nonwrapping assignment generation and normalized `hid::Gamepad` controls.
+`LinkId` occupant, a nonwrapping assignment generation, and normalized `hid::Gamepad` controls.
 An empty slot has neutral controls. Assignment generations change when a slot is assigned again,
 including when the same link receives a replacement layout. They are separate from enumeration
 generations.
@@ -274,7 +274,7 @@ oneof contains a state or full `Error`; an unset or unknown variant means Off. T
 | --- | --- |
 | Off | Turned off with `SetDevice`. |
 | Disconnected | Turned on, and the device is not connected. |
-| Starting | Connected; detecting the integration, reading its settings and applying saved values. |
+| Starting | Connected; detecting the integration, reading its settings, and applying saved values. |
 | Active | Up: its settings have been read and saved values are applied. |
 
 An integration that cannot start reports `error`. Missing required protocol versions or reports
@@ -290,7 +290,7 @@ translated, and the rest behave as the device sends them. Ordinary input never w
 ## Information
 
 `Device.information` contains typed identity, battery, keyboard, power, backlight, pointer-sensor,
-wheel and thumbwheel facts. Missing scalars are unknown, never false or zero. Nothing here is saved
+wheel, and thumbwheel facts. Missing scalars are unknown, never false or zero. Nothing here is saved
 to flash. An event replaces the whole information object, clearing absent fields. Information
 belongs to the current connection and clears on disconnect.
 
@@ -317,7 +317,7 @@ A saved preference for that field remains a setting with an `UNSUPPORTED` error.
 ## Settings
 
 `SettingsObject` is a complete domain owned by an integration. Its group is Keyboard, Power,
-Backlight, Pointer Sensor, Wheel or Thumbwheel. Each configurable field has a typed wrapper.
+Backlight, Pointer Sensor, Wheel, or Thumbwheel. Each configurable field has a typed wrapper.
 `value` is the last actual reading, never an echo of `saved`. It is current while the owning
 integration is Active, otherwise possibly stale on the current connection, and absent before the
 first read or after disconnect. `saved` exists only for an explicit preference stored on the
@@ -342,13 +342,13 @@ describe applying that field to the device, independently of saving its preferen
 A write that may have taken effect but cannot be confirmed uses outcome `UNKNOWN`. An unset or
 unknown status variant provides no confirmation that the preference took effect.
 
-Discovery, reads, notifications and applies never create a saved preference; only `SetSettings`
+Discovery, reads, notifications, and applies never create a saved preference; only `SetSettings`
 does. Unpairing deletes the device's saved settings. A field appears only when discovered as
 configurable on this connection or when it has a saved preference. If its capability disappears,
 a saved field remains with an `UNSUPPORTED` error. Disconnect removes unsaved fields and clears
 readings on the rest. The integration state determines availability and freshness.
 
-`SettingsRef` identifies an entire domain by integration, group and optional `index`. Pointer
+`SettingsRef` identifies an entire domain by integration, group, and optional `index`. Pointer
 Sensor requires a zero-based physical sensor index, stable across connections to the same device.
 At most two sensors are supported; other groups omit `index`. `ListSettings` sorts by integration,
 group, then index, and returns every object in one response.

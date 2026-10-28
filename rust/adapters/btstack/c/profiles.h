@@ -22,7 +22,7 @@ enum cordial_prompt { CORDIAL_CONFIRM, CORDIAL_ENTER_PASSKEY, CORDIAL_ENTER_PIN,
 // Most Report characteristics of one BLE layout; equals the application's limit.
 #define CORDIAL_LAYOUT_REPORTS 32
 // One Report characteristic: value and CCCD handles, GATT properties, owning
-// service index, Report ID and report type (1 input, 2 output, 3 feature).
+// service index, Report ID, and report type (1 input, 2 output, 3 feature).
 typedef struct { uint16_t value, cccd; uint8_t properties, service, id, type; } cordial_layout_report;
 _Static_assert(sizeof(cordial_layout_report) == 8, "layout report ABI");
 extern const uint16_t cordial_layout_report_capacity;

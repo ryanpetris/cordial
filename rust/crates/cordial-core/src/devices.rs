@@ -1,4 +1,4 @@
-//! Saved device policies, the resident reconnection entries of enabled devices and the adapter
+//! Saved device policies, the resident reconnection entries of enabled devices, and the adapter
 //! preference.
 use crate::model::{
     errors::ErrorCode,
@@ -209,7 +209,7 @@ impl Policy {
                 .collect(),
         }
     }
-    /// The policy a record holds, not yet validated. Unknown integrations, output roles and modes
+    /// The policy a record holds, not yet validated. Unknown integrations, output roles, and modes
     /// are left out.
     pub fn from_saved(policy: Option<saved::Policy>) -> Result<Self, storage::Error> {
         let policy = policy.ok_or(storage::Error::Corrupt)?;
@@ -380,7 +380,7 @@ pub struct Device {
     /// The policy before an unpair, retained to report an unresolved deletion.
     pub unpair_policy: Option<Box<Policy>>,
     /// The entry leaves the resident set once its link has closed, because the device was
-    /// disabled, blocked or its transport turned off.
+    /// disabled, blocked, or its transport turned off.
     pub retiring: bool,
     /// An unpair is waiting for the device's link to close.
     pub deleting: bool,

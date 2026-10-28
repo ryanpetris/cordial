@@ -20,7 +20,7 @@ COPY . /src
 # COMMAND runs in its own shell so any failure in it fails the build. SOURCE_DATE_EPOCH is only set
 # when supplied: compilers reject an empty value.
 # ponytail: builds in one image serialize; split cache locks if parallel throughput needs it.
-# Locked mounts protect SDK checkouts, generated configuration and native build trees as well as
+# Locked mounts protect SDK checkouts, generated configuration, and native build trees as well as
 # Cargo outputs. Packages and /out stay outside the caches so wildcard exports are current.
 RUN --mount=type=cache,id=cordial-downloads-${CACHE_ID},target=/cache,sharing=locked \
     --mount=type=cache,id=cordial-rust-${CACHE_ID},target=/src/rust/target,sharing=locked \

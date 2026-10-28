@@ -52,11 +52,11 @@ int main(void) {
     CHECK_POOL(hci_connection, hci_connection_t, CORDIAL_ACTIVE_CONNECTIONS);
     CHECK_POOL(hid_host_connection, hid_host_connection_t, CORDIAL_CLASSIC_CONNECTIONS + 1);
     CHECK_POOL(gatt_client, gatt_client_t, CORDIAL_BLE_CONNECTIONS + 1);
-    // Each Classic link has HID control, HID interrupt and SDP. ATT and SMP
+    // Each Classic link has HID control, HID interrupt, and SDP. ATT and SMP
     // register fixed bearers, which do not allocate dynamic L2CAP channels.
     CHECK_POOL(l2cap_channel, l2cap_channel_t, 3 * (CORDIAL_CLASSIC_CONNECTIONS + 1));
     CHECK_POOL(sm_lookup_entry, sm_lookup_entry_t, CORDIAL_BLE_CONNECTIONS + 1);
     CHECK_POOL(whitelist_entry, whitelist_entry_t, CORDIAL_BLE_CONNECTIONS + 1);
     descriptor_capacity();
-    puts("Native connection, channel, security and accept-list pools passed");
+    puts("Native connection, channel, security, and accept-list pools passed");
 }

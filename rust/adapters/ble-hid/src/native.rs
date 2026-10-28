@@ -1,4 +1,4 @@
-//! Native hosts own GAP, security, ATT transactions and bond persistence. This
+//! Native hosts own GAP, security, ATT transactions, and bond persistence. This
 //! boundary carries owned results to the common HID-over-GATT profile owner.
 use alloc::{boxed::Box, vec::Vec};
 use cordial_core::devices::Peer;

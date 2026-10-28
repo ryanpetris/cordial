@@ -17,7 +17,7 @@ fn error_clause(code: ErrorCode) -> &'static str {
         BadArgs => "the adapter couldn't accept those values",
         TooLong => "the request was too large for the adapter",
         NotReady => "the adapter's Bluetooth or storage isn't ready. Try again in a moment",
-        NotFound => "the adapter couldn't find this device, setting or profile",
+        NotFound => "the adapter couldn't find this device, setting, or profile",
         NotConnected => "the device isn't connected. Connect it first",
         Busy => "the adapter is busy. Try again when the current operation finishes",
         Disabled => "this device is turned off in Cordial. Turn on “Use This Device” first",
@@ -629,7 +629,7 @@ impl Battery {
         })
     }
 
-    /// "45%", "45% · Charging" or "Charging"; None when nothing is known.
+    /// "45%", "45% · Charging", or "Charging"; None when nothing is known.
     pub fn text(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(p) = self.percent {

@@ -12,7 +12,7 @@ pub struct Entry {
 /// A stable read-only dataset, supplied by a mounted filesystem or a host RAM snapshot.
 ///
 /// Implementations enumerate every entry exactly once after `rewind`, including empty files,
-/// unknown files and directories. `read` returns `None` only for a missing path; an empty file is
+/// unknown files, and directories. `read` returns `None` only for a missing path; an empty file is
 /// `Some(Vec::new())`. The dataset must stay unchanged throughout validation. No filesystem data
 /// is retained by the validator between calls. A current record uses one file buffer; converting
 /// a legacy record also holds its replacement. Parent commit records are released before child
@@ -327,7 +327,7 @@ pub async fn inspect_entry<D: Dataset>(
 /// Validates every committed record without writes or repairs.
 ///
 /// Root 1 accepts frozen v1 records and completed v2 replacements. Root 2 requires v2.
-/// Empty files, inactive children and unusable layout caches become explicit deletion candidates.
+/// Empty files, inactive children, and unusable layout caches become explicit deletion candidates.
 /// Dangling profile references and stale role summaries retain their exact committed payloads;
 /// ordinary startup repairs those relationships. Unknown entries are preserved unchanged.
 /// Missing roots require an empty inventory apart from the transfer owner's scratch file.

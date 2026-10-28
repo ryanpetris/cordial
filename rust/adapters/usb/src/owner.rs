@@ -1,18 +1,18 @@
-//! The application's two loops. They share the application, its storage and the Bluetooth
+//! The application's two loops. They share the application, its storage, and the Bluetooth
 //! backend through one lock on one executor, so only one of them touches them at a time.
 //!
 //! The priority loop does what key presses and mouse movement need right now: it polls the radio
 //! and handles every radio event, including connection setup and the profile loads on connect,
-//! runs links' timers and output to devices, follows the USB status and hands HID input reports
+//! runs links' timers and output to devices, follows the USB status, and hands HID input reports
 //! to USB.
 //!
-//! The secondary loop does everything that can wait: the serial session, its requests, events
-//! and output, configuration editor packets, background storage work and deciding when USB
+//! The secondary loop does everything that can wait: the serial session, its requests, events,
+//! and output; configuration editor packets; background storage work; and deciding when USB
 //! enumerates again. Before each step it waits for a pass of the priority loop that left nothing
 //! waiting, or, under continuous input, for a pass `SECONDARY_WAIT_MS` after its last step ended.
 //! Most steps read or write about one record. A step that needs everything waiting on flash
 //! first writes all of it: before USB enumerates again, before the bootloader, when a
-//! configuration editor's profile is released and before free space is counted to admit new
+//! configuration editor's profile is released, and before free space is counted to admit new
 //! data. Input waits for one step at a time. A step that wrote flash is followed by a rest at least
 //! as long as the step took, so input keeps at least half the time while writes continue.
 use crate::{HidTx, Io, RawPacket, SerialRx, SerialTx, Status, Topology};
@@ -32,7 +32,7 @@ use embassy_sync::{
 const HID_WAIT_MS: u64 = 8;
 
 /// How long after its last step ended the secondary loop takes another while every priority pass
-/// leaves input waiting. Continuous input then still lets serial requests, configuration editors
+/// leaves input waiting. Continuous input then still lets serial requests, configuration editors,
 /// and background work make progress, one step at a time, and gets at least this long between
 /// such steps.
 const SECONDARY_WAIT_MS: u64 = 5;
@@ -143,7 +143,7 @@ impl<'a> Priority<'a> {
             hid_since: None,
         }
     }
-    /// One pass: polls the radio, handles every radio event, runs the application's link work and
+    /// One pass: polls the radio, handles every radio event, runs the application's link work, and
     /// hands the next input report to USB. Returns whether nothing is left waiting for input: no
     /// report the host is reading promptly is waiting to be sent.
     pub async fn pass<S: RecordStore, B: EventSource>(
@@ -281,7 +281,7 @@ impl<'a> Secondary<'a> {
     /// One step: asks USB to enumerate again when it should, saving everything waiting first, or
     /// else continues a command that can progress, or writes a deferred save that is due, or reads
     /// and starts the next request, or answers one configuration editor packet, or does the
-    /// application's other work. List steps alternate with saves, editor packets and background
+    /// application's other work. List steps alternate with saves, editor packets, and background
     /// work even when output is writable. Then it hands serial output to USB.
     pub async fn step<S: RecordStore, B: EventSource>(
         &mut self,
@@ -330,7 +330,7 @@ impl<'a> Secondary<'a> {
         if app.command_pending() && !app.yield_command() {
             app.proceed(store, radio, now).await;
         } else if self.drain_since.is_some() {
-            // Only the response, terminal pairing result and final event produce output here.
+            // Only the response, terminal pairing result, and final event produce output here.
         } else if app.serial.ending() {
             app.work(store, radio, now).await;
         } else if app.save(store, now).await {

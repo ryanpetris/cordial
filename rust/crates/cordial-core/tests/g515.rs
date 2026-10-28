@@ -12,7 +12,7 @@ use cordial_core::{
     settings::Catalog,
 };
 
-// Bluetooth GET captures: feature IDs, revisions, flags, protocol and battery.
+// Bluetooth GET captures: feature IDs, revisions, flags, protocol, and battery.
 // Device information responses use synthetic metadata.
 const FEATURES: &[(u16, u8, u8)] = &[
     (0x0001, 2, 0),

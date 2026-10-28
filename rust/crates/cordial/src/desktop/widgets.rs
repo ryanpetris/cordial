@@ -1,6 +1,6 @@
-//! Small widgets shared by the pages: buttons that remember their action, menus and groups of
+//! Small widgets shared by the pages: buttons that remember their action, menus, and groups of
 //! read-only rows. Setters change a widget only when its value differs, so redraws
-//! keep focus, selection and scroll positions.
+//! keep focus, selection, and scroll positions.
 use super::shell::Ctx;
 use crate::ui::app::{Action, Tone};
 use adw::prelude::*;
@@ -71,7 +71,7 @@ pub fn add_style() {
     //
     // Pairing shows the device's icon on an accent-tinted disc, with a round badge at its corner
     // filled with the step's result color. The badge's ring in the dialog's color separates it
-    // from the disc. Named colors follow the light, dark and high-contrast styles.
+    // from the disc. Named colors follow the light, dark, and high-contrast styles.
     const CSS: &str = "
         row.property.dim-label > box.header > box.title > .title { opacity: 1; }
         .pairing-icon { border-radius: 9999px; background-color: alpha(@accent_color, 0.15); }
@@ -604,7 +604,7 @@ impl List {
     }
 }
 
-/// Puts a row's icon, value and chevron in it only while they are used. A row keeps its prefix
+/// Puts a row's icon, value, and chevron in it only while they are used. A row keeps its prefix
 /// and suffix boxes, with their margins and spacing, while anything is in them, even hidden
 /// widgets, so an unused one would indent the row's text.
 fn attach(r: &ListRow, icon: bool, value: bool, chevron: bool) {
@@ -658,7 +658,7 @@ fn show_item(r: &ListRow, item: &Item) {
     );
     // Short values stay on one line; long ones wrap rather than widen the row.
     r.value.set_wrap(value.chars().count() > 24);
-    // A link's value carries its emphasis; a fact, sentence or link without one is emphasized
+    // A link's value carries its emphasis; a fact, sentence, or link without one is emphasized
     // whole.
     if value.is_empty() {
         set_look(&r.row, item.look);

@@ -1,4 +1,4 @@
-# Build environment for the native desktop application, CLI and TUI.
+# Build environment for the native desktop application, CLI, and TUI.
 # Resolute supplies the host archive and AppImage; Debian builds use their native libraries.
 ARG BASE=ubuntu:26.04
 FROM ${BASE}

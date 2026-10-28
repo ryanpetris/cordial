@@ -1551,9 +1551,9 @@ class Smoke:
         if trace.index(["done", adapter, session, device]) >= trace.index(
                 ["closed", adapter, session, device]):
             raise AssertionError("The simulated transport closed before PairingDone")
-        self.ui.wait("show the retained dialog, adapter and new device while the port is absent",
+        self.ui.wait("show the retained dialog, adapter, and new device while the port is absent",
                      lambda: retained() and not event("present"))
-        self.ui.retain("retain the dialog, adapter and new device during the absent port", lambda:
+        self.ui.retain("retain the dialog, adapter, and new device during the absent port", lambda:
             retained() and not event("present"), duration=0.4)
         self.ui.dump(self.stage + "-gap")
         self.ui.screenshot(self.stage + "-gap")

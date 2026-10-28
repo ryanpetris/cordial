@@ -1,4 +1,4 @@
-//! Saved preferences, login start and the Settings page.
+//! Saved preferences, login start, and the Settings page.
 //!
 //! Linux preferences use GSettings. The configuration directory holds the XDG autostart entry.
 use super::{Emit, ServiceEvent};
@@ -80,7 +80,7 @@ fn values(p: Preferences) -> [(&'static str, glib::Variant); 5] {
     ]
 }
 
-/// One Exec argument, quoted for a desktop entry: `"`, `` ` ``, `$` and `\` take a backslash
+/// One Exec argument, quoted for a desktop entry: `"`, `` ` ``, `$`, and `\` take a backslash
 /// inside double quotes, the value's own escaping then doubles each backslash, and `%` is
 /// written `%%`.
 fn quote(arg: &str) -> String {

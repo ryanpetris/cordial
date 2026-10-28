@@ -110,7 +110,7 @@ fn battery(d: &mut p::Device, percent: u32) {
         .level = Some(percent);
 }
 
-/// A mouse with Logitech Features up and three settings: a saved sensitivity, a stepped wheel
+/// A mouse with Logitech Features up and three settings: a saved sensitivity, a stepped wheel,
 /// and its direction.
 fn mouse_settings() -> Vec<p::SettingsObject> {
     let mut dpi = ranged(Some(1000), 200, 4000, 50);
@@ -1314,7 +1314,7 @@ fn profiles_show_one_listing_a_page_at_a_time() {
     assert!(app.shows("The adapter couldn't read its profiles.") && app.shows("P20"));
 }
 
-/// Renames P02, removes P03 and creates P04, as profile events.
+/// Renames P02, removes P03, and creates P04, as profile events.
 fn change_profiles(app: &mut App) {
     let slot = app.slot("00000000000FA001");
     for (id, name) in [(2, "Renamed"), (4, "P04")] {

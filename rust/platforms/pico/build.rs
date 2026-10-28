@@ -25,7 +25,7 @@ fn main() {
         (true, false, false) => "development",
         (true, false, true) => "debug",
         (false, true, false) => "production",
-        _ => panic!("Select exactly one firmware profile: production, debug or development"),
+        _ => panic!("Select exactly one firmware profile: production, debug, or development"),
     };
     println!("cargo:rerun-if-changed={}", config.display());
     println!("cargo:rerun-if-changed={}", generator.display());

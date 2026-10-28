@@ -503,7 +503,7 @@ pub enum Error {
     UnsupportedSetting,
 }
 
-/// Persistent metadata contains no observation, transient state or presentation text.
+/// Persistent metadata contains no observation, transient state, or presentation text.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SettingMetadata {
     pub key: SettingKey,

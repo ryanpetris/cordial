@@ -96,7 +96,7 @@ impl Completion for TransferCompletion {
             } else {
                 pac::USB_DPRAM.ep_out_buffer_control(address.index())
             };
-            // Keep FULL, AVAILABLE, length and payload intact. An unread OUT
+            // Keep FULL, AVAILABLE, length, and payload intact. An unread OUT
             // packet remains readable; its later rearm must expect DATA0.
             buffer.modify(|r| r.set_pid(0, rp_data0_pid(r.available(0))));
         }

@@ -49,7 +49,7 @@ pub struct Storage<F: NorFlash + 'static> {
     available: Option<usize>,
 }
 
-/// LittleFS state, the driver it reads through and the filesystem mounted over
+/// LittleFS state, the driver it reads through, and the filesystem mounted over
 /// them. LittleFS keeps pointers to the allocation and driver while mounted, so
 /// they stay at one heap address for the mount's life.
 struct Volume<F: NorFlash + 'static> {
@@ -268,7 +268,7 @@ impl<F: NorFlash + 'static> Storage<F> {
         }
         Ok(())
     }
-    /// Mounts, classifies saved data and runs eligible migrations before settings are used.
+    /// Mounts, classifies saved data, and runs eligible migrations before settings are used.
     pub async fn open_or_recover(
         flash: F,
         range: Range<u32>,
@@ -581,7 +581,7 @@ impl<F: NorFlash + 'static> Storage<F> {
                         }
                         match fs.metadata(&entry.path().join(record)) {
                             Ok(meta) if holds_record(&meta) => (),
-                            // A directory, an empty file or nothing in the commit file's place
+                            // A directory, an empty file, or nothing in the commit file's place
                             // holds no record.
                             Ok(_) | Err(LfsError::NO_SUCH_ENTRY) => {
                                 let children: &[&littlefs2::path::Path] = if directory
@@ -693,7 +693,7 @@ impl<F: NorFlash + 'static> Storage<F> {
     /// Writes `bytes` as the whole file `name`, unless it already holds them. Old contents that
     /// cannot be read are written over.
     ///
-    /// The file is opened truncated, written and closed. LittleFS keeps an existing file's old
+    /// The file is opened truncated, written, and closed. LittleFS keeps an existing file's old
     /// contents until the close commits the new ones in one metadata commit, so an interrupted
     /// write leaves the old or the new contents. A missing file is written under a random internal
     /// name and atomically renamed, so interrupted creation leaves absence or complete contents.

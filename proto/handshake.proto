@@ -8,7 +8,7 @@ message ClientHello {}
 
 // The adapter's reply to ClientHello.
 message AdapterHello {
-  // Required, exactly once and nonzero. The adapter's operational protocol revision.
+  // Required, exactly once, and nonzero. The adapter's operational protocol revision.
   optional uint32 protocol_version = 1;
   // Optional adapter metadata. Absence does not prevent a session.
   optional string firmware_version = 2;

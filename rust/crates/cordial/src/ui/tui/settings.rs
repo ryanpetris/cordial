@@ -157,7 +157,7 @@ impl<F: Fleet> Model<F> {
         self.stepper(&mut c, d, s, busy);
         c
     }
-    /// An integer's stepper: down, the value (typed when clicked), up and the unit.
+    /// An integer's stepper: down, the value (typed when clicked), up, and the unit.
     fn stepper(&self, c: &mut Layout, d: &DeviceView, s: &Setting, busy: bool) {
         let key = s.field;
         let shown = self.shown_value(d, s);

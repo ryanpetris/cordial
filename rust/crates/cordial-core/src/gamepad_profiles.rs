@@ -52,7 +52,7 @@ pub(super) fn lookup(layout: GamepadLayout, input: RuleRef) -> Option<Found<'sta
         0xc0224 if matches!(layout, XboxBluetooth | LunaBluetooth) => 11,
         0xc0223 if matches!(layout, XboxBluetooth | LunaBluetooth) => 13,
         0x10085 if layout == XboxCompact => 13,
-        // Share, microphone and touchpad have no ordinary XInput destination.
+        // Share, microphone, and touchpad have no ordinary XInput destination.
         0xc0001..=0xcffff | 0x10085 => 0,
         axis if GAMEPAD_AXES.contains(&axis) => {
             let destination = match (layout, axis) {

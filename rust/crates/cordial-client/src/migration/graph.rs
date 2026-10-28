@@ -271,7 +271,7 @@ pub struct Edge {
     pub from: u32,
     pub to: u32,
     pub checkpoint: Checkpoint,
-    /// Conservative allocation bound for output bytes, paths, vectors and additional work.
+    /// Conservative allocation bound for output bytes, paths, vectors, and additional work.
     /// Checked before `transform` runs. Three largest-file work buffers are reserved separately.
     pub allocation_bound: fn(&Snapshot) -> Result<usize>,
     pub transform: fn(&Snapshot) -> Result<Transformation>,
@@ -415,7 +415,7 @@ impl Graph {
             apply_stage(&mut output, &stage)?;
             self.validate(edge.to, &output)?;
             // The fixed 1 -> 2 edge replaces independent records and deletes only empty,
-            // inactive or unusable cache files. Core mixed validation establishes recovery.
+            // inactive, or unusable cache files. Core mixed validation establishes recovery.
             if !self.standard {
                 self.prove(&current, &[edge], &stage, &output, retained)?;
             }

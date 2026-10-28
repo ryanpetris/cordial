@@ -83,7 +83,7 @@ def inspect_uf2(data):
     expected_absolute = (FLASH_BASE + manifest["firmware_bytes"] - 256
                          if manifest["chip"] == "rp2350" else None)
     if absolute_address != expected_absolute:
-        raise ValueError("Missing, misplaced or unexpected RP2350-E10 workaround block")
+        raise ValueError("Missing, misplaced, or unexpected RP2350-E10 workaround block")
     if families != {FAMILIES[manifest["chip"]]}:
         raise ValueError("UF2 family does not match the manifest")
     return manifest

@@ -1,5 +1,5 @@
 //! The interactive shell: complete command output goes to terminal
-//! scrollback above an editable prompt, with history, completion and
+//! scrollback above an editable prompt, with history, completion, and
 //! bluetoothctl-style commands. Commands run while others are pending, and
 //! notifications print without disturbing a partially typed line. During a
 //! pairing prompt the next line is the answer, and `/COMMAND` runs a command.
@@ -545,7 +545,7 @@ impl<B: Backend> Model<B> {
                 if open {
                     // The session stays for diagnosis and recovery.
                     self.log(format!(
-                        "Error: {line}. The adapter still accepts adapter status, adapter restart, file list, file get, file put, file delete and adapter bootloader. Use adapter select to retry."
+                        "Error: {line}. The adapter still accepts adapter status, adapter restart, file list, file get, file put, file delete, and adapter bootloader. Use adapter select to retry."
                     ));
                 } else {
                     // An adapter that refused the connection isn't awaited any longer.
@@ -858,7 +858,7 @@ pub fn shell(options: UiOptions) -> (Shell, Interrupter) {
 }
 
 impl Shell {
-    /// Runs until quit, exit, Ctrl+C, Ctrl+D, SIGINT or SIGTERM. Closing the adapter's port ends
+    /// Runs until quit, exit, Ctrl+C, Ctrl+D, SIGINT, or SIGTERM. Closing the adapter's port ends
     /// a running scan and an unsaved pairing.
     pub fn run(self) -> Result<(), UiError> {
         let output = crate::json::Output::terminal();
@@ -1136,7 +1136,7 @@ mod tests {
             },
         })));
         assert!(m.output.last().unwrap().ends_with(
-            "The adapter still accepts adapter status, adapter restart, file list, file get, file put, file delete and adapter bootloader. Use adapter select to retry."
+            "The adapter still accepts adapter status, adapter restart, file list, file get, file put, file delete, and adapter bootloader. Use adapter select to retry."
         ));
     }
 

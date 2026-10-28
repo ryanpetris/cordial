@@ -1,8 +1,8 @@
 //! Application-owned policy and live links. Bluetooth adapters own security and
-//! vendor procedures; this module owns admission, persistence and HID forwarding.
+//! vendor procedures; this module owns admission, persistence, and HID forwarding.
 //!
 //! Only enabled devices the Bluetooth stack has room for are resident, as reconnection entries.
-//! A connected device's policy, settings and readings live with its connection. Every
+//! A connected device's policy, settings, and readings live with its connection. Every
 //! other saved device is read from flash when a command needs it.
 use crate::model::{
     errors::ErrorCode as Error,
@@ -522,7 +522,7 @@ impl Manager {
 
     /// Load complete records before publishing readiness or admitting a peer.
     /// Read each document separately; never format a failed store here. A
-    /// device whose record is missing, undecodable or does not match its bond
+    /// device whose record is missing, undecodable, or does not match its bond
     /// is deleted; a read error fails the load and deletes nothing.
     pub async fn load<S: RecordStore, B: Bluetooth>(
         &mut self,
@@ -1279,7 +1279,7 @@ impl Manager {
         Ok(())
     }
     /// Saves the bond of pairing link `id` for `saved`, the saved device with `identity`, or for a
-    /// new device when there is none. Returns the saved ID, resident slot and any subsequent error.
+    /// new device when there is none. Returns the saved ID, resident slot, and any subsequent error.
     ///
     /// The caller verifies the live pairing attempt and its deadline first. New native keys remain
     /// provisional until the device record is committed.
@@ -1834,7 +1834,7 @@ impl Manager {
             Some((index, slot, policy, setup))
         })
     }
-    /// Saves a device's policy, resident or not, and brings the resident set, the stack and the
+    /// Saves a device's policy, resident or not, and brings the resident set, the stack, and the
     /// device's connection in line with it. Turning a connected device off or blocking it closes
     /// its link; its entry leaves once the link has closed. `bond` is the bond the device's
     /// saved record holds when the caller read it in this step; otherwise the record is read for
@@ -1874,7 +1874,7 @@ impl Manager {
             None => Policies { store }.save(&policy).await,
         };
         if saved == Err(crate::storage::Error::Missing) {
-            // The saved record is missing, undecodable or holds another device's bond.
+            // The saved record is missing, undecodable, or holds another device's bond.
             let _ = self.lose(policy.id, store, radio).await;
             return Err(crate::wire::error(Error::NotFound, None, false));
         }
@@ -2120,7 +2120,7 @@ impl Manager {
         };
         self.adapter(preference, store).await
     }
-    /// Deletes a saved device that has no link: its bond in the stack, its resident entry and its
+    /// Deletes a saved device that has no link: its bond in the stack, its resident entry, and its
     /// files.
     pub async fn unpair<S: RecordStore, B: Bluetooth>(
         &mut self,

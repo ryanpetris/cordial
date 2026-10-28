@@ -5,31 +5,31 @@ Every release ships a `SHA256SUMS` file for verifying them.
 
 ## Desktop app and CLI
 
-Cordial uses one native Rust executable for the GTK4/libadwaita desktop app, CLI and TUI.
+Cordial uses one native Rust executable for the GTK4/libadwaita desktop app, CLI, and TUI.
 The `cordial` package includes the executable, application menu entry, icons, settings schema,
-documentation, notices and adapter access rule.
+documentation, notices, and adapter access rule.
 Protocol compatibility and storage migration run inside the application.
 
 Launch **Cordial** from the application menu or run `cordial desktop`. Use `cordial tui` for the
 terminal interface. `cordial desktop --hidden` starts without presenting a window.
 `--json` logs every protocol response and event to standard error alongside normal operation.
-The stream includes background reads, migration traffic and complete file contents. For example,
+The stream includes background reads, migration traffic, and complete file contents. For example,
 use `cordial --json tui 2>cordial.jsonl` or `cordial desktop --json 2>cordial.jsonl`.
 The shell and one-shot commands accept the same flag; human command results stay on standard
 output. Quit Cordial before starting a desktop JSON stream. An ordinary desktop launch activates
 the running instance, while a subsequent launch with `--json` exits with an error because the
 stream belongs to the primary process's standard error.
 
-Native packages target Arch Linux, Debian 13 and Ubuntu 26.04 on x86-64, using each
+Native packages target Arch Linux, Debian 13, and Ubuntu 26.04 on x86-64, using each
 distribution's GTK and libadwaita libraries. The unified host archive uses the Ubuntu 26.04
-baseline of glibc 2.43, GLib 2.88, GTK 4.22 and libadwaita 1.9. The Debian 13 package builds
+baseline of glibc 2.43, GLib 2.88, GTK 4.22, and libadwaita 1.9. The Debian 13 package builds
 its executable on Debian 13 with that distribution's libraries.
-The AppImage bundles GTK, libadwaita, text libraries and the dconf settings backend.
+The AppImage bundles GTK, libadwaita, text libraries, and the dconf settings backend.
 It requires a session D-Bus and the host's dconf service, provided by GNOME desktops. Install
 `dconf-service` on Debian or Ubuntu, or `dconf` on Arch, when using another desktop.
 The AppImage requires glibc 2.43 or newer and uses the host's compiler runtime,
-window-system libraries and graphics drivers,
-including EGL, OpenGL and Vulkan.
+window-system libraries, and graphics drivers,
+including EGL, OpenGL, and Vulkan.
 
 ### Arch Linux
 
@@ -63,9 +63,9 @@ run it to open the desktop app. It also accepts CLI arguments, such as `tui`. If
 unavailable, set `APPIMAGE_EXTRACT_AND_RUN=1` when launching it.
 
 The unified `cordial-<version>-linux-amd64.tar.gz` archive contains the `cordial` executable,
-documentation, notices, adapter access rule and GSettings schemas. Keep `share/` beside the
+documentation, notices, adapter access rule, and GSettings schemas. Keep `share/` beside the
 executable, including when launching it through a symlink. Extract it and run `./cordial desktop`,
-`./cordial tui` or another command. Install the required GTK and libadwaita runtime libraries
+`./cordial tui`, or another command. Install the required GTK and libadwaita runtime libraries
 with your distribution's package manager.
 
 ### Adapter access
@@ -119,7 +119,7 @@ storage stays intact. See the [storage format](storage-format.md) for migration 
 The ESP32-S3 image needs at least 4 MiB flash and a USB connection wired to the chip's native USB
 peripheral. Boards that meet these requirements include the
 [Seeed Studio XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/),
-[M5Stack Atom S3](https://docs.m5stack.com/en/core/AtomS3) and
+[M5Stack Atom S3](https://docs.m5stack.com/en/core/AtomS3), and
 [Atom S3U](https://docs.m5stack.com/en/core/AtomS3U).
 
 Enter the board's download mode:

@@ -22,7 +22,7 @@ static char pin[17];
 #endif
 // Enabled transports, indexed by transport; Classic starts disabled and BLE
 // enabled, and both keep their setting across restarts. A disabled transport
-// does not scan, initiate or admit connections; disabled Classic is also not
+// does not scan, initiate, or admit connections; disabled Classic is also not
 // connectable over BR/EDR.
 static bool transport_enabled[2];
 // auth_error: the security failure seen before admission, as a cordial_error.
@@ -70,7 +70,7 @@ static bd_addr_t page_address;
 #define LE_SUPERVISION_MAX_MS 32000
 #define CLASSIC_SUPERVISION_DEFAULT_MS 20000
 // Input that arrives before a link's Connected event, keyed by connection
-// handle: records of value handle (zero for Classic), length and bytes. The
+// handle: records of value handle (zero for Classic), length, and bytes. The
 // oldest record is dropped when a new one does not fit.
 #define EARLY_BYTES 256
 #define EARLY_REPORT 64
@@ -129,7 +129,7 @@ static uint8_t security_error(uint8_t status) {
             return CORDIAL_AUTHENTICATION;
         default:
             // Timeouts, terminations, parameter or scheduling failures, busy
-            // controllers and the host's own statuses.
+            // controllers, and the host's own statuses.
             return CORDIAL_CONNECTION;
     }
 }
@@ -1311,7 +1311,7 @@ int cordial_profiles_set_transport(uint8_t transport, bool enabled) {
 }
 int cordial_profiles_can_write(cordial_link id) {
     cordial_connection *l = cordial_by_id(id);
-    // One ATT request per connection: wait for setup, verification queries
+    // One ATT request per connection: wait for setup, verification queries,
     // and information reads. Classic hosts refuse requests during SDP.
     return l && l->ready && !l->closing && !l->writing && !l->reading && !l->info.pending && !l->query
         && l->setup != SETUP_SUBSCRIBE && l->setup != SETUP_SDP;

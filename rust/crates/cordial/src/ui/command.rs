@@ -1,5 +1,5 @@
 //! The shell's command language: resource/action commands named after the
-//! protocol's commands, pairing answers and completion.
+//! protocol's commands, pairing answers, and completion.
 use crate::{
     commands::{self, MAX_SCAN_SECONDS},
     controller::{Command, Pick, SettingInput, State, Target, Toggle},
@@ -14,7 +14,7 @@ use crate::{
 use cordial_protocol::{OutputMode, Platform, Transport, profile_rule};
 use std::path::PathBuf;
 
-/// A shell command: its words, argument syntax and description, in help order.
+/// A shell command: its words, argument syntax, and description, in help order.
 struct Spec {
     words: &'static str,
     args: &'static str,
@@ -63,7 +63,7 @@ const SPECS: &[Spec] = &[
     spec(
         "adapter status",
         "",
-        "Adapter identity, readiness, platform and capacity",
+        "Adapter identity, readiness, platform, and capacity",
     ),
     spec("adapter set name", "NAME", "Rename adapter"),
     spec("adapter reset name", "", "Reset adapter name to default"),
@@ -402,7 +402,8 @@ fn join_or(words: &[&str]) -> String {
     match words {
         [] => String::new(),
         [one] => (*one).to_owned(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [first, last] => format!("{first} and {last}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
     }
 }
 
@@ -1803,6 +1804,9 @@ pub(crate) mod tests {
         assert!(help(Some(&st)).contains("file list"));
         assert!(help(Some(&st)).contains("file put"));
         assert!(help(Some(&st)).contains("file delete"));
+        assert!(help(Some(&st)).contains(
+            "except adapter status, adapter restart, file list, file get, file put, file delete, and adapter bootloader."
+        ));
         st.status.information = None;
         let shown = help(Some(&st));
         assert!(!shown.contains("file list") && !shown.contains("adapter bootloader"));

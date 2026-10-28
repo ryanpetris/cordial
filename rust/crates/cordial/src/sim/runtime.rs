@@ -80,7 +80,7 @@ fn reconnect_trace(sim: &Sim, stage: &str) {
 }
 
 impl Desktop {
-    /// Seeds `count` adapters with devices, settings, profiles, files and pairing candidates.
+    /// Seeds `count` adapters with devices, settings, profiles, files, and pairing candidates.
     pub fn new(count: usize) -> Self {
         Self {
             adapters: (0..count)

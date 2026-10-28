@@ -1,4 +1,4 @@
-//! Terminal ownership: raw mode and restoration, the input reader and the
+//! Terminal ownership: raw mode and restoration, the input reader, and the
 //! TUI's event loop.
 use crate::ui::{Interrupter, Msg, UiError, UiOptions, tui};
 use ratatui::{
@@ -148,7 +148,7 @@ pub(crate) fn channel() -> (SyncSender<Msg>, Receiver<Msg>, Interrupter, Arc<Ato
 }
 
 /// The full-screen TUI. Ctrl+C and SIGINT exit it on every screen, ending the
-/// session, releasing the serial port and restoring the terminal.
+/// session, releasing the serial port, and restoring the terminal.
 pub struct Tui {
     port: Option<String>,
     json: bool,

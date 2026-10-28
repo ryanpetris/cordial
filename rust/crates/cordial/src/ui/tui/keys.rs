@@ -14,7 +14,7 @@ use ratatui::{
     text::Line,
 };
 
-/// A key as the handlers name it, such as `ctrl+c`, `shift+tab` or `q`.
+/// A key as the handlers name it, such as `ctrl+c`, `shift+tab`, or `q`.
 pub fn name(k: &KeyEvent) -> String {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);
@@ -44,7 +44,7 @@ pub fn name(k: &KeyEvent) -> String {
     base.to_owned()
 }
 
-/// A text field: its prompt, the visible text and a cursor while it has focus.
+/// A text field: its prompt, the visible text, and a cursor while it has focus.
 pub fn edit_line(field: &mut crate::ui::field::Field, focused: bool, w: usize) -> Styled {
     let (value, column) = field.view(w.saturating_sub(3).max(1));
     let mut line = Line::from(vec![span("> ", Style::new())]);

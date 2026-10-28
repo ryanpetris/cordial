@@ -11,7 +11,7 @@
 | `esp32s3` | BLE through ESP-NimBLE or BTstack | Yes |
 
 Board definitions live in `rust/boards/`. They specify pins, minimum flash capacity, clock settings,
-backends and `profile_memory_budget`: the bytes of RAM for loaded [input
+backends, and `profile_memory_budget`: the bytes of RAM for loaded [input
 profiles](input-profiles.md), or `null` to build without them. The Pico W preset leaves profiles
 out to keep its limited RAM for connections. The other presets budget 40 KiB for loaded profiles,
 shared across connections.
@@ -29,18 +29,18 @@ The `pimoroni_pico_plus2_w` preset targets the Pimoroni Pico Plus 2 W with an RP
 It reserves 2 MiB for firmware and budgets 40 KiB of internal RAM for loaded profiles.
 
 The [Seeed Studio XIAO ESP32-S3](https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/),
-[M5Stack Atom S3](https://docs.m5stack.com/en/core/AtomS3) and
+[M5Stack Atom S3](https://docs.m5stack.com/en/core/AtomS3), and
 [Atom S3U](https://docs.m5stack.com/en/core/AtomS3U) meet this preset's requirements. See the
 [flashing steps](installation.md#esp32-s3) for each board's download mode.
 
-To use custom wiring or another backend, copy a preset, edit it and pass its path
+To use custom wiring or another backend, copy a preset, edit it, and pass its path
 to `python3 rust/tools/build_firmware.py`. USB and Bluetooth identities are
 separate from transient port names. Select an adapter by its reported identity.
 
 ## Build
 
 Run commands from the repository root on Linux. Builds run in Docker.
-Install [just 1.59.0](https://github.com/casey/just/releases/tag/1.59.0), Git and [Docker](https://docs.docker.com/engine/install/)
+Install [just 1.59.0](https://github.com/casey/just/releases/tag/1.59.0), Git, and [Docker](https://docs.docker.com/engine/install/)
 with your user allowed to run it. `just DOCKER=podman host` uses Podman instead.
 The host and distribution packaging images and CI install the pinned just release with `docker/install-just.sh`,
 which verifies the official archive's SHA-256. To install it in a local directory,
@@ -56,7 +56,7 @@ including `DEB_BASE_trixie` and `DEB_BASE_resolute`, accept command-line assignm
 `just` and `just help` list the recipes and current firmware options.
 
 ```sh
-just host                   # one executable for desktop, CLI and TUI
+just host                   # one executable for desktop, CLI, and TUI
 just BOARD=pico_w firmware
 ```
 
@@ -73,7 +73,7 @@ from the directory where you invoked `just`. Relative file paths use that direct
 including when you run `just cordial` from a subdirectory. The recipe uses the executable
 path reported by Cargo. The default is `rust/target/debug/cordial`; Cargo configuration
 and environment settings such as `CARGO_TARGET_DIR` can change the output directory.
-Application arguments keep their original boundaries, including spaces, empty values and
+Application arguments keep their original boundaries, including spaces, empty values, and
 `NAME=value` strings. Put recipe configuration before `cordial`.
 The recipe compiles the desktop preference schema into `share/glib-2.0/schemas`
 beside that executable without installing it on the system. Direct launches and
@@ -87,24 +87,24 @@ rust/target/debug/cordial --json desktop 2>cordial.jsonl
 rust/target/debug/cordial --json tui 2>cordial.jsonl
 ```
 
-`just host`, `just firmware` and the `package-host-*` recipes run in toolchain images
+`just host`, `just firmware`, and the `package-host-*` recipes run in toolchain images
 from `docker/`, created on first use and reused afterwards.
 The build copies the checkout into the image, leaving out the
-paths in `.dockerignore` (build outputs, caches, installed dependencies and Git
+paths in `.dockerignore` (build outputs, caches, installed dependencies, and Git
 data), builds there, and copies only its outputs back to the same places a local
 build would put them, replacing the earlier copy of each output. Docker BuildKit
 is required.
 
 BuildKit cache mounts retain Cargo downloads, Rust compilation outputs, pinned
-firmware dependencies and tools that use `XDG_CACHE_HOME`. Packaged outputs are
+firmware dependencies, and tools that use `XDG_CACHE_HOME`. Packaged outputs are
 not cached. Firmware keeps its board configuration and profile hash directories
 under `target/firmware/`; host target triples remain separate under `rust/target/`.
 
 Caches are shared by checkouts using the same Docker builder and toolchain runtime.
 The cache key hashes the image's filesystem layers, runtime configuration, OS,
-architecture and variant. Image export metadata, such as provenance, can change
+architecture, and variant. Image export metadata, such as provenance, can change
 the image ID without changing this key. Changes to native libraries, compilers,
-runtime configuration or platform get separate caches. Firmware compilation and
+runtime configuration, or platform get separate caches. Firmware compilation and
 dependency caches also include the SHA-256 of `rust/tools/firmware_dependencies.py`,
 so different dependency pins never switch a shared SDK checkout. Cargo handles
 Rust dependency and compiler-option changes.
@@ -113,7 +113,7 @@ even when another checkout supplies older timestamps. Build commands and artifac
 validation still run when the Docker result layer is not reusable.
 
 Builds using the same toolchain runtime serialize access to their cache mounts.
-This protects Cargo outputs, generated configuration and mutable SDK checkouts
+This protects Cargo outputs, generated configuration, and mutable SDK checkouts
 across concurrent builds. Different toolchain runtimes can build in parallel.
 Each recipe has an export scratch directory under `.cache/docker/`;
 concurrent invocations of the same recipe must use separate checkouts. Toolchain
@@ -135,15 +135,15 @@ are removed with `docker image rm cordial-toolchain:<runtime-hash>`.
 `just host` exports `rust/target/x86_64-unknown-linux-gnu/release/cordial`.
 `HOST_TARGET` defaults to `x86_64-unknown-linux-gnu`, the release architecture,
 and applies to host release builds and packages. The host image uses Ubuntu 26.04
-Resolute with glibc 2.43, GLib 2.88, GTK 4.22 and libadwaita 1.9. It installs the current
+Resolute with glibc 2.43, GLib 2.88, GTK 4.22, and libadwaita 1.9. It installs the current
 distribution packages, including updates and security fixes.
 
 ### Building without Docker
 
-`just cordial` builds and runs the native desktop, CLI and TUI for development.
+`just cordial` builds and runs the native desktop, CLI, and TUI for development.
 `just local-host` builds the same executable locally with Cargo's release profile and
 the selected `HOST_TARGET`. Install Python 3.11.4+, Rust through
-[rustup](https://rustup.rs/) and native build tools. Cargo uses the pinned
+[rustup](https://rustup.rs/), and native build tools. Cargo uses the pinned
 toolchain in `rust/rust-toolchain.toml`;
 the rustup `cargo` and `rustc` commands must be on `PATH`. On Debian and Ubuntu:
 
@@ -151,7 +151,7 @@ the rustup `cargo` and `rustc` commands must be on `PATH`. On Debian and Ubuntu:
 sudo apt-get install build-essential git clang libclang-dev pkg-config python3 libgtk-4-dev libadwaita-1-dev libglib2.0-bin
 ```
 
-On Arch, install `base-devel`, `git`, `clang`, `pkgconf`, `python`, `gtk4` and
+On Arch, install `base-devel`, `git`, `clang`, `pkgconf`, `python`, `gtk4`, and
 `libadwaita`.
 The software checks below use the same local tools.
 
@@ -159,10 +159,10 @@ The native GTK application requires GTK 4.14 or newer and libadwaita 1.5 or newe
 Run the desktop with `just cordial desktop`, or run the local release build with
 `rust/target/x86_64-unknown-linux-gnu/release/cordial desktop`.
 Direct Cargo runs need the schema setup described under Desktop preferences.
-Direct desktop, CLI and TUI Cargo builds do not require Python. The just recipes, version tools
+Direct desktop, CLI, and TUI Cargo builds do not require Python. The just recipes, version tools,
 and packaging workflow still require Python. Firmware builds also require Python for board
 configuration and BTstack's ATT database compiler.
-The desktop, CLI and TUI share the Rust controller and run protocol compatibility and storage
+The desktop, CLI, and TUI share the Rust controller and run protocol compatibility and storage
 migration in-process. They do not launch another `cordial` process.
 
 A custom headless build can omit GTK and libadwaita:
@@ -183,10 +183,10 @@ just firmware-all
 ```
 
 The Pico image has Rust 1.99.1 and ARM GCC; the ESP32-S3 image adds Espressif's
-Rust 1.97.0.0, espup and ldproxy to its ESP-IDF v6.1 image. Builds fetch the pinned
+Rust 1.97.0.0, espup, and ldproxy to its ESP-IDF v6.1 image. Builds fetch the pinned
 Pico SDK and BTstack sources into the dependency cache as needed.
 
-`BOARD` defaults to `pico_w`. `PROFILE` is `production`, `debug` or `development`
+`BOARD` defaults to `pico_w`. `PROFILE` is `production`, `debug`, or `development`
 and defaults to `development`, independently of compiler release optimization.
 `PROFILE=production` excludes development commands, including remote bootloader
 entry and filesystem inspection. `debug` and `development` include them and run
@@ -196,7 +196,7 @@ The firmware version is the release version for `production`, with a `-debug`
 suffix for `debug` and a `-dev` suffix for `development`, such as `1.2.3-debug`.
 Firmware packages are written under
 `build/firmware/<firmware-version>/<board>-<bluetooth-backend>-<radio-backend>/`.
-They contain the ELF, binary, artifact metadata and checksums. Pico packages also
+They contain the ELF, binary, artifact metadata, and checksums. Pico packages also
 contain UF2; ESP packages contain bootloader and partition-table images plus
 `flash.json`. Packaging verifies image metadata and storage bounds. ESP packaging
 also checks the linked Rust startup frames: `main` has at most 1 KiB, and the
@@ -205,7 +205,7 @@ temporaries.
 
 Every Pico board reserves 65536 bytes for the core 0 stack. Its synchronous entry
 installs `embassy_rp::install_core0_stack_guard` before executor or task
-construction, peripheral initialization, heap initialization and application
+construction, peripheral initialization, heap initialization, and application
 construction. A separate, non-inlined function starts the executor so its frames
 are allocated after guard installation. Firmware halts if installation fails.
 The Cortex-M reset handler initializes RAM before this entry runs, so that early
@@ -254,14 +254,14 @@ It supplies the numeric version and tagged commit timestamp to every build job.
 ### Portable archives
 
 `just package-host-tar` builds the GNU/Linux native executable with documentation, protocol
-definitions and dependency notices in `build/release/cordial-<version>-linux-amd64.tar.gz`.
+definitions, and dependency notices in `build/release/cordial-<version>-linux-amd64.tar.gz`.
 `just package-host-appimage` builds this archive and an AppImage at
 `build/release/cordial-<version>-x86_64.AppImage`. The AppImage bundles GTK, libadwaita,
-icons and their redistribution notices. Both formats use the Resolute glibc 2.43 baseline.
-The AppImage bundles GTK, libadwaita, text libraries and the dconf GIO module with its dependencies
+icons, and their redistribution notices. Both formats use the Resolute glibc 2.43 baseline.
+The AppImage bundles GTK, libadwaita, text libraries, and the dconf GIO module with its dependencies
 and redistribution notices. It loads GIO modules only from the bundle and uses the host's
 session D-Bus and dconf service. The compiler runtime, window-system
-libraries and graphics drivers, including Vulkan, come from the host.
+libraries, and graphics drivers, including Vulkan, come from the host.
 
 `just HOST_ARCHIVE=path/to/cordial-1.2.3-linux-amd64.tar.gz package-host-appimage` repacks an
 existing unified archive. `just local-package-host-tar` and `just local-package-host-appimage`
@@ -272,12 +272,12 @@ Firmware packages remain separate from host application packages.
 
 ### Native distribution packages
 
-Supported native targets are Arch Linux x86-64, Debian 13 and Ubuntu 26.04.
+Supported native targets are Arch Linux x86-64, Debian 13, and Ubuntu 26.04.
 Arch and Ubuntu packages use the Resolute host archive. Debian 13 builds its own executable
 and archive inside a Debian 13 image using the same host Dockerfile with `BASE=debian:13`.
 This keeps its glibc and GTK dependencies compatible with Debian 13. Each package owns
 `/usr/bin/cordial`, the `dev.petris.cordial` desktop entry and icons, the GSettings schema,
-`/usr/share/doc/cordial`, dependency notices, the license and
+`/usr/share/doc/cordial`, dependency notices, the license, and
 `/usr/lib/udev/rules.d/50-cordial.rules`. The desktop entry runs `cordial desktop`.
 Distribution triggers maintain the GSettings schema cache.
 
@@ -293,7 +293,7 @@ CORDIAL_VERSION=1.2.3 just DEB_DISTRIBUTION=resolute \
   HOST_ARCHIVE=build/release/cordial-1.2.3-linux-amd64.tar.gz package-host-deb
 ```
 
-Archive versions, architectures, permissions and extraction boundaries are checked before
+Archive versions, architectures, permissions, and extraction boundaries are checked before
 packaging. The Arch recipe in `packaging/arch/` exports
 `build/packages/host-arch/cordial-<version>-1-x86_64.pkg.tar.zst`. Debian recipes in
 `packaging/debian/` export
@@ -316,7 +316,7 @@ codename. Set `DEB_DISTRIBUTION` and `DEB_REVISION` before the recipe to overrid
 
 The release workflow validates one tag and supplies the same version to all builds. It checks
 clean installation, reinstallation, package file ownership, native dependencies, schema registration,
-removal and Debian purge in disposable distribution containers, including Namcap and Lintian checks.
+removal, and Debian purge in disposable distribution containers, including Namcap and Lintian checks.
 It checks the actual AppImage's desktop launch.
 Release assets include the unified host archive, AppImage, one native package
 for each distribution, production and debug firmware archives for every board, and checksums.
@@ -330,7 +330,7 @@ Arch and Ubuntu packaging jobs reuse the portable archive through workflow artif
 The Debian job compiles its executable in its distribution image.
 
 Third-party license material is retained in `notices/`. Firmware and native host packages
-include the project license, generated dependency inventories and license notices.
+include the project license, generated dependency inventories, and license notices.
 
 ## Software checks
 
@@ -342,7 +342,7 @@ just check
 ```
 
 `just check` runs Rust tests and Clippy, native Bluetooth regression checks,
-Python tool tests and the protocol checks:
+Python tool tests, and the protocol checks:
 `buf lint` and `buf breaking`. The permanent handshake and serial revisions present in the current
 tree compare against every local release tag, regardless of application version or branch ancestry,
 except the release identified by `CORDIAL_VERSION`. Revisions released by ancestors must remain
@@ -364,7 +364,7 @@ select another executable for `just check-protocol` and the protocol fixtures.
 The lint and breaking rules live in `buf.yaml`.
 
 To run only the protocol checks, use `just check-protocol`. It requires just,
-Python and Git in addition to Buf, and does not compile Rust or native code.
+Python, and Git in addition to Buf, and does not compile Rust or native code.
 
 Run the GTK control checks with a display:
 
@@ -417,19 +417,19 @@ The normal Rust preference tests cover external updates
 and persistence. The low battery input test covers typed levels from 1 through 100, including 3
 and 60, and rejects invalid text and out-of-range values. Its percent unit is outside the entry.
 
-Install `xvfb`, `xauth` and `dbus-x11` for the display checks. Linux terminal fixtures need `pyte`,
-Python `protobuf`, `protoc`, a C compiler and an actual release `cordial` executable. Debian dependency-version tests need `dpkg`; run them
+Install `xvfb`, `xauth`, and `dbus-x11` for the display checks. Linux terminal fixtures need `pyte`,
+Python `protobuf`, `protoc`, a C compiler, and an actual release `cordial` executable. Debian dependency-version tests need `dpkg`; run them
 in a Debian or Ubuntu container when it is unavailable on the host. A missing prerequisite or skipped fixture does not
 complete validation.
 
 The build-cache fixtures check the local Cargo runner and its arguments, source timestamp
-reuse, cache boundaries and clean exports for native host and firmware builds.
+reuse, cache boundaries, and clean exports for native host and firmware builds.
 
 Linux CLI terminal checks use a simulated adapter over a PTY. They verify terminal restoration,
 interactive shell and TUI operation with JSON on redirected stderr, and complete file responses
 alongside ordinary CLI output. They check original wire errors in JSON, deferred terminal
 diagnostics, and shutdown with unread stderr.
-They require `pyte`, Python `protobuf`, `protoc`, a C compiler
+They require `pyte`, Python `protobuf`, `protoc`, a C compiler,
 and a built CLI:
 
 ```sh
@@ -473,7 +473,7 @@ same Cargo configuration to prepare its schema.
 
 No schema is needed for CLI or TUI commands. The GTK smoke fixture uses GLib's persistent
 keyfile backend under a private `XDG_CONFIG_HOME`. The AppImage fixture uses the default
-settings backend, private XDG directories, a private dconf profile and a private session D-Bus.
+settings backend, private XDG directories, a private dconf profile, and a private session D-Bus.
 It checks the bundled GIO module paths, reads preferences with the host's `gsettings` command
 before and after quitting, and checks preferences and autostart across a restart. It also changes
 and resets all five preferences with the host command while Settings stays open, checks the
@@ -498,8 +498,8 @@ a development system. Preserve Namcap and Lintian checks.
 
 In a disposable Resolute environment, install the matching `cordial` package, plus
 `python3-pyatspi`, `python3-gi`, `gir1.2-adw-1`, `xvfb`, `xauth`, `dbus-x11`, `imagemagick`,
-`adwaita-icon-theme` and `librsvg2-common`. The AppImage fixture also needs `libglib2.0-bin`,
-`dconf-gsettings-backend` and `dconf-service` for independent settings readback. Run:
+`adwaita-icon-theme`, and `librsvg2-common`. The AppImage fixture also needs `libglib2.0-bin`,
+`dconf-gsettings-backend`, and `dconf-service` for independent settings readback. Run:
 
 ```sh
 CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s '-screen 0 1280x1024x24' \
@@ -509,7 +509,7 @@ xvfb-run -a -s '-screen 0 1280x1024x24' dbus-run-session -- python3 tools/check_
 ```
 
 The installed fixture checks immediate adapter settings, transport and configuration interface
-changes, device connection switches, settings, Gamepad Output and profile layer changes. It keeps
+changes, device connection switches, settings, Gamepad Output, and profile layer changes. It keeps
 numeric edits focused through pauses and redraws, checks that the pre-edit numeric value and write
 count stay unchanged until commit, and checks persistence after committing an edit. The pre-edit
 text and numeric value are recorded in `numeric-baseline.json`.
@@ -530,7 +530,7 @@ Device profile layers move by dragging a row onto another row. A three-layer poi
 drag checks the final insertion order and exactly one completed write, then verifies the order
 after Refresh and reconnect. `device-profiles-drag-pointer.png` captures the pressed pointer,
 `device-profiles-drag-readback.png` captures the reconnected list, and
-`device-profiles-drag.json` records the pointer coordinates, write result and both readbacks.
+`device-profiles-drag.json` records the pointer coordinates, write result, and both readbacks.
 Each layer row has a drag handle and Remove. The fixture checks that the rows stay enabled and
 keep their Remove buttons while verifying the layer order. A second pointer drag moves a layer up
 and checks one completed write and the order after Refresh and reconnect in
@@ -538,10 +538,10 @@ and checks one completed write and the order after Refresh and reconnect in
 Deleting an in-use profile checks that the numbered confirmation names the affected device and VIA,
 keeps wrapped lines aligned with their text, and preserves its step rows through completion.
 Once deletion starts, its introduction reads "Changes, in order:" through completion or failure.
-The completed dialog is 420px wide at the normal window size, marks every step Done and stays open
+The completed dialog is 420px wide at the normal window size, marks every step Done, and stays open
 with only a full-width Close button. After Close, the fixture verifies the remaining layer order,
-disabled VIA and cleared interface profile after reconnect. `profile-delete-confirmation.png`,
-`profile-delete-completed.png` and `profile-delete-readback.json` record these checks.
+disabled VIA, and cleared interface profile after reconnect. `profile-delete-confirmation.png`,
+`profile-delete-completed.png`, and `profile-delete-readback.json` record these checks.
 Turning off an active configuration interface may reconnect the adapter. Profile deletion
 continues only after the same adapter returns, its current device and interface settings are
 read, the listed interfaces are off with no assigned profile, and no device or interface uses
@@ -550,20 +550,20 @@ A connection lost before the final deletion is confirmed leaves its outcome unkn
 The GTK dialog tests cover the active spinner, completed checkmarks, failed and unconfirmed
 markers, stable step placement, and confirmation of a changed remaining plan before retry.
 The narrow layouts also check the Profile Memory meter and the bootloader confirmation's heading,
-Cancel and Enter Bootloader buttons, then dismiss that confirmation with Escape.
+Cancel button, and Enter Bootloader button, then dismiss that confirmation with Escape.
 
 Run the same GTK smoke command with `--empty-states` and a separate output directory to check
 empty Profiles and sidebar groups. This flow removes the mouse's last profile, checks the large
-icon, No Profiles title and centered Add Profile button at 980px and 480px. It deletes every profile
-in that adapter's library, opens the empty Add Profile picker and checks No Profiles, New Profile
+icon, No Profiles title, and centered Add Profile button at 980px and 480px. It deletes every profile
+in that adapter's library, opens the empty Add Profile picker, and checks No Profiles, New Profile,
 and disabled Choose. Creating a profile reopens the picker with that profile selected. Choosing it
 adds the layer and persists after Refresh. It forgets every device on one adapter while the other
 stays populated, then empties both adapters and checks their separate Add Device rows. Pairing through
 each adapter's row verifies the target with the paired device's Adapter field. Screenshots,
-accessibility trees and `empty-profiles-*-bounds.json` record the empty layouts.
+accessibility trees, and `empty-profiles-*-bounds.json` record the empty layouts.
 
 The delayed flow checks rapid numeric edits while a write is pending, editable controls, retained
-values and the absence of apply progress and success indicators. Closing the window lets writes
+values, and the absence of apply progress and success indicators. Closing the window lets writes
 continue, and reopening retains the latest value. Explicit Quit commits the focused numeric edit,
 shows a separate Cordial window with "Settings are being applied.", and exits after pending writes
 drain. Process exit is the completion barrier for coalesced edits, which can produce one or two
@@ -574,13 +574,13 @@ Continue Editing restores a usable main window with the same error and no replay
 control edit saves successfully and is read back after Refresh. Quit Anyway exits cleanly without
 replaying the rejected write. Both flows record their outcomes in `failed-quit-*.json` and capture
 pending and failed Quit windows. These GUI failures confirm that nothing was saved. Headless
-engine tests check the exact persisted latest values and known, unknown and detached write outcomes;
+engine tests check the exact persisted latest values and known, unknown, and detached write outcomes;
 unknown write outcomes are not injected by the GUI fixture.
 With delayed profile writes, a second pointer drag restores the original order while the first
 write is pending. The fixture checks that the rows stay editable and quiet, then reads the order
 after Refresh. `device-profiles-delayed.json` records both drags and the completed writes.
-Profile creation, copying and deletion, pairing and Forget Device retain their
-confirmation actions. It also covers preferences, autostart and lifecycle. Settings opens in the
+Profile creation, copying, and deletion; pairing; and Forget Device retain their
+confirmation actions. It also covers preferences, autostart, and lifecycle. Settings opens in the
 content pane with its sidebar row selected, without a modal dialog. Ctrl+N on Settings cannot
 pair through the adapter or device page it replaced. Adapter and device
 settings share their main Details page, without tab controls, and Profiles and Diagnostics open
@@ -604,16 +604,16 @@ text's Hypertext interface without launching a browser. `about-main.png` and `ab
 capture both views.
 Search coverage opens the sidebar header's Search button and uses Ctrl+F with the sidebar visible.
 At narrow widths, it checks that Ctrl+F leaves the content page in place, then uses Back to search.
-It checks case-insensitive words across result titles and contexts, opens app, adapter and device controls,
+It checks case-insensitive words across result titles and contexts, opens app, adapter, and device controls,
 and checks their focus and scroll position without moving them from the fixture. Page results
-cover Overview, Settings, adapters, devices, Profiles and Diagnostics, with entry Enter and
+cover Overview, Settings, adapters, devices, Profiles, and Diagnostics, with entry Enter and
 Down/Enter result activation. Clearing or replacing a matching query followed immediately by
 Enter cannot open its previous result. A matching replacement opens its current first result.
 Advertised VIA and Vial settings open Profiles and focus their closed profile selectors.
 Information searches open the mouse's Battery and Ratchets per Rotation rows, the adapter's
 Firmware row on Details, and the mouse's Device ID row on Diagnostics. Active Devices results
 name Bluetooth Classic or Bluetooth LE in their context and focus the row in the matching
-transport group. Each requires focus, full row visibility and no writes without scrolling from
+transport group. Each requires focus, full row visibility, and no writes without scrolling from
 the fixture. `search-information.png` captures the diagnostic result.
 Profile searches open Typing in each adapter's library and its assigned layer on the second
 adapter's keyboard. Example Profile 11 opens its library row at normal and narrow widths. These
@@ -621,9 +621,9 @@ checks require focus and full row visibility without scrolling from the fixture.
 selected adapter or device in the visible sidebar. At narrow widths, they check the requested
 page header on activation and sidebar selection on returning from content.
 No-results shows "No Results Found" and "Try a different search". Escape restores navigation.
-The same flow checks a device control, a late library profile and no-results at 480 pixels.
-Simulator writes, saved app preferences and autostart stay unchanged throughout search.
-`search-results.png`, `search-control-480.png`, `search-profile-480.png` and
+The same flow checks a device control, a late library profile, and no-results at 480 pixels.
+Simulator writes, saved app preferences, and autostart stay unchanged throughout search.
+`search-results.png`, `search-control-480.png`, `search-profile-480.png`, and
 `search-no-results*.png` capture these states.
 Pairing opens through the Details header's Add Device button from both an adapter page and an
 attached device's page, with two adapters present. Profiles and Diagnostics have no Add Device
@@ -631,7 +631,7 @@ button. After pairing, the fixture checks the new
 device's Adapter row against the chosen adapter before forgetting it. The scan dialog has no
 adapter selector or searching text, and its passive spinner is in the header. Scan screenshots
 named `pairing-scan-*` capture the spinner's spacing for visual review. Enter-code, compare-code,
-display-code cancellation and automatic pairing remain covered. The fixture reacquires a distinct
+display-code cancellation, and automatic pairing remain covered. The fixture reacquires a distinct
 native dialog when moving between the device picker and pairing, including Search Again and
 Add Another. Prompt and result screenshots have matching `*-bounds.json` files. The fixture
 waits for every answer to fit inside the pairing dialog, which is 420 by 372 pixels and narrows
@@ -639,7 +639,7 @@ to preserve the native sheet's 30-pixel side margins. It checks full-width butto
 with equal widths for two choices, and checks that its outer size and answer placement stay
 unchanged between a prompt and its result.
 The ignored `pairing_centers_every_step_at_one_size` GTK test also covers progress, paired results,
-PIN, passkey, long device names and scrolling long errors at normal and narrow window widths.
+PIN, passkey, long device names, and scrolling long errors at normal and narrow window widths.
 Pairing hides the scan header's title and uses a centered Code entry.
 Passkey entry uses native key events and checks that a typed letter is rejected.
 The fixture keeps each successful result open for more than three seconds,
@@ -662,18 +662,18 @@ CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s '-screen 0 1280x1024x24' \
 It pairs through the existing passkey and code comparison controls. Each prompt stays open longer
 than three seconds before the fixture answers it. After `PairingDone`, the simulated adapter sends
 `SessionEnding` with `DEVICE_CONNECTION`, closes its framed stream, leaves discovery for 1500
-milliseconds and returns with the same adapter ID. The fixture checks the dialog, adapter and new
+milliseconds, and returns with the same adapter ID. The fixture checks the dialog, adapter, and new
 device in the native accessibility tree during that gap and checks that a different session opens.
 It retains the same native pairing dialog throughout the reconnect and checks that the prompt
 and result have the same outer size and answer placement.
 Both Paired results stay open for more than three seconds until the fixture presses Dismiss,
 which opens the new device's page. The code comparison flow also checks persistence after keyboard
-interaction. Screenshots, accessibility dumps, dismissal measurements and `pairing-reconnect.txt`
+interaction. Screenshots, accessibility dumps, dismissal measurements, and `pairing-reconnect.txt`
 capture both flows.
 
 `CORDIAL_SIM_PAIRING_RECONNECT_MS` enables this behavior only in desktop simulation, for the first
 adapter and after successful pairing. Positive integers are clamped to `100` through `10000`
-milliseconds; zero, missing or invalid values leave it disabled. The normal fixture leaves it
+milliseconds; zero, missing, or invalid values leave it disabled. The normal fixture leaves it
 disabled. `CORDIAL_SIM_PAIRING_RECONNECT_TRACE` names a private trace file. With the switch enabled,
 the simulator appends lines in this format:
 
@@ -688,11 +688,11 @@ handshake. The fixture checks the native interface as well as these transport ba
 adds no production interface controls or indicators.
 
 The fixture checks the visible header, device menus, settings rows, capacity rows, page menu
-items, profile actions and the Settings pane at 480, 661 and 700 pixels. Settings Back returns to
+items, profile actions, and the Settings pane at 480, 661, and 700 pixels. Settings Back returns to
 the sidebar at 480 pixels. It scrolls rows into view through
 the enclosing GTK scrollbar's accessible Value interface before checking bounds or interacting.
 Header and control bounds use the accessible window's actual origin. The fixture logs raw,
-window and relative coordinates, and rejects negative relative bounds and window overflow.
+window, and relative coordinates, and rejects negative relative bounds and window overflow.
 Setting markers are found by names such as "Pointer Sensitivity: Saved"; their visual states use
 symbolic icons with menu arrows and tooltips, without visible status words. The fixture checks that
 each marker follows its setting's control on the right.
@@ -700,7 +700,7 @@ each marker follows its setting's control on the right.
 The focused GTK control tests cover Automatic Free Spin's threshold and Automatic Power-Off's
 timeout in sibling rows below their switches, shown only while the switch is on. A continuous
 3-pixel colored band on the left joins each pair. Bands follow build order through blue, purple,
-teal, orange, green and pink, then repeat. The numeric row reserves the saved-state menu's width
+teal, orange, green, and pink, then repeat. The numeric row reserves the saved-state menu's width
 so its controls align with the switch. Numbers have separate unit labels and show empty text
 while unknown. Choice menus list supported values without an Unknown option.
 Readings without saved-state menus occupy a separate
@@ -708,7 +708,7 @@ list within their category. Shared formatting tests cover units in numeric choic
 A device's header shows its status without repeating its battery reading, and its
 page has no Status row. Device Menu contains Refresh followed by Connect or Disconnect on Details
 and Diagnostics; Profiles has no Device Menu. The fixture opens each menu at all three widths,
-checks that its items fit, and exercises Connect, Disconnect and Refresh through it. The Battery
+checks that its items fit, and exercises Connect, Disconnect, and Refresh through it. The Battery
 row retains its exact percentage and full-width meter. Adapter Menu offers Rename followed by
 Connect or Disconnect; the adapter's Details page has no Status row. Maintenance actions open
 from Adapter Menu on Diagnostics. New Profile sits beside the scrolling profile list.
@@ -738,7 +738,7 @@ device <adapter-id> <device-id> <details|profiles|settings> <ok|error|unknown>
 settings <adapter-id> <device-id> <ok|error|unknown>
 ```
 
-Staging, coalescing and unchanged values add no records. A session drop records an unknown result
+Staging, coalescing, and unchanged values add no records. A session drop records an unknown result
 once, including when the job later returns. The fixture matches only seeded simulated identifiers,
 `SIMULATED0000001` and `SIMULATED0000002`, and copies the trace to `writes.txt` with its other artifacts.
 The trace supplies fixture completion barriers without adding indicators to the interface.
@@ -749,7 +749,7 @@ Run the AppImage fixture in a disposable Arch environment as well. Its prerequis
 `libgcc`, `libx11`, `libxcursor`, `libxdamage`, `libxext`, `libxfixes`, `libxi`, `libxinerama`,
 `libxrandr`, `libxrender`, `libxcb`, `wayland`, `libglvnd`, `vulkan-icd-loader`, `expat`, `e2fsprogs`, `gmp`,
 `libgpg-error`, `zlib`, `python-atspi`, `python-gobject`, `xorg-server-xvfb`, `xorg-xauth`, `dbus`,
-`imagemagick`, `glib2` and `dconf`. Use the same command with `--renderer cairo`. The release
+`imagemagick`, `glib2`, and `dconf`. Use the same command with `--renderer cairo`. The release
 workflow runs Arch with Cairo and Resolute with software Mesa and GTK's default renderer.
 All AppImage runs use the default settings backend.
 
@@ -764,21 +764,21 @@ Adapter names are stored on the adapter. Rename through adapter settings in the 
 
 ## Repository layout
 
-- `rust/`: firmware, native GTK desktop, CLI/TUI, shared crates, adapters and their tools/tests.
-- `docs/`: control protocol, storage format and HID++ references.
+- `rust/`: firmware, native GTK desktop, CLI/TUI, shared crates, adapters, and their tools/tests.
+- `docs/`: control protocol, storage format, and HID++ references.
 - `proto/`: serial protocol messages and persistent storage records.
-- `docker/`: build images for the applications, firmware and distribution packages.
+- `docker/`: build images for the applications, firmware, and distribution packages.
 - `packaging/`: the distribution packaging steps and their installation checks.
-- `tools/`: version validation, package checks and their tests.
+- `tools/`: version validation, package checks, and their tests.
 
 `just all` builds the unified host and the selected firmware. `just clean` removes
 build outputs while preserving downloaded dependencies and toolchains.
 
 ## USB gamepad builds
 
-Pico W, Pico 2 W, Pimoroni Pico Plus 2 W and Waveshare RP2350B-Plus-W enable the
+Pico W, Pico 2 W, Pimoroni Pico Plus 2 W, and Waveshare RP2350B-Plus-W enable the
 `cordial-usb/gamepad` feature. These builds advertise
-Disabled, HID and XInput gamepad output modes. USB gamepad slot limits are separate from the
+Disabled, HID, and XInput gamepad output modes. USB gamepad slot limits are separate from the
 board's Bluetooth transport allowances.
 
 The largest USB allocation needs 12 interfaces and 10 handlers. The firmware
@@ -796,7 +796,7 @@ cargo clippy --manifest-path rust/Cargo.toml --config rust/.cargo/config.toml -p
 USB fixtures exercise all 25 HID/XInput pool combinations through the actual
 composite builder, including the VIA/Vial descriptor variants. The descriptor
 buffers hold 512 configuration bytes, 64 BOS bytes, 64 Microsoft OS descriptor
-bytes and 256 control bytes. The maximum configuration uses 455 bytes, and the
+bytes, and 256 control bytes. The maximum configuration uses 455 bytes, and the
 receiver's Microsoft OS descriptor uses 46 bytes.
 
 Windows driver binding uses the receiver function's `XUSB20` compatible ID and

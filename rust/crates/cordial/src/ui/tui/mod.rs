@@ -1,4 +1,4 @@
-//! Terminal input, focus, scrolling and rendering for the shared application.
+//! Terminal input, focus, scrolling, and rendering for the shared application.
 mod adapter;
 mod add;
 mod device;

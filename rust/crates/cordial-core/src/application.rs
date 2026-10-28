@@ -3,24 +3,24 @@
 //! The application is driven by two loops that take turns. The priority loop handles what input
 //! needs right now: radio events, connection setup with its profile loads, link timers and output,
 //! and HID forwarding (`event`, `operate`). The secondary loop handles everything that can wait:
-//! client commands, events, configuration editors and background storage work (`begin`,
+//! client commands, events, configuration editors, and background storage work (`begin`,
 //! `proceed`, `save`, `work`). Most calls the secondary loop makes read or write about one record,
 //! and one that writes may count free space again, so the priority loop usually waits for at most
 //! that.
 //!
 //! Records nothing needs on flash at once, such as a configuration editor's edits, discovered
-//! layouts and first-connection setup, are saved once keyboard and mouse input pauses
+//! layouts, and first-connection setup, are saved once keyboard and mouse input pauses
 //! ([`crate::deferred`]), one per call. Everything waiting is saved in one call before USB
-//! enumerates again, before restarting and when an editor is released, and every dirty record
-//! before free space is checked for a new profile, a pairing or a new setting. Saves that commands
+//! enumerates again, before restarting, and when an editor is released, and every dirty record
+//! before free space is checked for a new profile, a pairing, or a new setting. Saves that commands
 //! promise, and bonds, are written before the command responds.
 //!
 //! A list read takes turns with background work, one bounded step per `proceed`. Lists produce
 //! bounded batches as serial output drains, all in one response frame. Corrupt records omitted
 //! from a list are rescanned for cleanup once their removal events can drain. Every other command
-//! validates, acts and responds at once. Work that outlives a command (scanning, pairing, matching
+//! validates, acts, and responds at once. Work that outlives a command (scanning, pairing, matching
 //! a pairing's bond with a saved device, an unpair waiting for its link to close, settings jobs)
-//! lives here and reports its progress through events. Adapter, device, profile, scan and pairing
+//! lives here and reports its progress through events. Adapter, device, profile, scan, and pairing
 //! events carry the complete current state of one thing; settings events carry what changed since
 //! the client last listed or was told. Changed things are marked dirty and written one frame at a
 //! time when the serial output is free.
@@ -1783,7 +1783,7 @@ impl Application {
         }
     }
 
-    /// Applies rule changes to profile `id`, saves them and publishes them to every user of the
+    /// Applies rule changes to profile `id`, saves them, and publishes them to every user of the
     /// profile. A loaded table is changed in place of a copy: the new table is merged from it and
     /// replaces it once saved, and the saved file then holds any edits not yet saved too.
     pub(crate) async fn change_rules<S: RecordStore>(
@@ -2027,7 +2027,7 @@ impl Application {
     ///
     /// Commands can run between steps, but none can add a reference meanwhile: the profile record
     /// is missing or undecodable, so every command that would refer to it fails. Each device's
-    /// policy is read, changed and saved in one step, so a save between steps is not undone.
+    /// policy is read, changed, and saved in one step, so a save between steps is not undone.
     async fn clean_lost_profile<S: RecordStore, B: Bluetooth>(
         &mut self,
         id: u64,
@@ -3691,7 +3691,7 @@ impl Application {
         }
     }
 
-    /// Whether anything waits to be saved: an editor's edits, a dirty record or a discovered
+    /// Whether anything waits to be saved: an editor's edits, a dirty record, or a discovered
     /// layout.
     pub fn has_unsaved(&self) -> bool {
         self.editor.as_ref().is_some_and(|e| e.edited.is_some())
@@ -3730,7 +3730,7 @@ impl Application {
     }
 
     /// Saves everything waiting at once, whatever input is doing: before USB enumerates again,
-    /// before restarting and when an editor is released.
+    /// before restarting, and when an editor is released.
     pub async fn save_all<S: RecordStore>(&mut self, store: &mut S, now: u64) {
         self.save_records(store, now).await;
         if self.manager.storage_ready {
@@ -3813,7 +3813,7 @@ impl Application {
     /// Writes one dirty record. A rules file that cannot be written, which holds edits an editor
     /// has been told are made, is retried with its backoff, and the failure of its last try is
     /// reported ([`Self::writes_recovered`]). A failure that is not reported leaves storage ready,
-    /// so the profile can still be changed, overwritten or deleted. Roles summaries are repaired
+    /// so the profile can still be changed, overwritten, or deleted. Roles summaries are repaired
     /// without being reported, as when they are saved at once.
     ///
     /// After a write whose outcome is unknown, a failed retry ends that only when the file is then
@@ -4345,7 +4345,7 @@ impl Application {
         false
     }
 
-    /// One step of background work: continues the setup, pairing, unpair or storage work in
+    /// One step of background work: continues the setup, pairing, unpair, or storage work in
     /// progress, or starts the next. All but the pairing the user is waiting on wait while a
     /// connection waits for its first input. Returns whether it did anything.
     async fn maintain<S: RecordStore, B: Bluetooth>(
@@ -4370,7 +4370,7 @@ impl Application {
 
     /// Background storage work: reading connected devices' policies, saving their layouts,
     /// cleaning up lost device records and profiles, filling the stack, syncing its bonds,
-    /// repairing profile roles and retrying profile loads. One step at a time, none while a
+    /// repairing profile roles, and retrying profile loads. One step at a time, none while a
     /// connection waits for its first input. Failed work is tried again after a backoff, and work
     /// waiting for its backoff does not hold up the rest. Returns whether it did anything.
     async fn background<S: RecordStore, B: Bluetooth>(
@@ -5158,7 +5158,7 @@ impl Application {
     }
 
     /// The priority loop's work after radio events: link timers and output to devices,
-    /// reconnecting saved devices and the scan.
+    /// reconnecting saved devices, and the scan.
     pub async fn operate<S: RecordStore, B: Bluetooth>(
         &mut self,
         store: &mut S,

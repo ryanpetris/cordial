@@ -2,7 +2,7 @@
 #include "hardware/sync.h"
 #include <stdint.h>
 
-// Startup runs before core 1, radio DMA or USB can access flash.
+// Startup runs before core 1, radio DMA, or USB can access flash.
 uint32_t cordial_flash_jedec_id(void) {
     uint8_t command[4] = {0x9f, 0, 0, 0};
     uint8_t response[4];

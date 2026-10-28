@@ -1,6 +1,6 @@
 //! Device settings as the CLI presents them. The adapter groups settings into typed objects; each
 //! field of an object becomes one [`Setting`] with its identity, last reading, saved preference,
-//! apply status and limits. Readings of the same behavior from Device.information use the same
+//! apply status, and limits. Readings of the same behavior from Device.information use the same
 //! leaves.
 use crate::model;
 use cordial_client::order;
@@ -695,7 +695,7 @@ pub fn kind(s: &Setting) -> Type {
     }
 }
 
-/// An integer setting's range: minimum, maximum and step.
+/// An integer setting's range: minimum, maximum, and step.
 pub fn range(s: &Setting) -> Option<(i64, i64, i64)> {
     match &s.limits {
         Limits::Integer(Some(integer_setting::Limits::Range(r))) => {

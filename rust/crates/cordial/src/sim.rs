@@ -231,7 +231,7 @@ pub const CONSUMER: (u32, u32) = (0x0c, 0x01);
 
 /// Firmware with profiles: keys, mouse and gamepad buttons, and media controls remap, pointer
 /// motion and wheels scale, gamepad axes move to other axes, and VIA and Vial are offered,
-/// conflicting and disabled.
+/// conflicting, and disabled.
 pub fn enable_profiles(status: &mut p::Status) {
     status.profile_support = Some(p::ProfileSupport {
         ranges: vec![

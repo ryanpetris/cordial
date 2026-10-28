@@ -88,7 +88,7 @@ fn adapter_versions_metadata_and_unknown_fields_roundtrip() {
         decode_adapter_hello(&encode_adapter_hello(&adapter).unwrap()),
         Ok(adapter)
     );
-    // Unknown bytes, varint, fixed32, fixed64 and a group contain no top-level version.
+    // Unknown bytes, varint, fixed32, fixed64, and a group contain no top-level version.
     let unknown = [
         42, 2, 8, 99, 48, 2, 61, 0, 0, 0, 0, 65, 0, 0, 0, 0, 0, 0, 0, 0, 75, 8, 99, 76,
     ];

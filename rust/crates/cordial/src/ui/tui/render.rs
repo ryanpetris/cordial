@@ -45,7 +45,7 @@ impl PageView {
     }
 }
 
-/// A dialog as drawn: its title, body and buttons.
+/// A dialog as drawn: its title, body, and buttons.
 pub(super) struct DialogView {
     pub title: String,
     pub body: Layout,
@@ -220,7 +220,7 @@ impl<F: Fleet> Model<F> {
             );
         }
         self.body_area = (mx, top, mw, view_h);
-        // The page's header, body and bar move the highlight and scroll as one region.
+        // The page's header, body, and bar move the highlight and scroll as one region.
         self.regions.push((Area::Main, (mx, 0, mw, body_h)));
         if bar_h > 0 {
             let y = body_h.saturating_sub(bar_h);
@@ -439,7 +439,7 @@ impl<F: Fleet> Model<F> {
         }
     }
 
-    /// The Overview: counts, what needs attention, the connected devices and the adapters.
+    /// The Overview: counts, what needs attention, the connected devices, and the adapters.
     fn overview(&self, w: usize) -> PageView {
         let mut v = PageView::new(styled("Overview", bold()), w);
         let b = &mut v.body;
@@ -760,7 +760,7 @@ impl<F: Fleet> Model<F> {
     fn help_dialog(&self, w: usize) -> DialogView {
         let mut body = Layout::new(w);
         for (keys, what) in [
-            ("Mouse", "Click buttons, options and rows."),
+            ("Mouse", "Click buttons, options, and rows."),
             (
                 "Tab",
                 "Move between controls; Shift+Tab moves back. Enter activates the highlighted control, and Enter or Space chooses a highlighted On or Off option such as Show Unnamed Devices.",

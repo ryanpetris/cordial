@@ -1,6 +1,6 @@
 // Exercise adapter GATT callbacks: one discovery of two services with chunked
 // report maps, CCCD writes, notification routing, background verification
-// of a supplied layout and report write modes. Only the public query
+// of a supplied layout, and report write modes. Only the public query
 // submissions are faked; event decoding is native.
 #define gatt_client_discover_primary_services_by_uuid16 query_services
 #define gatt_client_discover_characteristics_for_service query_characteristics
@@ -181,7 +181,7 @@ static void no_hash(void) {
     complete(ATT_ERROR_ATTRIBUTE_NOT_FOUND); advance();
 }
 static const uint8_t first[] = {0x05, 0x01, 0x09, 0x06}, second[] = {0x05, 0x0c, 0x09, 0x01, 0xa1, 0x01};
-// The device: service 1..20 with map 3, input 5 (notify) and output 9;
+// The device: service 1..20 with map 3, input 5 (notify), and output 9;
 // service 21..40 with map 23 and a notifying feature 25.
 static void report(uint16_t value, uint8_t id, uint8_t type, bool cccd) {
     advance(); assert(query == DESCRIPTORS && requested == value);
@@ -502,7 +502,7 @@ static void supplied_hash_is_checked_before_use(void) {
     assert(query == HASH && link.setup == SETUP_HASH && link.query);
     hash_result(hash_a, 16); complete(0);
     assert(begins == 1 && link.hash_equal && link.cached && link.setup == SETUP_NONE && link.report_count == 3);
-    // A different, absent, malformed or repeated hash drops the saved layout,
+    // A different, absent, malformed, or repeated hash drops the saved layout,
     // so setup discovers.
     for (unsigned c = 0; c < 6; ++c) {
         pending_admission(false);
@@ -564,5 +564,5 @@ int main(void) {
     verification_compares_the_hash();
     supplied_hash_is_checked_before_use();
     write_modes();
-    puts("Single GATT discovery, subscription, routing, verification and write-mode regressions passed");
+    puts("Single GATT discovery, subscription, routing, verification, and write-mode regressions passed");
 }

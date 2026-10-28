@@ -1,6 +1,6 @@
 //! Profiles: an adapter's profile memory, its configuration interfaces, each with a switch and a
 //! profile staged until Save, and the listed profiles a page at a time, each labelled with its
-//! roles, with creating, copying and deleting them at once. The picker of a profile for an
+//! roles, with creating, copying, and deleting them at once. The picker of a profile for an
 //! interface or a device's layers lists and pages on its own. Profile rules are never read or
 //! changed here.
 use super::{
@@ -16,7 +16,7 @@ use cordial_protocol::ConfigurationInterface;
 use ratatui::{style::Style, text::Line};
 
 impl<F: Fleet> Model<F> {
-    /// The Profiles tab: memory, configuration interfaces and the profiles.
+    /// The Profiles tab: memory, configuration interfaces, and the profiles.
     pub(super) fn adapter_profiles(&self, a: &AdapterView, b: &mut Layout) {
         let Some(view) = a.view() else {
             b.row();

@@ -110,7 +110,7 @@ impl AdapterView {
         self.status.as_ref().is_some_and(profiles::available)
     }
 
-    /// The adapter's radio, storage and other faults, which a starting adapter doesn't report:
+    /// The adapter's radio, storage, and other faults, which a starting adapter doesn't report:
     /// every error other than those shown in their own places.
     pub fn faults(&self) -> Vec<&p::Error> {
         use ErrorCode::*;

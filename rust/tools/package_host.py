@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package the GNU/Linux desktop, CLI and TUI executable and its notices."""
+"""Package the GNU/Linux desktop, CLI, and TUI executable and its notices."""
 import argparse
 import gzip
 import hashlib

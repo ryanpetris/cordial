@@ -94,5 +94,5 @@ int main(void) {
     link.writing=false;poll_info(10);assert(requested==3);done(1);
     assert(percent==255 && !read_success && !link.closing);poll_info(11);
     cordial_info_clear(&link);assert(!listeners);
-    puts("Optional information discovery, notification, failure and ATT serialization checks passed");
+    puts("Optional information discovery, notification, failure, and ATT serialization checks passed");
 }

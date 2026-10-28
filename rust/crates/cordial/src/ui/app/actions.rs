@@ -101,7 +101,7 @@ impl<F: Fleet> App<F> {
             Page::Overview => {}
         }
     }
-    /// Whether the dialog is waiting for a rename, profile operation or device removal.
+    /// Whether the dialog is waiting for a rename, profile operation, or device removal.
     pub fn dialog_busy(&self) -> bool {
         match &self.dialog {
             Some(Dialog::Rename(id)) => self.renaming(id),

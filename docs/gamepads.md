@@ -1,6 +1,6 @@
 # Gamepad outputs
 
-Pico W, Pico 2 W, Pimoroni Pico Plus 2 W and Waveshare RP2350B-Plus-W support HID and XInput
+Pico W, Pico 2 W, Pimoroni Pico Plus 2 W, and Waveshare RP2350B-Plus-W support HID and XInput
 gamepad outputs.
 
 After pairing a controller, open its Settings tab, select **HID** or **XInput** under
@@ -17,7 +17,7 @@ connections have independent allowances per transport, separate from the USB poo
 
 Connecting or disconnecting a controller assigns or releases a slot without reconnecting USB. An
 empty HID slot stays visible with neutral controls; an empty XInput channel reports the controller
-absent. Pairing, unpairing or changing a saved mode reconnects USB when a pool's size changes.
+absent. Pairing, unpairing, or changing a saved mode reconnects USB when a pool's size changes.
 
 Controller support depends on its reported HID layout. See the
 [mapping limits](protocol/hid-forwarding.md#usb-gamepad-outputs).

@@ -1,5 +1,5 @@
-//! An adapter's page: Details, Settings, Profiles and Diagnostics. Settings and Profiles stage
-//! their changes until Save sends them together in one request; renaming, connecting and
+//! An adapter's page: Details, Settings, Profiles, and Diagnostics. Settings and Profiles stage
+//! their changes until Save sends them together in one request; renaming, connecting, and
 //! disconnecting act at once.
 use super::Kind;
 use super::{

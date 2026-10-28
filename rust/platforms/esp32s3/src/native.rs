@@ -25,7 +25,7 @@ pub async fn changed() {
     CHANGED.wait().await;
 }
 // Identities only, not a mirror of opaque keys. Updated by native store owners
-// before Ready, after bonding and after explicit removal.
+// before Ready, after bonding, and after explicit removal.
 type BondIdentities = (
     [ffi::cordial_ble_peer; cordial_core::devices::BLE_CONNECTIONS + 1],
     usize,

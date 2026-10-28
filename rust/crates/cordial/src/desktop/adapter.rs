@@ -1,6 +1,6 @@
 //! An adapter's page: its details and settings, with Profiles and Diagnostics opening from it.
 //! Settings and Profiles changes apply as they are made. While the adapter isn't ready, the page
-//! shows its state instead, with the migration's Migrate and Cancel. Rename, Connect and
+//! shows its state instead, with the migration's Migrate and Cancel. Rename, Connect, and
 //! Disconnect are in the page's menu, and Restart and the development tools in the Diagnostics
 //! menu.
 use super::{
@@ -327,7 +327,7 @@ pub fn usb(live: &Report) -> Vec<Item> {
     usb
 }
 
-/// The Information group's facts: the firmware, board and storage while the adapter is ready,
+/// The Information group's facts: the firmware, board, and storage while the adapter is ready,
 /// or the firmware it reported on connecting while it isn't.
 pub fn information(a: &AdapterView) -> Vec<Item> {
     let Some(live) = a.live() else {
@@ -520,7 +520,7 @@ struct Diagnostics {
     retry: Btn,
     ids: List,
     buttons: Migration,
-    /// Restart and, on development firmware, Enter Bootloader.
+    /// Restart, and, on development firmware, Enter Bootloader.
     menu: Menu,
 }
 

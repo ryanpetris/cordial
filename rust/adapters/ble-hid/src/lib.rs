@@ -352,7 +352,7 @@ impl<H: Host> Backend<H> {
     }
     /// Brings the host in line with the requested transport state: the
     /// application's accept list while BLE is enabled, and while it is
-    /// disabled an empty accept list, no scan, no offer and no open link.
+    /// disabled an empty accept list, no scan, no offer, and no open link.
     /// Every step is attempted; the first failure is returned and the step is
     /// retried by the next call.
     fn reconcile(&mut self) -> Result<(), Error> {
@@ -472,7 +472,7 @@ impl<H: Host> Backend<H> {
                 return;
             }
             NativeEvent::Ready => {
-                // The restarted host holds no accept list, scan or offer.
+                // The restarted host holds no accept list, scan, or offer.
                 self.reconnect.clear();
                 self.scanning = false;
                 self.decline = None;

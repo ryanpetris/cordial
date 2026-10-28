@@ -493,7 +493,7 @@ impl Link {
     }
     /// Whether the device answered the protocol probe as HID++ 2.0 or later
     /// and has usable long reports, once that is known. HID++ 1.0 and a device
-    /// without usable HID++ reports answer false; an error reply, timeout or
+    /// without usable HID++ reports answer false; an error reply, timeout, or
     /// transport failure leaves it unknown.
     pub fn hidpp_found(&self) -> Option<bool> {
         let client = &self.client;
@@ -685,7 +685,7 @@ impl Link {
         core::mem::take(&mut self.input_activity)
     }
     /// Whether an input report reached the forwarder since the last call. Rollover reports,
-    /// omitted vendor reports, vendor reports of other services and HID++ responses forward nothing.
+    /// omitted vendor reports, vendor reports of other services, and HID++ responses forward nothing.
     pub fn take_input_forwarded(&mut self) -> bool {
         core::mem::take(&mut self.input_forwarded)
     }

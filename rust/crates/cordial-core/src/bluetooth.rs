@@ -253,7 +253,7 @@ pub trait Bluetooth {
     /// enabled.
     fn capabilities(&self) -> Capabilities;
     /// Enables or disables a transport. The backend starts with Classic
-    /// disabled and BLE enabled, keeps the last values across its own restarts
+    /// disabled and BLE enabled, keeps the last values across its own restarts,
     /// and applies them whenever it starts. With Classic disabled it is neither
     /// connectable nor discoverable over BR/EDR, does not page or inquire, and
     /// declines incoming Classic connections. With BLE disabled it does not

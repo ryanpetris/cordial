@@ -1,20 +1,20 @@
 //! Application state shared by the desktop and terminal interfaces.
 //!
 //! Each adapter has one in-process controller. Actions stage edits or submit commands;
-//! messages reconcile their results, discovery, reconnects and storage migrations.
+//! messages reconcile their results, discovery, reconnects, and storage migrations.
 //!
 //! Construct [`Live`] with a [`Sink`] that delivers messages to the UI thread, then pass it to
 //! [`App::new`]. Feed received messages to [`App::update`] and call [`App::tick`] every 500 ms.
 //! The sink runs on worker threads and may block on a bounded channel; it must not mutate the
-//! app directly. [`Live::with_backend`] replaces serial connections, discovery and migration
+//! app directly. [`Live::with_backend`] replaces serial connections, discovery, and migration
 //! for tests or simulations.
 //!
 //! [`App::act`] handles [`Action`] values against the shown page or dialog. Set dialog text with
 //! [`App::set_form`] before submitting it. Native setting controls use [`Action::SettingChoice`]
 //! with typed values.
 //!
-//! [`App::adapters`], [`App::devices`] and [`App::state_of`] expose the current read model.
-//! The `adapter_changes`, `device_values`, `settings_of`, `shown_value`, `marker` and
+//! [`App::adapters`], [`App::devices`], and [`App::state_of`] expose the current read model.
+//! The `adapter_changes`, `device_values`, `settings_of`, `shown_value`, `marker`, and
 //! `shown_page` methods include staged edits and profile paging. Their locking and saving
 //! helpers determine control availability. [`App::note`] returns results at their [`Spot`];
 //! [`App::toast_text`] returns transient results belonging outside the shown page.
@@ -61,7 +61,7 @@ use std::{
 };
 pub use world::{AdapterView, DeviceView, Storage};
 
-/// Events produced by controllers, discovery and the migration worker.
+/// Events produced by controllers, discovery, and the migration worker.
 pub enum Msg {
     Fleet(Slot, Box<Event>),
     Ports(Result<Vec<PortInfo>, String>),
@@ -332,7 +332,7 @@ pub(crate) enum Kind {
         /// The staged gamepad output is saved once this finishes.
         gamepad: bool,
     },
-    /// Creating, copying or deleting a profile, from its dialog.
+    /// Creating, copying, or deleting a profile, from its dialog.
     Profile,
     Scan,
     Pair,
@@ -454,7 +454,7 @@ pub struct Submission {
     pub unknown: bool,
 }
 
-/// Session state, staged edits and the page and dialog currently shown.
+/// Session state, staged edits, and the page and dialog currently shown.
 pub struct App<F: Fleet> {
     pub(crate) fleet: F,
     pub(crate) done: bool,
@@ -628,7 +628,7 @@ impl<F: Fleet> App<F> {
             .is_some_and(|m| !matches!(m.stage, Stage::Failed(..)))
     }
 
-    /// Closes every session, stops discovery and migrates the adapter once every port is
+    /// Closes every session, stops discovery, and migrates the adapter once every port is
     /// released.
     pub(crate) fn begin_migration(&mut self, id: &str) {
         let Some(s) = self.session_of(id) else { return };
@@ -803,7 +803,7 @@ impl<F: Fleet> App<F> {
         self.sync();
     }
 
-    /// A timer tick: adapters are listed, spinners advance and held adapters expire.
+    /// A timer tick: adapters are listed, spinners advance, and held adapters expire.
     pub fn tick(&mut self) {
         self.refresh();
         self.sync();

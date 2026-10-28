@@ -1,7 +1,7 @@
-// Exercise saved-layout reconnection across profile, GATT and information
+// Exercise saved-layout reconnection across profile, GATT, and information
 // callbacks: Connected at re-encryption, CCCD rewrites, request gating, early
-// input, background verification and the Classic SDP path. GATT queries,
-// security state and Classic host calls are faked; event decoding is native.
+// input, background verification, and the Classic SDP path. GATT queries,
+// security state, and Classic host calls are faked; event decoding is native.
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -483,7 +483,7 @@ static void classic_follows_its_setting(void) {
     event_count = 0; declines = 0;
     classic_event(request, sizeof request);
     assert(declines == 1 && !event_count);
-    // No paging, inquiry or discovery results.
+    // No paging, inquiry, or discovery results.
     cordial_link id = { .generation = 400, .slot = 0 };
     assert(cordial_profiles_connect(id, peer, false, NULL) == CORDIAL_TRANSPORT && !cordial_by_id(id));
     assert(cordial_profiles_scan(9, true, false) == CORDIAL_TRANSPORT);
@@ -788,5 +788,5 @@ int main(void) {
     classic_follows_its_setting();
     transport_enabled[CORDIAL_CLASSIC] = true;
     incoming_entries_start_clean();
-    puts("Saved layout reconnection, early input and Classic SDP regressions passed");
+    puts("Saved layout reconnection, early input, and Classic SDP regressions passed");
 }

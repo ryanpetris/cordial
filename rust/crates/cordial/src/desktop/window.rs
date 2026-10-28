@@ -279,7 +279,7 @@ impl Window {
         ));
         window.add_action(&search);
         // A search result waiting to be laid out gives way to the user's next key press, click,
-        // scroll or touch. Focus changes can't show that, since GTK and the split view move focus
+        // scroll, or touch. Focus changes can't show that, since GTK and the split view move focus
         // themselves while the result's page comes on screen.
         let revealing = Revealing::default();
         let input = gtk::EventControllerLegacy::new();

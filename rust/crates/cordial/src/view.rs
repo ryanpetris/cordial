@@ -1,5 +1,5 @@
 //! The session's view of the Dongle, built from responses and events in the order the Dongle
-//! sent them. A device, profile or status record arrives whole and replaces what the view held. A
+//! sent them. A device, profile, or status record arrives whole and replaces what the view held. A
 //! listing is complete and replaces what the view held of its kind, and change events replace or
 //! remove the settings objects the view holds. An accepted Set request carries no result: the
 //! Dongle now holds what was sent in the form the command saves it, so the view takes the sent
@@ -29,7 +29,7 @@ pub enum Item {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Pending {
     pub command: &'static str,
-    /// The device, candidate or profile ID the command acts on; 0 for none.
+    /// The device, candidate, or profile ID the command acts on; 0 for none.
     pub target: u32,
 }
 
@@ -55,7 +55,7 @@ pub struct State {
     pub pairing: Option<p::Pairing>,
     /// Each device's settings objects in listing order, once listed.
     pub settings: BTreeMap<u32, Vec<p::SettingsObject>>,
-    /// Profiles by ID, from listings, results and events. Before a listing it holds only the
+    /// Profiles by ID, from listings, results, and events. Before a listing it holds only the
     /// profiles this session has seen.
     pub profiles: BTreeMap<u32, p::Profile>,
     pub pending: Vec<Pending>,

@@ -51,7 +51,7 @@ typedef struct cordial_connection {
     // verified yet. resubscribe: a CCCD write of that layout failed.
     bool cached, resubscribe;
     // The layout's GATT Database Hash. Before a supplied layout is used the
-    // device's hash is read: hash_read, hash_equal and hash_malformed record
+    // device's hash is read: hash_read, hash_equal, and hash_malformed record
     // whether a value arrived, matched, or could not be used.
     bool hashed, hash_read, hash_equal, hash_malformed;
     uint8_t hash[16];

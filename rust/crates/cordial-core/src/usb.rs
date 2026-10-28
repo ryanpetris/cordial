@@ -1,4 +1,4 @@
-//! USB allocation shared by startup, saved preferences and live connections.
+//! USB allocation shared by startup, saved preferences, and live connections.
 use crate::outputs::Plan;
 
 /// The interfaces actually exposed. Editor preference and exposure are independent.

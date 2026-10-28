@@ -1,4 +1,4 @@
-//! Platform hooks for transfer completion, endpoint halt and USB remote wake.
+//! Platform hooks for transfer completion, endpoint halt, and USB remote wake.
 use core::{
     future::{Future, poll_fn},
     pin::{Pin, pin},

@@ -52,7 +52,7 @@ pub const GAMEPAD_AXES: [Usage; 8] = [
 ];
 /// Consumer AC Pan, the horizontal wheel a mouse reports.
 pub const PAN: Usage = usage(CONSUMER_PAGE, 0x238);
-/// The relative values in `Input::motion`, in order: X, Y, wheel and pan.
+/// The relative values in `Input::motion`, in order: X, Y, wheel, and pan.
 pub const AXES: [Usage; 4] = [
     usage(DESKTOP_PAGE, 0x30),
     usage(DESKTOP_PAGE, 0x31),
@@ -88,7 +88,7 @@ impl Range {
         page(usage) == self.page && (self.min..=self.max).contains(&id(usage))
     }
 }
-/// On/off controls a remap can name: keys, held Consumer controls, mouse buttons and the System
+/// On/off controls a remap can name: keys, held Consumer controls, mouse buttons, and the System
 /// Control buttons the adapter's System Control report carries. The display rotation lock slider
 /// (`01:ca`) reports a switch position rather than a press, so rules do not name it.
 pub const REMAP_INPUTS: [Range; 14] = [
@@ -213,7 +213,7 @@ impl Rule {
         }
     }
     /// Checks a rule against what the firmware supports and puts it in its saved form: output
-    /// collections resolved, outputs sorted without duplicates and ratios in lowest terms.
+    /// collections resolved, outputs sorted without duplicates, and ratios in lowest terms.
     pub fn normalized(mut self) -> Result<Self, Invalid> {
         let ranges: &[Range] = match self.effect {
             Effect::Remap(_) => &REMAP_INPUTS,
@@ -526,7 +526,7 @@ impl Rules {
             .iter()
             .fold(0, |roles, e| roles | role(e.collection))
     }
-    /// USB roles produced by the profile's remaps, scales and axis rules.
+    /// USB roles produced by the profile's remaps, scales, and axis rules.
     pub fn output_roles(&self) -> u8 {
         self.entries.iter().fold(0, |roles, entry| {
             roles
@@ -2233,7 +2233,7 @@ mod tests {
                 denominator: 1,
             })),
         };
-        // A rule without an effect, a zero input, a zero ratio, unsorted or repeated inputs and
+        // A rule without an effect, a zero input, a zero ratio, unsorted or repeated inputs, and
         // truncated bytes are undecodable.
         let effectless = saved::Rule {
             input: key(4),

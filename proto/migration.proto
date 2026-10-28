@@ -1,15 +1,15 @@
 // Desktop/CLI migration IPC. Each stdin control and stdout event is one protobuf message
 // prefixed by its unsigned 32-bit byte length in four little-endian bytes. Length must be
-// 1..65536 before allocation or decoding; zero, oversize, malformed and truncated frames fail
+// 1..65536 before allocation or decoding; zero, oversize, malformed, and truncated frames fail
 // closed. Write boundaries have no meaning. stdout contains only framed events; diagnostics
 // use stderr. There is no IPC version counter. Unknown oneof variants never authorize resume.
 syntax = "proto3";
 
 package cordial.migration;
 
-// The desktop closes ALL adapters and stops discovery, probes and reconnect before starting
+// The desktop closes ALL adapters and stops discovery, probes, and reconnect before starting
 // the subprocess. It remains globally suspended until verified success AND child exit, or an
-// explicit user cancellation AND child exit. Failure, EOF or child exit alone do not release it.
+// explicit user cancellation AND child exit. Failure, EOF, or child exit alone do not release it.
 // CLI and TUI use the same global exclusivity through their direct coordinator.
 message MigrationControl {
   oneof action {
@@ -33,7 +33,7 @@ message MigrationStart {
   string port_hint = 2;
 }
 
-// Explicit user cancellation. The child stops issuing file commands, closes its adapter and
+// Explicit user cancellation. The child stops issuing file commands, closes its adapter, and
 // exits. A partial temporary file may remain for cleanup when migration resumes. A lost stdin
 // stream is a failure, not proof of explicit cancellation or permission to resume.
 message MigrationCancel {}
@@ -96,7 +96,7 @@ message MigrationFailure {
 }
 
 // Sent only after reconnecting to the same stable Status.id and verifying the requested target,
-// Status.ready and the absence of STORAGE_MIGRATION_REQUIRED. The desktop also waits for child exit
+// Status.ready, and the absence of STORAGE_MIGRATION_REQUIRED. The desktop also waits for child exit
 // before resuming its connections.
 message MigrationSuccess {
   string adapter_id = 1;

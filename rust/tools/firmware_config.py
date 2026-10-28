@@ -50,7 +50,7 @@ def load(path, profile):
     if not isinstance(config, dict) or set(config) != fields:
         raise ValueError(f"Board configuration requires exactly: {', '.join(sorted(fields))}")
     if profile not in ("production", "debug", "development"):
-        raise ValueError("Select the production, debug or development profile explicitly")
+        raise ValueError("Select the production, debug, or development profile explicitly")
     if not isinstance(config["name"], str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", config["name"]):
         raise ValueError("Invalid hardware configuration name")
     name = config["default_adapter_name"]
@@ -70,7 +70,7 @@ def load(path, profile):
     feature, triple, gpio_max, ram = target
     selected = tuple(config[key] for key in ("bluetooth_backend", "usb_backend", "storage_backend"))
     if selected != ("btstack", "embassy", "littlefs"):
-        raise ValueError("Pico requires btstack, embassy USB and littlefs")
+        raise ValueError("Pico requires btstack, embassy USB, and littlefs")
     if config["radio_backend"] not in ("pico-sdk-cyw43", "embassy-cyw43"):
         raise ValueError("Pico requires pico-sdk-cyw43 or embassy-cyw43 radio")
     flash = integer(config["minimum_flash_bytes"], 2097152, 16777216, "minimum_flash_bytes", 4096)
@@ -87,10 +87,10 @@ def load(path, profile):
         raise ValueError("Crystal must divide the 1.5 GHz system and 1.2 GHz USB PLL VCOs")
     radio = config["radio"]
     if not isinstance(radio, dict) or set(radio) != {"power", "data", "clock", "cs", "led"}:
-        raise ValueError("radio requires power, data, clock, cs and led")
+        raise ValueError("radio requires power, data, clock, cs, and led")
     pins = [integer(radio[k], 0, gpio_max, f"radio.{k}") for k in ("power", "data", "clock", "cs")]
     if len(set(pins)) != 4:
-        raise ValueError("Radio power, data, clock and cs pins must be distinct")
+        raise ValueError("Radio power, data, clock, and cs pins must be distinct")
     if max(radio["data"], radio["clock"]) > 31 and min(radio["data"], radio["clock"]) < 16:
         raise ValueError("Radio data and clock must share PIO window 0..31 or 16..47")
     led = indicator(radio["led"], 2, "radio.led")

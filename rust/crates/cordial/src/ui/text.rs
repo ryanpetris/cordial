@@ -1,4 +1,4 @@
-//! Human-readable text shared by the shell, scripts and the TUI: safe terminal
+//! Human-readable text shared by the shell, scripts, and the TUI: safe terminal
 //! rendering of untrusted strings, the host's explanations of adapter codes,
 //! and the shell's line formats.
 use crate::{
@@ -24,9 +24,9 @@ use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
-/// Printable: letters, marks, numbers, punctuation, symbols and the ASCII
+/// Printable: letters, marks, numbers, punctuation, symbols, and the ASCII
 /// space. Controls, format characters (including
-/// bidirectional controls and tags), other separators, private-use and
+/// bidirectional controls and tags), other separators, private-use, and
 /// unassigned code points are not.
 fn printable(c: char) -> bool {
     c == ' '
@@ -180,7 +180,7 @@ pub fn display_candidate_name(c: &p::Candidate) -> String {
     }
 }
 
-/// Double-quotes text, escaping quotes, backslashes and nonprintable
+/// Double-quotes text, escaping quotes, backslashes, and nonprintable
 /// characters.
 pub fn quote(s: &str) -> String {
     let mut out = String::from("\"");
@@ -435,7 +435,7 @@ pub fn hidpp_words(code: ErrorCode) -> String {
         .unwrap_or_else(|| unknown_code(code))
 }
 
-/// Explains an integration, setting or output failure with its details.
+/// Explains an integration, setting, or output failure with its details.
 pub fn hidpp_error_words(e: &p::Error) -> String {
     described(
         e,
@@ -1446,7 +1446,7 @@ fn bytes_in_use(r: &p::ResourceCapacity) -> Option<String> {
     })
 }
 
-/// One `file list` row: type, size and name, tab-separated.
+/// One `file list` row: type, size, and name, tab-separated.
 pub fn file_line(e: &p::FileEntry) -> String {
     format!(
         "{}\t{}\t{}",
@@ -1705,7 +1705,7 @@ fn role_tokens(profile: &p::Profile) -> String {
     }
 }
 
-/// One profile as `profile list` shows it: ID, roles and name, tab-separated.
+/// One profile as `profile list` shows it: ID, roles, and name, tab-separated.
 pub fn profile_line(profile: &p::Profile) -> String {
     format!(
         "{}\t{}\t{}",
@@ -1715,7 +1715,7 @@ pub fn profile_line(profile: &p::Profile) -> String {
     )
 }
 
-/// `profile show`: a profile's name, ID and roles.
+/// `profile show`: a profile's name, ID, and roles.
 fn profile_text(profile: &p::Profile) -> String {
     let roles = role_names(&profiles::roles(profile));
     format!(
