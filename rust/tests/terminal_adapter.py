@@ -1,4 +1,6 @@
 """Serial PTY fixture with real framing and generated protocol messages."""
+import atexit
+from functools import cache
 import importlib.util
 import os
 from pathlib import Path
@@ -43,27 +45,27 @@ def decode(data):
     return bytes(result)
 
 
-class Adapter:
-    def __init__(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="cordial-terminal-")
-        directory = Path(self.directory.name)
-        version = (ROOT / "proto/serial/current").read_text().strip()
-        schema = ROOT / "proto/serial" / f"v{version}"
-        subprocess.run(["protoc", f"-I{schema}", f"-I{ROOT / 'proto'}",
-                        f"--python_out={directory}", str(schema / "cordial.proto"),
-                        str(ROOT / "proto/handshake.proto")], check=True, capture_output=True)
+@cache
+def _artifacts():
+    temporary = tempfile.TemporaryDirectory(prefix="cordial-terminal-")
+    directory = Path(temporary.name)
+    version = (ROOT / "proto/serial/current").read_text().strip()
+    schema = ROOT / "proto/serial" / f"v{version}"
+    subprocess.run(["protoc", f"-I{schema}", f"-I{ROOT / 'proto'}",
+                    f"--python_out={directory}", str(schema / "cordial.proto"),
+                    str(ROOT / "proto/handshake.proto")], check=True, capture_output=True)
 
-        def module(name):
-            spec = importlib.util.spec_from_file_location(name, directory / f"{name}.py")
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module
+    def module(name):
+        spec = importlib.util.spec_from_file_location(name, directory / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
 
-        self.p = module("cordial_pb2")
-        self.hello = module("handshake_pb2").AdapterHello(protocol_version=int(version))
-        # PTYs support serial byte transport but have no modem-control lines.
-        shim = directory / "modem.c"
-        shim.write_text('''#define _GNU_SOURCE
+    protocol = module("cordial_pb2")
+    handshake = module("handshake_pb2")
+    # PTYs support serial byte transport but have no modem-control lines.
+    shim = directory / "modem.c"
+    shim.write_text('''#define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdarg.h>
 #include <sys/ioctl.h>
@@ -78,9 +80,17 @@ int ioctl(int fd, unsigned long request, ...) {
     return original(fd, request, arg);
 }
 ''')
-        library = directory / "modem.so"
-        subprocess.run(["cc", "-shared", "-fPIC", "-o", str(library), str(shim), "-ldl"],
-                       check=True, capture_output=True)
+    library = directory / "modem.so"
+    subprocess.run(["cc", "-shared", "-fPIC", "-o", str(library), str(shim), "-ldl"],
+                   check=True, capture_output=True)
+    atexit.register(temporary.cleanup)
+    return protocol, handshake, int(version), library
+
+
+class Adapter:
+    def __init__(self):
+        self.p, handshake, version, library = _artifacts()
+        self.hello = handshake.AdapterHello(protocol_version=version)
         self.env = dict(os.environ, LD_PRELOAD=str(library))
         self.master, self.slave = pty.openpty()
         self.port = os.ttyname(self.slave)
@@ -101,7 +111,6 @@ int ioctl(int fd, unsigned long request, ...) {
         self.thread.join(timeout=3)
         os.close(self.master)
         os.close(self.slave)
-        self.directory.cleanup()
         assert not self.thread.is_alive(), "serial fixture did not stop"
         if self.error:
             raise self.error

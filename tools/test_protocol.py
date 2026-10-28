@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from check_protocol import check, version_storage_schema
+from check_protocol import check, definitions, version_storage_schema
 from version import protocol_base, released_tags
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +52,31 @@ class ProtocolBaselineTests(unittest.TestCase):
         destination = self.root / 'proto' / path
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(text)
+
+    def test_current_descriptor_is_built_and_parsed_once_per_check(self):
+        self.git('tag', 'v0.9.1')
+        self.git('commit', '--allow-empty', '-qm', 'Another release fixture')
+        self.git('tag', 'v0.9.2')
+        with patch('check_protocol.subprocess.run', wraps=subprocess.run) as run, \
+                patch('check_protocol.definitions', wraps=definitions) as parse:
+            check('v0.9.0', self.root, BUF)
+        builds = [call.args[0] for call in run.call_args_list if call.args[0][1] == 'build']
+        self.assertEqual(sum(argv[2] == str(self.root / 'proto') for argv in builds), 1)
+        self.assertEqual(len(builds), 5)  # Three serial baselines and one storage baseline.
+        self.assertEqual(sum(call.args[0].name == 'current.json' for call in parse.call_args_list), 1)
+        breaking = [call for call in run.call_args_list if call.args[0][1] == 'breaking']
+        self.assertEqual(len(breaking), 4)
+        self.write('serial/v1/cordial.proto', self.schemas['serial/v1/cordial.proto'].split('enum State')[0])
+        with self.assertRaisesRegex(ValueError, 'enum fixture.serial.v1.State'):
+            check('v0.9.0', self.root, BUF)
+        self.write('serial/v1/cordial.proto', self.schemas['serial/v1/cordial.proto'])
+        check('v0.9.0', self.root, BUF)
+
+    def test_storage_only_check_does_not_build_current_descriptor(self):
+        with patch('check_protocol.stable_tags', return_value=[]), \
+                patch('check_protocol.definitions', wraps=definitions) as parse:
+            check('v0.9.0', self.root, BUF)
+        parse.assert_not_called()
 
     def test_new_series_check_handshake_with_empty_storage_base(self):
         self.write('handshake.proto', self.schemas['handshake.proto'].replace('uint32 protocol_version', 'string protocol_version'))

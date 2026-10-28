@@ -23,6 +23,7 @@ CONFIGURATION = (
     "HOST_TARGET", "BOARD", "PROFILE", "PROTOCOL_STABLE_BASE", "PROTOCOL_BASE", "DOCKER",
     "DEB_DISTRIBUTION", "DEB_REVISION", "HOST_ARCHIVE", "BOARDS", "ESP_BOARDS",
     "FIRMWARE_PLATFORM", "DEB_BASE", "DEB_BASE_trixie", "DEB_BASE_resolute",
+    "CHECK_IMAGE_FLAGS",
 )
 
 
@@ -188,6 +189,64 @@ elif "--output" in args:
             ["build", "-t", "cordial-deb-resolute", "--build-arg", "BASE=ubuntu:26.04",
              "--build-context", "tools=docker", "-f", "docker/deb.Dockerfile", "packaging/debian"],
         ])
+
+    def test_package_checks_share_the_archive_and_use_fresh_prerequisite_containers(self):
+        self.run_just("DEB_DISTRIBUTION=resolute", "check-appimage-resolute", "check-appimage-arch",
+                      "check-package-arch", "check-package-deb")
+        commands = [next(arg for arg in call if arg.startswith("COMMAND=")) for call in self.builds()]
+        self.assertEqual(sum("local-package-host-tar" in command for command in commands), 1)
+        self.assertEqual(len(commands), 4)
+        runs = [call for call in self.calls() if call[0] == "run"]
+        self.assertEqual(len(runs), 4)
+        self.assertTrue(all(call[1:3] == ["--rm", "--init"] for call in runs))
+        self.assertTrue(all(["-v", str(self.root) + ":/src"] == call[3:5] for call in runs))
+        self.assertEqual([call[-2:] for call in runs[:2]],
+                         [["docker/check-appimage.sh", "resolute"], ["docker/check-appimage.sh", "arch"]])
+        self.assertEqual([call[-1] for call in runs[2:]],
+                         ["packaging/check-arch.sh", "packaging/check-deb.sh"])
+        self.assertIn("DEB_REVISION", runs[-1])
+        for call in runs:
+            self.assertIn(f"CHECK_UID={os.getuid()}", call)
+            self.assertIn(f"CHECK_GID={os.getgid()}", call)
+
+    def test_prerequisite_images_keep_distribution_bases_and_refresh_flags(self):
+        self.run_just("CHECK_IMAGE_FLAGS=--pull --no-cache", "image-check-package-deb",
+                      "image-check-package-arch", "image-check-appimage-resolute", "image-check-appimage-arch",
+                      "image-check-desktop")
+        builds = [call for call in self.calls() if call[0] == "build"]
+        self.assertEqual(len(builds), 5)
+        for call, base, kind in zip(builds, ["debian:13", "archlinux:base-devel", "ubuntu:26.04", "archlinux:base", "ubuntu:26.04"],
+                                    ["package-deb", "package-arch", "appimage-resolute", "appimage-arch", "desktop-resolute"]):
+            self.assertIn("BASE=" + base, call)
+            self.assertIn("KIND=" + kind, call)
+            self.assertEqual(call[1:3], ["--pull", "--no-cache"])
+            self.assertEqual(call[-3:], ["-f", "docker/check.Dockerfile", "."])
+        self.assertEqual(builds[-1][builds[-1].index("--target") + 1], "desktop")
+
+    def test_installed_desktop_checks_build_current_resolute_package(self):
+        self.run_just("DEB_DISTRIBUTION=resolute", "check-installed-desktop")
+        commands = [next(arg for arg in call if arg.startswith("COMMAND=")) for call in self.builds()]
+        self.assertEqual(len(commands), 2)
+        self.assertIn("local-package-host-tar", commands[0])
+        self.assertIn("DEB_DISTRIBUTION=resolute", shlex.split(commands[1].removeprefix("COMMAND=")))
+        self.assertEqual(self.calls()[-1][-3:],
+                         ["cordial-check-desktop-resolute", "bash", "docker/check-installed-desktop.sh"])
+
+    def test_installed_desktop_rejects_trixie_before_any_docker_build(self):
+        rejected = self.run_just("check-installed-desktop", check=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("Installed desktop checks require DEB_DISTRIBUTION=resolute", rejected.stderr)
+        self.assertFalse((self.root / "calls.jsonl").exists())
+
+    def test_combined_firmware_runs_clippy_before_build_in_one_export(self):
+        self.run_just("BOARD=pico2_w", "PROFILE=production", "check-and-build-firmware")
+        self.assertEqual(len(self.builds()), 1)
+        call = self.builds()[0]
+        command = next(arg for arg in call if arg.startswith("COMMAND="))
+        build = "python3 rust/tools/build_firmware.py rust/boards/pico2_w.json --profile production"
+        self.assertEqual(command, "COMMAND=time " + build + " --clippy && time " + build)
+        self.assertIn("OUTPUTS=build/firmware/*/*", call)
+        self.assertEqual(sum("-t" in call for call in self.calls()), 1)
 
     def test_unknown_debian_distribution_only_blocks_its_image(self):
         self.run_just("DEB_DISTRIBUTION=unknown", "help", "host")
@@ -423,6 +482,11 @@ elif name == "dpkg-parsechangelog":
 
     def calls(self):
         return [json.loads(line) for line in (self.root / "commands.jsonl").read_text().splitlines()]
+
+    def test_gtk_checks_use_the_discovering_python_runner(self):
+        self.run_just("check-gtk")
+        self.assertEqual(self.calls()[-1]["tool"], "python-fixture")
+        self.assertEqual(self.calls()[-1]["args"], ["rust/tools/test_gtk.py"])
 
     def test_local_packages_share_schema_preparation_and_release_build(self):
         self.run_just("HOST_TARGET=fixture-target", "SOURCE_DATE_EPOCH=321", "local-host",

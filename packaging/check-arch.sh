@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # Run in a disposable Arch container as root from the repository root.
 set -euxo pipefail
-pacman -Syu --noconfirm namcap python binutils
-sed -i '/^NoExtract.*usr\/share\/doc/d' /etc/pacman.conf
+source "$(dirname "$0")/../docker/check-output.sh"
+if pacman -Q cordial; then echo 'Use a fresh prerequisite container' >&2; exit 1; fi
 package="build/packages/host-arch/cordial-$CORDIAL_VERSION-1-x86_64.pkg.tar.zst"
+check_output "release/$(basename "$package")" release/SHA256SUMS-arch
 test -f "$package"
-temporary=$(mktemp -d)
-trap 'rm -rf "$temporary"' EXIT
 pacman -U --noconfirm "$package"
 python tools/check_linux_package.py --version "$CORDIAL_VERSION"
-namcap "$package" > "$temporary/namcap.log"
-cat "$temporary/namcap.log"
-if grep -q ' E:' "$temporary/namcap.log"; then exit 1; fi
+namcap "$package" > "$HOME/namcap.log"
+cat "$HOME/namcap.log"
+if grep -q ' E:' "$HOME/namcap.log"; then exit 1; fi
 pacman -U --noconfirm "$package"
 python tools/check_linux_package.py --version "$CORDIAL_VERSION"
 pacman -Qkk cordial

@@ -366,61 +366,31 @@ The lint and breaking rules live in `buf.yaml`.
 To run only the protocol checks, use `just check-protocol`. It requires just,
 Python, and Git in addition to Buf, and does not compile Rust or native code.
 
-Run the GTK control checks with a display:
+Run all GTK control fixtures with the automatic runner:
 
 ```sh
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::settings::tests::integer_rows_commit_accepted_numbers -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::settings::tests::integer_rows_take_only_numbers -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::settings::tests::unknown_switches_offer_off_and_on -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::settings::tests::unknown_choices_show_unknown_without_listing_it -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::settings::tests::every_saved_state_has_an_icon -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::settings::tests::free_spin_threshold_follows_its_switch_while_on -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::settings::tests::switch_and_number_rows_line_up_in_banded_pairs -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::settings::tests::automatic_power_off_turns_on_with_its_last_timeout -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::window::tests::search_opens_the_expander_row_holding_its_result -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::add::tests::pairing_centers_every_step_at_one_size -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::add::tests::code_entry_takes_passkey_digits_and_pin_text -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::dialogs::tests::a_replaced_dialog_cancels_nothing -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::profiles::tests::cleaned_empty_profile_names_use_id_fallbacks -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::adapter::tests::platform_banner_accessibility_follows_revelation -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::dialogs::tests::a_changed_deletion_is_answered_once_its_changes_are_painted -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::dialogs::tests::a_deletion_is_wider_than_other_confirmations -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::dialogs::tests::a_deletion_marks_its_changes_in_place -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::dialogs::tests::a_change_found_while_a_deletion_ran_is_answered_once_painted -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::services::prefs::tests::dialog_rolls_back_controls_when_gsettings_rejects_saves -- --ignored --exact)
-(cd rust && xvfb-run -a dbus-run-session -- cargo test --locked -p cordial --all-features --lib \
-  desktop::services::prefs::tests::low_battery_level_takes_typed_levels_in_range -- --ignored --exact)
+just check-gtk
 ```
 
-Each command runs one GTK test in its own process. The preference rollback test constructs a
-Settings page in a window and checks all five controls against a read-only GSettings backend.
-The normal Rust preference tests cover external updates
-and persistence. The low battery input test covers typed levels from 1 through 100, including 3
-and 60, and rejects invalid text and out-of-range values. Its percent unit is outside the entry.
+`rust/tools/test_gtk.py` builds the all-feature Cordial library test binary once and discovers
+its ignored `desktop::` tests, currently 20. It runs each test in a separate process with private
+XDG configuration, cache, data, state, runtime, and temporary directories. Tests share one Xvfb
+and private D-Bus session. Every ignored `desktop::` library test must run unattended; interactive
+manual screens outside that namespace remain manual. Do not add a second list of test names.
 
-Install `xvfb`, `xauth`, and `dbus-x11` for the display checks. Linux terminal fixtures need `pyte`,
-Python `protobuf`, `protoc`, a C compiler, and an actual release `cordial` executable. Debian dependency-version tests need `dpkg`; run them
-in a Debian or Ubuntu container when it is unavailable on the host. A missing prerequisite or skipped fixture does not
-complete validation.
+Install `xvfb`, `xauth`, and `dbus-x11` for the display checks, alongside the local Rust and GTK
+build prerequisites and `glib-compile-schemas`. The runner reports per-test time, test-loop time,
+and total time including compilation and display setup.
+The preference rollback fixture constructs a Settings page in a window and checks all five
+controls against a read-only GSettings backend. Normal Rust preference tests cover external
+updates and persistence. The low battery input fixture covers typed levels from 1 through 100,
+including 3 and 60, and rejects invalid text and out-of-range values. Its percent unit is outside
+the entry.
+
+Linux terminal fixtures need `pyte`, Python `protobuf`, `protoc`, a C compiler, and an actual
+release `cordial` executable. Debian dependency-version tests need `dpkg`; run them in a Debian
+or Ubuntu container when it is unavailable on the host. A missing prerequisite or skipped fixture
+does not complete validation.
 
 The build-cache fixtures check the local Cargo runner and its arguments, source timestamp
 reuse, cache boundaries, and clean exports for native host and firmware builds.
@@ -430,19 +400,27 @@ interactive shell and TUI operation with JSON on redirected stderr, and complete
 alongside ordinary CLI output. They check original wire errors in JSON, deferred terminal
 diagnostics, and shutdown with unread stderr.
 They require `pyte`, Python `protobuf`, `protoc`, a C compiler,
-and a built CLI:
+and a built release CLI:
 
 ```sh
+just host
 CORDIAL_TEST_BINARY="$PWD/rust/target/x86_64-unknown-linux-gnu/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py
 ```
 
-Clippy for the firmware platform crates runs in the firmware images, for one board and
-profile or for all of them:
+Run firmware Clippy and artifact validation together for each required board/profile:
 
 ```sh
-just BOARD=esp32s3 PROFILE=production check-firmware
-just check-firmware-all
+just BOARD=pico2_w PROFILE=production check-and-build-firmware
+just BOARD=pico2_w PROFILE=debug check-and-build-firmware
 ```
+
+`check-and-build-firmware` uses one toolchain build invocation for Clippy followed by the linked
+and packaged firmware. It reuses dependency preparation and compilation caches, times both phases,
+and exports the validated artifacts. Artifact checks cover metadata, image layout, and storage
+boundaries; ESP builds also check linked Rust startup stack frames. Both Pico 2 W profiles are
+required. Run both profiles for another board when a change materially affects its board
+definition, platform code, radio backend, configuration, or partition or storage layout.
+`check-firmware` and `check-firmware-all` run only Clippy and do not replace artifact validation.
 
 To exercise the desktop with simulated adapters:
 
@@ -482,31 +460,117 @@ Both fixtures open the regular Settings pane through Ctrl+, and through its side
 
 ### Completion checks
 
-For host changes, run `just check`, the explicit GTK checks above, and the terminal fixture.
-Build and validate the unified archive and AppImage:
+The [required completion catalog](../AGENTS.md#required-completion-checks) retains the full
+local regression coverage. Run `just check`, `just check-gtk`, the terminal fixture with its
+prerequisites, both Pico 2 W firmware profiles, the portable archive check, every native package
+lifecycle, all three installed desktop scenarios, and both AppImage environments. Documentation-only
+changes do not run these suites. Also check any other board directly affected as described above.
+
+#### Native validation images and freshness
+
+The `image-check-*` recipes build prerequisite-only images from `docker/check.Dockerfile` and
+`docker/check-prerequisites.sh`. Before native compatibility validation, refresh every required
+image once against current distribution packages:
 
 ```sh
-just package-host-appimage package-host-tar
+just DEB_DISTRIBUTION=resolute CHECK_IMAGE_FLAGS='--pull --no-cache' \
+  image-check-package-deb image-check-package-arch image-check-desktop \
+  image-check-appimage-resolute image-check-appimage-arch
+just DEB_DISTRIBUTION=trixie CHECK_IMAGE_FLAGS='--pull --no-cache' image-check-package-deb
+```
+
+Then omit `CHECK_IMAGE_FLAGS` and reuse those images while their relevant inputs remain unchanged.
+Refresh explicitly rather than adding a hidden daily cache bust. Rebuild affected images when
+prerequisite definitions change. Do not rebuild every image for each command. Ordinary recipe
+invocations reuse Docker prerequisite layers; they do not refresh distribution repositories.
+
+Each validation starts a fresh disposable container with the checkout mounted and Cordial absent.
+Package lifecycle images contain native runtime dependencies and Namcap or Lintian plus package
+inspection tools. The Resolute desktop image is separate from packaging tools and adds native
+accessibility, Xvfb, D-Bus, and screenshot prerequisites. AppImage images contain only the external
+runtime and fixture dependencies, including graphics, accessibility, and dconf tools. Do not
+install the native application's full dependency set to mask missing bundled libraries. The
+prerequisite script owns the exact dependency lists.
+
+`packaging/check-deb.sh`, `packaging/check-arch.sh`, `docker/check-installed-desktop.sh`, and
+`docker/check-appimage.sh` expect those prerequisites; they do not bootstrap a bare distribution.
+Use the canonical recipes to supply the matching image. Never run installation fixtures against
+the development system's installed applications.
+
+#### Run native checks together
+
+Use one invocation to share the current-source Resolute host archive across package and AppImage
+builds, and reuse the Resolute package for installed desktop checks:
+
+```sh
+export CORDIAL_VERSION="${CORDIAL_VERSION:-0.0.0}"
+just DEB_DISTRIBUTION=resolute check-package-deb check-installed-desktop check-package-arch check-appimage-resolute check-appimage-arch
+just DEB_DISTRIBUTION=trixie check-package-deb
 python3 tools/check_release_archive.py "build/release/cordial-$CORDIAL_VERSION-linux-amd64.tar.gz" host "$CORDIAL_VERSION"
 ```
 
-Run `packaging/check-arch.sh` in a disposable Arch container after `just package-host-arch`.
-Build `package-host-deb` and run `packaging/check-deb.sh` in a matching disposable container for
-each of `trixie` and `resolute`. Pass `CORDIAL_VERSION` and `DEB_DISTRIBUTION` to the
-Debian fixture. These fixtures install and remove packages, so use clean containers rather than
-a development system. Preserve Namcap and Lintian checks.
+Use the same `CORDIAL_VERSION` for builds and validation. The example preserves an exported
+version and defaults to `0.0.0` for development. The first invocation builds the portable archive
+and AppImage as recipe dependencies, so a separate `just package-host-appimage package-host-tar`
+is unnecessary.
+Trixie retains its distinct Debian 13 compilation and rejects `HOST_ARCHIVE`.
 
-In a disposable Resolute environment, install the matching `cordial` package, plus
-`python3-pyatspi`, `python3-gi`, `gir1.2-adw-1`, `xvfb`, `xauth`, `dbus-x11`, `imagemagick`,
-`adwaita-icon-theme`, and `librsvg2-common`. The AppImage fixture also needs `libglib2.0-bin`,
-`dconf-gsettings-backend`, and `dconf-service` for independent settings readback. Run:
+`HOST_ARCHIVE` can reuse an already checked artifact only when its source, version, target,
+build configuration, and relevant inputs match the artifact being validated. Archive structure
+and version checks alone do not establish current-source freshness. Never supply a stale archive
+to claim validation of changed sources. Passing results can be reused while their relevant inputs
+remain unchanged; rerun only the affected validations after a change.
 
-```sh
-CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s '-screen 0 1280x1024x24' \
-  dbus-run-session -- python3 rust/tests/gtk_smoke.py build/package-smoke
-xvfb-run -a -s '-screen 0 1280x1024x24' dbus-run-session -- python3 tools/check_appimage.py \
-  "build/release/cordial-$CORDIAL_VERSION-x86_64.AppImage" build/appimage-smoke
-```
+Package checks retain clean installation, reinstallation, native dependencies, schema registration,
+file contents and ownership, Namcap or Lintian, removal, and Debian purge. Installed desktop checks
+run the normal, `--empty-states`, and `--pairing-reconnect` scenarios and write evidence under
+`build/package-smoke`, `build/empty-states-smoke`, and `build/pairing-reconnect-smoke`.
+AppImage checks run in Resolute with software Mesa and GTK's default renderer, and in Arch with
+Cairo. Both exercise packaged desktop launch, bundled GIO module paths, and persistent preferences
+through the default settings backend. They write evidence under `build/appimage-smoke-resolute`
+and `build/appimage-smoke-arch`. When assembling a release, verify every asset and checksum in
+`.github/workflows/release.yml`.
+
+#### Test ownership and timing
+
+Keep exhaustive pure-logic and control matrices in focused unit and GTK tests. Smoke fixtures
+own representative native input through protocol write/readback, settings-backend and process
+restart behavior, packaged runtime, layout breakpoints, and actual disconnect/reconnect. Retain
+unique failure modes when reducing repeated end-to-end actions and setup. Do not remove assertions
+without checking what failure they detect. Native BTstack fixtures keep process isolation, and
+storage tests keep their fault-injection cutpoints.
+
+Shorter test-specific timeouts must preserve production defaults. A deadline-renewal test must
+span the test timeout to detect accidental use of one fixed deadline. Terminal adapters may share
+immutable generated schemas and native artifacts, but each adapter keeps its own session and state.
+
+Keep the empty-state library seed minimal while exercising the transition through the last profile
+and layer. One device per adapter is enough if last-device forgetting and adapter-specific pairing
+routing remain covered. Check geometry at all three widths, 480, 661, and 700 pixels, while running
+behavior that does not depend on width once. Observe simulator writes, saved preferences, and
+autostart across search actions. The append-only simulator trace and latched preference and
+autostart file monitors detect changes even if values return to their starting state. Each
+selection checks the invariant, and one final write-stability window catches late effects.
+`search-write-observation.json` records file events and whether adapter writes occurred.
+Wait for observable state elsewhere rather than arbitrary sleeps. Reacquire accessibility objects
+after UI changes; do not retain a persistent accessibility tree cache. These are coverage
+requirements for fixture maintenance, not measured speed claims.
+
+Report check execution time separately from build/setup time and total wall time. Recipe `time`
+output for native checks includes container startup and fixture setup; keep that overhead visible
+rather than calling it assertion time. Compare the same binary and inputs with the same cache
+state and comparable host load. Label measured results and estimates, record prerequisites, and
+never count skipped fixtures as passes. Do not rerun unaffected validations just to repeat timing.
+Each desktop smoke `result.json` records `stage_seconds`, including each stage's evidence capture,
+and `elapsed_seconds` for the run so far. Successful startup has its own `stage_seconds` entry.
+Shutdown and other work outside the named stages contribute only to elapsed time.
+
+The release workflow has a combined 120-second test and validation budget across all jobs, rather
+than 120 seconds per job or elapsed parallel wall time. Build, packaging, and publishing time are
+excluded; record setup separately. Full regression suites run locally outside the release workflow.
+The budget requires measurement and is not evidence that current jobs meet it.
+
+#### Desktop smoke coverage
 
 The installed fixture checks immediate adapter settings, transport and configuration interface
 changes, device connection switches, settings, Gamepad Output, and profile layer changes. It keeps
@@ -514,9 +578,9 @@ numeric edits focused through pauses and redraws, checks that the pre-edit numer
 count stay unchanged until commit, and checks persistence after committing an edit. The pre-edit
 text and numeric value are recorded in `numeric-baseline.json`.
 Numeric input uses native key events, checks that a typed letter is rejected, and finds the DPI
-unit outside the entry. Low Battery Level is typed as 3 and 60, checked against isolated saved
-preferences, and restored as 60 and then 3 across separate relaunches. Its percent unit is a
-separate label.
+unit outside the entry. Retain native Low Battery Level edits, independent saved-preference
+readback, and persistence across a process restart. Exhaustive accepted and rejected values belong
+in the focused GTK fixture. The percent unit is a separate label.
 Before each normal configuration edit it records the matching simulator completion count, then
 waits for a new successful completion before Refresh or reconnect. Save and Discard are absent.
 Each configuration interface has a card with its enable switch above a native Profile selection
@@ -527,13 +591,13 @@ twelve seeded profiles without Next or Previous. The fixture scrolls to profiles
 adds profile 11 through the picker,
 checks it after Refresh, and removes it before the three-layer drag checks.
 Device profile layers move by dragging a row onto another row. A three-layer pointer
-drag checks the final insertion order and exactly one completed write, then verifies the order
-after Refresh and reconnect. `device-profiles-drag-pointer.png` captures the pressed pointer,
+drag moves a layer down, checks the final insertion order and exactly one completed write, then
+verifies the order after reconnect. `device-profiles-drag-pointer.png` captures the pressed pointer,
 `device-profiles-drag-readback.png` captures the reconnected list, and
-`device-profiles-drag.json` records the pointer coordinates, write result, and both readbacks.
+`device-profiles-drag.json` records the pointer coordinates, write result, and reconnect readback.
 Each layer row has a drag handle and Remove. The fixture checks that the rows stay enabled and
 keep their Remove buttons while verifying the layer order. A second pointer drag moves a layer up
-and checks one completed write and the order after Refresh and reconnect in
+and checks one completed write and the order after Refresh in
 `device-profiles-drag-up.json`.
 Deleting an in-use profile checks that the numbered confirmation names the affected device and VIA,
 keeps wrapped lines aligned with their text, and preserves its step rows through completion.
@@ -552,15 +616,18 @@ markers, stable step placement, and confirmation of a changed remaining plan bef
 The narrow layouts also check the Profile Memory meter and the bootloader confirmation's heading,
 Cancel button, and Enter Bootloader button, then dismiss that confirmation with Escape.
 
-Run the same GTK smoke command with `--empty-states` and a separate output directory to check
-empty Profiles and sidebar groups. This flow removes the mouse's last profile, checks the large
-icon, No Profiles title, and centered Add Profile button at 980px and 480px. It deletes every profile
-in that adapter's library, opens the empty Add Profile picker, and checks No Profiles, New Profile,
-and disabled Choose. Creating a profile reopens the picker with that profile selected. Choosing it
-adds the layer and persists after Refresh. It forgets every device on one adapter while the other
-stays populated, then empties both adapters and checks their separate Add Device rows. Pairing through
-each adapter's row verifies the target with the paired device's Adapter field. Screenshots,
-accessibility trees, and `empty-profiles-*-bounds.json` record the empty layouts.
+The `--empty-states` scenario sets `CORDIAL_SIM_EMPTY_STATES=1` for its simulator processes.
+Each adapter starts with one library profile and one device. The default simulator keeps its
+larger library and device set. The fixture removes the last device profile and deletes the last
+library profile. It asserts the No Profiles title, centered Add Profile button, and empty picker
+with New Profile and disabled Choose. The 980-pixel and 480-pixel screenshots record the decorative
+icon for visual review because it has no AT-SPI image node. Creating a profile must reopen
+the picker with it selected; choosing it must add a layer that survives
+Refresh. Three Forget transitions empty the first adapter, remove its newly paired device, and
+empty the second adapter. They cover one empty adapter beside a populated one and both empty
+adapters with separate Add Device rows. Pairing through each row verifies the target in the new
+device's Adapter field. Screenshots, accessibility trees, and empty-layout bounds record the
+980-pixel and 480-pixel layouts.
 
 The delayed flow checks rapid numeric edits while a write is pending, editable controls, retained
 values, and the absence of apply progress and success indicators. Closing the window lets writes
@@ -638,8 +705,8 @@ waits for every answer to fit inside the pairing dialog, which is 420 by 372 pix
 to preserve the native sheet's 30-pixel side margins. It checks full-width buttons
 with equal widths for two choices, and checks that its outer size and answer placement stay
 unchanged between a prompt and its result.
-The ignored `pairing_centers_every_step_at_one_size` GTK test also covers progress, paired results,
-PIN, passkey, long device names, and scrolling long errors at normal and narrow window widths.
+The focused GTK pairing layout fixture also covers progress, paired results, PIN, passkey,
+long device names, and scrolling long errors at normal and narrow window widths.
 Pairing hides the scan header's title and uses a centered Code entry.
 Passkey entry uses native key events and checks that a typed letter is rejected.
 The fixture keeps each successful result open for more than three seconds,
@@ -652,13 +719,7 @@ the dialog within one second, without a cancellation screen or later pairing fai
 The display-code and cancellation flow
 runs inside a 480-pixel window.
 
-Run the pairing reconnect fixture separately in the same disposable environment:
-
-```sh
-CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a -s '-screen 0 1280x1024x24' \
-  dbus-run-session -- python3 rust/tests/gtk_smoke.py build/pairing-reconnect-smoke --pairing-reconnect
-```
-
+The pairing-reconnect scenario runs automatically in `check-installed-desktop`.
 It pairs through the existing passkey and code comparison controls. Each prompt stays open longer
 than three seconds before the fixture answers it. After `PairingDone`, the simulated adapter sends
 `SessionEnding` with `DEVICE_CONNECTION`, closes its framed stream, leaves discovery for 1500
@@ -707,8 +768,9 @@ Readings without saved-state menus occupy a separate
 list within their category. Shared formatting tests cover units in numeric choices and device-value notes.
 A device's header shows its status without repeating its battery reading, and its
 page has no Status row. Device Menu contains Refresh followed by Connect or Disconnect on Details
-and Diagnostics; Profiles has no Device Menu. The fixture opens each menu at all three widths,
-checks that its items fit, and exercises Connect, Disconnect, and Refresh through it. The Battery
+and Diagnostics; Profiles has no Device Menu. Geometry checks open each menu at all three widths
+and check that its items fit. Retain one native Connect, Disconnect, and Refresh cycle with
+readback, without repeating the behavior at every width. The Battery
 row retains its exact percentage and full-width meter. Adapter Menu offers Rename followed by
 Connect or Disconnect; the adapter's Details page has no Status row. Maintenance actions open
 from Adapter Menu on Diagnostics. New Profile sits beside the scrolling profile list.
@@ -744,19 +806,6 @@ once, including when the job later returns. The fixture matches only seeded simu
 The trace supplies fixture completion barriers without adding indicators to the interface.
 An `ok` record means the adapter confirmed the write. The fixture reconnects for independent
 readback where needed.
-
-Run the AppImage fixture in a disposable Arch environment as well. Its prerequisites are
-`libgcc`, `libx11`, `libxcursor`, `libxdamage`, `libxext`, `libxfixes`, `libxi`, `libxinerama`,
-`libxrandr`, `libxrender`, `libxcb`, `wayland`, `libglvnd`, `vulkan-icd-loader`, `expat`, `e2fsprogs`, `gmp`,
-`libgpg-error`, `zlib`, `python-atspi`, `python-gobject`, `xorg-server-xvfb`, `xorg-xauth`, `dbus`,
-`imagemagick`, `glib2`, and `dconf`. Use the same command with `--renderer cairo`. The release
-workflow runs Arch with Cairo and Resolute with software Mesa and GTK's default renderer.
-All AppImage runs use the default settings backend.
-
-Before completing a code change, also run Pico 2 W firmware Clippy and artifact builds for both
-`production` and `debug`. Run the same checks for any other board directly affected. Reuse passing
-results while their inputs remain unchanged. When assembling a release, verify every asset and
-checksum listed in `.github/workflows/release.yml`.
 
 ## Adapter names
 

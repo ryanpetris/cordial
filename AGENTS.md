@@ -171,48 +171,60 @@ environment variables, and configuration keys in backticks.
   an unbounded fix. Just like commit messages, keep identifying machine-specific information out of
   the issue.
 
-## Release workflow budget
+## Test ownership and runtime
 
-Keep the release workflow's tests and validation limited to a small, focused set.
-Their combined runtime across all jobs must fit within a two-minute budget.
-Run broader regression suites locally, outside the release workflow. Build,
-packaging, and publishing time does not count toward this budget.
+- Keep exhaustive pure-logic and control matrices in focused unit and GTK tests. Smoke fixtures
+  cover representative native input through protocol writes and readback, process restarts and
+  settings backends, packaged runtime, layout breakpoints, and actual disconnect/reconnect.
+- Preserve unique failure modes. Reduce repeated end-to-end flows and setup before removing
+  assertions. Keep native BTstack process isolation and storage-fault cutpoints.
+  Grouped readbacks must use distinct control values across rounds so swapped mappings fail.
+- All ignored `desktop::` library tests are unattended display fixtures discovered by
+  `just check-gtk`. Keep one process and private configuration per test, with shared Xvfb and D-Bus.
+  Do not maintain a second test-name list. Manual screens outside `desktop::` stay manual.
+- Use shorter test-specific timeouts without changing production defaults. A deadline-renewal
+  case must span the test timeout. Share only immutable generated terminal artifacts, never adapter
+  sessions. Wait for observable state instead of arbitrary sleeps, and reacquire accessibility
+  objects after UI changes rather than keeping a persistent tree cache.
+- Compare timings with the same binary, inputs, cache state, and comparable host load. Separate
+  check time, build/setup time, and total wall time, and label measurements and estimates.
+- Release tests and validation have a combined 120-second budget across all jobs. Record setup
+  separately; build, packaging, and publishing time are excluded. Run full regressions locally.
+  Measure the combined validation time before claiming the budget is met.
 
 ## Required completion checks
 
-Before any item is considered done, all suites below must pass for the completed changes.
-Use targeted tests during development, then complete this checklist before reporting completion.
-Passing results from the same work can be reused while their inputs remain unchanged. A skipped
-fixture or a missing prerequisite is not a pass; resolve it or report the item as incomplete.
-Documentation-only changes do not run these suites. Keep this catalog aligned with `justfile`
-and `.github/workflows/release.yml`. It lists suites and fixtures, not
-individual test cases.
+Use targeted tests during development, then pass every suite below before reporting completion.
+Documentation-only changes do not run these suites. Reuse passing results while relevant inputs
+remain unchanged; do not rerun unaffected validation. A skipped fixture or missing prerequisite
+is not a pass. Resolve it or report the item as incomplete.
+
+Before native compatibility validation, refresh each required prerequisite image once with
+`CHECK_IMAGE_FLAGS='--pull --no-cache'`, then reuse it. Use the canonical recipes below, which
+supply prerequisite images and run fresh containers with Cordial initially absent. Never install
+validation packages on the development system. See [building documentation](docs/building.md)
+for commands, prerequisites, freshness, and coverage ownership. Keep this catalog aligned with
+`justfile` and `.github/workflows/release.yml`; list suites and fixtures, not individual test names.
 
 | Suite or fixture | Required check and coverage |
 | --- | --- |
-| Rust workspace | `just check-rust`: unit, integration, and documentation tests for all workspace crates with all features, including the core, protocol, client, CLI/TUI, USB, BLE HID, BTstack, and record storage adapters. Includes the ESP storage fixture. |
-| Rust static checks | `just check-rust`: workspace Clippy for all targets and features, with warnings treated as errors. |
-| Native BTstack callbacks | `just check-rust`: `rust/tools/test_btstack.py` builds and runs the capacity, profiles, GATT, device information, layout, and saved-security C fixtures. |
-| Protocol compatibility | `just check-protocol`: Buf lint and breaking checks for the permanent handshake and retained serial revisions against prior released schemas, plus storage compatibility against `PROTOCOL_BASE`, selected from `CORDIAL_VERSION`. |
-| Repository tool fixtures | `just check-tools`: `tools/test_*.py`, covering versions, editor-definition validation, and release archive validation. |
-| Firmware and packaging tool fixtures | `just check-tools`: `rust/tests/test_*.py`, covering board configuration, firmware artifacts, flashing, dependency notices, packaging, native BLE, HID reports, and host terminal behavior. |
-| Linux CLI/TUI terminal fixture | Build the CLI and install `pyte`, then run `CORDIAL_TEST_BINARY="$PWD/rust/target/x86_64-unknown-linux-gnu/release/cordial" python3 -m unittest discover -s rust/tests -p test_host_terminal.py`. The default tool run skips this fixture without these prerequisites. |
-| Firmware static checks | `just BOARD=pico2_w PROFILE=production check-firmware` and `just BOARD=pico2_w PROFILE=debug check-firmware`: firmware Clippy for the Pico 2 W. Also run them for another board (`pico_w`, `waveshare_rp2350b_plus_w`, `esp32s3`) when a change materially affects that board specifically, such as its board definition, platform code, radio backend, configuration, or partition or storage layout. |
-| Firmware artifact validation | `just BOARD=pico2_w PROFILE=production firmware` and `just BOARD=pico2_w PROFILE=debug firmware`: link and package the Pico 2 W, including metadata, image layout, and storage-boundary checks in `rust/tools/build_firmware.py`. Also build another board under the same condition as its static checks. ESP builds check the linked Rust startup stack frames. |
-| Portable application packages | `just package-host-appimage package-host-tar`; validate the unified host archive with `tools/check_release_archive.py` using kind `host` and the selected `CORDIAL_VERSION`. |
-| Arch package fixture | Build `cordial` with `just package-host-arch`, then run `packaging/check-arch.sh` in a clean Arch container. Checks installation, native dependencies, schema registration, package contents, Namcap, reinstallation, and removal. |
-| Debian/Ubuntu package fixtures | Build `cordial` with `just DEB_DISTRIBUTION=... package-host-deb`, then run `packaging/check-deb.sh` in matching clean containers for `trixie` and `resolute`. Checks installation, native dependencies, schema registration, contents, Lintian, reinstallation, removal, and purge. |
-| Installed desktop smoke fixture | Install the Resolute `cordial` package, then run `CORDIAL_TEST_BINARY=/usr/bin/cordial xvfb-run -a dbus-run-session -- python3 rust/tests/gtk_smoke.py build/package-smoke`. Also run it with `build/empty-states-smoke --empty-states` for empty device profiles and per-adapter pairing actions, and `build/pairing-reconnect-smoke --pairing-reconnect` for pairing results across announced USB reconnects. Exercises native navigation, profiles, pairing, profile deletion, GSettings, narrow layouts, immediate writes, and quit behavior with simulated adapters. |
-| GTK control fixtures | Run the ignored integer-control and rejected-preference tests under Xvfb and a private D-Bus session, as specified in `docs/building.md`. |
-| AppImage smoke fixture | Run `tools/check_appimage.py` against the packaged AppImage in disposable Resolute and Arch environments. Verify desktop launch, bundled GIO modules, and persistent default-backend GSettings. |
-| Release asset validation | When assembling a release, verify all expected application and board/profile archives and their checksums using the asset checklist in `.github/workflows/release.yml`. Publishing is not a check and still requires authorization. |
+| Rust workspace and static checks | `just check`, via `check-rust`: all-feature workspace unit, integration, and documentation tests, including core, protocol, client, CLI/TUI, USB, BLE HID, BTstack, record storage, and ESP storage; all-target, all-feature Clippy with warnings denied. |
+| Native BTstack callbacks | `just check`, via `check-rust`: capacity, profiles, GATT, device information, layout, and saved-security C fixtures in `rust/tools/test_btstack.py`. |
+| Protocol compatibility | `just check`, via `check-protocol`: Buf lint and released-schema compatibility for the permanent handshake and retained serial revisions, plus storage compatibility against `PROTOCOL_BASE`, selected from `CORDIAL_VERSION`. |
+| Python tool suites | `just check`, via `check-tools`: both `tools/test_*.py` and `rust/tests/test_*.py`, including versions, editor definitions, release archives, board configuration, firmware artifacts, flashing, dependency notices, packaging, native BLE, HID reports, and host terminal behavior. |
+| Linux CLI/TUI terminal fixture | Build the actual release CLI and install `pyte`, Python `protobuf`, `protoc`, and a C compiler, then run `rust/tests/test_host_terminal.py` with `CORDIAL_TEST_BINARY` set to that binary. The default tool run skips this fixture without prerequisites. |
+| GTK controls | `just check-gtk`: every automatically discovered ignored `desktop::` library test, currently 20, including numeric input, preference rejection, search, pairing, layout, and dialogs. |
+| Firmware Clippy and artifact validation | `just BOARD=pico2_w PROFILE=production check-and-build-firmware` and the same command with `PROFILE=debug`: Clippy, link, package, metadata, image layout, and storage-boundary validation. Also run both profiles for another board, such as `pico_w`, `waveshare_rp2350b_plus_w`, or `esp32s3`, when a change materially affects its board definition, platform code, radio backend, configuration, or partition or storage layout. ESP builds also check linked Rust startup stack frames. |
+| Portable application packages | `just package-host-appimage package-host-tar`; validate the unified archive with `tools/check_release_archive.py`, kind `host`, and the selected `CORDIAL_VERSION`. The native validation invocation in `docs/building.md` also builds both formats. |
+| Native package lifecycle | `just check-package-arch` and `just DEB_DISTRIBUTION=... check-package-deb` for both `trixie` and `resolute`: installation, native dependencies, schema registration, contents, Namcap or Lintian, reinstallation, removal, and Debian purge in disposable matching containers. Trixie retains its separate native compilation. |
+| Installed desktop | `just DEB_DISTRIBUTION=resolute check-installed-desktop`: all three scenarios, normal, empty states, and pairing reconnect, against the installed package. Retain native navigation, profiles, pairing, profile deletion, GSettings, narrow layouts, immediate writes, and quit behavior with simulated adapters. |
+| AppImage runtime | Both `just check-appimage-resolute` and `just check-appimage-arch`: packaged desktop launch, bundled GIO modules, and persistent default-backend GSettings in disposable environments. |
+| Release assets | When assembling a release, verify every application and board/profile archive and checksum in `.github/workflows/release.yml`. Publishing still requires authorization. |
 
-`just check` covers the Rust, protocol, and Python tool suites. It does not supply the
-terminal prerequisites or run the display-dependent GTK controls, firmware, package
-installation, installed desktop, or AppImage smoke checks. Run package installation fixtures only in
-disposable environments, never against the developer's installed
-applications. See [building documentation](docs/building.md) and the release workflow for setup
-and the distribution matrix.
+`just check` does not supply terminal prerequisites or run GTK display fixtures, firmware,
+package lifecycle, installed desktop, or AppImage runtime checks. Commands that share a host
+archive should run in one invocation as documented in `docs/building.md`. `HOST_ARCHIVE` may
+supply a matching checked artifact, never a stale substitute for current-source validation.
 
 ## Reviews
 

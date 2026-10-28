@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Compare permanent serial contracts across releases and storage/IPC within a release series."""
 import argparse
+from functools import cache
 import json
 import os
 from pathlib import Path
@@ -51,7 +52,7 @@ def version_storage_schema(text):
             text.replace('package cordial.storage;', f'package cordial.storage.{version};'))
 
 
-def compare(base, root, buf, *, stable):
+def compare(base, root, buf, *, stable, current_definitions=None):
     released = subprocess.check_output(
         ['git', 'ls-tree', '-r', '--name-only', base, '--', 'proto'], cwd=root, text=True,
     ).splitlines()
@@ -103,21 +104,26 @@ def compare(base, root, buf, *, stable):
                         str(config), '--against-config', str(config),
                         '--against', str(image)], cwd=root, check=True)
         if stable:
-            current = Path(temporary) / 'current.json'
-            subprocess.run([str(buf), 'build', str(root / 'proto'), '--config', str(config),
-                            '-o', str(current)], cwd=root, check=True)
             # Buf's package deletion rules skip the last message or enum in a package.
-            missing = definitions(image) - definitions(current)
+            missing = definitions(image) - current_definitions()
             if missing:
                 raise ValueError('Released protocol definitions are missing: ' + ', '.join(
                     f'{kind} {name}' for kind, name in sorted(missing)))
 
 
 def check(base, root, buf, stable_base=None):
+    @cache
+    def current_definitions():
+        with tempfile.TemporaryDirectory(prefix='cordial-protocol-current-') as temporary:
+            image = Path(temporary) / 'current.json'
+            subprocess.run([str(buf), 'build', str(root / 'proto'), '--config',
+                            str(root / 'buf.yaml'), '-o', str(image)], cwd=root, check=True)
+            return definitions(image)
+
     baselines = [stable_base] if stable_base else stable_tags(
         resolve(), released_tags(root, ancestors_only=False))
     for baseline in baselines:
-        compare(baseline, root, buf, stable=True)
+        compare(baseline, root, buf, stable=True, current_definitions=current_definitions)
     if base:
         compare(base, root, buf, stable=False)
 

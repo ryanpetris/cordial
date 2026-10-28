@@ -14,10 +14,12 @@ export DOCKER := env('DOCKER', 'docker')
 export DEB_DISTRIBUTION := env('DEB_DISTRIBUTION', 'trixie')
 export DEB_REVISION := env('DEB_REVISION', '1~' + DEB_DISTRIBUTION)
 export HOST_ARCHIVE := env('HOST_ARCHIVE', '')
+export CHECK_IMAGE_FLAGS := env('CHECK_IMAGE_FLAGS', '')
 export BOARDS := 'pico_w pico2_w pimoroni_pico_plus2_w waveshare_rp2350b_plus_w esp32s3'
 export ESP_BOARDS := 'esp32s3'
 export FIRMWARE_PLATFORM := ''
 firmware_platform := if FIRMWARE_PLATFORM != '' { FIRMWARE_PLATFORM } else if replace(' ' + ESP_BOARDS + ' ', ' ' + BOARD + ' ', '') != ' ' + ESP_BOARDS + ' ' { 'esp32s3' } else { 'pico' }
+firmware_command := 'python3 rust/tools/build_firmware.py rust/boards/' + BOARD + '.json --profile ' + PROFILE
 export DEB_BASE_trixie := 'debian:13'
 export DEB_BASE_resolute := 'ubuntu:26.04'
 export DEB_BASE := if DEB_DISTRIBUTION == 'trixie' { DEB_BASE_trixie } else if DEB_DISTRIBUTION == 'resolute' { DEB_BASE_resolute } else { '' }
@@ -64,6 +66,20 @@ image-deb: (_image-host-trixie (if DEB_DISTRIBUTION == 'trixie' { 'true' } else 
     set -euo pipefail
     if [ "$DEB_DISTRIBUTION" != trixie ] && [ -z "$DEB_BASE" ]; then echo "Unknown DEB_DISTRIBUTION $DEB_DISTRIBUTION" >&2; exit 1; fi
     $DOCKER build -t "cordial-deb-$DEB_DISTRIBUTION" --build-arg BASE={{ quote(if DEB_DISTRIBUTION == 'trixie' { 'cordial-host-trixie' } else { DEB_BASE }) }} --build-context tools=docker -f docker/deb.Dockerfile packaging/debian
+
+# Docker reuses prerequisite layers until their inputs change. Refresh with CHECK_IMAGE_FLAGS='--pull --no-cache'.
+image-check-package-arch: (_image-check 'package-arch' 'archlinux:base-devel')
+image-check-package-deb: (_image-check ('package-' + DEB_DISTRIBUTION) DEB_BASE 'package-deb')
+image-check-appimage-resolute: (_image-check 'appimage-resolute' DEB_BASE_resolute)
+image-check-appimage-arch: (_image-check 'appimage-arch' 'archlinux:base')
+image-check-desktop: (_image-check 'desktop-resolute' DEB_BASE_resolute 'desktop-resolute' 'desktop')
+
+[private]
+_image-check name base kind='' target='prerequisites':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    test -n {{ quote(base) }} || { echo "Unknown DEB_DISTRIBUTION $DEB_DISTRIBUTION" >&2; exit 1; }
+    $DOCKER build $CHECK_IMAGE_FLAGS -t cordial-check-{{ name }} --target {{ target }} --build-arg BASE={{ quote(base) }} --build-arg KIND={{ quote(if kind == '' { name } else { kind }) }} -f docker/check.Dockerfile .
 
 # Each task owns its export directory. Concurrent runs of one task use separate checkouts.
 # Runtime contents select retained image tags and caches independently of export metadata.
@@ -138,7 +154,10 @@ local-host:
     cargo build --locked --release -p cordial --bin cordial --target "$HOST_TARGET"
 
 firmware: (_image-firmware firmware_platform)
-    {{ just }} _build firmware {{ firmware_platform }} "python3 rust/tools/build_firmware.py rust/boards/$BOARD.json --profile $PROFILE" 'build/firmware/*/*'
+    {{ just }} _build firmware {{ firmware_platform }} {{ quote(firmware_command) }} 'build/firmware/*/*'
+
+check-and-build-firmware: (_image-firmware firmware_platform)
+    {{ just }} _build check-and-build-firmware {{ firmware_platform }} {{ quote('time ' + firmware_command + ' --clippy && time ' + firmware_command) }} 'build/firmware/*/*'
 
 firmware-all:
     for board in {{ BOARDS }}; do {{ just }} BOARD="$board" firmware; done
@@ -183,11 +202,36 @@ package-host-deb: image-deb (_host-tar (if DEB_DISTRIBUTION != 'trixie' { build_
       {{ just }} _build package-host-deb "deb-$DEB_DISTRIBUTION" {{ quote('just --justfile packaging/justfile HOST_ARCHIVE=' + quote('/inputs/' + file_name(host_archive)) + ' DEB_DISTRIBUTION=' + quote(DEB_DISTRIBUTION) + ' DEB_REVISION=' + quote(DEB_REVISION) + ' deb') }} "build/packages/host-deb/$DEB_DISTRIBUTION/cordial_$CORDIAL_VERSION-${DEB_REVISION}_amd64.deb" {{ quote(host_archive) }}
     fi
 
+# These recipes build current sources unless HOST_ARCHIVE supplies a checked release archive.
+check-package-arch: package-host-arch image-check-package-arch
+    time $DOCKER run --rm --init -v "$PWD:/src" -w /src -e CHECK_UID="$(id -u)" -e CHECK_GID="$(id -g)" -e CORDIAL_VERSION cordial-check-package-arch bash packaging/check-arch.sh
+
+check-package-deb: package-host-deb image-check-package-deb
+    time $DOCKER run --rm --init -v "$PWD:/src" -w /src -e CHECK_UID="$(id -u)" -e CHECK_GID="$(id -g)" -e CORDIAL_VERSION -e DEB_DISTRIBUTION -e DEB_REVISION cordial-check-package-{{ DEB_DISTRIBUTION }} bash packaging/check-deb.sh
+
+check-appimage-resolute: package-host-appimage image-check-appimage-resolute
+    time $DOCKER run --rm --init -v "$PWD:/src" -w /src -e CHECK_UID="$(id -u)" -e CHECK_GID="$(id -g)" -e CORDIAL_VERSION cordial-check-appimage-resolute bash docker/check-appimage.sh resolute
+
+check-appimage-arch: package-host-appimage image-check-appimage-arch
+    time $DOCKER run --rm --init -v "$PWD:/src" -w /src -e CHECK_UID="$(id -u)" -e CHECK_GID="$(id -g)" -e CORDIAL_VERSION cordial-check-appimage-arch bash docker/check-appimage.sh arch
+
+check-installed-desktop: _require-resolute package-host-deb image-check-desktop
+    #!/usr/bin/env bash
+    set -euo pipefail
+    time $DOCKER run --rm --init -v "$PWD:/src" -w /src -e CHECK_UID="$(id -u)" -e CHECK_GID="$(id -g)" -e CORDIAL_VERSION -e DEB_DISTRIBUTION -e DEB_REVISION cordial-check-desktop-resolute bash docker/check-installed-desktop.sh
+
+[private]
+_require-resolute:
+    test "$DEB_DISTRIBUTION" = resolute || { echo 'Installed desktop checks require DEB_DISTRIBUTION=resolute' >&2; exit 1; }
+
 check: check-rust check-protocol check-tools
+
+check-gtk:
+    $PYTHON rust/tools/test_gtk.py
 
 # Check firmware Clippy in the board's toolchain image.
 check-firmware: (_image-firmware firmware_platform)
-    {{ just }} _build check-firmware {{ firmware_platform }} "python3 rust/tools/build_firmware.py rust/boards/$BOARD.json --profile $PROFILE --clippy"
+    {{ just }} _build check-firmware {{ firmware_platform }} {{ quote(firmware_command + ' --clippy') }}
 
 check-firmware-all:
     for board in {{ BOARDS }}; do for profile in production debug; do {{ just }} BOARD="$board" PROFILE="$profile" check-firmware; done; done

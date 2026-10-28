@@ -25,6 +25,9 @@ pub fn desktop(sink: Sink, count: usize) -> Live {
         .min(2000);
     for adapter in desktop.adapters() {
         let mut sim = adapter.0.lock().unwrap();
+        if std::env::var("CORDIAL_SIM_EMPTY_STATES").as_deref() == Ok("1") {
+            seed_empty_states(&mut sim);
+        }
         for command in ["set_adapter", "set_device", "set_settings"] {
             sim.slow.insert(command, Duration::from_millis(delay));
         }
@@ -65,6 +68,16 @@ pub fn desktop(sink: Sink, count: usize) -> Live {
         });
     }
     desktop.live(sink)
+}
+
+fn seed_empty_states(sim: &mut Sim) {
+    sim.devices.retain(|device| device.id == 1);
+    sim.settings.retain(|&device, _| device == 1);
+    sim.profiles.retain(|profile| profile.id == 2);
+    for interface in &mut sim.status.configuration_interfaces {
+        interface.profile = 0;
+        interface.enabled = false;
+    }
 }
 
 fn reconnect_trace(sim: &Sim, stage: &str) {
@@ -544,5 +557,41 @@ fn seed(sim: &mut Sim, index: usize) {
         );
         d.profiles = Some(p::ProfileLayers::default());
         sim.pairings.insert(candidate, (plan, d));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_states_start_with_one_assigned_profile_and_device_per_adapter() {
+        let desktop = Desktop::new(2);
+        for (index, adapter) in desktop.adapters().iter().enumerate() {
+            let mut sim = adapter.0.lock().unwrap();
+            assert_eq!(sim.devices.len(), 4);
+            assert_eq!(sim.profiles.len(), 12);
+            seed_empty_states(&mut sim);
+            assert_eq!(sim.devices.len(), 1);
+            assert_eq!(
+                sim.devices[0].name,
+                if index == 0 {
+                    "Example Mouse"
+                } else {
+                    "Example Trackball"
+                }
+            );
+            assert_eq!(sim.devices[0].profiles.as_ref().unwrap().profiles, [2]);
+            assert_eq!(sim.profiles.len(), 1);
+            assert_eq!(sim.profiles[0].id, 2);
+            assert_eq!(sim.profiles[0].name, "Natural Scrolling");
+            assert_eq!(sim.settings.len(), 1);
+            assert!(
+                sim.status
+                    .configuration_interfaces
+                    .iter()
+                    .all(|interface| !interface.enabled && interface.profile == 0)
+            );
+        }
     }
 }

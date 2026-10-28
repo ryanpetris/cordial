@@ -77,13 +77,15 @@ class Smoke:
         self.ui = None
         self.completed = []
         self.stage = "startup"
+        self.timings = {}
+        self.started = time.monotonic()
         self.frame_origins = set()
         self.pair_geometry = {}
         self.trace = root / "writes.txt"
         self.trace.touch(mode=0o600)
         self.env = dict(os.environ, CORDIAL_DESKTOP_SIMULATE="2", GDK_BACKEND="x11",
                         CORDIAL_SIM_WRITE_DELAY_MS="0", CORDIAL_SIM_WRITE_TRACE=str(self.trace),
-                        CORDIAL_SIM_FAIL_SETTINGS_ONCE="0",
+                        CORDIAL_SIM_FAIL_SETTINGS_ONCE="0", CORDIAL_SIM_EMPTY_STATES="0",
                         GDK_SCALE="1", GDK_DPI_SCALE="1",
                         GTK_A11Y="atspi", GTK_USE_PORTAL="0", GSK_RENDERER="cairo",
                         GIO_USE_VFS="local", GIO_USE_VOLUME_MONITOR="unix",
@@ -145,9 +147,13 @@ class Smoke:
     def step(self, name, action):
         self.stage = name
         print(f"RUN {name}", flush=True)
-        action()
-        self.ui.dump(name)
-        self.ui.screenshot(name)
+        started = time.monotonic()
+        try:
+            action()
+            self.ui.dump(name)
+            self.ui.screenshot(name)
+        finally:
+            self.timings[name] = round(time.monotonic() - started, 3)
         self.completed.append(name)
         self.report("running")
         print(f"PASS {name}", flush=True)
@@ -155,6 +161,7 @@ class Smoke:
     def report(self, status, error=None):
         (self.output / "result.json").write_text(json.dumps({
             "status": status, "completed": self.completed, "stage": self.stage, "error": error,
+            "stage_seconds": self.timings, "elapsed_seconds": round(time.monotonic() - self.started, 3),
         }, indent=2) + "\n")
 
     def modal(self):
@@ -200,15 +207,16 @@ class Smoke:
         else:
             self.no_tabs()
 
-    def sidebar_visible(self):
+    def sidebar_visible(self, nodes=None):
         return any(row.parent.getRoleName() == "list"
                    and row.getState().contains(pyatspi.STATE_SHOWING)
-                   for row in self.ui.matches("Overview", {"list item"}))
+                   for row in self.ui.matches("Overview", {"list item"}, nodes=nodes))
 
     def navigation_content(self, name, occurrence=None):
-        return self.page_header(name) and (
-            self.selected_navigation(name, occurrence) if self.sidebar_visible() else
-            len([node for node in self.ui.matches("Back", BUTTONS)
+        nodes = self.ui.nodes()
+        return self.page_header(name, nodes) and (
+            self.selected_navigation(name, occurrence, nodes) if self.sidebar_visible(nodes) else
+            len([node for node in self.ui.matches("Back", BUTTONS, nodes=nodes)
                  if node.getState().contains(pyatspi.STATE_SHOWING)]) == 1)
 
     def expose_navigation(self, name):
@@ -221,12 +229,19 @@ class Smoke:
             self.selected_navigation(name))
         self.ui.absent("Back")
 
-    def selected_navigation(self, name, occurrence=None):
-        for overview in self.ui.matches("Overview", {"list item"}):
+    def selected_navigation(self, name, occurrence=None, nodes=None):
+        nodes = self.ui.nodes() if nodes is None else nodes
+        for overview in self.ui.matches("Overview", {"list item"}, nodes=nodes):
             if (overview.parent.getRoleName() != "list"
                     or not overview.getState().contains(pyatspi.STATE_SHOWING)):
                 continue
-            rows = self.ui.matches(name, {"list item"}, overview.parent)
+            rows = []
+            for node in self.ui.matches(name, {"list item"}, nodes=nodes):
+                parent = node.parent
+                while parent is not None and parent != overview.parent:
+                    parent = parent.parent
+                if parent is not None:
+                    rows.append(node)
             return (len(rows) == (1 if occurrence is None else 2)
                     and rows[0 if occurrence is None else occurrence].getState().contains(
                         pyatspi.STATE_SHOWING)
@@ -234,8 +249,8 @@ class Smoke:
                         pyatspi.STATE_SELECTED))
         return False
 
-    def no_tabs(self):
-        tabs = [n for n in self.ui.nodes() if visible(n)
+    def no_tabs(self, nodes=None):
+        tabs = [n for n in (self.ui.nodes() if nodes is None else nodes) if visible(n)
                 and n.getState().contains(pyatspi.STATE_SHOWING)
                 and (n.getRoleName() in {"page tab", "page tab list"}
                      or n.name in {"Details", "Settings", "Profiles", "Diagnostics"}
@@ -244,8 +259,13 @@ class Smoke:
             raise AssertionError(f"The main page exposes tab controls: {[n.name for n in tabs]}")
 
     def main_page(self):
-        self.ui.find("Diagnostics", {"list item"})
-        self.no_tabs()
+        def shown():
+            nodes = self.ui.nodes()
+            if self.ui.match_one("Diagnostics", {"list item"}, nodes):
+                self.no_tabs(nodes)
+                return True
+            return False
+        self.ui.wait("show the main page", shown)
 
     def overview(self):
         self.nav("Overview")
@@ -261,8 +281,8 @@ class Smoke:
         if rows[:2] != ["Example Adapter 1", "Example Adapter 2"]:
             raise AssertionError(f"Overview does not list its adapters first: {rows}")
 
-    def page_header(self, name):
-        for node in self.ui.matches(name, {"label"}):
+    def page_header(self, name, nodes=None):
+        for node in self.ui.matches(name, {"label"}, nodes=nodes):
             if not node.getState().contains(pyatspi.STATE_SHOWING):
                 continue
             parent = node.parent
@@ -288,20 +308,25 @@ class Smoke:
         self.main_page()
         self.page_end()
         self.ui.click(node=self.ui.row(name))
-        self.ui.wait(f"open the {name!r} subpage", lambda:
-            self.ui.matches(name, {"label"}) and not self.ui.matches("Diagnostics", {"list item"}))
-        self.ui.wait("finish the subpage transition", lambda:
-            len(self.ui.matches("Back", BUTTONS)) == 1)
-        self.ui.absent("Add Device")
-        self.no_tabs()
+        def opened():
+            nodes = self.ui.nodes()
+            if (not self.ui.matches(name, {"label"}, nodes=nodes)
+                    or self.ui.matches("Diagnostics", {"list item"}, nodes=nodes)
+                    or len(self.ui.matches("Back", BUTTONS, nodes=nodes)) != 1
+                    or self.ui.matches("Add Device", nodes=nodes)):
+                return False
+            self.no_tabs(nodes)
+            return True
+        self.ui.wait(f"finish opening the {name!r} subpage", opened)
 
     def back(self):
         self.ui.click("Back")
         self.main_page()
-        self.ui.wait("finish returning to the main page", lambda:
-            len(self.ui.matches("Back", BUTTONS)) == (0 if any(
-                n.getState().contains(pyatspi.STATE_SHOWING)
-                for n in self.ui.matches("Overview", {"list item"})) else 1))
+        def returned():
+            nodes = self.ui.nodes()
+            return len(self.ui.matches("Back", BUTTONS, nodes=nodes)) == (
+                0 if self.sidebar_visible(nodes) else 1)
+        self.ui.wait("finish returning to the main page", returned)
 
     def enabled(self, name, on=True, root=None):
         self.ui.wait(f"{name!r} enabled={on}", lambda:
@@ -342,9 +367,9 @@ class Smoke:
         self.ui.wait(f"complete apply for {target}", completed)
 
     def no_save_discard(self):
-        for name in ("Save", "Discard"):
-            if self.ui.matches(name, BUTTONS):
-                raise AssertionError(f"Immediate settings expose {name}")
+        for node in self.ui.nodes():
+            if visible(node) and node.name in {"Save", "Discard"} and node.getRoleName() in BUTTONS:
+                raise AssertionError(f"Immediate settings expose {node.name}")
 
     def apply(self, target, action):
         self.no_save_discard()
@@ -384,10 +409,11 @@ class Smoke:
         self.ui.wait(f"show {status!r} in the {name!r} header", header)
         if self.ui.matches("Status", {"list item"}):
             raise AssertionError("The device page repeats its header status in a row")
-        for action in ("Refresh", "Connect", "Disconnect"):
-            if any(node.getState().contains(pyatspi.STATE_SHOWING)
-                   for node in self.ui.matches(action, BUTTONS)):
-                raise AssertionError(f"The device page exposes {action} outside Device Menu")
+        for node in self.ui.nodes():
+            if (visible(node) and node.name in {"Refresh", "Connect", "Disconnect"}
+                    and node.getRoleName() in BUTTONS
+                    and node.getState().contains(pyatspi.STATE_SHOWING)):
+                raise AssertionError(f"The device page exposes {node.name} outside Device Menu")
 
     def device_menu(self, choice):
         self.ui.click("Device Menu")
@@ -398,20 +424,23 @@ class Smoke:
 
     def reconnect_adapter(self):
         def ready(status):
-            rows = self.ui.matches("Smoke Adapter", {"list item"}, self.navigation())
+            nodes = self.ui.nodes()
+            rows = self.ui.matches("Smoke Adapter", {"list item"}, nodes=nodes)
             return (any(row.description == status
                         and row.getState().contains(pyatspi.STATE_SELECTED) for row in rows)
-                and self.ui.matches("Diagnostics", {"list item"}) and any(
+                and self.ui.matches("Diagnostics", {"list item"}, nodes=nodes) and any(
                     node.getState().contains(pyatspi.STATE_SHOWING)
                     and node.getState().contains(pyatspi.STATE_SENSITIVE)
-                    for node in self.ui.matches("Adapter Menu", BUTTONS)))
+                    for node in self.ui.matches("Adapter Menu", BUTTONS, nodes=nodes)))
 
         def no_connection_controls():
             self.ui.absent("Status")
-            for action in ("Connect", "Disconnect"):
-                if any(n.getState().contains(pyatspi.STATE_SHOWING)
-                       for n in self.ui.matches(action, BUTTONS)):
-                    raise AssertionError(f"The adapter page exposes {action} outside Adapter Menu")
+            nodes = self.ui.nodes()
+            for node in nodes:
+                if (visible(node) and node.getRoleName() in BUTTONS
+                        and node.name in {"Connect", "Disconnect"}
+                        and node.getState().contains(pyatspi.STATE_SHOWING)):
+                    raise AssertionError(f"The adapter page exposes {node.name} outside Adapter Menu")
 
         self.nav("Overview")
         self.no_tabs()
@@ -441,6 +470,7 @@ class Smoke:
             raise AssertionError("Closing the window quit the application")
 
     def startup(self):
+        started = time.monotonic()
         self.ui = Desktop(self.launch(hidden=True), self.output)
         self.ui.wait("register the hidden instance", lambda: self.owner() == self.ui.process.pid)
         self.hidden()
@@ -452,6 +482,7 @@ class Smoke:
         self.ui.expect("Example Mouse")
         self.ui.expect("Example Trackball")
         self.sidebar()
+        self.timings["startup"] = round(time.monotonic() - started, 3)
 
     def sidebar(self):
         navigation = self.navigation()
@@ -460,8 +491,9 @@ class Smoke:
         expected = ["Overview", "Settings"]
         for adapter, mouse in (("Example Adapter 1", "Example Mouse"),
                                ("Example Adapter 2", "Example Trackball")):
-            expected.extend((adapter, "Example Controller", "Example Keys Wireless",
-                             mouse, "Travel Keyboard"))
+            expected.extend((adapter, mouse) if self.env.get("CORDIAL_SIM_EMPTY_STATES") == "1"
+                            else (adapter, "Example Controller", "Example Keys Wireless",
+                                  mouse, "Travel Keyboard"))
         if [n.name for n in rows] != expected:
             raise AssertionError(f"Unexpected sidebar group order: {[n.name for n in rows]}")
         for title in ("Devices", "Adapters", "Add Device"):
@@ -573,15 +605,17 @@ class Smoke:
         self.reconnect_adapter()
         self.ui.expect("Windows", self.ui.row("Platform"))
         self.apply(ADAPTER_WRITE, lambda: self.ui.choose("Platform", "Linux"))
-        for transport in ("Bluetooth Classic", "Bluetooth LE"):
-            self.apply(ADAPTER_WRITE, lambda: self.ui.switch(transport, False))
-            self.checked(transport, False)
-            self.reconnect_adapter()
-            self.checked(transport, False)
-            self.apply(ADAPTER_WRITE, lambda: self.ui.switch(transport, True))
-            self.checked(transport, True)
-            self.reconnect_adapter()
-            self.checked(transport, True)
+        self.apply(ADAPTER_WRITE, lambda: self.ui.switch("Bluetooth Classic", False))
+        self.reconnect_adapter()
+        self.checked("Bluetooth Classic", False)
+        self.checked("Bluetooth LE", True)
+        self.apply(ADAPTER_WRITE, lambda: self.ui.switch("Bluetooth Classic", True))
+        self.apply(ADAPTER_WRITE, lambda: self.ui.switch("Bluetooth LE", False))
+        self.reconnect_adapter()
+        self.checked("Bluetooth Classic", True)
+        self.checked("Bluetooth LE", False)
+        self.apply(ADAPTER_WRITE, lambda: self.ui.switch("Bluetooth LE", True))
+        self.checked("Bluetooth LE", True)
         self.ui.expect("Linux", self.ui.row("Platform"))
 
     def details(self):
@@ -595,18 +629,25 @@ class Smoke:
         self.ui.screenshot("sidebar-disconnected-battery")
         self.device_menu("Connect")
         self.device_status("Example Mouse", "Connected")
-        for title, initial in (("Use This Device", True), ("Automatic Connections", True),
-                               ("Logitech Features", True), ("Block Connections", False)):
+        switches = (("Use This Device", True), ("Automatic Connections", True),
+                    ("Logitech Features", True), ("Block Connections", False))
+        for title, initial in switches:
             self.checked(title, initial)
-            self.apply(MOUSE_DETAILS, lambda: self.ui.switch(title, not initial))
-            self.checked(title, not initial)
+        previous = tuple(initial for _, initial in switches)
+        for values in ((False, False, True, True), (False, True, False, True)):
+            for (title, _), value, old in zip(switches, values, previous):
+                if value != old:
+                    self.apply(MOUSE_DETAILS, lambda: self.ui.switch(title, value))
+                self.checked(title, value)
             self.nav("Example Trackball")
             self.nav("Example Mouse")
             self.refresh_device()
-            self.checked(title, not initial)
-            self.apply(MOUSE_DETAILS, lambda: self.ui.switch(title, initial))
-            self.checked(title, initial)
-            self.refresh_device()
+            for (title, _), value in zip(switches, values):
+                self.checked(title, value)
+            previous = values
+        for (title, initial), value in zip(switches, previous):
+            if value != initial:
+                self.apply(MOUSE_DETAILS, lambda: self.ui.switch(title, initial))
             self.checked(title, initial)
 
     def search_flow(self):
@@ -614,12 +655,40 @@ class Smoke:
         writes = self.trace.read_text()
         preferences = saved_preferences(self.config)
         autostart = self.autostart.exists()
+        changes = []
+        monitors = []
+        paths = (self.config / "glib-2.0/settings/keyfile", self.autostart)
+        try:
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                monitor = Gio.File.new_for_path(str(path.parent)).monitor_directory(
+                    Gio.FileMonitorFlags.WATCH_MOVES, None)
+                def changed(monitor, file, other, event, path=path):
+                    if any(candidate and candidate.get_path() == str(path)
+                           for candidate in (file, other)):
+                        changes.append((path.name, event.value_nick))
+                handler = monitor.connect("changed", changed)
+                monitors.append((monitor, handler))
 
-        def unchanged():
-            return (self.trace.read_text() == writes
-                    and saved_preferences(self.config) == preferences
-                    and self.autostart.exists() == autostart)
+            def unchanged():
+                context = GLib.MainContext.default()
+                while context.pending():
+                    context.iteration(False)
+                return (not changes and self.trace.read_text() == writes
+                        and saved_preferences(self.config) == preferences
+                        and self.autostart.exists() == autostart)
 
+            self.search_selections(unchanged)
+            self.ui.retain("search without writing adapter settings or preferences", unchanged)
+        finally:
+            for monitor, handler in monitors:
+                monitor.cancel()
+                monitor.disconnect(handler)
+            (self.output / "search-write-observation.json").write_text(json.dumps({
+                "file_changes": changes, "adapter_writes": self.trace.read_text() != writes,
+            }, indent=2) + "\n")
+
+    def search_selections(self, unchanged):
         def open_search(query, icon=False):
             if icon:
                 toggle = self.ui.find("Search", BUTTONS)
@@ -638,9 +707,10 @@ class Smoke:
             return entry
 
         def closed():
-            return not any(n.getState().contains(pyatspi.STATE_SHOWING)
-                for n in self.ui.matches("Search", {"text", "entry"})
-                + self.ui.matches("Search Results", {"list"}))
+            return not any(visible(n) and n.getState().contains(pyatspi.STATE_SHOWING)
+                and (n.name == "Search" and n.getRoleName() in {"text", "entry"}
+                     or n.name == "Search Results" and n.getRoleName() == "list")
+                for n in self.ui.nodes())
 
         def choose(query, title, context, page, control=None, subpage=None,
                    icon=False, keyboard=False, width=980, height=680, occurrence=None,
@@ -692,7 +762,8 @@ class Smoke:
                     return (px <= x and py <= y and x + w <= px + pw
                             and y + h <= py + ph)
                 self.ui.wait(f"scroll the searched {control!r} control into view", in_view)
-            self.ui.retain("search without writing settings", unchanged)
+            if not unchanged():
+                raise AssertionError("Search wrote adapter settings or preferences")
 
         for replacement in ("", "cordial-no-matching-setting"):
             entry = open_search("settings")
@@ -723,7 +794,8 @@ class Smoke:
         row = self.ui.row("Pointer Sensitivity")
         self.ui.wait("focus Pointer Sensitivity after replacing the query", lambda: any(
             n.getState().contains(pyatspi.STATE_FOCUSED) for n in walk(row)))
-        self.ui.retain("replace and activate a search query without writing settings", unchanged)
+        if not unchanged():
+            raise AssertionError("Search wrote adapter settings or preferences")
 
         choose("CONNECTIONS settings", "Connections", "Settings", "Settings",
                control="Connections", icon=True)
@@ -785,7 +857,8 @@ class Smoke:
             self.page_header("Diagnostics"))
         self.ui.wait("retain the selected adapter after Escape", lambda:
             self.selected_navigation("Smoke Adapter"))
-        self.ui.retain("cancel search without writing settings", unchanged)
+        if not unchanged():
+            raise AssertionError("Search wrote adapter settings or preferences")
         self.nav("Example Mouse")
         self.ui.resize(480, 720)
         self.ui.wait("show the narrow content page", lambda:
@@ -821,7 +894,8 @@ class Smoke:
         self.ui.wait("restore the narrow sidebar after Escape", closed)
         self.ui.wait("retain the searched adapter after Escape in the narrow sidebar", lambda:
             self.selected_navigation("Example Adapter 2"))
-        self.ui.retain("search at 480px without writing settings", unchanged)
+        if not unchanged():
+            raise AssertionError("Search wrote adapter settings or preferences")
         self.ui.resize(980, 680)
         self.nav("Example Mouse")
 
@@ -869,18 +943,10 @@ class Smoke:
         self.device_menu("Refresh")
         self.ui.wait("read saved pointer sensitivity", lambda:
             self.ui.number("Pointer Sensitivity") == 1200)
+        for title, value in (("Use This Device", True), ("Automatic Connections", True),
+                             ("Logitech Features", True), ("Block Connections", False)):
+            self.checked(title, value)
         self.marker("Pointer Sensitivity", "Saved")
-        self.ui.focus(entry)
-        self.ui.key("Control_L", "a")
-        for digit in "1250":
-            self.ui.key(digit)
-        self.apply(MOUSE_SETTINGS, lambda: self.ui.key("Return"))
-        self.ui.wait("commit pointer sensitivity with Enter", lambda:
-            self.ui.number("Pointer Sensitivity") == 1250)
-        self.apply(MOUSE_SETTINGS, lambda: self.ui.key("Down"))
-        self.ui.wait("commit a pointer sensitivity step", lambda:
-            self.ui.number("Pointer Sensitivity") == 1200)
-        self.device_menu("Refresh")
         self.apply(MOUSE_SETTINGS, lambda: self.ui.choose("Pointer Sensitivity 2", "1600 DPI",
             choices=("400 DPI", "800 DPI", "1600 DPI")))
         self.apply(MOUSE_SETTINGS, lambda: self.ui.choose("Wheel Mode", "Free Spin",
@@ -891,11 +957,7 @@ class Smoke:
         self.device_menu("Refresh")
         self.ui.wait("read saved pointer sensitivity", lambda:
             self.ui.number("Pointer Sensitivity") == 1200)
-        self.nav("Example Trackball")
-        self.nav("Example Mouse")
         self.main_page()
-        self.ui.wait("retain saved numeric setting", lambda:
-            self.ui.number("Pointer Sensitivity") == 1200)
         self.ui.expect("Free Spin", self.ui.row("Wheel Mode"))
         self.ui.expect("1600 DPI", self.ui.row("Pointer Sensitivity 2"))
         self.marker("Pointer Sensitivity 2", "Saved")
@@ -930,12 +992,14 @@ class Smoke:
         return row
 
     def all_profiles(self, root=None):
-        for name in ("Next", "Previous"):
-            if self.ui.matches(name, BUTTONS, root):
-                raise AssertionError(f"The profile list exposes {name}")
-        for name in ("Natural Scrolling", "Typing", *(
-                f"Example Profile {i}" for i in range(3, 13))):
-            self.ui.find(name, {"list item"}, root)
+        def complete():
+            nodes = self.ui.nodes(root)
+            for name in ("Next", "Previous"):
+                if self.ui.matches(name, BUTTONS, nodes=nodes):
+                    raise AssertionError(f"The profile list exposes {name}")
+            return all(self.ui.match_one(name, {"list item"}, nodes) for name in (
+                "Natural Scrolling", "Typing", *(f"Example Profile {i}" for i in range(3, 13))))
+        self.ui.wait("show every library profile without pagination", complete)
 
     def profile_menu(self, name, choice):
         label = name + " Profile Menu"
@@ -967,11 +1031,14 @@ class Smoke:
 
     def layer_order(self, names):
         def ordered():
-            if sorted(n.name for n in self.ui.nodes() if visible(n)
+            nodes = self.ui.nodes()
+            if sorted(n.name for n in nodes if visible(n)
                       and n.getRoleName() in BUTTONS and n.name.startswith("Remove ")) != sorted(
                           f"Remove {name}" for name in names):
                 return None
-            rows = [self.ui.row(name) for name in names]
+            rows = [self.ui.match_row(name, nodes) for name in names]
+            if any(row is None for row in rows):
+                return None
             if len(set(rows)) != len(names) or len({row.parent for row in rows}) != 1:
                 raise AssertionError("Profile layers do not occupy distinct rows in one list")
             positions = [row.getIndexInParent() for row in rows]
@@ -1020,24 +1087,23 @@ class Smoke:
         self.apply(ADAPTER_WRITE, lambda: self.ui.choose("VIA Profile", "Example Profile 11"))
         self.available("VIA", True)
         self.reconnect_adapter()
+        self.checked("Bluetooth Classic", True)
+        self.checked("Bluetooth LE", True)
         self.subpage("Profiles")
         self.ui.expect("Example Profile 11", self.ui.row("VIA Profile"))
         self.apply(ADAPTER_WRITE, lambda: self.ui.choose("VIA Profile", "Natural Scrolling"))
-        self.reconnect_adapter()
-        self.subpage("Profiles")
         self.ui.expect("Natural Scrolling", self.ui.row("VIA Profile"))
         self.apply(ADAPTER_WRITE, lambda: self.ui.switch("VIA", True))
         self.checked("VIA", True)
-        self.reconnect_adapter()
-        self.subpage("Profiles")
-        self.checked("VIA", True)
-        self.ui.expect("Natural Scrolling", self.ui.row("VIA Profile"))
         # Vial conflicts with VIA: its profile stays editable while its switch waits for VIA.
         self.apply(ADAPTER_WRITE, lambda: self.ui.choose("Vial Profile", "Example Profile 11"))
         self.available("Vial", False)
         self.search_focus("vial smoke", "Vial", "Vial Profile")
         self.reconnect_adapter()
         self.subpage("Profiles")
+        self.checked("VIA", True)
+        self.ui.expect("Natural Scrolling", self.ui.row("VIA Profile"))
+        self.ui.expect("Example Profile 11", self.ui.row("Vial Profile"))
         self.available("Vial", False)
         self.apply(ADAPTER_WRITE, lambda: self.ui.switch("VIA", False))
         self.checked("VIA", False)
@@ -1079,9 +1145,6 @@ class Smoke:
         self.layer_order(("Typing", "Example Profile 3", "Natural Scrolling"))
         self.ui.dump("device-profiles-drag")
         self.ui.screenshot("device-profiles-drag")
-        self.refresh_device()
-        self.subpage("Profiles")
-        refreshed = self.layer_order(("Typing", "Example Profile 3", "Natural Scrolling"))
         self.reconnect_adapter()
         self.nav("Example Mouse")
         self.subpage("Profiles")
@@ -1095,7 +1158,7 @@ class Smoke:
             "initial_order": ["Natural Scrolling", "Typing", "Example Profile 3"],
             "dragged_profile": "Natural Scrolling", "target_profile": "Example Profile 3",
             "pointer": pointer, "completed_writes": outcomes,
-            "refreshed_order": refreshed, "reconnected_order": reconnected,
+            "reconnected_order": reconnected,
         }, indent=2) + "\n")
         before = len(self.writes(MOUSE_PROFILES))
         pointer = self.ui.drag(self.ui.row("Example Profile 3"), self.ui.row("Typing"))
@@ -1104,10 +1167,6 @@ class Smoke:
         self.refresh_device()
         self.subpage("Profiles")
         refreshed = self.layer_order(("Example Profile 3", "Typing", "Natural Scrolling"))
-        self.reconnect_adapter()
-        self.nav("Example Mouse")
-        self.subpage("Profiles")
-        reconnected = self.layer_order(("Example Profile 3", "Typing", "Natural Scrolling"))
         outcomes = self.writes(MOUSE_PROFILES)[before:]
         if outcomes != ["ok"]:
             raise AssertionError(f"One pointer drop must write the final order once: {outcomes}")
@@ -1115,7 +1174,7 @@ class Smoke:
             "initial_order": ["Typing", "Example Profile 3", "Natural Scrolling"],
             "dragged_profile": "Example Profile 3", "target_profile": "Typing",
             "pointer": pointer, "completed_writes": outcomes,
-            "refreshed_order": refreshed, "reconnected_order": reconnected,
+            "refreshed_order": refreshed,
         }, indent=2) + "\n")
         self.apply(MOUSE_PROFILES, lambda:
             self.ui.click("Remove Example Profile 3", root=self.ui.row("Example Profile 3")))
@@ -1388,13 +1447,11 @@ class Smoke:
         self.ui.wait("show the expanded sidebar", self.sidebar_visible)
         self.nav("Example Adapter 1")
         self.subpage("Profiles")
-        for name in ("Natural Scrolling", "Typing", *(
-                f"Example Profile {i}" for i in range(3, 13))):
-            self.profile_menu(name, "Delete")
-            dialog = self.modal()
-            self.ui.click("Delete", root=dialog)
-            self.close_deletion(name, dialog)
-            self.ui.absent(name)
+        self.profile_menu("Natural Scrolling", "Delete")
+        dialog = self.modal()
+        self.ui.click("Delete", root=dialog)
+        self.close_deletion("Natural Scrolling", dialog)
+        self.ui.absent("Natural Scrolling")
         self.nav("Example Mouse")
         self.subpage("Profiles")
         self.ui.click("Add Profile" + ELLIPSIS)
@@ -1447,7 +1504,8 @@ class Smoke:
         return self.ui.wait(f"show adapter groups {expected!r}", grouped)
 
     def empty_sidebar(self):
-        groups = {adapter: ["Example Controller", "Example Keys Wireless", mouse, "Travel Keyboard"]
+        self.back()
+        groups = {adapter: [mouse]
                   for adapter, mouse in (("Example Adapter 1", "Example Mouse"),
                                          ("Example Adapter 2", "Example Trackball"))}
 
@@ -1490,6 +1548,7 @@ class Smoke:
         pair_from_sidebar("Example Adapter 2")
 
     def run_empty_states(self):
+        self.env["CORDIAL_SIM_EMPTY_STATES"] = "1"
         self.startup()
         self.step("empty-profiles", self.empty_profiles)
         self.step("empty-sidebar", self.empty_sidebar)
@@ -1810,17 +1869,16 @@ class Smoke:
         for title in ("Start at Login", "Always Show Tray Icon", "Connections"):
             self.ui.switch(title, True, page)
         self.ui.switch("Low Battery", False, page)
-        for level in (3, 60):
-            entry = self.ui.control("Low Battery Level", "queryEditableText", page)
-            self.ui.focus(entry)
-            self.ui.key("Control_L", "a")
-            for digit in str(level):
-                self.ui.key(digit)
-            self.ui.wait(f"type a low battery level of {level}", lambda: text(entry) == str(level))
-            self.ui.key("Return")
-            self.ui.wait(f"save a low battery level of {level}", lambda:
-                saved_preferences(self.config).get("low-battery-percent") == level)
-            self.ui.expect("%", self.ui.row("Low Battery Level", page))
+        entry = self.ui.control("Low Battery Level", "queryEditableText", page)
+        self.ui.focus(entry)
+        self.ui.key("Control_L", "a")
+        for digit in "60":
+            self.ui.key(digit)
+        self.ui.wait("type a low battery level of 60", lambda: text(entry) == "60")
+        self.ui.key("Return")
+        self.ui.wait("save a low battery level of 60", lambda:
+            saved_preferences(self.config).get("low-battery-percent") == 60)
+        self.ui.expect("%", self.ui.row("Low Battery Level", page))
         expected = {"start-at-login": True, "always-show-tray": True,
                     "notify-low-battery": False, "low-battery-percent": 60,
                     "notify-connections": True}
@@ -1835,7 +1893,6 @@ class Smoke:
             raise AssertionError(f"Unexpected autostart command: {desktop['Exec']!r}")
         if desktop["Type"] != "Application" or desktop["Terminal"] != "false":
             raise AssertionError("The autostart entry is not a background desktop application")
-        self.ui.screenshot("preferences-unit-placement")
         self.ui.screenshot("preferences-page")
         self.nav("Overview")
         self.ui.absent("Start at Login")
@@ -1859,19 +1916,23 @@ class Smoke:
             self.device_status("Example Mouse", "Connected")
             self.fit_device_menu(width, height, "Disconnect")
             self.fit_capacity("Battery", width, height)
-            self.device_menu("Disconnect")
-            self.device_status("Example Mouse", "Disconnected")
-            self.fit_device_menu(width, height, "Connect")
-            self.device_menu("Connect")
-            self.device_status("Example Mouse", "Connected")
-            for title in ("Use This Device", "Automatic Connections", "Logitech Features",
-                          "Block Connections", "Pointer Sensitivity", "Pointer Sensitivity 2",
-                          "Wheel Mode", "Reverse Vertical Scrolling"):
+            if width == 480:
+                self.device_menu("Disconnect")
+                self.device_status("Example Mouse", "Disconnected")
+                self.fit_device_menu(width, height, "Connect")
+                self.device_menu("Connect")
+                self.device_status("Example Mouse", "Connected")
+            titles = ("Use This Device", "Pointer Sensitivity", "Pointer Sensitivity 2",
+                      "Wheel Mode", "Reverse Vertical Scrolling")
+            if width == 480:
+                titles += ("Automatic Connections", "Logitech Features", "Block Connections")
+            for title in titles:
                 self.fit_row(title, width, height)
             self.fit_marker("Pointer Sensitivity", "Saved", width, height)
-            self.fit_marker("Pointer Sensitivity 2", "Saved", width, height)
             self.fit_marker("Wheel Mode", "Saved", width, height)
-            self.fit_marker("Reverse Vertical Scrolling", "Saved", width, height)
+            if width == 480:
+                self.fit_marker("Pointer Sensitivity 2", "Saved", width, height)
+                self.fit_marker("Reverse Vertical Scrolling", "Saved", width, height)
             self.fit_marker("Automatic Free Spin", "Not Saved", width, height)
             self.ui.screenshot(f"device-settings-{width}")
             self.page_end()
@@ -1891,7 +1952,6 @@ class Smoke:
             self.ui.screenshot(f"device-profiles-{width}")
             self.ui.click("Add Profile")
             picker = self.modal()
-            self.all_profiles(picker)
             row = self.ui.find("Example Profile 11", {"list item"}, picker)
             self.ui.click(node=row)
             self.fit_node(row, width, height)
@@ -1904,7 +1964,8 @@ class Smoke:
             self.subpage("Diagnostics")
             self.fit_header("Diagnostics", width, height)
             self.fit_device_menu(width, height, "Disconnect", page="diagnostics")
-            self.device_menu("Refresh")
+            if width == 480:
+                self.device_menu("Refresh")
             self.ui.screenshot(f"device-diagnostics-{width}")
             self.back()
             self.expose_navigation("Example Mouse")
@@ -1934,12 +1995,10 @@ class Smoke:
             self.ui.screenshot(f"adapter-details-{width}")
             self.subpage("Profiles")
             self.fit_header("Profiles", width, height)
-            self.all_profiles()
             self.fit_capacity("In Use", width, height)
-            for title in ("Example Profile 11", "Example Profile 12"):
-                self.fit_node(self.profile_page(title), width, height)
+            self.fit_node(self.profile_page("Example Profile 12"), width, height)
             self.fit_controls(width, height, ("New Profile",))
-            for title in ("VIA", "Vial"):
+            for title in (("VIA", "Vial") if width == 480 else ("Vial",)):
                 self.fit_row(title, width, height)
                 self.fit_row(title + " Profile", width, height)
             self.ui.screenshot(f"adapter-profiles-{width}")
@@ -1965,8 +2024,10 @@ class Smoke:
             self.expose_navigation("Smoke Adapter")
             page = self.preferences_page(sidebar=True)
             self.fit_header("Settings", width, height)
-            for title in ("Start at Login", "Always Show Tray Icon", "Low Battery",
-                          "Low Battery Level", "Connections"):
+            titles = ("Start at Login", "Low Battery Level", "Connections")
+            if width == 480:
+                titles += ("Always Show Tray Icon", "Low Battery")
+            for title in titles:
                 if title == "Low Battery Level":
                     control = self.ui.control(title, "queryValue", page)
                 else:
@@ -2113,20 +2174,6 @@ class Smoke:
             raise AssertionError("Low Battery was not restored")
         if self.ui.number("Low Battery Level", root=page) != 60:
             raise AssertionError("Low Battery Level was not restored")
-        entry = self.ui.control("Low Battery Level", "queryEditableText", page)
-        self.ui.focus(entry)
-        self.ui.key("Control_L", "a")
-        self.ui.key("3")
-        self.ui.key("Return")
-        self.ui.wait("save a low battery level of 3 before relaunch", lambda:
-            saved_preferences(self.config).get("low-battery-percent") == 3)
-        self.quit()
-        self.ui.x11.close()
-        self.ui = Desktop(self.launch(), self.output)
-        self.ui.expect("Example Adapter 1")
-        page = self.preferences_page(sidebar=True)
-        if self.ui.number("Low Battery Level", root=page) != 3:
-            raise AssertionError("A low battery level of 3 was not restored")
         self.ui.switch("Start at Login", False, page)
         self.ui.wait("remove isolated autostart entry", lambda: not self.autostart.exists())
         self.ui.wait("save Start at Login off", lambda:

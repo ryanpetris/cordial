@@ -216,25 +216,27 @@ class Desktop:
         return [node for app in pyatspi.Registry.getDesktop(0)
                 if app and app.get_process_id() in pids for node in walk(app)]
 
-    def matches(self, name, roles=None, root=None):
-        return [n for n in self.nodes(root) if visible(n) and n.name == name
+    def matches(self, name, roles=None, root=None, *, nodes=None):
+        nodes = self.nodes(root) if nodes is None else nodes
+        return [n for n in nodes if visible(n) and n.name == name
                 and (roles is None or n.getRoleName() in roles)]
 
+    def match_one(self, name, roles, nodes):
+        matches = self.matches(name, roles, nodes=nodes)
+        outer = []
+        for node in matches:
+            parent = node.parent
+            while parent is not None and parent not in matches:
+                parent = parent.parent
+            if parent is None:
+                outer.append(node)
+        if len(outer) > 1:
+            raise AssertionError(f"Ambiguous {name!r}, roles {roles}: {len(outer)} matches")
+        return outer[0] if outer else None
+
     def find(self, name, roles=None, root=None):
-        def one():
-            matches = self.matches(name, roles, root)
-            outer = []
-            for node in matches:
-                parent = node.parent
-                while parent is not None and parent not in matches:
-                    parent = parent.parent
-                if parent is None:
-                    outer.append(node)
-            matches = outer
-            if len(matches) > 1:
-                raise AssertionError(f"Ambiguous {name!r}, roles {roles}: {len(matches)} matches")
-            return matches[0] if matches else None
-        return self.wait(f"find {name!r}, roles {roles}", one)
+        return self.wait(f"find {name!r}, roles {roles}", lambda:
+            self.match_one(name, roles, self.nodes(root)))
 
     def expect(self, name, root=None):
         return self.wait(f"show {name!r}", lambda: self.matches(name, root=root))
@@ -370,20 +372,22 @@ class Desktop:
         return {"start": start, "drop": finish}
 
     def row(self, title, root=None):
-        def find():
-            candidates = set()
-            for node in self.matches(title, root=root):
-                while node is not None:
-                    if (node.getRoleName() in ROWS | {"combo box"}
-                            or (node.getRoleName() == "switch" and node.parent is not None
-                                and node.parent.getRoleName() == "list")):
-                        candidates.add(node)
-                        break
-                    node = node.parent
-            if len(candidates) > 1:
-                raise AssertionError(f"Ambiguous accessible row {title!r}: {len(candidates)} matches")
-            return next(iter(candidates), None)
-        return self.wait(f"find accessible row {title!r}", find)
+        return self.wait(f"find accessible row {title!r}", lambda:
+            self.match_row(title, self.nodes(root)))
+
+    def match_row(self, title, nodes):
+        candidates = set()
+        for node in self.matches(title, nodes=nodes):
+            while node is not None:
+                if (node.getRoleName() in ROWS | {"combo box"}
+                        or (node.getRoleName() == "switch" and node.parent is not None
+                            and node.parent.getRoleName() == "list")):
+                    candidates.add(node)
+                    break
+                node = node.parent
+        if len(candidates) > 1:
+            raise AssertionError(f"Ambiguous accessible row {title!r}: {len(candidates)} matches")
+        return next(iter(candidates), None)
 
     def control(self, title, interface, root=None):
         def query(node):
@@ -393,7 +397,8 @@ class Desktop:
             except (NotImplementedError, GLib.Error):
                 return False
         def find():
-            named = [n for n in self.matches(title, root=root) if query(n)]
+            anchors = self.matches(title, root=root)
+            named = [n for n in anchors if query(n)]
             if len(named) == 1:
                 if interface == "queryEditableText":
                     fields = [n for n in walk(named[0]) if visible(n) and query(n)
@@ -401,7 +406,7 @@ class Desktop:
                     if fields:
                         return fields[-1]
                 return named[0]
-            for anchor in self.matches(title, root=root):
+            for anchor in anchors:
                 node = anchor
                 for _ in range(4):
                     controls = [n for n in walk(node) if visible(n) and query(n)]
@@ -432,11 +437,12 @@ class Desktop:
 
     def switch(self, title, on, root=None):
         def switches():
-            named = self.matches(title, {"switch", "check box", "toggle button"}, root)
+            anchors = self.matches(title, root=root)
+            named = [n for n in anchors if n.getRoleName() in {"switch", "check box", "toggle button"}]
             for node in reversed(named):
                 if node.queryAction().nActions:
                     return node
-            for anchor in self.matches(title, root=root):
+            for anchor in anchors:
                 for n in walk(anchor):
                     if (n.getRoleName() in {"switch", "check box", "toggle button"}
                             and n.queryAction().nActions):

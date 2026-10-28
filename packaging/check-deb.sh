@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 # Run in a disposable DEB_DISTRIBUTION container as root from the repository root.
 set -euxo pipefail
+source "$(dirname "$0")/../docker/check-output.sh"
 export DEBIAN_FRONTEND=noninteractive
+if dpkg-query -W cordial; then echo 'Use a fresh prerequisite container' >&2; exit 1; fi
 package="./build/packages/host-deb/$DEB_DISTRIBUTION/cordial_$CORDIAL_VERSION-${DEB_REVISION:-1~$DEB_DISTRIBUTION}_amd64.deb"
+check_output "release/$(basename "$package")" "release/SHA256SUMS-$DEB_DISTRIBUTION"
 test -f "$package"
-apt-get update
-apt-get install -y --no-install-recommends lintian python3 dpkg-dev binutils libglib2.0-bin
-echo 'path-include=/usr/share/doc/cordial/*' > /etc/dpkg/dpkg.cfg.d/zz-cordial-check
-temporary=$(mktemp -d)
-trap 'rm -rf "$temporary"' EXIT
 apt-get install -y --no-install-recommends "$package"
 python3 tools/check_linux_package.py --debian --version "$CORDIAL_VERSION"
 # The package retains the release executable and its symbol table.

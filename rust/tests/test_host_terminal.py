@@ -115,6 +115,31 @@ class Terminal(unittest.TestCase):
                           outcome=adapter.p.ERROR_OUTCOME_NO_EFFECT)
         return status
 
+    def test_adapters_share_artifacts_and_keep_sessions_independent(self):
+        from terminal_adapter import Adapter
+        imports = {name: sys.modules.get(name) for name in ("cordial_pb2", "handshake_pb2")}
+        first = Adapter()
+        try:
+            second = self.adapter()
+            self.assertIs(first.p, second.p)
+            self.assertEqual(first.env["LD_PRELOAD"], second.env["LD_PRELOAD"])
+            first.hello.protocol_version = 0
+            first.status.name = "Other Adapter"
+            first.sent.append(first.p.Message())
+            self.assertNotEqual(second.hello.protocol_version, 0)
+            self.assertEqual(second.status.name, "Terminal Adapter")
+            self.assertEqual(second.sent, [])
+            self.assertIsNot(first.events, second.events)
+            self.assertIsNot(first.thread, second.thread)
+            self.assertNotEqual(first.port, second.port)
+            self.assertEqual(imports, {name: sys.modules.get(name) for name in imports})
+        finally:
+            first.close()
+        result = subprocess.run([BINARY, "--port", second.port, "adapter", "status"],
+                                env=second.env, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b"Terminal Adapter", result.stdout)
+
     def test_json_cli_succeeds_when_stderr_is_a_broken_pipe(self):
         adapter = self.adapter()
         reader, writer = os.pipe()

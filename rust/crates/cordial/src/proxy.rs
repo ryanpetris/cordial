@@ -331,7 +331,14 @@ fn run(args: Arguments) -> bool {
         }
     };
     let native = NativeInput::new(reader);
-    let result = session(&input, &output, &native, &mut writer, deadline);
+    let result = session(
+        &input,
+        &output,
+        &native,
+        &mut writer,
+        deadline,
+        WRITE_TIMEOUT,
+    );
     // The physical reader and writer are released before process exit, with no reopen path.
     drop(native);
     drop(writer);
@@ -373,6 +380,7 @@ fn session(
     native: &NativeInput,
     writer: &mut impl Write,
     deadline: Instant,
+    write_timeout: Duration,
 ) -> io::Result<()> {
     let mut negotiate = || -> io::Result<(NativeHello, Vec<u8>)> {
         let mut hello = vec![frame::DELIMITER];
@@ -435,7 +443,7 @@ fn session(
     let virtual_deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut pending_output = (!tail.is_empty()).then_some(tail);
     let mut output_progress = output.progress.load(Ordering::Acquire);
-    let mut output_deadline = Instant::now() + WRITE_TIMEOUT;
+    let mut output_deadline = Instant::now() + write_timeout;
     loop {
         if input.ended.load(Ordering::Acquire) || output.failed.load(Ordering::Acquire) {
             return Err(io::ErrorKind::BrokenPipe.into());
@@ -468,7 +476,7 @@ fn session(
                 && output.queued.load(Ordering::Relaxed) == output.written.load(Ordering::Acquire))
         {
             output_progress = progress;
-            output_deadline = Instant::now() + WRITE_TIMEOUT;
+            output_deadline = Instant::now() + write_timeout;
         } else if virtual_ready && Instant::now() >= output_deadline {
             // Backpressure can prevent the native reader from observing a physical disconnect.
             return Err(io::ErrorKind::TimedOut.into());
@@ -521,7 +529,7 @@ fn session(
                                     return Err(io::ErrorKind::InvalidData.into());
                                 }
                             }
-                            write_native(writer, &request, input, Instant::now() + WRITE_TIMEOUT)?;
+                            write_native(writer, &request, input, Instant::now() + write_timeout)?;
                             request.clear();
                         }
                     }
@@ -574,11 +582,12 @@ mod tests {
     }
 
     fn fixture(timeout: Duration) -> Fixture {
-        fixture_with_output(timeout, |writer| writer)
+        fixture_with_output(timeout, WRITE_TIMEOUT, |writer| writer)
     }
 
     fn fixture_with_output<W: Write + Send + 'static>(
         timeout: Duration,
+        write_timeout: Duration,
         output_writer: impl FnOnce(UnixStream) -> W + Send + 'static,
     ) -> Fixture {
         let (app, proxy_input) = UnixStream::pair().unwrap();
@@ -606,6 +615,7 @@ mod tests {
                 &native,
                 &mut writer,
                 Instant::now() + timeout,
+                write_timeout,
             );
             drop(native);
             drop(writer);
@@ -969,10 +979,13 @@ mod tests {
         }
 
         let (permits, receiver) = mpsc::channel();
-        let mut f = fixture_with_output(STARTUP_TIMEOUT, move |stream| ControlledWriter {
-            stream,
-            initial: 2,
-            permits: receiver,
+        let write_timeout = Duration::from_secs(1);
+        let mut f = fixture_with_output(STARTUP_TIMEOUT, write_timeout, move |stream| {
+            ControlledWriter {
+                stream,
+                initial: 2,
+                permits: receiver,
+            }
         });
         ready(&mut f);
         virtual_hello(&mut f.app);
@@ -980,7 +993,7 @@ mod tests {
         f.app
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        thread::sleep(WRITE_TIMEOUT + Duration::from_millis(50));
+        thread::sleep(write_timeout + Duration::from_millis(50));
         assert!(matches!(f.done.try_recv(), Err(TryRecvError::Empty)));
 
         let bytes = frame(&[1; 8]);
@@ -988,7 +1001,7 @@ mod tests {
         let mut received = Vec::new();
         // One output chunk takes longer than the timeout, but each partial write advances it.
         for _ in 0..3 {
-            thread::sleep(WRITE_TIMEOUT / 2);
+            thread::sleep(write_timeout / 2);
             permits.send(3).unwrap();
             let mut partial = [0; 3];
             f.app.read_exact(&mut partial).unwrap();
@@ -1005,7 +1018,7 @@ mod tests {
         f.adapter.write_all(&bytes).unwrap();
         assert_eq!(
             f.done
-                .recv_timeout(WRITE_TIMEOUT + Duration::from_secs(1))
+                .recv_timeout(write_timeout + Duration::from_secs(1))
                 .unwrap()
                 .unwrap_err()
                 .kind(),
@@ -1063,6 +1076,7 @@ mod tests {
             &native,
             &mut writer,
             Instant::now() + STARTUP_TIMEOUT,
+            WRITE_TIMEOUT,
         );
         drop(native);
         drop(writer);
