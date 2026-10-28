@@ -411,10 +411,6 @@ pub enum Outcome {
         subject: Subject,
         device: Option<p::Device>,
     },
-    /// The bond is saved, but its device ID is not yet known.
-    PairedWithoutDevice {
-        name: String,
-    },
     Answered,
     PairingCancelled,
     Devices,
@@ -1066,10 +1062,6 @@ fn open(
                     },
                 });
             }
-            Received::PairingComplete { candidate } => cell.update(|st| {
-                st.pairing = None;
-                st.paired_candidate = Some(candidate);
-            }),
             Received::Response(request, response) => {
                 cell.update(|st| st.response(request, response))
             }

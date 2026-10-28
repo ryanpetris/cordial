@@ -117,7 +117,7 @@ int main(void) {
 
     def test_preempted_discovery_resumes_without_restarting_cancelled_scans(self):
         native = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
-        stop = native[native.index("static int stop_scan(void)"):native.index("// Call only after")]
+        stop = native[native.index("static int stop_scan(void)"):native.index("static int unpair_view(")]
         start = native[native.index("static int start_scan(void)"):native.index("static ble_addr_t scan_identity")]
         completed = native[native.index("    case BLE_GAP_EVENT_DISC_COMPLETE:"):native.index("    case BLE_GAP_EVENT_CONNECT:")]
         run_c(r'''
@@ -175,7 +175,7 @@ int main(void) {
 
     def test_accept_list_waits_for_any_peer_and_serializes_scan_and_manual_connect(self):
         source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
-        resume = source[source.index("static void resume_radio(void) {"):source.index("static void security_ready(")]
+        resume = source[source.index("static int cancel_auto(void) {"):source.index("static void security_ready(")]
         connect = source[source.index("        if(!arg) {", source.index("    case BLE_GAP_EVENT_CONNECT:")):source.index("        if (!l) { if(!event->connect.status)")]
         wrapper = source[source.index("static int auto_gap(struct ble_gap_event *event"):source.index("static int gap(struct ble_gap_event *event")]
         expired = source[source.index("static void reject_incoming(void)"):source.index("// Start HID links")]
@@ -372,15 +372,27 @@ int main(void){
         source = (ROOT / "platforms/esp32s3/components/platform/bonds.c").read_text()
         source = "\n".join(line for line in source.splitlines() if not line.startswith("#include"))
         native=(ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
-        imports=native[native.index("    if(c->kind==CORDIAL_BLE_IMPORT"):native.index("    if (c->kind==CORDIAL_BLE_FORGET)")]
+        imports=native[native.index("    if(c->kind==CORDIAL_BLE_IMPORT"):native.index("    if (c->kind==CORDIAL_BLE_CONNECT)")]
+        errors=native[native.index("static uint8_t bond_error("):native.index("static void complete(")]
+        unpair=native[native.index("static int unpair_view("):native.index("static int start_scan(")]
+        inventory=native[native.index("static bool bonds("):native.index("static uint8_t security_error(")]
+        radio=native[native.index("static int cancel_auto(void) {"):native.index("static void security_ready(")]
+        process=native[native.index("static bool changes_privacy("):native.index("static void synced(")]
         run_c(r'''
 #include <assert.h>
 #include <stdbool.h>
 #include "ble.h"
 #include <stdint.h>
 #include <string.h>
+#define pdTRUE 1
+#define BLE_HS_CONN_HANDLE_NONE 65535
+#define BLE_OWN_ADDR_PUBLIC 0
+#define BLE_HS_FOREVER (-1)
 enum { BLE_HS_EINVAL=1, BLE_HS_ENOMEM=2, BLE_HS_ENOENT=3, BLE_HS_EBUSY=4, BLE_HS_ESTORE_FAIL=5,
+    BLE_HS_EBADDATA=6, BLE_HS_ETIMEOUT=7, BLE_HS_ETIMEOUT_HCI=8, BLE_HS_EALREADY=9, BLE_HS_EPREEMPTED=10,
+    BLE_ERR_MEM_CAPACITY=7, BLE_ERR_CMD_DISALLOWED=12, BLE_ERR_CONN_SPVN_TMO=8, BLE_ERR_UNK_CONN_ID=2,
     BLE_STORE_OBJ_TYPE_OUR_SEC=1, BLE_STORE_OBJ_TYPE_PEER_SEC=2 };
+#define BLE_HS_HCI_ERR(x) (0x200+(x))
 typedef struct { uint8_t type, val[6]; } ble_addr_t;
 static const ble_addr_t any={.type=255};
 #define BLE_ADDR_ANY (&any)
@@ -395,28 +407,80 @@ static int ble_store_config_write(int t,const union ble_store_value *v) {(void)t
 static int ble_store_config_delete(int t,const union ble_store_key *k) {(void)t;(void)k;return BLE_HS_ENOENT;}
 ''' + source + r'''
 int cordial_ble_resolve_key(const uint8_t *irk,const uint8_t *rpa) { return irk[0]==28 && rpa[5]==0x40; }
-static int live, removes, adds, scans;
+static int live, removes, adds, scans, write_error, cleanup_error, restart_error, stop_error, removal_error;
+static int privacy_removes, radio_failures, results, inventories;
 static cordial_ble_event last;
 struct ble_gap_conn_desc { int unused; };
+struct ble_npl_event {int unused;};
+typedef struct {uint32_t token;uint16_t connection;cordial_ble_peer peer;bool started,pairing;} link;
+static link links[MYNEWT_VAL(BLE_MAX_CONNECTIONS)];
+static bool is_synced=true,auto_active,auto_cancel,auto_dirty,auto_consumed,scanning;
+static unsigned reconnect_count;
+static ble_addr_t reconnect_peers[MYNEWT_VAL(BLE_MAX_CONNECTIONS)-1];
+static uint64_t scan_id=1;
+static uint32_t auto_attempt;
+static struct {uint16_t handle;} incoming={.handle=BLE_HS_CONN_HANDLE_NONE};
+static int commands,hid_connection;
+static cordial_ble_command queue[2];static unsigned queued;
+static int xQueuePeek(int q,cordial_ble_command *c,int wait) {
+    (void)q;(void)wait;if(!queued)return 0;*c=queue[0];return pdTRUE;
+}
+static int xQueueReceive(int q,cordial_ble_command *c,int wait) {
+    if(!xQueuePeek(q,c,wait))return 0;
+    memmove(queue,queue+1,--queued*sizeof(*queue));return pdTRUE;
+}
 static int ble_gap_conn_find_by_addr(const ble_addr_t *p, struct ble_gap_conn_desc *d) {(void)p;(void)d;return live?0:BLE_HS_ENOENT;}
-static int stop_scan(void) {scans++;return 0;}
-static int start_scan(void) {scans++;return 0;}
-static int unpair_view(const ble_addr_t *p) {
-    assert(!live);removes++;
-    assert(!cordial_bonds_prepare_unpair(p));
+static int stop_scan(void) {scans++;scanning=false;return stop_error;}
+static int start_scan(void) {
+    assert(!queued && !auto_active);
+    if(!scan_id || scanning)return 0;
+    scans++;scanning=!restart_error;return restart_error;
+}
+static int ble_gap_conn_cancel(void) {assert(false);return 0;}
+static int ble_gap_conn_active(void) {return 0;}
+static int ble_gap_wl_set(const ble_addr_t *p,unsigned count) {(void)p;(void)count;assert(false);return 0;}
+static int gap(void *event,void *arg) {(void)event;(void)arg;return 0;}
+static int auto_gap(void *event,void *arg) {(void)event;(void)arg;return 0;}
+static int ble_gap_connect(int own,const ble_addr_t *p,int timeout,const int *params,int (*cb)(void *,void *),void *arg) {
+    (void)own;(void)p;(void)timeout;(void)params;(void)cb;(void)arg;assert(false);return 0;
+}
+static void fail(link *l,uint8_t code) {(void)l;(void)code;assert(false);}
+static void schedule_radio(void) {assert(false);}
+static int ble_hs_pvcy_remove_entry(uint8_t type,const uint8_t *addr) {
+    (void)type;(void)addr;assert(!live);privacy_removes++;
+    if(removal_error)return removal_error;
+    if(write_error && adds)return cleanup_error;
+    return 0;
+}
+static int ble_store_util_delete_peer(const ble_addr_t *p) {
+    removes++;
     union ble_store_key k={.sec={.peer_addr=*p}};
     while(!cordial_bonds_delete(BLE_STORE_OBJ_TYPE_OUR_SEC,&k)) {}
     while(!cordial_bonds_delete(BLE_STORE_OBJ_TYPE_PEER_SEC,&k)) {}
-    cordial_bonds_clean(p);return 0;
+    return 0;
 }
+''' + unpair + r'''
 static int ble_store_write_peer_sec(const struct ble_store_value_sec *v) {
-    union ble_store_value value={.sec=*v};adds++;return cordial_bonds_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value);
+    union ble_store_value value={.sec=*v};adds++;if(write_error)return write_error;return cordial_bonds_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&value);
 }
 static ble_addr_t address(cordial_ble_peer p) {ble_addr_t a={.type=p.random};for(unsigned i=0;i<6;i++)a.val[i]=p.address[5-i];return a;}
-static bool bonds(const ble_addr_t *p) {(void)p;return true;}
-static void emit(const cordial_ble_event *e) {last=*e;}
+static cordial_ble_peer peer(ble_addr_t p) {cordial_ble_peer a={.random=p.type};for(unsigned i=0;i<6;i++)a.address[i]=p.val[5-i];return a;}
+static void emit(const cordial_ble_event *e) {
+    if(e->kind==CORDIAL_BLE_FAILED) {assert(e->code==CORDIAL_BLE_RADIO && !e->request);radio_failures++;return;}
+    if(e->kind==CORDIAL_BLE_BONDS) {inventories++;return;}
+    assert(e->kind==CORDIAL_BLE_BOND_RESULT || e->kind==CORDIAL_BLE_FORGOTTEN);
+    last=*e;results++;
+}
+''' + errors + inventory + radio + r'''
 static void command(const cordial_ble_command *c) {int status=0;
 ''' + imports + r'''
+}
+''' + process + r'''
+static void run_command(const cordial_ble_command *c) {
+    assert(!queued);queue[0]=*c;queued=1;int before=results;
+    process_commands(NULL);
+    assert(!queued && results==before+1 && last.request==c->request);
+    assert(last.kind==(c->kind==CORDIAL_BLE_FORGET ? CORDIAL_BLE_FORGOTTEN:CORDIAL_BLE_BOND_RESULT));
 }
 int main(void) {
     uint8_t r[145]={0},out[145];r[0]=77;r[8]=2;r[9]=1;r[16]=1;
@@ -446,9 +510,7 @@ int main(void) {
     assert(cordial_bonds_dirty(&peers[0]));
     assert(cordial_bonds_delete(BLE_STORE_OBJ_TYPE_PEER_SEC,&k)==BLE_HS_ENOENT);
     assert(!cordial_bonds_peers(peers,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) && count==0);
-    assert(!cordial_bonds_prepare_unpair(&k.sec.peer_addr));
-    assert(!cordial_bonds_read(BLE_STORE_OBJ_TYPE_PEER_SEC,&k,&v) && v.sec.irk_present);
-    assert(!cordial_bonds_delete(BLE_STORE_OBJ_TYPE_PEER_SEC,&k));
+    assert(cordial_bonds_read(BLE_STORE_OBJ_TYPE_PEER_SEC,&k,&v)==BLE_HS_ENOENT);
     cordial_bonds_clean(&k.sec.peer_addr);assert(!cordial_bonds_dirty(&k.sec.peer_addr));
     // A real two-direction record must terminate each delete-all loop.
     memcpy(r+17,r+81,64);assert(!cordial_bonds_import(r,145));
@@ -460,20 +522,100 @@ int main(void) {
     assert(!cordial_bonds_peers(peers,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) && count==MYNEWT_VAL(BLE_STORE_MAX_BONDS));
     cordial_bonds_clear();assert(!cordial_bonds_peers(peers,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) && count==0);
     assert(!cordial_bonds_same_privacy(r,145));
-    cordial_ble_command c={.kind=CORDIAL_BLE_IMPORT,.length=145};memcpy(c.data,r,145);
-    command(&c);assert(!last.code && removes==1 && adds==1 && scans==2);
-    command(&c);assert(!last.code && removes==1 && adds==1 && scans==2);
+    cordial_ble_command c={.kind=CORDIAL_BLE_IMPORT,.length=145,.request=42};memcpy(c.data,r,145);
+    run_command(&c);assert(!last.code && removes==1 && adds==1 && scans==2);
+    run_command(&c);assert(!last.code && removes==1 && adds==1 && scans==2);
     // Changed privacy cannot tear down an established link.
-    live=1;c.data[109]++;command(&c);assert(!last.code && removes==1 && adds==1);
+    live=1;c.data[109]++;run_command(&c);assert(!last.code && removes==1 && adds==1);
     c.data[109]--;
     ble_addr_t addr={.type=r[9]};reverse(addr.val,r+10,6);
     assert(!cordial_bonds_mark_dirty(&addr));
-    command(&c);assert(!last.code && cordial_bonds_dirty(&addr) && removes==1);
-    live=0;command(&c);assert(!last.code && !cordial_bonds_dirty(&addr) && removes==2 && adds==2);
+    run_command(&c);assert(!last.code && cordial_bonds_dirty(&addr) && removes==1);
+    live=0;run_command(&c);assert(!last.code && !cordial_bonds_dirty(&addr) && removes==2 && adds==2);
     // A native late-identity write can change IRK without a repeat callback.
     k.sec.peer_addr=addr;assert(!cordial_bonds_read(BLE_STORE_OBJ_TYPE_PEER_SEC,&k,&v));
     v.sec.irk[0]++;assert(!cordial_bonds_write(BLE_STORE_OBJ_TYPE_PEER_SEC,&v));
     assert(cordial_bonds_dirty(&addr));
+    adds=0;write_error=0x212;cleanup_error=0x20c;restart_error=BLE_HS_ENOMEM;
+    int deleted=removes,privacy=privacy_removes,scanned=scans;
+    run_command(&c);
+    assert(last.code==CORDIAL_BLE_RADIO && adds==1);
+    assert(removes==deleted+1 && privacy_removes==privacy+2 && scans==scanned+2);
+    assert(cordial_bonds_dirty(&addr));
+    assert(!cordial_bonds_export(&addr,out) && !memcmp(out,c.data,145));
+    assert(radio_failures==1 && !scan_id);
+    write_error=cleanup_error=restart_error=0;scan_id=2;
+    run_command(&c);assert(!last.code && adds==2 && !cordial_bonds_dirty(&addr));
+    assert(!cordial_bonds_export(&addr,out) && !memcmp(out,c.data,145));
+    // Scan failure before import leaves installed keys untouched and skips cleanup.
+    c.data[109]++;stop_error=BLE_HS_EBUSY;restart_error=BLE_HS_ENOMEM;
+    int before=removes;privacy=privacy_removes;scanned=scans;
+    run_command(&c);assert(last.code==CORDIAL_BLE_BUSY && removes==before && adds==2);
+    assert(privacy_removes==privacy && scans==scanned+2);
+    assert(!cordial_bonds_export(&addr,out) && out[109]==c.data[109]-1);
+    assert(radio_failures==2 && !scan_id);
+    stop_error=0;scan_id=3;
+    run_command(&c);assert(last.code==CORDIAL_BLE_OK && adds==3 && !cordial_bonds_dirty(&addr));
+    assert(!cordial_bonds_export(&addr,out) && !memcmp(out,c.data,145));
+    assert(radio_failures==3 && !scan_id);
+    scanned=scans;process_commands(NULL);
+    assert(scans==scanned && radio_failures==3);
+    c.length=144;before=removes;privacy=privacy_removes;
+    run_command(&c);assert(last.code==CORDIAL_BLE_STORAGE && removes==before && adds==3);
+    assert(privacy_removes==privacy && !cordial_bonds_export(&addr,out) && !memcmp(out,c.data,145));
+    // Successful cleanup also preserves the import failure and permits a retry.
+    c.length=145;c.data[109]++;write_error=0x212;before=removes;privacy=privacy_removes;
+    run_command(&c);assert(last.code==CORDIAL_BLE_RADIO && adds==4);
+    assert(removes==before+2 && privacy_removes==privacy+2 && !cordial_bonds_dirty(&addr));
+    assert(cordial_bonds_export(&addr,out)==BLE_HS_ENOENT);
+    write_error=restart_error=0;scan_id=4;run_command(&c);assert(!last.code && adds==5);
+    assert(!cordial_bonds_export(&addr,out) && !memcmp(out,c.data,145));
+    // Forget commits its bond result even when the scan restart fails.
+    c.kind=CORDIAL_BLE_FORGET;c.peer=peer(addr);restart_error=BLE_HS_ENOMEM;
+    run_command(&c);assert(last.code==CORDIAL_BLE_OK && radio_failures==4 && !scan_id);
+    assert(cordial_bonds_export(&addr,out)==BLE_HS_ENOENT && !cordial_bonds_dirty(&addr));
+    scanned=scans;process_commands(NULL);assert(scans==scanned && radio_failures==4);
+    // A failed forget retains its keys and its primary failure independently.
+    assert(!cordial_bonds_import(c.data,c.length));
+    removal_error=BLE_HS_ETIMEOUT;scan_id=5;
+    run_command(&c);assert(last.code==CORDIAL_BLE_TIMEOUT && radio_failures==5 && !scan_id);
+    assert(!cordial_bonds_export(&addr,out) && !memcmp(out,c.data,145));
+    removal_error=0;scan_id=6;
+    run_command(&c);assert(last.code==CORDIAL_BLE_OK && radio_failures==6 && !scan_id);
+    assert(cordial_bonds_export(&addr,out)==BLE_HS_ENOENT);
+    restart_error=0;
+    // A failed removal for an identity without host keys consumes no bond slot.
+    cordial_bonds_clear();assert(!cordial_bonds_mark_dirty(&addr));
+    removal_error=BLE_HS_HCI_ERR(BLE_ERR_CMD_DISALLOWED);
+    assert(unpair_view(&addr)==removal_error && cordial_bonds_dirty(&addr));
+    assert(cordial_bonds_export(&addr,out)==BLE_HS_ENOENT);
+    assert(!cordial_bonds_peers(peers,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) && count==0);
+    for(int i=0;i<MYNEWT_VAL(BLE_STORE_MAX_BONDS);i++) {r[15]=i;assert(!cordial_bonds_import(r,145));}
+    // A retry needs no free host slot, even if the controller entry is absent.
+    removal_error=BLE_HS_HCI_ERR(BLE_ERR_UNK_CONN_ID);
+    assert(!unpair_view(&addr) && !cordial_bonds_dirty(&addr));
+    assert(!cordial_bonds_peers(peers,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) && count==MYNEWT_VAL(BLE_STORE_MAX_BONDS));
+    assert(cordial_bonds_export(&addr,out)==BLE_HS_ENOENT);
+    // A replacement with no IRK retains its exact host keys on removal failure.
+    cordial_bonds_clear();r[15]=addr.val[0];r[81]&=~2;
+    assert(!cordial_bonds_import(r,145) && !cordial_bonds_mark_dirty(&addr));
+    removal_error=BLE_HS_HCI_ERR(BLE_ERR_CMD_DISALLOWED);
+    assert(unpair_view(&addr)==removal_error && cordial_bonds_dirty(&addr));
+    assert(!cordial_bonds_export(&addr,out) && !memcmp(out,r,145));
+    assert(!cordial_bonds_read(BLE_STORE_OBJ_TYPE_PEER_SEC,&k,&v) && !v.sec.irk_present);
+    removal_error=0;assert(!unpair_view(&addr) && !cordial_bonds_dirty(&addr));
+    assert(cordial_bonds_export(&addr,out)==BLE_HS_ENOENT);
+    // A batch finishes both bond operations before its single scan restart.
+    c.kind=CORDIAL_BLE_IMPORT;memcpy(c.data,r,145);queue[0]=c;
+    queue[1]=(cordial_ble_command){.kind=CORDIAL_BLE_FORGET,.request=43,.peer=peer(addr)};
+    queued=2;scan_id=7;restart_error=BLE_HS_ENOMEM;
+    before=results;int published=inventories;scanned=scans;
+    process_commands(NULL);
+    assert(!queued && results==before+2 && inventories==published+2);
+    assert(last.kind==CORDIAL_BLE_FORGOTTEN && last.request==43 && last.code==CORDIAL_BLE_OK);
+    assert(radio_failures==7 && !scan_id && scans==scanned+3);
+    assert(cordial_bonds_export(&addr,out)==BLE_HS_ENOENT);
+    process_commands(NULL);assert(radio_failures==7 && scans==scanned+3);
 }
 ''')
 
@@ -481,7 +623,7 @@ int main(void) {
         source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
         functions = source[source.index("static int stop_scan("):
                            source.index("static ble_addr_t address(")]
-        begin=functions.index("// Call only after the target link")
+        begin=functions.index("static int unpair_view(")
         end=functions.index("static int start_scan(",begin)
         functions=functions[:begin]+functions[end:]
         bonds = source[source.index("static bool bonds("):source.index("static uint8_t security_error(")]

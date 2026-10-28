@@ -216,7 +216,7 @@ impl Native {
             match embassy_time::with_deadline(deadline, BOND_RESULT.wait()).await {
                 Ok((request, result)) if request == self.sequence => return result,
                 Ok(_) => {}
-                Err(_) => return Err(Error::StorageFailed),
+                Err(_) => return Err(Error::Timeout),
             }
         }
     }
@@ -483,7 +483,7 @@ impl Host for Native {
             match embassy_time::with_deadline(deadline, FORGOTTEN.wait()).await {
                 Ok((request, result)) if request == self.sequence => return result,
                 Ok(_) => {}
-                Err(_) => return Err(Error::StorageFailed),
+                Err(_) => return Err(Error::Timeout),
             }
         }
     }

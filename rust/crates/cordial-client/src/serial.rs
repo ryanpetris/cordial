@@ -63,7 +63,7 @@ fn unique_ports(mut found: Vec<PortInfo>) -> Vec<PortInfo> {
 }
 
 /// Opens a Dongle's port and starts a session on it. Returns the connection and its events.
-pub fn open(port: &str) -> io::Result<(Connection, Receiver<crate::Event>)> {
+pub fn open(port: &str) -> io::Result<(Connection, Receiver<crate::protocol::Event>)> {
     let (reader, writer) = open_stream(port)?;
     Ok(Connection::new(reader, writer))
 }

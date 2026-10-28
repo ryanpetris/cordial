@@ -16,4 +16,3 @@ void cordial_bonds_clear(void);
 int cordial_bonds_dirty(const ble_addr_t *);
 int cordial_bonds_mark_dirty(const ble_addr_t *);
 void cordial_bonds_clean(const ble_addr_t *);
-int cordial_bonds_prepare_unpair(const ble_addr_t *);

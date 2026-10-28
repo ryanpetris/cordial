@@ -98,13 +98,9 @@ fn simulated(value: Option<&str>) -> Option<usize> {
 
 /// Runs the app until it quits, or hands the launch over to the instance already running.
 pub fn run(options: Options) -> ExitCode {
-    let output = if options.json {
-        json::Output::start()
-    } else {
-        json::Output::completed()
-    };
+    let output = json::Output::start();
     *DIAGNOSTICS.lock().unwrap() = Some(output.diagnostics());
-    let observer = Some(output.observer());
+    let observer = options.json.then(|| output.observer());
     let app = adw::Application::builder()
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)

@@ -1250,7 +1250,7 @@ fn json_migration_prints_wire_records_without_handler_only_events() {
                             handler(Received::Event(event));
                             None
                         }
-                        Received::Closed(_) | Received::PairingComplete { .. } => None,
+                        Received::Closed(_) => None,
                     };
                     if let Some(kind) = kind {
                         observed.lock().unwrap().push(kind);
@@ -1718,26 +1718,25 @@ fn scripts_delete_enabled_interface_profiles_and_keep_the_reconnected_session() 
 }
 
 #[test]
-fn completed_operations_have_build_specific_cli_results_and_stderr() {
-    const CHILD: &str = "CORDIAL_COMPLETE_OUTCOME_CHILD";
-    if let Ok(operation) = std::env::var(CHILD) {
-        let dongle = Dongle::with(|sim| {
-            let error = p::Error {
+fn completed_operations_report_primary_and_related_errors_once() {
+    for operation in ["pair", "save"] {
+        let error = p::Error {
+            code: ErrorCode::StorageFailed as i32,
+            reason: p::ErrorReason::Radio as i32,
+            outcome: p::ErrorOutcome::Complete as i32,
+            related: vec![p::Error {
                 code: ErrorCode::StorageFailed as i32,
-                reason: p::ErrorReason::Radio as i32,
-                outcome: p::ErrorOutcome::Complete as i32,
-                related: vec![p::Error {
-                    code: ErrorCode::StorageFailed as i32,
-                    reason: p::ErrorReason::Storage as i32,
-                    outcome: p::ErrorOutcome::NoEffect as i32,
-                    related: Vec::new(),
-                }],
-            };
+                reason: p::ErrorReason::Storage as i32,
+                outcome: p::ErrorOutcome::NoEffect as i32,
+                related: Vec::new(),
+            }],
+        };
+        let dongle = Dongle::with(|sim| {
             if operation == "pair" {
                 sim.plan = Plan::EnterCode("012345".into());
-                sim.pairing_error = Some(error);
+                sim.pairing_error = Some(error.clone());
             } else {
-                sim.refuse.insert("set_device", error);
+                sim.refuse.insert("set_device", error.clone());
             }
         });
         let args: &[&str] = if operation == "pair" {
@@ -1745,10 +1744,14 @@ fn completed_operations_have_build_specific_cli_results_and_stderr() {
         } else {
             &["device", "set", "1", "trusted", "off"]
         };
-        let (result, out, diagnostics) = script(&dongle, args, false, b"999999\n");
-        assert!(cordial_client::diagnostics::flush());
-        print!("{out}");
-        eprint!("{diagnostics}");
+        let (result, _, _) = script(&dongle, args, false, b"999999\n");
+        let command = if operation == "pair" {
+            "pair start"
+        } else {
+            "device set"
+        };
+        let expected = cordial::ui::text::error_line(&Error::dongle(error, Some(command)));
+        assert_eq!(result.unwrap_err().message, expected);
         assert_eq!(
             dongle
                 .sent()
@@ -1762,48 +1765,5 @@ fn completed_operations_have_build_specific_cli_results_and_stderr() {
                 .count(),
             1
         );
-        if let Err(error) = result {
-            eprintln!("{}", error.message);
-            std::process::exit(1);
-        }
-        return;
-    }
-    for operation in ["pair", "save"] {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "completed_operations_have_build_specific_cli_results_and_stderr",
-                "--nocapture",
-            ])
-            .env(CHILD, operation)
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(if cfg!(debug_assertions) { 1 } else { 0 }),
-            "{stdout}\n{stderr}"
-        );
-        assert!(!stdout.contains("Completed adapter operation"));
-        assert!(!stderr.contains("012345"));
-        assert!(!stderr.contains("999999"));
-        if cfg!(debug_assertions) {
-            assert!(stderr.contains("storage_failed"), "{stderr}");
-        } else {
-            assert!(
-                stderr.contains("Completed adapter operation: Error"),
-                "{stderr}"
-            );
-            assert!(stderr.contains("related: [Error"), "{stderr}");
-            assert!(!stdout.contains("Bluetooth error"));
-            if operation == "pair" {
-                assert!(
-                    stdout.contains("Paired and saved New Keyboard."),
-                    "{stdout}"
-                );
-                assert!(!stdout.contains("#0"));
-            }
-        }
     }
 }

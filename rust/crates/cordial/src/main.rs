@@ -18,12 +18,6 @@ const USAGE_DESKTOP: &str = "\n       cordial [--port PORT] [--json] desktop [--
 const USAGE_DESKTOP: &str = "";
 const USAGE_OPTIONS: &str = "\n       cordial migrate --ipc\n\nNo command opens the interactive shell. Piped input is a command script.\n\n  --port PORT        USB CDC serial port\n  --json             Print each response and event as one line of protobuf JSON to stderr\n  --timeout SECONDS  Overall one-shot timeout; finite scan duration\n  --version          Print version\n  --help             Show usage";
 fn main() -> ExitCode {
-    let result = execute();
-    let _ = cordial_client::diagnostics::flush();
-    result
-}
-
-fn execute() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(success) = proxy::dispatch(&args) {
         return if success {
@@ -153,16 +147,16 @@ fn run(mut options: Options) -> Result<(), RunError> {
     let cancellation = Cancellation::default();
     let signal = cancellation.clone();
     ctrlc::set_handler(move || signal.cancel()).map_err(|e| e.to_string())?;
-    let output = if options.json {
-        cordial::json::Output::start()
-    } else {
-        cordial::json::Output::completed()
-    };
+    let output = cordial::json::Output::start();
     let connector: std::sync::Arc<cordial::controller::Connector> =
         std::sync::Arc::new(|port, handler| {
             cordial_client::serial::open_with_handler(port, handler)
         });
-    let connector = cordial::json::observe(connector, output.observer());
+    let connector = if options.json {
+        cordial::json::observe(connector, output.observer())
+    } else {
+        connector
+    };
     // The shared writer logs raw records while the foreground runner prints human output.
     options.json = false;
     let mut diagnostics = output.diagnostics();

@@ -29,45 +29,27 @@ All three keep their view of the Dongle the same way:
 - Failed changes: only after an error, including a storage failure whose outcome is unknown, may a
   client query again to learn the current state, and only when it needs that state.
 
-The Rust client applies the host build's error policy before delivering responses or events to
-response observers, state updates or command callers. With debug assertions enabled, it preserves full
-`Error` messages, including reason, outcome and related errors recursively. Without debug
-assertions, `ERROR_OUTCOME_COMPLETE` confirms success in the containing operation's scope. The
-client queues the original error tree for standard error and removes it from the delivered result.
-Completed-operation text diagnostics contain only error enums, never request contents, passkeys
-or bond data. A separate diagnostic sink receives original wire responses and events before
-normalization. It does not supply state updates or command results. The adapter's firmware build
-does not select this policy.
+The Rust client preserves full `Error` messages in responses and events, including reason,
+outcome and related errors recursively. Response observers, state updates and command callers
+receive the original protocol messages in both debug and release builds. A diagnostic sink
+installed with `Connection::set_diagnostics` before the handshake also receives wire responses
+and events on the serial reader thread. The sink must return without waiting for output.
 
-Diagnostic delivery never waits for standard error on the serial reader. The default library sink
-uses one worker and a 256-entry queue, dropping excess diagnostics when the queue is full. Library
-callers use `cordial_client::diagnostics::flush()` before process exit to drain accepted diagnostics
-with a two-second deadline, or install a nonblocking sink with `Connection::set_diagnostics` before
-the handshake. Closing a connection does not wait for diagnostic output.
+The application queues JSON protocol records and foreground diagnostics for standard error.
+Delivery uses a 256-entry queue and drops excess entries when the queue is full. Terminal
+interfaces defer terminal-bound output until they restore terminal ownership. Shutdown drains
+accepted output with a two-second deadline. Closing a connection does not wait for output.
 
 A completed save confirms saved preferences, not a Bluetooth connection or application of a
-setting. Device records determine connection and inactive state. Completed integration and output
-errors are cleared without assigning Active or inventing an output slot. A completed `SettingStatus`
-instead confirms application and becomes `APPLIED`, without inventing an actual reading. A
-completed pairing becomes a host-only success when its event omits the saved device ID. The
-interface shows Paired immediately, without selecting a device; ordinary device events supply
-records as they arrive. The CLI succeeds without printing an invented device ID. A completed
-scan clears its error and keeps the reported candidate count.
-
-A completed error cannot supply omitted read data, a created profile ID or a missing record in
-a listing. Such responses fail with the client's unexpected-response error; clients never
-construct empty status or device records to make them succeed. Current firmware does not emit
-completed errors for these shapes.
-
-The primary outcome describes the requested operation. Related failures retain their own
-scope, such as cleanup after pairing, and cannot invalidate a confirmed bond save. Production
-logs that complete tree without turning the successful pairing into a failed command. Independent
-noncomplete errors in the same record remain visible. A completed related error is removed from
-a noncomplete primary error; the primary failure remains. Unknown, partial, no-effect, missing
-and unrecognized outcomes retain their handling and never authorize an automatic retry.
+setting. Clients retain the saved values while displaying the error. Device and setting records
+determine connection and application state. The primary outcome describes the requested
+operation. Related failures retain their own scope, such as cleanup after pairing, and cannot
+invalidate a confirmed bond save. Read errors and record errors retain their original details;
+clients never construct missing records or identifiers. Unknown, partial, no-effect, missing
+and unrecognized outcomes never authorize an automatic retry.
 
 Human-readable error feedback leads with the known outcome in the operation's scope: a saved
-change, an applied change, pairing, a read, or pairing cleanup. In debug builds a confirmed save
+change, an applied change, pairing, a read, or pairing cleanup. A confirmed save
 with a Bluetooth error reports both without claiming the device connected or applied the change.
 Unknown and partial saves ask the user to check the current settings before trying again.
 Specific causes and related failures remain in that feedback. See
@@ -287,9 +269,7 @@ silently between duplicate names. Setting paths name typed fields, such as `keyb
 - Output is human-readable and rendered safely for the terminal. `--json` also logs every original
   wire response and event to standard error as one line of protobuf JSON with the schema's field
   names. It includes background reads, migration traffic and complete file contents. The stream
-  retains original error trees, including completed pairing errors and responses rejected because
-  they omit required data. Completed errors produce no additional text diagnostic in this mode.
-  Host-only completion notifications and events injected by handlers are not protocol records.
+  retains original error trees. Events injected by handlers are not protocol records.
   Commands, piped scripts, the interactive shell, the TUI and the desktop app support it. Human command results
   stay on standard output, and diagnostics keep their usual destination. Use
   `cordial --json tui 2>cordial.jsonl` or `cordial tui --json 2>cordial.jsonl` to keep the terminal
@@ -557,8 +537,7 @@ Protocol compatibility and storage migration run in-process.
   commits the focused numeric field and waits for pending writes in a separate Cordial window
   labelled "Settings are being applied." If a write fails or its outcome is unknown, Continue
   Editing returns to the main window and Quit Anyway exits.
-  An error that confirms the save completed does not block Quit or repeat the write. Production
-  treats it as success and logs its detail to standard error. In debug builds its feedback
+  An error that confirms the save completed does not block Quit or repeat the write. Its feedback
   stays beside the action. For an enable or unblock save, a matching healthy connected-device
   readback received after the save response clears radio feedback. Other completed-save notes
   clear on navigation. A newer failed change keeps its failure feedback.

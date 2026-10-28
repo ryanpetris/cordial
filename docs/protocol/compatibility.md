@@ -89,8 +89,7 @@ understood are Required.
   `OUTPUT_STATE_UNKNOWN` reports an unknown state.
 - `Error` carries code, reason, outcome and related errors in every failure scope. Conversions
   preserve the complete error recursively, including unknown numeric details when retained by the
-  decoder. The production host client then normalizes `COMPLETE` according to the
-  [client policy](clients.md). A code alone never establishes an outcome. Missing outcome evidence
+  decoder. A code alone never establishes an outcome. Missing outcome evidence
   uses `UNSPECIFIED`, even when the code commonly describes a refusal; `NO_EFFECT` requires evidence of no effects or
   results in the documented scope. See [Errors](limits-and-errors.md#errors) for outcome meanings
   and complete-error ordering and deduplication.

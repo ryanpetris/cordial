@@ -53,8 +53,6 @@ pub struct State {
     pub last_scan: Option<p::ScanDone>,
     /// The latest pairing event.
     pub pairing: Option<p::Pairing>,
-    /// A confirmed bond save whose event omitted the saved device ID.
-    pub paired_candidate: Option<u32>,
     /// Each device's settings objects in listing order, once listed.
     pub settings: BTreeMap<u32, Vec<p::SettingsObject>>,
     /// Profiles by ID, from listings, results and events. Before a listing it holds only the
@@ -300,7 +298,6 @@ impl State {
                 self.last_scan = Some(done.clone());
             }
             event::Kind::Pairing(pairing) => {
-                self.paired_candidate = None;
                 self.pairing = Some(pairing.clone());
             }
             event::Kind::Profile(profile) => {
@@ -332,7 +329,6 @@ impl State {
             ),
             Some(Command::StartPairing(_)) if accepted => {
                 self.pairing = None;
-                self.paired_candidate = None;
             }
             Some(Command::DeleteProfile(d)) if accepted => {
                 self.profiles.remove(&d.profile);

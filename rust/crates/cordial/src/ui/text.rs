@@ -1536,9 +1536,6 @@ pub fn outcome(command: &Command, outcome: &Outcome, state: Option<&State>) -> S
                 "Discovery is already off.".into()
             }
         }
-        Outcome::PairedWithoutDevice { name } => {
-            format!("Paired and saved {}.", self::name(Some(name)))
-        }
         Outcome::Paired { subject, device } => {
             match device
                 .as_ref()

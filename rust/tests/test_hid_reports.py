@@ -7,7 +7,8 @@ from test_native_ble import ROOT, run_c
 class HidReportTests(unittest.TestCase):
     def test_ble_att_errors_keep_capacity_and_capability_distinct(self):
         source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
-        helper = source[source.index("static uint8_t operation_error("):source.index("static void complete(")]
+        start = source.index("static uint8_t operation_error(")
+        helper = source[start:source.index("\n}", start) + 2]
         run_c(r'''
 #include <assert.h>
 #include "ble.h"
@@ -90,7 +91,8 @@ int main(void) {
 
     def test_uuid_reads_deliver_the_first_value_and_separate_peer_errors(self):
         source = (ROOT / "platforms/esp32s3/components/platform/nimble.c").read_text()
-        errors = source[source.index("static uint8_t operation_error("):source.index("static void complete(")]
+        start = source.index("static uint8_t operation_error(")
+        errors = source[start:source.index("\n}", start) + 2]
         helper = source[source.index("static void complete_uuid("):source.index("static int write_callback(")]
         run_c(r'''
 #include <assert.h>

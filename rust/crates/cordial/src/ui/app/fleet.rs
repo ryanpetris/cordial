@@ -349,9 +349,10 @@ mod tests {
         let output = Arc::new(Mutex::new(Vec::new()));
         let observed = output.clone();
         let live = live.observe(Arc::new(move |diagnostic| {
-            if let Some(kind) = diagnostic_kind(diagnostic) {
-                observed.lock().unwrap().push(crate::runner::json(kind));
-            }
+            observed
+                .lock()
+                .unwrap()
+                .push(crate::runner::json(diagnostic_kind(diagnostic)));
         }));
         live.migrate("ADAPTER01", "simulated");
         loop {
@@ -415,9 +416,10 @@ mod tests {
         let live = Live::new(Arc::new(|_| {}), None)
             .with_backend(Arc::new(connector), || Ok(Vec::new()), migration::live())
             .observe(Arc::new(move |diagnostic| {
-                if let Some(kind) = diagnostic_kind(diagnostic) {
-                    observed.lock().unwrap().push((true, kind));
-                }
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((true, diagnostic_kind(diagnostic)));
             }));
         let handled = seen.clone();
         let (event_seen, event_ready) = mpsc::channel();
@@ -466,14 +468,11 @@ mod tests {
         );
     }
 
-    fn diagnostic_kind(
-        diagnostic: cordial_client::diagnostics::Diagnostic<'_>,
-    ) -> Option<message::Kind> {
+    fn diagnostic_kind(diagnostic: cordial_client::diagnostics::Diagnostic<'_>) -> message::Kind {
         use cordial_client::diagnostics::Diagnostic;
         match diagnostic {
-            Diagnostic::Response(_, response) => Some(message::Kind::Response(response.clone())),
-            Diagnostic::Event(event) => Some(message::Kind::Event(event.clone())),
-            Diagnostic::Completed(_) => None,
+            Diagnostic::Response(_, response) => message::Kind::Response(response.clone()),
+            Diagnostic::Event(event) => message::Kind::Event(event.clone()),
         }
     }
 
@@ -481,7 +480,7 @@ mod tests {
         match received {
             Received::Response(_, response) => Some(message::Kind::Response(response.clone())),
             Received::Event(event) => Some(message::Kind::Event(event)),
-            Received::Closed(_) | Received::PairingComplete { .. } => None,
+            Received::Closed(_) => None,
         }
     }
 }

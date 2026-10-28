@@ -154,25 +154,21 @@ fn completed_device_save_keeps_radio_feedback_without_blocking_quit_or_retrying(
         let note = h.app.note(&spot).map(str::to_owned);
         assert_eq!(
             note.as_deref(),
-            if outcome == p::ErrorOutcome::Complete && !cfg!(debug_assertions) {
-                None
-            } else {
-                Some(match outcome {
-                    p::ErrorOutcome::Complete => {
-                        "The change was saved, but the adapter reported a Bluetooth error."
-                    }
-                    p::ErrorOutcome::Unknown => {
-                        "The adapter couldn't confirm whether the change was saved. Check the current settings before trying again. The adapter reported a Bluetooth error."
-                    }
-                    p::ErrorOutcome::Partial => {
-                        "The adapter confirmed only part of the change. Check the current settings before trying again. The adapter reported a Bluetooth error."
-                    }
-                    p::ErrorOutcome::NoEffect => {
-                        "The adapter couldn't save the change. The adapter reported a Bluetooth error."
-                    }
-                    _ => "The adapter reported a Bluetooth error.",
-                })
-            }
+            Some(match outcome {
+                p::ErrorOutcome::Complete => {
+                    "The change was saved, but the adapter reported a Bluetooth error."
+                }
+                p::ErrorOutcome::Unknown => {
+                    "The adapter couldn't confirm whether the change was saved. Check the current settings before trying again. The adapter reported a Bluetooth error."
+                }
+                p::ErrorOutcome::Partial => {
+                    "The adapter confirmed only part of the change. Check the current settings before trying again. The adapter reported a Bluetooth error."
+                }
+                p::ErrorOutcome::NoEffect => {
+                    "The adapter couldn't save the change. The adapter reported a Bluetooth error."
+                }
+                _ => "The adapter reported a Bluetooth error.",
+            })
         );
         let complete = outcome == p::ErrorOutcome::Complete;
         assert_eq!(h.app.write_error().is_none(), complete, "{outcome:?}");
@@ -284,11 +280,10 @@ fn completed_settings_and_adapter_saves_preserve_an_unrelated_quit_failure() {
     assert!(!h.app.submitting(d));
     assert_eq!(h.shown_dpi(), Some(Value::Integer(1200)));
     assert_eq!(h.app.write_error(), Some(failure.as_str()));
-    assert_eq!(
+    assert!(
         h.app
             .note(&Spot::SettingsNote(h.adapter.clone(), 1))
-            .is_some(),
-        cfg!(debug_assertions)
+            .is_some()
     );
 
     h.app.show(Page::Adapter(h.adapter.clone()));
@@ -310,20 +305,14 @@ fn completed_settings_and_adapter_saves_preserve_an_unrelated_quit_failure() {
     assert!(h.app.adapter_changes(a).is_empty());
     assert_eq!(a.status.as_ref().unwrap().platform(), p::Platform::Windows);
     assert_eq!(h.app.write_error(), Some(failure.as_str()));
-    assert_eq!(
-        h.app.note(&Spot::AdapterSave(h.adapter.clone())).is_some(),
-        cfg!(debug_assertions)
-    );
+    assert!(h.app.note(&Spot::AdapterSave(h.adapter.clone())).is_some());
     h.app.apply_pending();
     assert!(!h.app.writes_pending());
     assert_eq!(h.settings_writes().len(), 1);
     assert_eq!(h.adapter_writes().len(), 1);
     h.app.acknowledge_write_error();
     assert!(h.app.write_error().is_none());
-    assert_eq!(
-        h.app.note(&Spot::AdapterSave(h.adapter.clone())).is_some(),
-        cfg!(debug_assertions)
-    );
+    assert!(h.app.note(&Spot::AdapterSave(h.adapter.clone())).is_some());
     h.app.show(Page::Device(h.adapter.clone(), 1));
     assert!(h.app.note(&Spot::AdapterSave(h.adapter.clone())).is_none());
     h.close();
@@ -364,7 +353,7 @@ fn complete_save_preserves_a_newer_edit_and_trust_feedback_clears_on_navigation(
         assert!(h.app.device_changes(d).is_empty());
         let mut readback = d.d.clone();
         let spot = Spot::DetailsSave(h.adapter.clone(), 1);
-        assert_eq!(h.app.note(&spot).is_some(), cfg!(debug_assertions));
+        assert!(h.app.note(&spot).is_some());
         readback.state = p::DeviceState::Connected as i32;
         readback.inactive = None;
         readback.errors.clear();
@@ -375,7 +364,7 @@ fn complete_save_preserves_a_newer_edit_and_trust_feedback_clears_on_navigation(
                 .iter()
                 .any(|d| d.name == "Fresh Connected Record")
         });
-        assert_eq!(h.app.note(&spot).is_some(), cfg!(debug_assertions));
+        assert!(h.app.note(&spot).is_some());
         h.app.show(Page::Adapter(h.adapter.clone()));
         assert!(h.app.note(&spot).is_none());
         assert!(h.app.write_error().is_none());
@@ -412,8 +401,7 @@ fn fresh_connection_readback_resolves_a_completed_radio_failure() {
     let spot = Spot::DetailsSave(h.adapter.clone(), 1);
     assert_eq!(
         h.app.note(&spot),
-        cfg!(debug_assertions)
-            .then_some("The change was saved, but the adapter reported a Bluetooth error.")
+        Some("The change was saved, but the adapter reported a Bluetooth error.")
     );
     assert!(h.app.write_error().is_none());
     {
@@ -1425,7 +1413,7 @@ fn radio_recovery_requires_a_device_record_after_the_save_response() {
             let spot = Spot::DetailsSave(h.adapter.clone(), 1);
             assert_eq!(
                 h.app.note(&spot).is_none(),
-                !cfg!(debug_assertions) || !readback_before_response && readback_before_done
+                !readback_before_response && readback_before_done
             );
             assert!(h.app.write_error().is_none());
             assert!(!h.app.writes_pending());
@@ -1516,10 +1504,7 @@ fn completed_device_save_never_hides_a_newer_edit_rejected_by_session_loss() {
             assert_eq!(h.app.write_error(), Some(failure.as_str()));
             assert_eq!(h.app.note(&spot), Some(failure.as_str()));
             h.app.acknowledge_write_error();
-            assert_eq!(
-                h.app.note(&spot).is_none(),
-                !cfg!(debug_assertions) || same_field
-            );
+            assert_eq!(h.app.note(&spot).is_none(), same_field);
             h.close();
         }
     }
@@ -1564,10 +1549,7 @@ fn late_completed_save_uses_replacement_session_recovery() {
         h.until(|a| a.devices().iter().any(|d| d.d.id == 1 && d.available));
         h.app.update(done);
         let spot = Spot::DetailsSave(h.adapter.clone(), 1);
-        assert_eq!(
-            h.app.note(&spot).is_none(),
-            !cfg!(debug_assertions) || recovered
-        );
+        assert_eq!(h.app.note(&spot).is_none(), recovered);
         assert!(h.app.write_error().is_none());
         assert!(!h.app.writes_pending());
         assert_eq!(
@@ -1618,7 +1600,7 @@ fn completed_radio_feedback_for_other_preferences_clears_only_on_navigation() {
             _ => Spot::LayersSave(h.adapter.clone(), device),
         };
         let note = h.app.note(&spot).map(str::to_owned);
-        assert_eq!(note.is_some(), cfg!(debug_assertions));
+        assert!(note.is_some());
         let mut reported = h.app.device(&h.adapter, device).unwrap().d.clone();
         reported.state = p::DeviceState::Connected as i32;
         reported.inactive = None;
@@ -1668,7 +1650,7 @@ fn newer_completed_save_note_precedes_an_unrecovered_radio_warning() {
     h.until(|a| !a.writes_pending());
     let spot = Spot::DetailsSave(h.adapter.clone(), 1);
     let radio = h.app.note(&spot).map(str::to_owned);
-    assert_eq!(radio.is_some(), cfg!(debug_assertions));
+    assert!(radio.is_some());
     adapter
         .0
         .lock()
@@ -1687,19 +1669,10 @@ fn newer_completed_save_note_precedes_an_unrecovered_radio_warning() {
     let Event::Done { result, .. } = &**event else {
         panic!("expected completion")
     };
-    let expected = if cfg!(debug_assertions) {
-        Some(cordial::ui::app::words::failure(
-            result.as_ref().unwrap_err(),
-        ))
-    } else {
-        assert!(result.is_ok());
-        None
-    };
+    let expected = cordial::ui::app::words::failure(result.as_ref().unwrap_err());
     h.app.update(done);
-    assert_eq!(h.app.note(&spot), expected.as_deref());
-    if cfg!(debug_assertions) {
-        assert_ne!(expected, radio);
-    }
+    assert_eq!(h.app.note(&spot), Some(expected.as_str()));
+    assert_ne!(Some(expected), radio);
     assert!(h.app.write_error().is_none());
     h.app.show(Page::Adapter(h.adapter.clone()));
     h.app.show(Page::Device(h.adapter.clone(), 1));
@@ -1738,7 +1711,7 @@ fn completed_connection_feedback_with_other_failures_is_ephemeral() {
         h.until(|a| !a.writes_pending());
         let spot = Spot::DetailsSave(h.adapter.clone(), 1);
         let note = h.app.note(&spot).map(str::to_owned);
-        assert_eq!(note.is_some(), cfg!(debug_assertions));
+        assert!(note.is_some());
         device.blocked = false;
         device.state = p::DeviceState::Connected as i32;
         device.inactive = None;
@@ -1758,9 +1731,5 @@ fn completed_connection_feedback_with_other_failures_is_ephemeral() {
 }
 
 fn completed_result(result: &Result<cordial::controller::Outcome, cordial::error::Error>) -> bool {
-    if cfg!(debug_assertions) {
-        result.as_ref().is_err_and(|error| error.complete())
-    } else {
-        matches!(result, Ok(cordial::controller::Outcome::Device { .. }))
-    }
+    result.as_ref().is_err_and(|error| error.complete())
 }

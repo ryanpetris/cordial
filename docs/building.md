@@ -427,8 +427,8 @@ reuse, cache boundaries and clean exports for native host and firmware builds.
 
 Linux CLI terminal checks use a simulated adapter over a PTY. They verify terminal restoration,
 interactive shell and TUI operation with JSON on redirected stderr, and complete file responses
-alongside ordinary CLI output. Completed-operation cases check debug and production outcomes,
-original wire errors in JSON, deferred terminal diagnostics, and shutdown with unread stderr.
+alongside ordinary CLI output. They check original wire errors in JSON, deferred terminal
+diagnostics, and shutdown with unread stderr.
 They require `pyte`, Python `protobuf`, `protoc`, a C compiler
 and a built CLI:
 

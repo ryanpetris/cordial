@@ -115,48 +115,6 @@ class Terminal(unittest.TestCase):
                           outcome=adapter.p.ERROR_OUTCOME_NO_EFFECT)
         return status
 
-    def test_completed_diagnostics_wait_until_tui_and_shell_release_the_terminal(self):
-        for tui in (False, True):
-            with self.subTest(tui=tui):
-                adapter = self.adapter()
-                adapter.status.CopyFrom(self.completed_status(adapter))
-                probe = subprocess.run([BINARY, "--port", adapter.port, "adapter", "status"],
-                                       env=adapter.env, capture_output=True, timeout=5)
-                self.assertEqual(probe.returncode, 0, probe.stderr)
-                logged = b"Completed adapter operation" in probe.stderr
-                self.start(tui, adapter=adapter)
-                self.wait_text("Terminal Adapter" if tui else "Connected to")
-                self.assertNotIn(b"Completed adapter operation", self.transcript)
-                os.write(self.master, b"\x03")
-                self.exited(0)
-                self.assertEqual(b"Completed adapter operation" in self.transcript, logged)
-                if logged:
-                    self.assertIn(b"related: [Error", self.transcript)
-                    if tui:
-                        self.assertLess(self.transcript.index(b"\x1b[?1049l"),
-                                        self.transcript.index(b"Completed adapter operation"))
-                self.doCleanups()
-
-    def test_completed_cli_diagnostics_have_bounded_shutdown_with_a_full_pipe(self):
-        adapter = self.adapter()
-        adapter.status.CopyFrom(self.completed_status(adapter))
-        args = [BINARY, "--port", adapter.port, "adapter", "status"]
-        probe = subprocess.run(args, env=adapter.env, capture_output=True, timeout=5)
-        self.assertEqual(probe.returncode, 0, probe.stderr)
-        for _ in range(4096):
-            adapter.status.errors[0].related.add(code=adapter.p.ERROR_CODE_UNSUPPORTED,
-                                                outcome=adapter.p.ERROR_OUTCOME_NO_EFFECT)
-        process = subprocess.Popen(args, env=adapter.env, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.PIPE)
-        try:
-            # The child must finish without a reader draining its stderr pipe.
-            self.assertEqual(process.wait(timeout=5), 0)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=3)
-            process.stderr.close()
-
     def test_json_cli_succeeds_when_stderr_is_a_broken_pipe(self):
         adapter = self.adapter()
         reader, writer = os.pipe()
@@ -183,7 +141,6 @@ class Terminal(unittest.TestCase):
         errors = status["errors"]
         self.assertEqual(errors[0]["outcome"], "ERROR_OUTCOME_COMPLETE")
         self.assertEqual(errors[0]["related"][0]["code"], "ERROR_CODE_UNSUPPORTED")
-        self.assertNotIn(b"Completed adapter operation", result.stdout)
 
     def test_json_help_and_internal_migration_arguments(self):
         help = subprocess.run([BINARY, "--json", "--help"], capture_output=True, timeout=3)

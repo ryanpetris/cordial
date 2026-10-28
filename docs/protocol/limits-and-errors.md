@@ -101,8 +101,7 @@ scope, such as bond saving for pairing or applying a setting to the device.
 | `COMPLETE` | The intended effects or results are confirmed despite a failure elsewhere in the operation, such as later cleanup. |
 
 Missing details never imply success, unchanged data or permission to retry. An error code alone
-proves no outcome. Error conversions preserve the complete error recursively. The production
-host client then normalizes `COMPLETE` according to the [client policy](clients.md).
+proves no outcome. Error conversions and clients preserve the complete error recursively.
 Conversions use `UNSPECIFIED` when they have no outcome evidence. They use `NO_EFFECT`
 only when evidence confirms that no effects or results occurred in the documented scope.
 

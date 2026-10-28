@@ -1,5 +1,5 @@
 use crate::{
-    Error, Event, Result,
+    Error, Result,
     compatibility::{Compatibility, NativeHello, is_ordinary_message},
 };
 use cordial_protocol::{
@@ -45,10 +45,6 @@ pub const MAX_RECEIVED_FRAME_BYTES: usize = 32 * 1024 * 1024;
 )]
 pub enum Received<'a> {
     Event(p::Event),
-    /// The bond was saved, but the adapter did not supply its device ID.
-    PairingComplete {
-        candidate: u32,
-    },
     /// A response and the request it answers, passed to the handler before that request
     /// returns it.
     Response(&'a p::Request, &'a p::Response),
@@ -132,19 +128,16 @@ pub struct Connection {
 impl Connection {
     /// Starts a connection and returns it with a channel of the Dongle's events. The channel
     /// disconnects when the connection closes.
-    pub fn new<R, W>(reader: R, writer: W) -> (Self, Receiver<Event>)
+    pub fn new<R, W>(reader: R, writer: W) -> (Self, Receiver<p::Event>)
     where
         R: Read + Send + 'static,
         W: Write + Send + 'static,
     {
         let (tx, rx) = mpsc::channel();
         let connection = Self::with_handler(reader, writer, move |received| {
-            let event = match received {
-                Received::Event(event) => Event::Protocol(event),
-                Received::PairingComplete { candidate } => Event::PairingComplete { candidate },
-                _ => return,
-            };
-            let _ = tx.send(event);
+            if let Received::Event(event) = received {
+                let _ = tx.send(event);
+            }
         });
         (connection, rx)
     }
@@ -202,9 +195,8 @@ impl Connection {
         }
     }
 
-    /// Replaces stderr diagnostics with a sink for original wire messages and completed errors.
+    /// Observes original wire responses and events.
     /// Set this before the handshake. The sink runs on the reader thread and must not block.
-    /// It does not change the normalized messages delivered to handlers and request observers.
     pub fn set_diagnostics(&self, sink: crate::diagnostics::Sink) {
         *self.shared.diagnostics.lock().unwrap() = Some(sink);
     }
@@ -908,23 +900,14 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
                 break;
             };
             let diagnostics = shared.diagnostics.lock().unwrap().clone();
-            let log = |error: &p::Error| match &diagnostics {
-                Some(sink) => sink(crate::diagnostics::Diagnostic::Completed(error)),
-                None => crate::diagnostics::completed(error),
-            };
             match message.kind {
                 Some(message::Kind::Event(event)) => {
                     if let Some(sink) = &diagnostics {
                         sink(crate::diagnostics::Diagnostic::Event(&event));
                     }
-                    match crate::outcomes::event(event, &log) {
-                        Event::Protocol(event) => handler(Received::Event(event)),
-                        Event::PairingComplete { candidate } => {
-                            handler(Received::PairingComplete { candidate })
-                        }
-                    }
+                    handler(Received::Event(event));
                 }
-                Some(message::Kind::Response(mut response)) => {
+                Some(message::Kind::Response(response)) => {
                     let waiting = {
                         let mut state = shared.state.lock().unwrap();
                         let waiting = state.pending.pop_front();
@@ -942,10 +925,6 @@ fn read_loop<R: Read>(shared: &Shared, mut reader: R, mut handler: impl FnMut(Re
                         sink(crate::diagnostics::Diagnostic::Response(
                             &request, &response,
                         ));
-                    }
-                    if let Err(error) = crate::outcomes::response(&request, &mut response, &log) {
-                        let _ = reply.try_send(Err(error));
-                        continue;
                     }
                     handler(Received::Response(&request, &response));
                     if let Some(observe) = observe {

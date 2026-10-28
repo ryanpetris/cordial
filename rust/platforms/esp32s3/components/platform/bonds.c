@@ -207,22 +207,3 @@ int cordial_bonds_same_privacy(const uint8_t *r, unsigned size) {
   return (records[i][81] & 2) == (r[81] & 2) &&
          (!(r[81] & 2) || !memcmp(records[i] + 109, r + 109, 16));
 }
-
-// ble_gap_unpair only removes a controller entry when a peer IRK is present
-// in its host view. Supply that flag even if repeat-pair deleted the old keys
-// and the replacement distributed no IRK. This transient record is never
-// exported.
-int cordial_bonds_prepare_unpair(const ble_addr_t *addr) {
-  if (!cordial_bonds_dirty(addr))
-    return 0;
-  int i = find(addr);
-  if (i < 0)
-    i = free_record();
-  if (i < 0)
-    return BLE_HS_ENOMEM;
-  records[i][8] = 2;
-  records[i][9] = addr->type;
-  reverse(records[i] + 10, addr->val, 6);
-  records[i][81] |= 2;
-  return 0;
-}

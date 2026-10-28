@@ -19,6 +19,8 @@
 #include <string.h>
 
 void ble_store_config_init(void);
+// The pinned NimBLE privacy helper returns the controller's removal status.
+int ble_hs_pvcy_remove_entry(uint8_t addr_type,const uint8_t *addr);
 _Static_assert(MYNEWT_VAL(BLE_GATTS),"HID peers require ATT server replies");
 
 _Static_assert(!MYNEWT_VAL(BLE_STATIC_TO_DYNAMIC),"custom IRK requires static NimBLE privacy state");
@@ -86,11 +88,19 @@ static int stop_scan(void) {
     }
     return 0;
 }
-// Call only after the target link is gone; the public API also terminates links.
+// Remove controller privacy before deleting host keys, with no live target link.
 static int unpair_view(const ble_addr_t *p) {
-    int status=cordial_bonds_prepare_unpair(p);
-    if(!status)status=ble_gap_unpair(p);
-    if(status==BLE_HS_ENOENT)status=0;
+    struct ble_gap_conn_desc live;
+    if(!ble_gap_conn_find_by_addr(p,&live))return BLE_HS_EBUSY;
+    union ble_store_key key={0};union ble_store_value value;key.sec.peer_addr=*p;
+    int status=cordial_bonds_read(BLE_STORE_OBJ_TYPE_PEER_SEC,&key,&value);
+    if(status && status!=BLE_HS_ENOENT)return status;
+    if(cordial_bonds_dirty(p) || (!status && value.sec.irk_present)) {
+        // Keep the host keys when the controller cannot remove their privacy entry.
+        status=ble_hs_pvcy_remove_entry(p->type,p->val);
+        if(status && status!=BLE_HS_HCI_ERR(BLE_ERR_UNK_CONN_ID))return status;
+    }
+    status=ble_store_util_delete_peer(p);
     if(!status)cordial_bonds_clean(p);
     return status;
 }
@@ -145,6 +155,20 @@ static uint8_t operation_error(int status) {
     if (status == BLE_HS_ETIMEOUT) return CORDIAL_BLE_TIMEOUT;
     return CORDIAL_BLE_CONNECTION;
 }
+static uint8_t bond_error(int status) {
+    if(!status)return CORDIAL_BLE_OK;
+    if(status==BLE_HS_ENOMEM || status==BLE_HS_HCI_ERR(BLE_ERR_MEM_CAPACITY))return CORDIAL_BLE_CAPACITY;
+    if(status==BLE_HS_EBUSY || status==BLE_HS_EALREADY || status==BLE_HS_EPREEMPTED ||
+       status==BLE_HS_HCI_ERR(BLE_ERR_CMD_DISALLOWED))return CORDIAL_BLE_BUSY;
+    if(status==BLE_HS_ETIMEOUT || status==BLE_HS_ETIMEOUT_HCI ||
+       status==BLE_HS_HCI_ERR(BLE_ERR_CONN_SPVN_TMO))return CORDIAL_BLE_TIMEOUT;
+    if(status==BLE_HS_ESTORE_FAIL || status==BLE_HS_EBADDATA || status==BLE_HS_ENOENT)return CORDIAL_BLE_STORAGE;
+    return CORDIAL_BLE_RADIO;
+}
+static void bond_complete(const cordial_ble_command *c,int status) {
+    cordial_ble_event e={.kind=c->kind==CORDIAL_BLE_FORGET ? CORDIAL_BLE_FORGOTTEN:CORDIAL_BLE_BOND_RESULT,
+        .request=c->request,.code=bond_error(status)};emit(&e);
+}
 static void complete(uint32_t request,int status) {
     cordial_ble_event e={.kind=CORDIAL_BLE_COMPLETE,.request=request,.code=operation_error(status)}; emit(&e);
 }
@@ -153,7 +177,7 @@ static bool bonds(const ble_addr_t *absent) {
     if (cordial_bonds_peers(addresses,&count,MYNEWT_VAL(BLE_STORE_MAX_BONDS)) || count<0 || count>MYNEWT_VAL(BLE_STORE_MAX_BONDS)) return false;
     cordial_ble_peer peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
     for (int i=0;i<count;i++) {
-        // ble_gap_unpair may log a native deletion failure yet return success.
+        // Confirm the forgotten peer is absent before publishing the inventory.
         if(absent && addresses[i].type==absent->type && !memcmp(addresses[i].val,absent->val,6)) return false;
         peers[i]=peer(addresses[i]);
     }
@@ -179,8 +203,15 @@ static void fail(link *l,uint8_t code) {
     if (l->connection!=BLE_HS_CONN_HANDLE_NONE) { l->error=code;l->closing=true; return; }
     emit(&e); memset(l,0,sizeof(*l));
 }
-// GAP cancellation is asynchronous. Explicit requests wait here until the
-// auto initiator has delivered its completion callback.
+// GAP cancellation is asynchronous; auto_cancel tracks the pending completion.
+static int cancel_auto(void) {
+    if(auto_cancel)return 0;
+    int status=ble_gap_conn_cancel();
+    // The controller can finish initiation before NimBLE delivers CONNECT.
+    if(status && status!=BLE_HS_EALREADY && status!=BLE_HS_HCI_ERR(BLE_ERR_CMD_DISALLOWED))return status;
+    auto_cancel=true;
+    return 0;
+}
 static void resume_radio(void) {
     if(!is_synced)return;
     link *pending=NULL;
@@ -191,12 +222,7 @@ static void resume_radio(void) {
     }
     if(auto_active) {
         if(!auto_cancel && (pending || scan_id || auto_dirty || !reconnect_count || auto_consumed)) {
-            int status=ble_gap_conn_cancel();
-            // ACL completion retires the initiator before NimBLE publishes
-            // CONNECT after remote-version exchange. EALREADY still waits for
-            // that callback, just like controller-side Command Disallowed.
-            if(status && status!=BLE_HS_EALREADY && status!=BLE_HS_HCI_ERR(BLE_ERR_CMD_DISALLOWED))goto failed;
-            auto_cancel=true;
+            if(cancel_auto())goto failed;
         }
         return;
     }
@@ -440,6 +466,8 @@ static void command(const cordial_ble_command *c) {
     if(!is_synced && c->kind!=CORDIAL_BLE_FORGET) {
         if(c->kind==CORDIAL_BLE_CONNECT) {
             cordial_ble_event e={.kind=CORDIAL_BLE_DISCONNECTED,.token=c->token,.code=CORDIAL_BLE_RADIO};emit(&e);
+        } else if(c->kind==CORDIAL_BLE_IMPORT || c->kind==CORDIAL_BLE_EXPORT) {
+            bond_complete(c,BLE_HS_ENOTSYNCED);
         } else if(c->request) complete(c->request,BLE_HS_ENOTSYNCED);
         return;
     }
@@ -483,8 +511,9 @@ static void command(const cordial_ble_command *c) {
     if(c->kind==CORDIAL_BLE_IMPORT || c->kind==CORDIAL_BLE_EXPORT) {
         uint8_t data[145];ble_addr_t p=address(c->peer);
         bool change=c->kind==CORDIAL_BLE_IMPORT && !cordial_bonds_same_privacy(c->data,c->length);
+        bool imported=false;
         if(c->kind==CORDIAL_BLE_IMPORT) {
-            if(c->length!=145 || c->data[8]!=2 || c->data[9]>1)status=BLE_HS_EINVAL;
+            if(c->length!=145 || c->data[8]!=2 || c->data[9]>1)status=BLE_HS_EBADDATA;
             else {
                 p.type=c->data[9];for(unsigned i=0;i<6;i++)p.val[i]=c->data[15-i];
                 change=change || cordial_bonds_dirty(&p);
@@ -500,30 +529,34 @@ static void command(const cordial_ble_command *c) {
                     status=stop_scan();
                     if(!status) {status=unpair_view(&p);}
                 }
-                if(!status)status=cordial_bonds_import(c->data,c->length);
+                if(!status) {
+                    status=cordial_bonds_import(c->data,c->length);
+                    imported=!status;
+                }
                 if(!status && change) {
                     union ble_store_key key={0};union ble_store_value value;key.sec.peer_addr=p;
                     int read=cordial_bonds_read(BLE_STORE_OBJ_TYPE_PEER_SEC,&key,&value);
-                    if(!read)status=ble_store_write_peer_sec(&value.sec);
+                    if(!read) {
+                        if(value.sec.irk_present)status=cordial_bonds_mark_dirty(&p);
+                        if(!status)status=ble_store_write_peer_sec(&value.sec);
+                        if(!status)cordial_bonds_clean(&p);
+                    }
                     else if(read!=BLE_HS_ENOENT)status=read;
                 }
             }
         } else status=cordial_bonds_export(&p,data);
         // A failed resolving-list update must not look installed on the next import.
-        if(status && change) (void)unpair_view(&p);
+        if(status && change && imported) (void)unpair_view(&p);
         if(!status && !bonds(NULL))status=BLE_HS_ESTORE_FAIL;
-        if(change && start_scan())status=BLE_HS_ESTORE_FAIL;
-        cordial_ble_event e={.kind=CORDIAL_BLE_BOND_RESULT,.request=c->request,.code=status?CORDIAL_BLE_STORAGE:CORDIAL_BLE_OK,
+        cordial_ble_event e={.kind=CORDIAL_BLE_BOND_RESULT,.request=c->request,.code=bond_error(status),
             .data=data,.length=(!status && c->kind==CORDIAL_BLE_EXPORT)?145:0};emit(&e);return;
     }
     if (c->kind==CORDIAL_BLE_FORGET) {
         ble_addr_t p=address(c->peer);
         status=stop_scan();
         if(!status) { status=unpair_view(&p); }
-        bool stored=!status && bonds(&p);
-        int scanning=start_scan();
-        cordial_ble_event e={.kind=CORDIAL_BLE_FORGOTTEN,.request=c->request,.code=stored ? CORDIAL_BLE_OK:CORDIAL_BLE_STORAGE};emit(&e);
-        if(scanning) { cordial_ble_event failed={.kind=CORDIAL_BLE_FAILED,.code=CORDIAL_BLE_RADIO};emit(&failed); }
+        if(!status && !bonds(&p))status=BLE_HS_ESTORE_FAIL;
+        bond_complete(c,status);
         return;
     }
     if (c->kind==CORDIAL_BLE_CONNECT) {
@@ -592,9 +625,41 @@ static void command(const cordial_ble_command *c) {
     }
     if(status) complete(c->request,status);
 }
+static bool changes_privacy(const cordial_ble_command *c) {
+    if(c->kind==CORDIAL_BLE_FORGET) {
+        ble_addr_t p=address(c->peer);
+        union ble_store_key key={0};union ble_store_value value;key.sec.peer_addr=p;
+        int status=cordial_bonds_read(BLE_STORE_OBJ_TYPE_PEER_SEC,&key,&value);
+        if(status && status!=BLE_HS_ENOENT)return false;
+        return cordial_bonds_dirty(&p) || (!status && value.sec.irk_present);
+    }
+    if(c->kind!=CORDIAL_BLE_IMPORT || c->length!=145 || c->data[8]!=2 || c->data[9]>1)return false;
+    ble_addr_t p={.type=c->data[9]};for(unsigned i=0;i<6;i++)p.val[i]=c->data[15-i];
+    struct ble_gap_conn_desc live;
+    return (!cordial_bonds_same_privacy(c->data,c->length) || cordial_bonds_dirty(&p)) &&
+        ble_gap_conn_find_by_addr(&p,&live)!=0;
+}
 static void process_commands(struct ble_npl_event *event) {
     (void)event;cordial_ble_command c;
-    while (xQueueReceive(commands,&c,0)==pdTRUE) command(&c);
+    while (xQueuePeek(commands,&c,0)==pdTRUE) {
+        if(is_synced && changes_privacy(&c)) {
+            int status=0;
+            if(auto_active) {
+                status=cancel_auto();
+                if(!status) {
+                    // CONNECT retires the initiator before this queued command
+                    // runs; resume_radio cannot restart it in between.
+                    return;
+                }
+            } else if(ble_gap_conn_active())status=BLE_HS_EBUSY;
+            if(status) {
+                xQueueReceive(commands,&c,0);bond_complete(&c,status);
+                continue;
+            }
+        }
+        xQueueReceive(commands,&c,0);
+        command(&c);
+    }
     resume_radio();
 }
 static void synced(void) {
@@ -617,6 +682,7 @@ static void reset(int reason) {
             .code=stored ? CORDIAL_BLE_RADIO:CORDIAL_BLE_STORAGE};emit(&e);memset(&links[i],0,sizeof(links[i]));
     }
     cordial_ble_event e={.kind=stored ? CORDIAL_BLE_RESTARTING:CORDIAL_BLE_FAILED,.code=stored ? CORDIAL_BLE_RADIO:CORDIAL_BLE_STORAGE};emit(&e);
+    schedule_radio();
 }
 static uint8_t local_irk[16];
 void cordial_ble_identity(const uint8_t *irk) { for(unsigned i=0;i<16;i++)local_irk[i]=irk[15-i]; }

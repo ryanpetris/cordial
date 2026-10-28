@@ -1,4 +1,4 @@
-//! Bounded stderr delivery for protocol records and completed operation diagnostics.
+//! Bounded stderr delivery for protocol records and foreground diagnostics.
 use cordial_client::diagnostics::Diagnostic;
 use cordial_protocol::message;
 use std::{
@@ -14,7 +14,7 @@ use std::{
 
 pub type Observer = cordial_client::diagnostics::Sink;
 
-/// Observes original wire messages separately from normalized state and caller inputs.
+/// Observes wire responses and events without changing command results.
 pub fn observe(
     connector: Arc<crate::controller::Connector>,
     observer: Observer,
@@ -32,7 +32,6 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Output {
     tx: Arc<SyncSender<Message>>,
     resume: SyncSender<()>,
-    json: bool,
     worker: JoinHandle<()>,
     done: Receiver<()>,
 }
@@ -77,23 +76,20 @@ impl Write for Diagnostics {
 
 impl Output {
     pub fn start() -> Self {
-        Self::with_writer(io::stderr())
+        Self::configured(io::stderr(), false)
     }
 
     /// Defers terminal-bound diagnostics until the interface has restored terminal ownership.
-    pub fn terminal(json: bool) -> Self {
-        Self::configured(io::stderr(), json, io::stderr().is_terminal())
+    pub fn terminal() -> Self {
+        Self::configured(io::stderr(), io::stderr().is_terminal())
     }
 
-    pub fn completed() -> Self {
-        Self::configured(io::stderr(), false, false)
-    }
-
+    #[cfg(test)]
     fn with_writer(writer: impl Write + Send + 'static) -> Self {
-        Self::configured(writer, true, false)
+        Self::configured(writer, false)
     }
 
-    fn configured(mut writer: impl Write + Send + 'static, json: bool, deferred: bool) -> Self {
+    fn configured(mut writer: impl Write + Send + 'static, deferred: bool) -> Self {
         let (resume, ready) = mpsc::sync_channel(1);
         if !deferred {
             let _ = resume.try_send(());
@@ -116,7 +112,6 @@ impl Output {
         Self {
             tx: Arc::new(tx),
             resume,
-            json,
             worker,
             done,
         }
@@ -125,20 +120,10 @@ impl Output {
     pub fn observer(&self) -> Observer {
         // Observers do not keep the queue open after shutdown.
         let diagnostics = self.diagnostics();
-        let json = self.json;
         Arc::new(move |diagnostic| {
             let kind = match diagnostic {
-                Diagnostic::Response(_, response) if json => {
-                    message::Kind::Response(response.clone())
-                }
-                Diagnostic::Event(event) if json => message::Kind::Event(event.clone()),
-                Diagnostic::Completed(error) if !json => {
-                    diagnostics.send(Message::Diagnostic(
-                        format!("Completed adapter operation: {error:?}\n").into_bytes(),
-                    ));
-                    return;
-                }
-                _ => return,
+                Diagnostic::Response(_, response) => message::Kind::Response(response.clone()),
+                Diagnostic::Event(event) => message::Kind::Event(event.clone()),
             };
             diagnostics.send(Message::Record(Box::new(kind)));
         })
@@ -374,27 +359,19 @@ mod tests {
         let (events, seen) = mpsc::channel();
         let connection = connector(
             "simulated",
-            Box::new(move |received| match received {
-                Received::PairingComplete { candidate } => {
-                    events.send(candidate).unwrap();
+            Box::new(move |received| {
+                if let Received::Event(event) = received
+                    && let Some(p::event::Kind::Pairing(pairing)) = event.kind
+                {
+                    events.send(pairing.candidate).unwrap();
                 }
-                Received::Event(event) => {
-                    if let Some(p::event::Kind::Pairing(pairing)) = event.kind {
-                        events.send(pairing.candidate).unwrap();
-                    }
-                }
-                _ => {}
             }),
         )
         .unwrap();
         let result = connection.set_settings(1, Vec::new());
-        assert_eq!(result.is_ok(), !cfg!(debug_assertions));
+        assert!(matches!(result, Err(cordial_client::Error::Dongle(e)) if e == error));
         let result = connection.status();
-        assert!(if cfg!(debug_assertions) {
-            matches!(result, Err(cordial_client::Error::Dongle(_)))
-        } else {
-            matches!(result, Err(cordial_client::Error::UnexpectedResponse))
-        });
+        assert!(matches!(result, Err(cordial_client::Error::Dongle(e)) if e == error));
         let event = p::Event {
             kind: Some(p::event::Kind::Pairing(p::Pairing {
                 candidate: 7,
@@ -423,83 +400,42 @@ mod tests {
 
     #[test]
     fn terminal_diagnostics_wait_for_terminal_release_and_drain_before_exit() {
-        for json in [false, true] {
-            let buffer = Buffer::default();
-            let output = Output::configured(buffer.clone(), json, true);
-            let observer = output.observer();
-            let error = complete_error();
-            let response = p::Response {
-                result: Some(response::Result::Error(error.clone())),
-            };
-            observer(Diagnostic::Response(&p::Request::default(), &response));
-            observer(Diagnostic::Completed(&error));
-            // The worker has no permission to write until finish releases the terminal gate.
-            assert!(buffer.0.lock().unwrap().is_empty());
-            output.finish();
-            let bytes = buffer.0.lock().unwrap();
-            let text = std::str::from_utf8(&bytes).unwrap();
-            assert_eq!(text.lines().count(), 1);
-            if json {
-                assert_eq!(
-                    serde_json::from_str::<p::Message>(text).unwrap().kind,
-                    Some(message::Kind::Response(response))
-                );
-            } else {
-                assert_eq!(text, format!("Completed adapter operation: {error:?}\n"));
-            }
-        }
+        let buffer = Buffer::default();
+        let output = Output::configured(buffer.clone(), true);
+        let response = p::Response {
+            result: Some(response::Result::Error(complete_error())),
+        };
+        output.observer()(Diagnostic::Response(&p::Request::default(), &response));
+        writeln!(output.diagnostics(), "Waiting for adapter.").unwrap();
+        // The worker waits until finish releases terminal ownership.
+        assert!(buffer.0.lock().unwrap().is_empty());
+        output.finish();
+        let bytes = buffer.0.lock().unwrap();
+        let lines: Vec<_> = std::str::from_utf8(&bytes).unwrap().lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            serde_json::from_str::<p::Message>(lines[0]).unwrap().kind,
+            Some(message::Kind::Response(response))
+        );
+        assert_eq!(lines[1], "Waiting for adapter.");
     }
 
     #[test]
     fn deferred_overflow_does_not_end_the_terminal_session() {
-        for json in [false, true] {
-            let buffer = Buffer::default();
-            let output = Output::configured(buffer.clone(), json, true);
-            let observer = output.observer();
-            for _ in 0..BACKLOG + 17 {
-                observer(Diagnostic::Event(&p::Event::default()));
-                observer(Diagnostic::Completed(&complete_error()));
-            }
-            assert!(buffer.0.lock().unwrap().is_empty());
-            output.finish();
-            let bytes = buffer.0.lock().unwrap();
-            let text = std::str::from_utf8(&bytes).unwrap();
-            assert_eq!(text.lines().count(), BACKLOG);
-            if json {
-                for line in text.lines() {
-                    serde_json::from_str::<p::Message>(line).unwrap();
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn completed_diagnostics_do_not_interrupt_when_the_writer_stalls() {
-        struct Blocked(Option<mpsc::SyncSender<()>>, mpsc::Receiver<()>);
-        impl Write for Blocked {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                if let Some(entered) = self.0.take() {
-                    entered.send(()).unwrap();
-                    self.1.recv().unwrap();
-                }
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let (entered, writing) = mpsc::sync_channel(1);
-        let (release, blocked) = mpsc::channel();
-        let output = Output::configured(Blocked(Some(entered), blocked), false, false);
+        let buffer = Buffer::default();
+        let output = Output::configured(buffer.clone(), true);
         let observer = output.observer();
-        observer(Diagnostic::Completed(&complete_error()));
-        writing.recv_timeout(Duration::from_secs(2)).unwrap();
         for _ in 0..BACKLOG + 17 {
-            observer(Diagnostic::Completed(&complete_error()));
+            observer(Diagnostic::Event(&p::Event::default()));
         }
-        release.send(()).unwrap();
-        drop(release);
+        assert!(buffer.0.lock().unwrap().is_empty());
         output.finish();
+        let bytes = buffer.0.lock().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(text.lines().count(), BACKLOG);
+        for line in text.lines() {
+            serde_json::from_str::<p::Message>(line).unwrap();
+        }
     }
 
     #[test]

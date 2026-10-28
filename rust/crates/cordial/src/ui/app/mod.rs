@@ -2297,7 +2297,7 @@ mod ending_tests {
     }
 
     #[test]
-    fn completed_pairing_finishes_without_a_device_id_in_production() {
+    fn pairing_error_reports_the_saved_outcome_and_related_failure() {
         let mut h = Harness::new();
         h.pair();
         h.world.adapters()[0].event(p::event::Kind::Pairing(p::Pairing {
@@ -2313,16 +2313,13 @@ mod ending_tests {
                 }],
             })),
         }));
-        let expected = if cfg!(debug_assertions) {
-            add::Phase::Failed
-        } else {
-            add::Phase::Paired
-        };
-        h.until(|h| h.phase() == Some(expected));
+        h.until(|h| h.phase() == Some(add::Phase::Failed));
         assert!(h.pairing().unwrap().device.is_none());
         assert_eq!(
-            h.pairing().unwrap().message.is_some(),
-            cfg!(debug_assertions)
+            h.pairing().unwrap().message.as_deref(),
+            Some(
+                "The device was paired, but the adapter reported an error. The adapter couldn't read or write its saved data. Also, the adapter couldn't read or write its saved data."
+            )
         );
         assert!(!h.world.adapters()[0].sent().contains(&"cancel_pairing"));
         h.close();

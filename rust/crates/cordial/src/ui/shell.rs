@@ -861,8 +861,8 @@ impl Shell {
     /// Runs until quit, exit, Ctrl+C, Ctrl+D, SIGINT or SIGTERM. Closing the adapter's port ends
     /// a running scan and an unsaved pairing.
     pub fn run(self) -> Result<(), UiError> {
-        let output = crate::json::Output::terminal(self.json);
-        let observer = Some(output.observer());
+        let output = crate::json::Output::terminal();
+        let observer = self.json.then(|| output.observer());
         let result = self.run_observed(observer);
         super::finish_output(output, result)
     }

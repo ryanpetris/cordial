@@ -180,7 +180,6 @@ impl Script {
                             message::Kind::Response(response.clone())
                         }
                         Diagnostic::Event(event) => message::Kind::Event(event.clone()),
-                        Diagnostic::Completed(_) => return,
                     };
                     let _ = raw.try_send(RunMessage::Raw(kind));
                 }),

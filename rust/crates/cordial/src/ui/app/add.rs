@@ -512,10 +512,6 @@ impl<F: Fleet> App<F> {
                 }
                 match result {
                     Err(_) if unknown => close = true,
-                    Ok(Outcome::PairedWithoutDevice { .. }) => {
-                        pairing.device = None;
-                        pairing.phase = Phase::Paired;
-                    }
                     Ok(Outcome::Paired { subject, device }) => {
                         pairing.device = Some(subject.id);
                         pairing.phase = Phase::Paired;

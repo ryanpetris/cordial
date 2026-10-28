@@ -11,16 +11,12 @@
 //! [`rules`] puts profile rules in the form the Dongle saves them.
 //!
 //! The library keeps no state beyond the open connection and writes nothing to stdout.
-//! Host builds without debug assertions treat completed adapter operations as success and write
-//! their original error details through bounded stderr delivery. Call [`diagnostics::flush`] before
-//! process exit, or install a connection diagnostic sink. Debug builds preserve those errors.
 pub mod compatibility;
 mod connection;
 pub mod diagnostics;
 mod error;
 pub mod migration;
 pub mod order;
-mod outcomes;
 pub mod rules;
 #[cfg(feature = "serialport")]
 pub mod serial;
@@ -33,14 +29,3 @@ pub use error::Error;
 
 /// The result of a request.
 pub type Result<T> = std::result::Result<T, Error>;
-
-/// An adapter event after applying the host build's outcome policy.
-#[derive(Clone, Debug, PartialEq)]
-#[allow(clippy::large_enum_variant)]
-pub enum Event {
-    Protocol(protocol::Event),
-    /// The bond is saved. The adapter did not supply the saved device ID.
-    PairingComplete {
-        candidate: u32,
-    },
-}

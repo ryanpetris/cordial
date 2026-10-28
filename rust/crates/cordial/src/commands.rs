@@ -1129,15 +1129,12 @@ fn pair(session: &Session, target: &Target, options: &RunOptions) -> Result<Outc
         )
         .map_err(|e| transport_refusal(session, &[transport], e))?;
     let ended = session.cell.wait_for(&options.wait, |st| {
-        if st.paired_candidate == Some(candidate.id) {
-            return Some(Ok(None));
-        }
         let p = st
             .pairing
             .as_ref()
             .filter(|p| p.candidate == candidate.id)?;
         match &p.step {
-            Some(pairing::Step::Done(done)) => Some(Ok(Some(done.device))),
+            Some(pairing::Step::Done(done)) => Some(Ok(done.device)),
             Some(pairing::Step::Error(e)) => Some(Err(e.clone())),
             _ => None,
         }
@@ -1155,11 +1152,6 @@ fn pair(session: &Session, target: &Target, options: &RunOptions) -> Result<Outc
             let _ = session.connection().cancel_pairing();
             return Err(error);
         }
-    };
-    let Some(device) = device else {
-        return Ok(Outcome::PairedWithoutDevice {
-            name: candidate.name.clone(),
-        });
     };
     // The saved record follows the pairing's end as a device event.
     let record = session
