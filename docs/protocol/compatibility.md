@@ -1,284 +1,100 @@
-# Compatibility rules
+# Compatibility Rules
 
 [Protocol index](README.md)
 
-The permanent handshake in [`proto/handshake.proto`](../../proto/handshake.proto) identifies the
-adapter's operational serial revision. Clients complete it before sending ordinary requests. The
-current revision is `1`, selected by [`proto/serial/current`](../../proto/serial/current). Its
-schema lives in [`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto), with package
-`cordial.serial.v1`. The shared libraries provide hello encoders and bounded decoders.
+## Protocol Revisions
 
-The handshake stays independent of operational revisions. `ClientHello` is an empty query that
-carries no host revision. `AdapterHello` has exactly one nonzero `uint32 protocol_version` at tag
-`1`. Its protobuf field is `optional` so decoders preserve presence, but its presence is required
-by the contract. Unknown optional fields
-are skipped. `AdapterHello` uses tags `2`, `3`, and `4` for optional `firmware_version`,
-`serial_number`, and `name`. It may omit any or all of them. A valid hello with a different revision
-still decodes so the host can report the mismatch.
+The permanent handshake ([`proto/handshake.proto`](../../proto/handshake.proto)) identifies the adapter's operational serial revision independently of operational schemas, firmware release versions, and storage format versions. The current revision is `1`, selected by [`proto/serial/current`](../../proto/serial/current) and defined in [`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto) (`package cordial.serial.v1`).
 
-Compatibility is the host's decision. Firmware always speaks its one native revision, answers the
-hello whenever asked, and accepts ordinary requests without it, so it has no compatibility gate and
-never knows the host's revision. A host sends ordinary requests only after a valid `AdapterHello`
-names a revision it implements.
+- `ClientHello` is empty and carries no host revision.
+- `AdapterHello` requires exactly one nonzero `protocol_version` at tag `1` (`optional uint32` for presence tracking) and may include optional `firmware_version` (2), `serial_number` (3), and `name` (4).
+- Compatibility is decided strictly by the client. Firmware speaks only its native revision and never inspects host versions. Clients connect directly when revisions match, refuse newer revisions (requiring an app update), and require an implemented converter for older revisions (revision `1` has no older revision). Firmware lacking the permanent hello is unsupported.
+- Breaking operational changes introduce an explicitly approved `proto/serial/vN/` directory while keeping earlier revisions as schema history. Breaking protocol or storage changes increment the release minor version while major is `0`, or major from `1.0` onward.
 
-Current applications use the current operational schema. A matching native revision connects
-directly. A newer native revision is refused and requires an application upgrade. An older native
-revision requires an implemented converter to the current schema. Revision `1` has no earlier
-nonzero revision and no historical conversion. Firmware without the permanent hello is
-unsupported; clients never infer a revision from a firmware release number or an ordinary response.
+### Operational Schema Fingerprint
 
-The native GTK desktop, CLI, and TUI perform compatibility selection inside the Rust process.
-Optional hello metadata is not a compatibility requirement. See [client implementations](clients.md).
+`cordial-protocol` exports `OPERATIONAL_SCHEMA_SHA256`, the lowercase hex SHA-256 of the normalized protobuf `FileDescriptorSet` for the current operational schema and its imports (excluding handshake and storage). Normalization strips filenames and `source_code_info`, replaces dependency filenames recursively with their normalized SHA-256 digests, and sorts files lexicographically by encoded descriptor bytes. Comments and file paths do not change the digest; operational definitions do. (Schemas using custom option extensions are rejected at build time because typed descriptor conversion would drop them.)
 
-Breaking operational changes get an explicitly approved new revision in `proto/serial/vN/`.
-Retain earlier revision directories as schema history. Default builds generate only the current
-revision and its imports, the handshake, and existing storage records. Historical revisions
-remain source schemas without generated message exports. The operational revision is independent of application
-release versions and storage versions. The breaking transition to revision `1` requires the next
-release to increment the minor version. Breaking protocol changes increment the release minor
-version while the application major version is `0`, or the major version from `1` onward. The
-development release template remains `0.0.0`.
-
-### Operational schema identity
-
-Rust exposes `OPERATIONAL_SCHEMA_SHA256`, a lowercase hexadecimal SHA-256 digest of
-the normalized protobuf `FileDescriptorSet` for the current operational schema and all its imports.
-The handshake and storage are not included. Normalization clears each file's `name` and
-`source_code_info`, recursively replaces dependency filenames with the SHA-256 digest of each
-normalized dependency descriptor, sorts files by lexicographic order of their encoded descriptor
-bytes, then encodes and hashes the descriptor set.
-All other descriptor fields, declaration order, and dependency order remain significant. Comments
-and incidental source paths do not affect the digest; operational fields and imported definitions
-do. The Rust build generates the digest with its protobuf descriptor encoder. A dependency
-fixture and the current schema's checked-in digest verify normalization. Cargo rejects
-operational descriptors with custom option extensions because its typed descriptor conversion
-would omit them. Such schemas require lossless normalization support before use.
-
-The digest identifies exact schema content. It is not another compatibility version and is not a
-handshake field. Compatible additive schema changes may change the digest without changing the
-operational revision.
+This digest identifies exact schema content; it is not a compatibility version or handshake field.
 
 ## Fields
 
-Proto3 already behaves the way this API needs: a scalar field at its zero value is not sent, a
-missing field reads as zero, unknown fields, `oneof` variants, and enum values do not fail decoding,
-and `optional` gives a field explicit presence. The schema comments mark each field as one of:
+Proto3 wire semantics align with the API: zero scalars are omitted, missing scalars decode as zero, unknown fields/variants/enums are ignored, and `optional` adds presence. Schema comments classify every field into one of three kinds:
 
-| Kind | Proto | When missing |
+| Kind | Protobuf Form | When Missing |
 | --- | --- | --- |
-| Required | Plain field marked `Required` in its comment; code checks it. | The record is invalid. A client ignores that record; the Dongle refuses a request with `ERROR_CODE_BAD_ARGS`, or `ERROR_CODE_NOT_FOUND` for a missing ID. |
-| Defaulted | Plain field. | Read as the zero value, which is chosen to be the right default. |
-| Optional | `optional` scalar, or a message field. | There is no value: unknown, not reported, or not applicable. |
+| **Required** | Plain field documented `Required`; enforced in code. | Invalid record (client ignores it) or refused request (`ERROR_CODE_BAD_ARGS`, or `ERROR_CODE_NOT_FOUND` for missing IDs). |
+| **Defaulted** | Plain field. | Zero value, chosen as the safe default. |
+| **Optional** | `optional` scalar or message field. | Unknown, unreported, or not applicable. |
 
-A value that is meaningful as zero or false but can also be unknown, such as a battery level or a
-security property, is Optional. Only identifiers and fields without which a record cannot be
-understood are Required.
+Values where zero or `false` is distinct from unknown (such as battery level or link security flags) are always Optional.
 
-## Enums and oneofs
+## Enums and Oneofs
 
-- The zero value of every enum is its safe default. Where none exists it is `_UNSPECIFIED` (for a
-  required field) or `_UNKNOWN` (for a value that can come from newer firmware).
-- A client reads an enum value it does not know as the zero value, and skips unknown values in
-  repeated enum fields. An unknown `ErrorCode` is a generic failure; unknown `ErrorReason` and
-  `ErrorOutcome` values provide no further detail. An unknown `InactiveReason` still means inactive.
-- A `oneof` that holds a variant newer than the client reads as unset, with a documented meaning:
-  an unknown pairing step means pairing is still in progress, an unknown integration status means
-  off, an unknown setting status provides no confirmation, and an unknown output status means
-  Unknown. An unknown settings group means the client skips the object, and an unknown listing
-  entry means the client skips the entry. Output producers always set a state or error; explicit
-  `OUTPUT_STATE_UNKNOWN` reports an unknown state.
-- `Error` carries code, reason, outcome, and related errors in every failure scope. Conversions
-  preserve the complete error recursively, including unknown numeric details when retained by the
-  decoder. A code alone never establishes an outcome. Missing outcome evidence
-  uses `UNSPECIFIED`, even when the code commonly describes a refusal; `NO_EFFECT` requires evidence of no effects or
-  results in the documented scope. See [Errors](limits-and-errors.md#errors) for outcome meanings
-  and complete-error ordering and deduplication.
+- Every enum's zero value is its safe default, `_UNSPECIFIED` (required fields), or `_UNKNOWN` (values from newer firmware).
+- Unknown enum values decode as zero (and are skipped in repeated enum fields). An unknown `ErrorCode` is a generic failure; unknown `ErrorReason`/`ErrorOutcome` add no detail; unknown `InactiveReason` still means inactive.
+- Unknown `oneof` variants decode as unset with safe fallbacks: pairing still in progress, integration off, setting unconfirmed, output Unknown, unknown settings group or listing entry skipped.
+- Structured `Error` records (`code`, `reason`, `outcome`, `related`) are preserved recursively across conversions. An error code alone never establishes an outcome (`UNSPECIFIED` when unknown; `NO_EFFECT` only with evidence). See [Errors](limits-and-errors.md#errors).
 
-## Changing the schema
+## Schema Evolution Rules
 
-1. A field's number and type never change, and a field never changes meaning; a different meaning
-   gets a new field.
-2. A removed field, enum value, or `oneof` variant is tombstoned with `reserved`, number and name,
-   so neither is ever reused.
-3. A new field's zero value, or its absence for an Optional field, means exactly what firmware did
-   before the field existed.
-4. A Required field is never removed.
-5. New commands are new `Request.command` variants; old firmware answers them with
-   `ERROR_CODE_UNKNOWN_COMMAND`. New events are new `Event.kind` variants and new result types new
-   `Response.result` variants; old clients ignore them.
-6. Old firmware ignores request fields it does not know, so a new request field must be safe to
-   ignore. If ignoring it would do the wrong thing, the behavior gets a new command.
-7. A command that needs more in its result than its record carries gets a new field on `Response`
-   beside the `result` oneof.
-8. Nothing is named after one member of an enum. Data that varies by transport, integration, or any
-   other kind is a repeated message with the kind as a field, like `TransportSupport` and
-   `Integration`.
+1. Never change a field's number, type, or meaning; add a new field for a new meaning.
+2. Tombstone removed fields, enum values, and `oneof` variants with `reserved` (both number and name).
+3. New fields' zero values (or absence for Optional fields) must match prior firmware behavior.
+4. Never remove a Required field.
+5. Add commands as new `Request.command` variants (older firmware returns `ERROR_CODE_UNKNOWN_COMMAND`), events as `Event.kind` variants, and results as `Response.result` variants (older clients ignore them).
+6. New request fields must be safe for older firmware to ignore; otherwise add a new command.
+7. Extra return data alongside a record goes in a new field on `Response` beside `result`.
+8. Never name fields after individual enum members; use repeated messages keyed by enum (like `TransportSupport` and `Integration`).
 
-Additive operations and writable fields require a positive advertised capability before a client
-uses them. An absent or unknown capability means unsupported. A matching protocol revision or a
-successful response to an unrecognized field does not prove that firmware supports the operation.
+Clients must gate additive operations and writable fields on advertised capabilities (`Status` fields), never on revision matching alone.
 
-`just check-protocol` runs `buf lint` on every schema and uses `WIRE_JSON` for compatibility
-checks. Stable comparisons also check compiled descriptors to preserve released message and enum
-names within their packages, including nested definitions. Definitions can move between source
-files in the same package. The permanent handshake and operational revisions present in the current
-tree compare against every local release tag, regardless of application version or branch ancestry, except the
-release identified by `CORDIAL_VERSION`. This protects field assignments shared across release
-branches. A revision released by an ancestor must remain present even when another revision becomes
-current. A revision released only on another branch need not be added, but its contract is checked
-if that revision is present. `PROTOCOL_STABLE_BASE` overrides these comparisons with one Git
-revision. The comparison builds released schemas with their imports and protects their dependencies
-too.
+### Automated Protocol Checks
 
-Storage and migration IPC compare against the newest earlier release in the same application
-series, selected by `PROTOCOL_BASE`. Before application version `1.0`, a new minor version starts a
-series; from `1.0`, only a new major version does. The first release of a series has no storage or
-migration IPC baseline, but still checks permanent serial contracts. Baseline selection uses ancestor tags
-reachable before `HEAD`; a development build selects the newest of these releases. Selection uses
-existing local tags without fetching. An earlier release's unversioned
-serial schema is not compared with revision `1`.
+`just check-protocol` runs `buf lint` (`buf.yaml`) and `WIRE_JSON` breaking checks plus descriptor name preservation:
 
-Buf's standard lint exceptions include `ENUM_ZERO_VALUE_SUFFIX` for meaningful zero defaults,
-`PACKAGE_VERSION_SUFFIX` for permanent handshake and storage packages, and directory rules for the
-schema layout. Rules 3 to 8 and the rules below are review rules.
+- **Permanent contracts** (`proto/handshake.proto` and all retained `proto/serial/vN/` revisions): compared against every local release tag (except `CORDIAL_VERSION`, overridable via `PROTOCOL_STABLE_BASE`). Revisions released by ancestor tags must remain present.
+- **Storage and migration IPC**: compared against the newest earlier ancestor release in the same application series (`PROTOCOL_BASE`; one minor version before `1.0`, one major from `1.0`). The first release in a series skips only the storage/IPC baseline check.
 
-## Set commands
+## Set Commands
 
-A command that updates an existing object is a partial update: a client sends only the fields it
-wants to change, and every missing field keeps its current value.
+Every `Set*` command is a partial update:
 
-- Every updatable field on a set command is `optional` or a message, never a plain scalar, so
-  `false`, `0`, or `""` cannot overwrite a stored value by accident.
-- Fields that only make sense together are grouped in one message, replaced or kept as a whole.
-- Because a missing field means unchanged, clearing a value needs an explicit form, such as `name:
-  ""` restoring the default adapter name, or a `forget` entry in a list of changes, such as
-  `BoolSettingUpdate.forget`.
-- A set command responds with no result once the change is applied, and the changed object's
-  event announces it when anything changed. A success means the Dongle holds what was sent, in the
-  saved form the command defines, so a client sends a newer field only when `Status` shows the
-  firmware supports it, and a field that older firmware could not ignore safely gets a new command
-  (rule 6).
-- A new updatable property of an existing object is a new `optional` field on that object's set
-  command, not a new command.
-- A repeated list of updates, changes, or items to forget applies in order. A later entry for the
-  same transport, integration, interface, setting, or rule replaces an earlier one, and repeating an
-  entry is never refused. The command still saves in one storage write.
+- Updatable fields are `optional` or messages (never plain scalars) so zero/`false`/`""` cannot accidentally overwrite saved state.
+- Interdependent fields are grouped in one message and updated together.
+- Clearing a field uses an explicit representation (`name: ""` for default adapter name; `forget` markers for settings and rules).
+- Repeated update lists apply in order (later entries for the same target win) and commit in a single flash write.
+- Successful `Set*` responses return no payload; an event follows if state actually changed.
 
-## Integrations
+## Extensibility: Integrations, Profiles, and IDs
 
-Settings, features, and device-protocol state are not tied to HID++ on the wire. Each belongs to an
-integration named by `IntegrationKind`; HID++ is the only kind so far. A new integration is a new
-enum value; it reports itself as another `Device.integrations` entry, its readings in typed
-`DeviceInformation` fields, its settings as `SettingsObject` records with its kind, and its
-feature table as `Feature` records with a new `detail` variant. Settings domains describe device
-behavior, independently of the integration providing it.
-
-- A client keeps the number of a kind it does not know and passes it back unchanged.
-- Integration failures use the shared `Error` message, including `PROTOCOL_UNSUPPORTED` for
-  missing required protocol versions or reports.
-- The Dongle decodes everything it reads from a device into typed fields before sending it. Raw
-  report bytes, protocol responses, and hex dumps never reach the wire, and a value the Dongle
-  cannot decode is not sent. Decoded identifiers and positions, such as a report ID, a bit offset,
-  or a usage number, are typed fields, not raw data.
-
-## Profiles
-
-Profiles are not tied to keyboards, mice, or any other kind of device. A profile is a set of rules
-keyed by HID usage and application collection, and the Dongle applies whichever of them match the
-input a device produces. A new kind of input or output, such as a joystick axis or a gamepad report,
-is a new usage range in `ProfileSupport`, never a new field, message, or command. HID usages and
-collections are typed fields, decoded by the Dongle.
-
-Each rule and rule reference requires both input usage and collection. Capability ranges in
-`ProfileSupport.ranges` include a `UsageRange.Kind` and collection for inputs and outputs.
-`KIND_REMAP_INPUT`, `KIND_SCALE_INPUT`, and `KIND_AXIS_INPUT` describe on/off, relative, and absolute
-axis rules; `KIND_REMAP_OUTPUT` and `KIND_AXIS_OUTPUT` describe their destinations. Clients match
-kind, collection, and usage together. Unknown kinds and `KIND_UNSPECIFIED` grant no capability.
-A usage and collection may appear separately under several kinds.
-
-Configuration interfaces follow the transport pattern. Each is a `ConfigurationInterface` value
-that reports itself as a `ConfigurationInterfaceSupport` entry with its preferences and the
-interfaces it conflicts with, and is changed through a `ConfigurationInterfaceUpdate`. Any number
-can be enabled at once; firmware that cannot run two together lists each in the other's
-`conflicts`.
-
-- A client keeps an interface or collection it does not know and passes it back unchanged, and
-  skips a role it does not know.
-
-## Identifiers
-
-Saved records and scan candidates are identified by positive `uint32` IDs, never strings. Each
-kind of record has its own IDs, and a saved record's ID is never reused. Where a field refers to an
-optional record, `0` means none.
+- **Integrations**: Wire records are keyed by `IntegrationKind` (currently HID++). Clients preserve unknown kinds unchanged. Firmware decodes all device values into typed fields; raw HID++ bytes never cross the serial wire.
+- **Profiles**: Rules are keyed by `(usage, collection)` rather than device type. New input/output classes appear as `UsageRange` entries in `ProfileSupport.ranges` (`KIND_REMAP_INPUT`, `KIND_REMAP_OUTPUT`, `KIND_SCALE_INPUT`, `KIND_AXIS_INPUT`, `KIND_AXIS_OUTPUT`; unknown/unspecified kinds grant no capability). Configuration interfaces follow the `TransportSupport` pattern with explicit `conflicts` lists. Clients preserve unknown interfaces and collections unchanged.
+- **Identifiers**: Saved records and scan candidates use positive `uint32` IDs (`0` means none in optional references). Saved IDs are never reused.
 
 ## Listings
 
-Every `List` command returns the complete list in one logical protobuf `Message` and one
-continuous COBS frame. There are no cursors or followup requests. The final frame delimiter marks
-completion. An empty list explicitly selects its response variant.
+Every `List*` command returns its complete collection in **one logical protobuf `Message` and one continuous COBS frame** with no cursors:
 
-| Command | Result | Order |
+| Command | Result Field | Sort Order |
 | --- | --- | --- |
 | `ListDevices` | `DeviceList.entries` | Ascending ID |
 | `ListProfiles` | `ProfileList.entries` | Ascending ID |
-| `ListProfileRules` | `ProfileRules.rules` | Input usage page, input usage, collection usage page, then collection usage |
-| `ListSettings` | `DeviceSettings.objects` | Integration, group, then component index |
-| `ListFeatures` | `FeatureList.features` | Integration, then index |
-| `ListFiles` | `FileList.entries` | Name compared bytewise |
+| `ListProfileRules` | `ProfileRules.rules` | Input usage page, input usage, collection page, collection usage |
+| `ListSettings` | `DeviceSettings.objects` | Integration, group, component index |
+| `ListFeatures` | `FeatureList.features` | Integration, index |
+| `ListFiles` | `FileList.entries` | Bytewise name order |
 
-The Dongle iterates live state rather than taking a snapshot. It serializes bounded batches as
-ordinary `Message` values containing the same `Response` list variant and concatenates their
-protobuf bytes before incremental COBS encoding. Protobuf merges repeated occurrences of the same
-nested message, appending repeated entries. Identity fields such as `DeviceSettings.device` and
-`ProfileRules.profile` stay constant throughout the response. Batch boundaries have no wire
-meaning and need not align with COBS blocks, USB packets, or host reads.
+Streaming mechanics:
 
-A failure after list data has been emitted appends an ordinary `Message` containing
-`Response.error` to the same COBS frame. The response oneof replaces the list with that error.
-Clients decode and apply only completed frames, so they never apply partial success. A disconnect
-discards an incomplete frame. Adapter-to-host messages have no total protocol size cap. The Rust
-client's local [receive limit](transport.md#rust-host-receive-limit) applies to the complete received
-frame; an oversized listing is discarded in full.
+- Firmware iterates live state in bounded batches, serializing ordinary `Message` chunks holding the same `Response` list variant and concatenating their protobuf bytes into one incremental COBS frame (protobuf merges repeated messages and appends repeated entries).
+- If an error aborts the listing mid-frame, firmware appends a `Message` holding `Response.error` to the same frame, replacing the list in the `oneof`. Clients apply only complete frames, discarding incomplete frames on disconnect.
+- Events never interleave inside a response frame; changes occurring during a listing emit afterward.
+- In `ListDevices` and `ListProfiles`, a per-record flash read failure emits a `RecordError { id, error }` entry (`STORAGE_FAILED` / `STORAGE` / `NO_EFFECT`) and continues the listing (undecodable records are removed as lost). Clients retain last-known device data on `RecordError` without treating it as confirmed; profile read errors need not retain cached profiles.
 
-Events never interleave within a response frame. The Dongle preserves changes that occur during
-the listing for subsequent events. A client replaces its list with the completed response, then
-applies those events in receive order. Profile rules have no change event, so clients list them
-again when they need a fresh view.
+## Information and Settings
 
-`ListDevices` and `ListProfiles` hold one entry per saved record: the record, or an `error` entry
-containing `RecordError { id, error }` when its flash read fails. The error uses `STORAGE_FAILED`,
-reason `STORAGE`, and outcome `NO_EFFECT`: no record was returned. It makes no claim about saved
-data. This entry does not fail the whole response; later entries follow. A failure to continue the
-listing instead returns `Response.error` and discards the partial list. An undecodable record is
-removed as lost and is not listed. A client skips entry variants it does not understand and
-continues reading the same frame.
-
-Clients retain a previously known device after its record read fails as last-known data, without
-treating that data as confirmation of its connection or preferences. Fresh records and events
-supersede it; a completed listing that actually omits the ID, or a removal event, removes it.
-Profile read-error placeholders do not require preserving previously cached profile data.
-
-## Information and settings
-
-`Status.information` and `Device.information` contain typed read-only facts. Each scalar has
-independent presence. Missing means unknown, including for false and zero. A device event replaces
-the whole information object, so absent fields clear prior readings. Device information belongs to
-the current connection and clears on disconnect.
-
-Settings use complete domain objects owned by an integration. The domain is selected by a
-`SettingsObject.group` oneof. Every configurable field has a typed wrapper with independent
-`value` and `saved` presence, optional per-field `status`, and its accepted range or choices where
-applicable. Unknown enum readings provide no confirmation of a writable choice. Clients preserve
-unknown integration kinds but skip unknown groups.
-
-`SettingsUpdate` is partial, down to each nested field. Every present field chooses a typed value
-or an empty `SettingForget` marker. Missing leaves the preference unchanged; `forget` removes only
-the saved preference and never resets the actual device value. False and zero remain explicit
-writes. See [settings records](records.md#settings) for metadata and event replacement rules.
-
-The wire protocol imposes no object or message size limit on settings responses and change events.
-Ranges, choices, and saved metadata remain complete. Device and resource constraints still apply,
-such as at most six Pointer Sensor DPI choices. For ordinary traffic, the 1024-byte limit applies
-to the complete host `Request`, including its command envelope and all entries, before COBS
-encoding. An `AdapterHello` has a separate 1024-byte decoded limit, and a `ClientHello` is always
-empty.
+- `Status.information` and `Device.information` carry typed read-only facts with independent optional presence (cleared on disconnect or absent from a replacement event).
+- `SettingsObject` groups configurable fields by integration and domain (`SettingsObject.group`), each wrapper having independent `value`, `saved`, `status`, and accepted range/choices.
+- `SettingsUpdate` is partial down to nested fields, choosing either a typed value or `SettingForget` per field.
+- Adapter-to-host settings responses and events have no wire size cap; host `Request` messages remain bounded to 1024 protobuf bytes.

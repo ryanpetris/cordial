@@ -1,53 +1,35 @@
 # Serial API
 
-The Dongle's USB CDC port carries a protobuf API. A client sends one request and gets one response
-back, in order; the Dongle also sends an event whenever something changes. There are no request
-IDs, no subscriptions, and no heartbeats. Clients start every session with the permanent handshake
-to identify the operational serial revision. Separate USB interfaces carry keyboard and mouse
-input, enabled HID or XInput gamepad outputs, and enabled HID configuration traffic.
+Cordial's USB CDC port exposes a protobuf control API. A client sends one `Request` and receives one `Response` in FIFO order; the adapter also emits unsolicited `Event` messages whenever state changes. There are no request IDs, subscriptions, or heartbeats. Every session begins with a permanent handshake identifying the adapter's operational protocol revision.
 
-One host process owns the port at a time. The Dongle stores its bonds, connection policy, settings,
-and profiles itself and works without any host software once set up; the host only configures it and
-reports what it says, such as battery levels.
+Separate USB interfaces carry standard keyboard/mouse HID input, enabled HID or XInput gamepads, and an enabled VIA/Vial configuration interface. Only one host process owns the serial port at a time. The adapter operates independently without host software once configured; the host is used only for configuration, diagnostics, and status reporting.
 
-## Documents
+## Protocol Documents
 
-- [USB discovery, framing, and sessions](transport.md)
-- [Compatibility rules](compatibility.md)
-- [Commands](commands.md)
-- [Records: status, profiles, devices, integrations, information, and settings](records.md)
-- [Limits and errors](limits-and-errors.md)
-- [CLI, TUI, and desktop behavior](clients.md)
-- [Development and file commands](development.md)
-- [HID decoding, forwarding limits, and suspend behavior](hid-forwarding.md)
+- [USB discovery, framing, and sessions](transport.md) -- VID/PID discovery, COBS framing, handshake, sessions, and `SessionEnding`
+- [Compatibility rules](compatibility.md) -- schema evolution, field kinds, streamed listings, and `check-protocol`
+- [Commands](commands.md) -- adapter, discovery/pairing, device, settings, and profile commands
+- [Records](records.md) -- `Status`, capacities, profiles, devices, outputs, integrations, information, and settings
+- [Limits and errors](limits-and-errors.md) -- protocol/resource limits, Bluetooth board capacities, structured errors, and pre-checks
+- [CLI, TUI, and desktop behavior](clients.md) -- client state model, commands, TUI/desktop behavior, and migration IPC
+- [Development and file commands](development.md) -- debug commands, filesystem access, and `Restart`
+- [HID forwarding and limits](hid-forwarding.md) -- report compiler, USB control/wake/allocation, lock LEDs, and gamepad outputs
 
-## Definitions
+## Schema Definitions
 
-- [`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto) defines the revision `1` operational
-  messages. Its comments say what each field means, which fields are required, and what a missing
-  field means.
-- [`proto/handshake.proto`](../../proto/handshake.proto) defines the permanent opening messages.
-- [`proto/storage/v2/storage.proto`](../../proto/storage/v2/storage.proto) defines the operating saved
-  records independently of the serial representation. Historical schemas remain under
-  `proto/storage/v1/`. See [storage format](../storage-format.md).
-- [`proto/migration.proto`](../../proto/migration.proto) defines framed migration-worker subprocess IPC.
-  Its length prefix and bounds are separate from the serial API's COBS frames.
+- [`proto/handshake.proto`](../../proto/handshake.proto) -- permanent opening handshake (`ClientHello`, `AdapterHello`).
+- [`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto) -- operational serial revision `1` messages (current revision pinned in [`proto/serial/current`](../../proto/serial/current)).
+- [`proto/storage/v2/storage.proto`](../../proto/storage/v2/storage.proto) -- on-board storage records (historical v1 retained in `proto/storage/v1/`; see [On-board storage format](../storage-format.md)).
+- [`proto/migration.proto`](../../proto/migration.proto) -- length-prefixed subprocess IPC for host-assisted storage migration.
 
-`buf lint` checks all schemas. `just check-protocol` checks the permanent handshake and retained
-serial revisions against published schemas. Storage and migration IPC use the newest earlier
-release in the same application series. See [Compatibility rules](compatibility.md).
+`just check-protocol` validates all schemas with `buf lint` and checks compatibility against released tags (see [Compatibility rules](compatibility.md)).
 
 ## Libraries
 
-The protocol and the connection are libraries that the apps build on, so other projects can use
-them too:
+The Rust workspace separates protocol and transport layers for reuse:
 
-`cordial-protocol` provides messages and framing. It performs no I/O, is `no_std`,
-and is shared with the firmware. `cordial-client` provides port discovery and
-connections, without user-facing text or state beyond the open connection.
-Firmware compiles only the current v2 storage schema. Host clients also retain v1
-for preserving migration. The Rust `historical-storage` and `migration` features
-provide historical records and subprocess IPC to host builds. The native desktop,
-CLI, and TUI share the Rust host coordinator and migration worker in-process.
-All examples in
-these documents use synthetic identifiers and values.
+- `cordial-protocol`: `no_std` protobuf message types, handshake helpers, and COBS framing shared between firmware and host tools.
+- `cordial-client`: USB port discovery, handshake, FIFO request/response handling, and ordering helpers (`cordial_client::order`), without UI text or application state.
+- Host builds enable `historical-storage` and `migration` features so the desktop app, TUI, and CLI share the coordinator and migration worker in-process. Firmware compiles only the current storage schema.
+
+All examples in these documents use synthetic identifiers and values.

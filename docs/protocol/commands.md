@@ -2,400 +2,123 @@
 
 [Protocol index](README.md)
 
-Each command is one `Request.command` variant; its message in
-[`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto) documents its fields. This page describes what
-each command does. A command that needs an unavailable subsystem returns `ERROR_CODE_NOT_READY`.
-Pairing requires both Bluetooth and storage to be ready; aggregate `Status.ready = false` does not
-identify which subsystem is unavailable.
+Each command is a `Request.command` variant defined in [`proto/serial/v1/cordial.proto`](../../proto/serial/v1/cordial.proto). Commands requiring an unavailable subsystem return `ERROR_CODE_NOT_READY` (pairing requires both Bluetooth and storage).
 
-Every `List` command returns its complete list in one response frame; see
-[Listings](compatibility.md#listings) for ordering and streaming.
-Commands that change saved preferences respond with no result once the change is applied, and the
-changed object's event follows when anything changed; a change to what the Dongle already holds
-sends no event. A success means the Dongle now holds the values sent, in the saved form the
-command defines: `SetAdapter` trims the name, and `SetProfileRules` saves each rule in its
-[normalized form](#profiles). A client applies the same normalization to the values it sent instead
-of querying again. `SetAdapter` with `name: ""` is the exception: only the `adapter` event that
-follows a change reports the default name.
-
-## Validation
-
-A command is refused only when carrying it out would fail or corrupt something: a missing required
-field, a value of the wrong type or outside the device's range, an ID that does not exist, a second
-pairing, no room to save a new device. A command that can be carried out as given is accepted, even
-when the value has no effect in the current state; the Dongle applies it when it can. Clients check
-the refusals they can predict before sending (see [Limits and errors](limits-and-errors.md)), and
-show the Dongle's error without refreshing when it refuses anyway.
+- `List*` commands return the full collection in one response frame; see [Listings](compatibility.md#listings).
+- `Set*` commands respond with an empty `Response` once changes are durably saved and emit a change event only when state actually changed. Clients apply the command's normalized form locally (`SetAdapter` trims `name`; `SetProfileRules` normalizes rules) rather than re-querying. `SetAdapter` with `name: ""` is the sole exception: the following `adapter` event reports the firmware default name.
+- Firmware refuses commands only when execution would fail or corrupt state (missing required fields, out-of-range values, missing IDs, concurrent pairing, insufficient capacity). Valid commands whose effect does not currently apply are still saved and applied when possible. Clients enforce predictable checks before sending; see [Client pre-checks](limits-and-errors.md#client-pre-checks).
 
 ## Adapter
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `GetStatus` | `Status` | Refreshes the storage readings first. |
-| `SetAdapter` | none | Partial update of the name, host platform, enabled transports, and configuration interfaces, saved together. A name is 1..64 UTF-8 bytes without control characters, trimmed; `""` restores the firmware default. Transport updates apply in order; one for a transport the firmware does not support returns `ERROR_CODE_UNSUPPORTED` and changes nothing. Any transport may be disabled, including all of them. An unchanged value writes nothing. A platform change reconfigures special-key translation on every connected device with HID++ on and re-applies its saved settings. Disabling a transport closes its links, fails a pairing over it that has not saved its bond with `ERROR_CODE_UNSUPPORTED`, drops it from a running scan (ending the scan when no transport is left), stops reconnecting its devices and declines their connections, and makes its saved devices inactive with `INACTIVE_REASON_TRANSPORT_DISABLED`. Enabling it makes them eligible again: after the response, the Dongle reads their saved records in the background, and a `device` event reports each device that becomes resident. Configuration interface changes are described under [Profiles](#profiles). |
-| `Restart` | none | Available in every mode, including assisted and blocked storage. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. Under the [session ending rules](transport.md#intentional-session-endings), the Dongle sends its empty response followed by `SessionEnding` with reason `REBOOT`, drains both within the backend's deadline, then performs a full hardware reset. It doesn't validate or convert files. |
-| `EnterBootloader` | none | Development firmware only. Refused with `ERROR_CODE_BUSY` while a pairing or setup link is open. Under the [session ending rules](transport.md#intentional-session-endings), the Dongle stops accepting requests, sends its response followed by `SessionEnding` with reason `BOOTLOADER`, and drains both within the backend's deadline. It releases held input and reboots into ROM programming mode (BOOTSEL on Pico, download mode on ESP32-S3). Saved data is untouched. |
+| `GetStatus` | `Status` | Refreshes storage usage readings and returns current adapter status. |
+| `SetAdapter` | none | Partial update of `name` (`1..64` UTF-8 bytes, trimmed, no control chars; `""` resets to board default), `host_platform`, `transports`, and `configuration_interfaces`, saved atomically. Unsupported transports return `ERROR_CODE_UNSUPPORTED` without changing anything; all transports may be disabled. Platform changes reconfigure HID++ translation and reapply settings on connected HID++ devices. Disabling a transport closes its links, fails unsaved pairings (`ERROR_CODE_UNSUPPORTED`), drops it from active scans, stops reconnection, and marks its devices `INACTIVE_REASON_TRANSPORT_DISABLED`. Enabling a transport loads eligible devices in the background and emits `device` events. |
+| `Restart` | none | Available in normal, assisted, and blocked modes (refused with `ERROR_CODE_BUSY` during pairing/setup). Sends empty success, drains `SessionEnding(REBOOT)`, and resets the MCU. |
+| `EnterBootloader` | none | Development firmware only (refused with `ERROR_CODE_BUSY` during pairing/setup). Sends empty success, drains `SessionEnding(BOOTLOADER)`, releases held input, and reboots into ROM bootloader (BOOTSEL / ESP download mode) with saved data intact. |
 
-An `adapter` event follows any change to the name, platform, enabled transports, configuration
-interfaces, readiness, or adapter information. Best-effort storage recounts also report changes
-to storage byte counts or their presence.
+An `adapter` event follows any change to adapter preferences, readiness, information, or best-effort storage counts.
 
-## File access and storage migration
+## File Access and Storage Migration
 
-`ListFiles`, `ReadFile`, `WriteFile`, `MoveFile`, and `DeleteFile` operate on the
-application filesystem in debug firmware and automatically during required host
-assistance in production. See [file access](development.md#file-access) for path
-validation, bounded reads, atomic writes, and availability.
+`ListFiles`, `ReadFile`, `WriteFile`, `MoveFile`, and `DeleteFile` operate on LittleFS in debug firmware and automatically during assisted migration in production firmware. After a compatible handshake, clients read `GetStatus` and verify exact `target_storage_format` support before sending any other command.
 
-After a compatible permanent hello, `GetStatus` remains available before storage, identity, and
-radio startup. Hosts read bootstrap status and check
-`Status.information.target_storage_format` for exact support before any other command.
-`Status.information.storage_format` reports the committed root's format for
-display only.
+Only `STORAGE_MIGRATION_REQUIRED` (`reason = STORAGE`, `outcome = NO_EFFECT`, no related or other errors) authorizes host-assisted migration. See [File access](development.md#file-access) and [Preserving migration](../storage-format.md#preserving-migration) for the full protocol and verification rules.
 
-Assisted mode reports `ERROR_CODE_STORAGE_MIGRATION_REQUIRED` with reason `STORAGE` and
-outcome `NO_EFFECT` in `Status.errors`, enables the shared file commands, and
-disables ordinary commands. Firmware selects the mode at boot and keeps it until
-the next restart, even after `/format.pb` reaches the target format. Any other
-status error, or related errors on the marker, blocks host conversion. Without
-the marker, clients never start a migration and treat readiness and errors as
-usual.
-
-The host downloads the whole dataset, converts it when it isn't already in the
-target format, uploads `/format.pb` last, and verifies it by reading it back. An
-intermediate checkpoint is an ordinary root upload and readback, followed by the
-next conversion step. After the final root, the host sends `Restart`. It then
-reconnects to the same stable `Status.id` and requires the same supported target,
-`ready = true`, and no `ERROR_CODE_STORAGE_MIGRATION_REQUIRED`. See
-[preserving migration](../storage-format.md#preserving-migration).
-
-## Discovery and pairing
+## Discovery and Pairing
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `StartScan` | none | Scans the listed transports for 1..60 seconds (10 when zero). Listed transports the firmware does not support or has disabled are left out; when none is left, the scan returns `ERROR_CODE_UNSUPPORTED`. Starting a new scan discards earlier candidates, except one a pairing already captured. |
-| `StopScan` | none | Ends the scan early; candidates already found stay usable. |
-| `StartPairing` | none | Starts pairing a candidate. Only one pairing runs at a time. |
-| `AcceptPrompt` | none | Answers the open prompt, with the passkey or PIN when the step is `EnterCode`. |
-| `RejectPrompt` | none | Rejects the open prompt; pairing fails with `ERROR_CODE_REJECTED`. |
-| `CancelPairing` | none | Cancels a pairing that has not saved its bond. |
+| `StartScan` | none | Scans listed transports for `1..60` s (`10` s when `0`). Unsupported/disabled transports are skipped; if none remain, returns `ERROR_CODE_UNSUPPORTED`. Discards earlier candidates except one captured by an active pairing. |
+| `StopScan` | none | Stops scanning early while keeping discovered candidates usable. |
+| `StartPairing` | none | Pairs one candidate (at most one pairing runs at a time). |
+| `AcceptPrompt` | none | Answers the active prompt (including passkey/PIN for `EnterCode`). |
+| `RejectPrompt` | none | Rejects the active prompt (`ERROR_CODE_REJECTED`). |
+| `CancelPairing` | none | Cancels an in-progress pairing before bond commit. |
 
-Candidates arrive as `scan_found` events, again whenever a candidate's name, kinds, or signal
-changes, and the scan ends with a `scan_done` event. `ScanDone.count` is the number retained.
-At most 32 candidates are kept; dropping candidates reports `NO_CAPACITY` with reason
-`SCAN_CANDIDATES` in `ScanDone.error`. Exhausting candidate IDs reports `INTERNAL` with the same
-reason. A radio failure is primary with reason `RADIO` and keeps earlier candidate failures in
-`related`. The outcome describes collected results: `PARTIAL` when some candidates were retained,
-`NO_EFFECT` when none were retained. An ordinary timeout or `StopScan` with no lost results has no
-error. Candidate IDs remain valid until the next scan starts or the session ends, including after
-a scan error, but pairing still requires adapter readiness. Results are candidates, not a promise
-of HID support. An enabled saved BLE device advertising its identity alone is not a fresh candidate.
+Scanning and pairing details:
 
-`StartPairing` refuses a blocked saved device, a transport the firmware cannot pair or has
-disabled, a full flash (`ERROR_CODE_NO_CAPACITY` with `ERROR_REASON_STORAGE`, also reported as
-`ERROR_CODE_STORAGE_FULL` in `Status.errors`), and a full connection table
-(`ERROR_REASON_CONNECTIONS`). A saved device is recognized from the candidate's address when the
-address is its identity or the stack can resolve it; a disabled device advertising a private
-address is recognized only once pairing reveals its
-identity, and a blocked one then fails with `ERROR_CODE_BLOCKED` without changing its bond. It
-closes the selected device's own link and any setup link first, and never an unrelated working
-device.
-
-Progress arrives as `pairing` events: `connecting`, then `enter_code`, `confirm_code`, or
-`show_code` when the method needs the user, then `done` with the saved device ID or `error` with
-a full `Error`. Just Works pairing goes straight from `connecting` to `done`. A prompt expires after
-30 seconds and the whole pairing after 120.
-
-The bond is committed only once pairing completes. A failure before saving leaves existing bonds
-unchanged. In a pairing error, `NO_EFFECT` confirms unchanged saved bonds, `UNKNOWN` means the save
-cannot be confirmed, and `COMPLETE` confirms the bond save despite a later failure. The other
-generic outcomes retain their meanings; these values are not exhaustive. Cleanup failures remain
-in `related` with their own cleanup outcomes and never replace uncertain bond-save evidence.
-Cancellation, session end, and restart do not undo a bond already saved. Pairing a device that is
-already saved renews its bond in place, keeping its ID, name, and preferences, including whether it
-is enabled; a disabled device connects once it is enabled.
-
-A newly paired device is saved trusted and unblocked, with no integration enabled; its first
-connection turns on each integration it detects. It is saved enabled when the number enabled for
-its transport is below the advertised `DEVICES.limit`, and disabled otherwise. An enabled device then connects on
-its own; there is no separate connect step.
+- **Candidates**: Arrive via `scan_found` events (re-emitted when name, kinds, or signal updates) and finish with `scan_done`. Up to 32 candidates are kept; overflow reports `NO_CAPACITY(SCAN_CANDIDATES)` and ID exhaustion reports `INTERNAL(SCAN_CANDIDATES)` in `ScanDone.error` (with `PARTIAL` if some were kept, `NO_EFFECT` if none). Candidate IDs last until the next scan or session end. Enabled saved BLE devices advertising their identity are skipped as fresh candidates.
+- **Admission**: `StartPairing` rejects blocked saved devices (`ERROR_CODE_BLOCKED`), unsupported/disabled transports, full flash (`NO_CAPACITY`/`STORAGE`), and full connection tables (`CONNECTIONS`). It closes only the target device's existing link or an existing setup link, never unrelated devices.
+- **Progress**: Emits `pairing` events (`connecting`, optional `enter_code`/`confirm_code`/`show_code`, then `done` with saved device ID or `error`). Prompts time out after 30 s; total pairing times out after 120 s.
+- **Bond commit**: Committed only on completion. Failures before commit leave bonds unchanged (`NO_EFFECT`); `UNKNOWN` means save durability could not be confirmed; `COMPLETE` confirms the bond saved despite a later failure (cleanup errors stay in `related`). Cancellation, session end, or restart never undoes a committed bond. Re-pairing an existing device renews its bond in place while keeping its ID, name, and preferences.
+- **Initial state**: Newly paired devices start trusted, unblocked, with integrations off (probed on first connection), and enabled if the transport's enabled count is below `DEVICES.limit` (otherwise disabled). Enabled devices connect automatically.
 
 ## Devices
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListDevices` | `DeviceList` | All saved devices in ascending ID order. A record read failure is an `error` entry carrying `RecordError { id, error }`; the listing continues past it. |
+| `ListDevices` | `DeviceList` | All saved devices in ascending ID order. Read failures emit `RecordError` entries and continue. |
 | `GetDevice` | `Device` | One saved device. |
-| `SetDevice` | none | Partial update of `enabled`, `trusted`, `blocked`, integration preferences, output preferences, and profile layers, saved in one write. Integration and output updates apply in order. Turning `enabled` off or `blocked` on closes the device's link. |
-| `ConnectDevice` | `Device` | Clears a disconnect pause and starts connecting, or joins an attempt already running. Refused for a disabled or blocked device and while a pairing runs. |
-| `DisconnectDevice` | `Device` | Closes the link and pauses automatic reconnection until `ConnectDevice` or a restart. |
-| `UnpairDevice` | none | Pauses and disconnects the device, then deletes its bond and settings once the link is gone; `device_removed` follows. |
+| `SetDevice` | none | Partial atomic update of `enabled`, `trusted`, `blocked`, `integrations`, `output_preferences`, and `profiles`. Disabling or blocking closes any active link. |
+| `ConnectDevice` | `Device` | Clears disconnect pause and starts/joins a connection attempt (refused if disabled, blocked, or pairing). |
+| `DisconnectDevice` | `Device` | Closes the link and pauses automatic reconnection until `ConnectDevice` or restart. |
+| `UnpairDevice` | none | Disconnects the device and deletes its bond and settings once closed; emits `device_removed`. |
 | `RefreshDevice` | none | Re-reads device information and settings from a connected device. |
 
-`device` and `settings_changed` events report changes. Immediate `ConnectDevice` refusals return
-response `Error`. After acceptance, connection progress and failure arrive in `Event.device`, in
-`Device.state` and `Device.errors`; a connection attempt times out after 30
-seconds and records `ERROR_CODE_TIMEOUT` without pausing automatic reconnection.
+Immediate `ConnectDevice` refusals return `Response.error`; post-acceptance connection failures arrive in `Event.device` (connection attempts time out after 30 s with `ERROR_CODE_TIMEOUT` without pausing reconnection).
 
-### Enabled, trusted, and blocked
+### Enabled, Trusted, Blocked, and Reconnection
 
-Enabled is the saved preference that lets a device connect. Eligible devices are loaded into the
-Bluetooth stack's bond table to reconnect, recognize incoming connections, and encrypt their links;
-a disabled device stays saved but cannot connect. Each transport reports its allowance as
-`DEVICES.limit` in `TransportSupport.resources`, with one additional native bond entry kept free
-for pairing. The table holds every enabled, unblocked
-device whose transport the firmware supports and has enabled. A `SetDevice` that changes anything
-about a device without an entry, and leaves it enabled and unblocked on such a transport, is refused
-with `ERROR_CODE_NO_CAPACITY` and `ERROR_REASON_ENABLED_DEVICES` while that transport's table is full. A
-`SetDevice` that changes nothing succeeds without the check, and a device that has an entry keeps
-it, including a device turned off or blocked whose link is still closing. If firmware with a
-smaller table starts
-with more devices enabled, nothing is disabled or deleted: the lowest device IDs are loaded and the
-rest report `INACTIVE_REASON_CAPACITY` until the user disables enough of them.
+- **Bond table and connection capacity**: Each transport has an independent allowance reported as both `DEVICES.limit` and `CONNECTIONS.limit`, plus one shared pairing reserve overall (see [Bluetooth capacity](limits-and-errors.md#bluetooth-capacity)). Modifying a nonresident device so it remains enabled and unblocked on an enabled transport returns `NO_CAPACITY(ENABLED_DEVICES)` when that transport's table is full. If saved enabled devices exceed a smaller firmware's table at boot, the lowest IDs load and the rest report `INACTIVE_REASON_CAPACITY`.
+- **Automatic reconnection**: Requires an enabled, trusted, unblocked device without a disconnect pause. Disconnected BLE devices use the controller accept list (clean drops reconnect immediately; 3+ consecutive drops within 1 s back off 1 s to 5 s). Classic devices retry on a timer (starting 2 s after clean disconnect). Failures back off from 2 s to 5 min and record the error; `ConnectDevice` resets backoff to 2 s. BLE discovery runs alongside accept-list reconnection when supported, otherwise alternating in 1 s windows.
+- **Trust and block**: Untrusting prevents future unattended connections without dropping an active link; blocking closes the link while keeping the bond and disconnect pause.
 
-The same allowance is reported as `CONNECTIONS.limit` and governs normal connection admission for
-that transport. Classic and BLE have independent allowances; enabling Classic does not reduce BLE
-capacity. Connecting and closing links occupy normal slots until freed. The Dongle reserves one
-additional pairing connection overall, outside both normal allowances. An eligible device can
-connect while its transport has room, regardless of the other transport's normal connection count.
+### Lost Records
 
-Automatic reconnection and incoming connections need an enabled, trusted, unblocked device without
-a disconnect pause. While eligible BLE devices are disconnected, the Dongle uses the controller's
-accept list to connect whichever advertises first; a sleeping device holds no connection. Classic
-devices get timed attempts, the first two seconds after a connected device goes away cleanly. A
-connected BLE device that goes away, such as by sleeping or being switched off, may reconnect at
-once. From its third consecutive drop within a second of connecting, it waits one second, doubling
-up to five seconds. Every failure, including an authentication failure or a device the Dongle
-cannot use, backs off from two seconds to five minutes and records its error on the device; only
-the user's own settings stop reconnection. An explicit connect starts the backoff again from two
-seconds. Discovery runs beside accept-list reconnection when the controller supports scanning
-while initiating; otherwise BLE discovery and reconnection alternate in one-second windows.
+If a device's `device.pb` is missing, undecodable, or holds a mismatched bond when read, firmware deletes the device record and settings and emits `device_removed`. Flash I/O errors return `ERROR_CODE_STORAGE_FAILED` and never delete data (at startup they keep `Status.ready = false`).
 
-Untrusting a device prevents future unattended connections without closing the current one.
-Blocking keeps the bond and any disconnect pause. All of this is enforced on the Dongle without a
-client.
+### Output Preferences
 
-### Lost records
-
-Every saved device has a bond. If a device's saved record turns out to be missing, undecodable, or
-holding a bond that does not belong to it, at startup or when the Dongle next reads it, the Dongle
-deletes the device and its settings as an unpair would and sends `device_removed`; the user pairs it
-again as a new device.
-
-A storage read that fails is an error, never proof that data is missing: the operation that needed
-the data fails with `ERROR_CODE_STORAGE_FAILED` and nothing is deleted. A read error while loading at
-startup leaves storage not ready, so `Status.ready` stays false.
-
-### Output preferences
-
-`SetDevice.output_preferences` changes only the listed roles. Entries apply in order, with the last
-entry for a role winning, and the complete policy is saved once before runtime state changes.
-Only Gamepad is configurable. Disabled clears its saved enabled choice and works without backend
-support. HID and XInput require that role and mode in `Status.output_support`; otherwise the command
-returns `ERROR_CODE_UNSUPPORTED`. Unknown numeric roles or modes and an unspecified role return
-`ERROR_CODE_BAD_ARGS`. Other known roles return `ERROR_CODE_UNSUPPORTED`. Invalid updates and
-confirmed no-effect save failures leave the previous policy and desired pools unchanged. A save
-with outcome `UNKNOWN` does not confirm which policy is durable. An empty list changes nothing.
-Clients gate these writes on advertised support because older firmware ignores unknown fields.
-
-A missing Gamepad preference means Disabled. Saving HID or XInput contributes configured candidates
-for that mode even while the device is disconnected, disabled, or blocked. The `SLOTS.limit` in
-`OutputModeSupport.resources` limits USB allocation, not how many paired devices may save the
-choice. Valid preferences save even when their requested interfaces cannot fit. Pairing, unpairing,
-connection, and profile changes all use the same allocator; USB reconnects only when its actual
-allocation changes. Connected-device requirements can preempt lower-priority interfaces.
-See [live output states and pool rules](records.md#devices) and
-[USB gamepad behavior](hid-forwarding.md#usb-gamepad-outputs). Client controls,
-CLI commands, and human-readable slot numbering are described in
-[Gamepad outputs](clients.md#gamepad-outputs).
+`SetDevice.output_preferences` updates only the listed roles in order (last wins). Only Gamepad is configurable (`Disabled`, `HID`, `XInput`; missing means `Disabled`). `Disabled` works even without backend support; `HID` and `XInput` require matching entries in `Status.output_support` (otherwise `ERROR_CODE_UNSUPPORTED`; unknown numeric roles/modes return `ERROR_CODE_BAD_ARGS`). Valid preferences always save even if USB slots cannot currently expose them; USB reconnects only when the active interface allocation changes. See [Devices](records.md#devices) and [USB allocation](hid-forwarding.md#usb-allocation).
 
 ## Settings
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListSettings` | `DeviceSettings` | All complete typed settings domains, across integrations: configurable fields discovered on this connection plus every saved preference. Sends nothing to the device. |
-| `SetSettings` | none | Saves and forgets values in one storage write. Each change either saves a value or, with `forget`, removes the saved value. A `settings_changed` event follows. |
+| `ListSettings` | `DeviceSettings` | Complete typed `SettingsObject` list across integrations (discovered fields + saved preferences). Sends nothing to the device. |
+| `SetSettings` | none | Saves values or forgets saved preferences in one flash write; emits `settings_changed`. |
 
-A valid value is always saved, whatever the device's current state: disconnected, busy, its
-integration off, or in a mode where the value does not apply. It stays pending until an apply writes
-and confirms it. Changes are typed partial domain updates, so missing nested fields stay unchanged.
-Each present field selects a value or an empty `SettingForget` marker. Changes apply in order,
-so a later change to the same field replaces an earlier one. If any
-change in a request is invalid, nothing is saved. A forgotten setting is never written to the device
-again; the device keeps whatever value it has.
+Valid values always save regardless of device state (disconnected, integration off, or dependent mode inactive) and stay pending until applied. Updates are partial down to nested fields (each present field sets a value or `SettingForget`); if any field is invalid, nothing saves. Forgetting a preference leaves the device's current setting alone and stops future writes.
 
-### Applying saved settings
+### Applying Saved Settings
 
-The Dongle's saved settings are the truth for the device, and an apply syncs them to it. One routine
-does every apply, for one integration: it reads the device's current values, skips those already
-equal to the saved ones, writes the differences one setter at a time (fields that share a setter
-go out together), and reads back to confirm. Only saved settings are written.
+The adapter's saved settings are authoritative. One apply routine runs per integration on connect, integration enable, adapter platform change, and after `SetSettings`:
 
-The routine runs when an integration comes up (on connect, or when it is turned on), when the
-adapter platform changes, and after every `SetSettings` for each integration in the request, once
-the command has responded. A failure sets the affected settings' status to a full `Error` in a
-`settings_changed` event, keeps their saved values, and is tried again at the next apply. Different
-setters and integrations are separate device writes, so one failing does not undo the others. A
-write the device does not answer uses `ERROR_CODE_TIMEOUT` with outcome `UNKNOWN` when it may have
-taken effect. The next apply settles it by reading first. These outcomes describe applying the
-setting to the device, independently of the durable preference save.
+1. Reads current device values and skips fields that already match saved values.
+2. Writes differing fields one setter at a time (merging companion fields that share a setter) and reads back to verify.
+3. Failed writes record a full `Error` on the affected fields in `settings_changed` while keeping saved preferences intact for the next apply (unanswered writes report `TIMEOUT` with outcome `UNKNOWN`).
+4. User changes made directly on the device report `SETTING_STATE_CHANGED_ON_DEVICE` until the next apply restores the saved value.
 
-A setting that only applies while another has a particular value is still saved: a configured
-backlight level saved while the mode is automatic waits as pending and is written once the mode
-becomes permanent manual. If the user changes a saved setting on the device itself, the setting
-shows `SETTING_STATE_CHANGED_ON_DEVICE` until the next apply writes the saved value back.
-
-See [HID++](../hidpp.md) for the device operations behind each HID++ setting.
+See [Logitech HID++ support](../hidpp.md) for device-level command layouts.
 
 ## Profiles
 
 | Command | Result | Behavior |
 | --- | --- | --- |
-| `ListProfiles` | `ProfileList` | All saved profiles in ascending ID order. A record read failure is an `error` entry carrying `RecordError { id, error }`; the listing continues past it. |
+| `ListProfiles` | `ProfileList` | All saved profiles in ascending ID order (read failures emit `RecordError` entries). |
 | `GetProfile` | `Profile` | One saved profile. |
-| `CreateProfile` | `ProfileCreated` | Saves a new, empty profile and returns its ID; a `profile` event follows. |
-| `CopyProfile` | `ProfileCreated` | Saves a new profile with the source's rules and returns its ID; a `profile` event follows. |
-| `DeleteProfile` | none | Deletes an unused profile with its rules; `profile_removed` follows. |
-| `ListProfileRules` | `ProfileRules` | All of the profile's rules, ordered by input usage page, input usage, collection usage page, then collection usage. |
-| `SetProfileRules` | none | Saves and forgets rules in one storage write. Each change either saves a rule or, with `forget`, removes the rule for an input and collection. |
+| `CreateProfile` | `ProfileCreated` | Creates a new empty profile; emits `profile`. |
+| `CopyProfile` | `ProfileCreated` | Copies a profile and its rules; emits `profile`. |
+| `DeleteProfile` | none | Deletes an unused profile (refused with `ERROR_CODE_IN_USE` if referenced by any device layer or configuration interface); emits `profile_removed`. |
+| `ListProfileRules` | `ProfileRules` | All rules sorted by `(input_page, input_usage, collection_page, collection_usage)`. |
+| `SetProfileRules` | none | Atomic partial save/forget of rules in one flash write (complete request <= 1024 protobuf bytes). `cordial-client` sends one request without auto-splitting; callers divide larger change sets into sequential <= 1024-byte requests (not atomic across requests). |
 
-A new profile is empty and passes every input through unchanged. Nothing is filled in on the
-client's behalf. Every rule and `ProfileRuleRef` requires both an `input` usage and its application
-`collection`; the collection is never inferred from the usage. Each capability range includes its
-collection, so the same usage in Mouse and Game Pad collections identifies different inputs.
-A rule is refused with `ERROR_CODE_BAD_ARGS`, and nothing is saved, when its input and collection
-are outside `ProfileSupport.ranges` of kind `KIND_REMAP_INPUT` for a remap, `KIND_SCALE_INPUT`
-for a scale, or `KIND_AXIS_INPUT` for an axis rule, when a remap has an output outside ranges of
-kind `KIND_REMAP_OUTPUT` or more outputs than `OUTPUTS.limit` in `ProfileSupport.resources`, or
-when a scale has a zero numerator or denominator. An axis rule's `destination` must be within ranges of kind
-`KIND_AXIS_OUTPUT` in the input's Game Pad collection. Unknown and unspecified kinds grant no
-capability. Axis rules apply only to absolute Game Pad axes; `invert` reverses the normalized
-axis range. They add no deadzones, curves, or sensitivity settings. A save that would make the
-profile larger than `MEMORY.limit` in `ProfileSupport.resources` returns `ERROR_CODE_NO_CAPACITY` with
-`ERROR_REASON_PROFILE_MEMORY`, since it could never be loaded. The Dongle applies every rule it
-accepts to every device that uses the profile, whatever kind of device it is. The number of saved
-profiles is limited only by flash; creating or copying one
-that does not fit returns `ERROR_CODE_NO_CAPACITY` with `ERROR_REASON_STORAGE`.
+### Rule Validation and Normalization
 
-The complete `SetProfileRules` request, including its command envelope and every change, must fit
-1024 protobuf bytes before COBS encoding. Clients reject an oversized request without sending it
-and do not split it automatically. Each accepted request is atomic. A caller that deliberately
-sends several bounded requests gets no atomicity across that sequence.
+- Every rule requires explicit `input` usage and application `collection` matching `ProfileSupport.ranges` (`KIND_REMAP_INPUT`, `KIND_SCALE_INPUT`, or `KIND_AXIS_INPUT`). Remap outputs must match `KIND_REMAP_OUTPUT` (count <= `OUTPUTS.limit`); scale ratios require nonzero numerator and denominator; axis destinations must match `KIND_AXIS_OUTPUT` in the same Game Pad collection. Invalid rules return `ERROR_CODE_BAD_ARGS`.
+- Rules normalize before saving: omitted output collections resolve when unique; remap outputs deduplicate and sort by `(usage, collection)`; scale ratios reduce to lowest terms; no-op rules (self-remap in same collection, scale `1`, non-inverted self-axis) delete the rule.
+- Rules exceeding `MEMORY.limit` return `NO_CAPACITY(PROFILE_MEMORY)`; flash exhaustion returns `NO_CAPACITY(STORAGE)`.
+- Boards without profile support (such as Pico W) omit `Status.profile_support`, answer profile commands with `ERROR_CODE_UNKNOWN_COMMAND`, and refuse `SetDevice.profiles` with `ERROR_CODE_UNSUPPORTED`.
 
-A profile has at most one rule for each input and collection together. Changes in one
-`SetProfileRules` apply in order, so a later save or forget for the same input and collection
-replaces an earlier one; forgetting a rule that does not exist is accepted. Rules stay sparse. A
-rule is saved and reported in its normalized form:
+### Configuration Interfaces and Runtime Loading
 
-- A missing output collection is resolved to the only report that carries the usage.
-- A remap keeps each output, a usage with its collection, once, sorted by usage page, usage, then
-  collection usage page and usage.
-- A scale's ratio is reduced to lowest terms.
+- `SetAdapter.configuration_interfaces` updates VIA/Vial preferences in order (`profile = 0` clears). Enabling an interface requires a profile and no enabled conflicting interface (`ERROR_CODE_UNSUPPORTED`). Saved `enabled` is independent of active USB exposure; USB reconnects only if the actual allocation changes.
+- `SetDevice.profiles` assigns up to `LAYERS.limit` profile IDs in application order (empty list passes through).
+- When a device connects, firmware loads all of its layer profiles into the shared `MEMORY.limit` RAM budget (sharing copies by ID) before forwarding its first input. Loading is all-or-nothing: if layers do not fit or fail to read, none load, input passes through unchanged, and `Device.errors` reports `PROFILE_MEMORY_EXCEEDED` or `PROFILE_LOAD_FAILED` (retrying when memory frees, layers/rules change, or on backoff).
+- Live edits refuse to grow a loaded profile past the remaining budget so connected devices never lose loaded profiles. Edits and layer updates apply from the next input; already-held inputs keep their original outputs until released.
+- Remaps chain through layers (capped at `OUTPUTS.limit` per layer), scales multiply into one reduced ratio with a single fractional remainder per input, and axis rules within one profile evaluate simultaneously against the axes entering that profile.
 
-A normalized rule that remaps its input to only itself in the same collection, scales it by a
-ratio equal to 1, or maps an axis to itself without inversion changes nothing. Saving it forgets
-the rule for that input and collection, through the serial API and through a configuration
-interface alike. An input keeps the application collection of its report. Game Pad inputs use
-Game Pad (`01:05`), independently of Mouse (`01:02`), Keyboard (`01:06`), Consumer Control
-(`0c:01`), and System Control (`01:80`) inputs with the same usage.
+### Lost Profiles
 
-These limits apply to saves. A saved profile that a later firmware's limits no longer allow is kept
-as saved. A rule whose input or output the firmware does not support has no effect. Only the first
-profiles up to `LAYERS.limit` in `ProfileSupport.resources` apply. A save that would leave the
-profile or layer list over the limits is refused.
-
-`SetDevice.profiles` sets a device's layers, up to the `LAYERS.limit` in `ProfileSupport.resources`,
-in the order they apply, or an empty list to pass everything through. A newly paired device has no
-layers; each device's layers are set on their own.
-
-`SetAdapter.configuration_interfaces` changes the preferences of each configuration interface it
-lists, such as VIA or Vial, applying the updates in order. Each interface has its own enabled flag
-and profile, independent of any device's layers; 0 clears the profile. Every interface starts
-disabled. An enabled interface needs a profile in the resulting configuration, and several
-interfaces can be enabled at once unless `conflicts` lists one of the others; a resulting
-configuration that enables conflicting interfaces returns `ERROR_CODE_UNSUPPORTED` and changes
-nothing. A disabled interface keeps its profile. Saved `enabled` requests an interface; `active`
-reports whether it fits in the actual USB allocation. Valid preferences save even when capacity
-omits the interface. USB reconnects only when the actual allocation changes. The plan is computed
-before durable save/apply and detach, and later failures do not roll back persisted preferences.
-Under the [session ending rules](transport.md#intentional-session-endings), the response
-and `SessionEnding` finish transmitting before detach, subject to the bounded drain deadline.
-Bluetooth connections and held input
-carry on. Clients reopen the serial session and read fresh status without a reconnect confirmation
-dialog.
-
-`DeleteProfile` refuses with `ERROR_CODE_IN_USE` while the profile is the profile of any
-configuration interface, enabled or not, or in any saved device's layers, whether or not the device
-is enabled.
-
-### Using profiles
-
-When a device's connection starts, the Dongle takes the device's layers from its resident
-reconnection entry and loads every profile in them before the device's first input is forwarded. A
-profile already loaded for another connected device or a configuration interface is shared and costs
-nothing more. Loading profiles waits only for their flash reads, never for HID++ setup, a client, or
-USB. Commands, events, and background storage work read or write about one record at a time, and a
-step that writes may count free space again. Each step waits until radio events have been handled
-and pending input has been sent to a host that is reading it, so loading a starting connection's
-profiles waits for at most one such step already in progress. A command that
-reads many records, such as a listing or a reference check, therefore answers after reading them
-one at a time.
-
-Loaded profiles share the `MEMORY.limit` in `ProfileSupport.resources`, set by the board
-configuration. A board configured without profile support, such as the Pico W, reports no
-`ProfileSupport` and no configuration interfaces, answers profile commands with
-`ERROR_CODE_UNKNOWN_COMMAND`, and refuses `SetDevice.profiles` with `ERROR_CODE_UNSUPPORTED`.
-`MEMORY.count` reports loaded bytes. A device
-loads all of its layers or none: when the profiles it would add do not fit in what is left of the
-budget, or one of them cannot be read or decoded, none is loaded, its input passes through
-unchanged, and `Device.errors` includes `ERROR_CODE_PROFILE_MEMORY_EXCEEDED` or
-`ERROR_CODE_PROFILE_LOAD_FAILED`. The connection itself carries on. When a connected
-device's layers change, the profiles it no longer uses count as released before the new ones are
-checked. The Dongle tries again when memory is released, when the device's layers change, or when a
-profile in its layers is edited, and after a failed read it also retries with the connection
-backoff, from two seconds to five minutes. Saving layers never depends on loading the profiles.
-
-An edit that would grow a loaded profile beyond what is left of the budget is refused with
-`ERROR_CODE_NO_CAPACITY` and `ERROR_REASON_PROFILE_MEMORY`, through the serial API and through a
-configuration interface alike, so a device never loses its loaded profiles because of an edit. A
-configuration interface loads its profile when an editor first uses it; when it does not fit, the
-editor's requests fail and no device's profiles are unloaded to make room.
-
-Each input goes through the layers in order, one rule lookup per layer. A remap's outputs are each
-looked up in the next layer by their usage, and their results are held together in order, each
-output's results taking its place, each output at most once. After each layer, only the first
-outputs up to the advertised `OUTPUTS.limit` are kept. A remap applies only while the device reports the input as a
-held control; other forms of the same usage keep their usual behavior. A remap output never reaches a scale rule, because no usage is both a remap output and a
-scale input. Scales from every layer multiply into one ratio, kept in lowest terms and applied once
-with one fractional remainder per connection and input, which resets when the ratio changes; a
-result too large for the USB report is limited to the largest value it carries, and a ratio too
-large to represent is limited the same way.
-
-Changing a connected device's layers or a profile's rules takes effect from the device's next input,
-before the command responds. A held input keeps the outputs it was pressed with until it is
-released, and an output that several held inputs produce stays held until the last of them is
-released. A profile is released once no connected device or configuration interface uses it.
-
-See [Input profiles](../input-profiles.md) for external editors.
-
-### Lost profiles
-
-A profile whose `profile.pb` turns out to be missing or undecodable when the Dongle reads it is
-deleted with its rules, and `profile_removed` follows. Its references are removed first, so no
-device applies its rules once deletion begins. An undecodable rules file is removed, leaving the
-profile empty. Neither cleanup runs between a connection starting and its first forwarded input;
-the connection loads no profiles, its `errors` includes `ERROR_CODE_PROFILE_LOAD_FAILED`, and the
-cleanup follows.
-
-A saved reference to a profile that no longer exists is skipped until it is changed. Startup checks
-which profile directories exist without reading them. Before USB starts, it clears and disables a
-configuration interface whose profile does not exist, so the adapter still enumerates once. While
-reading device policies, it removes such references from device layers. Deleting a lost profile
-removes its references the same way, and USB reconnects if the actual allocation changes.
-`device` and `adapter` events follow. A listing leaves out a lost record it removes; a `RecordError`
-names only a record whose flash read failed. As for devices, a failed read is never proof that
-data is missing and deletes nothing.
-
-## Development
-
-See [Development commands](development.md).
+A missing or undecodable `profile.pb` is deleted after stripping its references from devices and configuration interfaces (emitting `profile_removed`, `device`, and `adapter` events). An undecodable `rules.pb` is deleted, leaving the profile empty. Cleanup never delays a connecting device's first input; flash read errors never delete profiles.

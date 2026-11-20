@@ -1,130 +1,119 @@
 <p align="center">
-  <img src="packaging/icons/app.svg" width="112" alt="">
+  <img src="packaging/icons/app.svg" width="112" alt="Cordial logo">
 </p>
 
 <h1 align="center">Cordial</h1>
 
 <p align="center">
-  <strong>Your Bluetooth keyboard, mouse, and gamepad, as plain USB.</strong>
+  <strong>Your Bluetooth keyboard, mouse, and gamepad, presented as plain USB.</strong>
 </p>
 
 <p align="center">
-  Cordial turns a small, inexpensive microcontroller board into an adapter that pairs
-  with your Bluetooth keyboards, mice, and gamepads and presents them to the computer as ordinary
-  USB devices. No host Bluetooth, no drivers, no software running in the background.
+  Cordial turns an inexpensive microcontroller board into a standalone Bluetooth-to-USB adapter.
+  Pair your wireless peripherals once and plug the adapter into any computer, KVM switch, or OS.
+  No host Bluetooth, no drivers, and no background software required.
 </p>
 
 <p align="center">
   <a href="https://github.com/ryanpetris/cordial/releases/latest"><img src="https://img.shields.io/github/v/release/ryanpetris/cordial?label=latest" alt="Latest release"></a>
-  <img src="https://img.shields.io/badge/desktop-Linux%20x86--64-informational" alt="Desktop app: Linux x86-64">
+  <img src="https://img.shields.io/badge/app-Linux%20x86--64-informational" alt="App: Linux x86-64">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
 </p>
 
 <p align="center">
   <a href="https://github.com/ryanpetris/cordial/releases/latest"><b>Download</b></a>
-  &nbsp;·&nbsp;
-  <a href="docs/installation.md">Install</a>
-  &nbsp;·&nbsp;
-  <a href="#supported-boards">Supported boards</a>
-  &nbsp;·&nbsp;
-  <a href="docs/building.md">Build from source</a>
+  &nbsp;|&nbsp;
+  <a href="#quick-start">Quick Start</a>
+  &nbsp;|&nbsp;
+  <a href="#supported-boards">Supported Boards</a>
+  &nbsp;|&nbsp;
+  <a href="#documentation">Documentation</a>
 </p>
 
-## Features
+## Why Cordial
 
-- The computer receives input over USB. It needs no Bluetooth radio, no pairing, and
-  no drivers.
-- Pairings and preferences live on the adapter. Move it to another computer and your devices come
-  with it.
-- Input forwarding happens on the adapter. The app is for setup and status; quit it and your
-  keyboard carries on.
-- Bluetooth connections survive host sleep, and nothing you typed meanwhile is replayed on wake.
-- On Logitech HID++ keyboards and mice, special keys are translated for Linux, Windows, or macOS.
-  Backlight, DPI, SmartShift, and scroll direction are adjustable, and battery level is reported.
-- RP2040 and RP2350 boards can forward controllers as HID or XInput [gamepads](docs/gamepads.md).
-- [Input profiles](docs/input-profiles.md) remap keys, mouse buttons, and controller inputs on the
-  adapter. Edit key and mouse rules with VIA or Vial, and any rule with the CLI.
-- The native GTK4/libadwaita desktop app shows adapter and device status, settings, and profiles.
-  The same `cordial` executable provides an interactive shell, one-shot commands with JSON output,
-  and a full-screen TUI.
+- **Plain USB everywhere**: The host sees standard USB keyboards, mice, and gamepads, so your devices work in BIOS/UEFI, disk-encryption prompts, KVM switches, and locked-down machines without host Bluetooth or drivers.
+- **Standalone and portable**: Pairings, device preferences, and input profiles are stored on the adapter itself. Quit the app or move the adapter to another computer and everything keeps working.
+- **Sleep-friendly**: Bluetooth connections stay alive while the host sleeps, standard USB remote wake is supported, and nothing typed during suspend is replayed on wake.
+- **Logitech HID++ integration**: Translates special keys for Linux, Windows, or macOS, reports battery status, and configures DPI, SmartShift, scroll direction, backlighting, Fn-row behavior, and auto power-off on [supported Logitech devices](docs/hidpp.md).
+- **USB gamepads**: RP2040 and RP2350 boards forward Bluetooth controllers as standard USB HID or XInput [gamepads](docs/gamepads.md), with automatic builtin mappings for common Xbox, DualShock 4, and Luna layouts.
+- **On-adapter input profiles**: Remap keys, mouse buttons, and controller inputs, scale pointer or scroll axes, and stack per-device layers directly on the adapter. Edit keyboard and mouse rules in VIA or Vial, or edit any rule from the CLI; see [Input profiles](docs/input-profiles.md).
+- **One native companion tool**: A single `cordial` executable provides a native GTK4/libadwaita desktop app, a full-screen TUI, an interactive shell, and scriptable one-shot CLI commands with JSON protocol logging.
 
-## Supported boards
+## Supported Boards
 
-| Board | Code | Bluetooth | Gamepad | Input profiles |
+| Board | Firmware Code | Bluetooth | Gamepads | Input Profiles |
 | --- | --- | --- | --- | --- |
-| Raspberry Pi Pico W | `pico_w` | Classic and Low Energy | Yes | No |
-| Raspberry Pi Pico 2 W | `pico2_w` | Classic and Low Energy | Yes | Yes |
-| Pimoroni Pico Plus 2 W | `pimoroni_pico_plus2_w` | Classic and Low Energy | Yes | Yes |
-| Waveshare RP2350B-Plus-W | `waveshare_rp2350b_plus_w` | Classic and Low Energy | Yes | Yes |
-| ESP32-S3 with at least 4 MiB flash and native USB | `esp32s3` | Low Energy only | No | Yes |
+| Raspberry Pi Pico W | `pico_w` | Classic and BLE | HID and XInput | No |
+| Raspberry Pi Pico 2 W | `pico2_w` | Classic and BLE | HID and XInput | Yes |
+| Pimoroni Pico Plus 2 W | `pimoroni_pico_plus2_w` | Classic and BLE | HID and XInput | Yes |
+| Waveshare RP2350B-Plus-W | `waveshare_rp2350b_plus_w` | Classic and BLE | HID and XInput | Yes |
+| ESP32-S3 (4 MiB+ flash, native USB) | `esp32s3` | BLE only | No | Yes |
 
-Each board's firmware is in `cordial-firmware-<version>-<code>.tar.gz`.
+Each board's release archive is named `cordial-firmware-<version>-<code>.tar.gz`.
 
-## Installation
+## Quick Start
 
-You need a Linux x86-64 computer to install firmware and pair devices. Once set up, the adapter
-works with any computer.
+A Linux x86-64 computer is used to flash firmware and configure the adapter. Once paired, the adapter works with any operating system without running Cordial.
 
-### Desktop app and CLI
+### 1. Install Cordial
 
-Download the package for your distribution from the
-[latest release](https://github.com/ryanpetris/cordial/releases/latest). The `cordial` package
-includes the GNOME application, CLI, and TUI.
+Download the package for your distribution from the [latest release](https://github.com/ryanpetris/cordial/releases/latest). The `cordial` package includes the desktop app, TUI, CLI, and udev rules.
 
-On Arch Linux:
+Arch Linux:
 
 ```sh
 sudo pacman -U cordial-[0-9]*-1-x86_64.pkg.tar.zst
 ```
 
-On Ubuntu 26.04, use the files marked `resolute`. Substitute `trixie` for Debian 13:
+Ubuntu 26.04 (`resolute`) or Debian 13 (substitute `trixie` for `resolute`):
 
 ```sh
 sudo apt install ./cordial_[0-9]*-1~resolute_amd64.deb
 ```
 
-Use the same command to update an installed `cordial` package.
-See [installation](docs/installation.md#desktop-app-and-cli) for desktop setup.
+Using another distribution? Download the AppImage or portable tar archive; see the [Installation guide](docs/installation.md) for setup, udev permissions, and GNOME tray icon details.
 
-An AppImage and a unified host tar archive are available for other distributions. See
-[installation](docs/installation.md#desktop-app-and-cli) for details.
+### 2. Flash Firmware
 
-### Firmware for RP2040 and RP2350 boards
+For RP2040 and RP2350 boards:
 
-1. Download and extract your board's firmware archive from the
-   [latest release](https://github.com/ryanpetris/cordial/releases/latest).
-2. Hold the **BOOTSEL** (or **BOOT**) button while plugging the board into USB. It appears as a
-   USB drive.
-3. Copy the extracted `.uf2` file onto that drive. The board restarts as a Cordial adapter.
+1. Download and extract your board's firmware archive from the [latest release](https://github.com/ryanpetris/cordial/releases/latest).
+2. Hold **BOOTSEL** (or **BOOT**) while plugging the board into USB so it mounts as a USB drive.
+3. Copy the extracted `.uf2` file onto the drive. The board reboots as a Cordial adapter.
 
-For ESP32-S3, see [installation](docs/installation.md#esp32-s3).
+For ESP32-S3 download-mode and `esptool` instructions, or debug firmware builds, see [Firmware installation](docs/installation.md#firmware).
 
-## Usage
+### 3. Pair a Device
 
-1. Plug in the adapter and open **Cordial**. The adapter appears in the sidebar.
-2. Choose **Add Device**, put your device into pairing mode, and select **Pair** next to it.
-3. Follow any on-screen passkey prompt.
+1. Plug in the adapter and launch **Cordial**.
+2. Open the adapter in the sidebar, select **Add Device**, and put your Bluetooth peripheral into pairing mode.
+3. Select **Pair** next to the device and follow any passkey prompt.
 
-From the terminal:
+You can also manage adapters from a terminal:
 
 ```sh
-cordial desktop                 # native GNOME application
-cordial adapter list            # find your adapter
-cordial --port PORT             # interactive shell
-cordial tui                     # full-screen interface for every attached adapter
+cordial desktop           # launch the GTK4/libadwaita desktop app
+cordial tui               # open the full-screen terminal UI
+cordial adapter list      # list attached adapters
+cordial --port PORT       # open the interactive shell
 ```
 
 ## Documentation
 
-- [Installation](docs/installation.md)
-- [Gamepad outputs](docs/gamepads.md)
-- [Input profiles](docs/input-profiles.md)
-- [HID++ support](docs/hidpp.md)
-- [Build from source](docs/building.md)
-- [USB control protocol](docs/protocol/README.md)
-- [Storage format](docs/storage-format.md)
+User guides:
+
+- [Installation](docs/installation.md) -- packages, AppImage, udev permissions, tray icon, and firmware flashing
+- [Gamepad outputs](docs/gamepads.md) -- HID and XInput controller setup and slot pools
+- [Input profiles](docs/input-profiles.md) -- remapping, layers, VIA/Vial editing, and builtin controller rules
+- [Logitech HID++ support](docs/hidpp.md) -- feature inventory, special-key translations, and device settings
+
+Developer and technical references:
+
+- [Building from source](docs/building.md) -- Docker and local builds, board presets, packaging, and test suites
+- [USB control protocol](docs/protocol/README.md) -- serial API, framing, commands, records, HID forwarding, and client behavior
+- [On-board storage format](docs/storage-format.md) -- flash layout, LittleFS records, migrations, and recovery
 
 ## License
 
-Cordial is released under the [MIT License](LICENSE). Third-party components keep their
-own licenses; see [`notices/`](notices/).
+Cordial is licensed under the [MIT License](LICENSE). Third-party components retain their own licenses; see [`notices/`](notices/).
