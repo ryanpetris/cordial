@@ -28,15 +28,19 @@ Run all `just` commands from the repository root on Linux. Release host builds, 
 
 ### Prerequisites
 
-- Git
+- Bash, Git, Python 3, and `just`
 - [Docker](https://docs.docker.com/engine/install/) with BuildKit enabled and user permissions (or Podman via `just DOCKER=podman ...`)
-- [just 1.59.0](https://github.com/casey/just/releases/tag/1.59.0)
 
-To install the pinned `just` release locally with SHA-256 verification:
+Debian and Ubuntu:
 
 ```sh
-sh docker/install-just.sh .cache/just/bin
-export PATH="$PWD/.cache/just/bin:$PATH"
+sudo apt-get install git just python3
+```
+
+Arch Linux:
+
+```sh
+sudo pacman -S git just python
 ```
 
 ### Common Recipes
@@ -77,22 +81,22 @@ Local builds are used for day-to-day host development and running `just check` /
 
 ### Local Prerequisites
 
-Install Python 3.11.4+, [rustup](https://rustup.rs/) (Cargo automatically selects the toolchain pinned in `rust/rust-toolchain.toml`), and native GTK4/libadwaita development libraries (minimum GTK 4.14 and libadwaita 1.5).
+- Rust via [rustup](https://rustup.rs/) (Cargo automatically selects the toolchain pinned in `rust/rust-toolchain.toml`).
+- A C compiler, `make`, `clang`/`libclang`, `pkg-config`, Git, `just`, and Python 3.11.4+ (direct Cargo host builds do not require Python; `just` recipes, version tools, packaging, and firmware builds do).
+- Native GTK4 and libadwaita development libraries (minimum GTK 4.14 and libadwaita 1.5) and `glib-compile-schemas`.
 
 Debian and Ubuntu:
 
 ```sh
-sudo apt-get install build-essential git clang libclang-dev pkg-config python3 \
-  libgtk-4-dev libadwaita-1-dev libglib2.0-bin
+sudo apt-get install build-essential clang git just libadwaita-1-dev \
+  libclang-dev libglib2.0-bin libgtk-4-dev pkg-config python3
 ```
 
 Arch Linux:
 
 ```sh
-sudo pacman -S base-devel git clang pkgconf python gtk4 libadwaita
+sudo pacman -S base-devel clang git glib2 gtk4 just libadwaita pkgconf python
 ```
-
-Direct Cargo host builds do not require Python; `just` recipes, version tools, packaging, and firmware builds do.
 
 ### Running Development Builds
 
@@ -132,7 +136,28 @@ The Pico toolchain image (`docker/pico.Dockerfile`) provides Rust 1.99.1 and ARM
 
 To invoke `python3 rust/tools/build_firmware.py` locally without Docker:
 
-- **RP2040 / RP2350**: Install `arm-none-eabi-gcc`, `cmake`, `ninja`, `clang`/`libclang`, and the pinned Rust toolchain targets from `rust/rust-toolchain.toml` (`thumbv6m-none-eabi` and `thumbv8m.main-none-eabihf`).
+- **RP2040 / RP2350**: Install `arm-none-eabi-gcc`, `cmake`, `ninja`, `clang`/`libclang`, and the pinned Rust toolchain targets from `rust/rust-toolchain.toml` (`thumbv6m-none-eabi` and `thumbv8m.main-none-eabihf`):
+
+  Debian and Ubuntu:
+
+  ```sh
+  sudo apt-get install build-essential clang cmake gcc-arm-none-eabi git \
+    libclang-dev libnewlib-arm-none-eabi ninja-build pkg-config python3
+  ```
+
+  Arch Linux:
+
+  ```sh
+  sudo pacman -S arm-none-eabi-gcc arm-none-eabi-newlib base-devel clang cmake \
+    git ninja pkgconf python
+  ```
+
+  Rust targets:
+
+  ```sh
+  (cd rust && rustup target add thumbv6m-none-eabi thumbv8m.main-none-eabihf)
+  ```
+
 - **ESP32-S3**: Install ESP-IDF `v6.1`, `ldproxy`, and the `espup` `1.97.0.0` toolchain, then source both ESP-IDF's `export.sh` and `espup`'s `export-esp.sh` so `IDF_PATH`, `IDF_PYTHON_ENV_PATH`, `LIBCLANG_PATH`, and `xtensa-esp32s3-elf-gcc` are active in the environment.
 
 ### Profiles and Artifacts
@@ -218,15 +243,45 @@ Run protocol checks alone with `just check-protocol` (requires only `just`, Pyth
 
 ### GTK Control Fixtures (`just check-gtk`)
 
+Requires `xvfb-run`, `Xvfb`, `xauth`, `dbus-run-session`, and `glib-compile-schemas`.
+
+Debian and Ubuntu:
+
+```sh
+sudo apt-get install dbus-x11 libglib2.0-bin xauth xvfb
+```
+
+Arch Linux:
+
+```sh
+sudo pacman -S dbus glib2 xorg-server-xvfb xorg-xauth
+```
+
+Run the suite:
+
 ```sh
 just check-gtk
 ```
 
-Requires `xvfb-run`, `Xvfb`, `xauth`, `dbus-run-session`, and `glib-compile-schemas` (provided by `xvfb`, `xauth`, `dbus-x11`, and `libglib2.0-bin` on Debian/Ubuntu, or `xorg-server-xvfb`, `xorg-xauth`, `dbus`, and `glib2` on Arch). `rust/tools/test_gtk.py` builds the all-feature `cordial` library test binary once, discovers every ignored `desktop::` test (currently 20), and runs each in an isolated process with private XDG directories sharing one Xvfb and D-Bus session. All ignored `desktop::` library tests must run unattended; manual test screens live outside that namespace.
+`rust/tools/test_gtk.py` builds the all-feature `cordial` library test binary once, discovers every ignored `desktop::` test (currently 20), and runs each in an isolated process with private XDG directories sharing one Xvfb and D-Bus session. All ignored `desktop::` library tests must run unattended; manual test screens live outside that namespace.
 
 ### Linux Terminal Fixture
 
-Verifies PTY terminal restoration, interactive shell and TUI operation, `--json` stderr streaming, error preservation, and shutdown behavior against the release binary. Requires `pyte`, Python `protobuf`, `protoc`, and a C compiler:
+Verifies PTY terminal restoration, interactive shell and TUI operation, `--json` stderr streaming, error preservation, and shutdown behavior against the release binary. Requires `pyte`, Python `protobuf`, `protoc`, and a C compiler.
+
+Debian and Ubuntu:
+
+```sh
+sudo apt-get install build-essential protobuf-compiler python3-protobuf python3-pyte
+```
+
+Arch Linux:
+
+```sh
+sudo pacman -S base-devel protobuf python-protobuf python-pyte
+```
+
+Build the release binary and run the fixture:
 
 ```sh
 just host
